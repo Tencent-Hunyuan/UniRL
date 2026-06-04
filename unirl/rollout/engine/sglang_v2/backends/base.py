@@ -44,17 +44,18 @@ class RawResult(Protocol):
     test fakes stand in structurally.
 
     Population: ``text`` and ``finish_reason`` are always set. ``token_ids`` /
-    ``logprobs`` come from ``meta_info['output_token_logprobs']`` pairs (with an
-    ``output_token_ids`` fallback for the ids) and are empty lists when the
-    request didn't ask for logprobs.
+    ``logprobs`` both come from the ``meta_info['output_token_logprobs']``
+    items — the runtime's only source of generated token ids (there is no
+    separate ``output_token_ids`` field) — so they are length-aligned by
+    construction, and both empty when the request didn't ask for logprobs.
     """
 
     #: The raw generated text (``<think>`` tags intact — stripping is a
     #: driver-side concern, applied by the adapter at decode time).
     text: str
-    #: Generated token ids, aligned with ``logprobs`` when both are populated.
+    #: Generated token ids, always length-aligned with ``logprobs``.
     token_ids: List[int]
-    #: Per-token log-probs; empty when ``return_logprob`` was off.
+    #: Per-token log-probs; both lists empty when ``return_logprob`` was off.
     logprobs: List[float]
     #: Normalized finish reason (SRT returns a dict or a bare string).
     finish_reason: str

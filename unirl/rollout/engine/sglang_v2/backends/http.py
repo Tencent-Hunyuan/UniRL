@@ -155,9 +155,10 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
 
     SGLang returns a single dict for ``n=1`` and a list of dicts for ``n>1``;
     both normalize to a list here (the per-prompt candidate order is SRT's).
-    Token ids ride the ``output_token_logprobs`` ``(logprob, token_id)`` pairs,
-    falling back to ``meta_info['output_token_ids']`` when the pairs carry bare
-    floats; ``finish_reason`` arrives as a dict or a bare string.
+    Token ids and log-probs both ride the ``output_token_logprobs``
+    ``(logprob, token_id[, token_text])`` items — the runtime's only source of
+    generated token ids — so the two lists are length-aligned by construction;
+    ``finish_reason`` arrives as a dict or a bare string.
     """
     if isinstance(response, list):
         candidates = response
@@ -170,18 +171,12 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
     for candidate in candidates:
         meta = candidate.get("meta_info", {})
 
-        raw_logprobs = meta.get("output_token_logprobs", [])
         token_logprobs: List[float] = []
         output_token_ids: List[int] = []
-        for item in raw_logprobs:
+        for item in meta.get("output_token_logprobs", []):
             if isinstance(item, (list, tuple)) and len(item) >= 2:
                 token_logprobs.append(float(item[0]))
                 output_token_ids.append(int(item[1]))
-            elif isinstance(item, (int, float)):
-                token_logprobs.append(float(item))
-
-        if not output_token_ids:
-            output_token_ids = list(meta.get("output_token_ids", []))
 
         raw_finish = meta.get("finish_reason", "unknown")
         if isinstance(raw_finish, dict):
@@ -190,16 +185,6 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
             finish_reason = str(raw_finish)
 
         raw_text = str(candidate.get("text", ""))
-
-        n_tok = len(output_token_ids)
-        n_lp = len(token_logprobs)
-        if n_tok != n_lp:
-            logger.warning(
-                "sglang_v2 HTTPBackend: token_ids/logprobs length MISMATCH: token_ids=%d logprobs=%d text_len=%d",
-                n_tok,
-                n_lp,
-                len(raw_text),
-            )
 
         results.append(
             _HTTPRawResult(
