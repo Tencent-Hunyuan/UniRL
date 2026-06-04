@@ -14,25 +14,27 @@ Boot sequence (load-bearing order — see each step's note):
 3. ``CUDA_VISIBLE_DEVICES`` pop when the adapter's boot intent asks for it
    (HI3 multi-GPU stages; the documented last-resort env override — vllm-omni
    reads CVD for per-stage device pinning and has no arg for it).
-4. Stage-config tree: load the YAML asset, overlay ``enable_sleep_mode`` +
-   per-stage ``master_port`` from the reserved :class:`VLLMOmniPorts`, write
-   ONE temp file (``Omni`` only accepts a path — ``stage_configs_path``), and
-   unlink it in :meth:`shutdown` / on boot failure.
-5. ``Omni(...)`` + the driver-side ``AutoTokenizer`` when the modality needs it.
+4. ``Omni(...)`` with the PRISTINE packaged stage YAML + ctor kwargs —
+   ``enable_sleep_mode`` / ``master_port`` ride the runtime's own override
+   channel (the ``base_engine_args`` merge + the dedicated sleep-mode
+   injection in ``AsyncOmniEngine._resolve_stage_configs``), so no YAML
+   rewrite, no temp file. Then the driver-side ``AutoTokenizer`` when the
+   modality needs it; ``tp_per_stage`` reads back from the runtime's own
+   merged ``omni.stage_configs``.
 
 This replaces v1's ``base + rank*200 + idx*50`` port math and ``RANK``-env
-fallback with reserved ports riding the runtime's own per-stage
-``engine_args.master_port`` field.
+fallback with one reserved master-port base riding ``Omni(master_port=...)``;
+each stage settles its own port from that base (pinned v0.20.0:
+``base + random(0, 100)`` then a +37 bind-check scan; ≥ v0.21.0rc2: honored
+verbatim, scan only on collision — and note env ``MASTER_PORT`` then takes
+precedence over the kwarg).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from typing import Any, Dict, List, Optional, Sequence
-
-import yaml
 
 from unirl.rollout.engine.vllm_omni_v2.backends.base import (
     STAGE_KIND_AR,
@@ -93,54 +95,64 @@ def _resolve_stage_yaml(name: str, source: str) -> str:
     raise ValueError(f"_resolve_stage_yaml: unknown source {source!r} (expected 'local' or 'upstream')")
 
 
-def _parse_tp_per_stage(stage_tree: Dict[str, Any]) -> Dict[int, int]:
-    """Extract ``{stage_id: tensor_parallel_size}`` from a loaded stage tree.
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    """Mapping/OmegaConf/attr-tolerant getter (``None`` coerces to default)."""
+    if cfg is None:
+        return default
+    getter = getattr(cfg, "get", None)
+    value = getter(key, default) if callable(getter) else getattr(cfg, key, default)
+    return default if value is None else value
 
-    LLM stages store ``engine_args.tensor_parallel_size``; diffusion stages
-    store ``engine_args.parallel_config.tensor_parallel_size``. Falls back to
-    1 when neither key is present. Parsed from the PRE-overlay tree (the
-    overlays only touch ``master_port`` / ``enable_sleep_mode``).
+
+def _tp_from_stage_configs(stage_configs: Sequence[Any]) -> Dict[int, int]:
+    """Extract ``{stage_id: tensor_parallel_size}`` from the runtime's configs.
+
+    Reads ``omni.stage_configs`` post-boot — the runtime's own merged
+    (OmegaConf) per-stage configs, so this is the authoritative parse rather
+    than a re-read of the YAML asset. LLM stages store
+    ``engine_args.tensor_parallel_size``; diffusion stages store
+    ``engine_args.parallel_config.tensor_parallel_size``. Falls back to 1
+    when neither key is present.
     """
     tp_map: Dict[int, int] = {}
-    for entry in stage_tree.get("stage_args", []):
-        sid = int(entry.get("stage_id", len(tp_map)))
-        ea = entry.get("engine_args", {})
-        tp = ea.get("tensor_parallel_size", None)
+    for entry in stage_configs:
+        sid = int(_cfg_get(entry, "stage_id", len(tp_map)))
+        ea = _cfg_get(entry, "engine_args", {})
+        tp = _cfg_get(ea, "tensor_parallel_size")
         if tp is None:
-            pc = ea.get("parallel_config", {})
-            tp = pc.get("tensor_parallel_size", None)
+            tp = _cfg_get(_cfg_get(ea, "parallel_config", {}), "tensor_parallel_size")
         tp_map[sid] = int(tp) if tp is not None else 1
     return tp_map
 
 
-def _overlay_stage_tree(
-    stage_tree: Dict[str, Any],
-    *,
-    enable_sleep_mode: bool,
-    ports: Optional[Any],
-) -> Dict[str, Any]:
-    """Apply the per-stage ``engine_args`` overlays onto the loaded tree.
+def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Spell the boot intent into ``Omni`` ctor kwargs.
 
-    - ``enable_sleep_mode: True`` gates vllm-omni's ``CuMemAllocator`` pool at
-      construction time; without it ``worker.sleep()`` raises.
-    - ``master_port`` rides each stage's own typed ``engine_args.master_port``
-      field (``StageRuntimeData.__post_init__`` otherwise self-settles to
-      ``30005 + random(0, 100)``, which collides across colocated actors).
-      Stage ``idx`` takes the reserved set's ``stage{idx}_master_port``.
+    ``intent["omni_kwargs"]`` arrives pre-layered by ``config.server_intent``
+    (timeouts < adapter ``mode`` < the ``omni_extra`` escape hatch). The
+    dedicated keys go ON TOP — the escape hatch must not override ports or
+    the sleep gate:
+
+    - ``enable_sleep_mode=True`` (only when the intent asks): vllm-omni's
+      ``AsyncOmniEngine._resolve_stage_configs`` injects it into every stage
+      whose YAML doesn't define it (none of ours do), gating the
+      ``CuMemAllocator`` pool ``worker.sleep()`` needs. The runtime first
+      logs a spurious "top-level engine args are ignored: enable_sleep_mode"
+      warning (the strip filter sees a vllm ``EngineArgs`` field) — the
+      dedicated injection block applies it regardless; verified at the
+      v0.20.0 pin and upstream main.
+    - ``master_port`` (only when ports were reserved): merged into every
+      stage's ``engine_args`` via the loader's ``base_engine_args`` channel;
+      each stage settles its own port from this base (see
+      :class:`VLLMOmniPorts`).
     """
-    stage_args = stage_tree.get("stage_args", [])
-    if ports is not None and len(stage_args) > 2:
-        raise ValueError(
-            f"VLLMOmniBackend: stage tree has {len(stage_args)} stages but "
-            "VLLMOmniPorts reserves master ports for at most 2."
-        )
-    for idx, entry in enumerate(stage_args):
-        ea = entry.setdefault("engine_args", {})
-        if enable_sleep_mode:
-            ea["enable_sleep_mode"] = True
-        if ports is not None:
-            ea["master_port"] = int(getattr(ports, f"stage{idx}_master_port"))
-    return stage_tree
+    omni_kwargs = dict(intent.get("omni_kwargs") or {})
+    if intent.get("enable_sleep_mode"):
+        omni_kwargs["enable_sleep_mode"] = True
+    ports = intent.get("ports")
+    if ports is not None:
+        omni_kwargs["master_port"] = int(ports.master_port)
+    return omni_kwargs
 
 
 class VLLMOmniBackend:
@@ -153,13 +165,11 @@ class VLLMOmniBackend:
         *,
         tokenizer: Optional[Any],
         tp_per_stage: Dict[int, int],
-        yaml_tmp_path: Optional[str],
     ) -> None:
         self._omni: Optional[Any] = omni
         self._rt = runtime
         self._tokenizer = tokenizer
         self._tp_per_stage = dict(tp_per_stage)
-        self._yaml_tmp_path = yaml_tmp_path
 
     # ------------------------------------------------------------------ #
     # Boot — the only place the runtime import / spawn / env override live
@@ -167,11 +177,14 @@ class VLLMOmniBackend:
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
-        """Spell the intent into a stage-config tree + ``Omni`` ctor and spawn.
+        """Spell the intent into ``Omni`` ctor kwargs and spawn.
 
         ``intent`` is the dict from ``config.server_intent`` (adapter boot
-        extras + reserved ports already overlaid). See the module docstring
-        for the load-bearing boot order.
+        extras + the reserved port base already overlaid). The stage YAML is
+        passed PRISTINE — ``enable_sleep_mode`` / ``master_port`` ride the
+        runtime's own ctor-kwarg override channel (see
+        :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
+        temp file. See the module docstring for the load-bearing boot order.
         """
         # 1. Patches first: install() wraps mp.Process so spawn children
         #    re-run the hijack at startup — the primary mechanism for
@@ -198,37 +211,15 @@ class VLLMOmniBackend:
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # 4. Stage-config tree: load → tp parse (pre-overlay) → overlay → temp file.
+        # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
         yaml_path = _resolve_stage_yaml(
             str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local"))
         )
-        with open(yaml_path) as f:
-            stage_tree = yaml.safe_load(f)
-        tp_per_stage = _parse_tp_per_stage(stage_tree)
-        stage_tree = _overlay_stage_tree(
-            stage_tree,
-            enable_sleep_mode=bool(intent.get("enable_sleep_mode", False)),
-            ports=intent.get("ports"),
-        )
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp:
-            yaml.safe_dump(stage_tree, tmp, sort_keys=False)
-            yaml_tmp_path = tmp.name
-
-        # 5. Spawn Omni; unlink the temp file if construction throws (shutdown
-        #    would never run).
-        omni_kwargs: Dict[str, Any] = dict(
+        omni = rt["Omni"](
             model=str(intent["model_path"]),
-            stage_configs_path=yaml_tmp_path,
+            stage_configs_path=yaml_path,
+            **_assemble_omni_kwargs(intent),
         )
-        omni_kwargs.update(intent.get("omni_kwargs") or {})
-        try:
-            omni = rt["Omni"](**omni_kwargs)
-        except BaseException:
-            try:
-                os.unlink(yaml_tmp_path)
-            except FileNotFoundError:
-                pass
-            raise
 
         # Driver-side tokenizer for AR prompt-token construction (workers
         # reload their own from the model path). Pure-DiT modalities skip it.
@@ -242,8 +233,9 @@ class VLLMOmniBackend:
             omni,
             rt,
             tokenizer=tokenizer,
-            tp_per_stage=tp_per_stage,
-            yaml_tmp_path=yaml_tmp_path,
+            # The runtime's own merged per-stage configs — authoritative,
+            # no YAML re-read.
+            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
         )
 
     def _require_omni(self) -> Any:
@@ -392,12 +384,6 @@ class VLLMOmniBackend:
                     close()
             finally:
                 self._omni = None
-        if self._yaml_tmp_path is not None:
-            try:
-                os.unlink(self._yaml_tmp_path)
-            except FileNotFoundError:
-                pass
-            self._yaml_tmp_path = None
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — per-stage collective_rpc fan-out lives here

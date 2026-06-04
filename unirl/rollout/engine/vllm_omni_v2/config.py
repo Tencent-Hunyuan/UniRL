@@ -1,15 +1,17 @@
 """``vllm_omni_v2`` engine config + the typed port set it self-reserves.
 
 Ported from v1's ``VLLMOmniEngineConfig`` minus all port/placement math: the
-engine reserves its own :class:`VLLMOmniPorts` at boot (one master port per
-stage, riding each stage's own ``engine_args.master_port``), so there is no
-``_VLLM_OMNI_PORT_BASE + rank * stride`` and no ``RANK``-env fallback here.
-``modality`` is validated against the live adapter registry rather than the
-engine raising on an unknown YAML key at boot.
+engine reserves its own :class:`VLLMOmniPorts` base at boot (riding the
+``Omni(master_port=...)`` ctor kwarg into every stage's ``engine_args``), so
+there is no ``_VLLM_OMNI_PORT_BASE + rank * stride`` and no ``RANK``-env
+fallback here. ``modality`` is validated against the live adapter registry
+rather than the engine raising on an unknown YAML key at boot.
 
 ``server_intent`` (the successor of v1's inline YAML-injection + ``Omni``
-kwargs assembly) spells this config + the reserved ports + the adapter's boot
-extras as the intent dict ``VLLMOmniBackend.boot`` consumes.
+kwargs assembly) spells this config + the reserved port base + the adapter's
+boot extras as the intent dict ``VLLMOmniBackend.boot`` consumes; the seam
+translates it into ``Omni`` ctor kwargs — the runtime's own override channel
+— rather than rewriting the stage YAML.
 """
 
 from __future__ import annotations
@@ -26,18 +28,24 @@ from unirl.rollout.engine.ports import ReservedPorts
 
 @dataclass(frozen=True)
 class VLLMOmniPorts(ReservedPorts):
-    """The per-stage master ports one ``Omni`` spawn consumes.
+    """The master-port base one ``Omni`` spawn consumes.
 
-    Each rides the stage's own typed ``engine_args.master_port`` field —
-    vllm-omni's ``StageRuntimeData.__post_init__`` otherwise self-settles to
-    ``30005 + random(0, 100)``, which collides across colocated actors. Two
-    ports cover the maximum stage count (t2i/it2i = AR + DiT); single-stage
-    modalities simply leave ``stage1_master_port`` unused (still reserved —
-    reservation is cheap and keeps the set one fixed shape).
+    Rides the ``Omni(master_port=...)`` ctor kwarg, which vllm-omni's loader
+    merges into every stage's ``engine_args`` (``load_stage_configs_from_yaml``
+    ``base_engine_args`` channel — YAML keys would win, but no stage YAML
+    defines ``master_port``). Per-stage separation is the runtime's own job:
+    each stage's ``OmniDiffusionConfig.__post_init__`` settles its port from
+    this base (at the pinned v0.20.0: ``base + random(0, 100)`` then a
+    +37 bind-check scan; from v0.21.0rc2 (#3803): honored verbatim, scan only
+    on collision). Reserving the base de-synchronizes colocated engines
+    without the v1 ``30200 + rank*200 + idx*50`` math.
+
+    Upgrade landmine (≥ v0.21.0rc2): the env var ``MASTER_PORT`` takes
+    precedence over the explicit arg — clear/guard it at the seam when the
+    pin is bumped, or the injection is silently ignored.
     """
 
-    stage0_master_port: int
-    stage1_master_port: int
+    master_port: int
 
 
 @dataclass
@@ -109,8 +117,10 @@ class VLLMOmniV2EngineConfig(BaseEngineConfig):
         engine-knowledge defaults (timeouts) < adapter ``mode`` < the
         ``omni_extra`` escape hatch — escape-hatch-highest matches v1, where
         ``omni_extra`` is the documented override for the timeout knobs.
-        ``ports`` ride a dedicated top-level key (per-stage ``engine_args``
-        overlays, untouchable by the escape hatch). ``model_config`` is
+        ``ports`` and ``enable_sleep_mode`` ride dedicated top-level keys that
+        the seam applies ON TOP of the escape hatch (they become the
+        ``master_port`` / ``enable_sleep_mode`` ctor kwargs vllm-omni merges
+        into every stage's ``engine_args`` itself). ``model_config`` is
         accepted for signature symmetry with the other v2 engines but unused —
         vllm-omni's checkpoint path rides ``self.model_path``.
         """

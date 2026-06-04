@@ -8,7 +8,10 @@ import pytest
 import torch
 
 from tests.rollout.vllm_omni_v2.conftest import fake_ar_output, fake_dit_output, make_req, sigmas_for
-from unirl.rollout.engine.vllm_omni_v2.backends.native import _group_by_request
+from unirl.rollout.engine.vllm_omni_v2.backends.native import (
+    _group_by_request,
+    _tp_from_stage_configs,
+)
 from unirl.rollout.engine.vllm_omni_v2.utils import (
     build_ar_segment,
     build_image_segment,
@@ -91,6 +94,25 @@ def test_group_by_request_orders_by_rid_prefix():
     assert [len(g) for g in grouped] == [2, 1, 1]
     assert grouped[0][0].request_id == "0_aa" and grouped[0][1].request_id == "0_cc"
     assert grouped[2][0].request_id == "2_zz"
+
+
+def test_tp_from_stage_configs_reads_both_stage_kinds():
+    """LLM stages: flat tensor_parallel_size; diffusion stages: nested under
+    parallel_config; absent → 1. Sourced from the runtime's merged configs
+    (``omni.stage_configs``) — mapping- and attr-style entries both work."""
+    tp = _tp_from_stage_configs(
+        [
+            {"stage_id": 0, "engine_args": {"tensor_parallel_size": 4}},
+            {"stage_id": 1, "engine_args": {"parallel_config": {"tensor_parallel_size": 2}}},
+            {"stage_id": 2, "engine_args": {}},
+        ]
+    )
+    assert tp == {0: 4, 1: 2, 2: 1}
+    # Attr-style entries (OmegaConf-ish objects without .get).
+    tp2 = _tp_from_stage_configs(
+        [SimpleNamespace(stage_id=0, engine_args=SimpleNamespace(tensor_parallel_size=8))]
+    )
+    assert tp2 == {0: 8}
 
 
 def test_seed_from_sample_id_deterministic_and_distinct():
