@@ -125,15 +125,16 @@ class WeightSync:
     ) -> None:
         """Push a LoRA adapter from in-memory tensors.
 
-        Rotates to a fresh VERSIONED name (``<name>_v<N>``) each sync.
-        Re-loading the SAME ``lora_name`` is unreliable: SRT rejects a duplicate
-        name (HTTP 400 "already loaded"), an explicit /unload of the live
-        adapter can stall for minutes under colocate, and — the killer —
+        Rotates to a fresh VERSIONED name (``<name>_v<N>``) each sync — the
+        rotation is REQUIRED, not just defensive: upstream sglang hard-rejects
+        a duplicate ``lora_name`` (``lora_manager`` raises "already loaded" →
+        HTTP 400), so a fresh name is the only way to re-push at all. On the
+        legacy fork the failure modes were softer but worse — an explicit
+        /unload of the live adapter can stall for minutes under colocate, and
         reusing the name can serve STALE weights, so the rollout policy never
         actually updates (reward stays flat while the FSDP model trains).
-        Loading a NEW name forces fresh weights; generation points at the
-        latest via :attr:`active_adapter`. Stale versions evict via SRT's LRU
-        (``max_loaded_loras``).
+        Generation points at the latest version via :attr:`active_adapter`;
+        stale versions evict via SRT's LRU (``max_loaded_loras``).
         """
         nickname = self._next_lora_nickname(adapter_name)
         self._backend.set_lora(
