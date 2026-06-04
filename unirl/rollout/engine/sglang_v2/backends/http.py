@@ -9,10 +9,17 @@ the SRT subprocess needs at the spawn boundary, launches the server, and polls
 ``sglang_llm`` predecessor used); weight/memory verbs are synchronous POSTs with
 the long weight-op timeout tier.
 
-Because the SGLang import is lazy (only in :meth:`boot` and ``set_lora``'s
-serializer), the module imports on CPU — the rest of the package is exercisable
-without a GPU, and :func:`parse_generate_response` (the ``/generate`` JSON →
-:class:`RawResult` deserialization) is a pure module-level function.
+Control-plane payloads (weight sync, memory, LoRA) are constructed from the
+installed runtime's own ``io_struct`` request dataclasses rather than hand-built
+dicts: the actor and the SRT subprocess share one install, so the payloads are
+version-matched to the server by construction — a field-name drift fails loudly
+at construction instead of as an opaque HTTP 422 mid-training.
+
+Because the SGLang import is lazy (only :func:`_import_sglang_runtime`, called
+from :meth:`boot`), the module imports on CPU — the rest of the package is
+exercisable without a GPU, and :func:`parse_generate_response` (the
+``/generate`` JSON → :class:`RawResult` deserialization) is a pure module-level
+function.
 """
 
 from __future__ import annotations
@@ -77,6 +84,55 @@ def wait_server_healthy(
             raise RuntimeError("SGLang SRT server process terminated unexpectedly.")
         time.sleep(poll_interval_s)
     raise TimeoutError(f"SGLang SRT server at {base_url} did not become healthy within {timeout_s}s")
+
+
+# ---------------------------------------------------------------------------
+# Lazy runtime import — the only place sglang is named (once per process)
+# ---------------------------------------------------------------------------
+
+
+def _import_sglang_runtime() -> Dict[str, Any]:
+    """Lazy import of the server entrypoints + the io_struct request types.
+
+    Only called from :meth:`HTTPBackend.boot`, so the module imports on CPU.
+    The verbs construct these installed-runtime request dataclasses instead of
+    hand-built dicts (see the module docstring for why).
+    """
+    from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.managers.io_struct import (
+        DestroyWeightsUpdateGroupReqInput,
+        InitWeightsUpdateGroupReqInput,
+        LoadLoRAAdapterFromTensorsReqInput,
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromTensorReqInput,
+    )
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    return {
+        "launch_server": launch_server,
+        "ServerArgs": ServerArgs,
+        "MultiprocessingSerializer": MultiprocessingSerializer,
+        "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
+        "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
+        "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
+        "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
+        "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
+        "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
+        "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
+    }
+
+
+def asdict_drop_none(req: Any) -> Dict[str, Any]:
+    """The wire view of an io_struct request: its fields minus the ``None``s.
+
+    Unset Optionals (incl. ``BaseReq``'s ``rid`` / ``http_worker_ipc``) drop;
+    ``False`` / ``0`` / empty containers survive (``flush_cache=False`` must
+    reach the server).
+    """
+    return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +227,12 @@ class HTTPBackend:
         base_url: str,
         *,
         concurrency: int,
+        runtime: Dict[str, Any],
     ) -> None:
         self._server_process: Optional[multiprocessing.Process] = server_process
         self._base_url = base_url
         self._concurrency = int(concurrency)
+        self._rt = runtime
         self._client: Any = None
         if httpx is not None:
             self._client = httpx.AsyncClient(
@@ -204,10 +262,9 @@ class HTTPBackend:
         the real ServerArgs fields here (the only place that knows them —
         non-ServerArgs escape-hatch keys drop harmlessly), then spawn.
         """
-        from sglang.srt.entrypoints.http_server import launch_server
-        from sglang.srt.server_args import ServerArgs
+        rt = _import_sglang_runtime()
 
-        allowed = {f.name for f in dataclasses.fields(ServerArgs)}
+        allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
         server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
 
         # --- Env quarantine: everything the SRT subprocess needs, set at the
@@ -251,8 +308,8 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-        server_args = ServerArgs(**server_kwargs)
-        process = multiprocessing.Process(target=launch_server, args=(server_args,))
+        server_args = rt["ServerArgs"](**server_kwargs)
+        process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
         process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
@@ -271,7 +328,7 @@ class HTTPBackend:
             getattr(server_args, "nccl_port", None),
             getattr(server_args, "host", None),
         )
-        return cls(process, base_url, concurrency=concurrency)
+        return cls(process, base_url, concurrency=concurrency, runtime=rt)
 
     # ------------------------------------------------------------------ #
     # Generation — async fan-out owned here (event loop, semaphore, retry)
@@ -387,6 +444,11 @@ class HTTPBackend:
                 pass
             raise RuntimeError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}") from exc
 
+    def _post_struct(self, path: str, req: Any, operation: str) -> None:
+        """POST a typed io_struct request (its non-``None`` fields) and check."""
+        resp = self._post(path, asdict_drop_none(req))
+        self._check_update_response(resp, operation)
+
     @staticmethod
     def _check_update_response(response: Any, operation: str) -> None:
         if isinstance(response, dict):
@@ -427,17 +489,19 @@ class HTTPBackend:
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("release memory")
-        payload: Dict[str, Any] = {}
-        if tags is not None:
-            payload["tags"] = list(tags)
-        self._post("/release_memory_occupation", payload)
+        self._post_struct(
+            "/release_memory_occupation",
+            self._rt["ReleaseMemoryOccupationReqInput"](tags=list(tags) if tags is not None else None),
+            "release_memory",
+        )
 
     def resume_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("resume memory")
-        payload: Dict[str, Any] = {}
-        if tags is not None:
-            payload["tags"] = list(tags)
-        self._post("/resume_memory_occupation", payload)
+        self._post_struct(
+            "/resume_memory_occupation",
+            self._rt["ResumeMemoryOccupationReqInput"](tags=list(tags) if tags is not None else None),
+            "resume_memory",
+        )
 
     def ping(self) -> bool:
         if self._server_process is None or not self._server_process.is_alive():
@@ -477,14 +541,15 @@ class HTTPBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
-        payload: Dict[str, Any] = {
-            "serialized_named_tensors": serialized_named_tensors,
-            "flush_cache": flush_cache,
-        }
-        if load_format is not None:
-            payload["load_format"] = load_format
-        resp = self._post("/update_weights_from_tensor", payload)
-        self._check_update_response(resp, "update_from_tensor")
+        self._post_struct(
+            "/update_weights_from_tensor",
+            self._rt["UpdateWeightsFromTensorReqInput"](
+                serialized_named_tensors=serialized_named_tensors,
+                load_format=load_format,
+                flush_cache=flush_cache,
+            ),
+            "update_from_tensor",
+        )
 
     def init_weights_group(
         self,
@@ -496,18 +561,18 @@ class HTTPBackend:
         group_name: str,
         backend: str,
     ) -> None:
-        resp = self._post(
+        self._post_struct(
             "/init_weights_update_group",
-            {
-                "master_address": master_address,
-                "master_port": int(master_port),
-                "rank_offset": int(rank_offset),
-                "world_size": int(world_size),
-                "group_name": str(group_name),
-                "backend": str(backend),
-            },
+            self._rt["InitWeightsUpdateGroupReqInput"](
+                master_address=master_address,
+                master_port=int(master_port),
+                rank_offset=int(rank_offset),
+                world_size=int(world_size),
+                group_name=str(group_name),
+                backend=str(backend),
+            ),
+            "init_weights_group",
         )
-        self._check_update_response(resp, "init_weights_group")
         logger.info(
             "sglang_v2 HTTPBackend: NCCL group %r initialized (rank_offset=%d, world_size=%d)",
             group_name,
@@ -532,24 +597,24 @@ class HTTPBackend:
             names[-1] if names else "<empty>",
             flush_cache,
         )
-        resp = self._post(
+        self._post_struct(
             "/update_weights_from_distributed",
-            {
-                "names": list(names),
-                "dtypes": list(dtypes),
-                "shapes": [list(s) for s in shapes],
-                "group_name": str(group_name),
-                "flush_cache": flush_cache,
-            },
+            self._rt["UpdateWeightsFromDistributedReqInput"](
+                names=list(names),
+                dtypes=list(dtypes),
+                shapes=[list(s) for s in shapes],
+                group_name=str(group_name),
+                flush_cache=flush_cache,
+            ),
+            "update_from_distributed",
         )
-        self._check_update_response(resp, "update_from_distributed")
 
     def destroy_weights_group(self, *, group_name: str) -> None:
-        resp = self._post(
+        self._post_struct(
             "/destroy_weights_update_group",
-            {"group_name": str(group_name)},
+            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=str(group_name)),
+            "destroy_weights_group",
         )
-        self._check_update_response(resp, "destroy_weights_group")
 
     def set_lora(
         self,
@@ -564,21 +629,22 @@ class HTTPBackend:
         accepts serialized LoRA tensors + a PEFT config dict and hot-loads the
         adapter on all TP workers internally.
         """
-        try:
-            from sglang.srt.utils import MultiprocessingSerializer
-        except ImportError:
-            from sglang.srt.utils.utils import MultiprocessingSerializer
-
-        serialized = MultiprocessingSerializer.serialize(lora_tensors, output_str=True)
-        resp = self._post(
+        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        self._post_struct(
             "/load_lora_adapter_from_tensors",
-            {
-                "lora_name": str(lora_name),
-                "config_dict": dict(config_dict or {}),
-                "serialized_tensors": serialized,
-            },
+            self._rt["LoadLoRAAdapterFromTensorsReqInput"](
+                lora_name=str(lora_name),
+                config_dict=dict(config_dict or {}),
+                serialized_tensors=serialized,
+            ),
+            "set_lora",
         )
-        self._check_update_response(resp, "set_lora")
 
 
-__all__ = ["HTTPBackend", "parse_generate_response", "kill_process_tree", "wait_server_healthy"]
+__all__ = [
+    "HTTPBackend",
+    "asdict_drop_none",
+    "kill_process_tree",
+    "parse_generate_response",
+    "wait_server_healthy",
+]
