@@ -158,7 +158,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         """
         import ray
 
-        from unirl.rollout.engine.vllm_omni.weight_sync.ipc_dispatch import (
+        from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
             DIFFRL_LORA_INT_ID,
         )
 

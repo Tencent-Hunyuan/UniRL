@@ -1,0 +1,75 @@
+# AR-ONLY think_recaption stage config (two-engine v2 trainer).
+#
+# A single, TERMINAL AR (LLM) stage that, in is_comprehension:false mode,
+# generates <think>...</think><recaption>...</recaption><answer><boi><img_size>...
+# and stops at EOS. The full AR text is the recaption the DiT engine consumes as
+# cot_text (extra["ar_generated_text"]); per-token logp (logprobs=1) feeds
+# ar_capture.extract_ar_segment for ARGRPO replay.
+#
+# Differs from upstream i2t/t2t (which are is_comprehension:true comprehension
+# answers, NOT think/recaption) — see hi3_v2_IMPL_spec.md plan-correction #1.
+#
+# Terminal AR-stage specifics:
+#   - final_output_type stays text (terminal; no DiT downstream).
+#   - omni_kv_config.need_send_cache DROPPED (no DiT stage to receive KV).
+#
+# Devices 0-3 (AR engine half of the 8-GPU colocate pool); the DiT engine
+# (hunyuan_image3_dit_recaption_rl.yaml) takes 4-7.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: AR
+      max_num_seqs: 1
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # Side-effect import installs the Base-ckpt tokenizer fix AND composes
+      # the bucketed CUDA-IPC weight-sync mixin (LoRA sync target). See
+      # t2i_rl.yaml for the full rationale.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni_v2.worker.ar_extension.HI3ARWeightSyncExtension
+      enable_lora: true
+      # Colocate-memory trim: the AR stage only needs prompt + max_new_tokens
+      # (~4096), not the model's full 22800 ctx. Capping max_model_len shrinks
+      # the KV-cache reservation (~21 GiB → a few GiB) and gpu_memory_util 0.9→0.7
+      # lowers the resident/slept footprint — both free room on the shared train
+      # cards (engine sleep keeps a few GiB on GPU 0-3, which the FSDP backward
+      # competes with). max_num_batched_tokens 32768→8192 also clears the
+      # "exceeds max_num_seqs*max_model_len" boot warning.
+      max_model_len: 8192
+      gpu_memory_utilization: 0.7
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      distributed_executor_backend: "mp"
+      hf_overrides:
+        rope_parameters:
+          mrope_section: [0, 32, 32]
+          rope_type: default
+    # is_comprehension:false → AR generates think/recaption (not a plain
+    # comprehension answer). No omni_kv_config: this stage is terminal.
+    is_comprehension: false
+    final_output: true
+    final_output_type: text
+    # No default seed on purpose: a fixed seed + temperature would make the N
+    # temperature-sampled recaptions of a prompt identical (→ AR GRPO advantage
+    # 0). Omitting it lets vLLM draw a fresh seed per request so the N recaptions
+    # actually differ.
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.95
+      top_k: 1024
+      max_tokens: 4096
+      detokenize: True
+      repetition_penalty: 1.1
+
+runtime:
+  enabled: true
