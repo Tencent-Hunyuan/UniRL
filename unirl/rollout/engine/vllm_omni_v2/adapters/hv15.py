@@ -14,7 +14,11 @@ from typing import Any, Dict, List, Tuple
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni_v2.utils import build_hv15_conditions, grouped_pils_to_videos
+from unirl.rollout.engine.vllm_omni_v2.utils import (
+    build_hv15_conditions,
+    collect_dit_outputs,
+    grouped_pils_to_videos,
+)
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 
@@ -38,7 +42,9 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
     final_output_type = "video"
 
     def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        _, frame_groups, _ = self._collect(per_request)
+        _, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         return {self.track_name: grouped_pils_to_videos(frame_groups)}
 
     def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:

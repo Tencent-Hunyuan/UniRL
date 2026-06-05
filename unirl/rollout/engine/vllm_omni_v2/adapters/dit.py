@@ -128,22 +128,10 @@ class DitOutputAdapter:
         packed frame groups. Re-collecting here is deliberate and cheap —
         ``collect_dit_outputs`` only gathers references.
         """
-        _, _, pil_images = self._collect(per_request)
-        return {self.track_name: pils_to_images(pil_images)}
-
-    # ------------------------------------------------------------------ #
-    # Shared mechanics
-    # ------------------------------------------------------------------ #
-
-    def _collect(self, per_request: List[List[OmniRawResult]]) -> Tuple[List[Any], List[List[Any]], List[Any]]:
-        """``collect_dit_outputs`` with this adapter's knobs —
-        ``(diff_outputs, frame_groups, pil_images)``."""
-        return collect_dit_outputs(
-            per_request,
-            final_output_type=self.final_output_type,
-            stage_id=self.stage_id,
-            modality=self.modality,
+        _, _, pil_images = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
+        return {self.track_name: pils_to_images(pil_images)}
 
     # ------------------------------------------------------------------ #
     # Skeleton
@@ -153,7 +141,9 @@ class DitOutputAdapter:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
 
-        diff_outputs, _frames, _pils = self._collect(per_request)
+        diff_outputs, _frames, _pils = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         decoded = self.build_decoded(per_request)
         segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=req.sigmas)}
         conditions = self.conditions(diff_outputs)
