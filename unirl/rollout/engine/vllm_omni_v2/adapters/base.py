@@ -1,8 +1,8 @@
 """Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + boilerplate with sensible defaults) over per-output-
-shape base adapters (``ar_dit`` / ``ar_only`` / ``dit_image`` / ``dit_video``)
-that hold the conversion logic as overridable methods. Concrete adapters
+shape base adapters (``hi3_ar_dit`` / ``hi3_ar_only`` / ``dit_image`` /
+``dit_video``) that hold the conversion logic as overridable methods. Concrete adapters
 override only what differs and self-register by ``modality`` key — the same
 axis v1 branched on inline. Selected once at engine construction via
 :func:`get_adapter`.
@@ -194,24 +194,22 @@ class ModelAdapter(ABC):
     def core_diff_kwargs(self, req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
         """The diffusion sampling kwargs common to every DiT stage.
 
-        ``eta`` rides as a typed first-class field; ``guidance_scale_provided``
-        marks the explicit CFG choice; trajectory latents are always requested
-        (dense — replay needs ``x_t`` at every slot).
+        Every value reads off the request's typed ``DiffusionSamplingParams``
+        — the engine keeps no sampling defaults. ``eta`` rides as a typed
+        first-class field; ``guidance_scale_provided`` marks the explicit CFG
+        choice; trajectory latents are always requested (dense — replay needs
+        ``x_t`` at every slot).
         """
         from unirl.rollout.engine.vllm_omni_v2.utils.sigmas import sigmas_list_from_req
 
-        height = int(getattr(diff_params, "height", self.cfg.default_height))
-        width = int(getattr(diff_params, "width", self.cfg.default_width))
-        num_inference_steps = int(
-            getattr(diff_params, "num_inference_steps", self.cfg.default_num_inference_steps)
-        )
+        num_inference_steps = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
-            height=height,
-            width=width,
+            height=int(diff_params.height),
+            width=int(diff_params.width),
             num_inference_steps=num_inference_steps,
-            guidance_scale=float(getattr(diff_params, "guidance_scale", self.cfg.default_guidance_scale)),
+            guidance_scale=float(diff_params.guidance_scale),
             guidance_scale_provided=True,
-            eta=float(getattr(diff_params, "eta", self.cfg.default_eta)),
+            eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
             num_outputs_per_prompt=1,

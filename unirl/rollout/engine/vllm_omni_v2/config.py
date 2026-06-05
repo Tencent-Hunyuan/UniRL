@@ -5,7 +5,10 @@ engine reserves its own :class:`VLLMOmniPorts` base at boot (riding the
 ``Omni(master_port=...)`` ctor kwarg into every stage's ``engine_args``), so
 there is no ``_VLLM_OMNI_PORT_BASE + rank * stride`` and no ``RANK``-env
 fallback here. ``modality`` is validated against the live adapter registry
-rather than the engine raising on an unknown YAML key at boot.
+rather than the engine raising on an unknown YAML key at boot. v1's
+``default_*`` sampling fallbacks are gone too: sampling values ride the
+request's typed sampling params (the single source of truth), never the
+engine config.
 
 ``server_intent`` (the successor of v1's inline YAML-injection + ``Omni``
 kwargs assembly) spells this config + the reserved port base + the adapter's
@@ -62,21 +65,6 @@ class VLLMOmniV2EngineConfig(BaseEngineConfig):
     # modalities). Kept as ``str`` because OmegaConf structured configs reject
     # ``Literal[...]``; ``__post_init__`` validates against the live registry.
     modality: str = "t2i"
-
-    # DiT-side defaults (image modalities only). ``default_eta=1.0`` puts
-    # SDE on by default; pass ``"eta": 0.0`` per request for the
-    # deterministic ODE path.
-    default_height: int = 1024
-    default_width: int = 1024
-    default_num_inference_steps: int = 25
-    default_guidance_scale: float = 5.0
-    default_eta: float = 1.0
-
-    # AR-side defaults (all modalities).
-    default_ar_max_tokens: int = 2048
-    default_ar_temperature: float = 0.6
-    default_ar_top_p: float = 0.95
-    default_ar_top_k: int = 1024
 
     # Overlay ``enable_sleep_mode: True`` onto each stage's ``engine_args`` at
     # boot so worker.sleep()/wake_up() (level 2) can run. Disable to fall back

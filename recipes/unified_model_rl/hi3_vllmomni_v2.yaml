@@ -121,14 +121,9 @@ ar_rollout:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,/root/HunyuanImage-3-Instruct}
     # AR-only think/recaption stage (is_comprehension:false), GPUs 0-3.
+    # AR decode + recaption-prompt dims ride the request's composed
+    # ``sampling`` params — the v2 engine config keeps no sampling defaults.
     modality: ar_recaption
-    default_height: 1024
-    default_width: 1024
-    # AR decode defaults — match the old hi3 stage config.
-    default_ar_max_tokens: 4096
-    default_ar_temperature: 0.6
-    default_ar_top_p: 0.95
-    default_ar_top_k: 1024
     enable_sleep_mode: true
 
 dit_rollout:
@@ -138,12 +133,8 @@ dit_rollout:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,/root/HunyuanImage-3-Instruct}
     # Standalone DiT stage that eats an externally-injected recaption, GPUs 4-7.
+    # Sampling values ride ``sampling.diffusion`` on the request.
     modality: dit_recaption
-    default_height: 1024
-    default_width: 1024
-    default_num_inference_steps: 16
-    default_guidance_scale: 1.0
-    default_eta: 1.0
     enable_sleep_mode: true
 
 reward:

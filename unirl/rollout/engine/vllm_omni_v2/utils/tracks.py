@@ -154,9 +154,6 @@ def build_image_segment(
     - ``indices`` — dense ``arange(T+1)`` storage slots; ``sde_indices`` — the
       sparse step ids echoed via ``custom_output["sde_step_indices"]``.
     """
-    if not diff_outputs:
-        raise ValueError("build_image_segment: empty diff_outputs")
-
     per_latents: List[torch.Tensor] = []
     per_log_probs: List[torch.Tensor] = []
     for diff_out in diff_outputs:

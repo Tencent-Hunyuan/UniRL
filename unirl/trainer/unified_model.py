@@ -422,12 +422,15 @@ class UnifiedModelTrainer(BaseTrainer):
         # ── Level 1: P → P*N recaptions. Root "ar" track groups by prompt.
         ar_shell = req.make_root_track(track_name=AR_TRACK, branch=n_recaptions)
         ar_texts = Texts(texts=[t for t in prompts for _ in range(n_recaptions)])
+        # Ship the WHOLE composed params: the ar_recaption adapter reads its AR
+        # slice for sampling AND the diffusion slice's height/width for the
+        # recaption prompt (the engine keeps no sampling defaults).
         ar_req = RolloutReq(
             sample_ids=list(ar_shell.sample_ids),
             group_ids=list(ar_shell.parent_ids),
             primitives={"text": ar_texts},
             request_conditions={},
-            sampling_params=ar_params,
+            sampling_params=req.sampling_params,
         )
         ar_resp = ar_engine.generate(ar_req)
         ar_inner = ar_resp.tracks.get(AR_TRACK)

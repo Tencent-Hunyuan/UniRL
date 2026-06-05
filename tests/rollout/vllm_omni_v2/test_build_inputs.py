@@ -98,7 +98,7 @@ def test_t2i_two_stage_call(model_config):
     (call,) = adapter.build_inputs(req)
     assert [s.kind for s in call.sampling] == [STAGE_KIND_AR, STAGE_KIND_DIFFUSION]
     ar_kw = call.sampling[0].kwargs
-    # ARSamplingParams fields land via getattr; logprobs=1 always.
+    # ARSamplingParams fields land via direct reads; logprobs=1 always.
     assert ar_kw == {"temperature": 0.5, "top_p": 0.9, "top_k": 50, "max_tokens": 16, "logprobs": 1}
     # Prompt entries carry the official end2end.py base fields + t2i h/w.
     entry = call.prompts[0]
@@ -107,6 +107,30 @@ def test_t2i_two_stage_call(model_config):
     assert entry["height"] == 64 and entry["width"] == 64
     # fake_tokenize is length-keyed: text/task/sys_type lengths.
     assert entry["prompt_token_ids"] == [len("prompt 0"), len("t2i_think"), len("en_unified")]
+
+
+def test_t2i_bot_task_translation(model_config):
+    """stage_config bot_task swaps the chat-template task key (fake_tokenize
+    is length-keyed, so prompt_token_ids[1] echoes len(task))."""
+    adapter = make_adapter("t2i", model_config)
+
+    req = make_req(1, modality_params="composed", sigmas=sigmas_for(2), stage_config={"bot_task": "recaption"})
+    (call,) = adapter.build_inputs(req)
+    entry = call.prompts[0]
+    assert entry["prompt_token_ids"][1] == len("t2i_recaption")
+    assert entry["use_system_prompt"] == "en_unified"
+
+    # vanilla pins BOTH the task and the system preset (sys_type override ignored).
+    req2 = make_req(
+        1,
+        modality_params="composed",
+        sigmas=sigmas_for(2),
+        stage_config={"bot_task": "vanilla", "sys_type": "en_unified"},
+    )
+    (call2,) = adapter.build_inputs(req2)
+    entry2 = call2.prompts[0]
+    assert entry2["prompt_token_ids"][1] == len("t2i_vanilla")
+    assert entry2["use_system_prompt"] == "en_vanilla"
 
 
 def test_t2i_rejects_materialized_noise_and_ships_recipe(model_config):

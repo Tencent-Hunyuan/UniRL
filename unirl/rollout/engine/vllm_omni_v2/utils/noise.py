@@ -34,12 +34,7 @@ def pack_initial_noise_extra_args(
     """
     initial_latent_cond = (req.request_conditions or {}).get("initial_latents")
     if initial_latent_cond is not None:
-        initial_noise = getattr(initial_latent_cond, "latents", None)
-        if initial_noise is None:
-            raise RuntimeError(
-                f"{caller}: request_conditions['initial_latents'] "
-                f"has no .latents tensor (got {type(initial_latent_cond).__name__})."
-            )
+        initial_noise = initial_latent_cond.latents
         if int(initial_noise.shape[0]) != n_prompts:
             raise RuntimeError(
                 f"{caller}: initial_latents.shape[0]={int(initial_noise.shape[0])} "

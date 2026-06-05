@@ -1,4 +1,4 @@
-"""Single-"ar"-track shape: HI3 AR-only modalities (no DiT stage).
+"""HI3 single-"ar"-track shape: AR-only modalities (no DiT stage).
 
 ``i2t`` / ``t2t`` are the upstream comprehension modalities (upstream stage
 YAMLs unchanged); ``ar_recaption`` is the two-engine trainer's think/recaption
@@ -11,17 +11,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from unirl.rollout.engine.vllm_omni_v2.adapters.ar_dit import ArDiTAdapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
+from unirl.rollout.engine.vllm_omni_v2.adapters.hi3_ar_dit import Hi3ArDiTAdapter, build_prompt_entries
 from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult
 from unirl.rollout.engine.vllm_omni_v2.utils import (
     assemble_tracks,
     build_ar_fused_condition,
     build_ar_segment,
-    build_prompt_entries,
     decoded_text_from_ar,
     pil_images_from_req,
-    resolve_task,
     texts_from_req,
 )
 from unirl.types.rollout_req import RolloutReq
@@ -29,8 +27,8 @@ from unirl.types.rollout_resp import RolloutResp
 from unirl.types.sampling import get_ar_params, get_diffusion_params
 
 
-class ArOnlyAdapter(ModelAdapter):
-    """Per-shape base for the HI3 AR-only modalities."""
+class Hi3ArOnlyAdapter(ModelAdapter):
+    """Shape base for the HI3 AR-only modalities."""
 
     #: AR-only requests carry ``ARSamplingParams`` with no diffusion sub-block
     #: — ``ensure_req_sigmas`` would raise on them.
@@ -40,9 +38,14 @@ class ArOnlyAdapter(ModelAdapter):
     #: i2t overrides: the request carries ``primitives['image']``.
     image_input = False
 
+    # ---- HI3 chat-template row (upstream ``_TASK_PRESETS`` mirror) ----
+    task_key = ""
+    sys_type = "en_unified"
+    output_modalities = ("text",)
+
     # The AR sampling kwargs are shared with the two-stage shape — borrow the
-    # step rather than duplicate it (same config defaults, same logprobs=1).
-    build_ar_sampling = ArDiTAdapter.build_ar_sampling
+    # step rather than duplicate it (same direct param reads, same logprobs=1).
+    build_ar_sampling = Hi3ArDiTAdapter.build_ar_sampling
 
     # ------------------------------------------------------------------ #
     # Request side
@@ -50,7 +53,9 @@ class ArOnlyAdapter(ModelAdapter):
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
         stage_config = req.stage_config or {}
-        task, sys_type, modalities_field = resolve_task(self.modality, stage_config)
+        # ``bot_task`` is deliberately NOT honored here — only the two-stage
+        # t2i/it2i templates have think/recaption/vanilla variants.
+        sys_type = stage_config.get("sys_type") or self.sys_type
 
         texts = texts_from_req(req)
         n = len(texts.texts)
@@ -62,30 +67,27 @@ class ArOnlyAdapter(ModelAdapter):
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
 
         diff_params = get_diffusion_params(req.sampling_params)
-        ar_params = get_ar_params(req.sampling_params) or {}
-
-        height = int(getattr(diff_params, "height", self.cfg.default_height))
-        width = int(getattr(diff_params, "width", self.cfg.default_width))
+        ar_params = get_ar_params(req.sampling_params)
 
         prompts = build_prompt_entries(
             texts,
-            task=task,
+            task=self.task_key,
             sys_type=sys_type,
-            modalities_field=modalities_field,
+            modalities_field=self.output_modalities,
             tokenize_fn=self.tokenize_fn,
             decorate=lambda entry, i: self.decorate_prompt_entry(
-                entry, i, pil_images=pil_images, height=height, width=width
+                entry, i, pil_images=pil_images, diff_params=diff_params
             ),
         )
 
         return [GenerateCall(prompts=prompts, sampling=[self.build_ar_sampling(ar_params)])]
 
     def decorate_prompt_entry(
-        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], height: int, width: int
+        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any
     ) -> None:
         """Default: no extras (the t2t shape). i2t attaches the image;
         ar_recaption attaches the generation height/width."""
-        del entry, i, pil_images, height, width
+        del entry, i, pil_images, diff_params
 
     # ------------------------------------------------------------------ #
     # Response side
@@ -117,11 +119,12 @@ class ArOnlyAdapter(ModelAdapter):
 
 
 @register_adapter("i2t")
-class I2tAdapter(ArOnlyAdapter):
+class I2tAdapter(Hi3ArOnlyAdapter):
     """HI3 image+text → AR text (upstream comprehension YAML)."""
 
     stage_yaml = "hunyuan_image3_i2t.yaml"
     stage_yaml_source = "upstream"
+    task_key = "i2t"
     image_input = True
 
     def validate_request(self, req: RolloutReq) -> None:
@@ -129,11 +132,11 @@ class I2tAdapter(ArOnlyAdapter):
             raise ValueError("modality='i2t' requires req.primitives['image'].")
 
     def decorate_prompt_entry(
-        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], height: int, width: int
+        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any
     ) -> None:
         # Carry h/w for completeness even though i2t doesn't run the DiT;
-        # harmless and matches end2end.py.
-        del height, width
+        # harmless and matches end2end.py. PIL dims, not the request's.
+        del diff_params
         pil = pil_images[i]
         entry["multi_modal_data"] = {"image": pil}
         entry["height"] = pil.height
@@ -141,11 +144,12 @@ class I2tAdapter(ArOnlyAdapter):
 
 
 @register_adapter("t2t")
-class T2tAdapter(ArOnlyAdapter):
+class T2tAdapter(Hi3ArOnlyAdapter):
     """HI3 text → AR text (upstream comprehension YAML)."""
 
     stage_yaml = "hunyuan_image3_t2t.yaml"
     stage_yaml_source = "upstream"
+    task_key = "t2t"
 
     def validate_request(self, req: RolloutReq) -> None:
         if req.primitives.get("image") is not None:
@@ -153,20 +157,28 @@ class T2tAdapter(ArOnlyAdapter):
 
 
 @register_adapter("ar_recaption")
-class ArRecaptionAdapter(ArOnlyAdapter):
-    """Two-engine trainer's AR think/recaption producer."""
+class ArRecaptionAdapter(Hi3ArOnlyAdapter):
+    """Two-engine trainer's AR think/recaption producer.
+
+    Builds the same think/recaption prompt as ``t2i`` (``task_key``
+    ``t2i_think``) but is served by an AR-only stage. Needs composed
+    sampling: the recaption prompt carries the DiT generation dims, read off
+    the request's ``diffusion.height`` / ``diffusion.width``.
+    """
 
     stage_yaml = "hunyuan_image3_ar_recaption_rl.yaml"
+    task_key = "t2i_think"
+    output_modalities = ("image",)
     #: HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the
     #: byte-copy transport (a zero-copy handle crashes ranks 2..N).
     lora_copy_transport = True
 
     def decorate_prompt_entry(
-        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], height: int, width: int
+        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any
     ) -> None:
         del i, pil_images
-        entry["height"] = height
-        entry["width"] = width
+        entry["height"] = int(diff_params.height)
+        entry["width"] = int(diff_params.width)
 
     def build_ar_condition(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         # ARGRPO.replay teacher-forces over prompt+response; it needs the
@@ -177,4 +189,4 @@ class ArRecaptionAdapter(ArOnlyAdapter):
         return {"fused": ar_fused} if ar_fused is not None else {}
 
 
-__all__ = ["ArOnlyAdapter", "ArRecaptionAdapter", "I2tAdapter", "T2tAdapter"]
+__all__ = ["ArRecaptionAdapter", "Hi3ArOnlyAdapter", "I2tAdapter", "T2tAdapter"]

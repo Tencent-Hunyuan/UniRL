@@ -54,10 +54,6 @@ class VLLMOmniV2RolloutEngine(BaseRolloutEngine):
         model_config: Any = None,
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
-        require(
-            isinstance(config, VLLMOmniV2EngineConfig),
-            f"VLLMOmniV2RolloutEngine requires VLLMOmniV2EngineConfig; got {type(config).__name__}",
-        )
         self.cfg = config
         # Carried for subclass / extension use; the synchronous Omni
         # entrypoint does not consume them directly.

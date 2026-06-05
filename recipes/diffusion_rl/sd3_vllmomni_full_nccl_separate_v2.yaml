@@ -88,11 +88,6 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     modality: sd35_t2i
-    default_height: 512
-    default_width: 512
-    default_num_inference_steps: 10
-    default_guidance_scale: 1.0
-    default_eta: 0.7
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
     enable_sleep_mode: false
 

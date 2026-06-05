@@ -1,4 +1,4 @@
-"""Two-track shape: HI3 AR prelude (Stage 0) → DiT denoise (Stage 1).
+"""HI3 two-track shape: AR prelude (Stage 0) → DiT denoise (Stage 1).
 
 ``build_inputs`` mirrors the official vllm-omni end-to-end inference example
 (``examples/offline_inference/hunyuan_image3/end2end.py``) — the canonical
@@ -8,6 +8,12 @@ reference for the per-prompt dict shape::
      "use_system_prompt": sys_type, "modalities": [...],
      # it2i: "multi_modal_data": {"image": pil}, "height": h, "width": w}
 
+The HI3 chat-template knowledge lives here as class attributes
+(``task_key`` / ``sys_type`` / ``output_modalities`` — one registry row per
+adapter, mirroring upstream ``_TASK_PRESETS``) plus the ``resolve_task``
+hook for the ``stage_config`` overrides; ``build_prompt_entries`` builds the
+per-prompt dicts every AR-bearing HI3 modality shares.
+
 ``build_response`` produces the two-track ``RolloutResp``: ``"ar"``
 (TextSegment root) + ``"image"`` (LatentSegment child, ``parent_track="ar"``,
 ``conditions["fused"]`` from the worker-side ``prepare_inputs_for_generation``
@@ -16,7 +22,7 @@ capture).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.backends import (
@@ -31,21 +37,52 @@ from unirl.rollout.engine.vllm_omni_v2.utils import (
     build_ar_segment,
     build_fused_mm_condition,
     build_image_segment,
-    build_prompt_entries,
     collect_dit_outputs,
     decoded_text_from_ar,
     pil_images_from_req,
     pils_to_images,
-    resolve_task,
     texts_from_req,
 )
+from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 from unirl.types.sampling import get_ar_params, get_diffusion_params
 
 
-class ArDiTAdapter(ModelAdapter):
-    """Per-shape base for the HI3 two-stage (AR + DiT) modalities."""
+def build_prompt_entries(
+    texts: Texts,
+    *,
+    task: str,
+    sys_type: str,
+    modalities_field: List[str],
+    tokenize_fn: Optional[Callable[..., List[int]]],
+    decorate: Callable[[Dict[str, Any], int], None],
+) -> List[Dict[str, Any]]:
+    """Build the HI3 per-prompt dicts shared by the AR-bearing modalities.
+
+    Each entry carries the official ``end2end.py`` base fields
+    (``prompt_token_ids`` / ``prompt`` / ``use_system_prompt`` /
+    ``modalities``); the adapter's ``decorate`` callback then attaches its
+    modality-specific extras (``multi_modal_data``, ``height`` / ``width``).
+    """
+    if tokenize_fn is None:
+        raise RuntimeError("build_prompt_entries: tokenize_fn not provided (AR modalities need the driver tokenizer)")
+    prompts: List[Dict[str, Any]] = []
+    for i, text in enumerate(texts.texts):
+        token_ids = tokenize_fn(text, task=task, sys_type=sys_type)
+        entry: Dict[str, Any] = {
+            "prompt_token_ids": token_ids,
+            "prompt": text,
+            "use_system_prompt": sys_type,
+            "modalities": list(modalities_field),
+        }
+        decorate(entry, i)
+        prompts.append(entry)
+    return prompts
+
+
+class Hi3ArDiTAdapter(ModelAdapter):
+    """Shape base for the HI3 two-stage (AR + DiT) modalities."""
 
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
@@ -53,13 +90,30 @@ class ArDiTAdapter(ModelAdapter):
     #: it2i overrides: the request carries ``primitives['image']``.
     image_input = False
 
+    # ---- HI3 chat-template row (upstream ``_TASK_PRESETS`` mirror) ----
+    task_key = ""
+    sys_type = "en_unified"
+    output_modalities = ("image",)
+
+    def resolve_task(self, stage_config: Dict[str, Any]) -> Tuple[str, str]:
+        """Resolve ``(task_key, sys_type)`` with the ``stage_config`` overrides.
+
+        ``stage_config["bot_task"]`` swaps the trigger tag used by upstream's
+        chat template (``think`` / ``recaption``). ``stage_config["sys_type"]``
+        overrides the system-prompt key (``en_unified`` / ``en_vanilla``).
+        """
+        sys_type = stage_config.get("sys_type") or self.sys_type
+        bot_task = stage_config.get("bot_task")
+        if bot_task in ("think", "recaption"):
+            return f"{self.modality}_{bot_task}", sys_type
+        return self.task_key, sys_type
+
     # ------------------------------------------------------------------ #
     # Request side
     # ------------------------------------------------------------------ #
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        stage_config = req.stage_config or {}
-        task, sys_type, modalities_field = resolve_task(self.modality, stage_config)
+        task, sys_type = self.resolve_task(req.stage_config or {})
 
         texts = texts_from_req(req)
         n = len(texts.texts)
@@ -71,19 +125,16 @@ class ArDiTAdapter(ModelAdapter):
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
 
         diff_params = get_diffusion_params(req.sampling_params)
-        ar_params = get_ar_params(req.sampling_params) or {}
-
-        height = int(getattr(diff_params, "height", self.cfg.default_height))
-        width = int(getattr(diff_params, "width", self.cfg.default_width))
+        ar_params = get_ar_params(req.sampling_params)
 
         prompts = build_prompt_entries(
             texts,
             task=task,
             sys_type=sys_type,
-            modalities_field=modalities_field,
+            modalities_field=self.output_modalities,
             tokenize_fn=self.tokenize_fn,
             decorate=lambda entry, i: self.decorate_prompt_entry(
-                entry, i, pil_images=pil_images, height=height, width=width
+                entry, i, pil_images=pil_images, diff_params=diff_params
             ),
         )
 
@@ -98,27 +149,27 @@ class ArDiTAdapter(ModelAdapter):
         ]
 
     def decorate_prompt_entry(
-        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], height: int, width: int
+        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any
     ) -> None:
         """Modality-specific prompt-entry extras. Default: the t2i shape
         (request height/width on the entry); it2i overrides to attach the
         conditioning image + its own dimensions."""
         del i, pil_images
-        entry["height"] = height
-        entry["width"] = width
+        entry["height"] = int(diff_params.height)
+        entry["width"] = int(diff_params.width)
 
     def build_ar_sampling(self, ar_params: Any) -> StageSampling:
         """AR sampling intent (Stage 0). ``logprobs=1`` makes vLLM emit
         per-token logp on the sampled token (read by ``build_ar_segment``).
-        ``ar_params`` is an ``ARSamplingParams`` dataclass or ``{}`` — getattr
-        covers both (NB the dataclass field is ``max_new_tokens``)."""
+        ``ar_params`` is the request's ``ARSamplingParams`` — the engine keeps
+        no AR sampling defaults (NB the dataclass field is ``max_new_tokens``)."""
         return StageSampling(
             kind=STAGE_KIND_AR,
             kwargs=dict(
-                temperature=float(getattr(ar_params, "temperature", self.cfg.default_ar_temperature)),
-                top_p=float(getattr(ar_params, "top_p", self.cfg.default_ar_top_p)),
-                top_k=int(getattr(ar_params, "top_k", self.cfg.default_ar_top_k)),
-                max_tokens=int(getattr(ar_params, "max_new_tokens", self.cfg.default_ar_max_tokens)),
+                temperature=float(ar_params.temperature),
+                top_p=float(ar_params.top_p),
+                top_k=int(ar_params.top_k),
+                max_tokens=int(ar_params.max_new_tokens),
                 logprobs=1,
             ),
         )
@@ -202,10 +253,18 @@ class ArDiTAdapter(ModelAdapter):
 
 
 @register_adapter("t2i")
-class T2iAdapter(ArDiTAdapter):
+class T2iAdapter(Hi3ArDiTAdapter):
     """HI3 text → AR think → DiT image."""
 
     stage_yaml = "hunyuan_image3_t2i_rl.yaml"
+    task_key = "t2i_think"
+
+    def resolve_task(self, stage_config: Dict[str, Any]) -> Tuple[str, str]:
+        # ``vanilla`` swaps BOTH the task and the system prompt to the
+        # no-think preset (upstream pairs t2i_vanilla with en_vanilla).
+        if stage_config.get("bot_task") == "vanilla":
+            return "t2i_vanilla", "en_vanilla"
+        return super().resolve_task(stage_config)
 
     def validate_request(self, req: RolloutReq) -> None:
         if req.primitives.get("image") is not None:
@@ -216,10 +275,11 @@ class T2iAdapter(ArDiTAdapter):
 
 
 @register_adapter("it2i")
-class It2iAdapter(ArDiTAdapter):
+class It2iAdapter(Hi3ArDiTAdapter):
     """HI3 image+text → AR recaption → DiT edited image."""
 
     stage_yaml = "hunyuan_image3_it2i_rl.yaml"
+    task_key = "it2i_think"
     image_input = True
 
     def validate_request(self, req: RolloutReq) -> None:
@@ -227,15 +287,15 @@ class It2iAdapter(ArDiTAdapter):
             raise ValueError("modality='it2i' requires req.primitives['image'].")
 
     def decorate_prompt_entry(
-        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], height: int, width: int
+        self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any
     ) -> None:
         # Upstream HI3 reads height/width off the prompt dict for the it2i
-        # path (matches end2end.py:185-187).
-        del height, width
+        # path (matches end2end.py:185-187) — the PIL dims, not the request's.
+        del diff_params
         pil = pil_images[i]
         entry["multi_modal_data"] = {"image": pil}
         entry["height"] = pil.height
         entry["width"] = pil.width
 
 
-__all__ = ["ArDiTAdapter", "It2iAdapter", "T2iAdapter"]
+__all__ = ["Hi3ArDiTAdapter", "It2iAdapter", "T2iAdapter", "build_prompt_entries"]
