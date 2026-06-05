@@ -6,12 +6,14 @@ these are the generic mechanics it leans on.
 """
 
 from unirl.rollout.engine.sglang_v2.utils.conditions import pack_prompt_condition
+from unirl.rollout.engine.sglang_v2.utils.images import pil_to_base64
 from unirl.rollout.engine.sglang_v2.utils.sampling import ResolvedSampling, resolve_sampling
 from unirl.rollout.engine.sglang_v2.utils.thinking import split_thinking_tags
 
 __all__ = [
     "ResolvedSampling",
     "pack_prompt_condition",
+    "pil_to_base64",
     "resolve_sampling",
     "split_thinking_tags",
 ]

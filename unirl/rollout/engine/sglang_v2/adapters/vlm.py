@@ -20,19 +20,9 @@ from unirl.rollout.engine.sglang_v2.adapters.base import (
     register_adapter,
 )
 from unirl.rollout.engine.sglang_v2.adapters.text import TextLMAdapter
-from unirl.rollout.engine.sglang_v2.utils import ResolvedSampling
+from unirl.rollout.engine.sglang_v2.utils import ResolvedSampling, pil_to_base64
 from unirl.types.primitives import Image, Images
 from unirl.types.rollout_req import RolloutReq
-
-
-def _pil_to_base64(image: Any) -> str:
-    """Encode a PIL image as a ``data:image/png;base64,...`` URI for SRT."""
-    import base64
-    import io
-
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 @register_adapter("vlm")
@@ -70,7 +60,7 @@ class VLMAdapter(TextLMAdapter):
             # attends the image. (Sending the pre-expanded input_ids +
             # image_data makes SRT return HTTP 500.)
             payload["text"] = mm.text
-            payload["image_data"] = _pil_to_base64(mm.image)
+            payload["image_data"] = pil_to_base64(mm.image)
             wire.append(payload)
             prompt_token_ids.append(list(mm.input_ids))
 
@@ -81,20 +71,8 @@ class VLMAdapter(TextLMAdapter):
             mm=mm_encs,
         )
 
-    def extract_images(self, req: RolloutReq, *, n_prompts: int) -> List[Any]:
-        image_prim = req.primitives.get("image")
-        require(
-            image_prim is not None,
-            f"{type(self).__name__} requires req.primitives['image']: Images (config.image_token is set — VLM mode)",
-        )
-        require(
-            isinstance(image_prim, Images),
-            f"{type(self).__name__}: req.primitives['image'] must be Images, got {type(image_prim).__name__}",
-        )
-        require(
-            len(image_prim) == n_prompts,
-            f"{type(self).__name__}: image batch {len(image_prim)} != prompt count {n_prompts}",
-        )
+    def extract_images(self, req: RolloutReq, *, n_prompts: int) -> List[Image]:
+        image_prim = req.primitives["image"]
         return [Image(pixels=image_prim.pixels[i]).to_pil() for i in range(len(image_prim))]
 
     def encode_mm(
