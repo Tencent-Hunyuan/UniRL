@@ -9,11 +9,11 @@ the shared :class:`~.dit.DitInputAdapter` adding the video-only
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
-from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult
+from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult, StageSampling
 from unirl.rollout.engine.vllm_omni_v2.utils import (
     build_hv15_conditions,
     collect_dit_outputs,
@@ -21,18 +21,32 @@ from unirl.rollout.engine.vllm_omni_v2.utils import (
 )
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sampling import get_diffusion_params
+
+
+def _num_frames(req: RolloutReq) -> int:
+    return int(getattr(get_diffusion_params(req.sampling_params), "num_frames", 5))
 
 
 class Hv15InputAdapter(DitInputAdapter):
     """SD3-style request side + the video-only ``num_frames`` knob.
 
     ``num_frames`` rides both the per-prompt dict (read by
-    ``RLHunyuanVideo15Pipeline.forward``) and the diffusion kwargs.
+    ``RLHunyuanVideo15Pipeline.forward``) and the diffusion kwargs — one
+    ``super()``-extend override per side.
     """
 
-    def extras(self, diff_params: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        num_frames = int(getattr(diff_params, "num_frames", 5))
-        return {"num_frames": num_frames}, {"num_frames": num_frames}
+    def build_prompts(self, req: RolloutReq) -> List[Any]:
+        prompts = super().build_prompts(req)
+        num_frames = _num_frames(req)
+        for prompt in prompts:
+            prompt["num_frames"] = num_frames
+        return prompts
+
+    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
+        sampling = super().build_sampling(req)
+        sampling[0].kwargs["num_frames"] = _num_frames(req)
+        return sampling
 
 
 class Hv15VideoOutputAdapter(DitOutputAdapter):

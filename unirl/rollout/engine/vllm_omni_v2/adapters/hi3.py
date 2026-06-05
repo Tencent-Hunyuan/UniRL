@@ -195,7 +195,8 @@ class Hi3InputAdapter:
                 return f"{self.bot_task_base}_{bot_task}", sys_type
         return self.task_key, sys_type
 
-    def build(self, req: RolloutReq) -> List[GenerateCall]:
+    def build_prompts(self, req: RolloutReq) -> List[Dict[str, Any]]:
+        """The HI3 chat-templated per-prompt entries (+ the image gates)."""
         task, sys_type = self._resolve_task(req.stage_config or {})
 
         texts = texts_from_req(req)
@@ -208,9 +209,7 @@ class Hi3InputAdapter:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
 
         diff_params = get_diffusion_params(req.sampling_params)
-        ar_params = get_ar_params(req.sampling_params)
-
-        prompts = _build_prompt_entries(
+        return _build_prompt_entries(
             texts,
             task=task,
             sys_type=sys_type,
@@ -219,10 +218,17 @@ class Hi3InputAdapter:
             decorate=lambda entry, i: self._decorate(entry, i, pil_images=pil_images, diff_params=diff_params),
         )
 
+    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
+        """AR always; a DiT stage rides along iff ``"dit" in self.stages``."""
+        diff_params = get_diffusion_params(req.sampling_params)
+        ar_params = get_ar_params(req.sampling_params)
         sampling = [self._ar_sampling(ar_params)]
         if "dit" in self.stages:
             sampling.append(self._dit_sampling(req, diff_params))
-        return [GenerateCall(prompts=prompts, sampling=sampling)]
+        return sampling
+
+    def build(self, req: RolloutReq) -> List[GenerateCall]:
+        return [GenerateCall(prompts=self.build_prompts(req), sampling=self.build_sampling(req))]
 
     def _decorate(self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any) -> None:
         """The per-entry extras, derived from the constructor flags."""
@@ -304,6 +310,10 @@ class Hi3DitRecaptionInputAdapter:
     ``seed_from_sample_id`` seed and its own x_T recipe gid slice (a shared
     full-batch gid list would make the worker's ``NoiseRecipe.for_batch(1)``
     hand gids[0] to EVERY image).
+
+    Deliberately does NOT use the ``build_prompts`` / ``build_sampling``
+    pair: prompts and sampling are paired per single-prompt call (seed + gid
+    slice decided together), so a wholesale ``build`` keeps them co-located.
     """
 
     def __init__(self, modality: str, *, sys_type: str = "en_unified") -> None:

@@ -14,7 +14,7 @@ file (``hi3.py`` / ``sd3.py`` / ``hv15.py``).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 from unirl.rollout.engine.vllm_omni_v2.backends import (
     STAGE_KIND_DIFFUSION,
@@ -40,36 +40,37 @@ from unirl.types.sampling import get_diffusion_params
 class DitInputAdapter:
     """``RolloutReq`` → one single-diffusion-stage :class:`GenerateCall`.
 
-    The shared request skeleton of the pure-DiT modalities: text prompts +
-    ``negative_prompt``, the typed diffusion kwargs, optional
-    ``max_sequence_length`` / ``seed``, sparse SDE indices, and the
-    driver-authoritative x_T recipe. Families contribute extra fields via
-    :meth:`extras`.
+    ``build`` is pure assembly over two parallel hooks that mirror the wire
+    type's payload fields 1:1 — :meth:`build_prompts` / :meth:`build_sampling`
+    — both with the raw-``req`` currency (each hook derives what it needs
+    from the typed sampling params; the accessors are cheap). Children
+    derive either via ``super()``.
     """
 
     def __init__(self, modality: str) -> None:
         self.modality = modality
 
-    def extras(self, diff_params: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """``(per-prompt extras, diff-kwargs extras)``. Default: none."""
-        del diff_params
-        return {}, {}
+    # ------------------------------------------------------------------ #
+    # Family hooks — one per GenerateCall payload field
+    # ------------------------------------------------------------------ #
 
-    def build(self, req: RolloutReq) -> List[GenerateCall]:
+    def build_prompts(self, req: RolloutReq) -> List[Any]:
+        """The per-prompt dicts: the ``{"prompt", "negative_prompt"}`` shape."""
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-
         texts = texts_from_req(req)
         diff_params = get_diffusion_params(req.sampling_params)
         negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
-        prompt_extras, kwargs_extras = self.extras(diff_params)
+        return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
 
-        prompts: List[Any] = [
-            {"prompt": text, "negative_prompt": negative_prompt, **prompt_extras} for text in texts.texts
-        ]
+    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
+        """The single diffusion-stage intent: the typed diffusion kwargs,
+        optional ``max_sequence_length`` / ``seed``, sparse SDE indices, and
+        the driver-authoritative x_T recipe."""
+        texts = texts_from_req(req)
+        diff_params = get_diffusion_params(req.sampling_params)
 
         diff_kwargs = core_diff_kwargs(req, diff_params)
-        diff_kwargs.update(kwargs_extras)
         max_seq_len = getattr(diff_params, "max_sequence_length", None)
         if max_seq_len is not None:
             diff_kwargs["max_sequence_length"] = int(max_seq_len)
@@ -82,12 +83,14 @@ class DitInputAdapter:
         if extra_args:
             diff_kwargs["extra_args"] = extra_args
 
-        return [
-            GenerateCall(
-                prompts=prompts,
-                sampling=[StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)],
-            )
-        ]
+        return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]
+
+    # ------------------------------------------------------------------ #
+    # Skeleton
+    # ------------------------------------------------------------------ #
+
+    def build(self, req: RolloutReq) -> List[GenerateCall]:
+        return [GenerateCall(prompts=self.build_prompts(req), sampling=self.build_sampling(req))]
 
 
 class DitOutputAdapter:
