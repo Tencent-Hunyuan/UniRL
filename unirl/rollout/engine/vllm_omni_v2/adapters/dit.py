@@ -116,15 +116,21 @@ class DitOutputAdapter:
         """The family's replay conditions, extracted from the DiT outputs."""
         raise NotImplementedError(f"{type(self).__name__} must implement conditions()")
 
-    def decode(self, pil_images: List[Any], frame_groups: List[List[Any]]) -> Any:
-        """Final media for ``decoded`` — image families eat the flat PILs."""
-        del frame_groups
-        return pils_to_images(pil_images)
+    def build_decoded(
+        self,
+        pil_images: List[Any],
+        frame_groups: List[List[Any]],
+        per_request: List[List[OmniRawResult]],
+    ) -> Dict[str, Any]:
+        """The per-track ``decoded`` payloads. Must keep the ``track_name``
+        entry (a missing key silently yields ``decoded=None`` on that track).
 
-    def extra_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Additional ``decoded`` entries (the HI3 two-track AR text)."""
-        del per_request
-        return {}
+        Default: the flat PILs as ``Images``. Children derive via ``super()``
+        — hv15 swaps the payload for packed frame groups, the HI3 two-track
+        shape adds the best-effort AR text.
+        """
+        del frame_groups, per_request
+        return {self.track_name: pils_to_images(pil_images)}
 
     # ------------------------------------------------------------------ #
     # Skeleton
@@ -140,8 +146,7 @@ class DitOutputAdapter:
             stage_id=self.stage_id,
             modality=self.modality,
         )
-        decoded: Dict[str, Any] = {self.track_name: self.decode(pil_images, frame_groups)}
-        decoded.update(self.extra_decoded(per_request))
+        decoded = self.build_decoded(pil_images, frame_groups, per_request)
         segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=req.sigmas)}
         conditions = self.conditions(diff_outputs)
 

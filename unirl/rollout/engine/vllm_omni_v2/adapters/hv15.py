@@ -37,9 +37,14 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
     track_name = "video"
     final_output_type = "video"
 
-    def decode(self, pil_images: List[Any], frame_groups: List[List[Any]]) -> Any:
-        del pil_images
-        return grouped_pils_to_videos(frame_groups)
+    def build_decoded(
+        self,
+        pil_images: List[Any],
+        frame_groups: List[List[Any]],
+        per_request: List[List[OmniRawResult]],
+    ) -> Dict[str, Any]:
+        del pil_images, per_request
+        return {self.track_name: grouped_pils_to_videos(frame_groups)}
 
     def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
         hv_conds = build_hv15_conditions(diff_outputs)
