@@ -2,8 +2,10 @@
 
 Holds the conversion logic once: chat-template encoding into per-prompt
 ``/generate`` payloads (``build_inputs``) and the predecessor's
-``build_rollout_resp`` packing decomposed into steps (``build_response`` /
-``build_conditions``). The VLM adapter overrides the steps that differ.
+``build_rollout_resp`` packing fanned out per ``RolloutTrack`` field
+(``build_response`` is the template; ``build_ids`` / ``build_segment`` /
+``build_decoded`` / ``build_conditions`` each derive one field from
+``(req, prepared, raw)``). The VLM adapter overrides the steps that differ.
 """
 
 from __future__ import annotations
@@ -143,17 +145,16 @@ class TextLMAdapter(ModelAdapter):
         return input_ids
 
     # ------------------------------------------------------------------ #
-    # build_response — seam results → typed RolloutResp
+    # build_response — the template: one fan-out stage per RolloutTrack field
     # ------------------------------------------------------------------ #
 
     def build_response(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> RolloutResp:
         """Pack the seam's per-candidate results into a typed ``RolloutResp``.
 
         ``raw`` is in prompt-major order: candidate ``k`` of prompt ``i`` is at
-        index ``i * n + k`` (the seam's ordering contract). The output rows are
-        in the same order, with ``sample_indices`` pointing each row at its own
-        slot. For ``n > 1`` the sample-id is mangled as ``f"{sid}#{k}"`` to keep
-        uniqueness while group membership stays intact.
+        index ``i * n + k`` (the seam's ordering contract). The count is checked
+        once here; each stage then derives its field from ``(req, prepared,
+        raw)`` independently, iterating ``raw`` in that shared order.
         """
         n = int(prepared.resolved_n)
         n_prompts = len(prepared.prompt_token_ids)
@@ -163,50 +164,62 @@ class TextLMAdapter(ModelAdapter):
             f"candidates ({n_prompts} prompts × n={n}); got {len(raw)}",
         )
 
-        decoded_texts: List[str] = []
-        per_sample_tokens: List[torch.Tensor] = []
-        per_sample_logprobs: List[torch.Tensor] = []
-        sample_indices: List[int] = []
-        sample_ids: List[str] = []
-        group_ids: List[str] = []
-
-        has_req_sids = bool(req.sample_ids)
-        has_req_gids = bool(req.group_ids)
-
-        for prompt_idx in range(n_prompts):
-            base = prompt_idx * n
-            req_sid = req.sample_ids[prompt_idx] if has_req_sids else f"s{prompt_idx}"
-            req_gid = req.group_ids[prompt_idx] if has_req_gids else req_sid
-            for k in range(n):
-                r = raw[base + k]
-                out_idx = base + k
-                content, _reasoning = split_thinking_tags(r.text)
-                decoded_texts.append(content or r.text or "")
-                per_sample_tokens.append(torch.tensor(list(r.token_ids or []), dtype=torch.long))
-                per_sample_logprobs.append(torch.tensor(list(r.logprobs or []), dtype=torch.float32))
-                sample_indices.append(out_idx)
-                sample_ids.append(f"{req_sid}#{k}" if n > 1 else req_sid)
-                group_ids.append(req_gid)
-
-        segment = TextSegment.pack(
-            tokens=per_sample_tokens,
-            log_probs=per_sample_logprobs,
-            sample_indices=torch.tensor(sample_indices, dtype=torch.long),
-        )
-
+        sample_ids, group_ids = self.build_ids(req, prepared, raw)
         return RolloutResp(
             tracks={
                 self.track_name: RolloutTrack(
                     sample_ids=sample_ids,
                     parent_ids=list(group_ids) if group_ids else None,
-                    conditions=self.build_conditions(prepared),
-                    segment=segment,
-                    decoded=Texts(texts=decoded_texts),
+                    conditions=self.build_conditions(req, prepared, raw),
+                    segment=self.build_segment(req, prepared, raw),
+                    decoded=self.build_decoded(req, prepared, raw),
                 ),
             }
         )
 
-    def build_conditions(self, prepared: PreparedInputs) -> Dict[str, Any]:
+    def build_ids(
+        self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]
+    ) -> Tuple[List[str], List[str]]:
+        """The per-row ``(sample_ids, group_ids)``, prompt-major.
+
+        For ``n > 1`` the sample-id is mangled as ``f"{sid}#{k}"`` to keep
+        uniqueness while group membership stays intact.
+        """
+        n = int(prepared.resolved_n)
+        has_req_sids = bool(req.sample_ids)
+        has_req_gids = bool(req.group_ids)
+
+        sample_ids: List[str] = []
+        group_ids: List[str] = []
+        for prompt_idx in range(len(prepared.prompt_token_ids)):
+            req_sid = req.sample_ids[prompt_idx] if has_req_sids else f"s{prompt_idx}"
+            req_gid = req.group_ids[prompt_idx] if has_req_gids else req_sid
+            for k in range(n):
+                sample_ids.append(f"{req_sid}#{k}" if n > 1 else req_sid)
+                group_ids.append(req_gid)
+        return sample_ids, group_ids
+
+    def build_segment(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
+        """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""
+        return TextSegment.pack(
+            tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
+            log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
+            sample_indices=torch.arange(len(raw), dtype=torch.long),
+        )
+
+    def build_decoded(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
+        """Strip thinking tags per candidate.
+
+        Predecessor's ``content or text``: an all-think output decodes as the
+        RAW text (tags intact), never as the empty string.
+        """
+        decoded: List[str] = []
+        for r in raw:
+            content, _reasoning = split_thinking_tags(r.text)
+            decoded.append(content or r.text or "")
+        return Texts(texts=decoded)
+
+    def build_conditions(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """The replay conditions — the prompt ids the server saw, per sample.
 
         Each prompt's ids are replicated across its ``n`` siblings (every

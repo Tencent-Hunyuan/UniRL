@@ -20,6 +20,7 @@ from unirl.rollout.engine.sglang_v2.adapters.base import (
     register_adapter,
 )
 from unirl.rollout.engine.sglang_v2.adapters.text import TextLMAdapter
+from unirl.rollout.engine.sglang_v2.backends import RawResult
 from unirl.rollout.engine.sglang_v2.utils import ResolvedSampling, pil_to_base64
 from unirl.types.primitives import Image, Images
 from unirl.types.rollout_req import RolloutReq
@@ -108,7 +109,7 @@ class VLMAdapter(TextLMAdapter):
     # build_conditions — prompt condition + the multimodal replay conditions
     # ------------------------------------------------------------------ #
 
-    def build_conditions(self, prepared: PreparedInputs) -> Dict[str, Any]:
+    def build_conditions(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base.
 
         Replicated from the prompt-level processor encoding so each sibling
@@ -116,7 +117,7 @@ class VLMAdapter(TextLMAdapter):
         (per-sample lists with FieldKind.CONCAT semantics — they survive the
         DP split/merge and reach the replay aligned with ``prompt``).
         """
-        conditions = super().build_conditions(prepared)
+        conditions = super().build_conditions(req, prepared, raw)
         if prepared.mm:
             _, prompt_index = self.replicate_per_sample(prepared)
             per_sample_pixel_values = [prepared.mm[i].pixel_values for i in prompt_index]
