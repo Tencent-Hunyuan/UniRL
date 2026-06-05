@@ -427,13 +427,8 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
     def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
-    def build_decoded(
-        self,
-        pil_images: List[Any],
-        frame_groups: List[List[Any]],
-        per_request: List[List[OmniRawResult]],
-    ) -> Dict[str, Any]:
-        decoded = super().build_decoded(pil_images, frame_groups, per_request)
+    def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        decoded = super().build_decoded(per_request)
         # Surface the AR-generated text (best-effort; don't break rollout if
         # AR text extraction fails).
         try:

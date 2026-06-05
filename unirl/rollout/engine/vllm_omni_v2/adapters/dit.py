@@ -116,21 +116,34 @@ class DitOutputAdapter:
         """The family's replay conditions, extracted from the DiT outputs."""
         raise NotImplementedError(f"{type(self).__name__} must implement conditions()")
 
-    def build_decoded(
-        self,
-        pil_images: List[Any],
-        frame_groups: List[List[Any]],
-        per_request: List[List[OmniRawResult]],
-    ) -> Dict[str, Any]:
-        """The per-track ``decoded`` payloads. Must keep the ``track_name``
-        entry (a missing key silently yields ``decoded=None`` on that track).
+    def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """The per-track ``decoded`` payloads, from the raw per-request groups.
 
-        Default: the flat PILs as ``Images``. Children derive via ``super()``
-        — hv15 swaps the payload for packed frame groups, the HI3 two-track
-        shape adds the best-effort AR text.
+        Takes the raw wire groups (not the collected DiT slices) because
+        decoded may span tracks beyond the DiT one — the HI3 two-track shape
+        adds the AR text via ``super()``. Must keep the ``track_name`` entry
+        (a missing key silently yields ``decoded=None`` on that track).
+
+        Default: the flat PILs as ``Images``; hv15 swaps the payload for
+        packed frame groups. Re-collecting here is deliberate and cheap —
+        ``collect_dit_outputs`` only gathers references.
         """
-        del frame_groups, per_request
+        _, _, pil_images = self._collect(per_request)
         return {self.track_name: pils_to_images(pil_images)}
+
+    # ------------------------------------------------------------------ #
+    # Shared mechanics
+    # ------------------------------------------------------------------ #
+
+    def _collect(self, per_request: List[List[OmniRawResult]]) -> Tuple[List[Any], List[List[Any]], List[Any]]:
+        """``collect_dit_outputs`` with this adapter's knobs —
+        ``(diff_outputs, frame_groups, pil_images)``."""
+        return collect_dit_outputs(
+            per_request,
+            final_output_type=self.final_output_type,
+            stage_id=self.stage_id,
+            modality=self.modality,
+        )
 
     # ------------------------------------------------------------------ #
     # Skeleton
@@ -140,13 +153,8 @@ class DitOutputAdapter:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
 
-        diff_outputs, frame_groups, pil_images = collect_dit_outputs(
-            per_request,
-            final_output_type=self.final_output_type,
-            stage_id=self.stage_id,
-            modality=self.modality,
-        )
-        decoded = self.build_decoded(pil_images, frame_groups, per_request)
+        diff_outputs, _frames, _pils = self._collect(per_request)
+        decoded = self.build_decoded(per_request)
         segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=req.sigmas)}
         conditions = self.conditions(diff_outputs)
 
