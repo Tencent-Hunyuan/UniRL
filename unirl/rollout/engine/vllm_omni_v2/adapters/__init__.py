@@ -4,9 +4,9 @@ Modality adapters are grouped by model family and composed from input/output
 sub-adapters (the binder constructs both in ``__init__`` and delegates the
 two conversion verbs):
 
-- ``hi3``  — t2i, it2i, i2t, t2t, ar_recaption, dit_recaption
-- ``sd3``  — sd35_t2i
-- ``hv15`` — t2v
+- ``hi3``  — hi3_t2i, hi3_it2i, hi3_i2t, hi3_t2t, hi3_ar_recaption, hi3_dit_recaption
+- ``sd3``  — sd3_t2i
+- ``hv15`` — hv15_t2v
 
 ``dit`` holds the universal single-stage DiT skeletons
 (:class:`DitInputAdapter` / :class:`DitOutputAdapter`) the families derive

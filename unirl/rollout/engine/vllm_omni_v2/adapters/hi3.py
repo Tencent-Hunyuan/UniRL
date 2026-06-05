@@ -448,7 +448,7 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
 # --------------------------------------------------------------------------- #
 
 
-@register_adapter("t2i")
+@register_adapter("hi3_t2i")
 class Hi3T2iAdapter(ModelAdapter):
     """HI3 text → AR think → DiT image."""
 
@@ -484,7 +484,7 @@ class Hi3T2iAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-@register_adapter("it2i")
+@register_adapter("hi3_it2i")
 class Hi3It2iAdapter(ModelAdapter):
     """HI3 image+text → AR recaption → DiT edited image."""
 
@@ -517,7 +517,7 @@ class Hi3It2iAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-@register_adapter("i2t")
+@register_adapter("hi3_i2t")
 class Hi3I2tAdapter(ModelAdapter):
     """HI3 image+text → AR text (upstream comprehension YAML)."""
 
@@ -552,7 +552,7 @@ class Hi3I2tAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-@register_adapter("t2t")
+@register_adapter("hi3_t2t")
 class Hi3T2tAdapter(ModelAdapter):
     """HI3 text → AR text (upstream comprehension YAML)."""
 
@@ -575,7 +575,9 @@ class Hi3T2tAdapter(ModelAdapter):
 
     def validate_request(self, req: RolloutReq) -> None:
         if req.primitives.get("image") is not None:
-            raise ValueError(f"modality={self.modality!r} rejects image-bearing requests; use modality='i2t' instead.")
+            raise ValueError(
+                f"modality={self.modality!r} rejects image-bearing requests; use modality='hi3_i2t' instead."
+            )
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
         return self.input_adapter.build(req)
@@ -584,7 +586,7 @@ class Hi3T2tAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-@register_adapter("ar_recaption")
+@register_adapter("hi3_ar_recaption")
 class Hi3ArRecaptionAdapter(ModelAdapter):
     """Two-engine trainer's AR think/recaption producer.
 
@@ -621,7 +623,7 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-@register_adapter("dit_recaption")
+@register_adapter("hi3_dit_recaption")
 class Hi3DitRecaptionAdapter(ModelAdapter):
     """Standalone HI3 DiT — the two-engine trainer's image half."""
 

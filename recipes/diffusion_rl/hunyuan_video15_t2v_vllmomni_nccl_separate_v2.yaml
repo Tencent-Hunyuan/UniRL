@@ -7,7 +7,7 @@
 # Stack:
 #   - Layout: separate slabs (train_fraction split).
 #     train half — FSDPBackend (HunyuanVideo15TransformerBlock wrap)
-#     rollout half — vllm-omni "t2v" modality (single DiT stage)
+#     rollout half — vllm-omni "hv15_t2v" modality (single DiT stage)
 #   - LoRA r64 trained, MERGED full-weight pushed to rollout via NCCL
 #     broadcast (sync.use_merged: true folds the LoRA delta into base).
 #   - DanceGRPO-aligned hyperparameters: steps=16, cfg=0, eta=0.25,
@@ -110,7 +110,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
-    modality: t2v
+    modality: hv15_t2v
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
     enable_sleep_mode: false
     # HV1.5 has ~30GB DiT shards on cephfs; checkpoint load alone takes

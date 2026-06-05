@@ -36,7 +36,7 @@ class Sd3OutputAdapter(DitOutputAdapter):
         return {"text": text_cond}
 
 
-@register_adapter("sd35_t2i")
+@register_adapter("sd3_t2i")
 class Sd3T2iAdapter(ModelAdapter):
     """SD3.5-medium text → image (single diffusion stage, TP=1)."""
 

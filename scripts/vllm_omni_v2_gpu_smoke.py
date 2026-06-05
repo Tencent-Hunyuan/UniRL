@@ -150,7 +150,7 @@ def main() -> int:
     log(f"reserved master_port base = {base}")
     cfg = VLLMOmniV2EngineConfig(
         model_path=model_path,
-        modality="sd35_t2i",
+        modality="sd3_t2i",
         default_height=hw, default_width=hw,
         default_num_inference_steps=steps,
         enable_sleep_mode=True,

@@ -73,7 +73,7 @@ class FakeAdapter:
 
 def bare_engine(*, lora_loaded: bool = False):
     engine = object.__new__(VLLMOmniV2RolloutEngine)
-    engine.cfg = SimpleNamespace(modality="t2i")
+    engine.cfg = SimpleNamespace(modality="hi3_t2i")
     engine._is_offloaded = False
     engine._backend = FakeBackend()
     engine._weight_sync = WeightSync(engine._backend, uses_lora=True, lora_copy_transport=False)

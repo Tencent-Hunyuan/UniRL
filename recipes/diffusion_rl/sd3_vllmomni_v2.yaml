@@ -96,7 +96,7 @@ rollout:
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     # SD3 single-stage diffusion modality (matches the reference
     # flowgrpo_fast_sd3_colocate_reproduce.yaml rollout.engine block).
-    modality: sd35_t2i
+    modality: sd3_t2i
     # Required for colocate: trainer calls sleep()/wake_up() around the
     # train phase, which is a no-op unless CuMemAllocator is enabled at
     # vLLM-Omni init time (this knob flips ``enable_sleep_mode: True`` into

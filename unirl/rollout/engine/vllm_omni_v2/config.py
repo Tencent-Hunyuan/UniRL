@@ -61,10 +61,10 @@ class VLLMOmniV2EngineConfig(BaseEngineConfig):
     # Required: model checkpoint path. Set per experiment or via
     # ``cfg.rollout.engine.model_path=...`` on the CLI.
     model_path: str = MISSING
-    # Adapter registry key — one of ``registered_adapters()`` (the 8 v1
-    # modalities). Kept as ``str`` because OmegaConf structured configs reject
+    # Adapter registry key — one of ``registered_adapters()`` (family-namespaced,
+    # e.g. ``hi3_t2i``). Kept as ``str`` because OmegaConf structured configs reject
     # ``Literal[...]``; ``__post_init__`` validates against the live registry.
-    modality: str = "t2i"
+    modality: str = "hi3_t2i"
 
     # Overlay ``enable_sleep_mode: True`` onto each stage's ``engine_args`` at
     # boot so worker.sleep()/wake_up() (level 2) can run. Disable to fall back

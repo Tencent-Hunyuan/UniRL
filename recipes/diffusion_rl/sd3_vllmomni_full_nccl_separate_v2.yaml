@@ -87,7 +87,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
-    modality: sd35_t2i
+    modality: sd3_t2i
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
     enable_sleep_mode: false
 

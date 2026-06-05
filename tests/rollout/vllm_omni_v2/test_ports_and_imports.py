@@ -30,7 +30,7 @@ def test_assemble_omni_kwargs_layering():
     still overrides the timeout/mode defaults (v1 parity)."""
     cfg = VLLMOmniV2EngineConfig(
         model_path="/x",
-        modality="sd35_t2i",
+        modality="sd3_t2i",
         omni_extra={"stage_init_timeout": 99, "enable_sleep_mode": False, "master_port": 1},
     )
     ports = VLLMOmniPorts(master_port=30100)
@@ -49,7 +49,7 @@ def test_assemble_omni_kwargs_omits_disabled_keys():
     """enable_sleep_mode absent when off (upstream YAML defaults apply);
     master_port absent without a reserved set — matching v1's conditional
     injection semantics."""
-    cfg = VLLMOmniV2EngineConfig(model_path="/x", modality="sd35_t2i", enable_sleep_mode=False)
+    cfg = VLLMOmniV2EngineConfig(model_path="/x", modality="sd3_t2i", enable_sleep_mode=False)
     intent = cfg.server_intent(model_config=None, ports=None, extra={"stage_yaml": "x.yaml"})
     kw = _assemble_omni_kwargs(intent)
     assert "enable_sleep_mode" not in kw

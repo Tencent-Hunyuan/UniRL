@@ -55,7 +55,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         return dict(hv_conds)
 
 
-@register_adapter("t2v")
+@register_adapter("hv15_t2v")
 class Hv15T2vAdapter(ModelAdapter):
     """HunyuanVideo-1.5 text → video (single diffusion stage, TP=1)."""
 

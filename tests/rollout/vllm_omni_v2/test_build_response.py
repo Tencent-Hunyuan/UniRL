@@ -24,7 +24,7 @@ from unirl.types.primitives import Texts
 
 
 def test_t2i_two_tracks_with_lineage(model_config):
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(2, modality_params="composed", sigmas=sig)
     per_request = [
@@ -49,7 +49,7 @@ def test_t2i_two_tracks_with_lineage(model_config):
 
 
 def test_t2i_missing_fused_capture_raises(model_config):
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(1, modality_params="composed", sigmas=sig)
     per_request = [[fake_ar_output(0), fake_dit_output(0, sigmas=sig)]]  # no fused_mm_capture
@@ -58,14 +58,14 @@ def test_t2i_missing_fused_capture_raises(model_config):
 
 
 def test_t2i_missing_dit_output_raises(model_config):
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     req = make_req(1, modality_params="composed", sigmas=sigmas_for(2))
     with pytest.raises(RuntimeError, match="did the DiT stage fail"):
         adapter.build_response(req, [[fake_ar_output(0)]])
 
 
 def test_sigma_echo_mismatch_raises(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(1, sigmas=sig)
     bad = fake_dit_output(0, sigmas=torch.tensor([0.9, 0.4, 0.0]), stage_id=0, custom_capture=fake_sd3_capture())
@@ -74,7 +74,7 @@ def test_sigma_echo_mismatch_raises(model_config):
 
 
 def test_sd35_text_condition_and_empty_input_guard(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(2, sigmas=sig)
     per_request = [
@@ -93,7 +93,7 @@ def test_sd35_text_condition_and_empty_input_guard(model_config):
 
 
 def test_t2v_video_track_and_dual_stream_conditions(model_config):
-    adapter = make_adapter("t2v", model_config)
+    adapter = make_adapter("hv15_t2v", model_config)
     sig = sigmas_for(2)
     req = make_req(2, sigmas=sig)
     per_request = [
@@ -123,7 +123,7 @@ def test_t2v_video_track_and_dual_stream_conditions(model_config):
 
 
 def test_ar_only_track(model_config):
-    adapter = make_adapter("t2t", model_config)
+    adapter = make_adapter("hi3_t2t", model_config)
     req = make_req(2, modality_params="ar")
     resp = adapter.build_response(req, [[fake_ar_output(i, text=f"out {i}")] for i in range(2)])
     assert set(resp.tracks) == {"ar"}
@@ -134,7 +134,7 @@ def test_ar_only_track(model_config):
 
 
 def test_ar_recaption_fused_prompt_condition(model_config):
-    adapter = make_adapter("ar_recaption", model_config)
+    adapter = make_adapter("hi3_ar_recaption", model_config)
     req = make_req(2, modality_params="composed")
     per_request = [
         [fake_ar_output(0, prompt_token_ids=[1, 2, 3])],
@@ -149,7 +149,7 @@ def test_ar_recaption_fused_prompt_condition(model_config):
 
 def test_ar_text_extraction_is_best_effort_for_two_stage(model_config, monkeypatch):
     """t2i: a broken AR-text path must not break the rollout (v1:671-675)."""
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(1, modality_params="composed", sigmas=sig)
     per_request = [

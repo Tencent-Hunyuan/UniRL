@@ -5,7 +5,7 @@
 # DiT) trained jointly by ARGRPO (AR TextSegment) + DiffusionGRPO (DiT
 # LatentSegment), both backward-accumulating into ONE LoRA adapter with a single
 # optimizer step (UnifiedModelTrainStack). Rollout is a two-engine vLLM-Omni setup
-# (modality=ar_recaption: AR think/recaption → modality=dit_recaption: DiT); the
+# (modality=hi3_ar_recaption: AR think/recaption → modality=hi3_dit_recaption: DiT); the
 # trained LoRA is synced back into both engines every rollout.
 #
 # Pairs with unirl/train_unified_model.py (UnifiedModelTrainer). Modeled on
@@ -106,8 +106,8 @@ backend:
       - o_proj
 
 # Two standalone vLLM-Omni engines (the v2 two-engine design). The AR engine
-# (modality ar_recaption, single LLM stage, GPUs 0-3) emits N think/recaption
-# texts per prompt; the DiT engine (modality dit_recaption, single diffusion
+# (modality hi3_ar_recaption, single LLM stage, GPUs 0-3) emits N think/recaption
+# texts per prompt; the DiT engine (modality hi3_dit_recaption, single diffusion
 # stage, GPUs 4-7) renders M distinct-noise images per recaption. UnifiedModelTrainer
 # wires both with remote() in the shared placement; each engine clears
 # CUDA_VISIBLE_DEVICES for its multi-GPU HI3 modality and its stage YAML's
@@ -123,7 +123,7 @@ ar_rollout:
     # AR-only think/recaption stage (is_comprehension:false), GPUs 0-3.
     # AR decode + recaption-prompt dims ride the request's composed
     # ``sampling`` params — the v2 engine config keeps no sampling defaults.
-    modality: ar_recaption
+    modality: hi3_ar_recaption
     enable_sleep_mode: true
 
 dit_rollout:
@@ -134,7 +134,7 @@ dit_rollout:
     model_path: ${oc.env:PRETRAINED_MODEL,/root/HunyuanImage-3-Instruct}
     # Standalone DiT stage that eats an externally-injected recaption, GPUs 4-7.
     # Sampling values ride ``sampling.diffusion`` on the request.
-    modality: dit_recaption
+    modality: hi3_dit_recaption
     enable_sleep_mode: true
 
 reward:

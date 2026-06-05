@@ -19,7 +19,7 @@ from unirl.types.primitives import Images, Texts
 
 
 def test_sd35_t2i_single_call_shape(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     req = make_req(2, sigmas=sigmas_for(2))
     calls = adapter.build_inputs(req)
     assert len(calls) == 1
@@ -43,7 +43,7 @@ def test_sd35_t2i_single_call_shape(model_config):
 
 
 def test_sd35_t2i_sde_and_materialized_noise(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     req = make_req(2, sigmas=sigmas_for(2))
     req.sampling_params.sde_indices = [1, 0, 1]
     noise = torch.randn(2, 4, 8, 8)
@@ -60,7 +60,7 @@ def test_sd35_t2i_sde_and_materialized_noise(model_config):
 
 
 def test_sd35_t2i_noise_recipe_path(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     req = make_req(
         2,
         sigmas=sigmas_for(2),
@@ -75,7 +75,7 @@ def test_sd35_t2i_noise_recipe_path(model_config):
 
 
 def test_sd35_t2i_rejects_image(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     req = make_req(2, sigmas=sigmas_for(2), primitives={"image": Images(pixels=torch.zeros(2, 3, 8, 8))})
     with pytest.raises(ValueError, match="does not accept"):
         adapter.build_inputs(req)
@@ -84,7 +84,7 @@ def test_sd35_t2i_rejects_image(model_config):
 
 
 def test_t2v_adds_num_frames(model_config):
-    adapter = make_adapter("t2v", model_config)
+    adapter = make_adapter("hv15_t2v", model_config)
     req = make_req(2, sigmas=sigmas_for(2))
     req.sampling_params.num_frames = 9
     (call,) = adapter.build_inputs(req)
@@ -93,7 +93,7 @@ def test_t2v_adds_num_frames(model_config):
 
 
 def test_t2i_two_stage_call(model_config):
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     req = make_req(2, modality_params="composed", sigmas=sigmas_for(2))
     (call,) = adapter.build_inputs(req)
     assert [s.kind for s in call.sampling] == [STAGE_KIND_AR, STAGE_KIND_DIFFUSION]
@@ -112,7 +112,7 @@ def test_t2i_two_stage_call(model_config):
 def test_t2i_bot_task_translation(model_config):
     """stage_config bot_task swaps the chat-template task key (fake_tokenize
     is length-keyed, so prompt_token_ids[1] echoes len(task))."""
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
 
     req = make_req(1, modality_params="composed", sigmas=sigmas_for(2), stage_config={"bot_task": "recaption"})
     (call,) = adapter.build_inputs(req)
@@ -134,7 +134,7 @@ def test_t2i_bot_task_translation(model_config):
 
 
 def test_t2i_rejects_materialized_noise_and_ships_recipe(model_config):
-    adapter = make_adapter("t2i", model_config)
+    adapter = make_adapter("hi3_t2i", model_config)
     req = make_req(2, modality_params="composed", sigmas=sigmas_for(2))
     req.request_conditions = {"initial_latents": SimpleNamespace(latents=torch.zeros(2, 4, 8, 8))}
     with pytest.raises(NotImplementedError, match="AR-dynamic"):
@@ -150,7 +150,7 @@ def test_t2i_rejects_materialized_noise_and_ships_recipe(model_config):
 
 
 def test_it2i_attaches_image_and_pil_dims(model_config):
-    adapter = make_adapter("it2i", model_config)
+    adapter = make_adapter("hi3_it2i", model_config)
     req = make_req(
         2,
         modality_params="composed",
@@ -168,7 +168,7 @@ def test_it2i_attaches_image_and_pil_dims(model_config):
 
 
 def test_t2t_single_ar_stage_no_dims(model_config):
-    adapter = make_adapter("t2t", model_config)
+    adapter = make_adapter("hi3_t2t", model_config)
     req = make_req(2, modality_params="ar")
     (call,) = adapter.build_inputs(req)
     assert [s.kind for s in call.sampling] == [STAGE_KIND_AR]
@@ -176,7 +176,7 @@ def test_t2t_single_ar_stage_no_dims(model_config):
 
 
 def test_ar_recaption_carries_dims(model_config):
-    adapter = make_adapter("ar_recaption", model_config)
+    adapter = make_adapter("hi3_ar_recaption", model_config)
     req = make_req(2, modality_params="composed")
     (call,) = adapter.build_inputs(req)
     assert [s.kind for s in call.sampling] == [STAGE_KIND_AR]
@@ -186,7 +186,7 @@ def test_ar_recaption_carries_dims(model_config):
 
 
 def test_dit_recaption_per_prompt_seeded_calls(model_config):
-    adapter = make_adapter("dit_recaption", model_config)
+    adapter = make_adapter("hi3_dit_recaption", model_config)
     req = make_req(
         3,
         sigmas=sigmas_for(2),
@@ -211,7 +211,7 @@ def test_dit_recaption_per_prompt_seeded_calls(model_config):
 
 
 def test_dit_recaption_requires_cot_text(model_config):
-    adapter = make_adapter("dit_recaption", model_config)
+    adapter = make_adapter("hi3_dit_recaption", model_config)
     with pytest.raises(TypeError, match="cot_text"):
         adapter.build_inputs(make_req(2, sigmas=sigmas_for(2)))
     # Misaligned counts fail too.
@@ -221,7 +221,7 @@ def test_dit_recaption_requires_cot_text(model_config):
 
 
 def test_sigmas_length_contract(model_config):
-    adapter = make_adapter("sd35_t2i", model_config)
+    adapter = make_adapter("sd3_t2i", model_config)
     req = make_req(2, sigmas=sigmas_for(5))  # wrong length for 2 steps
     with pytest.raises(Exception, match="num_inference_steps"):
         adapter.build_inputs(req)
