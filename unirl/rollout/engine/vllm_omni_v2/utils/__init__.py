@@ -15,7 +15,7 @@ from unirl.rollout.engine.vllm_omni_v2.utils.conditions import (
 from unirl.rollout.engine.vllm_omni_v2.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni_v2.utils.prompts import (
     build_prompt_entries,
-    images_to_pil,
+    pil_images_from_req,
     resolve_task,
     texts_from_req,
 )
@@ -44,9 +44,9 @@ __all__ = [
     "collect_dit_outputs",
     "decoded_text_from_ar",
     "grouped_pils_to_videos",
-    "images_to_pil",
     "pack_initial_noise_extra_args",
     "pick_stage_output",
+    "pil_images_from_req",
     "pils_to_images",
     "resolve_task",
     "seed_from_sample_id",

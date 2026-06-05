@@ -179,6 +179,10 @@ class Images(Batch):
     def to_list(self) -> List[Image]:
         return [Image(pixels=self.pixels[i]) for i in range(self.pixels.shape[0])]
 
+    def to_pils(self) -> List[PIL.Image.Image]:
+        """Per-sample PIL conversion — batch counterpart of :meth:`Image.to_pil`."""
+        return [img.to_pil() for img in self.to_list()]
+
     def __len__(self) -> int:
         return int(self.pixels.shape[0]) if self.pixels is not None else 0
 

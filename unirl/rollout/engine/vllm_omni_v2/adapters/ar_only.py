@@ -20,7 +20,7 @@ from unirl.rollout.engine.vllm_omni_v2.utils import (
     build_ar_segment,
     build_prompt_entries,
     decoded_text_from_ar,
-    images_to_pil,
+    pil_images_from_req,
     resolve_task,
     texts_from_req,
 )
@@ -55,7 +55,7 @@ class ArOnlyAdapter(ModelAdapter):
         texts = texts_from_req(req)
         n = len(texts.texts)
 
-        pil_images = images_to_pil(req, n) if self.image_input else []
+        pil_images = pil_images_from_req(req, n) if self.image_input else []
         if self.image_input and not pil_images:
             raise ValueError(f"modality={self.modality!r} requires req.primitives['image']")
         if not self.image_input and req.primitives.get("image") is not None:

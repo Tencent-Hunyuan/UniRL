@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
-from unirl.types.primitives import Image, Images, Texts
+from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import get_ar_params, get_diffusion_params
 
@@ -114,7 +114,7 @@ def _images_from_req(req: RolloutReq, n: int) -> List[Any]:
         raise TypeError(f"req.primitives['image'] must be Images when present, got {type(images).__name__}")
     if len(images) != n:
         raise ValueError(f"image batch {len(images)} != prompt count {n}")
-    return [Image(pixels=images.pixels[i]).to_pil() for i in range(len(images))]
+    return images.to_pils()
 
 
 def _sigmas_list_from_req(req: RolloutReq, num_inference_steps: int) -> Optional[List[float]]:

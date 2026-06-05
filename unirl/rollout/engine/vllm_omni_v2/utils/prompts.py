@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from unirl.types.primitives import Image, Images, Texts
+import PIL.Image
+
+from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 
 # (default_task_key, default_sys_type, modalities) per modality.
@@ -64,11 +66,11 @@ def texts_from_req(req: RolloutReq) -> Texts:
     return texts
 
 
-def images_to_pil(req: RolloutReq, n: int) -> List[Any]:
-    """Convert ``req.primitives['image']`` (Images) → list of PIL images.
+def pil_images_from_req(req: RolloutReq, n: int) -> List[PIL.Image.Image]:
+    """Extract ``req.primitives['image']`` (Images) as a list of PIL images.
 
     Returns an empty list when there's no image primitive. Asserts batch
-    alignment when present.
+    alignment when present; the conversion itself is :meth:`Images.to_pils`.
     """
     images = req.primitives.get("image")
     if images is None:
@@ -77,7 +79,7 @@ def images_to_pil(req: RolloutReq, n: int) -> List[Any]:
         raise TypeError(f"req.primitives['image'] must be Images when present, got {type(images).__name__}")
     if len(images) != n:
         raise ValueError(f"image batch {len(images)} != prompt count {n}")
-    return [Image(pixels=images.pixels[i]).to_pil() for i in range(len(images))]
+    return images.to_pils()
 
 
 def build_prompt_entries(
@@ -114,7 +116,7 @@ def build_prompt_entries(
 
 __all__ = [
     "build_prompt_entries",
-    "images_to_pil",
+    "pil_images_from_req",
     "resolve_task",
     "texts_from_req",
 ]
