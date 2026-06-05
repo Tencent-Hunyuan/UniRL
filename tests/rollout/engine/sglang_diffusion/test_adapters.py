@@ -1,4 +1,4 @@
-"""Pure adapter tests — registry, build_inputs, build_response, Klein unpack.
+"""Pure adapter tests — registry, build_inputs (template + stages), build_response, Klein unpack.
 
 Canned data, no SGLang, no GPU. Adapters are constructed with ``SimpleNamespace``
 stand-ins for the engine config + model config (they only read a handful of fields).
@@ -160,6 +160,98 @@ def test_build_inputs_sde_without_label_raises():
     req = _req(["p"], sde_indices=[0])
     with pytest.raises(Exception, match="requires an sde_label"):
         a.build_inputs(req, initial_noise=None)
+
+
+# --------------------------------------------------------------------------- #
+# request stages — the template seals validation/pins/SDE around the overrides
+# --------------------------------------------------------------------------- #
+
+
+def test_build_prompts_payload_forms():
+    a = SD3Adapter(_cfg(), _model_config(), strategy=None)
+    assert a.build_prompts(_req(["a"])) == {"prompt": "a"}  # single → scalar
+    assert a.build_prompts(_req(["a", "b"])) == {"prompt": ["a", "b"]}  # distinct → list
+    assert a.build_prompts(_req(["a", "a"], group_ids=["g", "g"])) == {
+        "prompt": "a",
+        "num_outputs_per_prompt": 2,
+    }
+
+
+def test_build_sampling_slices_sigmas():
+    a = SD3Adapter(_cfg(), _model_config(), strategy=None)
+    req = _req(["p"], num_inference_steps=3)
+    from unirl.types.sampling import get_diffusion_params
+
+    kw = a.build_sampling(req, diffusion=get_diffusion_params(req.sampling_params))
+    assert kw["sigmas"] == req.sigmas.tolist()[:-1]  # interior T, terminal 0 dropped
+    assert kw["num_inference_steps"] == 3 and kw["seed"] == 42
+
+
+def test_template_seals_pins_and_sde_over_overridden_build_prompts():
+    class _CustomPrompts(SD3Adapter):
+        def build_prompts(self, req):
+            # Also tries to flip an engine pin — the template must win.
+            return {"prompt": "OVERRIDDEN", "return_trajectory_latents": False}
+
+    a = _CustomPrompts(_cfg(), _model_config(), strategy=_Flow())
+    kw = a.build_inputs(_req(["p"], sde_indices=[0]), initial_noise=None)
+    assert kw["prompt"] == "OVERRIDDEN"  # stage payload lands
+    assert kw["return_trajectory_latents"] is True  # pin survives the stage
+    assert kw["rollout"] is True and kw["rollout_sde_type"] == "sde"  # SDE layer applied
+
+
+def test_template_invariants_fire_over_overridden_stages():
+    class _CustomPrompts(SD3Adapter):
+        def build_prompts(self, req):
+            return {"prompt": "x"}
+
+    a = _CustomPrompts(_cfg(), _model_config(), strategy=None)
+    req = _req(["p"], sampler_kwargs={"negative_prompt": "bad"})
+    with pytest.raises(Exception, match="return_negative_prompt_embeds"):
+        a.build_inputs(req, initial_noise=None)
+
+
+def test_build_sampling_override_merges_into_template():
+    class _ExtraKnob(SD3Adapter):
+        def build_sampling(self, req, *, diffusion):
+            out = super().build_sampling(req, diffusion=diffusion)
+            out["fps"] = 24
+            return out
+
+    a = _ExtraKnob(_cfg(), _model_config(), strategy=None)
+    kw = a.build_inputs(_req(["p"]), initial_noise=None)
+    assert kw["fps"] == 24
+    assert kw["num_inference_steps"] == 2
+
+
+def test_build_inputs_matches_legacy_translator():
+    # Transitional parity gate: the staged template must emit the exact kwargs
+    # dict the legacy engine's translator builds. Dies with the legacy engine.
+    from unirl.rollout.engine.sglang.request import _to_sglang_kwargs
+
+    noise = torch.randn(1, 4, 2, 2)
+    cases = [
+        # (prompts, group_ids, req_kwargs, strategy, sde_label, initial_noise)
+        (["a photo"], None, {}, None, None, None),
+        (["p"], None, {"sde_indices": [1, 0]}, _Flow(), "sde", None),
+        (["a", "a"], ["g", "g"], {}, None, None, None),
+        (["a", "b"], None, {}, None, None, None),
+        (
+            ["p"],
+            None,
+            {"sampler_kwargs": {"negative_prompt": "bad", "return_negative_prompt_embeds": True}},
+            None,
+            None,
+            None,
+        ),
+        (["p"], None, {}, None, None, noise),
+    ]
+    for prompts, gids, rkw, strategy, sde_label, init_noise in cases:
+        a = SD3Adapter(_cfg(), _model_config(), strategy=strategy)
+        req = _req(prompts, group_ids=gids, **rkw)
+        got = a.build_inputs(req, initial_noise=init_noise)
+        want = _to_sglang_kwargs(req, cfg=None, sde_label=sde_label, initial_noise=init_noise)
+        assert got == want, f"kwargs drift vs legacy for case {prompts}, {rkw}"
 
 
 # --------------------------------------------------------------------------- #

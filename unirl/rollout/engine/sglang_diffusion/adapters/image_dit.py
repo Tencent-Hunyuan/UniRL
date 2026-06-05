@@ -2,9 +2,14 @@
 
 Output shape = a 5-D image-form latent trajectory ``[B, T+1, C, H, W]`` decoded to
 ``Images``. Holds ``build_inputs`` / ``build_response`` once and exposes the per-model
-variation points as overridable methods (``unpack_trajectory``, ``build_segment``,
+variation points as overridable methods (request side: ``build_prompts``,
+``build_sampling``; response side: ``unpack_trajectory``, ``build_segment``,
 ``build_decoded``, ``build_condition``) and class knobs (``track_name``,
 ``segment_factory``). Concrete adapters override only what differs.
+
+Convention: the ``build_*`` stages are the overridable variation points;
+``build_inputs`` / ``build_response`` are sealed templates that own validation,
+the engine pins, and merge order — override the stages, not the templates.
 
 Ported from the old engine's ``request.py`` / ``response.py`` free functions, with
 the model-family branches lifted into overridable methods.
@@ -40,6 +45,15 @@ class ImageDiTAdapter(ModelAdapter):
     # ------------------------------------------------------------------ #
 
     def build_inputs(self, req: RolloutReq, *, initial_noise: Any) -> Dict[str, Any]:
+        """Sealed template: validate, then merge the stage payloads in layer order.
+
+        Override the ``build_prompts`` / ``build_sampling`` stages, not this
+        method — the validation gates, engine pins, noise wiring, and SDE-kernel
+        layer are RL-correctness contracts that must survive any per-model
+        variation. Stages return plain kwargs dicts whose keys must stay
+        disjoint from the pins; later updates override earlier ones.
+        """
+        # ---- sealed validation (fail-fast gates survive any stage override) ----
         text_prim = req.primitives.get("text")
         if not isinstance(text_prim, Texts):
             raise TypeError(
@@ -59,32 +73,18 @@ class ImageDiTAdapter(ModelAdapter):
             "build_inputs: req.sampling_params must contain diffusion params",
         )
 
-        num_inference_steps = int(diffusion.num_inference_steps)
-        guidance_scale = float(diffusion.guidance_scale)
-        height = int(diffusion.height)
-        width = int(diffusion.width)
-        eta = float(diffusion.eta)
-        sde_indices_raw = diffusion.sde_indices
-        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
-
         # σ is the SSOT on RolloutReq (pinned by the engine via ensure_req_sigmas
-        # before this runs). Never recompute here. req.sigmas is length T+1
-        # (terminal 0 included); SGLang's set_timesteps wants the interior T.
+        # before this runs). Never recompute here; ``build_sampling`` slices it.
         require(
             req.sigmas is not None,
             "build_inputs: req.sigmas must be set by the engine before conversion "
             "(see unirl.sde.runtime.ensure_req_sigmas).",
         )
         require(
-            int(req.sigmas.shape[0]) == num_inference_steps + 1,
+            int(req.sigmas.shape[0]) == int(diffusion.num_inference_steps) + 1,
             f"build_inputs: req.sigmas length {int(req.sigmas.shape[0])} != "
-            f"num_inference_steps+1 ({num_inference_steps + 1}).",
+            f"num_inference_steps+1 ({int(diffusion.num_inference_steps) + 1}).",
         )
-        sigmas = req.sigmas.detach().cpu().tolist()[:-1]
-
-        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(req.group_ids))
-        prompt_payload: Any = unique_prompts if len(unique_prompts) > 1 else unique_prompts[0]
-        num_outputs_per_prompt: Optional[int] = k if k > 1 else None
 
         sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs or {})
 
@@ -102,20 +102,18 @@ class ImageDiTAdapter(ModelAdapter):
             "ratio mismatch). Set return_negative_prompt_embeds=True.",
         )
 
+        sde_indices_raw = diffusion.sde_indices
+        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
+
         # Layer 1: caller escape-hatch (lowest priority).
         kwargs: Dict[str, Any] = dict(sampler_kwargs)
-        # Layers 2 + 3: typed/computed + engine pins (override layer 1).
+        # Layer 2: overridable stages (override layer 1).
+        kwargs.update(self.build_prompts(req))
+        kwargs.update(self.build_sampling(req, diffusion=diffusion))
+        # Layer 3: engine pins — RL-loop invariants, not model knobs.
         kwargs.update(
             {
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "height": height,
-                "width": width,
-                "num_frames": int(diffusion.num_frames),
-                "sigmas": sigmas,
-                "prompt": prompt_payload,
                 "init_same_noise": False,
-                "seed": int(diffusion.seed) if diffusion.seed is not None else 0,
                 "save_output": False,
                 "return_file_paths_only": False,
                 "return_trajectory_latents": True,
@@ -137,13 +135,49 @@ class ImageDiTAdapter(ModelAdapter):
             )
             kwargs["rollout"] = True
             kwargs["rollout_sde_type"] = self._sde_label
-            kwargs["rollout_noise_level"] = eta
+            kwargs["rollout_noise_level"] = float(diffusion.eta)
             kwargs["rollout_sde_indices"] = sde_indices
 
-        if num_outputs_per_prompt is not None:
-            kwargs["num_outputs_per_prompt"] = num_outputs_per_prompt
-
         return kwargs
+
+    # ------------------------------------------------------------------ #
+    # Overridable request stages (the template merges them in layer order)
+    # ------------------------------------------------------------------ #
+
+    def build_prompts(self, req: RolloutReq) -> Dict[str, Any]:
+        """Prompt payload: collapse K-expanded prompts back to unique + repeat count.
+
+        One text-encode pass per group instead of K when the structure admits a
+        clean collapse; ``num_outputs_per_prompt`` is emitted only then (k > 1).
+        The template has already validated ``req.primitives['text']``.
+        """
+        prompts = list(req.primitives["text"].texts)
+        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(req.group_ids))
+        out: Dict[str, Any] = {
+            "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
+        }
+        if k > 1:
+            out["num_outputs_per_prompt"] = k
+        return out
+
+    def build_sampling(self, req: RolloutReq, *, diffusion: Any) -> Dict[str, Any]:
+        """Sampling scalars + the σ schedule slice.
+
+        ``req.sigmas`` is length T+1 (terminal 0 included); SGLang's
+        ``set_timesteps`` wants the interior T. Pass the seed even when
+        ``initial_noise`` pins x_T verbatim: SGLang derives per-step SDE noise
+        deterministically (keyed on ``noise_group_ids``) only when seed is not
+        None — a None seed silently falls back to global RNG.
+        """
+        return {
+            "num_inference_steps": int(diffusion.num_inference_steps),
+            "guidance_scale": float(diffusion.guidance_scale),
+            "height": int(diffusion.height),
+            "width": int(diffusion.width),
+            "num_frames": int(diffusion.num_frames),
+            "sigmas": req.sigmas.detach().cpu().tolist()[:-1],
+            "seed": int(diffusion.seed) if diffusion.seed is not None else 0,
+        }
 
     # ------------------------------------------------------------------ #
     # Response side
