@@ -148,11 +148,11 @@ def main() -> int:
     ports = VLLMOmniPorts.reserve()
     base = ports.master_port
     log(f"reserved master_port base = {base}")
+    # No default_* sampling kwargs post-refactor: sampling values ride the
+    # request's typed DiffusionSamplingParams (single source of truth).
     cfg = VLLMOmniV2EngineConfig(
         model_path=model_path,
         modality="sd3_t2i",
-        default_height=hw, default_width=hw,
-        default_num_inference_steps=steps,
         enable_sleep_mode=True,
     )
     model_config = SimpleNamespace(shift=3.0, use_lora=False)
