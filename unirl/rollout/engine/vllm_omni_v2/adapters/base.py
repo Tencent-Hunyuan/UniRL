@@ -1,11 +1,13 @@
 """Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
 
-A thin top ABC (registry + boilerplate with sensible defaults) over per-output-
-shape base adapters (``hi3_ar_dit`` / ``hi3_ar_only`` / ``dit_image`` /
-``dit_video``) that hold the conversion logic as overridable methods. Concrete adapters
-override only what differs and self-register by ``modality`` key — the same
-axis v1 branched on inline. Selected once at engine construction via
-:func:`get_adapter`.
+A thin top ABC (registry + knobs + the two conversion verbs). Concrete
+modality adapters live in family files (``hi3`` / ``sd3`` / ``hv15``) and are
+**binders**: each constructs an ``input_adapter`` and an ``output_adapter``
+in ``__init__`` and delegates ``build_inputs`` / ``build_response`` to them.
+The universal single-stage DiT skeletons live in ``dit.py``; family-specific
+sub-adapters carry the family prefix and live in the family file. Adapters
+self-register by ``modality`` key — the same axis v1 branched on inline —
+and are selected once at engine construction via :func:`get_adapter`.
 
 Pure: never imports vllm-omni — adapters consume the seam's ``OmniRawResult``
 protocol and emit :class:`GenerateCall` intent; tokenization reaches the
@@ -72,9 +74,10 @@ def registered_adapters() -> Tuple[str, ...]:
 class ModelAdapter(ABC):
     """Thin ABC: registry key + topology knobs + the two conversion seams.
 
-    The conversion *logic* lives on the per-shape base adapters; this ABC
-    declares the boilerplate every adapter shares (boot intent, schedule
-    policy, validation) and the two abstract methods the engine drives.
+    The conversion *logic* lives on the input/output sub-adapters the
+    concrete binders construct; this ABC declares the boilerplate every
+    adapter shares (boot intent, schedule policy, validation) and the two
+    abstract methods the engine drives.
     """
 
     modality: str = ""
@@ -189,44 +192,6 @@ class ModelAdapter(ABC):
     @abstractmethod
     def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
         """Translate the seam's per-request-grouped results into a ``RolloutResp``."""
-
-    # ---- shared DiT-kwargs boilerplate (every DiT-bearing shape calls it) ----
-    def core_diff_kwargs(self, req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
-        """The diffusion sampling kwargs common to every DiT stage.
-
-        Every value reads off the request's typed ``DiffusionSamplingParams``
-        — the engine keeps no sampling defaults. ``eta`` rides as a typed
-        first-class field; ``guidance_scale_provided`` marks the explicit CFG
-        choice; trajectory latents are always requested (dense — replay needs
-        ``x_t`` at every slot).
-        """
-        from unirl.rollout.engine.vllm_omni_v2.utils.sigmas import sigmas_list_from_req
-
-        num_inference_steps = int(diff_params.num_inference_steps)
-        diff_kwargs: Dict[str, Any] = dict(
-            height=int(diff_params.height),
-            width=int(diff_params.width),
-            num_inference_steps=num_inference_steps,
-            guidance_scale=float(diff_params.guidance_scale),
-            guidance_scale_provided=True,
-            eta=float(diff_params.eta),
-            return_trajectory_latents=True,
-            return_trajectory_decoded=False,
-            num_outputs_per_prompt=1,
-        )
-        sigmas = sigmas_list_from_req(req, num_inference_steps)
-        if sigmas is not None:
-            diff_kwargs["sigmas"] = sigmas
-        return diff_kwargs
-
-    @staticmethod
-    def sde_extra_args(diff_params: Any) -> Dict[str, Any]:
-        """Sparse SDE step indices, normalized for the ``extra_args`` channel."""
-        extra_args: Dict[str, Any] = {}
-        sde_indices = getattr(diff_params, "sde_indices", None)
-        if sde_indices is not None:
-            extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
-        return extra_args
 
 
 __all__ = [

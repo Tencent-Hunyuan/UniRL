@@ -1,8 +1,8 @@
 """Request-side primitive extraction helpers the adapters' ``build_inputs`` call.
 
-Pure and family-agnostic. The HI3 prompt construction (the task-preset
-class attributes + ``build_prompt_entries``) lives with the HI3 adapters in
-``adapters/hi3_ar_dit.py``.
+Pure and family-agnostic. The HI3 prompt construction (the task presets +
+the per-prompt entry builder) lives with the HI3 sub-adapters in
+``adapters/hi3.py``.
 """
 
 from __future__ import annotations

@@ -155,11 +155,11 @@ def test_ar_text_extraction_is_best_effort_for_two_stage(model_config, monkeypat
     per_request = [
         [fake_ar_output(0), fake_dit_output(0, sigmas=sig, custom_capture={"fused_mm_capture": fake_fused_capture()})]
     ]
-    import unirl.rollout.engine.vllm_omni_v2.adapters.hi3_ar_dit as hi3_ar_dit_mod
+    import unirl.rollout.engine.vllm_omni_v2.adapters.hi3 as hi3_mod
 
     def boom(_):
         raise RuntimeError("text extraction broke")
 
-    monkeypatch.setattr(hi3_ar_dit_mod, "decoded_text_from_ar", boom)
+    monkeypatch.setattr(hi3_mod, "decoded_text_from_ar", boom)
     resp = adapter.build_response(req, per_request)
     assert resp.tracks["ar"].decoded is None  # dropped, not raised
