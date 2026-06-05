@@ -93,10 +93,12 @@ class DitInputAdapter:
 class DitOutputAdapter:
     """Per-request DiT results → a DiT-track :class:`RolloutResp`.
 
-    The shared response skeleton of every DiT-bearing modality: collect the
-    DiT outputs, pack the trajectory segment (asserting the σ echo), decode
-    the final media, attach the family's replay conditions, sweep a Stage-0
-    AR segment for v1 parity, and assemble the tracks.
+    ``build`` is guard + ``assemble_tracks`` over three parallel hooks that
+    mirror its parameter list 1:1 — :meth:`build_segments` /
+    :meth:`build_decoded` / :meth:`build_conditions` — all with the uniform
+    ``(req, per_request)`` currency: raw wire groups in, each hook collects
+    what it needs (cheap — ``collect_dit_outputs`` only gathers references).
+    Children derive any of the three via ``super()``.
     """
 
     #: Track key + the wire ``final_output_type`` to collect. Video families
@@ -109,29 +111,41 @@ class DitOutputAdapter:
         self.stage_id = stage_id
 
     # ------------------------------------------------------------------ #
-    # Family hooks
+    # Family hooks — one per assemble_tracks parameter
     # ------------------------------------------------------------------ #
 
-    def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
-        """The family's replay conditions, extracted from the DiT outputs."""
-        raise NotImplementedError(f"{type(self).__name__} must implement conditions()")
+    def build_segments(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """The per-track segments: the DiT trajectory (asserting the σ echo)
+        plus the v1-parity Stage-0 AR sweep."""
+        diff_outputs, _, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
+        segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=req.sigmas)}
+        # Parity with v1's unconditional Stage-0 sweep: a single-DiT stage
+        # carries no completions, so this is None unless something upstream
+        # surfaces one (the HI3 two-stage shape always does).
+        ar_segment = build_ar_segment(per_request)
+        if ar_segment is not None:
+            segments["ar"] = ar_segment
+        return segments
 
-    def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """The per-track ``decoded`` payloads, from the raw per-request groups.
-
-        Takes the raw wire groups (not the collected DiT slices) because
-        decoded may span tracks beyond the DiT one — the HI3 two-track shape
-        adds the AR text via ``super()``. Must keep the ``track_name`` entry
-        (a missing key silently yields ``decoded=None`` on that track).
+    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """The per-track ``decoded`` payloads. Must keep the ``track_name``
+        entry (a missing key silently yields ``decoded=None`` on that track).
 
         Default: the flat PILs as ``Images``; hv15 swaps the payload for
-        packed frame groups. Re-collecting here is deliberate and cheap —
-        ``collect_dit_outputs`` only gathers references.
+        packed frame groups; the HI3 two-track shape adds the AR text via
+        ``super()``.
         """
+        del req
         _, _, pil_images = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         return {self.track_name: pils_to_images(pil_images)}
+
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """The family's replay conditions."""
+        raise NotImplementedError(f"{type(self).__name__} must implement build_conditions()")
 
     # ------------------------------------------------------------------ #
     # Skeleton
@@ -140,26 +154,11 @@ class DitOutputAdapter:
     def build(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
-
-        diff_outputs, _frames, _pils = collect_dit_outputs(
-            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
-        )
-        decoded = self.build_decoded(per_request)
-        segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=req.sigmas)}
-        conditions = self.conditions(diff_outputs)
-
-        # Parity with v1's unconditional Stage-0 sweep: a single-DiT stage
-        # carries no completions, so this is None unless something upstream
-        # surfaces one (the HI3 two-stage shape always does).
-        ar_segment = build_ar_segment(per_request)
-        if ar_segment is not None:
-            segments["ar"] = ar_segment
-
         return assemble_tracks(
             req,
-            segments_for_track=segments,
-            decoded_for_track=decoded,
-            conditions=conditions,
+            segments_for_track=self.build_segments(req, per_request),
+            decoded_for_track=self.build_decoded(req, per_request),
+            conditions=self.build_conditions(req, per_request),
         )
 
 

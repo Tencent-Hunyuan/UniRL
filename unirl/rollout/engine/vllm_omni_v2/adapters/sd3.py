@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni_v2.utils import build_sd3_text_condition
+from unirl.rollout.engine.vllm_omni_v2.utils import build_sd3_text_condition, collect_dit_outputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 
@@ -22,7 +22,11 @@ from unirl.types.rollout_resp import RolloutResp
 class Sd3OutputAdapter(DitOutputAdapter):
     """Single-"image"-track response with the SD3 text-capture conditions."""
 
-    def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        diff_outputs, _, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         text_cond = build_sd3_text_condition(diff_outputs)
         if text_cond is None:
             raise RuntimeError(

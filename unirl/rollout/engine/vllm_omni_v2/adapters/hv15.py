@@ -41,13 +41,18 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
     track_name = "video"
     final_output_type = "video"
 
-    def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
         _, frame_groups, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         return {self.track_name: grouped_pils_to_videos(frame_groups)}
 
-    def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        diff_outputs, _, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         hv_conds = build_hv15_conditions(diff_outputs)
         if hv_conds is None:
             raise RuntimeError(

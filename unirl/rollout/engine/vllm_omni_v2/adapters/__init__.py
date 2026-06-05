@@ -23,6 +23,7 @@ from unirl.rollout.engine.vllm_omni_v2.adapters.base import (
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.hi3 import (
     Hi3ArRecaptionAdapter,
+    Hi3ArRecaptionOutputAdapter,
     Hi3DitRecaptionAdapter,
     Hi3DitRecaptionInputAdapter,
     Hi3DitRecaptionOutputAdapter,
@@ -45,6 +46,7 @@ __all__ = [
     "DitInputAdapter",
     "DitOutputAdapter",
     "Hi3ArRecaptionAdapter",
+    "Hi3ArRecaptionOutputAdapter",
     "Hi3DitRecaptionAdapter",
     "Hi3DitRecaptionInputAdapter",
     "Hi3DitRecaptionOutputAdapter",

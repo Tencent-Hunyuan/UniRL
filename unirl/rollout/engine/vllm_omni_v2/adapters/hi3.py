@@ -45,6 +45,7 @@ from unirl.rollout.engine.vllm_omni_v2.utils import (
     build_ar_fused_condition,
     build_ar_segment,
     build_fused_mm_condition,
+    collect_dit_outputs,
     decoded_text_from_ar,
     pil_images_from_req,
     seed_from_sample_id,
@@ -384,38 +385,50 @@ class Hi3DitRecaptionInputAdapter:
 class Hi3TextOutputAdapter:
     """Per-request AR results → the single-"ar"-track :class:`RolloutResp`.
 
-    ``conditions`` is the optional replay-condition extractor over the raw
-    per-request groups — ``None`` for the comprehension modalities,
-    :func:`hi3_ar_fused_conditions` for the recaption producer.
+    Same three-hook shape as :class:`~.dit.DitOutputAdapter`
+    (:meth:`build_segments` / :meth:`build_decoded` / :meth:`build_conditions`,
+    uniform ``(req, per_request)`` currency). ``build_decoded`` is
+    deliberately NOT best-effort — the text IS the product here, so a broken
+    extraction must raise.
     """
 
-    def __init__(
-        self,
-        modality: str,
-        *,
-        conditions: Optional[Callable[[List[List[OmniRawResult]]], Dict[str, Any]]] = None,
-    ) -> None:
+    def __init__(self, modality: str) -> None:
         self.modality = modality
-        self._conditions = conditions
+
+    def build_segments(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        segments: Dict[str, Any] = {}
+        ar_segment = build_ar_segment(per_request)
+        if ar_segment is not None:
+            segments["ar"] = ar_segment
+        return segments
+
+    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        return {"ar": decoded_text_from_ar(per_request)}
+
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """AR-track conditions. Default: none (no replay capture in scope)."""
+        del req, per_request
+        return {}
 
     def build(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
-
-        decoded_text = decoded_text_from_ar(per_request)
-        conditions = self._conditions(per_request) if self._conditions is not None else {}
-
-        segments = {}
-        ar_segment = build_ar_segment(per_request)
-        if ar_segment is not None:
-            segments["ar"] = ar_segment
-
         return assemble_tracks(
             req,
-            segments_for_track=segments,
-            decoded_for_track={"ar": decoded_text},
-            conditions=conditions,
+            segments_for_track=self.build_segments(req, per_request),
+            decoded_for_track=self.build_decoded(req, per_request),
+            conditions=self.build_conditions(req, per_request),
         )
+
+
+class Hi3ArRecaptionOutputAdapter(Hi3TextOutputAdapter):
+    """AR-track response + the ARGRPO fused prompt-capture conditions."""
+
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        return hi3_ar_fused_conditions(per_request)
 
 
 class Hi3ImageOutputAdapter(DitOutputAdapter):
@@ -424,11 +437,15 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
     def __init__(self, modality: str) -> None:
         super().__init__(modality, stage_id=1)
 
-    def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        diff_outputs, _, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
-    def build_decoded(self, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        decoded = super().build_decoded(per_request)
+    def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        decoded = super().build_decoded(req, per_request)
         # Surface the AR-generated text (best-effort; don't break rollout if
         # AR text extraction fails).
         try:
@@ -441,7 +458,11 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
 class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
     """Single-"image"-track response of the standalone HI3 DiT (Stage 0)."""
 
-    def conditions(self, diff_outputs: List[OmniRawResult]) -> Dict[str, Any]:
+    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        del req
+        diff_outputs, _, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
 
@@ -616,7 +637,7 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
             stages=("ar",),
             carries_target_size=True,
         )
-        self.output_adapter = Hi3TextOutputAdapter(self.modality, conditions=hi3_ar_fused_conditions)
+        self.output_adapter = Hi3ArRecaptionOutputAdapter(self.modality)
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
         return self.input_adapter.build(req)
@@ -652,6 +673,7 @@ class Hi3DitRecaptionAdapter(ModelAdapter):
 
 __all__ = [
     "Hi3ArRecaptionAdapter",
+    "Hi3ArRecaptionOutputAdapter",
     "Hi3DitRecaptionAdapter",
     "Hi3DitRecaptionInputAdapter",
     "Hi3DitRecaptionOutputAdapter",
