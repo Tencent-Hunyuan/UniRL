@@ -27,7 +27,7 @@
 # Pairs with unirl/train_pe.py:
 #   python -m unirl.train_pe --config-name pe_sglang_full_pickscore
 #
-# Format mirrors recipes/pe_rl/pe_trainside_pickscore.yaml (v2). Set checkpoint paths via
+# Format mirrors examples/pe/pe_trainside_pickscore.yaml (v2). Set checkpoint paths via
 # the PRETRAINED_MODEL / LLM_MODEL env vars (see ${oc.env:...} defaults below).
 #
 # batch_size MUST be divisible by num_devices — the composed rollout dispatches
