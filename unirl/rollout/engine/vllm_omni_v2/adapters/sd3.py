@@ -11,10 +11,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+import torch
+
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni_v2.utils import build_sd3_text_condition, collect_dit_outputs
+from unirl.rollout.engine.vllm_omni_v2.utils import collect_dit_outputs
+from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 
@@ -23,12 +26,20 @@ class Sd3OutputAdapter(DitOutputAdapter):
     """Single-"image"-track response with the SD3 text-capture conditions."""
 
     def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """Concat the per-request SD3 ``text_capture`` dicts into one condition.
+
+        Written by ``RLStableDiffusion3Pipeline`` after intercepting
+        ``encode_prompt``. All per-request encodes share the same ``L`` (T5
+        padding to ``max_sequence_length`` is fixed), so a plain dim-0 concat
+        suffices.
+        """
         del req
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        text_cond = build_sd3_text_condition(diff_outputs)
-        if text_cond is None:
+
+        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        if any(c is None for c in captures):
             raise RuntimeError(
                 "build_response: SD3 rollout returned no 'text_capture' on "
                 "DiffusionOutput.custom_output. Check that "
@@ -37,6 +48,12 @@ class Sd3OutputAdapter(DitOutputAdapter):
                 "effect (verify custom_pipeline_args.pipeline_class in the "
                 "stage YAML)."
             )
+
+        text_cond = TextEmbedCondition(
+            embeds=torch.cat([c["prompt_embeds"] for c in captures], dim=0),
+            pooled=torch.cat([c["pooled_prompt_embeds"] for c in captures], dim=0),
+            attn_mask=None,  # SD3 uses fixed-length T5 padding; no attn mask needed
+        )
         return {"text": text_cond}
 
 

@@ -9,16 +9,15 @@ the shared :class:`~.dit.DitInputAdapter` adding the video-only
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+import torch
 
 from unirl.rollout.engine.vllm_omni_v2.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni_v2.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni_v2.backends import GenerateCall, OmniRawResult, StageSampling
-from unirl.rollout.engine.vllm_omni_v2.utils import (
-    build_hv15_conditions,
-    collect_dit_outputs,
-    grouped_pils_to_videos,
-)
+from unirl.rollout.engine.vllm_omni_v2.utils import collect_dit_outputs, grouped_pils_to_videos
+from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 from unirl.types.sampling import get_diffusion_params
@@ -55,6 +54,15 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
     track_name = "video"
     final_output_type = "video"
 
+    _MISSING_CAPTURE_MSG = (
+        "build_response: HV1.5 t2v rollout returned no 'text_capture' "
+        "on DiffusionOutput.custom_output (or it lacked the dual-stream "
+        "text_mllm/text_glyph embeds). Check that "
+        "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
+        "worker — verify custom_pipeline_args.pipeline_class in the stage "
+        "YAML."
+    )
+
     def build_decoded(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         del req
         _, frame_groups, _ = collect_dit_outputs(
@@ -63,21 +71,58 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         return {self.track_name: grouped_pils_to_videos(frame_groups)}
 
     def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+        """Unpack the per-request HV1.5 dual-stream text conditions.
+
+        Written by ``RLHunyuanVideo15Pipeline`` after intercepting
+        ``encode_prompt`` — 8 tensors from the dual text encoder (Qwen2.5-VL
+        MLLM + ByT5 glyph), mapped to ``text_mllm`` / ``text_glyph``
+        (+ negatives). Returns the conditions *dict* (keys aligned with
+        ``HunyuanVideo15Conditions.from_dict``), NOT the typed wrapper — the
+        trainer runs ``from_dict(track.conditions)`` itself.
+        """
         del req
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        hv_conds = build_hv15_conditions(diff_outputs)
-        if hv_conds is None:
-            raise RuntimeError(
-                "build_response: HV1.5 t2v rollout returned no 'text_capture' "
-                "on DiffusionOutput.custom_output (or it lacked the dual-stream "
-                "text_mllm/text_glyph embeds). Check that "
-                "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
-                "worker — verify custom_pipeline_args.pipeline_class in the stage "
-                "YAML."
+
+        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        if any(c is None for c in captures):
+            raise RuntimeError(self._MISSING_CAPTURE_MSG)
+
+        def _cat_field(field_name: str) -> Optional[torch.Tensor]:
+            tensors = [c[field_name] for c in captures if c.get(field_name) is not None]
+            if not tensors:
+                return None
+            return torch.cat(tensors, dim=0)
+
+        prompt_embeds = _cat_field("prompt_embeds")
+        prompt_embeds_mask = _cat_field("prompt_embeds_mask")
+        prompt_embeds_2 = _cat_field("prompt_embeds_2")
+        prompt_embeds_mask_2 = _cat_field("prompt_embeds_mask_2")
+        negative_prompt_embeds = _cat_field("negative_prompt_embeds")
+        negative_prompt_embeds_mask = _cat_field("negative_prompt_embeds_mask")
+        negative_prompt_embeds_2 = _cat_field("negative_prompt_embeds_2")
+        negative_prompt_embeds_mask_2 = _cat_field("negative_prompt_embeds_mask_2")
+
+        cond_dict: Dict[str, Any] = {}
+        if prompt_embeds is not None:
+            cond_dict["text_mllm"] = TextEmbedCondition(embeds=prompt_embeds, pooled=None, attn_mask=prompt_embeds_mask)
+        if prompt_embeds_2 is not None:
+            cond_dict["text_glyph"] = TextEmbedCondition(
+                embeds=prompt_embeds_2, pooled=None, attn_mask=prompt_embeds_mask_2
             )
-        return dict(hv_conds)
+        if negative_prompt_embeds is not None:
+            cond_dict["negative_text_mllm"] = TextEmbedCondition(
+                embeds=negative_prompt_embeds, pooled=None, attn_mask=negative_prompt_embeds_mask
+            )
+        if negative_prompt_embeds_2 is not None:
+            cond_dict["negative_text_glyph"] = TextEmbedCondition(
+                embeds=negative_prompt_embeds_2, pooled=None, attn_mask=negative_prompt_embeds_mask_2
+            )
+
+        if "text_mllm" not in cond_dict or "text_glyph" not in cond_dict:
+            raise RuntimeError(self._MISSING_CAPTURE_MSG)
+        return cond_dict
 
 
 @register_adapter("hv15_t2v")

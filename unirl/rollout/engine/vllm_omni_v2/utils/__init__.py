@@ -6,12 +6,6 @@ with canned wire data (``SimpleNamespace`` fakes of the seam's
 input/output sub-adapters; these are the mechanics they lean on.
 """
 
-from unirl.rollout.engine.vllm_omni_v2.utils.conditions import (
-    build_ar_fused_condition,
-    build_fused_mm_condition,
-    build_hv15_conditions,
-    build_sd3_text_condition,
-)
 from unirl.rollout.engine.vllm_omni_v2.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni_v2.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni_v2.utils.prompts import (
@@ -33,12 +27,8 @@ from unirl.rollout.engine.vllm_omni_v2.utils.tracks import (
 
 __all__ = [
     "assemble_tracks",
-    "build_ar_fused_condition",
     "build_ar_segment",
-    "build_fused_mm_condition",
-    "build_hv15_conditions",
     "build_image_segment",
-    "build_sd3_text_condition",
     "collect_dit_outputs",
     "core_diff_kwargs",
     "decoded_text_from_ar",
