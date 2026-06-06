@@ -34,10 +34,9 @@ class _Dance:
     canonical_name = "dance"
 
 
-def _cfg(*, populate_conditions=True, logprob_source="replay", target_modules=None):
+def _cfg(*, populate_conditions=True, target_modules=None):
     return SimpleNamespace(
         populate_conditions=populate_conditions,
-        logprob_source=logprob_source,
         target_modules=target_modules,
     )
 
@@ -335,7 +334,7 @@ def test_base_image_adapter_rejects_4d_trajectory():
     req = _req(["p"])
     results = [_result(torch.randn(1, 3, 4, 8), req.sigmas)]
     with pytest.raises(ValueError, match="expected a 5-D image-form trajectory"):
-        a.build_segment(req, results, num_steps=2, sde_indices=None, use_native_logprob=False)
+        a.build_segment(req, results, num_steps=2, sde_indices=None, emit_native_logprob=False)
 
 
 def test_klein_passes_through_5d():
@@ -344,7 +343,7 @@ def test_klein_passes_through_5d():
     req = _req(["p"])
     traj = torch.randn(1, 3, 2, 4, 4)
     seg = a.build_segment(
-        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
     )
     assert torch.equal(seg.latents, traj)
 
@@ -357,7 +356,7 @@ def test_klein_unpacks_packed_4d():
     B, T, S, C = 1, 3, 4, 8
     traj = torch.randn(B, T, S, C)
     seg = a.build_segment(
-        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
     )
     assert seg.latents.shape == (B, T, C, 2, 2)
 
@@ -369,7 +368,7 @@ def test_klein_rejects_token_count_mismatch():
     traj = torch.randn(1, 3, 9, 8)  # S = 9 ≠ 4
     with pytest.raises(ValueError, match="packed token count"):
         a.build_segment(
-            req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+            req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
         )
 
 

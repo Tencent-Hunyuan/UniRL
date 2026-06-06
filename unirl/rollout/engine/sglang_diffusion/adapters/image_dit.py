@@ -190,14 +190,18 @@ class ImageDiTAdapter(ModelAdapter):
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
-        use_native_logprob = self.cfg.logprob_source == "native" and sde_indices is not None
+        # Best-effort native log-prob emission: only meaningful when the algorithm
+        # requested SDE steps (NFT / forward-process resolves sde_indices to []).
+        # Whether the emitted anchor is *used* or recomputed is the training
+        # layer's call (``algorithm.old_logp_source``), not an engine flag.
+        emit_native_logprob = sde_indices is not None and len(sde_indices) > 0
 
         segment = self.build_segment(
             req,
             raw,
             num_steps=num_steps,
             sde_indices=sde_indices,
-            use_native_logprob=use_native_logprob,
+            emit_native_logprob=emit_native_logprob,
         )
         decoded = self.build_decoded(raw)
 
@@ -228,7 +232,7 @@ class ImageDiTAdapter(ModelAdapter):
         *,
         num_steps: int,
         sde_indices: Optional[List[int]],
-        use_native_logprob: bool,
+        emit_native_logprob: bool,
     ):
         """Latent-trajectory stage: collect, gate the 5-D image-form shape, assemble.
 
@@ -249,7 +253,7 @@ class ImageDiTAdapter(ModelAdapter):
             expected_sigmas=req.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
-            use_native_logprob=use_native_logprob,
+            emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
 

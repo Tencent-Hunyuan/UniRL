@@ -100,9 +100,6 @@ rollout:
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: sd3
-    # REPLAY mode: engine returns trajectories without log-probs; trainer
-    # recomputes them via stage.replay at update time. Diverges from native.
-    logprob_source: replay
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
     # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
@@ -143,6 +140,9 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via stage.replay at update
+  # time (engine emits trajectories; its native log-probs, if any, are ignored).
+  old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.sd3.conditions.SD3Conditions

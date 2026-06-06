@@ -70,7 +70,7 @@ def _req(*, seed=42, steps=4):
 
 def _build_v2(ports: SGLangDiffusionPorts | None = None):
     cfg = SGLangDiffusionEngineConfig(
-        sampling=None, model_family="sd3", logprob_source="replay",
+        sampling=None, model_family="sd3",
         populate_conditions=True, local_mode=True,
     )
     return SGLangDiffusionRolloutEngine(
@@ -81,7 +81,7 @@ def _build_v2(ports: SGLangDiffusionPorts | None = None):
 
 def _build_v1():
     cfg = SGLangEngineConfig(
-        sampling=None, model_family="sd3", logprob_source="replay",
+        sampling=None, model_family="sd3",
         populate_conditions=True, local_mode=True,
     )
     return SGLangRolloutEngine(

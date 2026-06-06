@@ -1,4 +1,5 @@
-"""``sglang_diffusion`` engine config — registered under ``rollout/engine: sglang_diffusion``.
+"""``sglang_diffusion`` engine config — wired by ``_target_``; the rollout actor
+constructs the engine via :meth:`SGLangDiffusionEngineConfig.make_engine`.
 
 Ported from the legacy ``SGLangEngineConfig`` minus all port/placement math: the
 engine reserves its own :class:`SGLangDiffusionPorts` at boot, so there is no
@@ -19,12 +20,9 @@ from typing import Any, Dict, Optional, Tuple
 
 from omegaconf import SI
 
-from unirl.config.registration import register_config
 from unirl.config.require import require
 from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
-
-_VALID_LOGPROB_SOURCES = ("replay", "native")
 
 
 @dataclass(frozen=True)
@@ -45,14 +43,14 @@ class SGLangDiffusionPorts(ReservedPorts):
     master_port: int
 
 
-@register_config(
-    group="rollout/engine",
-    name="sglang_diffusion",
-    target="unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine",
-)
 @dataclass
 class SGLangDiffusionEngineConfig(BaseEngineConfig):
     """Configuration for the ``sglang_diffusion`` rollout engine."""
+
+    def make_engine(self, **deps: Any):
+        from unirl.rollout.engine.sglang_diffusion.engine import SGLangDiffusionRolloutEngine
+
+        return SGLangDiffusionRolloutEngine(config=self, **deps)
 
     # --- Sampling (live interpolation back to top-level cfg.sampling) ---
     sampling: Any = dc_field(default_factory=lambda: SI("${sampling}"))
@@ -65,9 +63,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
     # --- Engine-internal noise fallback (only when caller didn't pre-ship latents) ---
     init_same_noise: bool = False
-
-    # --- Log-prob policy ---
-    logprob_source: str = "replay"
 
     # --- Parallelism & GPU ---
     num_gpus: int = 1
@@ -110,12 +105,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"{set(valid_families)}; got {self.model_family!r}",
         )
 
-        self.logprob_source = str(self.logprob_source or "replay").strip().lower()
-        require(
-            self.logprob_source in _VALID_LOGPROB_SOURCES,
-            f"SGLangDiffusionEngineConfig.logprob_source must be one of "
-            f"{set(_VALID_LOGPROB_SOURCES)}; got {self.logprob_source!r}",
-        )
         require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
         require(
             self.tp_size is None or self.tp_size >= 1,

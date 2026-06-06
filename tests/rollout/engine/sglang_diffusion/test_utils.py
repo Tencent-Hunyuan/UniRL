@@ -133,7 +133,7 @@ def test_build_latent_segment_basic_image():
         expected_sigmas=sigmas,
         num_steps=2,
         sde_indices=None,
-        use_native_logprob=False,
+        emit_native_logprob=False,
     )
     assert seg.latents.shape == (2, 3, 2, 4, 4)
     assert torch.equal(seg.sigmas, sigmas)
@@ -153,7 +153,7 @@ def test_build_latent_segment_selective_trim():
         expected_sigmas=sigmas,
         num_steps=num_steps,
         sde_indices=sde_indices,
-        use_native_logprob=False,
+        emit_native_logprob=False,
     )
     expected_keep = sorted(set(compute_trajectory_positions({1}, num_steps)) | {num_steps})
     expected_keep = [p for p in expected_keep if 0 <= p < num_steps + 1]
@@ -174,9 +174,26 @@ def test_build_latent_segment_native_logprob():
         expected_sigmas=sigmas,
         num_steps=4,
         sde_indices=[1],
-        use_native_logprob=True,
+        emit_native_logprob=True,
     )
     assert seg.sde_logp is not None and seg.sde_logp.shape == (2, 1)
+
+
+def test_build_latent_segment_native_logprob_missing_degrades_to_none():
+    # Best-effort emission: a build that returns no per-step log-probs yields
+    # sde_logp=None (trainer decides — replay recomputes, native raises there).
+    sigmas = torch.linspace(1.0, 0.0, 5)
+    traj = _traj(1, 5)
+    res = [_result(trajectory_latents=traj, trajectory_timesteps=sigmas)]
+    seg = utils.build_latent_segment(
+        traj,
+        results=res,
+        expected_sigmas=sigmas,
+        num_steps=4,
+        sde_indices=[1],
+        emit_native_logprob=True,
+    )
+    assert seg.sde_logp is None
 
 
 def test_build_latent_segment_native_logprob_slices_full_schedule():
@@ -191,7 +208,7 @@ def test_build_latent_segment_native_logprob_slices_full_schedule():
         expected_sigmas=sigmas,
         num_steps=num_steps,
         sde_indices=[2],
-        use_native_logprob=True,
+        emit_native_logprob=True,
     )
     assert seg.sde_logp.shape == (1, 1)
     assert float(seg.sde_logp[0, 0]) == 2.0  # column 2 selected

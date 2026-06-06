@@ -87,7 +87,7 @@ def build_latent_segment(
     expected_sigmas: torch.Tensor,
     num_steps: int,
     sde_indices: Optional[List[int]],
-    use_native_logprob: bool,
+    emit_native_logprob: bool,
     segment_factory: Callable[..., LatentSegment] = make_image_segment,
 ) -> LatentSegment:
     """Pack an (already-unpacked) trajectory tensor into one batched ``LatentSegment``.
@@ -119,14 +119,15 @@ def build_latent_segment(
             indices_t = torch.tensor(keep_cols, dtype=torch.long)
 
     # sde_indices: always populated (trainer needs to know which steps to replay).
-    # sde_logp: only populated in native mode; replay mode recomputes trainer-side.
+    # sde_logp: best-effort native emission; whether it is used or recomputed is
+    # the training layer's call (``algorithm.old_logp_source``), not an engine flag.
     sde_indices_t: Optional[torch.Tensor] = (
         torch.tensor(list(sde_indices), dtype=torch.long)
         if sde_indices is not None
         else torch.arange(num_steps, dtype=torch.long)
     )
     sde_logp: Optional[torch.Tensor] = None
-    if use_native_logprob:
+    if emit_native_logprob:
         sde_logp = _native_sde_logp(
             results, num_steps=num_steps, sde_indices=sde_indices
         )
@@ -147,22 +148,24 @@ def _native_sde_logp(
     *,
     num_steps: int,
     sde_indices: Optional[List[int]],
-) -> torch.Tensor:
-    """Extract + reconcile SGLang's native ``trajectory_log_probs`` into ``[B, S]``."""
+) -> Optional[torch.Tensor]:
+    """Best-effort extract of SGLang's native ``trajectory_log_probs`` into ``[B, S]``.
+
+    Returns ``None`` when any result lacks per-step log-probs and lets the
+    trainer decide: replay (``algorithm.old_logp_source='replay'``) recomputes;
+    native raises trainer-side with an actionable message. The engine stays
+    silent — it can't know the intent, and for an intentional replay run a
+    missing emission is expected, not warning-worthy. Shape drift, by contrast,
+    is a hard error.
+    """
     per_result: List[Optional[torch.Tensor]] = [
         result.trajectory_log_probs.detach().cpu()
         if result.trajectory_log_probs is not None
         else None
         for result in results
     ]
-    missing = [i for i, lp in enumerate(per_result) if lp is None]
-    if missing:
-        raise RuntimeError(
-            f"logprob_source='native' but SGLang did not return usable "
-            f"trajectory_log_probs for {len(missing)}/{len(results)} result(s) "
-            f"(first missing index={missing[0]}). Pin a SGLang build that emits "
-            f"trajectory_log_probs of shape [B, T] or switch logprob_source='replay'."
-        )
+    if any(lp is None for lp in per_result):
+        return None
     log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
     # [B, T] (one entry per SDE transition). When sde_indices is a subset but the
     # server emitted the full schedule, slice down to the requested transitions.

@@ -7,10 +7,9 @@
 # with Klein knobs (DanceSDE, empirical-mu, klein LoRA).
 #
 # SGLang = rollout runs in a separate per-actor worker process (DiffGenerator),
-# weight-synced from the trainer via LoRA. logprob_source=replay: the engine
-# returns trajectories without log-probs; the trainer recomputes them via
-# Flux2KleinDiffusionStage.replay at update time (so the SGLang fork does NOT
-# need to emit trajectory_log_probs).
+# weight-synced from the trainer via LoRA. algorithm.old_logp_source=replay: the
+# trainer recomputes the π_old anchor via Flux2KleinDiffusionStage.replay at
+# update time (so the SGLang fork does NOT need to emit trajectory_log_probs).
 #
 # Upstream SGLang fork prerequisites (engine fails fast otherwise):
 #   1. FLUX.2-klein pipeline registered so DiffGenerator.from_pretrained can
@@ -167,9 +166,6 @@ rollout:
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: flux2_klein
-    # REPLAY mode: engine returns trajectories without log-probs; trainer
-    # recomputes them via Flux2KleinDiffusionStage.replay at update time.
-    logprob_source: replay
     # SGLang's Klein pipeline emits the Qwen3-layer-concat prompt_embeds;
     # populate_conditions packs them into TextEmbedCondition so trainer-side
     # replay sees the same conditions as rollout (no fallback path).
@@ -230,6 +226,10 @@ algorithm:
   stage_attr: diffusion
   clip_range: 5.0e-3
   clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via
+  # Flux2KleinDiffusionStage.replay at update time (engine emits trajectories;
+  # its native log-probs, if any, are ignored).
+  old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.flux2_klein.conditions.Flux2KleinConditions

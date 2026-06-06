@@ -55,7 +55,7 @@ class Flux2KleinAdapter(ImageDiTAdapter):
         *,
         num_steps: int,
         sde_indices: Optional[List[int]],
-        use_native_logprob: bool,
+        emit_native_logprob: bool,
     ):
         """Stage override: unpack Klein's packed trajectory before segment assembly."""
         traj = utils.collect_trajectory_latents(results)
@@ -66,7 +66,7 @@ class Flux2KleinAdapter(ImageDiTAdapter):
             expected_sigmas=req.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
-            use_native_logprob=use_native_logprob,
+            emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
 

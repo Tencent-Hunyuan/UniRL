@@ -88,13 +88,12 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
 
         logger.info(
             "Initializing sglang_diffusion engine (rank=%s, local_mode=%s, "
-            "model_family=%s, target_modules=%s, populate_conditions=%s, logprob_source=%s)",
+            "model_family=%s, target_modules=%s, populate_conditions=%s)",
             rank,
             config.local_mode,
             config.model_family,
             target_modules,
             config.populate_conditions,
-            config.logprob_source,
         )
 
         # Ports — engine-reserved on this node at the last moment before the spawn.
