@@ -185,6 +185,12 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             guidance_value = guidance_scale if distilled_guidance_scale is None else float(distilled_guidance_scale)
             guidance = torch.tensor([guidance_value], device=device, dtype=torch.float32).expand(batch_size)
 
+        # Per-sample true text lengths — the RoPE builder slices its text
+        # frequency table by ``max(txt_seq_lens)`` (required positionally by
+        # the installed diffusers; passing only the attention mask raises
+        # ``max(None)`` TypeError — LIN-382 qwen probe-e).
+        txt_seq_lens = prompt_embeds_mask.sum(dim=1).to(torch.long).tolist()
+
         noise_pred_packed = model.transformer(
             hidden_states=packed,
             timestep=timestep,
@@ -192,6 +198,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             encoder_hidden_states_mask=prompt_embeds_mask,
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
+            txt_seq_lens=txt_seq_lens,
             return_dict=False,
         )[0]
 
@@ -200,6 +207,11 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             if neg is not None and neg.embeds is not None:
                 negative_prompt_embeds = neg.embeds
                 negative_prompt_embeds_mask = neg.attn_mask
+                negative_txt_seq_lens = (
+                    negative_prompt_embeds_mask.sum(dim=1).to(torch.long).tolist()
+                    if negative_prompt_embeds_mask is not None
+                    else None
+                )
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,
@@ -207,6 +219,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
                     encoder_hidden_states_mask=negative_prompt_embeds_mask,
                     encoder_hidden_states=negative_prompt_embeds,
                     img_shapes=img_shapes,
+                    txt_seq_lens=negative_txt_seq_lens,
                     return_dict=False,
                 )[0]
                 # Combined-CFG with norm correction. Spec: keep the per-token
