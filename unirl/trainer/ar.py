@@ -165,6 +165,7 @@ class ARTrainer(BaseTrainer):
                     normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
                 )
 
+        self._dump_rollout_samples(req, resp, rollout_id)
         self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
         # verl balance_batch parity: reorder so each DP shard gets a near-equal
@@ -230,6 +231,48 @@ class ARTrainer(BaseTrainer):
         )
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
         return acc
+
+    def _dump_rollout_samples(self, req, resp, rollout_id: int) -> None:
+        """Debug dump of the first N (prompt, output, reward) triples per rollout.
+
+        Off unless ``ROLLOUT_DUMP_DIR`` is set (driver-side env). Writes one
+        ``rollout_<id>.jsonl`` per rollout (``ROLLOUT_DUMP_N`` samples, default
+        4) so rollout-engine quality can be eyeballed without keeping the full
+        decoded batch alive. Must run BEFORE ``_drop_decoded``. Never raises.
+        (Ported from the b182a511 LIN-371 lineage — lost in the rebase.)
+        """
+        import json
+        import os
+
+        out_dir = os.environ.get("ROLLOUT_DUMP_DIR", "")
+        if not out_dir:
+            return
+        try:
+            n = int(os.environ.get("ROLLOUT_DUMP_N", "4"))
+            prompts = getattr(req.primitives.get("text"), "texts", None) or []
+            (track,) = resp.tracks.values()
+            outputs = getattr(track.decoded, "texts", None) or []
+            rewards = track.rewards.to(torch.float32).tolist() if track.rewards is not None else []
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                for i in range(min(n, len(outputs))):
+                    f.write(
+                        json.dumps(
+                            {
+                                "rollout": int(rollout_id),
+                                "sample": i,
+                                "prompt": prompts[i] if i < len(prompts) else None,
+                                "output": outputs[i],
+                                "output_chars": len(outputs[i] or ""),
+                                "reward": rewards[i] if i < len(rewards) else None,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+        except Exception as exc:  # debug path — never let it kill training
+            logger.warning("rollout sample dump failed: %s", exc)
 
     def train(
         self,
