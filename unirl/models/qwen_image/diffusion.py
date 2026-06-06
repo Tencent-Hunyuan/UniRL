@@ -188,8 +188,18 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         # Per-sample true text lengths — the RoPE builder slices its text
         # frequency table by ``max(txt_seq_lens)`` (required positionally by
         # the installed diffusers; passing only the attention mask raises
-        # ``max(None)`` TypeError — LIN-382 qwen probe-e).
-        txt_seq_lens = prompt_embeds_mask.sum(dim=1).to(torch.long).tolist()
+        # ``max(None)`` TypeError — LIN-382 qwen probe-e). The embeds must be
+        # trimmed to this slice's true max first: replay microbatches carry
+        # the BATCH-wide pad width (e.g. 18) while their own max true length
+        # may be shorter (12) — diffusers applies RoPE over the full tensor
+        # width and the freq slice over max(txt_seq_lens), so a width
+        # mismatch hard-crashes in apply_rotary_emb_qwen (probe-f).
+        true_lens = prompt_embeds_mask.sum(dim=1).to(torch.long)
+        max_true = int(true_lens.max().item())
+        if prompt_embeds.shape[1] > max_true:
+            prompt_embeds = prompt_embeds[:, :max_true]
+            prompt_embeds_mask = prompt_embeds_mask[:, :max_true]
+        txt_seq_lens = true_lens.tolist()
 
         noise_pred_packed = model.transformer(
             hidden_states=packed,
@@ -207,11 +217,14 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             if neg is not None and neg.embeds is not None:
                 negative_prompt_embeds = neg.embeds
                 negative_prompt_embeds_mask = neg.attn_mask
-                negative_txt_seq_lens = (
-                    negative_prompt_embeds_mask.sum(dim=1).to(torch.long).tolist()
-                    if negative_prompt_embeds_mask is not None
-                    else None
-                )
+                negative_txt_seq_lens = None
+                if negative_prompt_embeds_mask is not None:
+                    neg_true = negative_prompt_embeds_mask.sum(dim=1).to(torch.long)
+                    neg_max = int(neg_true.max().item())
+                    if negative_prompt_embeds.shape[1] > neg_max:
+                        negative_prompt_embeds = negative_prompt_embeds[:, :neg_max]
+                        negative_prompt_embeds_mask = negative_prompt_embeds_mask[:, :neg_max]
+                    negative_txt_seq_lens = neg_true.tolist()
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,
