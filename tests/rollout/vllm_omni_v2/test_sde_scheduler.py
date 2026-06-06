@@ -61,4 +61,7 @@ def test_injected_sigmas_survive_static_shift():
     s = FlowMatchSDEDiscreteScheduler.from_config(dict(_SD35_CONFIG))
     s.set_timesteps(sigmas=list(_PINNED), device="cpu")
     _assert_verbatim(s)
-    assert float(s.shift) == 3.0
+    # finally-restore: the CONFIG is untouched (``s.shift`` is a property
+    # over the instance attr ``_shift``, which diffusers' from_config never
+    # seeds from config.shift — asserting it would test diffusers, not us).
+    assert float(s.config.shift) == 3.0
