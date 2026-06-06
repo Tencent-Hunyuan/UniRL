@@ -2,7 +2,7 @@
 
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes the
 backend and the LoRA spec explicitly and owns all sync/LoRA state
-(``_lora_version`` / ``_lora_loaded`` / ``_active_adapter``). Method names mirror
+(``_lora_loaded`` / ``_active_adapter``). Method names mirror
 the frozen ``base.py`` surface minus ``track_prefix`` (the engine's forwards absorb
 that, along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
 trainer-side entry point lands here.
@@ -50,7 +50,6 @@ class WeightSync:
         self._uses_lora = uses_lora
         self._active_adapter: Optional[str] = None
         self._lora_loaded = False
-        self._lora_version = 0
 
     # ------------------------------------------------------------------ #
     # Tensor-bag (SGLang one-bag payload per TP rank)
@@ -121,7 +120,7 @@ class WeightSync:
         self._backend.destroy_weights_group(group_name=str(group_name))
 
     # ------------------------------------------------------------------ #
-    # LoRA tensor bag — wire-key adaptation + versioned-nickname rotation
+    # LoRA tensor bag — wire-key adaptation
     # ------------------------------------------------------------------ #
 
     def set_lora_from_tensors(
@@ -133,9 +132,13 @@ class WeightSync:
     ) -> None:
         """Push a LoRA adapter from in-memory tensors.
 
-        Versioned nicknames (``<name>_v<N>``) avoid serving stale LoRA weights:
-        SGLang caches adapters by nickname, so re-loading the same name can keep
-        the old tensors (mirrors the ``sglang_llm`` rotation).
+        The nickname is ``adapter_name`` verbatim on every push: SGLang's
+        diffusion ``_register_lora_state_dict`` clears and replaces the registry
+        entry for a re-used nickname and ``set_lora`` always reloads from
+        tensors, so same-name pushes serve fresh weights. Versioned nicknames
+        (the ``sglang_llm`` rotation) leak here instead — the diffusion
+        ``lora_adapters`` registry never evicts other nicknames, so each sync
+        would strand one GPU-resident adapter copy (~34 MB/sync measured).
         """
         # Canonical wire keys are "<pipeline_prefix><module>.lora_A.weight"; SGLang's
         # lora_layers dict is keyed from inside the transformer, so strip the prefix
@@ -145,7 +148,7 @@ class WeightSync:
             pipeline_prefix=self._pipeline_prefix,
             peft_config=peft_config,
         )
-        nickname = self._next_lora_nickname(adapter_name)
+        nickname = adapter_name
         self._backend.set_lora(lora_nickname=nickname, lora_tensors=stripped)
         self._active_adapter = nickname
         self._lora_loaded = True
@@ -166,10 +169,6 @@ class WeightSync:
             nickname,
             len(layer_names),
         )
-
-    def _next_lora_nickname(self, adapter_name: str) -> str:
-        self._lora_version += 1
-        return f"{adapter_name}_v{self._lora_version}"
 
     # ------------------------------------------------------------------ #
     # Checksum query (vllm-omni-shape return)

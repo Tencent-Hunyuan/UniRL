@@ -3,8 +3,8 @@
 The seam is a recording fake; no SGLang, no GPU. Two layers:
 
 - **component**: ``WeightSync`` constructed directly (explicit ctor — no host class
-  to fake): forwarding + defaults, LoRA strip/alpha/rotation, the dirty flag,
-  checksum reshaping.
+  to fake): forwarding + defaults, LoRA strip/alpha/nickname stability, the dirty
+  flag, checksum reshaping.
 - **engine orchestration**: a bare real engine (``object.__new__``) wired with the
   fake seam + a real ``WeightSync``: sleep/wake state, the weights-released event
   (sleep → ``lora_dirty``), and one forward smoke for the frozen-surface wiring.
@@ -98,7 +98,7 @@ def test_update_from_distributed_rejects_empty_names():
 
 
 # --------------------------------------------------------------------------- #
-# component: LoRA — prefix strip + alpha inject + version rotation + dirty flag
+# component: LoRA — prefix strip + alpha inject + stable nickname + dirty flag
 # --------------------------------------------------------------------------- #
 
 
@@ -110,19 +110,22 @@ def _lora_tensors():
     }
 
 
-def test_set_lora_strips_prefix_injects_alpha_and_rotates():
+def test_set_lora_strips_prefix_injects_alpha_keeps_nickname_stable():
     ws = _ws()
     ws.set_lora_from_tensors("default", _lora_tensors(), peft_config={"lora_alpha": 16})
     call = ws._backend.named("set_lora")[0]
-    assert call["lora_nickname"] == "default_v1"
+    assert call["lora_nickname"] == "default"
     sent = call["lora_tensors"]
     assert "attn.to_q.lora_A.weight" in sent  # prefix stripped
     assert "attn.to_q.alpha" in sent          # alpha injected
-    assert ws._active_adapter == "default_v1"
+    assert ws._active_adapter == "default"
 
-    # second push rotates the nickname (avoids serving stale weights)
+    # second push re-uses the SAME nickname: SGLang's diffusion registry clears
+    # and replaces the entry in place, so fresh weights are served. A versioned
+    # nickname per push (the sglang_llm rotation) leaks one never-evicted
+    # GPU-resident adapter copy per sync instead.
     ws.set_lora_from_tensors("default", _lora_tensors(), peft_config={"lora_alpha": 16})
-    assert ws._backend.named("set_lora")[1]["lora_nickname"] == "default_v2"
+    assert ws._backend.named("set_lora")[1]["lora_nickname"] == "default"
 
 
 def test_lora_dirty_lifecycle():

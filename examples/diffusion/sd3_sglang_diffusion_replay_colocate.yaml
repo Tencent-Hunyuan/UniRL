@@ -12,6 +12,7 @@
 
 num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
 batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 num_rollouts: 10000
 
 # Shared nodes: model_config + strategy defined once, referenced by
@@ -152,6 +153,7 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
@@ -186,6 +188,6 @@ weight_sync_interval: 1
 
 sync:
   _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
-  verify: true
+  verify: false  # SGLang engine lacks loaded_lora_checksums (only loaded_param_checksums); skip read-back
   param_prefix: "transformer."
   adapter_name: default
