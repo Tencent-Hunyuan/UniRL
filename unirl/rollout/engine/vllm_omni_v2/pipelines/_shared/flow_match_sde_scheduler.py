@@ -112,6 +112,24 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         self._sde_indices_set: Optional[frozenset] = None
 
     # ------------------------------------------------------------------
+    # Per-request arming
+    # ------------------------------------------------------------------
+
+    def arm(self, *, eta: float, sde_indices: Optional[List[int]] = None) -> None:
+        """Per-request arming: SDE strength + the sparse step gate.
+
+        MUST re-fire on every pipeline ``forward`` — the gate is per-request
+        state on a long-lived scheduler, and a stale set from a previous
+        request would silently mis-gate SDE steps. ``sde_indices=None``
+        disarms the gate (pure ODE; dense trajectory capture still runs).
+        Counterpart of :meth:`drain_trajectory` on the harvest side.
+        """
+        if eta < 0.0:
+            raise ValueError(f"FlowMatchSDEDiscreteScheduler.arm: eta must be >= 0; got eta={eta!r}.")
+        self._eta = float(eta)
+        self._sde_indices_set = frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
+
+    # ------------------------------------------------------------------
     # Schedule lifecycle
     # ------------------------------------------------------------------
 

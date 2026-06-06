@@ -1,17 +1,22 @@
-"""RL-aware HunyuanVideo-1.5 pipeline subclass for vllm-omni.
+"""RL-aware HunyuanVideo-1.5 pipeline subclass.
 
-Three behaviors on top of upstream ``HunyuanVideo15Pipeline``
+``forward`` follows the RL interception protocol (see
+``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
+request) → run (upstream) → **harvest**. The interceptions, mapped to
+upstream's stages
 (``vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5.py``):
 
-1. Before the denoise loop: install :class:`FlowMatchSDEDiscreteScheduler`
-   in place of the upstream scheduler (captures dense latent trajectory for
-   SDE log-prob replay on the trainer side; at eta=0 degenerates to ODE).
-2. After the denoise loop: drain trajectory (latents, sigmas, log_probs)
-   off the scheduler and stamp into ``DiffusionOutput.trajectory_*``.
-3. Capture dual text-encoder embeddings (Qwen2.5-VL MLLM + ByT5 glyph)
-   from the first ``encode_prompt`` call and stamp into
-   ``DiffusionOutput.custom_output["text_capture"]`` for the trainer-side
-   ``HunyuanVideo15Conditions`` reconstruction.
+- SDE scheduler swap (behavior policy + dense-trajectory recorder) in place
+  of the upstream scheduler; installed regardless of eta — at eta=0 the SDE
+  math is dormant but the per-step ``prev_sample`` capture still fires
+  (``resp_to_samples`` requires ``segment.latents``).
+- A conditioning **tap** on ``encode_prompt``: captures the dual
+  text-encoder embeddings (Qwen2.5-VL MLLM + ByT5 glyph, 8 tensors) for the
+  trainer-side ``HunyuanVideo15Conditions`` reconstruction.
+- An initial-noise **injection** through the ``prepare_latents`` override
+  (driver-authored x_T slice or recipe row replaces upstream's RNG draw).
+- A σ-schedule **workaround**: upstream HV1.5 ignores
+  ``req.sampling_params.sigmas`` (see :meth:`_sigma_override`).
 
 This class is loaded inside vLLM-Omni's worker subprocess via
 ``custom_pipeline_args.pipeline_class`` injected from
@@ -20,7 +25,8 @@ This class is loaded inside vLLM-Omni's worker subprocess via
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional
 
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -32,66 +38,58 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from unirl.rollout.engine.vllm_omni_v2.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
 )
-from unirl.types.noise_recipe import NoiseRecipe
-
-
-def _detach_cpu(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Detach + move to CPU for IPC transport. None passthrough."""
-    if t is None:
-        return None
-    return t.detach().to("cpu")
+from unirl.rollout.engine.vllm_omni_v2.pipelines._shared.interception import (
+    detach_cpu,
+    drain_trajectory_into,
+    inject_latents,
+    make_sde_scheduler,
+    resolve_request_noise,
+    stamp_custom_output,
+)
 
 
 class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
-    """HunyuanVideo-1.5 pipeline with SDE trajectory + text-condition capture for RL rollout."""
+    """HunyuanVideo-1.5 pipeline with the RL interception protocol installed."""
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Stash upstream scheduler for SDE scheduler construction via from_config.
+        # Config donor for the SDE swap.
         self._upstream_scheduler = self.scheduler
-        # Text-encoder capture state: reset per-forward, filled on first encode_prompt call.
-        self._text_capture: Optional[Dict[str, Any]] = None
-        self._encode_prompt_patched: bool = False
-        # Per-request initial-noise hand-off (same pattern as SD3).
-        self._pending_request_noise: Optional[torch.Tensor] = None
+        # Conditioning-tap state: armed (reset) every request, filled by the
+        # tap's first call; the flag keeps the install idempotent.
+        self._captured_conditioning: Optional[Dict[str, Any]] = None
+        self._conditioning_tap_installed: bool = False
+        # Per-request x_T hand-off (same pattern as SD3).
+        self._pending_initial_noise: Optional[torch.Tensor] = None
 
-    def _ensure_scheduler_for_eta(self, eta: float) -> None:
-        """Install our trajectory-capturing scheduler unconditionally.
+    # ------------------------------------------------------------------ #
+    # install — once per pipeline lifetime, idempotent
+    # ------------------------------------------------------------------ #
 
-        Even at eta=0, we need the scheduler installed to capture the dense
-        latent trajectory (required by ``resp_to_samples``). The SDE math is
-        dormant when no step is SDE-gated; the per-step ``prev_sample``
-        capture still fires.
-        """
+    def _install_sde_scheduler(self) -> None:
+        """Swap in the trajectory-capturing SDE scheduler (from_config keeps
+        the upstream schedule parameters). Per-request eta rides ``_arm_sde``."""
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
-            self.scheduler._eta = float(eta)
             return
-        sde = FlowMatchSDEDiscreteScheduler.from_config(
-            self._upstream_scheduler.config,
-            eta=float(eta),
-        )
-        self.scheduler = sde
+        self.scheduler = make_sde_scheduler(self._upstream_scheduler.config)
 
-    def _install_encode_prompt_hook(self) -> None:
-        """Wrap ``encode_prompt`` to capture dual text-encoder embeddings.
+    def _install_conditioning_tap(self) -> None:
+        """Wrap ``encode_prompt`` to capture the dual text-encoder embeddings.
 
-        HunyuanVideo-1.5 returns 8 values from encode_prompt:
-          (prompt_embeds, prompt_embeds_mask,
-           prompt_embeds_2, prompt_embeds_mask_2,
-           negative_prompt_embeds, negative_prompt_embeds_mask,
-           negative_prompt_embeds_2, negative_prompt_embeds_mask_2)
-
-        We capture the first 4 (positive branch) on the first call per request.
+        HunyuanVideo-1.5 returns 8 values from ``encode_prompt``:
+        ``(prompt_embeds, prompt_embeds_mask, prompt_embeds_2,
+        prompt_embeds_mask_2, negative_*, …)``. First-call-only per request
+        (the buffer is re-armed each ``forward``).
         """
-        if self._encode_prompt_patched:
+        if self._conditioning_tap_installed:
             return
 
         orig = self.encode_prompt
         pipeline_self = self
 
-        def wrapped(*args: Any, **kw: Any) -> Any:
+        def tapped(*args: Any, **kw: Any) -> Any:
             result = orig(*args, **kw)
-            if pipeline_self._text_capture is None:
+            if pipeline_self._captured_conditioning is None:
                 (
                     prompt_embeds,
                     prompt_embeds_mask,
@@ -102,164 +100,123 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
                     neg_embeds_2,
                     neg_mask_2,
                 ) = result
-                pipeline_self._text_capture = {
+                pipeline_self._captured_conditioning = {
                     # MLLM (Qwen2.5-VL) text encoder output
-                    "prompt_embeds": _detach_cpu(prompt_embeds),
-                    "prompt_embeds_mask": _detach_cpu(prompt_embeds_mask),
+                    "prompt_embeds": detach_cpu(prompt_embeds),
+                    "prompt_embeds_mask": detach_cpu(prompt_embeds_mask),
                     # ByT5 glyph encoder output
-                    "prompt_embeds_2": _detach_cpu(prompt_embeds_2),
-                    "prompt_embeds_mask_2": _detach_cpu(prompt_embeds_mask_2),
+                    "prompt_embeds_2": detach_cpu(prompt_embeds_2),
+                    "prompt_embeds_mask_2": detach_cpu(prompt_embeds_mask_2),
                     # Negative (for CFG)
-                    "negative_prompt_embeds": _detach_cpu(neg_embeds),
-                    "negative_prompt_embeds_mask": _detach_cpu(neg_mask),
-                    "negative_prompt_embeds_2": _detach_cpu(neg_embeds_2),
-                    "negative_prompt_embeds_mask_2": _detach_cpu(neg_mask_2),
+                    "negative_prompt_embeds": detach_cpu(neg_embeds),
+                    "negative_prompt_embeds_mask": detach_cpu(neg_mask),
+                    "negative_prompt_embeds_2": detach_cpu(neg_embeds_2),
+                    "negative_prompt_embeds_mask_2": detach_cpu(neg_mask_2),
                 }
             return result
 
-        self.encode_prompt = wrapped  # type: ignore[assignment]
-        self._encode_prompt_patched = True
+        self.encode_prompt = tapped  # type: ignore[assignment]
+        self._conditioning_tap_installed = True
 
-    def _resolve_pending_noise(self, req: "OmniDiffusionRequest") -> None:
-        """Look up this request's pre-computed x_T slice or recipe row."""
+    # ------------------------------------------------------------------ #
+    # arm — every request (stale-leak guards)
+    # ------------------------------------------------------------------ #
+
+    def _arm_sde(self, req: OmniDiffusionRequest) -> None:
+        """This request's SDE strength + sparse step gate."""
+        eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
         extra = getattr(req.sampling_params, "extra_args", None) or {}
-        noise_batch = extra.get("initial_noise_batch")
-        if noise_batch is None:
-            # Driver shipped the x_T RECIPE — regenerate THIS request's row on
-            # CPU-fp32 (mirrors RLStableDiffusion3Pipeline._resolve_pending_noise;
-            # previously this form was silently ignored and upstream RNG drew
-            # x_T — the x_T-collapse class of bug).
-            recipe_gids = extra.get("init_noise_group_ids")
-            if recipe_gids:
-                rid = str(getattr(req, "request_id", "") or "")
-                try:
-                    idx = int(rid.split("_", 1)[0])
-                except ValueError:
-                    raise RuntimeError(
-                        f"RLHunyuanVideo15Pipeline._resolve_pending_noise: cannot "
-                        f"parse batch index from request_id={rid!r}."
-                    )
-                if idx < 0 or idx >= len(recipe_gids):
-                    raise IndexError(
-                        f"RLHunyuanVideo15Pipeline._resolve_pending_noise: index "
-                        f"{idx} out of bounds for init_noise_group_ids len={len(recipe_gids)}."
-                    )
-                self._pending_request_noise = NoiseRecipe(
-                    noise_group_ids=[str(recipe_gids[idx])],
-                    base_seed=int(extra.get("init_noise_seed", 0)),
-                    latent_shape=tuple(extra["init_noise_latent_shape"]),
-                ).resolve()  # [1, ...] — matches the noise_batch[idx:idx+1] slice shape
-                return
-            self._pending_request_noise = None
-            return
-        rid = str(getattr(req, "request_id", "") or "")
-        try:
-            idx = int(rid.split("_", 1)[0])
-        except ValueError:
-            raise RuntimeError(
-                f"RLHunyuanVideo15Pipeline._resolve_pending_noise: cannot parse batch index from request_id={rid!r}."
-            )
-        if idx < 0 or idx >= int(noise_batch.shape[0]):
-            raise IndexError(
-                f"RLHunyuanVideo15Pipeline._resolve_pending_noise: index "
-                f"{idx} out of bounds for noise_batch.shape[0]="
-                f"{int(noise_batch.shape[0])}."
-            )
-        self._pending_request_noise = noise_batch[idx : idx + 1].clone()
+        self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
+
+    def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
+        """This request's driver-authored x_T (batch slice or recipe row)."""
+        self._pending_initial_noise = resolve_request_noise(req, caller="RLHunyuanVideo15Pipeline._arm_initial_noise")
+
+    def _arm_conditioning_tap(self) -> None:
+        """Fresh capture buffer so the tap records THIS request's first encode."""
+        self._captured_conditioning = None
+
+    # ------------------------------------------------------------------ #
+    # run-phase interceptions
+    # ------------------------------------------------------------------ #
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
-        """Bypass upstream RNG when driver supplied an x_T tensor."""
-        noise = self._pending_request_noise
+        """Initial-noise injection point (consume-once; upstream signature:
+        ``(batch_size, height, width, num_frames, dtype, device, generator,
+        latents)`` — same dtype@4/device@5/latents@7 slots as SD3)."""
+        noise = self._pending_initial_noise
         if noise is not None:
-            # HunyuanVideo15Pipeline.prepare_latents signature:
-            # (batch_size, height, width, num_frames, dtype, device, generator, latents)
-            dtype = args[4] if len(args) > 4 else kwargs.get("dtype")
-            device = args[5] if len(args) > 5 else kwargs.get("device")
-            if dtype is not None:
-                noise = noise.to(dtype=dtype)
-            if device is not None:
-                noise = noise.to(device=device)
-            if len(args) >= 8:
-                args = (*args[:7], noise, *args[8:])
-            else:
-                kwargs["latents"] = noise
-            self._pending_request_noise = None
+            args, kwargs = inject_latents(args, kwargs, noise)
+            self._pending_initial_noise = None
         return super().prepare_latents(*args, **kwargs)
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        # Read eta from sampling params.
-        eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
-        self._ensure_scheduler_for_eta(eta)
+    @contextmanager
+    def _sigma_override(self, req: OmniDiffusionRequest) -> Iterator[None]:
+        """WORKAROUND: make upstream pick up the engine's σ schedule.
 
-        # Install SDE step gate on scheduler.
-        if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
-            extra = getattr(req.sampling_params, "extra_args", None) or {}
-            sde_indices = extra.get("sde_indices")
-            self.scheduler._sde_indices_set = (
-                frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
-            )
+        Upstream HunyuanVideo15Pipeline hardcodes
+        ``sigmas = np.linspace(1.0, 0.0, num_steps + 1)[:-1]`` before its
+        single ``scheduler.set_timesteps(sigmas=sigmas, ...)`` call, ignoring
+        ``req.sampling_params.sigmas`` (every other vllm-omni model does
+        ``sigmas = req.sampling_params.sigmas or sigmas`` — see qwen_image,
+        sd3, flux*, z_image — HV1.5 is the outlier). Without this the worker
+        runs an unshifted linear σ schedule while the engine sent a shift=5.0
+        flow-match schedule, tripping ``sigma_verify`` (max-abs-diff ~0.38)
+        and aborting rollout.
 
-        # Resolve pre-computed initial noise.
-        self._resolve_pending_noise(req)
-
-        # Reset and install text-encoder capture hook.
-        self._text_capture = None
-        self._install_encode_prompt_hook()
-
-        # Inject engine-supplied sigmas. Upstream HunyuanVideo15Pipeline
-        # hardcodes ``sigmas = np.linspace(1.0, 0.0, num_steps + 1)[:-1]``
-        # before its single ``scheduler.set_timesteps(sigmas=sigmas, ...)``
-        # call, ignoring ``req.sampling_params.sigmas`` (every other
-        # vllm-omni model does ``sigmas = req.sampling_params.sigmas or
-        # sigmas`` — see qwen_image, sd3, flux*, z_image — HV1.5 is the
-        # outlier). Without this swap the worker runs an unshifted linear σ
-        # schedule while the engine sent a shift=5.0 flow-match schedule,
-        # which trips ``sigma_verify`` with a max-abs-diff ~0.38 and aborts
-        # rollout.
-        #
-        # We monkey-patch the scheduler's ``set_timesteps`` for the
-        # duration of this call so upstream's call site transparently
-        # picks up our σ.
+        Patches the scheduler's ``set_timesteps`` for the duration of ONE
+        ``forward`` and always restores — the closure must never leak across
+        requests. Delete once upstream honors the request sigmas.
+        """
         engine_sigmas = getattr(req.sampling_params, "sigmas", None)
-        sigma_patch_active = False
-        if engine_sigmas is not None:
-            sched = self.scheduler
-            orig_set_timesteps = sched.set_timesteps
+        if engine_sigmas is None:
+            yield
+            return
 
-            def _set_timesteps_with_engine_sigmas(*args, **kw):
-                kw["sigmas"] = engine_sigmas
-                return orig_set_timesteps(*args, **kw)
+        sched = self.scheduler
+        orig_set_timesteps = sched.set_timesteps
 
-            sched.set_timesteps = _set_timesteps_with_engine_sigmas  # type: ignore[assignment]
-            sigma_patch_active = True
+        def _set_timesteps_with_engine_sigmas(*args: Any, **kw: Any) -> Any:
+            kw["sigmas"] = engine_sigmas
+            return orig_set_timesteps(*args, **kw)
 
+        sched.set_timesteps = _set_timesteps_with_engine_sigmas  # type: ignore[assignment]
         try:
-            # Delegate to upstream (encode, latent prep, denoise loop, VAE decode).
-            out = super().forward(req, **kwargs)
+            yield
         finally:
-            if sigma_patch_active:
-                # Restore so we never leak the closure across requests.
-                del self.scheduler.set_timesteps
+            del sched.set_timesteps
 
-        # Drain trajectory from our scheduler.
+    # ------------------------------------------------------------------ #
+    # harvest — export onto the wire
+    # ------------------------------------------------------------------ #
+
+    def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
-            traj = self.scheduler.drain_trajectory()
-            if traj is not None:
-                latents, sigmas, _timesteps, log_probs = traj
-                out.trajectory_latents = latents
-                out.trajectory_timesteps = sigmas
-                out.trajectory_log_probs = log_probs
-                sde_step_indices = self.scheduler.last_sde_step_indices
-                if out.custom_output is None:
-                    out.custom_output = {}
-                out.custom_output["sde_step_indices"] = sde_step_indices
+            drain_trajectory_into(out, self.scheduler)
 
-        # Surface captured text embeds for trainer-side conditions reconstruction.
-        if self._text_capture is not None:
-            if out.custom_output is None:
-                out.custom_output = {}
-            out.custom_output["text_capture"] = self._text_capture
+    def _harvest_conditioning(self, out: DiffusionOutput) -> None:
+        if self._captured_conditioning is not None:
+            stamp_custom_output(out, "text_capture", self._captured_conditioning)
 
+    # ------------------------------------------------------------------ #
+    # the protocol
+    # ------------------------------------------------------------------ #
+
+    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+        self._install_sde_scheduler()
+        self._install_conditioning_tap()
+
+        self._arm_sde(req)
+        self._arm_initial_noise(req)
+        self._arm_conditioning_tap()
+
+        # Delegate to upstream (encode, latent prep, denoise loop, VAE
+        # decode); the installed tap/injector fire inside.
+        with self._sigma_override(req):
+            out = super().forward(req, **kwargs)
+
+        self._harvest_trajectory(out)
+        self._harvest_conditioning(out)
         return out
 
 
