@@ -42,9 +42,18 @@ class TextLMAdapter(ModelAdapter):
     #: The single track this engine emits.
     track_name: str = "ar"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._chat_template_logged = False
+    def validate(self) -> None:
+        super().validate()
+        if not self._has_chat_template():
+            logger.info(
+                "%s: tokenizer has no chat template — raw-text completion rollouts",
+                type(self).__name__,
+            )
+
+    def _has_chat_template(self) -> bool:
+        return hasattr(self._tokenizer, "apply_chat_template") and bool(
+            getattr(self._tokenizer, "chat_template", None)
+        )
 
     # ------------------------------------------------------------------ #
     # build_inputs — RolloutReq → per-prompt /generate payloads
@@ -59,19 +68,27 @@ class TextLMAdapter(ModelAdapter):
             "enable VLM.",
         )
 
+        use_template = self._has_chat_template()
+        require(
+            use_template or sampling.system_instruction is None,
+            f"{type(self).__name__}: system_instruction is configured but the tokenizer "
+            "has no chat template to render it (raw-text completion mode)",
+        )
+
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
         for prompt in prompts:
             payload = self.base_payload(sampling)
-            ids = self.apply_chat_template(prompt, sampling.system_instruction)
-            if ids is not None:
+            if use_template:
+                ids = self.apply_chat_template(prompt, sampling.system_instruction)
                 payload["input_ids"] = ids
-                prompt_token_ids.append(list(ids))
             else:
+                # Raw-text completion mode — encode the raw prompt so the
+                # replay's prompt condition still carries the ids the server
+                # tokenized.
                 payload["text"] = prompt
-                # No chat template — encode the raw prompt so the replay's
-                # prompt condition still carries the ids the server tokenized.
-                prompt_token_ids.append(list(self._tokenizer.encode(prompt)))
+                ids = list(self._tokenizer.encode(prompt))
+            prompt_token_ids.append(list(ids))
             wire.append(payload)
 
         return PreparedInputs(
@@ -105,44 +122,25 @@ class TextLMAdapter(ModelAdapter):
         self,
         user_prompt: str,
         system_instruction: Optional[str] = None,
-    ) -> Optional[List[int]]:
+    ) -> List[int]:
         """Build chat-formatted ``input_ids`` via the tokenizer's chat template.
 
-        Returns ``None`` if the chat template is unavailable or fails; the
-        caller then falls back to the raw-``text`` payload variant (one-time
-        warning).
+        Only called in templated mode (``_has_chat_template``). A failure
+        raises: a set-but-broken template (bad ``chat_template_kwargs``, jinja
+        error) is a config bug — silently switching the run's prompt format
+        would corrupt training.
         """
-        if not hasattr(self._tokenizer, "apply_chat_template"):
-            return None
-
         messages: List[Dict[str, Any]] = []
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": user_prompt})
 
-        try:
-            input_ids = self._tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=True,
-                **(self.cfg.chat_template_kwargs or {}),
-            )
-        except Exception as exc:
-            if not self._chat_template_logged:
-                self._chat_template_logged = True
-                logger.warning("apply_chat_template failed, falling back to raw text: %s", exc)
-            return None
-
-        if not self._chat_template_logged:
-            self._chat_template_logged = True
-            decoded_preview = self._tokenizer.decode(input_ids[:30], skip_special_tokens=False)
-            logger.info(
-                "Chat template applied: %d tokens, preview=%r",
-                len(input_ids),
-                decoded_preview,
-            )
-
-        return input_ids
+        return self._tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            **(self.cfg.chat_template_kwargs or {}),
+        )
 
     # ------------------------------------------------------------------ #
     # build_response — the template: one fan-out stage per RolloutTrack field

@@ -135,18 +135,38 @@ def test_build_inputs_chat_template_path():
     assert call["kwargs"] == {"enable_thinking": False}
 
 
-def test_build_inputs_raw_text_fallback_when_template_fails():
+def test_build_inputs_raises_when_template_fails():
+    # A set-but-broken chat template is a config bug — no silent raw-text fallback.
     tok = StubTokenizer(fail_template=True)
     adapter = make_text_adapter(tokenizer=tok)
-    cfg = adapter.cfg
-    sampling = resolve_sampling(cfg, make_req(["fallback prompt"]))
-    prepared = adapter.build_inputs(make_req(["fallback prompt"]), sampling=sampling)
+    sampling = resolve_sampling(adapter.cfg, make_req(["prompt"]))
+    with pytest.raises(ValueError, match="no chat template"):
+        adapter.build_inputs(make_req(["prompt"]), sampling=sampling)
+
+
+def test_build_inputs_raw_text_mode_without_chat_template():
+    tok = StubTokenizer()
+    tok.chat_template = None
+    adapter = make_text_adapter(tokenizer=tok)
+    sampling = resolve_sampling(adapter.cfg, make_req(["raw prompt"]))
+    prepared = adapter.build_inputs(make_req(["raw prompt"]), sampling=sampling)
 
     payload = prepared.wire[0]
-    assert payload["text"] == "fallback prompt"
+    assert payload["text"] == "raw prompt"
     assert "input_ids" not in payload
-    # The replay prompt condition still carries ids (tokenizer.encode fallback).
-    assert prepared.prompt_token_ids[0] == tok.encode("fallback prompt")
+    # The replay prompt condition still carries ids (driver-side encode).
+    assert prepared.prompt_token_ids[0] == tok.encode("raw prompt")
+
+
+def test_raw_text_mode_rejects_system_instruction():
+    # Raw-text mode has no template to render a system message — loud, not dropped.
+    tok = StubTokenizer()
+    tok.chat_template = None
+    adapter = make_text_adapter(tokenizer=tok)
+    req = make_req(["a"], stage_config={"ar": {"system_instruction": "/sys"}})
+    sampling = resolve_sampling(adapter.cfg, req)
+    with pytest.raises(ValueError, match="no chat template"):
+        adapter.build_inputs(req, sampling=sampling)
 
 
 def test_build_inputs_rejects_images_in_text_mode():

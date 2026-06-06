@@ -36,6 +36,7 @@ class StubTokenizer:
 
     pad_token_id = 7
     eos_token_id = 9
+    chat_template = "stub-template"  # templated mode; raw-mode tests set None
 
     def __init__(self, fail_template: bool = False):
         self.fail_template = fail_template
