@@ -34,6 +34,10 @@ bundle:
     trajectory_precision: bf16
     logprob_precision: fp32
     max_sequence_length: 512
+    # Trainer-side TE is dead weight on the separate-engine path (the
+    # engine encodes; the trainer replays captured conditions) and its
+    # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
+    load_text_encoder: false
     # Static-shift fallback; the real checkpoint enables dynamic shifting via
     # scheduler/scheduler_config.json and this value is ignored at runtime.
     shift: 3.0

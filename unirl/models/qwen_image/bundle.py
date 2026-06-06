@@ -25,7 +25,7 @@ Use :meth:`QwenImageBundle.from_config` to load a checkpoint.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -44,7 +44,7 @@ class QwenImageBundle(Bundle):
         *,
         transformer: nn.Module,
         vae: nn.Module,
-        text_encoder: nn.Module,
+        text_encoder: Optional[nn.Module],
         tokenizer: Any,
         scheduler: Any,
         dtype: torch.dtype,
@@ -95,14 +95,20 @@ class QwenImageBundle(Bundle):
         vae = AutoencoderKLQwenImage.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
         vae.requires_grad_(False)
 
-        text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype
+        # vllm-omni recipes skip the trainer-side copy (~15 GiB/rank dead
+        # weight there — the engine encodes prompts in its own workers and
+        # the trainer replays from captured conditions); see
+        # QwenImagePipelineConfig.load_text_encoder.
+        text_encoder = None
+        if config.load_text_encoder:
+            text_encoder = (
+                Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype
+                )
+                .to(device)
+                .eval()
             )
-            .to(device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
+            text_encoder.requires_grad_(False)
 
         tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
 

@@ -436,6 +436,53 @@ def patch_per_request_ar_seed() -> None:
     AsyncOmniEngine.add_request = _patched
 
 
+def patch_master_port_unstrip() -> None:
+    """Keep ``master_port`` alive through ``AsyncOmniEngine._strip_single_engine_args``.
+
+    At the v0.20.0 pin the ``stage_configs_path`` route strips parent
+    ``EngineArgs`` fields (including ``master_port``) from the kwargs that
+    become ``base_engine_args`` for the per-stage YAML merge
+    (``async_omni_engine.py:1558``), and the post-resolution injection loop
+    only re-adds ``enable_sleep_mode`` / ``lora_path`` / ``lora_scale``.
+    Net effect: the engine-reserved per-replica master-port base NEVER
+    reaches ``OmniDiffusionConfig``, so every stage settles from the shared
+    ``(None or 30005) + random(0, 100)`` window with only the 37-stride
+    bind-check scan for collision avoidance (``diffusion/data.py:578``).
+    Eight colocated replicas race that window; fast-booting models (SD3.5)
+    happened to win, slow-booting ones (Qwen-Image, ~35s weight load) lose
+    the check-to-bind TOCTOU and die with ``DistNetworkError ... port:
+    30005, code: -98`` (LIN-382 qwen probe, 2026-06-07).
+
+    Re-attach the caller's ``master_port`` to the stripped dict so the
+    existing ``load_stage_configs_from_yaml`` ``base_engine_args`` merge
+    lands it per stage. Stage-YAML keys still win (none of ours define
+    ``master_port``); the settle scan stays as the TOCTOU fallback.
+
+    DELETE-WHEN: pin >= v0.21.0rc2 — #3803 honors the injected base
+    verbatim (mind the env ``MASTER_PORT`` precedence landmine documented
+    in ``docs/vllm-omni-v2-engine.md``).
+    """
+    try:
+        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+        _orig = AsyncOmniEngine._strip_single_engine_args
+        if getattr(_orig, "_diffrl_master_port_unstrip", False):
+            return
+
+        def _patched_strip(kwargs, _orig=_orig):
+            out = _orig(kwargs)
+            if isinstance(kwargs, dict):
+                master_port = kwargs.get("master_port")
+                if master_port is not None:
+                    out["master_port"] = master_port
+            return out
+
+        _patched_strip._diffrl_master_port_unstrip = True  # type: ignore[attr-defined]
+        AsyncOmniEngine._strip_single_engine_args = staticmethod(_patched_strip)
+    except (ImportError, AttributeError):
+        pass  # vllm-omni not available in this process; skip
+
+
 def patch_hi3_flow_alignment() -> None:
     """Port of bjf-frz/fix-hi3-flow (vllm-omni eed27812) to v0.20.0's older
     KV-cache API: store full 4-D first-step KV, then scatter live image KV by
@@ -559,6 +606,7 @@ class VLLMOmniHijack:
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
         patch_hi3_flow_alignment()
+        patch_master_port_unstrip()
 
 
 __all__ = [
