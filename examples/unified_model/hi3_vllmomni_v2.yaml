@@ -156,7 +156,7 @@ reward:
 # cfg.algorithm.ar / cfg.algorithm.image.
 algorithm:
   ar:
-    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    _target_: unirl.algorithms.grpo.GRPO
     stage_attr: ar
     clip_range: 1.0e-2            # AR/LLM trust region (matches vlm_rl ARGRPO; 0.2 never binds -> no clip)
     clip_schedule: constant
@@ -165,7 +165,7 @@ algorithm:
       path: unirl.models.hunyuan_image3.conditions.HunyuanImage3ARConditions
     sampling_temperature: ${sampling.ar.temperature}
   image:
-    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
     stage_attr: diffusion
     clip_range: 1.0e-4            # diffusion trust region (matches sd3/qwen_image; 0.2 never binds -> no clip on SDE-logprob ratio)
     clip_schedule: constant

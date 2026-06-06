@@ -1,21 +1,12 @@
 # @package _global_
-# SD3 v2 trainer — LoRA training, LoRA-ADAPTER sync via Ray RPC (SEPARATE slabs).
-# LoRA twin of sd3_vllmomni_full_nccl_separate.yaml: identical train side + rollout,
-# the only swap is the sync handler.
-#   - layout: separate — train on `train_fraction` of the pool, rollout on the rest.
-#   - LoRA training (lora_cfg kept), pushed as the bare ADAPTER each sync
-#     (RemoteLoraWeightSync ships lora_A/lora_B to the engine's set_lora_from_tensors).
-#   - No NCCL group / merged-model broadcast: rank 0 ships the few-MB adapter over a
-#     plain Ray RPC to each rollout Worker. The vLLM-Omni sd35_t2i stage config
-#     enables LoRA (enable_lora: true, max_lora_rank: 32), so the engine accepts it.
+# SD3 v2 trainer — LoRA training, MERGED full-weight sync via bucketed CUDA-IPC (COLOCATE).
+# Self-contained variant of sd3_vllmomni.yaml. Same as sd3_vllmomni_full_tensor
+# (LoRA training, sync.lora_merged: true) except the transport is IPC (same-node
+# CUDA-IPC over ZMQ).
 
 num_devices: 8
 batch_size: 48 # prompts_per_rollout
 adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
-
-# Layout: two sibling device slabs.
-layout: separate
-train_fraction: 0.5 # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool.
 
 weight_sync_interval: 1
 
@@ -64,8 +55,8 @@ backend:
     type: constant
     warmup_steps: 0
     total_steps: 10000
-  # LoRA training — synced as the bare adapter (RemoteLoraWeightSync), so the
-  # rollout engine keeps the frozen base and only its adapter changes each sync.
+  # LoRA training — synced as a MERGED full model (sync.lora_merged: true), so the
+  # rollout engine runs the merged weights without a separate adapter.
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
@@ -89,11 +80,8 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni_v2.config.VLLMOmniV2EngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
-    # sd35_t2i stage config enables LoRA (enable_lora: true, max_lora_rank: 32),
-    # so the engine accepts the adapter pushed by RemoteLoraWeightSync.
     modality: sd3_t2i
-    # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
-    enable_sleep_mode: false
+    enable_sleep_mode: true
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -108,7 +96,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
@@ -124,10 +112,13 @@ stack:
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
 
 data_source:
+  # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
+  # via data_path and exposes get_samples(bs). (DefaultDataSource returns only
+  # 8 hardcoded prompts — smoke-test use; training on it over-optimizes/collapses.)
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/pickscore/train.txt
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
       eval_data_path: datasets/pickscore/test.txt
       seed: 42
     algorithm:
@@ -154,17 +145,18 @@ sampling:
     # (the validated reproduce setting); [0,1] spreads it across all steps.
     timestep_fraction: [0, 0.5]
 
-# LoRA adapter sync → vLLM-Omni rollout (separate-slab Ray RPC). Wired to the
-# rollout slab by DiffusionTrainer's one-time handshake (set_rollout_targets only —
-# no NCCL pick_master/connect). RemoteLoraWeightSync takes the backend sibling
-# only (rollout is cross-slab); rank 0 ships the adapter to each rollout Worker.
+# LoRA → merged full-weight sync → vLLM-Omni rollout (colocate bucketed CUDA-IPC).
 sync:
-  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
-  # vLLM-Omni supports the loaded_lora_checksums read-back; verify asserts the
-  # synced adapter landed bit-exactly each sync. Set false once trusted.
-  verify: true
-  # Mirrors SD3PipelineConfig.weight_sync_param_name_prefix; must match the
-  # engine-side LoRA key naming (a wrong prefix yields wrong/zero loaded layers,
-  # which `verify` catches).
-  param_prefix: "transformer."
-  adapter_name: default
+  _target_: unirl.distributed.weight_sync.full.ipc.IPCWeightSync
+  # Fold the trained LoRA delta into the base weights and push the merged full
+  # model (we LoRA-train but serve a merged model — no separate adapter).
+  lora_merged: true
+  # Buffer must fit the largest single tensor in one bucket.
+  bucket_size_mb: 2048
+  use_shm: false
+  flush_cache: true
+  # Ordered first-match-wins name rewrite (see FullWeightSync._apply_name_remap):
+  # backend.model is the bare SD3 transformer, so the "*" catch-all nests every
+  # key under the receiver's transformer.* namespace. Applied on both the merged
+  # (lora_merged=true) and raw paths.
+  name_remap: {"*": "transformer.*"}
