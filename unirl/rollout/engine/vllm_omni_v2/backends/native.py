@@ -224,6 +224,21 @@ class VLLMOmniBackend:
         # DIFFRL_OMNI_BOOT_SERIALIZE=0 (e.g. single-replica smokes).
         import fcntl
 
+        # Return the host process's reserved-but-unallocated CUDA pool to the
+        # driver before spawning the engine. boot() runs inside the trainer's
+        # ray actor: the colocate flow full-loads the model per rank before
+        # FSDP shards it, leaving ~35-40 GiB reserved in THIS process's torch
+        # caching allocator — memory the engine SUBPROCESS cannot see or use
+        # (LIN-382 qwen probe-c: engine model 53.7 GiB + dummy run hit "116
+        # MiB free" on a 95 GiB GPU with the trainer's pool holding the rest).
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - belt and braces; never block a boot
+            pass
+
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
         serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
