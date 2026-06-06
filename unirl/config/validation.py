@@ -134,9 +134,7 @@ def validate_weight_sync_contract(cfg: DictConfig) -> None:
         if sync_name in _IPC_SYNC_SUFFIXES:
             engine_target = str(cfg.rollout.engine.get("_target_") or "")
             require(
-                engine_target.endswith(
-                    (_VLLM_OMNI_ENGINE_TARGET_SUFFIX, _VLLM_OMNI_V2_ENGINE_TARGET_SUFFIX)
-                ),
+                engine_target.endswith((_VLLM_OMNI_ENGINE_TARGET_SUFFIX, _VLLM_OMNI_V2_ENGINE_TARGET_SUFFIX)),
                 f"sync={sync_name} (bucketed CUDA-IPC) is only implemented by the "
                 f"vllm-omni rollout engines; got rollout.engine._target_={engine_target!r}",
             )

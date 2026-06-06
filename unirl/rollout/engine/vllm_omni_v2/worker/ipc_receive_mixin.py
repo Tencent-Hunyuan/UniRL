@@ -23,10 +23,6 @@ from typing import Optional
 
 import torch
 
-from unirl.rollout.engine.vllm_omni_v2.patches.runtime import (
-    OmniTensorLoRARequest,
-    VLLMOmniHijack,
-)
 from unirl.distributed.weight_sync.transfer.bucketed_transfer import (
     BucketedWeightReceiver,
 )
@@ -36,6 +32,10 @@ from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
     DIFFRL_LORA_PATH,
     replica_rank_from_env,
     zmq_handle,
+)
+from unirl.rollout.engine.vllm_omni_v2.patches.runtime import (
+    OmniTensorLoRARequest,
+    VLLMOmniHijack,
 )
 
 logger = logging.getLogger(__name__)

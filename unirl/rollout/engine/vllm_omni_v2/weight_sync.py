@@ -171,9 +171,7 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the zero-copy shm-handle transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_handle(
-            adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config
-        )
+        self._backend.set_lora_handle(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
         self._lora_loaded = True
         self._weights_released = False
 
@@ -186,21 +184,16 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the TP>1-safe byte-copy transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_copy(
-            adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config
-        )
+        self._backend.set_lora_copy(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
         self._lora_loaded = True
         self._weights_released = False
 
-    def _cache_lora(
-        self, adapter_name: str, lora_tensors: Dict[str, Any], peft_config: Optional[dict]
-    ) -> None:
+    def _cache_lora(self, adapter_name: str, lora_tensors: Dict[str, Any], peft_config: Optional[dict]) -> None:
         """Clone the adapter state so a sleep/wake cycle can re-push it."""
         self._last_lora_name = adapter_name
         if isinstance(lora_tensors, dict):
             self._last_lora_tensors = {
-                name: t.detach().clone() if isinstance(t, torch.Tensor) else t
-                for name, t in lora_tensors.items()
+                name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
             }
         else:
             self._last_lora_tensors = lora_tensors

@@ -20,7 +20,6 @@ from tests.rollout.vllm_omni_v2.conftest import (
     make_req,
     sigmas_for,
 )
-from unirl.types.primitives import Texts
 
 
 def test_t2i_two_tracks_with_lineage(model_config):
@@ -77,9 +76,7 @@ def test_sd35_text_condition_and_empty_input_guard(model_config):
     adapter = make_adapter("sd3_t2i", model_config)
     sig = sigmas_for(2)
     req = make_req(2, sigmas=sig)
-    per_request = [
-        [fake_dit_output(i, sigmas=sig, stage_id=0, custom_capture=fake_sd3_capture())] for i in range(2)
-    ]
+    per_request = [[fake_dit_output(i, sigmas=sig, stage_id=0, custom_capture=fake_sd3_capture())] for i in range(2)]
     resp = adapter.build_response(req, per_request)
     assert set(resp.tracks) == {"image"}
     cond = resp.tracks["image"].conditions["text"]
@@ -99,8 +96,12 @@ def test_t2v_video_track_and_dual_stream_conditions(model_config):
     per_request = [
         [
             fake_dit_output(
-                i, sigmas=sig, stage_id=0, final_output_type="video",
-                custom_capture=fake_hv15_capture(), num_images=3,
+                i,
+                sigmas=sig,
+                stage_id=0,
+                final_output_type="video",
+                custom_capture=fake_hv15_capture(),
+                num_images=3,
             )
         ]
         for i in range(2)

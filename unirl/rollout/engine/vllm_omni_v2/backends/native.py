@@ -38,7 +38,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni_v2.backends.base import (
     STAGE_KIND_AR,
-    STAGE_KIND_DIFFUSION,
     GenerateCall,
     OmniRawResult,
     StageSampling,
@@ -88,8 +87,7 @@ def _resolve_stage_yaml(name: str, source: str) -> str:
         path = os.path.join(project_root, "vllm_omni", "model_executor", "stage_configs", name)
         if not os.path.exists(path):
             raise FileNotFoundError(
-                f"_resolve_stage_yaml: upstream YAML {name!r} not found at {path}. "
-                "vllm-omni may have moved the file."
+                f"_resolve_stage_yaml: upstream YAML {name!r} not found at {path}. vllm-omni may have moved the file."
             )
         return path
     raise ValueError(f"_resolve_stage_yaml: unknown source {source!r} (expected 'local' or 'upstream')")
@@ -212,9 +210,7 @@ class VLLMOmniBackend:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
-        yaml_path = _resolve_stage_yaml(
-            str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local"))
-        )
+        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
         omni = rt["Omni"](
             model=str(intent["model_path"]),
             stage_configs_path=yaml_path,
@@ -225,9 +221,7 @@ class VLLMOmniBackend:
         # reload their own from the model path). Pure-DiT modalities skip it.
         tokenizer = None
         if intent.get("needs_driver_tokenizer"):
-            tokenizer = rt["AutoTokenizer"].from_pretrained(
-                str(intent["model_path"]), trust_remote_code=True
-            )
+            tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
 
         return cls(
             omni,
@@ -555,8 +549,7 @@ class VLLMOmniBackend:
 
         for sid in self._stage_ids():
             cloned = {
-                name: t.detach().clone() if isinstance(t, torch.Tensor) else t
-                for name, t in lora_tensors.items()
+                name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
             }
             serialized = MultiprocessingSerializer.serialize(cloned, output_str=True)
             omni.engine.collective_rpc(
@@ -602,8 +595,7 @@ class VLLMOmniBackend:
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
         cpu_tensors = {
-            name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t
-            for name, t in lora_tensors.items()
+            name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
         }
         buf = io.BytesIO()
         torch.save(cpu_tensors, buf)

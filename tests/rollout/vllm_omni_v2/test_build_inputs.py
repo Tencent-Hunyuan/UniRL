@@ -140,9 +140,7 @@ def test_t2i_rejects_materialized_noise_and_ships_recipe(model_config):
     with pytest.raises(NotImplementedError, match="AR-dynamic"):
         adapter.build_inputs(req)
 
-    req2 = make_req(
-        2, modality_params="composed", sigmas=sigmas_for(2), init_noise_group_ids=["a", "b"]
-    )
+    req2 = make_req(2, modality_params="composed", sigmas=sigmas_for(2), init_noise_group_ids=["a", "b"])
     (call,) = adapter.build_inputs(req2)
     ea = call.sampling[1].kwargs["extra_args"]
     assert ea["init_noise_group_ids"] == ["a", "b"] and ea["init_noise_seed"] == 7

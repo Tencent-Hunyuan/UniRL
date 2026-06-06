@@ -5,7 +5,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from tests.rollout.vllm_omni_v2.conftest import fake_ar_output, fake_dit_output, make_req, sigmas_for
 from unirl.rollout.engine.vllm_omni_v2.backends.native import (
@@ -109,9 +108,7 @@ def test_tp_from_stage_configs_reads_both_stage_kinds():
     )
     assert tp == {0: 4, 1: 2, 2: 1}
     # Attr-style entries (OmegaConf-ish objects without .get).
-    tp2 = _tp_from_stage_configs(
-        [SimpleNamespace(stage_id=0, engine_args=SimpleNamespace(tensor_parallel_size=8))]
-    )
+    tp2 = _tp_from_stage_configs([SimpleNamespace(stage_id=0, engine_args=SimpleNamespace(tensor_parallel_size=8))])
     assert tp2 == {0: 8}
 
 

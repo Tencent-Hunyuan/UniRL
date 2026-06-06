@@ -11,7 +11,16 @@ from unirl.rollout.engine.vllm_omni_v2.adapters import (
 )
 from unirl.rollout.engine.vllm_omni_v2.config import VLLMOmniV2EngineConfig
 
-ALL_MODALITIES = ("hi3_ar_recaption", "hi3_dit_recaption", "hi3_i2t", "hi3_it2i", "hi3_t2i", "hi3_t2t", "hv15_t2v", "sd3_t2i")
+ALL_MODALITIES = (
+    "hi3_ar_recaption",
+    "hi3_dit_recaption",
+    "hi3_i2t",
+    "hi3_it2i",
+    "hi3_t2i",
+    "hi3_t2t",
+    "hv15_t2v",
+    "sd3_t2i",
+)
 
 
 def test_all_eight_modalities_registered():

@@ -27,7 +27,7 @@ Live-LoRA re-push on wake is exercised by the LoRA e2e recipes
 
 Usage (inside the pod, venv active):
   PRETRAINED_MODEL=/root/diffusionrl/models/local/stable-diffusion-3.5-medium \\
-  python scripts/vllm_omni_v2_gpu_smoke.py
+  python examples/vllm_omni_v2_gpu_smoke.py
 """
 
 from __future__ import annotations
@@ -37,9 +37,12 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
-from typing import Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from unirl.types.rollout_req import RolloutReq
 
 T0 = time.time()
 
@@ -51,7 +54,9 @@ def log(msg: str) -> None:
 def gpu_used_mib() -> int:
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     return sum(int(x) for x in out.split())
 
@@ -99,13 +104,21 @@ def make_req(n: int, steps: int, hw: int) -> "RolloutReq":
     return RolloutReq(
         sample_ids=[f"p{i}/r0" for i in range(n)],
         group_ids=[f"g{i}" for i in range(n)],
-        primitives={"text": Texts(texts=[
-            "a watercolor fox in a snowy forest",
-            "a brutalist lighthouse at golden hour",
-        ][:n])},
+        primitives={
+            "text": Texts(
+                texts=[
+                    "a watercolor fox in a snowy forest",
+                    "a brutalist lighthouse at golden hour",
+                ][:n]
+            )
+        },
         sampling_params=DiffusionSamplingParams(
-            num_inference_steps=steps, height=hw, width=hw,
-            guidance_scale=4.5, eta=1.0, seed=7,
+            num_inference_steps=steps,
+            height=hw,
+            width=hw,
+            guidance_scale=4.5,
+            eta=1.0,
+            seed=7,
         ),
     )
 
@@ -133,9 +146,7 @@ def pick_checkpoint_tensors(model_path: str, k: int = 2) -> List[Tuple[str, torc
 
 
 def main() -> int:
-    model_path = os.environ.get(
-        "PRETRAINED_MODEL", "/root/diffusionrl/models/local/stable-diffusion-3.5-medium"
-    )
+    model_path = os.environ.get("PRETRAINED_MODEL", "/root/diffusionrl/models/local/stable-diffusion-3.5-medium")
     steps = int(os.environ.get("SMOKE_STEPS", "4"))
     hw = int(os.environ.get("SMOKE_HW", "512"))
     results: Dict[str, str] = {}
@@ -205,6 +216,7 @@ def main() -> int:
             except ImportError:
                 from sglang.srt.patch_torch import monkey_patch_torch_reductions
             from sglang.srt.utils import MultiprocessingSerializer
+
             try:
                 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
             except ImportError:
@@ -223,9 +235,7 @@ def main() -> int:
                     "metadata": flat.get_metadata(),
                 }
                 engine.update_weights_from_tensor(
-                    serialized_named_tensors=[
-                        MultiprocessingSerializer.serialize(payload, output_str=True)
-                    ],
+                    serialized_named_tensors=[MultiprocessingSerializer.serialize(payload, output_str=True)],
                     load_format="flattened_bucket",
                     flush_cache=True,
                 )

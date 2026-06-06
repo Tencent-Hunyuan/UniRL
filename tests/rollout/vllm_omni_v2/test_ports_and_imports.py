@@ -34,9 +34,7 @@ def test_assemble_omni_kwargs_layering():
         omni_extra={"stage_init_timeout": 99, "enable_sleep_mode": False, "master_port": 1},
     )
     ports = VLLMOmniPorts(master_port=30100)
-    intent = cfg.server_intent(
-        model_config=None, ports=ports, extra={"stage_yaml": "x.yaml", "mode": "text-to-image"}
-    )
+    intent = cfg.server_intent(model_config=None, ports=ports, extra={"stage_yaml": "x.yaml", "mode": "text-to-image"})
     kw = _assemble_omni_kwargs(intent)
     assert kw["stage_init_timeout"] == 99  # escape hatch beats defaults
     assert kw["init_timeout"] == 1800  # untouched default survives

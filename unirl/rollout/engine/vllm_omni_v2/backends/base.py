@@ -61,8 +61,7 @@ class StageSampling:
     def __post_init__(self) -> None:
         if self.kind not in (STAGE_KIND_AR, STAGE_KIND_DIFFUSION):
             raise ValueError(
-                f"StageSampling.kind must be {STAGE_KIND_AR!r} or "
-                f"{STAGE_KIND_DIFFUSION!r}; got {self.kind!r}"
+                f"StageSampling.kind must be {STAGE_KIND_AR!r} or {STAGE_KIND_DIFFUSION!r}; got {self.kind!r}"
             )
 
 
@@ -166,29 +165,54 @@ class Backend(Protocol):
     # runtime payload shaping (MultiprocessingSerializer / torch.save byte copy,
     # PEFT-envelope wrapping, remove-then-add ordering) stays there too.
     def update_from_ipc(
-        self, *, peft_config: Optional[dict], base_sync_done: bool,
-        use_shm: bool, replica_rank: Optional[int],
+        self,
+        *,
+        peft_config: Optional[dict],
+        base_sync_done: bool,
+        use_shm: bool,
+        replica_rank: Optional[int],
     ) -> None: ...
     def init_weights_group(
-        self, *, master_address: str, master_port: int, rank_offset: int,
-        world_size: int, group_name: str, backend: str,
+        self,
+        *,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str,
     ) -> None: ...
     def update_from_distributed(
-        self, *, names: List[str], dtypes: List[str], shapes: List[List[int]],
-        group_name: str, target_modules: Optional[List[str]], flush_cache: bool,
+        self,
+        *,
+        names: List[str],
+        dtypes: List[str],
+        shapes: List[List[int]],
+        group_name: str,
+        target_modules: Optional[List[str]],
+        flush_cache: bool,
     ) -> None: ...
     def destroy_weights_group(self, *, group_name: str) -> None: ...
     def update_from_tensor(
-        self, *, serialized_named_tensors: List[str],
-        target_modules: Optional[List[str]], load_format: Optional[str],
+        self,
+        *,
+        serialized_named_tensors: List[str],
+        target_modules: Optional[List[str]],
+        load_format: Optional[str],
         flush_cache: bool,
     ) -> None: ...
     def set_lora_handle(
-        self, *, adapter_name: str, lora_tensors: Dict[str, Any],
+        self,
+        *,
+        adapter_name: str,
+        lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None: ...
     def set_lora_copy(
-        self, *, adapter_name: str, lora_tensors: Dict[str, Any],
+        self,
+        *,
+        adapter_name: str,
+        lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None: ...
     def param_checksums(self, *, names: List[str]) -> dict: ...

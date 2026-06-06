@@ -7,7 +7,7 @@ particular.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import pytest
 import torch
@@ -72,12 +72,8 @@ LORA = {"transformer.x.lora_A.weight": torch.ones(2, 2)}
 
 def test_plain_forwards_reach_the_seam():
     ws, backend = make_ws()
-    ws.init_weights_update_group(
-        master_address="h", master_port=1, rank_offset=0, world_size=2, group_name="g"
-    )
-    ws.update_weights_from_distributed(
-        names=["a"], dtypes=["bfloat16"], shapes=[[2, 2]], group_name="g"
-    )
+    ws.init_weights_update_group(master_address="h", master_port=1, rank_offset=0, world_size=2, group_name="g")
+    ws.update_weights_from_distributed(names=["a"], dtypes=["bfloat16"], shapes=[[2, 2]], group_name="g")
     ws.destroy_weights_update_group(group_name="g")
     ws.update_weights_from_tensor(serialized_named_tensors=["blob"])
     ws.loaded_param_checksums(names=["a"])

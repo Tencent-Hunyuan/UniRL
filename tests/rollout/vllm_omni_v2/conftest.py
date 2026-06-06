@@ -43,9 +43,7 @@ def fake_tokenize(text: str, *, task: str, sys_type: str) -> List[int]:
 def make_adapter(modality: str, model_config: Any, **cfg_overrides: Any):
     from unirl.rollout.engine.vllm_omni_v2.adapters import get_adapter
 
-    return get_adapter(modality)(
-        make_config(modality, **cfg_overrides), model_config, tokenize_fn=fake_tokenize
-    )
+    return get_adapter(modality)(make_config(modality, **cfg_overrides), model_config, tokenize_fn=fake_tokenize)
 
 
 def make_req(
@@ -106,18 +104,12 @@ def fake_ar_output(
     prompt_token_ids: Optional[List[int]] = None,
 ) -> SimpleNamespace:
     tokens = token_ids if token_ids is not None else [10 + idx, 11 + idx]
-    logprobs = (
-        [{t: SimpleNamespace(logprob=-0.5 - 0.1 * j)} for j, t in enumerate(tokens)]
-        if with_logprobs
-        else None
-    )
+    logprobs = [{t: SimpleNamespace(logprob=-0.5 - 0.1 * j)} for j, t in enumerate(tokens)] if with_logprobs else None
     return SimpleNamespace(
         request_id=f"{idx}_uuid",
         stage_id=0,
         final_output_type="text",
-        request_output=SimpleNamespace(
-            outputs=[SimpleNamespace(token_ids=list(tokens), logprobs=logprobs, text=text)]
-        ),
+        request_output=SimpleNamespace(outputs=[SimpleNamespace(token_ids=list(tokens), logprobs=logprobs, text=text)]),
         prompt_token_ids=list(prompt_token_ids) if prompt_token_ids is not None else [1, 2, 3 + idx],
         images=None,
         trajectory_latents=None,
