@@ -25,6 +25,7 @@ Use :meth:`QwenImageBundle.from_config` to load a checkpoint.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
@@ -70,6 +71,37 @@ class QwenImageBundle(Bundle):
         alternate VAE / text-encoder checkpoints without re-downloading
         the transformer. Both default to ``pretrained_model_ckpt_path``.
         """
+        from diffusers import AutoencoderKLQwenImage, QwenImageTransformer2DModel
+        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+        from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+
+        import fcntl
+
+        # Node-local load serialization: 8 colocated ranks each hold ~20 GiB
+        # anon RSS while materializing the 20B transformer (safetensors ->
+        # bf16 staging). The simultaneous burst blows the pod's k8s memcg
+        # limit (~439 GiB incl. page cache) and the kernel OOM-kills
+        # raylet/python (LIN-382 qwen probes b/d: "Memory cgroup out of
+        # memory", anon-rss ~20-23 GiB per kill). Single-file the heavy
+        # window; DIFFRL_MODEL_LOAD_SERIALIZE=0 opts out (single-rank runs).
+        serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
+        if lock_file is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            return cls._from_config_locked(config)
+        finally:
+            if lock_file is not None:
+                # Return this rank's staging anon to the kernel before the
+                # next rank starts its load, so the serialized peak holds.
+                import gc
+
+                gc.collect()
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
+
+    @classmethod
+    def _from_config_locked(cls, config: QwenImagePipelineConfig) -> "QwenImageBundle":
         from diffusers import AutoencoderKLQwenImage, QwenImageTransformer2DModel
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
         from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
