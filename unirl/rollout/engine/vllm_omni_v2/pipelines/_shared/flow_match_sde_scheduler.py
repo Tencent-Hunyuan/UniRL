@@ -173,9 +173,12 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         ``self._internal_dict`` to one with ``use_dynamic_shifting=False``
         AND set ``self._shift = 1.0`` (note: ``self.shift`` is a
         ``@property`` over ``_shift``, NOT a FrozenDict entry) so step
-        2's two branches both collapse to identity, then restore via
-        ``finally``. This is the smallest patch that's stable against
-        future diffusers refactors (we don't reimplement steps 3-6).
+        2's two branches both collapse to identity, AND null
+        ``shift_terminal`` (step 3's whole-schedule stretch — e.g.
+        Qwen-Image-2512 ships ``shift_terminal: 0.02``) — then restore
+        via ``finally``. This is the smallest patch that's stable
+        against future diffusers refactors (we don't reimplement the
+        remaining steps).
 
         ``_sde_indices_set`` is intentionally NOT reset here — the
         calling pipeline installs it per-request right before driving
@@ -185,7 +188,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             # Neutralize step-2 shift for the duration of this call so
             # externally-provided sigmas (already shifted main-side)
             # don't get double-shifted by the parent's static or
-            # dynamic branch. Two distinct sources to override:
+            # dynamic branch. Three distinct sources to override:
             #
             # * ``self.config.use_dynamic_shifting`` — a ``FrozenDict``
             #   entry read at line ~347 of diffusers' set_timesteps to
@@ -207,6 +210,16 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             original_shift = self._shift
             overrides = dict(original_internal)
             overrides["use_dynamic_shifting"] = False
+            # Third shift source (step 3 in diffusers): ``shift_terminal``
+            # stretches the WHOLE schedule so its last nonzero σ lands on the
+            # configured value — applied even to externally passed sigmas.
+            # SD3.5's config leaves it null, but Qwen-Image-2512 ships
+            # ``shift_terminal: 0.02``, which turned our pinned
+            # [.., 0.3584] into [.., 0.0200] on the worker and tripped the
+            # σ-echo gate (LIN-382 qwen smoke, 2026-06-07: max abs diff
+            # 3.384e-01 — exactly the stretch factor (1-0.02)/(1-0.3584)).
+            # Pinned σ are FINAL values; neutralize the stretch too.
+            overrides["shift_terminal"] = None
             self._internal_dict = FrozenDict(overrides)
             self._shift = 1.0
             try:
