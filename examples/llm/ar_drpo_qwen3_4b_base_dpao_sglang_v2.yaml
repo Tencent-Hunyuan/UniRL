@@ -9,8 +9,9 @@
 #
 # Faithful port of the reference recipe (MaxwellJryao/SPO-DPPO run_qwen3_4b.sh +
 # verl core_algos.py) to reproduce the AdaSPO Figure-3 AIME curve:
-#   - variant=pg_tv_penalty: L_t = -A_t*logp_t + penalty_coef*|ratio_t - 1|
-#     (plain REINFORCE + soft TV penalty; no IS weight, no trust-region mask)
+#   - DRPO (paper §3, = verl spo_adaptive_eps): the token-adaptive SPO quadratic
+#     L_t = -A_t*r_t + |A_t|*mu*(r_t-1)^2 / (2*drpo_epsilon)  — smooth, advantage-
+#     weighted Binary-TV trust region (gradient Eq 9, weight Table 1)
 #   - loss_agg_mode=seq-mean-token-sum-norm (per-seq token-sum / horizon)
 #   - normalize_adv_by_std=false (mean-center-only advantage)
 #   - n=8 samples/prompt x batch=64 prompts = 512 samples/rollout
@@ -25,7 +26,7 @@
 # Run (64 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_vlm --config-name=llm_rl/ar_drpo_qwen3_4b_base_dpao_sglang_v2 num_devices=64
+#   python -m unirl.train_vlm --config-name=llm/ar_drpo_qwen3_4b_base_dpao_sglang_v2 num_devices=64
 
 num_devices: 64
 batch_size: 64 # prompts_per_rollout
@@ -141,8 +142,7 @@ reward:
 algorithm:
   _target_: unirl.algorithms.drpo.ARDRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
-  variant: pg_tv_penalty # reference loss: -A*logp + penalty_coef*|ratio-1|
-  penalty_coef: 0.15 # reference actor.clip_ratio used as the TV-penalty coefficient
+  drpo_epsilon: 12.5 # paper §4 "regularization threshold to 12.5"; per-token trust region eps_t = eps/mu
   loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
   horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
