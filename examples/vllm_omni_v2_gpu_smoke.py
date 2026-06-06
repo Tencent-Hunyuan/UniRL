@@ -145,8 +145,29 @@ def pick_checkpoint_tensors(model_path: str, k: int = 2) -> List[Tuple[str, torc
     return picked
 
 
+def make_model_config(modality: str) -> SimpleNamespace:
+    """The model-config fields the adapter family reads, per modality.
+
+    sd3_t2i: static shift only. qwen_image_t2i: dynamic shifting (the σ
+    policy reads ``use_dynamic_shifting`` + ``dynamic_shift_overrides``) and
+    the Qwen-VL ``max_sequence_length`` pin the input adapter forwards.
+    """
+    if modality == "qwen_image_t2i":
+        from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
+
+        return SimpleNamespace(
+            shift=3.0,
+            use_lora=False,
+            use_dynamic_shifting=True,
+            dynamic_shift_overrides=_qwen_image_dynamic_overrides(),
+            max_sequence_length=512,
+        )
+    return SimpleNamespace(shift=3.0, use_lora=False)
+
+
 def main() -> int:
     model_path = os.environ.get("PRETRAINED_MODEL", "/root/diffusionrl/models/local/stable-diffusion-3.5-medium")
+    modality = os.environ.get("SMOKE_MODALITY", "sd3_t2i")
     steps = int(os.environ.get("SMOKE_STEPS", "4"))
     hw = int(os.environ.get("SMOKE_HW", "512"))
     results: Dict[str, str] = {}
@@ -155,7 +176,7 @@ def main() -> int:
     from unirl.rollout.engine.vllm_omni_v2.config import VLLMOmniPorts, VLLMOmniV2EngineConfig
 
     # ---- 1. boot -----------------------------------------------------------
-    log(f"phase 1 boot: model={model_path} steps={steps} hw={hw}")
+    log(f"phase 1 boot: modality={modality} model={model_path} steps={steps} hw={hw}")
     ports = VLLMOmniPorts.reserve()
     base = ports.master_port
     log(f"reserved master_port base = {base}")
@@ -163,10 +184,10 @@ def main() -> int:
     # request's typed DiffusionSamplingParams (single source of truth).
     cfg = VLLMOmniV2EngineConfig(
         model_path=model_path,
-        modality="sd3_t2i",
+        modality=modality,
         enable_sleep_mode=True,
     )
-    model_config = SimpleNamespace(shift=3.0, use_lora=False)
+    model_config = make_model_config(modality)
     t = time.time()
     engine = cfg.make_engine(model_config=model_config, ports=ports)
     log(f"boot OK in {time.time() - t:.1f}s; tp_per_stage={engine.tp_per_stage()}")
