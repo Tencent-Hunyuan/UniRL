@@ -25,7 +25,6 @@ from unirl.rollout.engine.sglang_v2.backends import RawResult
 from unirl.rollout.engine.sglang_v2.utils import (
     ResolvedSampling,
     pack_prompt_condition,
-    split_thinking_tags,
 )
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
@@ -206,16 +205,15 @@ class TextLMAdapter(ModelAdapter):
         )
 
     def build_decoded(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
-        """Strip thinking tags per candidate.
+        """Emit the RAW sampler text per candidate (verl-reference parity).
 
-        Predecessor's ``content or text``: an all-think output decodes as the
-        RAW text (tags intact), never as the empty string.
+        Reward grading scores the full decoded response. The predecessor's
+        think-stripping (``content or text``) silently dropped boxed answers
+        living inside think markup — Qwen3-Base emits it organically on math —
+        depressing MathBoxed rewards ~3x (observed: LIN-381 e2e #1/#2 flat at
+        ~0.035 vs the b182a511-lineage v1 references at 0.09-0.25).
         """
-        decoded: List[str] = []
-        for r in raw:
-            content, _reasoning = split_thinking_tags(r.text)
-            decoded.append(content or r.text or "")
-        return Texts(texts=decoded)
+        return Texts(texts=[r.text or "" for r in raw])
 
     def build_conditions(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """The replay conditions — the prompt ids the server saw, per sample.

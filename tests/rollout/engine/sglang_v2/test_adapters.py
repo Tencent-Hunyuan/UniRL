@@ -253,21 +253,25 @@ def test_build_response_prompt_condition_right_padded():
     assert cond.attention_mask[0].tolist() == [1, 1, 1]
 
 
-def test_build_response_strips_thinking_tags_into_decoded():
+def test_build_response_decodes_raw_sampler_text():
+    """verl-reference parity: reward grading scores the FULL decoded response.
+
+    Think-stripping here silently dropped boxed answers living inside think
+    markup (Qwen3-Base emits it organically on math), depressing MathBoxed
+    rewards ~3x — LIN-381 e2e runs flat at ~0.035 vs v1 references at 0.09+.
+    """
     adapter = make_text_adapter()
     req, prepared = make_prepared(adapter, ["a", "b", "c"])
     raw = [
         make_raw("<think>plan</think>answer"),
-        make_raw("before<think>truncated reasoning"),  # unclosed: content before tag
-        make_raw("<think>only thoughts</think>"),  # empty content -> raw-text fallback
+        make_raw("before<think>truncated reasoning"),
+        make_raw("<think>boxed inside</think>"),
     ]
     resp = adapter.build_response(req, prepared, raw)
     texts = resp.tracks["ar"].decoded.texts
-    assert texts[0] == "answer"
-    assert texts[1] == "before"
-    # Predecessor's `content or text`: an all-think output decodes as the RAW
-    # text (tags intact), never as the empty string.
-    assert texts[2] == "<think>only thoughts</think>"
+    assert texts[0] == "<think>plan</think>answer"
+    assert texts[1] == "before<think>truncated reasoning"
+    assert texts[2] == "<think>boxed inside</think>"
 
 
 def test_split_thinking_tags_forms():
