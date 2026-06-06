@@ -83,6 +83,68 @@ def test_sd35_t2i_rejects_image(model_config):
         adapter.validate_request(req)
 
 
+def test_qwen_cfg_off_omits_negative_and_sets_true_cfg(model_config):
+    """The pin-v0.20.0 trap: ``negative_prompt: ""`` counts as PRESENT in
+    upstream ``_extract_prompts`` and ``sp.true_cfg_scale or 4.0`` arms CFG
+    by default — at guidance 1.0 (the trainside oracle setting) the prompt
+    dicts must omit the key entirely and true_cfg_scale must be explicit."""
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    req = make_req(2, sigmas=sigmas_for(2))
+    req.sampling_params.guidance_scale = 1.0
+    (call,) = adapter.build_inputs(req)
+    assert call.prompts == [{"prompt": "prompt 0"}, {"prompt": "prompt 1"}]
+    kw = call.sampling[0].kwargs
+    assert kw["true_cfg_scale"] == 1.0
+    assert kw["guidance_scale"] == 1.0  # embedded-guidance knob, unused by Qwen-Image
+    # Shared DiT path intact: σ T-slice + trajectory request.
+    assert kw["sigmas"] == pytest.approx([1.0, 0.5])
+    assert kw["return_trajectory_latents"] is True
+
+
+def test_qwen_cfg_on_emits_negative(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    req = make_req(2, sigmas=sigmas_for(2))  # make_req default guidance_scale=4.0
+    req.sampling_params.negative_prompt = "ugly"
+    (call,) = adapter.build_inputs(req)
+    assert call.prompts[0] == {"prompt": "prompt 0", "negative_prompt": "ugly"}
+    assert call.sampling[0].kwargs["true_cfg_scale"] == 4.0
+
+
+def test_qwen_max_sequence_length_pinned_to_model_config(model_config):
+    """Unset on the request → pinned to model_config's 512, never upstream's
+    1024 default; request-carried value wins."""
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    req = make_req(1, sigmas=sigmas_for(2))
+    (call,) = adapter.build_inputs(req)
+    assert call.sampling[0].kwargs["max_sequence_length"] == 512
+
+    req2 = make_req(1, sigmas=sigmas_for(2))
+    req2.sampling_params.max_sequence_length = 256
+    (call2,) = adapter.build_inputs(req2)
+    assert call2.sampling[0].kwargs["max_sequence_length"] == 256
+
+
+def test_qwen_noise_and_sde_ride_shared_path(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    req = make_req(2, sigmas=sigmas_for(2))
+    req.sampling_params.sde_indices = [1, 0]
+    noise = torch.randn(2, 16, 8, 8)
+    req.request_conditions = {"initial_latents": SimpleNamespace(latents=noise)}
+    (call,) = adapter.build_inputs(req)
+    ea = call.sampling[0].kwargs["extra_args"]
+    assert ea["sde_indices"] == [0, 1]
+    assert ea["initial_noise_batch"] is noise
+
+
+def test_qwen_rejects_image(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    req = make_req(2, sigmas=sigmas_for(2), primitives={"image": Images(pixels=torch.zeros(2, 3, 8, 8))})
+    with pytest.raises(ValueError, match="does not accept"):
+        adapter.build_inputs(req)
+    with pytest.raises(ValueError, match="rejects image-bearing"):
+        adapter.validate_request(req)
+
+
 def test_t2v_adds_num_frames(model_config):
     adapter = make_adapter("hv15_t2v", model_config)
     req = make_req(2, sigmas=sigmas_for(2))

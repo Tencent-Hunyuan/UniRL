@@ -15,6 +15,7 @@ from tests.rollout.vllm_omni_v2.conftest import (
     fake_dit_output,
     fake_fused_capture,
     fake_hv15_capture,
+    fake_qwen_capture,
     fake_sd3_capture,
     make_adapter,
     make_req,
@@ -87,6 +88,78 @@ def test_sd35_text_condition_and_empty_input_guard(model_config):
         adapter.build_response(req, [[fake_dit_output(i, sigmas=sig, stage_id=0)] for i in range(2)])
     with pytest.raises(ValueError, match="empty per-request"):
         adapter.build_response(req, [[], []])
+
+
+def test_qwen_text_condition_cfg_off(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    sig = sigmas_for(2)
+    req = make_req(2, sigmas=sig)
+    per_request = [[fake_dit_output(i, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture())] for i in range(2)]
+    resp = adapter.build_response(req, per_request)
+    assert set(resp.tracks) == {"image"}
+    track = resp.tracks["image"]
+    cond = track.conditions["text"]
+    # Qwen-Image conditioning: token embeds + mask, NO pooled vector.
+    assert cond.embeds.shape == (2, 6, 8) and cond.attn_mask.shape == (2, 6)
+    assert cond.pooled is None
+    assert "negative_text" not in track.conditions  # CFG-off rollout
+    assert track.parent_track is None
+
+    with pytest.raises(RuntimeError, match="text_capture"):
+        adapter.build_response(req, [[fake_dit_output(i, sigmas=sig, stage_id=0)] for i in range(2)])
+
+
+def test_qwen_ragged_pad_cat_across_requests(model_config):
+    """Per-request L differs after the chat-template prefix strip — embeds
+    pad with zero rows, masks with zeros, so mask sums echo true lengths."""
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    sig = sigmas_for(2)
+    req = make_req(2, sigmas=sig)
+    per_request = [
+        [fake_dit_output(0, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture(L=5))],
+        [fake_dit_output(1, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture(L=7))],
+    ]
+    resp = adapter.build_response(req, per_request)
+    cond = resp.tracks["image"].conditions["text"]
+    assert cond.embeds.shape == (2, 7, 8) and cond.attn_mask.shape == (2, 7)
+    assert cond.attn_mask.sum(dim=1).tolist() == [5, 7]
+
+
+def test_qwen_cfg_on_emits_negative_text(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    sig = sigmas_for(2)
+    req = make_req(2, sigmas=sig)
+    per_request = [
+        [fake_dit_output(i, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture(with_negative=True))]
+        for i in range(2)
+    ]
+    resp = adapter.build_response(req, per_request)
+    neg = resp.tracks["image"].conditions["negative_text"]
+    assert neg.embeds.shape == (2, 4, 8) and neg.pooled is None
+
+    # Mixed capture (CFG fired for one request only) is fatal, not silent.
+    mixed = [
+        [fake_dit_output(0, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture(with_negative=True))],
+        [fake_dit_output(1, sigmas=sig, stage_id=0, custom_capture=fake_qwen_capture())],
+    ]
+    with pytest.raises(RuntimeError, match="uniform"):
+        adapter.build_response(req, mixed)
+
+
+def test_qwen_sigma_echo_and_nft_k0(model_config):
+    adapter = make_adapter("qwen_image_t2i", model_config)
+    sig = sigmas_for(2)
+    req = make_req(1, sigmas=sig)
+    bad = fake_dit_output(0, sigmas=torch.tensor([0.9, 0.4, 0.0]), stage_id=0, custom_capture=fake_qwen_capture())
+    with pytest.raises(Exception):
+        adapter.build_response(req, [[bad]])
+
+    # K=0 NFT path: clean-latents segment, sde fields dropped.
+    nft = fake_dit_output(0, sigmas=sig, stage_id=0, K=0, sde_step_indices=[], custom_capture=fake_qwen_capture())
+    resp = adapter.build_response(req, [[nft]])
+    seg = resp.tracks["image"].segment
+    assert seg.sde_logp is None and seg.sde_indices is None
+    assert seg.indices.tolist() == [0, 1, 2]
 
 
 def test_t2v_video_track_and_dual_stream_conditions(model_config):

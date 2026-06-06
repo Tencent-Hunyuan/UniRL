@@ -24,6 +24,9 @@ class FakeModelConfig:
 
     shift = 3.0
     use_lora = True
+    # Read by QwenImageInputAdapter to pin the worker's text budget to the
+    # trainer's (upstream would default to 1024).
+    max_sequence_length = 512
 
 
 @pytest.fixture
@@ -171,6 +174,20 @@ def fake_sd3_capture() -> Dict[str, Any]:
             "pooled_prompt_embeds": torch.zeros(1, 8),
         }
     }
+
+
+def fake_qwen_capture(L: int = 6, *, with_negative: bool = False, neg_L: int = 4) -> Dict[str, Any]:
+    """Qwen text capture: variable-length embeds + mask, no pooled vector.
+    ``L`` varies per request (post-prefix-strip lengths differ), which is
+    what the output adapter's ragged-pad concat exists for."""
+    capture: Dict[str, Any] = {
+        "prompt_embeds": torch.zeros(1, L, 8),
+        "prompt_embeds_mask": torch.ones(1, L, dtype=torch.long),
+    }
+    if with_negative:
+        capture["negative_prompt_embeds"] = torch.zeros(1, neg_L, 8)
+        capture["negative_prompt_embeds_mask"] = torch.ones(1, neg_L, dtype=torch.long)
+    return {"text_capture": capture}
 
 
 def fake_hv15_capture() -> Dict[str, Any]:
