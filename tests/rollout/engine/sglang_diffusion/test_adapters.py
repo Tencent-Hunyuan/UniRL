@@ -1,4 +1,4 @@
-"""Pure adapter tests — registry, build_inputs (template + stages), build_response, Klein unpack.
+"""Pure adapter tests — registry, build_inputs (template + stages), build_response, build_segment.
 
 Canned data, no SGLang, no GPU. Adapters are constructed with ``SimpleNamespace``
 stand-ins for the engine config + model config (they only read a handful of fields).
@@ -326,21 +326,27 @@ def test_validate_requires_shift():
 
 
 # --------------------------------------------------------------------------- #
-# trajectory unpack (base rejects 4-D; Klein handles it)
+# build_segment stage (base gates 5-D image form; Klein unpacks packed input)
 # --------------------------------------------------------------------------- #
 
 
 def test_base_image_adapter_rejects_4d_trajectory():
     a = SD3Adapter(_cfg(), _model_config(), strategy=None)
+    req = _req(["p"])
+    results = [_result(torch.randn(1, 3, 4, 8), req.sigmas)]
     with pytest.raises(ValueError, match="expected a 5-D image-form trajectory"):
-        a.unpack_trajectory(torch.randn(1, 3, 4, 8), _req(["p"]))
+        a.build_segment(req, results, num_steps=2, sde_indices=None, use_native_logprob=False)
 
 
 def test_klein_passes_through_5d():
     mc = _model_config(shift=1.0, build_schedule_policy=lambda: None)
     a = Flux2KleinAdapter(_cfg(), mc, strategy=_Dance())
+    req = _req(["p"])
     traj = torch.randn(1, 3, 2, 4, 4)
-    assert a.unpack_trajectory(traj, _req(["p"])) is traj
+    seg = a.build_segment(
+        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+    )
+    assert torch.equal(seg.latents, traj)
 
 
 def test_klein_unpacks_packed_4d():
@@ -350,8 +356,10 @@ def test_klein_unpacks_packed_4d():
     req = _req(["p"], height=32, width=32)
     B, T, S, C = 1, 3, 4, 8
     traj = torch.randn(B, T, S, C)
-    out = a.unpack_trajectory(traj, req)
-    assert out.shape == (B, T, C, 2, 2)
+    seg = a.build_segment(
+        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+    )
+    assert seg.latents.shape == (B, T, C, 2, 2)
 
 
 def test_klein_rejects_token_count_mismatch():
@@ -360,7 +368,9 @@ def test_klein_rejects_token_count_mismatch():
     req = _req(["p"], height=32, width=32)  # expects S = 4
     traj = torch.randn(1, 3, 9, 8)  # S = 9 ≠ 4
     with pytest.raises(ValueError, match="packed token count"):
-        a.unpack_trajectory(traj, req)
+        a.build_segment(
+            req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, use_native_logprob=False
+        )
 
 
 def test_klein_validate_requires_build_schedule_policy():

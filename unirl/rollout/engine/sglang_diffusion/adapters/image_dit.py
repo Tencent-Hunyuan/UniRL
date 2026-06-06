@@ -2,10 +2,11 @@
 
 Output shape = a 5-D image-form latent trajectory ``[B, T+1, C, H, W]`` decoded to
 ``Images``. Holds ``build_inputs`` / ``build_response`` once and exposes the per-model
-variation points as overridable methods (request side: ``build_prompts``,
-``build_sampling``; response side: ``unpack_trajectory``, ``build_segment``,
-``build_decoded``, ``build_condition``) and class knobs (``track_name``,
-``segment_factory``). Concrete adapters override only what differs.
+variation points as overridable stages (request side: ``build_prompts``,
+``build_sampling``; response side: ``build_segment``, ``build_decoded``,
+``build_condition``) and class knobs (``track_name``, ``segment_factory``).
+Concrete adapters override only the stages that differ — no sub-step hooks below
+a stage.
 
 Convention: the ``build_*`` stages are the overridable variation points;
 ``build_inputs`` / ``build_response`` are sealed templates that own validation,
@@ -18,8 +19,6 @@ the model-family branches lifted into overridable methods.
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-
-import torch
 
 from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion import utils
@@ -231,11 +230,19 @@ class ImageDiTAdapter(ModelAdapter):
         sde_indices: Optional[List[int]],
         use_native_logprob: bool,
     ):
-        latents = []
-        for r in results:
-            require(r.trajectory_latents is not None, "SGLang result missing trajectory_latents")
-            latents.append(r.trajectory_latents.detach().cpu())
-        traj = self.unpack_trajectory(torch.cat(latents, dim=0), req)
+        """Latent-trajectory stage: collect, gate the 5-D image-form shape, assemble.
+
+        Image-form families keep latents 5-D throughout. Packed-trajectory
+        families override this stage wholesale (re-composing the same ``utils``
+        mechanics around their unpack) rather than hooking a sub-step.
+        """
+        traj = utils.collect_trajectory_latents(results)
+        if traj.ndim != 5:
+            raise ValueError(
+                f"{self.model_family}: expected a 5-D image-form trajectory "
+                f"[B, T+1, C, H, W]; got rank {traj.ndim}, shape {tuple(traj.shape)}. "
+                f"Packed-trajectory families override build_segment."
+            )
         return utils.build_latent_segment(
             traj,
             results=results,
@@ -244,20 +251,6 @@ class ImageDiTAdapter(ModelAdapter):
             sde_indices=sde_indices,
             use_native_logprob=use_native_logprob,
             segment_factory=self.segment_factory,
-        )
-
-    def unpack_trajectory(self, traj, req: RolloutReq):
-        """Image-form families keep latents 5-D throughout; reject other ranks.
-
-        Only ``flux2_klein`` emits + unpacks the packed 4-D ``[B, T, H*W, C]``
-        shape, so it overrides this.
-        """
-        if traj.ndim == 5:
-            return traj
-        raise ValueError(
-            f"{self.model_family}: expected a 5-D image-form trajectory "
-            f"[B, T+1, C, H, W]; got rank {traj.ndim}, shape {tuple(traj.shape)}. "
-            f"Only flux2_klein handles the packed 4-D shape."
         )
 
     def build_decoded(self, results: List[RawResult]):

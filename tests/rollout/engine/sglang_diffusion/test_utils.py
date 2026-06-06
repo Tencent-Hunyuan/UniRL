@@ -109,6 +109,20 @@ def _traj(b, tp1, c=2, h=4, w=4):
     return torch.randn(b, tp1, c, h, w)
 
 
+def test_collect_trajectory_latents_cats_on_batch():
+    a, b = _traj(1, 3), _traj(2, 3)
+    out = utils.collect_trajectory_latents(
+        [_result(trajectory_latents=a), _result(trajectory_latents=b)]
+    )
+    assert out.shape == (3, 3, 2, 4, 4)
+    assert torch.equal(out[:1], a)
+
+
+def test_collect_trajectory_latents_requires_latents():
+    with pytest.raises(Exception, match="missing trajectory_latents"):
+        utils.collect_trajectory_latents([_result()])
+
+
 def test_build_latent_segment_basic_image():
     sigmas = torch.tensor([1.0, 0.5, 0.0])  # T=2, T+1=3
     traj = _traj(2, 3)

@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
+    """Concat per-result trajectory latents on the batch dim (detached, CPU)."""
+    latents = []
+    for r in results:
+        require(r.trajectory_latents is not None, "SGLang result missing trajectory_latents")
+        latents.append(r.trajectory_latents.detach().cpu())
+    return torch.cat(latents, dim=0)
+
+
 def derive_timestep_alignment(
     *,
     trajectories_tensor: torch.Tensor,

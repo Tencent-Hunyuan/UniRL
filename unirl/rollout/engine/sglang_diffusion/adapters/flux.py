@@ -1,17 +1,22 @@
 """FLUX-family image DiT adapters: plain FLUX + FLUX.2-Klein.
 
 ``FluxAdapter`` is the default image path (5-D passthrough). ``Flux2KleinAdapter``
-overrides exactly two steps: the packed-trajectory unpack (Klein's transformer is a
-pure sequence model emitting ``[B, T, H*W, C_packed]`` tokens) and the schedule
-policy (Klein needs a model-specific ``compute_mu`` the generic FlowMatch path can't
-synthesize). The Dance-GRPO SDE label rides on the base ``resolve_sde_label``.
+overrides exactly two stages: ``build_segment`` (Klein's transformer is a pure
+sequence model emitting packed ``[B, T, H*W, C_packed]`` tokens, so the trajectory
+is unpacked to image form before segment assembly) and the schedule policy (Klein
+needs a model-specific ``compute_mu`` the generic FlowMatch path can't synthesize).
+The Dance-GRPO SDE label rides on the base ``resolve_sde_label``.
 """
 
 from __future__ import annotations
 
+from typing import List, Optional
+
 from unirl.config.require import require
+from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
+from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import get_diffusion_params
 
@@ -43,11 +48,33 @@ class Flux2KleinAdapter(ImageDiTAdapter):
     def schedule_policy(self):
         return self.model_config.build_schedule_policy()
 
-    def unpack_trajectory(self, traj, req: RolloutReq):
+    def build_segment(
+        self,
+        req: RolloutReq,
+        results: List[RawResult],
+        *,
+        num_steps: int,
+        sde_indices: Optional[List[int]],
+        use_native_logprob: bool,
+    ):
+        """Stage override: unpack Klein's packed trajectory before segment assembly."""
+        traj = utils.collect_trajectory_latents(results)
+        traj = self._unpack_packed(traj, req)
+        return utils.build_latent_segment(
+            traj,
+            results=results,
+            expected_sigmas=req.sigmas,
+            num_steps=num_steps,
+            sde_indices=sde_indices,
+            use_native_logprob=use_native_logprob,
+            segment_factory=self.segment_factory,
+        )
+
+    def _unpack_packed(self, traj, req: RolloutReq):
         """Convert SGLang's packed ``[B, T, H*W, C]`` to image-form ``[B, T, C, H_pat, W_pat]``.
 
-        Other families keep latents in image form throughout, so their
-        trajectories arrive 5-D and pass through untouched.
+        Private helper, not an override seam — stages are the only derivation
+        points. 5-D input passes through untouched (image-form arrivals).
         """
         if traj.ndim == 5:
             return traj
