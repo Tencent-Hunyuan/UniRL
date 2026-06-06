@@ -210,12 +210,35 @@ class VLLMOmniBackend:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
+        #
+        # Node-local boot serialization: colocated replicas (8 per node) each
+        # spawn worker subprocesses that hold ~20 GiB anon RSS while
+        # materializing weights (safetensors -> dtype-cast staging). Eight
+        # simultaneous boots burst past the pod's k8s memcg limit and the
+        # kernel OOM-kills raylet/python (LIN-382 qwen probe, 2026-06-07:
+        # "Memory cgroup out of memory: Killed process ... anon-rss:
+        # 20216496kB", raylet SIGKILL -> ActorUnavailableError). An exclusive
+        # flock makes the heavy-load window single-file per node — boots take
+        # N * t_load instead of dying; it also narrows the master-port settle
+        # TOCTOU window as a side effect. Disable via
+        # DIFFRL_OMNI_BOOT_SERIALIZE=0 (e.g. single-replica smokes).
+        import fcntl
+
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
-        omni = rt["Omni"](
-            model=str(intent["model_path"]),
-            stage_configs_path=yaml_path,
-            **_assemble_omni_kwargs(intent),
-        )
+        serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
+        try:
+            if lock_file is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+            omni = rt["Omni"](
+                model=str(intent["model_path"]),
+                stage_configs_path=yaml_path,
+                **_assemble_omni_kwargs(intent),
+            )
+        finally:
+            if lock_file is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+                lock_file.close()
 
         # Driver-side tokenizer for AR prompt-token construction (workers
         # reload their own from the model path). Pure-DiT modalities skip it.
