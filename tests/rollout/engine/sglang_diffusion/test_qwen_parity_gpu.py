@@ -178,6 +178,22 @@ def test_parity_ode_vs_trainside(v2_engine, trainside):
     # x_T: same NoiseRecipe → bit-identical before any model math.
     x_t_v2 = lat_v2[:, 0].float()
     x_t_ts = lat_ts[:, 0].float()
+    # Diagnostics: per-row norms vs the recipe-resolved reference, plus the
+    # within-batch duplicate check (a per-output fork that reuses row 0 shows
+    # up as row0 == row1 server-side).
+    from unirl.types.noise_recipe import NoiseRecipe
+
+    expected = NoiseRecipe.from_rollout_req(req).resolve().float()
+    print(
+        f"\nx_T row norms — expected={[round(float(n), 3) for n in expected.flatten(1).norm(dim=1)]}"
+        f" v2={[round(float(n), 3) for n in x_t_v2.flatten(1).norm(dim=1)]}"
+        f" trainside={[round(float(n), 3) for n in x_t_ts.flatten(1).norm(dim=1)]}"
+    )
+    print(
+        f"x_T deltas — v2-vs-expected={float((x_t_v2 - expected).abs().max()):.3e}"
+        f" ts-vs-expected={float((x_t_ts - expected).abs().max()):.3e}"
+        f" v2-row0-vs-row1={float((x_t_v2[0] - x_t_v2[1]).abs().max()):.3e}"
+    )
     assert torch.allclose(x_t_v2, x_t_ts, atol=1e-6), (
         f"x_T diverged: max|Δ|={float((x_t_v2 - x_t_ts).abs().max())}"
     )
@@ -205,10 +221,12 @@ def test_sde_native_logprob_matches_replay(v2_engine, trainside):
     seg = track.segment
     assert seg.sde_logp is not None, "engine did not emit native log-probs in SDE mode"
 
-    conds = QwenImageConditions.from_dict(track.conditions)
+    # Replay runs on the trainside device — the rollout's conditions/segment
+    # arrive on CPU.
+    conds = QwenImageConditions.from_dict(track.conditions).to_device("cuda:1")
     result = trainside.diffusion.replay(
         conds,
-        segment=seg,
+        segment=seg.to_device("cuda:1"),
         params=_sampling(seed=7, sde_indices=sde_indices),
         step_indices=sde_indices,
     )
