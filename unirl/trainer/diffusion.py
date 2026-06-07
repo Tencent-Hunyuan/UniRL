@@ -314,6 +314,14 @@ class DiffusionTrainer(BaseTrainer):
         per-sample reward of the single track (0.0 if none), for the log line.
         """
         t0 = time.perf_counter()
+        # Release the previous train phase's activation peak back to the
+        # driver BEFORE the colocated engine re-maps its weights: without
+        # activation checkpointing the peak stays reserved in this process's
+        # caching allocator (~30-40 GiB on Qwen-Image at mbs=1) and the wake
+        # then OOMs at a 2 MiB allocation (LIN-382 qwen e2e-c, 2026-06-07).
+        # ~100 ms against multi-minute rollouts; harmless for trainside.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self.rollout.wake_up()
         if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
