@@ -48,6 +48,16 @@ class FSDPConfig:
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
     use_torch_compile: bool = False
+    # Opt-in no-sync gradient accumulation: defer the per-block FSDP2 gradient
+    # reduce-scatter to the last micro-batch of an optimizer step, so one
+    # reduce-scatter runs per step instead of one per micro-batch (the standard
+    # FSDP2 no-sync pattern; a multi-node win, ~no-op over NVLink). Only takes
+    # effect under ZeRO-2 (reshard_after_forward=False); ignored otherwise. NOT
+    # bit-identical to the per-micro path: the deferred grads accumulate in the
+    # unsharded buffers at param dtype (bf16 under mixed precision) across the
+    # micro-batches, whereas per-micro sync reduces each in reduce_dtype (fp32) —
+    # so reward / grad-norm parity must be confirmed before enabling in a recipe.
+    defer_grad_sync: bool = False
     # Optional high-precision master dtype for the TRAINABLE params (e.g. "fp32").
     # When set, fsdp_wrap keeps the trainable (LoRA) sharded master + optimizer
     # states at this dtype while MixedPrecisionPolicy(param_dtype) still casts the

@@ -165,6 +165,11 @@ class FSDPBackend(Remote):
         self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
+        # No-sync gradient accumulation (see set_grad_sync). Only active under
+        # ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the
+        # per-micro reshard/re-gather interacts badly with deferred sync.
+        self._defer_grad_sync: bool = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
+        self._grad_sync_enabled: bool = True
 
     # ------------------------------------------------------------------
     # Training step
@@ -172,6 +177,32 @@ class FSDPBackend(Remote):
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
+
+    def set_grad_sync(self, enable: bool) -> None:
+        """Toggle the per-block FSDP2 gradient reduce-scatter for no-sync accumulation.
+
+        With ``defer_grad_sync`` on, the train loop disables sync on every
+        micro-batch except the last, so the wrapped blocks accumulate gradients
+        in their unsharded buffers and a single reduce-scatter runs per optimizer
+        step instead of one per micro-batch. The non-block (replicated) params
+        are already DP-averaged once per step by ``sync_unsharded_grads`` in
+        ``optimizer_step``, so deferring the block reduce-scatter completes "one
+        gradient sync per step" for the whole model on a multi-node fabric.
+
+        No-op when deferral is off (the common case) or the flag is already in
+        the wanted state. ``set_is_last_backward`` does not recurse, so every
+        FSDP module is toggled; ``set_requires_gradient_sync`` is idempotent
+        across nesting.
+        """
+        if not self._defer_grad_sync or enable == self._grad_sync_enabled:
+            return
+        from torch.distributed.fsdp import FSDPModule
+
+        for m in self.model.modules():
+            if isinstance(m, FSDPModule):
+                m.set_requires_gradient_sync(enable)
+                m.set_is_last_backward(enable)
+        self._grad_sync_enabled = enable
 
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip, optimizer step, scheduler step, EMA step.

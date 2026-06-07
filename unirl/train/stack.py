@@ -293,7 +293,12 @@ class TrainStack(Remote):
         has_backward = False
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
-        for start, end in micro_slices:
+        last_micro = len(micro_slices) - 1
+        for i, (start, end) in enumerate(micro_slices):
+            # Defer the per-block gradient reduce-scatter to the last micro-batch
+            # so it runs once per optimizer step instead of once per micro-batch
+            # (no-op unless defer_grad_sync + ZeRO-2). Must precede the backward.
+            self.fsdp_backend.set_grad_sync(i == last_micro)
             micro_track = resp_track if single_micro else resp_track.slice(start, end)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
