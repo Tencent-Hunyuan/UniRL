@@ -260,7 +260,9 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy):
+    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy),
+    # applied uniformly to EVERY param — blocks and leftovers alike; the wrap
+    # topology below is orthogonal to the dtype policy:
     #   * explicit master_dtype  → upcast the TRAINABLE (LoRA) params to it even under mixed
     #     precision; the mp_policy still all-gathers them as param_dtype for compute, so only
     #     the optimizer master gains precision (the bf16-base + fp32-LoRA-master case).
@@ -270,58 +272,29 @@ def fsdp_wrap(
     #     loaded dtype and casts to mp_policy.param_dtype per forward, so an fp32-loaded model
     #     gets Megatron-style fp32 master weights for free. Pre-casting to bf16 here would
     #     round away the ~1e-6 AdamW steps. (Historically a no-op: models were loaded in bf16.)
-    for layer in block_instances:
-        for p in layer.parameters(recurse=True):
-            if not p.dtype.is_floating_point:
-                continue
-            if trainable_dtype is not None and p.requires_grad:
-                dst = trainable_dtype
-            elif not mixed_precision:
-                dst = target_dtype
-            else:
-                continue
-            if p.dtype != dst:
-                p.data = p.data.to(dst)
-                casts += 1
+    for p in model.parameters():
+        if isinstance(p, DTensor) or not p.dtype.is_floating_point:
+            continue  # already-wrapped params and ints never cast
+        if trainable_dtype is not None and p.requires_grad:
+            dst = trainable_dtype
+        elif not mixed_precision:
+            dst = target_dtype
+        else:
+            continue
+        if p.dtype != dst:
+            p.data = p.data.to(dst)
+            casts += 1
 
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
-    leftover_params = 0
     if root_wrap and not isinstance(model, FSDPModule):
-        # Root wrap: claim the leftover params (everything outside the block
-        # instances — embed / final norm / lm_head / time+patch embeds) into a
-        # root fully_shard group. Apply the SAME three pre-cast regimes to them
-        # first (the block loop above only covers block params; in the no-mp
-        # regime leftovers were historically never cast — latent gap fixed here).
-        # The ``isinstance`` guard makes the wrap idempotent and skips the
-        # degenerate case where ``model`` itself is a wrapped block instance.
-        frozen_foreign: List[str] = []
-        for name, p in model.named_parameters():
-            if isinstance(p, DTensor) or not p.dtype.is_floating_point:
-                continue  # block params are DTensors already; ints never cast
-            leftover_params += 1
-            if trainable_dtype is not None and p.requires_grad:
-                dst = trainable_dtype
-            elif not mixed_precision:
-                dst = target_dtype
-            else:
-                if not p.requires_grad and p.dtype != target_dtype:
-                    frozen_foreign.append(f"{name}:{p.dtype}")
-                continue
-            if p.dtype != dst:
-                p.data = p.data.to(dst)
-                casts += 1
-        if frozen_foreign and _current_rank() == 0:
-            logger.warning(
-                "fsdp_wrap: root wrap will shard %d FROZEN leftover param(s) whose dtype "
-                "differs from param_dtype=%s (e.g. %s). If these belong to a frozen "
-                "sibling sub-model that must stay replicated (mixed-dtype VAE / ViT), "
-                "set training.fsdp.root_wrap=false.",
-                len(frozen_foreign),
-                param_dtype,
-                ", ".join(frozen_foreign[:3]),
-            )
+        # Root wrap: claim the leftover params (everything the block wraps
+        # above did not own — embed / final norm / lm_head / time+patch
+        # embeds) into a root fully_shard group. The ``isinstance`` guard
+        # makes the wrap idempotent and skips the degenerate case where
+        # ``model`` itself is a wrapped block instance.
+        #
         # The root group must NOT inherit reshard_after_forward: FSDP2's auto
         # policy never reshards the root after forward, keeping its params
         # materialized for post-forward direct submodule calls (Qwen3's chunked
@@ -372,8 +345,7 @@ def fsdp_wrap(
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
             "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, "
-            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, "
-            "root_wrap=%s, leftover_params=%d)",
+            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             "HSDP" if mesh is not None else "FSDP2",
@@ -385,7 +357,6 @@ def fsdp_wrap(
             casts,
             master_dtype,
             root_wrap,
-            leftover_params,
         )
 
 
