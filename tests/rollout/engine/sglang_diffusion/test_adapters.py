@@ -270,7 +270,10 @@ def test_build_inputs_matches_legacy_translator():
         a = SD3Adapter(_cfg(), _model_config(), strategy=strategy)
         req = _req(prompts, group_ids=gids, **rkw)
         got = a.build_inputs(req, initial_noise=init_noise)
-        want = _to_sglang_kwargs(req, cfg=None, sde_label=sde_label, initial_noise=init_noise)
+        # Legacy translator reads cfg.populate_conditions post-migration — feed
+        # it the same posture as the v2 adapter's _cfg() (True).
+        legacy_cfg = SimpleNamespace(populate_conditions=True)
+        want = _to_sglang_kwargs(req, cfg=legacy_cfg, sde_label=sde_label, initial_noise=init_noise)
         assert got == want, f"kwargs drift vs legacy for case {prompts}, {rkw}"
 
 
