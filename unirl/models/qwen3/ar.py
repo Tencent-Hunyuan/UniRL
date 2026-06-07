@@ -20,15 +20,14 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from types import MethodType
 from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.distributed.fsdp import FSDPModule
 from torch.utils.checkpoint import checkpoint
 
-from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -37,17 +36,67 @@ from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
 
-def _supports_logits_to_keep(transformer: object) -> bool:
-    """Feature-detect ``logits_to_keep`` on the CausalLM forward (slice form).
+def _replay_aware_forward(
+    self: Any,
+    *,
+    response_tokens: Optional[torch.Tensor] = None,
+    prompt_len: Optional[int] = None,
+    temperature: float = 1.0,
+    autocast_dtype: Optional[torch.dtype] = None,
+    **kw: Any,
+) -> Any:
+    """Dual-mode ``forward`` installed on the Qwen3 CausalLM instance.
 
-    Detect by signature rather than version compare: older transformers named
-    it ``num_logits_to_keep`` (int-only), which cannot express the empty-slice
-    "skip lm_head" call the root-wrapped replay path uses. The signature
-    resolves through the FSDP2 class-swap MRO to the original forward.
+    Without ``response_tokens``: delegate to the stock class forward (decode /
+    generate). With it: run the decoder body only and return the padded
+    ``[B, T_max]`` FP32 per-token log-probs via a chunked
+    ``x[tok] - logsumexp(x)`` over ``lm_head`` — the full ``[B, L, vocab]``
+    logits are never materialized. Running inside ``forward`` keeps replay
+    valid under FSDP2 root wrap: the root pre-forward gathers the leftover
+    embed/norm/lm_head group and does not reshard it after forward.
     """
-    import inspect
+    if response_tokens is None:
+        # Resolve the real class forward through the MRO (skips this instance
+        # override; FSDPModule defines no forward).
+        for klass in type(self).__mro__:
+            f = klass.__dict__.get("forward")
+            if f is not None and f is not _replay_aware_forward:
+                return f(self, **kw)
+        raise RuntimeError("_replay_aware_forward: no class-level forward found in the MRO")
 
-    return "logits_to_keep" in inspect.signature(type(transformer).forward).parameters
+    # Body in autocast (matmul bf16, norms fp32); the caller passes None off-CUDA.
+    autocast_ctx = (
+        torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
+    )
+    with autocast_ctx:
+        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state  # [B, L, H]
+
+    # Chunked lm_head outside autocast: FP32 logp matching SGLang's
+    # log_softmax(logits/T). The chunk scales inversely with batch so the
+    # [B, chunk, vocab] FP32 transient stays ~1.2 GiB, and each chunk is
+    # gradient-checkpointed (recomputed in backward rather than held).
+    T = float(temperature) if float(temperature) > 0.0 else 1.0
+    T_max = int(response_tokens.size(1))
+    resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
+
+    def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        lf = self.lm_head(h).float() / T  # [B, chunk, vocab] FP32
+        chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
+        return chosen - torch.logsumexp(lf, dim=-1)
+
+    bsz = resp_hidden.size(0)
+    chunk = max(64, 2048 // max(1, bsz))
+    parts: List[torch.Tensor] = []
+    for s in range(0, T_max, chunk):
+        h = resp_hidden[:, s : s + chunk, :]
+        tok = response_tokens[:, s : s + chunk]
+        if torch.is_grad_enabled() and h.requires_grad:
+            parts.append(checkpoint(_logp_chunk, h, tok, use_reentrant=False))
+        else:
+            parts.append(_logp_chunk(h, tok))
+    if not parts:
+        return resp_hidden.new_zeros((bsz, 0), dtype=torch.float32)  # T_max == 0
+    return torch.cat(parts, dim=1)
 
 
 @dataclass
@@ -149,6 +198,13 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # the GRPO ratio / clip math starts from FP32.
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
+        # Install the dual-mode forward (see ``_replay_aware_forward``) as an
+        # INSTANCE attribute: it wins over the class forward, survives the
+        # FSDP2 class swap (only ``__class__`` changes) and LoRA injection,
+        # and is idempotent via the ``__func__`` identity check.
+        transformer = model.transformer
+        if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
+            transformer.forward = MethodType(_replay_aware_forward, transformer)
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the HF causal LM module — the FSDP/LoRA wrap target.
@@ -225,7 +281,10 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # per step according to ``reshard_after_forward``; under the default
         # root wrap the leftover group (embed / final norm / lm_head) stays
         # gathered after the first step — the root group never reshards after
-        # forward — so only the blocks pay per-token gather traffic.
+        # forward — so only the blocks pay per-token gather traffic. The
+        # transformer's ``forward`` is the patched dual-mode function
+        # (``_replay_aware_forward``); without ``response_tokens`` it delegates
+        # to the stock class forward, so this loop is unchanged.
         for _ in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
@@ -358,109 +417,24 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # to ``arange(0, L)`` and ignores ``attention_mask``.
         position_ids = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
 
-        # autocast scope mirrors SD3DiffusionStage.replay: matmul/linear stay
-        # in BF16 but softmax / layer_norm / log_softmax auto-promote to FP32
-        # in both forward and backward.  Without it, FSDP's ``param_dtype=bf16``
-        # forces every op to BF16 and backward NaNs after long LoRA drift.
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-        # Run the decoder BODY only — never materialize the full [B, L, vocab]
-        # logits (at 32k that tensor is ~10 GiB forward + ~10 GiB grad, the
-        # dominant replay-memory term; last_hidden_state is [B, L, H], ~75x
-        # smaller). Two dispatch paths:
-        #   * root-wrapped (default ``root_wrap: true``): ``transformer`` is an
-        #     FSDPModule whose ROOT group owns embed / final norm / lm_head, so
-        #     submodules cannot be called before the root forward runs. Call
-        #     the WHOLE root once with ``logits_to_keep=slice(0, 0)`` (lm_head
-        #     applied to an empty slice — no logits materialized; the int form
-        #     ``0`` means keep-ALL, never use it) and capture the decoder's
-        #     last_hidden_state via a forward hook on ``transformer.model``.
-        #     The root group does not reshard after forward, so the chunked
-        #     ``lm_head`` calls below run on still-materialized params.
-        #   * legacy (``root_wrap: false``): embed / norm / lm_head are plain
-        #     full params, so ``.model(...)`` and ``.lm_head(...)`` work called
-        #     directly.
-        transformer = self.model.transformer
-        if isinstance(transformer, FSDPModule):
-            require(
-                _supports_logits_to_keep(transformer),
-                "Qwen3ARStage.replay: the root-wrapped FSDP path needs a transformers "
-                "version whose CausalLM forward accepts `logits_to_keep` (>=4.49). "
-                "Upgrade transformers or set training.fsdp.root_wrap=false.",
-            )
-            captured: dict = {}
-
-            def _capture_body(_m: object, _args: object, _kwargs: object, out: object) -> None:
-                captured["hidden"] = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
-
-            handle = transformer.model.register_forward_hook(_capture_body, with_kwargs=True)
-            try:
-                with autocast_ctx:
-                    transformer(
-                        input_ids=full_ids,
-                        attention_mask=full_mask,
-                        position_ids=position_ids,
-                        use_cache=False,
-                        return_dict=True,
-                        logits_to_keep=slice(0, 0),
-                    )
-            finally:
-                handle.remove()
-            hidden = captured["hidden"]  # [B, L, H]
-        else:
-            with autocast_ctx:
-                body_out = transformer.model(
-                    input_ids=full_ids,
-                    attention_mask=full_mask,
-                    position_ids=position_ids,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                hidden = body_out.last_hidden_state  # [B, L, H]
+        # Replay goes through the patched dual-mode ``forward`` (see
+        # ``_replay_aware_forward``): the decoder body + chunked lm_head run
+        # INSIDE the root forward, so this is topology-independent (FSDP2
+        # root-wrapped or plain) and never materializes [B, L, vocab] logits.
+        # The cuda-vs-cpu autocast decision lives here; dtype validity and the
+        # autocast scope live in the patched forward.
+        per_token = self.model.transformer(
+            input_ids=full_ids,
+            attention_mask=full_mask,
+            position_ids=position_ids,
+            response_tokens=response_tokens,
+            prompt_len=prompt_len,
+            temperature=temperature,
+            autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
+        )  # [B, T_max] FP32
 
         if T_max == 0:
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
-
-        # Apply lm_head only to response positions, chunked over the time dim, with
-        # the identity  log_softmax(x)[tok] = x[tok] - logsumexp(x)  so we never
-        # materialize a full [B, T_max, vocab] tensor (FP32 that is ~18.5 GiB at
-        # 32k). Gradient-checkpoint each chunk so the per-chunk lm_head + FP32
-        # upcast is recomputed in backward rather than held. log_softmax stays FP32
-        # (outside the autocast scope) so the GRPO ratio / clip math starts from
-        # FP32, matching SD3. Divide by T so the returned logp matches SGLang's
-        # sampler (log_softmax(logits/T)); old_logp uses the same scaling.
-        # Numerically identical (value + gradient) to dense lm_head + log_softmax
-        # + gather, since logits == lm_head(last_hidden_state).
-        T = float(temperature) if float(temperature) > 0.0 else 1.0
-        lm_head = self.model.transformer.lm_head
-        resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]  # [B, T_max, H]
-
-        def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-            lf = lm_head(h).float() / T  # [B, chunk, vocab] FP32
-            chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
-            return chosen - torch.logsumexp(lf, dim=-1)
-
-        # ~1.2 GiB FP32 transient per chunk at B=1 (chunk x vocab x 4B). Scale
-        # the time-chunk down with batch so the [B, chunk, vocab] FP32 transient
-        # stays ~1.2 GiB regardless of per-rank shard size: replay() runs the
-        # whole shard in one call (B = samples/num_devices, i.e. 16 at dp=32),
-        # where a fixed chunk=2048 is an 18.5 GiB alloc that OOMs next to the
-        # colocated engine (which pins expandable_segments:False for CUDA-IPC
-        # weight sync, so the allocator cannot grow segments to absorb it).
-        bsz = resp_hidden.size(0)
-        chunk = max(64, 2048 // max(1, bsz))
-        parts: List[torch.Tensor] = []
-        for s in range(0, T_max, chunk):
-            h = resp_hidden[:, s : s + chunk, :]
-            tok = response_tokens[:, s : s + chunk]
-            if torch.is_grad_enabled() and h.requires_grad:
-                parts.append(checkpoint(_logp_chunk, h, tok, use_reentrant=False))
-            else:
-                parts.append(_logp_chunk(h, tok))
-        per_token = torch.cat(parts, dim=1)
 
         flat: List[torch.Tensor] = []
         for b in range(batch_size):
