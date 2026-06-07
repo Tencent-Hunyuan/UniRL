@@ -75,21 +75,21 @@ def _model_config(device=None):
     )
 
 
-def _sampling(*, seed=42, sde_indices=None):
+def _sampling(*, seed=42, sde_indices=None, eta=0.7):
     return DiffusionSamplingParams(
         num_inference_steps=_STEPS,
         height=_HW,
         width=_HW,
         guidance_scale=1.0,
-        eta=0.7,
+        eta=eta,
         seed=seed,
         samples_per_prompt=1,
         sde_indices=sde_indices,
     )
 
 
-def _req(*, seed=42, sde_indices=None):
-    sp = _sampling(seed=seed, sde_indices=sde_indices)
+def _req(*, seed=42, sde_indices=None, eta=0.7):
+    sp = _sampling(seed=seed, sde_indices=sde_indices, eta=eta)
     latent_shape = QwenImagePipeline.latent_shape(model_config=None, sampling_spec=sp)
     sample_ids = [f"s{i}" for i in range(len(_PROMPTS))]
     return RolloutReq(
@@ -163,7 +163,12 @@ def test_smoke_generate_sleep_wake(v2_engine):
 
 
 def test_parity_ode_vs_trainside(v2_engine, trainside):
-    req = _req(seed=42, sde_indices=None)  # ODE: deterministic given x_T
+    # Zero-noise dense parity: all steps marked SDE with eta=0.0 — both sides
+    # reduce exactly to the Euler/ODE update (server: std=0 ⇒ prev = sample +
+    # dt·model_output; trainside: step_eta=0), while the all-steps marking makes
+    # BOTH segments store the full T+1 trajectory (trainside storage is
+    # selective: ODE-mode keeps only the final step). Deterministic given x_T.
+    req = _req(seed=42, sde_indices=list(range(_STEPS)), eta=0.0)
     resp_v2 = v2_engine.generate(req)  # pins req.sigmas (σ SSOT) as a side effect
     resp_ts = trainside.generate(req)
 
