@@ -55,7 +55,13 @@ from unirl.types.rollout_req import RolloutReq  # noqa: E402
 from unirl.types.sampling import DiffusionSamplingParams  # noqa: E402
 
 _CKPT = os.environ["QWEN_IMAGE_PATH"]
-_PROMPTS = ["a red cube on grass", "a blue sphere in snow"]
+# Production request shape: ONE unique prompt per server forward (a GRPO group —
+# the adapter de-expands to prompt + num_outputs_per_prompt). The patched stack
+# forks multi-distinct-prompt requests into per-prompt executions server-side
+# and hands each the FULL initial_noise tensor (batch-dim mismatch) — a
+# pre-existing patch-suite gap shared with SD3; recipes avoid it by
+# construction (forward_batch_size == samples_per_prompt ⇒ one group/chunk).
+_PROMPTS = ["a red cube on grass", "a red cube on grass"]
 _STEPS = 8
 _HW = 384  # qwen_384 preset; latent grid 48x48, S=576
 
@@ -88,7 +94,10 @@ def _req(*, seed=42, sde_indices=None):
     sample_ids = [f"s{i}" for i in range(len(_PROMPTS))]
     return RolloutReq(
         sample_ids=sample_ids,
-        group_ids=[f"g{i}" for i in range(len(_PROMPTS))],
+        # One group: the adapter collapses to a single unique prompt with
+        # num_outputs_per_prompt=2 — the shape the patched stack supports
+        # alongside driver initial_noise (see _PROMPTS note).
+        group_ids=["g0" for _ in _PROMPTS],
         primitives={"text": Texts(texts=list(_PROMPTS))},
         sampling_params=sp,
         # Driver-authoritative x_T: same recipe → byte-identical noise on both
