@@ -10,14 +10,14 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import (
     register_adapter,
     registered_adapters,
 )
+from unirl.rollout.engine.sglang_diffusion.adapters.flux import (
+    Flux2KleinAdapter,
+    FluxAdapter,
+)
 from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
 
 # Concrete adapters — imported for their registration side-effects.
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
-from unirl.rollout.engine.sglang_diffusion.adapters.flux import (
-    FluxAdapter,
-    Flux2KleinAdapter,
-)
 from unirl.rollout.engine.sglang_diffusion.adapters.video import (
     HunyuanVideoAdapter,
     MochiAdapter,

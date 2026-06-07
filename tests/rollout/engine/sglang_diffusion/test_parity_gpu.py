@@ -32,6 +32,7 @@ pytest.importorskip("sglang", reason="SGLang fork not installed")
 if not torch.cuda.is_available():
     pytest.skip("parity gate needs a CUDA device", allow_module_level=True)
 
+from unirl.models.sd3.config import SD3PipelineConfig  # noqa: E402
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig  # noqa: E402
 from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine  # noqa: E402
 from unirl.rollout.engine.sglang_diffusion.config import (  # noqa: E402
@@ -42,7 +43,6 @@ from unirl.rollout.engine.sglang_diffusion.engine import (  # noqa: E402
     SGLangDiffusionRolloutEngine,
 )
 from unirl.sde.kernels import FlowSDEStrategy  # noqa: E402
-from unirl.models.sd3.config import SD3PipelineConfig  # noqa: E402
 from unirl.types.primitives import Texts  # noqa: E402
 from unirl.types.rollout_req import RolloutReq  # noqa: E402
 from unirl.types.sampling import DiffusionSamplingParams  # noqa: E402
@@ -57,8 +57,14 @@ def _model_config():
 
 def _req(*, seed=42, steps=4):
     sp = DiffusionSamplingParams(
-        num_inference_steps=steps, height=512, width=512, guidance_scale=1.0,
-        eta=0.7, seed=seed, samples_per_prompt=1, sde_indices=list(range(steps)),
+        num_inference_steps=steps,
+        height=512,
+        width=512,
+        guidance_scale=1.0,
+        eta=0.7,
+        seed=seed,
+        samples_per_prompt=1,
+        sde_indices=list(range(steps)),
     )
     return RolloutReq(
         sample_ids=[f"s{i}" for i in range(len(_PROMPTS))],
@@ -70,23 +76,33 @@ def _req(*, seed=42, steps=4):
 
 def _build_v2(ports: SGLangDiffusionPorts | None = None):
     cfg = SGLangDiffusionEngineConfig(
-        sampling=None, model_family="sd3",
-        populate_conditions=True, local_mode=True,
+        sampling=None,
+        model_family="sd3",
+        populate_conditions=True,
+        local_mode=True,
     )
     return SGLangDiffusionRolloutEngine(
-        cfg, device=torch.device("cuda"), strategy=FlowSDEStrategy(),
-        model_config=_model_config(), ports=ports,
+        cfg,
+        device=torch.device("cuda"),
+        strategy=FlowSDEStrategy(),
+        model_config=_model_config(),
+        ports=ports,
     )
 
 
 def _build_v1():
     cfg = SGLangEngineConfig(
-        sampling=None, model_family="sd3",
-        populate_conditions=True, local_mode=True,
+        sampling=None,
+        model_family="sd3",
+        populate_conditions=True,
+        local_mode=True,
     )
     return SGLangRolloutEngine(
-        cfg, device=torch.device("cuda"), strategy=FlowSDEStrategy(),
-        model_config=_model_config(), rank=0,
+        cfg,
+        device=torch.device("cuda"),
+        strategy=FlowSDEStrategy(),
+        model_config=_model_config(),
+        rank=0,
     )
 
 
@@ -100,7 +116,9 @@ def test_smoke_generate_sleep_wake():
         # cover for dropping the MASTER_PORT env-scope.
         sa = engine._backend._server_args
         assert (sa.port, sa.scheduler_port, sa.master_port) == (
-            ports.server_port, ports.scheduler_port, ports.master_port,
+            ports.server_port,
+            ports.scheduler_port,
+            ports.master_port,
         )
         resp = engine.generate(_req())
         seg = resp.tracks["image"].segment
@@ -122,9 +140,9 @@ def test_parity_sd3_latents_match_legacy():
         seg_old = resp_old.tracks["image"].segment
         assert torch.equal(seg_new.sigmas, seg_old.sigmas), "σ schedule diverged"
         # Tolerance per D4; tighten to torch.equal once SDE kernels are confirmed equal.
-        assert torch.allclose(
-            seg_new.latents.float(), seg_old.latents.float(), atol=1e-3, rtol=1e-3
-        ), "v2 latents diverged from legacy sglang for a fixed seed"
+        assert torch.allclose(seg_new.latents.float(), seg_old.latents.float(), atol=1e-3, rtol=1e-3), (
+            "v2 latents diverged from legacy sglang for a fixed seed"
+        )
     finally:
         new.shutdown()
         old.shutdown()

@@ -75,9 +75,7 @@ class Backend(Protocol):
 
     # generation
     def generate(self, sampling_kwargs: Dict[str, Any]) -> List[RawResult]: ...
-    def prepare_latent_shape(
-        self, *, height: int, width: int, num_frames: int, batch_size: int
-    ) -> tuple: ...
+    def prepare_latent_shape(self, *, height: int, width: int, num_frames: int, batch_size: int) -> tuple: ...
     # memory / lifecycle / health
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None: ...
     def resume_memory(self, *, tags: Sequence[str]) -> None: ...
@@ -85,20 +83,39 @@ class Backend(Protocol):
     def ping(self) -> bool: ...
     # weight-sync verbs (runtime payload types stay inside the impls)
     def update_from_tensor(
-        self, *, serialized_named_tensors: List[str], target_modules: List[str],
-        load_format: Optional[str], flush_cache: bool,
+        self,
+        *,
+        serialized_named_tensors: List[str],
+        target_modules: List[str],
+        load_format: Optional[str],
+        flush_cache: bool,
     ) -> None: ...
     def init_weights_group(
-        self, *, master_address: str, master_port: int, rank_offset: int,
-        world_size: int, group_name: str, backend: str,
+        self,
+        *,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+        group_name: str,
+        backend: str,
     ) -> None: ...
     def update_from_distributed(
-        self, *, names: List[str], dtypes: List[str], shapes: List[List[int]],
-        group_name: str, target_modules: List[str], flush_cache: bool,
+        self,
+        *,
+        names: List[str],
+        dtypes: List[str],
+        shapes: List[List[int]],
+        group_name: str,
+        target_modules: List[str],
+        flush_cache: bool,
     ) -> None: ...
     def destroy_weights_group(self, *, group_name: str) -> None: ...
-    def set_lora(self, *, lora_nickname: str, lora_tensors: Dict[str, Any], target: str = "all", strength: float = 1.0) -> None: ...
+    def set_lora(
+        self, *, lora_nickname: str, lora_tensors: Dict[str, Any], target: str = "all", strength: float = 1.0
+    ) -> None: ...
     def weights_checksum(self, *, module_names: List[str]) -> dict: ...
+
     # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
 
 

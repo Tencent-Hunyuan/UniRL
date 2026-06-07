@@ -18,15 +18,15 @@ import torch
 
 from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
+from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
+    decode_sample,
+    fuse_encoder_outputs,
+)
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
-from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
-    decode_sample,
-    fuse_encoder_outputs,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -128,9 +128,7 @@ def build_latent_segment(
     )
     sde_logp: Optional[torch.Tensor] = None
     if emit_native_logprob:
-        sde_logp = _native_sde_logp(
-            results, num_steps=num_steps, sde_indices=sde_indices
-        )
+        sde_logp = _native_sde_logp(results, num_steps=num_steps, sde_indices=sde_indices)
 
     batch_size = int(trajectories_tensor.shape[0])
     return segment_factory(
@@ -159,9 +157,7 @@ def _native_sde_logp(
     is a hard error.
     """
     per_result: List[Optional[torch.Tensor]] = [
-        result.trajectory_log_probs.detach().cpu()
-        if result.trajectory_log_probs is not None
-        else None
+        result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
         for result in results
     ]
     if any(lp is None for lp in per_result):
@@ -209,8 +205,7 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             skipped_video = True
         else:
             raise RuntimeError(
-                f"stack_decoded_images: unexpected canonical media rank "
-                f"{canonical.dim()}; want 3 (image) or 4 (video)."
+                f"stack_decoded_images: unexpected canonical media rank {canonical.dim()}; want 3 (image) or 4 (video)."
             )
     if skipped_video:
         logger.warning(

@@ -53,8 +53,9 @@ def _model_config(**over):
     return SimpleNamespace(**base)
 
 
-def _req(prompts, group_ids=None, *, num_inference_steps=2, sde_indices=None, sampler_kwargs=None,
-         height=256, width=256):
+def _req(
+    prompts, group_ids=None, *, num_inference_steps=2, sde_indices=None, sampler_kwargs=None, height=256, width=256
+):
     sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1)
     sp = DiffusionSamplingParams(
         num_inference_steps=num_inference_steps,
@@ -96,9 +97,7 @@ def _result(latents, sigmas, **kw):
 
 
 def test_all_families_registered():
-    assert set(adapters.registered_adapters()) == {
-        "sd3", "flux", "flux2_klein", "mochi", "hunyuan_video"
-    }
+    assert set(adapters.registered_adapters()) == {"sd3", "flux", "flux2_klein", "mochi", "hunyuan_video"}
 
 
 def test_get_adapter_unknown_raises():
@@ -342,9 +341,7 @@ def test_klein_passes_through_5d():
     a = Flux2KleinAdapter(_cfg(), mc, strategy=_Dance())
     req = _req(["p"])
     traj = torch.randn(1, 3, 2, 4, 4)
-    seg = a.build_segment(
-        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
-    )
+    seg = a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
     assert torch.equal(seg.latents, traj)
 
 
@@ -355,9 +352,7 @@ def test_klein_unpacks_packed_4d():
     req = _req(["p"], height=32, width=32)
     B, T, S, C = 1, 3, 4, 8
     traj = torch.randn(B, T, S, C)
-    seg = a.build_segment(
-        req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
-    )
+    seg = a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
     assert seg.latents.shape == (B, T, C, 2, 2)
 
 
@@ -367,9 +362,7 @@ def test_klein_rejects_token_count_mismatch():
     req = _req(["p"], height=32, width=32)  # expects S = 4
     traj = torch.randn(1, 3, 9, 8)  # S = 9 ≠ 4
     with pytest.raises(ValueError, match="packed token count"):
-        a.build_segment(
-            req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False
-        )
+        a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
 
 
 def test_klein_validate_requires_build_schedule_policy():

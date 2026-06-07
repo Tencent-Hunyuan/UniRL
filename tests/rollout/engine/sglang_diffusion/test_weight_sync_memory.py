@@ -77,24 +77,30 @@ def test_update_from_tensor_rejects_empty():
 def test_nccl_three_phase_forwards():
     ws = _ws()
     ws.init_weights_update_group(
-        master_address="127.0.0.1", master_port=40000, rank_offset=0,
-        world_size=2, group_name="g",
+        master_address="127.0.0.1",
+        master_port=40000,
+        rank_offset=0,
+        world_size=2,
+        group_name="g",
     )
     ws.update_weights_from_distributed(
-        names=["w"], dtypes=["float32"], shapes=[[2, 2]], group_name="g",
+        names=["w"],
+        dtypes=["float32"],
+        shapes=[[2, 2]],
+        group_name="g",
     )
     ws.destroy_weights_update_group(group_name="g")
     assert [n for n, _ in ws._backend.calls] == [
-        "init_weights_group", "update_from_distributed", "destroy_weights_group"
+        "init_weights_group",
+        "update_from_distributed",
+        "destroy_weights_group",
     ]
     assert ws._backend.named("update_from_distributed")[0]["target_modules"] == ["transformer"]
 
 
 def test_update_from_distributed_rejects_empty_names():
     with pytest.raises(ValueError, match="non-empty"):
-        _ws().update_weights_from_distributed(
-            names=[], dtypes=[], shapes=[], group_name="g"
-        )
+        _ws().update_weights_from_distributed(names=[], dtypes=[], shapes=[], group_name="g")
 
 
 # --------------------------------------------------------------------------- #
@@ -117,7 +123,7 @@ def test_set_lora_strips_prefix_injects_alpha_keeps_nickname_stable():
     assert call["lora_nickname"] == "default"
     sent = call["lora_tensors"]
     assert "attn.to_q.lora_A.weight" in sent  # prefix stripped
-    assert "attn.to_q.alpha" in sent          # alpha injected
+    assert "attn.to_q.alpha" in sent  # alpha injected
     assert ws._active_adapter == "default"
 
     # second push re-uses the SAME nickname: SGLang's diffusion registry clears

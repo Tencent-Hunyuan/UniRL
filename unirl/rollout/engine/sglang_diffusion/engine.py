@@ -26,11 +26,11 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
+from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
     SGLangDiffusionEngineConfig,
     SGLangDiffusionPorts,
 )
-from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.weight_sync import WeightSync
 from unirl.sde.noise import generate_latents
 from unirl.sde.runtime import ensure_req_sigmas
@@ -65,8 +65,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     ) -> None:
         require(
             isinstance(config, SGLangDiffusionEngineConfig),
-            f"SGLangDiffusionRolloutEngine requires SGLangDiffusionEngineConfig; "
-            f"got {type(config).__name__}",
+            f"SGLangDiffusionRolloutEngine requires SGLangDiffusionEngineConfig; got {type(config).__name__}",
         )
         require(
             model_config is not None and bool(model_config.pretrained_model_ckpt_path),
@@ -77,9 +76,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         self.model_config = model_config
         self.strategy = strategy
         self.rank = rank
-        self._device = device if device is not None else torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
 
         # Adapter (the only read of a model knob) — owns the conversion + schedule.
@@ -303,9 +300,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        self._weight_sync.set_lora_from_tensors(
-            adapter_name, lora_tensors, peft_config=peft_config
-        )
+        self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> Dict[int, List[Dict[str, str]]]:
         return self._weight_sync.loaded_param_checksums(names=names)

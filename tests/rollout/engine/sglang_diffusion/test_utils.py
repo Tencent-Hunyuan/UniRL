@@ -15,7 +15,7 @@ import torch
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.types.primitives import Images
-from unirl.types.segments.latent import make_image_segment, make_video_segment
+from unirl.types.segments.latent import make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
 
 
@@ -50,9 +50,9 @@ def test_deexpand_collapses_uniform_groups():
 @pytest.mark.parametrize(
     "prompts,gids",
     [
-        (["a", "a", "b"], ["g0", "g0", "g1"]),       # heterogeneous K
+        (["a", "a", "b"], ["g0", "g0", "g1"]),  # heterogeneous K
         (["a", "x", "b", "b"], ["g0", "g0", "g1", "g1"]),  # mismatched within group
-        (["a", "b"], ["g0", "g1"]),                  # K == 1
+        (["a", "b"], ["g0", "g1"]),  # K == 1
     ],
 )
 def test_deexpand_falls_through(prompts, gids):
@@ -111,9 +111,7 @@ def _traj(b, tp1, c=2, h=4, w=4):
 
 def test_collect_trajectory_latents_cats_on_batch():
     a, b = _traj(1, 3), _traj(2, 3)
-    out = utils.collect_trajectory_latents(
-        [_result(trajectory_latents=a), _result(trajectory_latents=b)]
-    )
+    out = utils.collect_trajectory_latents([_result(trajectory_latents=a), _result(trajectory_latents=b)])
     assert out.shape == (3, 3, 2, 4, 4)
     assert torch.equal(out[:1], a)
 
@@ -219,9 +217,7 @@ def test_derive_timestep_alignment_rejects_length_mismatch():
     traj = _traj(1, 2)  # T+1 = 2, mismatched
     res = [_result(trajectory_latents=traj, trajectory_timesteps=sigmas[:2])]
     with pytest.raises(Exception, match="trajectory length"):
-        utils.derive_timestep_alignment(
-            trajectories_tensor=traj, expected_sigmas=sigmas, results=res
-        )
+        utils.derive_timestep_alignment(trajectories_tensor=traj, expected_sigmas=sigmas, results=res)
 
 
 # --------------------------------------------------------------------------- #

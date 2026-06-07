@@ -55,11 +55,9 @@ def test_lora_intent_when_enabled():
 def test_engine_kwargs_passthrough_and_extra_override():
     ports = SGLangDiffusionPorts(server_port=1, scheduler_port=2, master_port=3)
     cfg = _cfg(engine_kwargs={"mem_fraction_static": 0.8})
-    intent = cfg.server_intent(
-        model_config=_model_config(), ports=ports, extra={"model_path": "/override"}
-    )
-    assert intent["mem_fraction_static"] == 0.8       # escape-hatch passthrough
-    assert intent["model_path"] == "/override"        # adapter extra wins over typed
+    intent = cfg.server_intent(model_config=_model_config(), ports=ports, extra={"model_path": "/override"})
+    assert intent["mem_fraction_static"] == 0.8  # escape-hatch passthrough
+    assert intent["model_path"] == "/override"  # adapter extra wins over typed
 
 
 def test_ports_win_over_engine_kwargs():

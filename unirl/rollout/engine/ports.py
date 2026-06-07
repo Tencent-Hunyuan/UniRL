@@ -45,15 +45,12 @@ class ReservedPorts:
         fields = dataclasses.fields(self)
         if not fields:
             raise TypeError(
-                f"{type(self).__name__} declares no port fields; subclass "
-                "ReservedPorts with one int field per port"
+                f"{type(self).__name__} declares no port fields; subclass ReservedPorts with one int field per port"
             )
         for f in fields:
             value = getattr(self, f.name)
             if not isinstance(value, int) or not (1 <= value <= 65535):
-                raise ValueError(
-                    f"{type(self).__name__}.{f.name} must be a TCP port in [1, 65535]; got {value!r}"
-                )
+                raise ValueError(f"{type(self).__name__}.{f.name} must be a TCP port in [1, 65535]; got {value!r}")
         ports = tuple(getattr(self, f.name) for f in fields)
         if len(set(ports)) != len(ports):
             raise ValueError(f"{type(self).__name__} ports must be distinct; got {ports}")
@@ -64,9 +61,7 @@ class ReservedPorts:
         names = [f.name for f in dataclasses.fields(cls)]
         ports = list(ports)
         if len(ports) != len(names):
-            raise ValueError(
-                f"{cls.__name__}.from_ports expects {len(names)} ports; got {len(ports)}"
-            )
+            raise ValueError(f"{cls.__name__}.from_ports expects {len(names)} ports; got {len(ports)}")
         return cls(**{name: int(port) for name, port in zip(names, ports)})
 
     @classmethod

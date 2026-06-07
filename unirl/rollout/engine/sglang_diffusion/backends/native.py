@@ -101,14 +101,11 @@ class SGLangBackend:
         raw = self._gen.generate(sampling_params_kwargs=sampling_kwargs)
         if raw is None:
             raise RuntimeError(
-                "SGLang generator returned None — full-batch failure "
-                "(see DiffGenerator.generate docstring)."
+                "SGLang generator returned None — full-batch failure (see DiffGenerator.generate docstring)."
             )
         return list(raw) if isinstance(raw, list) else [raw]
 
-    def prepare_latent_shape(
-        self, *, height: int, width: int, num_frames: int, batch_size: int
-    ) -> tuple:
+    def prepare_latent_shape(self, *, height: int, width: int, num_frames: int, batch_size: int) -> tuple:
         """Per-sample latent shape via SGLang's ``pipeline_config`` (no RL types)."""
         from types import SimpleNamespace
 
@@ -132,9 +129,7 @@ class SGLangBackend:
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
         if cpu_backup_tags is not None:
             try:
-                response = self._gen.release_memory_occupation(
-                    tags=list(tags), cpu_backup_tags=list(cpu_backup_tags)
-                )
+                response = self._gen.release_memory_occupation(tags=list(tags), cpu_backup_tags=list(cpu_backup_tags))
             except TypeError:
                 # Tolerate an older fork whose release_memory_occupation predates
                 # cpu_backup_tags (real API-drift guard, not the absent-method kind).

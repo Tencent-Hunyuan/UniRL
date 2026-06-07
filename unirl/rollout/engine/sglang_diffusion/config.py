@@ -101,8 +101,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         valid_families = registered_adapters()
         require(
             self.model_family in valid_families,
-            f"SGLangDiffusionEngineConfig.model_family must be one of "
-            f"{set(valid_families)}; got {self.model_family!r}",
+            f"SGLangDiffusionEngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
         )
 
         require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
