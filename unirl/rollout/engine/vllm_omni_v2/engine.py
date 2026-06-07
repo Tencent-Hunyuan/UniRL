@@ -150,6 +150,15 @@ class VLLMOmniV2RolloutEngine(BaseRolloutEngine):
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
         if not self._is_offloaded:
             return
+        # This body executes INSIDE each colocated train actor (BROADCAST).
+        # Return the actor's train-phase allocation peak to the driver before
+        # the engine subprocess re-maps its ~50 GiB weight pool: without
+        # activation checkpointing the peak stays reserved in the actor's
+        # caching allocator and the post-wake generate OOMs at a 2 MiB
+        # allocation (LIN-382 qwen e2e-c/d — a driver-side flush in
+        # trainer.train_step demonstrably does NOT reach this process).
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         self._backend.wake_task()
         try:
             # v1 parity: actively re-push the cached adapter (NOT the passive
