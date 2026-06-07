@@ -75,3 +75,9 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
   shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass
   `block_class_names` explicitly in the recipe.
+- **`fsdp_wrap` shards the leftover params (embed / final norm / lm_head) into a
+  root `fully_shard` group by default** (`root_wrap`, on) — the root group never
+  reshards after forward. Set `root_wrap: false` for models whose stages call
+  submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
+  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
+  every group then fails fast.

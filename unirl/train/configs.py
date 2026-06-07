@@ -55,6 +55,15 @@ class FSDPConfig:
     # bf16 compute" recipe flow_grpo relies on for stable low-gradient RL. None
     # (default) = master dtype follows param_dtype (the prior all-bf16 behavior).
     master_dtype: Optional[str] = None
+    # Root fully_shard (default ON): after the per-block wrap, fully_shard the
+    # model root so the leftover params (embed / final norm / lm_head) are
+    # sharded + mp_policy'd like everything else instead of staying plain
+    # replicated tensors (which need manual grad sync and keep full fp32
+    # masters per rank). Set false for models whose stages call submodules of
+    # the wrapped object directly outside a root forward (bagel's vendored
+    # code) or whose wrapped object carries frozen mixed-dtype sibling
+    # sub-models that must not be sharded (hunyuan_image3's VAE/ViT).
+    root_wrap: bool = True
 
 
 __all__ = [

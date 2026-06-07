@@ -129,6 +129,7 @@ class FSDPBackend(Remote):
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            root_wrap=getattr(fsdp_cfg, "root_wrap", True),
         )
 
         bundle_materialize = getattr(bundle, "materialize", None)
@@ -189,8 +190,11 @@ class FSDPBackend(Remote):
         ``TrainStack``) routes through, so the guard covers all of them.
         """
         params = list(trainable_params(self.model))
-        # DP-average the grads FSDP doesn't own (embed / final norm / lm_head sit
-        # outside the per-block fully_shard wrap) so their replicas don't drift.
+        # DP-average the grads FSDP doesn't own. With the default root wrap
+        # every param is a DTensor and this is a no-op; it is the safety net
+        # for ``root_wrap: false`` configs (bagel / hunyuan_image3), where
+        # embed / final norm / lm_head stay plain replicated tensors whose
+        # replicas would otherwise drift.
         sync_unsharded_grads(params)
         clipped = clip_grad_norm(params, float(max_grad_norm))
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)

@@ -81,6 +81,9 @@ backend:
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
+    # trainable_attr resolves to the HF wrapper that carries frozen mixed-dtype
+    # VAE / ViT sibling sub-models; a root fully_shard would shard them too.
+    root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-4

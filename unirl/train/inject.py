@@ -198,6 +198,7 @@ def fsdp_wrap(
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    root_wrap: bool = True,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors
     ARE the handle.  Ported from FSDPPolicy._wrap_model.
@@ -206,12 +207,23 @@ def fsdp_wrap(
     ``stage`` is ignored for discovery.  Otherwise we fall back to
     ``_discover_block_classes(model, stage)`` (model __mro__ then stage
     source chain).
+
+    ``root_wrap`` (default ON) adds a root ``fully_shard(model)`` after the
+    per-block wrap so the leftover params (embed / final norm / lm_head)
+    are sharded + mp_policy'd instead of staying plain replicated tensors.
+    The root group deliberately does NOT inherit ``reshard_after_forward``:
+    FSDP2's auto policy keeps the root's params materialized after forward,
+    which stages rely on for direct post-forward submodule calls (e.g. the
+    chunked ``lm_head`` in Qwen3 replay). See ``FSDPConfig.root_wrap`` for
+    when to disable it.
     """
     from torch.distributed.fsdp import (
         CPUOffloadPolicy,
+        FSDPModule,
         MixedPrecisionPolicy,
         fully_shard,
     )
+    from torch.distributed.tensor import DTensor
 
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
     # Optional high-precision optimizer master for the TRAINABLE (LoRA) params. When set
@@ -274,6 +286,50 @@ def fsdp_wrap(
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
+    leftover_params = 0
+    if root_wrap and not isinstance(model, FSDPModule):
+        # Root wrap: claim the leftover params (everything outside the block
+        # instances — embed / final norm / lm_head / time+patch embeds) into a
+        # root fully_shard group. Apply the SAME three pre-cast regimes to them
+        # first (the block loop above only covers block params; in the no-mp
+        # regime leftovers were historically never cast — latent gap fixed here).
+        # The ``isinstance`` guard makes the wrap idempotent and skips the
+        # degenerate case where ``model`` itself is a wrapped block instance.
+        frozen_foreign: List[str] = []
+        for name, p in model.named_parameters():
+            if isinstance(p, DTensor) or not p.dtype.is_floating_point:
+                continue  # block params are DTensors already; ints never cast
+            leftover_params += 1
+            if trainable_dtype is not None and p.requires_grad:
+                dst = trainable_dtype
+            elif not mixed_precision:
+                dst = target_dtype
+            else:
+                if not p.requires_grad and p.dtype != target_dtype:
+                    frozen_foreign.append(f"{name}:{p.dtype}")
+                continue
+            if p.dtype != dst:
+                p.data = p.data.to(dst)
+                casts += 1
+        if frozen_foreign and _current_rank() == 0:
+            logger.warning(
+                "fsdp_wrap: root wrap will shard %d FROZEN leftover param(s) whose dtype "
+                "differs from param_dtype=%s (e.g. %s). If these belong to a frozen "
+                "sibling sub-model that must stay replicated (mixed-dtype VAE / ViT), "
+                "set training.fsdp.root_wrap=false.",
+                len(frozen_foreign),
+                param_dtype,
+                ", ".join(frozen_foreign[:3]),
+            )
+        # The root group must NOT inherit reshard_after_forward: FSDP2's auto
+        # policy never reshards the root after forward, keeping its params
+        # materialized for post-forward direct submodule calls (Qwen3's chunked
+        # lm_head) and activation-checkpoint recomputes. Everything else
+        # (mesh / mp_policy / offload_policy) is shared with the block groups.
+        root_kwargs = dict(fsdp_kwargs)
+        root_kwargs.pop("reshard_after_forward", None)
+        fully_shard(model, **root_kwargs)
+
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
 
@@ -297,7 +353,8 @@ def fsdp_wrap(
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
             "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, "
-            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s)",
+            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, "
+            "root_wrap=%s, leftover_params=%d)",
             len(block_instances),
             tuple(block_class_names),
             "HSDP" if mesh is not None else "FSDP2",
@@ -308,6 +365,8 @@ def fsdp_wrap(
             use_torch_compile,
             casts,
             master_dtype,
+            root_wrap,
+            leftover_params,
         )
 
 
