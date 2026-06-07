@@ -109,22 +109,44 @@ class ImageDiTAdapter(ModelAdapter):
         # Layer 2: overridable stages (override layer 1).
         kwargs.update(self.build_prompts(req))
         kwargs.update(self.build_sampling(req, diffusion=diffusion))
-        # Layer 3: engine pins — RL-loop invariants, not model knobs.
+        # Layer 3: engine pins — RL-loop invariants, not model knobs. Stock
+        # upstream has no ``init_same_noise`` field; its default draws per-output
+        # noise (== the fork's ``init_same_noise=False``), and any group-sharing
+        # pattern is already carried by ``initial_noise`` below, so the fork flag
+        # is simply dropped. ``save_output`` / ``return_file_paths_only`` default
+        # to True upstream — RL wants tensors, not files, so the pins are load-
+        # bearing.
         kwargs.update(
             {
-                "init_same_noise": False,
                 "save_output": False,
                 "return_file_paths_only": False,
                 "return_trajectory_latents": True,
                 "return_trajectory_decoded": False,
-                "return_prompt_embeds": True,
             }
         )
 
+        # ``return_prompt_embeds`` / ``return_negative_prompt_embeds`` are the
+        # conditions-path opt-in flags re-hosted onto stock upstream by
+        # ``_patches/patch_conditions`` (+ ``patch_sampling_io`` makes them genuine
+        # ``SamplingParams`` fields). Only request them when the engine populates
+        # conditions; positives are always emitted under ``populate_conditions``,
+        # negatives only when CFG is actually active in the rollout (SGLang's CFG
+        # gate: ``guidance_scale > 1`` AND a negative prompt present) — the same
+        # invariant the ``require`` above enforces from the opposite direction.
+        if self.cfg.populate_conditions:
+            kwargs["return_prompt_embeds"] = True
+            if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
+                kwargs["return_negative_prompt_embeds"] = True
+
         if initial_noise is not None:
             kwargs["initial_noise"] = initial_noise
-        if req.group_ids:
-            kwargs["noise_group_ids"] = [str(gid) for gid in req.group_ids]
+        # Per-step SDE noise key. Keyed on sample_ids (unique per sample) so each
+        # sample explores its own per-step SDE noise; the fork keyed on group_ids
+        # (same-group samples shared per-step noise). x_T is already per-sample
+        # via the initial_noise injection above, so within-group diversity does
+        # not depend on this; it is a secondary exploration knob.
+        if req.sample_ids:
+            kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
 
         # Layer 4: SDE-kernel kwargs only when the algorithm requested SDE noise.
         if sde_indices is not None:
@@ -135,7 +157,12 @@ class ImageDiTAdapter(ModelAdapter):
             kwargs["rollout"] = True
             kwargs["rollout_sde_type"] = self._sde_label
             kwargs["rollout_noise_level"] = float(diffusion.eta)
-            kwargs["rollout_sde_indices"] = sde_indices
+            # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``)
+            # and gates dit-trajectory collection (latents + timesteps, returned in
+            # ``rollout_trajectory_data.dit_trajectory``) on
+            # ``rollout_return_dit_trajectory``.
+            kwargs["rollout_sde_step_indices"] = sde_indices
+            kwargs["rollout_return_dit_trajectory"] = True
 
         return kwargs
 
@@ -165,8 +192,9 @@ class ImageDiTAdapter(ModelAdapter):
         ``req.sigmas`` is length T+1 (terminal 0 included); SGLang's
         ``set_timesteps`` wants the interior T. Pass the seed even when
         ``initial_noise`` pins x_T verbatim: SGLang derives per-step SDE noise
-        deterministically (keyed on ``noise_group_ids``) only when seed is not
-        None — a None seed silently falls back to global RNG.
+        deterministically (its ``_make_step_generators``, keyed on
+        ``denoise_seeds``) only when seed is not None — a None seed silently
+        falls back to global RNG.
         """
         return {
             "num_inference_steps": int(diffusion.num_inference_steps),

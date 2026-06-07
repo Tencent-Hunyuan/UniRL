@@ -23,20 +23,41 @@ logger = logging.getLogger(__name__)
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
-    """Lazy import of SGLang scheduler types. Imported once per process."""
+    """Install the UniRL patch suite, then import the runtime types. Once per process.
+
+    Stock upstream sglang (>= 0.5.12.post1) replaced the fork: the RL additions
+    (weight-sync verbs, in-memory LoRA, sleep/wake, rollout IO fields) are
+    re-hosted as in-process patches under ``unirl.rollout.engine.sglang._patches``
+    and MUST be installed before any scheduler/worker spawns — ``hijack()`` also
+    wraps the mp process target so spawned children re-install (mirrors the v1
+    engine, ``sglang/engine.py``).
+
+    Import sourcing mirrors v1: types that exist upstream come from upstream;
+    fork-only req types come from ``_patches.io_struct`` / ``_patches.lora_req``
+    (``patch_scheduler`` registers handlers keyed on those exact classes).
+    """
+    from unirl.rollout.engine.sglang._patches import SglangDiffusionHijack
+
+    SglangDiffusionHijack.hijack()
+
     from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
         DiffGenerator,
     )
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-        DestroyWeightsUpdateGroupReqInput,
         GetWeightsChecksumReqInput,
+    )
+    from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    from unirl.rollout.engine.sglang._patches.io_struct import (
+        DestroyWeightsUpdateGroupReqInput,
         InitWeightsUpdateGroupReqInput,
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
         UpdateWeightsFromTensorReqInput,
     )
-    from sglang.multimodal_gen.runtime.entrypoints.utils import SetLoraFromTensorsReq
-    from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+    from unirl.rollout.engine.sglang._patches.lora_req import SetLoraFromTensorsReq
 
     return {
         "DiffGenerator": DiffGenerator,
@@ -46,9 +67,48 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
+        "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
+        "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
         "SetLoraFromTensorsReq": SetLoraFromTensorsReq,
         "sync_scheduler_client": sync_scheduler_client,
     }
+
+
+class _RawResultView:
+    """Flat ``RawResult`` view over upstream's ``GenerationResult``.
+
+    Stock upstream packs the rollout trajectory + native log-probs into the
+    nested ``rollout_trajectory_data`` (RolloutTrajectoryData) instead of the
+    fork's flat ``trajectory_latents`` / ``trajectory_timesteps`` /
+    ``trajectory_log_probs``. This view flattens that path (rtd-only, tolerant
+    of missing levels — mirrors the v1 ``response.py`` accessors; GRPO uses the
+    ``dit_trajectory`` latents so the trajectory stays aligned with
+    ``rollout_log_probs``) and passes every other wire field through, keeping
+    adapters/utils on the unchanged ``RawResult`` protocol.
+    """
+
+    __slots__ = ("_result",)
+
+    def __init__(self, result: Any) -> None:
+        self._result = result
+
+    @property
+    def trajectory_latents(self) -> Any:
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(getattr(rtd, "dit_trajectory", None), "latents", None)
+
+    @property
+    def trajectory_timesteps(self) -> Any:
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
+
+    @property
+    def trajectory_log_probs(self) -> Any:
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(rtd, "rollout_log_probs", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._result, name)
 
 
 class SGLangBackend:
@@ -103,7 +163,8 @@ class SGLangBackend:
             raise RuntimeError(
                 "SGLang generator returned None — full-batch failure (see DiffGenerator.generate docstring)."
             )
-        return list(raw) if isinstance(raw, list) else [raw]
+        results = list(raw) if isinstance(raw, list) else [raw]
+        return [_RawResultView(result) for result in results]
 
     def prepare_latent_shape(self, *, height: int, width: int, num_frames: int, batch_size: int) -> tuple:
         """Per-sample latent shape via SGLang's ``pipeline_config`` (no RL types)."""
@@ -127,20 +188,23 @@ class SGLangBackend:
     # ------------------------------------------------------------------ #
 
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
-        if cpu_backup_tags is not None:
-            try:
-                response = self._gen.release_memory_occupation(tags=list(tags), cpu_backup_tags=list(cpu_backup_tags))
-            except TypeError:
-                # Tolerate an older fork whose release_memory_occupation predates
-                # cpu_backup_tags (real API-drift guard, not the absent-method kind).
-                response = self._gen.release_memory_occupation(tags=list(tags))
-        else:
-            response = self._gen.release_memory_occupation(tags=list(tags))
-        self._check_memory_response(response, "release_memory_occupation")
+        # Stock upstream DiffGenerator has no memory-occupation methods (the fork
+        # added them); route through the scheduler client to the handlers that
+        # ``patch_scheduler`` installs, keyed on the ``_patches`` req types
+        # (mirrors the v1 engine's ``_call_memory_api``).
+        self._forward(
+            self._rt["ReleaseMemoryOccupationReqInput"](
+                tags=list(tags),
+                cpu_backup_tags=(list(cpu_backup_tags) if cpu_backup_tags is not None else None),
+            ),
+            op="release_memory_occupation",
+        )
 
     def resume_memory(self, *, tags: Sequence[str]) -> None:
-        response = self._gen.resume_memory_occupation(tags=list(tags))
-        self._check_memory_response(response, "resume_memory_occupation")
+        self._forward(
+            self._rt["ResumeMemoryOccupationReqInput"](tags=list(tags)),
+            op="resume_memory_occupation",
+        )
 
     def shutdown(self) -> None:
         if self._gen is not None:
@@ -158,11 +222,6 @@ class SGLangBackend:
         except Exception as exc:  # noqa: BLE001
             logger.warning("SGLang health_check ping failed: %s", exc)
             return False
-
-    @staticmethod
-    def _check_memory_response(response: Any, op: str) -> None:
-        if isinstance(response, dict) and not bool(response.get("success", True)):
-            raise RuntimeError(str(response.get("message", f"{op} failed")))
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs (io_struct types stay here; no RL types cross)

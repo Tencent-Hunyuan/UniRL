@@ -125,6 +125,10 @@ def test_build_inputs_basic_no_sde():
     assert kw["seed"] == 42
     assert kw["return_trajectory_latents"] is True
     assert "rollout" not in kw  # no SDE branch without sde_indices
+    # Post-migration wire contract (stock upstream + _patches):
+    assert "init_same_noise" not in kw  # fork-only flag, dropped
+    assert kw["denoise_seeds"] == ["s0"]  # per-sample step-noise keys
+    assert kw["return_prompt_embeds"] is True  # populate_conditions default
 
 
 def test_build_inputs_sde_branch():
@@ -133,8 +137,17 @@ def test_build_inputs_sde_branch():
     kw = a.build_inputs(req, initial_noise=None)
     assert kw["rollout"] is True
     assert kw["rollout_sde_type"] == "sde"
-    assert kw["rollout_sde_indices"] == [0, 1]
+    assert kw["rollout_sde_step_indices"] == [0, 1]  # upstream name (fork: rollout_sde_indices)
+    assert "rollout_sde_indices" not in kw
+    assert kw["rollout_return_dit_trajectory"] is True  # gates rtd.dit_trajectory collection
     assert kw["rollout_noise_level"] == 1.0
+
+
+def test_build_inputs_embeds_flags_gated_on_populate_conditions():
+    a = SD3Adapter(_cfg(populate_conditions=False), _model_config(), strategy=None)
+    kw = a.build_inputs(_req(["p"]), initial_noise=None)
+    assert "return_prompt_embeds" not in kw
+    assert "return_negative_prompt_embeds" not in kw
 
 
 def test_build_inputs_deexpands_groups():
