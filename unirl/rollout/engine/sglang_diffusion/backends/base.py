@@ -51,7 +51,7 @@ class RawResult(Protocol):
     Population follows the request: ``trajectory_latents`` /
     ``trajectory_timesteps`` / ``prompt_embeds`` are always requested;
     ``trajectory_log_probs`` only in native-logprob mode; the ``negative_*``
-    pair only under CFG.
+    triple only under CFG.
     """
 
     #: Dense denoising trajectory, ``[B, T+1, ...]`` (T+1: initial latents prepended).
@@ -67,6 +67,9 @@ class RawResult(Protocol):
     encoder_attention_mask: EncoderOutputs
     negative_prompt_embeds: EncoderOutputs
     neg_pooled_prompt_embeds: EncoderOutputs
+    #: Mask paired with ``negative_prompt_embeds`` — variable-length encoders
+    #: (Qwen-VL) require it for mask-consuming replay conditioning.
+    negative_attention_mask: EncoderOutputs
 
 
 @runtime_checkable

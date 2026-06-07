@@ -223,6 +223,32 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
 # ---------------------------------------------------------------------------
 
 
+def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
+    """dim-0 concat tolerating per-result seq-len (dim-1) differences.
+
+    Variable-length text encoders (Qwen-VL) pad each server request to its own
+    batch max, so chunked generates ship different seq lens per result.
+    Right-pad dim 1 with zeros to the cross-result max — exactly the server's
+    own zero-pad convention, and the parallel attention mask (padded the same
+    way) keeps real-vs-pad explicit. Fixed-length encoders (SD3's CLIP/T5)
+    always agree on dim 1 and concat unchanged.
+    """
+    if len(tensors) == 1:
+        return tensors[0]
+    lens = {int(t.shape[1]) for t in tensors}
+    if len(lens) <= 1:
+        return torch.cat(tensors, dim=0)
+    max_len = max(lens)
+    padded: List[torch.Tensor] = []
+    for t in tensors:
+        if int(t.shape[1]) < max_len:
+            pad_shape = list(t.shape)
+            pad_shape[1] = max_len - int(t.shape[1])
+            t = torch.cat([t, t.new_zeros(pad_shape)], dim=1)
+        padded.append(t)
+    return torch.cat(padded, dim=0)
+
+
 def fuse_text_conditions(
     results: Sequence[RawResult],
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
@@ -230,13 +256,16 @@ def fuse_text_conditions(
 
     Returns ``(text_cond, neg_text_cond)``; either may be ``None`` when the
     corresponding source field was missing across all results (e.g. no CFG → no
-    negative branch). Concat is dim-0 across results.
+    negative branch). Concat is dim-0 across results; token-axis (dim-1)
+    differences between results are zero-padded to the max
+    (:func:`_cat_padded_rows`) with the attention masks padded in lockstep.
     """
     prompt_embeds_list: List[torch.Tensor] = []
     pooled_list: List[torch.Tensor] = []
     mask_list: List[torch.Tensor] = []
     neg_embeds_list: List[torch.Tensor] = []
     neg_pooled_list: List[torch.Tensor] = []
+    neg_mask_list: List[torch.Tensor] = []
 
     for result in results:
         embeds = fuse_encoder_outputs(result.prompt_embeds)
@@ -262,23 +291,30 @@ def fuse_text_conditions(
         if neg_pooled is not None:
             neg_pooled_list.append(neg_pooled.detach().cpu())
 
-    embeds_cat = torch.cat(prompt_embeds_list, dim=0) if prompt_embeds_list else None
+        # Negative mask: required alongside negative embeds by mask-consuming
+        # replay paths (Qwen-VL conditioning) — fused symmetrically with the
+        # positive mask rather than dropped.
+        neg_mask = fuse_encoder_outputs(result.negative_attention_mask)
+        if neg_mask is not None:
+            neg_mask_list.append(neg_mask.detach().cpu())
+
+    embeds_cat = _cat_padded_rows(prompt_embeds_list) if prompt_embeds_list else None
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
             pooled=torch.cat(pooled_list, dim=0) if pooled_list else None,
-            attn_mask=torch.cat(mask_list, dim=0) if mask_list else None,
+            attn_mask=_cat_padded_rows(mask_list) if mask_list else None,
         )
         if embeds_cat is not None
         else None
     )
 
-    neg_embeds_cat = torch.cat(neg_embeds_list, dim=0) if neg_embeds_list else None
+    neg_embeds_cat = _cat_padded_rows(neg_embeds_list) if neg_embeds_list else None
     neg_text_cond = (
         TextEmbedCondition(
             embeds=neg_embeds_cat,
             pooled=torch.cat(neg_pooled_list, dim=0) if neg_pooled_list else None,
-            attn_mask=None,
+            attn_mask=_cat_padded_rows(neg_mask_list) if neg_mask_list else None,
         )
         if neg_embeds_cat is not None
         else None

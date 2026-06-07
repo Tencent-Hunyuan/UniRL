@@ -15,6 +15,7 @@ from unirl.rollout.engine.sglang_diffusion import adapters
 from unirl.rollout.engine.sglang_diffusion.adapters.base import get_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.flux import Flux2KleinAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
+from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
@@ -86,6 +87,7 @@ def _result(latents, sigmas, **kw):
         encoder_attention_mask=None,
         negative_prompt_embeds=None,
         neg_pooled_prompt_embeds=None,
+        negative_attention_mask=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -97,7 +99,14 @@ def _result(latents, sigmas, **kw):
 
 
 def test_all_families_registered():
-    assert set(adapters.registered_adapters()) == {"sd3", "flux", "flux2_klein", "mochi", "hunyuan_video"}
+    assert set(adapters.registered_adapters()) == {
+        "sd3",
+        "flux",
+        "flux2_klein",
+        "qwen_image",
+        "mochi",
+        "hunyuan_video",
+    }
 
 
 def test_get_adapter_unknown_raises():
@@ -381,3 +390,48 @@ def test_klein_rejects_token_count_mismatch():
 def test_klein_validate_requires_build_schedule_policy():
     with pytest.raises(Exception, match="build_schedule_policy"):
         Flux2KleinAdapter(_cfg(), _model_config(shift=1.0), strategy=_Dance())
+
+
+# --------------------------------------------------------------------------- #
+# qwen_image — packed trajectory unpacked to true channels
+# --------------------------------------------------------------------------- #
+
+
+def test_qwen_passes_through_5d():
+    a = QwenImageAdapter(_cfg(), _model_config(), strategy=_Dance())
+    req = _req(["p"])
+    traj = torch.randn(1, 3, 2, 4, 4)
+    seg = a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
+    assert torch.equal(seg.latents, traj)
+
+
+def test_qwen_unpacks_packed_4d():
+    a = QwenImageAdapter(_cfg(), _model_config(), strategy=_Dance())
+    # height=width=32 → latent_h=latent_w=2*(32//16)=4 → S=(4/2)*(4/2)=4; C_packed=8 → C=2.
+    req = _req(["p"], height=32, width=32)
+    B, T, S, C_packed = 1, 3, 4, 8
+    traj = torch.randn(B, T, S, C_packed)
+    seg = a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
+    assert seg.latents.shape == (B, T, C_packed // 4, 4, 4)
+
+
+def test_qwen_unpack_inverts_trainside_pack():
+    # The adapter unpack must be the exact inverse of the trainside _pack_latents
+    # (a layout/permute bug here survives loose shape checks but corrupts replay).
+    from unirl.models.qwen_image.diffusion import _pack_latents
+
+    a = QwenImageAdapter(_cfg(), _model_config(), strategy=_Dance())
+    req = _req(["p"], height=32, width=32)
+    B, T, C, H, W = 1, 3, 2, 4, 4
+    image_form = torch.randn(B, T, C, H, W)
+    packed = torch.stack([_pack_latents(image_form[:, t]) for t in range(T)], dim=1)  # [B, T, S, C*4]
+    seg = a.build_segment(req, [_result(packed, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)
+    assert torch.equal(seg.latents, image_form)
+
+
+def test_qwen_rejects_token_count_mismatch():
+    a = QwenImageAdapter(_cfg(), _model_config(), strategy=_Dance())
+    req = _req(["p"], height=32, width=32)  # expects S = 4
+    traj = torch.randn(1, 3, 9, 8)  # S = 9 ≠ 4
+    with pytest.raises(ValueError, match="packed token count"):
+        a.build_segment(req, [_result(traj, req.sigmas)], num_steps=2, sde_indices=None, emit_native_logprob=False)

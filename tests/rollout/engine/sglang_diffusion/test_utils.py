@@ -31,6 +31,7 @@ def _result(**kw):
         encoder_attention_mask=None,
         negative_prompt_embeds=None,
         neg_pooled_prompt_embeds=None,
+        negative_attention_mask=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -257,3 +258,43 @@ def test_fuse_text_conditions_text_and_negative():
 def test_fuse_text_conditions_requires_prompt_embeds():
     with pytest.raises(Exception, match="missing prompt_embeds"):
         utils.fuse_text_conditions([_result()])
+
+
+def test_fuse_text_conditions_carries_negative_mask():
+    # Variable-length encoders (Qwen-VL) require the mask WITH the embeds on
+    # both branches; the negative mask must be fused, not dropped.
+    res = [
+        _result(
+            prompt_embeds=torch.zeros(1, 3, 8),
+            encoder_attention_mask=torch.ones(1, 3),
+            negative_prompt_embeds=torch.zeros(1, 2, 8),
+            negative_attention_mask=torch.ones(1, 2),
+        )
+    ]
+    text, neg = utils.fuse_text_conditions(res)
+    assert text is not None and text.attn_mask.shape == (1, 3)
+    assert neg is not None and neg.attn_mask is not None
+    assert neg.attn_mask.shape == (1, 2)
+
+
+def test_fuse_text_conditions_pads_mixed_seq_lens_across_results():
+    # Chunked generates pad each server request to its own batch max — fusion
+    # right-pads embeds + masks to the cross-result max (zero-pad + mask,
+    # matching the server's own convention).
+    res = [
+        _result(
+            prompt_embeds=torch.ones(1, 2, 4),
+            encoder_attention_mask=torch.ones(1, 2),
+        ),
+        _result(
+            prompt_embeds=torch.ones(2, 5, 4),
+            encoder_attention_mask=torch.ones(2, 5),
+        ),
+    ]
+    text, _ = utils.fuse_text_conditions(res)
+    assert text.embeds.shape == (3, 5, 4)
+    assert text.attn_mask.shape == (3, 5)
+    # First result's rows: real tokens then zero-pad, mask in lockstep.
+    assert torch.equal(text.embeds[0, :2], torch.ones(2, 4))
+    assert torch.equal(text.embeds[0, 2:], torch.zeros(3, 4))
+    assert text.attn_mask[0].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
