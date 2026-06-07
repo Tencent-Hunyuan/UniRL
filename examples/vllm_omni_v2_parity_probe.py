@@ -132,11 +132,13 @@ def main() -> int:
     def mu(x: torch.Tensor, sigma_val: torch.Tensor) -> torch.Tensor:
         with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
             return step_impl.predict_noise(
-                shim, conds,
-                sample=x.to("cuda"),
-                sigma=sigma_val.to("cuda"),
-                latent_h=lat_h, latent_w=lat_w,
+                shim,
+                x.to("cuda"),
+                sigma_val.to("cuda"),
+                conds,
                 guidance_scale=1.0,
+                latent_h=lat_h,
+                latent_w=lat_w,
             ).float()
 
     # step-0 mu under both timestep rounding paths (D2 quantification)
