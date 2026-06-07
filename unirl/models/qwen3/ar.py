@@ -25,14 +25,29 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule
 from torch.utils.checkpoint import checkpoint
 
+from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
+
+
+def _supports_logits_to_keep(transformer: object) -> bool:
+    """Feature-detect ``logits_to_keep`` on the CausalLM forward (slice form).
+
+    Detect by signature rather than version compare: older transformers named
+    it ``num_logits_to_keep`` (int-only), which cannot express the empty-slice
+    "skip lm_head" call the root-wrapped replay path uses. The signature
+    resolves through the FSDP2 class-swap MRO to the original forward.
+    """
+    import inspect
+
+    return "logits_to_keep" in inspect.signature(type(transformer).forward).parameters
 
 
 @dataclass
@@ -205,11 +220,12 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
-        # NOTE: this decode loop runs plain forwards; it does not unshard FSDP
-        # itself. The recipe sets ``reshard_after_forward=false`` on the
-        # FSDPBackend so parameters stay gathered after the first forward — the
-        # remaining decode steps then reuse the gathered params instead of
-        # re-AllGathering each token, which is what makes AR rollout fast.
+        # NOTE: this decode loop calls the ROOT module every token, so FSDP
+        # hooks fire normally in both wrap modes. Per-block groups re-gather
+        # per step according to ``reshard_after_forward``; under the default
+        # root wrap the leftover group (embed / final norm / lm_head) stays
+        # gathered after the first step — the root group never reshards after
+        # forward — so only the blocks pay per-token gather traffic.
         for _ in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
@@ -351,22 +367,59 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        # Run the model BODY only (no lm_head) so we never materialize the full
-        # [B, L, vocab] logits. At 32k that tensor is ~10 GiB (forward) + ~10 GiB
-        # (grad) and is the dominant replay-memory term; last_hidden_state is
-        # [B, L, H] (H=2048, ~75x smaller). Safe under this FSDP setup: only the
-        # Qwen3DecoderLayers are sharded (they gather via their own hooks when the
-        # body runs); embed/norm/lm_head are full params, so .model(...) and
-        # .lm_head(...) work called directly.
-        with autocast_ctx:
-            body_out = self.model.transformer.model(
-                input_ids=full_ids,
-                attention_mask=full_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                return_dict=True,
+        # Run the decoder BODY only — never materialize the full [B, L, vocab]
+        # logits (at 32k that tensor is ~10 GiB forward + ~10 GiB grad, the
+        # dominant replay-memory term; last_hidden_state is [B, L, H], ~75x
+        # smaller). Two dispatch paths:
+        #   * root-wrapped (default ``root_wrap: true``): ``transformer`` is an
+        #     FSDPModule whose ROOT group owns embed / final norm / lm_head, so
+        #     submodules cannot be called before the root forward runs. Call
+        #     the WHOLE root once with ``logits_to_keep=slice(0, 0)`` (lm_head
+        #     applied to an empty slice — no logits materialized; the int form
+        #     ``0`` means keep-ALL, never use it) and capture the decoder's
+        #     last_hidden_state via a forward hook on ``transformer.model``.
+        #     The root group does not reshard after forward, so the chunked
+        #     ``lm_head`` calls below run on still-materialized params.
+        #   * legacy (``root_wrap: false``): embed / norm / lm_head are plain
+        #     full params, so ``.model(...)`` and ``.lm_head(...)`` work called
+        #     directly.
+        transformer = self.model.transformer
+        if isinstance(transformer, FSDPModule):
+            require(
+                _supports_logits_to_keep(transformer),
+                "Qwen3ARStage.replay: the root-wrapped FSDP path needs a transformers "
+                "version whose CausalLM forward accepts `logits_to_keep` (>=4.49). "
+                "Upgrade transformers or set training.fsdp.root_wrap=false.",
             )
-            hidden = body_out.last_hidden_state  # [B, L, H]
+            captured: dict = {}
+
+            def _capture_body(_m: object, _args: object, _kwargs: object, out: object) -> None:
+                captured["hidden"] = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+
+            handle = transformer.model.register_forward_hook(_capture_body, with_kwargs=True)
+            try:
+                with autocast_ctx:
+                    transformer(
+                        input_ids=full_ids,
+                        attention_mask=full_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        return_dict=True,
+                        logits_to_keep=slice(0, 0),
+                    )
+            finally:
+                handle.remove()
+            hidden = captured["hidden"]  # [B, L, H]
+        else:
+            with autocast_ctx:
+                body_out = transformer.model(
+                    input_ids=full_ids,
+                    attention_mask=full_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                hidden = body_out.last_hidden_state  # [B, L, H]
 
         if T_max == 0:
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
