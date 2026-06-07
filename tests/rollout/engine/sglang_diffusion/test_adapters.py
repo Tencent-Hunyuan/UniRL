@@ -133,7 +133,14 @@ def test_build_inputs_basic_no_sde():
     assert kw["sigmas"] == req.sigmas.tolist()[:-1]  # interior T, terminal 0 dropped
     assert kw["seed"] == 42
     assert kw["return_trajectory_latents"] is True
-    assert "rollout" not in kw  # no SDE branch without sde_indices
+    # Rollout machinery is ALWAYS on (the per-output-sliced T+1 trajectory only
+    # rides rollout_trajectory_data.dit_trajectory); non-SDE sends the empty
+    # step-index list so every step takes the bit-exact effective-ODE branch.
+    assert kw["rollout"] is True
+    assert kw["rollout_return_dit_trajectory"] is True
+    assert kw["rollout_sde_step_indices"] == []
+    assert "rollout_sde_type" not in kw  # SDE-noise knobs stay gated on sde_indices
+    assert "rollout_noise_level" not in kw
     # Post-migration wire contract (stock upstream + _patches):
     assert "init_same_noise" not in kw  # fork-only flag, dropped
     assert kw["denoise_seeds"] == ["s0"]  # per-sample step-noise keys
@@ -274,6 +281,12 @@ def test_build_inputs_matches_legacy_translator():
         # it the same posture as the v2 adapter's _cfg() (True).
         legacy_cfg = SimpleNamespace(populate_conditions=True)
         want = _to_sglang_kwargs(req, cfg=legacy_cfg, sde_label=sde_label, initial_noise=init_noise)
+        # Documented v2 delta: rollout machinery is always on (v1 sends it only
+        # under SDE — v1 never runs non-SDE rollouts; the patched stack returns
+        # the usable trajectory only via rtd.dit_trajectory). SDE-case kwargs
+        # are identical between the engines.
+        if rkw.get("sde_indices") is None:
+            want = dict(want, rollout=True, rollout_return_dit_trajectory=True, rollout_sde_step_indices=[])
         assert got == want, f"kwargs drift vs legacy for case {prompts}, {rkw}"
 
 

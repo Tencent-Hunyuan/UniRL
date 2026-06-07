@@ -148,21 +148,28 @@ class ImageDiTAdapter(ModelAdapter):
         if req.sample_ids:
             kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
 
-        # Layer 4: SDE-kernel kwargs only when the algorithm requested SDE noise.
+        # Layer 4: the upstream rollout machinery is ALWAYS on — the patched
+        # stack returns the per-output-sliced T+1 trajectory + σ echo ONLY via
+        # ``rollout_trajectory_data.dit_trajectory`` (gated on
+        # ``rollout_return_dit_trajectory``); the flat ``trajectory_latents``
+        # field is unsliced across outputs and lacks the x_T prepend, so it
+        # cannot back the RawResult contract. Non-SDE requests (eval / NFT /
+        # ODE) send an EMPTY step-index list: every step then takes the
+        # effective-ODE branch, which upstream keeps bit-exact with
+        # ``rollout=False`` stepping (scheduler_rl_mixin.flow_sde_sampling).
+        kwargs["rollout"] = True
+        kwargs["rollout_return_dit_trajectory"] = True
         if sde_indices is not None:
             require(
                 self._sde_label is not None,
                 "build_inputs: SDE mode requires an sde_label (resolved from the strategy)",
             )
-            kwargs["rollout"] = True
             kwargs["rollout_sde_type"] = self._sde_label
             kwargs["rollout_noise_level"] = float(diffusion.eta)
-            # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``)
-            # and gates dit-trajectory collection (latents + timesteps, returned in
-            # ``rollout_trajectory_data.dit_trajectory``) on
-            # ``rollout_return_dit_trajectory``.
+            # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``).
             kwargs["rollout_sde_step_indices"] = sde_indices
-            kwargs["rollout_return_dit_trajectory"] = True
+        else:
+            kwargs["rollout_sde_step_indices"] = []
 
         return kwargs
 

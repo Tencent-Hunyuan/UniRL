@@ -21,12 +21,13 @@ same norm-preserving true-CFG blend as the trainside replay).
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
+from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import get_diffusion_params
 
@@ -100,6 +101,30 @@ class QwenImageAdapter(ImageDiTAdapter):
         flat = traj.reshape(B * T, S, C_packed)
         unpacked = _unpack_latents(flat, latent_h=latent_h, latent_w=latent_w)
         return unpacked.reshape(B, T, C_packed // 4, latent_h, latent_w).contiguous()
+
+    def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
+        """Stage override: backfill the attention masks the serving stack drops.
+
+        The sglang qwen text-encode postprocess returns padded embeds WITHOUT
+        the parallel mask (``qwen_image_postprocess_text`` pads to the
+        request's batch max and discards the lengths), but the trainside
+        replay hard-requires ``attn_mask`` alongside ``embeds``
+        (``models/qwen_image/diffusion.py``). Within one request every sample
+        shares the prompt (the engine de-expands one group per forward), so
+        the embeds are unpadded and an all-ones mask is EXACT — and matches
+        what the server itself attended to. Cross-chunk length differences are
+        then handled by the padded fusions (mask rows extended with zeros).
+        """
+        out = super().build_condition(results)
+        for key in ("text", "negative_text"):
+            cond = out.get(key)
+            if cond is not None and cond.embeds is not None and cond.attn_mask is None:
+                out[key] = TextEmbedCondition(
+                    embeds=cond.embeds,
+                    pooled=cond.pooled,
+                    attn_mask=cond.embeds.new_ones(cond.embeds.shape[:2]),
+                )
+        return out
 
 
 __all__ = ["QwenImageAdapter"]
