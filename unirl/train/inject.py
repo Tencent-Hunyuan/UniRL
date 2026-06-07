@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
+from unirl.config.require import require
 from unirl.train.shadow import Shadow
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -329,6 +330,24 @@ def fsdp_wrap(
         root_kwargs = dict(fsdp_kwargs)
         root_kwargs.pop("reshard_after_forward", None)
         fully_shard(model, **root_kwargs)
+    else:
+        # No root wrap: a TRAINABLE param outside every fully_shard group
+        # would receive grads no collective ever DP-syncs (the manual
+        # sync_unsharded_grads net was removed with the default root wrap),
+        # so its replicas would silently drift apart across ranks. Frozen
+        # leftovers (the bagel / hunyuan_image3 LoRA recipes) are fine —
+        # they carry no grads — and a single rank has no replicas to drift.
+        # Fail fast rather than corrupt the run.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            stray = [n for n, p in model.named_parameters() if p.requires_grad and not isinstance(p, DTensor)]
+            require(
+                not stray,
+                f"fsdp_wrap(root_wrap=false): {len(stray)} trainable param(s) sit outside "
+                f"every fully_shard group (e.g. {stray[:3]}); their grads would never be "
+                "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
+            )
 
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt

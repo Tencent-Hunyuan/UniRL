@@ -36,7 +36,6 @@ from unirl.train.fsdp_utils import (
     fsdp_onload,
     gather_state_dict,
     load_model_state_dict,
-    sync_unsharded_grads,
     trainable_params,
 )
 from unirl.train.inject import (
@@ -190,12 +189,9 @@ class FSDPBackend(Remote):
         ``TrainStack``) routes through, so the guard covers all of them.
         """
         params = list(trainable_params(self.model))
-        # DP-average the grads FSDP doesn't own. With the default root wrap
-        # every param is a DTensor and this is a no-op; it is the safety net
-        # for ``root_wrap: false`` configs (bagel / hunyuan_image3), where
-        # embed / final norm / lm_head stay plain replicated tensors whose
-        # replicas would otherwise drift.
-        sync_unsharded_grads(params)
+        # Every trainable grad is a sharded DTensor that FSDP reduce-scatters:
+        # the root wrap claims the leftover params, and fsdp_wrap fails fast on
+        # trainable params outside every group when root_wrap is disabled.
         clipped = clip_grad_norm(params, float(max_grad_norm))
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 
