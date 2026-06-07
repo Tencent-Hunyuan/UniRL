@@ -120,6 +120,42 @@ def main() -> int:
     transformer = QwenImageTransformer2DModel.from_pretrained(
         model_path, subfolder="transformer", torch_dtype=torch.bfloat16
     ).to("cuda").eval()
+
+    # Optional fp32-island alignment: vllm-omni's reimplementation runs
+    # time-embed / AdaLN modulation / norm_out / proj_out in FULL fp32;
+    # diffusers under autocast runs the modulation Linears in bf16. Wrap the
+    # matching trainside modules to compute in fp32 (autocast-exempt) to test
+    # whether the island mismatch is the dominant per-forward divergence.
+    if os.environ.get("PROBE_FP32_ISLANDS", "0") == "1":
+        import torch.nn as nn
+
+        targets = []
+        for name, mod in transformer.named_modules():
+            short = name.split(".")[-1]
+            if short in ("time_text_embed", "norm_out", "proj_out", "img_mod", "txt_mod") and name.count(short) >= 1:
+                targets.append((name, mod))
+        log(f"fp32-island wrap: {len(targets)} modules ({sorted(set(n.split('.')[-1] for n, _ in targets))})")
+
+        def wrap(mod: nn.Module) -> None:
+            mod.float()
+            orig_forward = mod.forward
+
+            def fp32_forward(*args, _orig=orig_forward, **kw):
+                with torch.autocast("cuda", enabled=False):
+                    args = tuple(a.float() if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
+                    kw = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in kw.items()}
+                    out = _orig(*args, **kw)
+                if torch.is_tensor(out):
+                    return out.to(torch.bfloat16)
+                if isinstance(out, tuple):
+                    return tuple(o.to(torch.bfloat16) if torch.is_tensor(o) and o.is_floating_point() else o for o in out)
+                return out
+
+            mod.forward = fp32_forward
+
+        for _, mod in targets:
+            wrap(mod)
+
     shim = SimpleNamespace(transformer=transformer)
     step_impl = QwenImageDiffusionStep()
     conds = QwenImageConditions(
