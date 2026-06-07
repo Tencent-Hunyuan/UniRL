@@ -18,10 +18,12 @@ num_rollouts: 10000
 weight_sync_interval: 1
 
 logging:
-  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
-  project_name: unirl
-  run_name: qwen_image_dancegrpo_vllmomni_v2
-  entity: null
+  # Env-driven like sd3_flowdppo_vllmomni_v2 (the launcher exports these);
+  # the trainside twins keep their hardcoded false.
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_dancegrpo_vllmomni_v2}
+  entity: ${oc.env:WANDB_ENTITY,null}
   tags: ["qwen-image", "dancegrpo", "grpo", "vllm-omni", "v2"]
 
 bundle:
