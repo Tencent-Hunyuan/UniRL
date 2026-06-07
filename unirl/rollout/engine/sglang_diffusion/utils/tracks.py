@@ -130,14 +130,12 @@ def build_latent_segment(
     if emit_native_logprob:
         sde_logp = _native_sde_logp(results, num_steps=num_steps, sde_indices=sde_indices)
 
-    batch_size = int(trajectories_tensor.shape[0])
     return segment_factory(
         latents=trajectories_tensor,
         sigmas=sigmas,
         indices=indices_t,
         sde_logp=sde_logp,
         sde_indices=sde_indices_t,
-        sample_indices=torch.arange(batch_size, dtype=torch.long),
     )
 
 

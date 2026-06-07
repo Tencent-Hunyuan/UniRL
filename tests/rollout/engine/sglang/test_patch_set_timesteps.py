@@ -59,7 +59,11 @@ def test_external_sigmas_skip_terminal_stretch_qwen_config():
     s = _qwen_scheduler()
     s.set_timesteps(sigmas=list(_SIGMAS), mu=0.8)
     got = s.sigmas[: len(_SIGMAS)]
-    torch.testing.assert_close(got, torch.tensor(_SIGMAS, dtype=torch.float32), atol=0.0, rtol=0.0)
+    # The dynamic path is neutralized via mu=0 — mathematically the identity,
+    # but still computed (exp/div), so allow 1-ULP float32 wobble (~6e-8).
+    # Orders of magnitude inside sigma_verify's 1e-5 gate; a re-applied stretch
+    # or mu-shift would be 1e-3+.
+    torch.testing.assert_close(got, torch.tensor(_SIGMAS, dtype=torch.float32), atol=1e-6, rtol=0.0)
     assert float(s.sigmas[-1]) == 0.0  # terminal zero still appended
 
 
