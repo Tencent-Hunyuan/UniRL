@@ -131,15 +131,6 @@ def trainside():
     return QwenImagePipeline.from_config(_model_config(device="cuda:1"), strategy=FlowSDEStrategy())
 
 
-def _cosine_per_step(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Per-step cosine over flattened latents — [K] vector."""
-    a2 = a.float().flatten(2)  # [B, K, N]
-    b2 = b.float().flatten(2)
-    num = (a2 * b2).sum(-1)
-    den = a2.norm(dim=-1) * b2.norm(dim=-1)
-    return (num / den.clamp_min(1e-12)).mean(0)  # mean over batch → [K]
-
-
 def test_smoke_generate_sleep_wake(v2_engine):
     resp = v2_engine.generate(_req(sde_indices=None))
     seg = resp.tracks["image"].segment
@@ -163,12 +154,13 @@ def test_smoke_generate_sleep_wake(v2_engine):
 
 
 def test_parity_ode_vs_trainside(v2_engine, trainside):
-    # Zero-noise dense parity: all steps marked SDE with eta=0.0 — both sides
-    # reduce exactly to the Euler/ODE update (server: std=0 ⇒ prev = sample +
-    # dt·model_output; trainside: step_eta=0), while the all-steps marking makes
-    # BOTH segments store the full T+1 trajectory (trainside storage is
-    # selective: ODE-mode keeps only the final step). Deterministic given x_T.
-    req = _req(seed=42, sde_indices=list(range(_STEPS)), eta=0.0)
+    # ODE parity, deterministic given x_T. The server rejects eta=0 SDE ("true
+    # log-probability requires a non-zero noise level") and trainside ODE-mode
+    # storage is selective (final step only), so the comparison anchors are:
+    # σ bit-equality, x_T vs the recipe (v2 side; trainside doesn't store it),
+    # and the FINAL latent — the product of all T DiT steps, so any
+    # intermediate divergence amplifies into it.
+    req = _req(seed=42, sde_indices=None)
     resp_v2 = v2_engine.generate(req)  # pins req.sigmas (σ SSOT) as a side effect
     resp_ts = trainside.generate(req)
 
@@ -180,35 +172,29 @@ def test_parity_ode_vs_trainside(v2_engine, trainside):
     lat_v2, lat_ts = seg_v2.latents.detach().cpu(), seg_ts.latents.detach().cpu()
 
     assert torch.equal(sig_v2, sig_ts), "σ schedule diverged"
-    # x_T: same NoiseRecipe → bit-identical before any model math.
-    x_t_v2 = lat_v2[:, 0].float()
-    x_t_ts = lat_ts[:, 0].float()
-    # Diagnostics: per-row norms vs the recipe-resolved reference, plus the
-    # within-batch duplicate check (a per-output fork that reuses row 0 shows
-    # up as row0 == row1 server-side).
+    # x_T: same NoiseRecipe → the server trajectory's first entry must be the
+    # recipe-resolved tensor bit-exactly (driver-noise → pack → capture →
+    # unpack roundtrip). Trainside ODE-mode storage keeps only the final step,
+    # so the recipe IS the trainside x_T reference.
     from unirl.types.noise_recipe import NoiseRecipe
 
     expected = NoiseRecipe.from_rollout_req(req).resolve().float()
-    print(
-        f"\nx_T row norms — expected={[round(float(n), 3) for n in expected.flatten(1).norm(dim=1)]}"
-        f" v2={[round(float(n), 3) for n in x_t_v2.flatten(1).norm(dim=1)]}"
-        f" trainside={[round(float(n), 3) for n in x_t_ts.flatten(1).norm(dim=1)]}"
-    )
-    print(
-        f"x_T deltas — v2-vs-expected={float((x_t_v2 - expected).abs().max()):.3e}"
-        f" ts-vs-expected={float((x_t_ts - expected).abs().max()):.3e}"
-        f" v2-row0-vs-row1={float((x_t_v2[0] - x_t_v2[1]).abs().max()):.3e}"
-    )
-    assert torch.allclose(x_t_v2, x_t_ts, atol=1e-6), (
-        f"x_T diverged: max|Δ|={float((x_t_v2 - x_t_ts).abs().max())}"
-    )
+    x_t_v2 = lat_v2[:, 0].float()
+    print(f"\nx_T v2-vs-recipe max|Δ|={float((x_t_v2 - expected).abs().max()):.3e}")
+    assert torch.allclose(x_t_v2, expected, atol=1e-6), "server x_T diverged from the driver recipe"
 
-    cos = _cosine_per_step(lat_v2, lat_ts)
-    print(f"\nper-step cosine: {[round(float(c), 5) for c in cos]}")
-    assert bool((cos > 0.999).all()), f"per-step cosine degraded: {cos.tolist()}"
-
-    final_delta = (lat_v2[:, -1].float() - lat_ts[:, -1].float()).abs()
-    print(f"final-step max|Δ|={float(final_delta.max()):.4e} mean|Δ|={float(final_delta.mean()):.4e}")
+    # Final latent = the product of all T DiT steps on both sides.
+    fin_v2 = lat_v2[:, -1].float()
+    fin_ts = lat_ts[:, -1].float()
+    num = (fin_v2.flatten(1) * fin_ts.flatten(1)).sum(-1)
+    den = fin_v2.flatten(1).norm(dim=-1) * fin_ts.flatten(1).norm(dim=-1)
+    cos = num / den.clamp_min(1e-12)
+    final_delta = (fin_v2 - fin_ts).abs()
+    print(
+        f"final-step cosine={[round(float(c), 5) for c in cos]} "
+        f"max|Δ|={float(final_delta.max()):.4e} mean|Δ|={float(final_delta.mean()):.4e}"
+    )
+    assert bool((cos > 0.999).all()), f"final-step cosine degraded: {cos.tolist()}"
     assert float(final_delta.max()) < 2e-2, "final latents drifted beyond fp16-storage tolerance"
 
     dec_v2 = resp_v2.tracks["image"].decoded
@@ -227,14 +213,16 @@ def test_sde_native_logprob_matches_replay(v2_engine, trainside):
     assert seg.sde_logp is not None, "engine did not emit native log-probs in SDE mode"
 
     # Replay runs on the trainside device — the rollout's conditions/segment
-    # arrive on CPU.
+    # arrive on CPU. no_grad: this is the old-logp anchor computation; with
+    # grad the 20B transformer's graph over S steps OOMs the H20.
     conds = QwenImageConditions.from_dict(track.conditions).to_device("cuda:1")
-    result = trainside.diffusion.replay(
-        conds,
-        segment=seg.to_device("cuda:1"),
-        params=_sampling(seed=7, sde_indices=sde_indices),
-        step_indices=sde_indices,
-    )
+    with torch.no_grad():
+        result = trainside.diffusion.replay(
+            conds,
+            segment=seg.to_device("cuda:1"),
+            params=_sampling(seed=7, sde_indices=sde_indices),
+            step_indices=sde_indices,
+        )
     native = seg.sde_logp.detach().cpu().float()
     replayed = result.log_probs.detach().cpu().float()
     delta = (native - replayed).abs()
