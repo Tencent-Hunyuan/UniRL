@@ -129,6 +129,12 @@ reward:
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
+  # Separate-engine recipes MUST anchor old_logp by trainer-side replay
+  # (the class default 'native' trusts the ENGINE's rollout logp — correct
+  # trainside, but cross-process it bakes the rollout<->replay numeric gap
+  # into every first-epoch ratio: ~2-5e-5 offset vs clip_range 1e-4 in the
+  # 0607 e2e. Every sd3 separate-engine recipe sets this; LIN-382.)
+  old_logp_source: replay
   clip_range: 1.0e-4
   clip_schedule: constant
   conditions_cls:
