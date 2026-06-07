@@ -27,6 +27,11 @@ from .config import SD3PipelineConfig
 class SD3Bundle(Bundle):
     """SD3-family bundle: transformer + VAE + 3 text encoders + scheduler."""
 
+    # SD3DiffusionStage.diffuse / .replay drive the whole transformer forward as
+    # one unit (no decomposed lm_head pass), so an FSDP root wrap's all-gather
+    # covers every param the forward uses — safe to enable forward_prefetch.
+    supports_fsdp_root_wrap: bool = True
+
     def __init__(
         self,
         *,

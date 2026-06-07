@@ -58,6 +58,12 @@ class FSDPConfig:
     # micro-batches, whereas per-micro sync reduces each in reduce_dtype (fp32) —
     # so reward / grad-norm parity must be confirmed before enabling in a recipe.
     defer_grad_sync: bool = False
+    # Opt-in FSDP2 cross-block forward prefetch: overlap each block's all-gather
+    # with compute (a multi-node win, ~no-op over NVLink). Requires a root wrap to
+    # initialize the shared all-gather comm context, so fsdp_wrap raises unless the
+    # bundle declares supports_fsdp_root_wrap=True (its forward is driven entirely
+    # through the root module). Off keeps the historical per-block-only wrapping.
+    forward_prefetch: bool = False
     # Optional high-precision master dtype for the TRAINABLE params (e.g. "fp32").
     # When set, fsdp_wrap keeps the trainable (LoRA) sharded master + optimizer
     # states at this dtype while MixedPrecisionPolicy(param_dtype) still casts the

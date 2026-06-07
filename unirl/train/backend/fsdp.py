@@ -125,6 +125,10 @@ class FSDPBackend(Remote):
             mixed_precision=fsdp_cfg.mixed_precision,
             fsdp_mode=fsdp_cfg.fsdp_mode,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
+            forward_prefetch=fsdp_cfg.forward_prefetch,
+            # Root wrap (required by forward_prefetch) is only safe when the model's
+            # forward is driven entirely through its root module — declared per bundle.
+            allow_root_wrap=bundle.supports_fsdp_root_wrap,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),

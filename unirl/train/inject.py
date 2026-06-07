@@ -196,6 +196,8 @@ def fsdp_wrap(
     mixed_precision: bool = True,
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
+    forward_prefetch: bool = False,
+    allow_root_wrap: bool = False,
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
@@ -322,6 +324,27 @@ def fsdp_wrap(
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
 
+    if forward_prefetch:
+        # Cross-block forward prefetch: chain each module to prefetch the NEXT
+        # block's all-gather during its own forward (root → block 0 → … →
+        # block N, in named_modules forward order), so the per-block all-gather
+        # overlaps compute instead of stalling the critical path (a multi-node
+        # win; ~no-op over NVLink). Needs the root wrapped so FSDP2 has
+        # initialized the shared all-gather comm context at the root pre-forward
+        # — the default root wrap above provides it. (allow_root_wrap, the #283
+        # per-bundle capability gate, is now subsumed by the universal root wrap;
+        # see the integration follow-up.)
+        if not isinstance(model, FSDPModule):
+            raise ValueError(
+                "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
+                "initializes the shared all-gather comm context, but root_wrap did not run "
+                "(training.fsdp.root_wrap=False). Set root_wrap=True, or forward_prefetch=False."
+            )
+        prev: nn.Module = model
+        for layer in block_instances:
+            prev.set_modules_to_forward_prefetch([layer])
+            prev = layer
+
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
 
@@ -344,7 +367,7 @@ def fsdp_wrap(
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, "
+            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
@@ -352,6 +375,7 @@ def fsdp_wrap(
             cpu_offload,
             mixed_precision,
             reshard_after_forward,
+            forward_prefetch,
             activation_checkpointing,
             use_torch_compile,
             casts,
