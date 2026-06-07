@@ -170,26 +170,30 @@ def test_parity_ode_vs_trainside(v2_engine, trainside):
     seg_v2 = resp_v2.tracks["image"].segment
     seg_ts = resp_ts.tracks["image"].segment
 
-    assert torch.equal(seg_v2.sigmas, seg_ts.sigmas), "σ schedule diverged"
+    # Normalize devices: the v2 segment lands on CPU, trainside on cuda:1.
+    sig_v2, sig_ts = seg_v2.sigmas.detach().cpu(), seg_ts.sigmas.detach().cpu()
+    lat_v2, lat_ts = seg_v2.latents.detach().cpu(), seg_ts.latents.detach().cpu()
+
+    assert torch.equal(sig_v2, sig_ts), "σ schedule diverged"
     # x_T: same NoiseRecipe → bit-identical before any model math.
-    x_t_v2 = seg_v2.latents[:, 0].float()
-    x_t_ts = seg_ts.latents[:, 0].float()
+    x_t_v2 = lat_v2[:, 0].float()
+    x_t_ts = lat_ts[:, 0].float()
     assert torch.allclose(x_t_v2, x_t_ts, atol=1e-6), (
         f"x_T diverged: max|Δ|={float((x_t_v2 - x_t_ts).abs().max())}"
     )
 
-    cos = _cosine_per_step(seg_v2.latents, seg_ts.latents)
+    cos = _cosine_per_step(lat_v2, lat_ts)
     print(f"\nper-step cosine: {[round(float(c), 5) for c in cos]}")
     assert bool((cos > 0.999).all()), f"per-step cosine degraded: {cos.tolist()}"
 
-    final_delta = (seg_v2.latents[:, -1].float() - seg_ts.latents[:, -1].float()).abs()
+    final_delta = (lat_v2[:, -1].float() - lat_ts[:, -1].float()).abs()
     print(f"final-step max|Δ|={float(final_delta.max()):.4e} mean|Δ|={float(final_delta.mean()):.4e}")
     assert float(final_delta.max()) < 2e-2, "final latents drifted beyond fp16-storage tolerance"
 
     dec_v2 = resp_v2.tracks["image"].decoded
     dec_ts = resp_ts.tracks["image"].decoded
     if dec_v2 is not None and dec_ts is not None:
-        d = (dec_v2.pixels.float() - dec_ts.pixels.float()).abs()
+        d = (dec_v2.pixels.detach().cpu().float() - dec_ts.pixels.detach().cpu().float()).abs()
         print(f"decoded mean|Δ|={float(d.mean()):.4e}")
 
 
@@ -199,7 +203,7 @@ def test_sde_native_logprob_matches_replay(v2_engine, trainside):
     resp = v2_engine.generate(req)
     track = resp.tracks["image"]
     seg = track.segment
-    assert seg.log_probs is not None, "engine did not emit native log-probs in SDE mode"
+    assert seg.sde_logp is not None, "engine did not emit native log-probs in SDE mode"
 
     conds = QwenImageConditions.from_dict(track.conditions)
     result = trainside.diffusion.replay(
@@ -208,8 +212,8 @@ def test_sde_native_logprob_matches_replay(v2_engine, trainside):
         params=_sampling(seed=7, sde_indices=sde_indices),
         step_indices=sde_indices,
     )
-    native = seg.log_probs.float()
-    replayed = result.log_probs.float()
+    native = seg.sde_logp.detach().cpu().float()
+    replayed = result.log_probs.detach().cpu().float()
     delta = (native - replayed).abs()
     print(f"\nlogp |Δ| max={float(delta.max()):.4e} mean={float(delta.mean()):.4e}")
     # bf16 server forward vs bf16 trainside forward (fp32 logp math both sides):
