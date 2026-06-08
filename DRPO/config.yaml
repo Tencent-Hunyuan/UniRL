@@ -21,7 +21,7 @@ normalize_adv_by_std: false      # mean-center only (reward − group_mean), NO 
 # ── The algorithm. ARDRPO implements the paper's DRPO loss (§3): the smooth,
 # advantage-weighted, token-adaptive SPO quadratic — NOT a hard tv/kl mask. ──
 algorithm:
-  _target_: unirl.algorithms.ar_drpo.ARDRPO
+  _target_: unirl.algorithms.drpo.ARDRPO
   stage_attr: ar                 # resolve the AR stage from the trainer-injected pipeline (.ar)
   drpo_epsilon: 12.5             # ε: regularization threshold (paper §4). Loss is
                                  #   L_t = −A_t*r_t + |A_t|*µ*(r_t − 1)² / (2*ε), the

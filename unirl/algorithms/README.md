@@ -45,7 +45,7 @@ not just three-tensor arithmetic.
   dual-adapter loop via `predict_noise_at_step`). The families: GRPO is a
   PPO-clipped ratio (`flowgrpo.py` / `ar_grpo.py`); FlowDPPO masks `-A·r` by a
   Gaussian-KL-vs-advantage criterion (`flowdppo.py`); NFT is a dual-adapter
-  reconstruction MSE (`nft.py`); DRPO is a token-adaptive SPO quadratic (`ar_drpo.py`).
+  reconstruction MSE (`nft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare

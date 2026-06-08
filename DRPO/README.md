@@ -6,7 +6,7 @@ Implementation of the paper "Rethinking the Divergence Regularization in LLM RL"
 train-side log-probs against the rollout log-probs, expands sample-level advantages to
 tokens, and applies the paper's smooth quadratic DRPO loss (Eq. 8).
 
-- **Loss:** [`unirl/algorithms/ar_drpo.py`](../unirl/algorithms/ar_drpo.py) (`ARDRPO`, `_ar_drpo_loss`)
+- **Loss:** [`unirl/algorithms/drpo.py`](../unirl/algorithms/drpo.py) (`ARDRPO`, `_ar_drpo_loss`)
 - **Recipe (SGLang):** [`examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml`](../examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml) — Qwen3-4B-Base on DAPO-Math
 - **Config extract:** [`config.yaml`](config.yaml)
 
@@ -71,7 +71,7 @@ whose weight grows without bound as `µ → 0` (paper §3.2, Figure 1).
 
 ## The code: `_ar_drpo_loss`
 
-The loss helper in [`ar_drpo.py`](../unirl/algorithms/ar_drpo.py) implements Eq. 8 directly.
+The loss helper in [`drpo.py`](../unirl/algorithms/drpo.py) implements Eq. 8 directly.
 The ratio `r_t` is kept differentiable (no `.detach()`, no TIS truncation), so the smooth
 Table-1 gradient weight arises naturally via autograd:
 
