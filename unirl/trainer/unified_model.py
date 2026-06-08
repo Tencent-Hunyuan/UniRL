@@ -2,7 +2,7 @@
 
 One shared HunyuanImage3 backbone (a single MoE transformer that operates in
 ``mode="gen_text"`` for AR and ``mode="gen_image"`` for DiT) trained jointly by
-two algorithms — ``ARGRPO`` over the AR ``TextSegment`` and ``DiffusionGRPO``
+two algorithms — ``ARGRPO`` over the AR ``TextSegment`` and ``FlowGRPO``
 over the DiT ``LatentSegment`` — both backward-accumulating into ONE LoRA
 adapter with a single optimizer step (see :class:`UnifiedModelTrainStack`).
 
@@ -14,7 +14,7 @@ vLLM-Omni engine Remotes that share ONE backbone / ONE LoRA:
 - ``ar_rollout`` (modality ``ar_recaption``, GPUs 0-3): original prompt → ``N``
   think/recaption texts (group-by-prompt → AR GRPO).
 - ``dit_rollout`` (modality ``dit_recaption``, GPUs 4-7): each recaption → ``M``
-  images of distinct noise (group-by-recaption → Diffusion GRPO).
+  images of distinct noise (group-by-recaption → FlowGRPO).
 
 The trainer assembles the lineage itself (``make_root_track(N)`` /
 ``fork_track(M)``, exactly like ``PEPipeline.generate``) because the two engines

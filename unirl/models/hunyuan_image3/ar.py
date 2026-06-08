@@ -474,7 +474,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             mask_4d = torch.full((1, 1, L_full, L_full), neg_inf, dtype=param_dtype, device=device)
             mask_4d.masked_fill_(causal.unsqueeze(0).unsqueeze(0), 0.0)
 
-            # Reset image/rope runtime state — DiffusionGRPO earlier in the same
+            # Reset image/rope runtime state — FlowGRPO earlier in the same
             # step sets num_image_tokens=4096; the text-only AR forward must run
             # with 0 image tokens or rope/attention indexing goes OOB → NaN. Per
             # forward because each sample's seq_len differs (forces rope rebuild).

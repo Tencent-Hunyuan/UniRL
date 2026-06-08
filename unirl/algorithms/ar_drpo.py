@@ -259,7 +259,7 @@ class ARDRPO(StageAlgorithm):
           ratio denominator is the frozen train-side π_old for ALL N updates:
           mini-batch 1 has ratio≈1 (same weights) and later mini-batches measure
           policy drift — no rollout-vs-train engine-gap contamination. Mirrors
-          :meth:`DiffusionGRPO.prepare_segment` replay mode. Caveat: the anchor
+          :meth:`FlowGRPO.prepare_segment` replay mode. Caveat: the anchor
           is replayed in one full-segment pass while training replays per
           micro-batch, and low-precision forwards are batch-shape sensitive —
           so mb1's ratio is close to, not exactly, 1 (exactness would need the
@@ -274,7 +274,7 @@ class ARDRPO(StageAlgorithm):
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         # Keep the replay's native (fp32) precision — do NOT downcast to whatever
         # dtype the engine emitted, so the anchor stays as close as possible to
-        # new_logp's fp32 replay (mirrors DiffusionGRPO).
+        # new_logp's fp32 replay (mirrors FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(

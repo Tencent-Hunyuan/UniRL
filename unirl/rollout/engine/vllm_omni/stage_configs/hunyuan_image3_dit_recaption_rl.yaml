@@ -12,7 +12,7 @@
 # need_recv_cache:true (no upstream edge feeds it, so it self-prefills — same
 # as the verified standalone). Plus our RL bits from t2i_rl.yaml's DiT stage:
 #   - custom_pipeline_args → RLHunyuanImage3Pipeline (SDE scheduler swap +
-#     dense trajectory capture + fused_mm_capture for DiffusionGRPO replay).
+#     dense trajectory capture + fused_mm_capture for FlowGRPO replay).
 #   - worker_extension_cls → DiTWeightSyncExtension (LoRA receive target).
 #   - vae_use_slicing/tiling:false, cache_*:null (trajectory-capture parity).
 #
@@ -49,7 +49,7 @@ stage_args:
         tensor_parallel_size: 4
         enable_expert_parallel: true
       # RL pipeline subclass: SDE scheduler + per-step trajectory + fused_mm
-      # capture (DiffusionGRPO replay needs conditions["fused"]).
+      # capture (FlowGRPO replay needs conditions["fused"]).
       custom_pipeline_args:
         pipeline_class: unirl.rollout.engine.vllm_omni.hi3.pipeline.RLHunyuanImage3Pipeline
       # Weight-sync extension: DiT worker exposes update_weights_from_ipc /

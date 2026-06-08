@@ -1,4 +1,4 @@
-"""Stage-driven ``DiffusionGRPO`` over a ``LatentSegment``.
+"""Stage-driven ``FlowGRPO`` over a ``LatentSegment``.
 
 Implements :class:`StageAlgorithm` and shares the module-level
 ``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
@@ -32,7 +32,7 @@ from .base import (
 
 
 @dataclass
-class DiffusionGRPOConfig(BaseAlgorithmConfig):
+class FlowGRPOConfig(BaseAlgorithmConfig):
     stage_attr: str = "diffusion"
     conditions_cls: str = ""
     clip_range: float = 1e-4
@@ -41,7 +41,7 @@ class DiffusionGRPOConfig(BaseAlgorithmConfig):
     params: Any = dc_field(default=None)
 
 
-class DiffusionGRPO(StageAlgorithm):
+class FlowGRPO(StageAlgorithm):
     """GRPO over a diffusion ``LatentSegment`` via ``DiffusionStage.replay``.
 
     The whole forward path (CFG batching, noise prediction, SDE math, autocast,
@@ -88,7 +88,7 @@ class DiffusionGRPO(StageAlgorithm):
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
-            raise ValueError("DiffusionGRPO: either `stage` or `pipeline` must be provided")
+            raise ValueError("FlowGRPO: either `stage` or `pipeline` must be provided")
         if stage is None:
             stage = getattr(pipeline, stage_attr)
         self.stage = stage
@@ -98,7 +98,7 @@ class DiffusionGRPO(StageAlgorithm):
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
             self.old_logp_source in ("rollout", "replay"),
-            f"DiffusionGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
+            f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
         self.conditions_cls = conditions_cls
 
@@ -130,7 +130,7 @@ class DiffusionGRPO(StageAlgorithm):
         if self.old_logp_source == "rollout":
             if segment.sde_logp is None:
                 raise RuntimeError(
-                    "DiffusionGRPO.prepare_segment: old_logp_source='rollout' but the "
+                    "FlowGRPO.prepare_segment: old_logp_source='rollout' but the "
                     "rollout engine emitted no per-step log-probs (segment.sde_logp is "
                     "None). Pin a rollout build that emits trajectory log-probs, or set "
                     "old_logp_source='replay'."
@@ -206,4 +206,4 @@ class DiffusionGRPO(StageAlgorithm):
         return [int(i) for i in segment.sde_indices.tolist()]
 
 
-__all__ = ["DiffusionGRPO", "DiffusionGRPOConfig"]
+__all__ = ["FlowGRPO", "FlowGRPOConfig"]

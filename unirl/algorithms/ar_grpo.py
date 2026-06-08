@@ -2,7 +2,7 @@
 
 Implements :class:`StageAlgorithm` and shares the module-level
 ``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
-:mod:`unirl.algorithms.base`) with :class:`DiffusionGRPO` so their loss
+:mod:`unirl.algorithms.base`) with :class:`FlowGRPO` so their loss
 math stays identical. The teacher-forced forward and per-token log-prob
 recompute are owned by ``stage.replay(...)``; the algorithm is ~20 lines of
 ratio-clip math.

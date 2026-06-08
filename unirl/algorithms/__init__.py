@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from .ar_grpo import ARGRPO
 from .base import AlgorithmStepResult, StageAlgorithm
-from .diffusion_grpo import DiffusionGRPO
-from .drpo import ARDRPO
+from .flowgrpo import FlowGRPO
+from .ar_drpo import ARDRPO
 from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .nft import DiffusionNFT, DiffusionNFTConfig
 
@@ -16,7 +16,7 @@ __all__ = [
     "ARGRPO",
     "ARDRPO",
     "AlgorithmStepResult",
-    "DiffusionGRPO",
+    "FlowGRPO",
     "DiffusionNFT",
     "DiffusionNFTConfig",
     "FlowDPPO",

@@ -151,7 +151,7 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  # Plain PPO-clip GRPO (shares _grpo_clip_loss with DiffusionGRPO). old_logp =
+  # Plain PPO-clip GRPO (shares _grpo_clip_loss with FlowGRPO). old_logp =
   # the SGLang rollout log-prob (segment.log_probs), frozen across the 4 mini-batch
   # updates below (rollout-anchored ratio, = verl bypass_mode=True parity; the
   # ratio also absorbs the rollout-vs-train engine gap — same trade-off as ARDRPO's

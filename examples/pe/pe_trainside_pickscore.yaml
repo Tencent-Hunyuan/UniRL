@@ -3,7 +3,7 @@
 #
 # A Qwen3 AR LLM rewrites each prompt into N candidates; SD3 renders M images
 # per candidate; PickScore scores the image ("diffusion") track; the reward is
-# credit-assigned up the lineage to the AR track; ARGRPO + DiffusionGRPO train
+# credit-assigned up the lineage to the AR track; ARGRPO + FlowGRPO train
 # jointly as two TrainStack siblings sharing one device pool. The composed
 # PEPipeline is driven as a trainside rollout (it samples the live FSDP modules)
 # so there is NO weight sync.
@@ -87,7 +87,7 @@ diffusion:
         - attn.to_q
         - attn.to_v
   algorithm:
-    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
     stage_attr: diffusion
     clip_range: 1.0e-4
     clip_schedule: constant
@@ -99,7 +99,7 @@ diffusion:
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.sd3.conditions.SD3Conditions
-    # DiffusionGRPO.replay needs the same guidance_scale / eta the rollout
+    # FlowGRPO.replay needs the same guidance_scale / eta the rollout
     # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
     params: ${sampling.diffusion}
   stack:

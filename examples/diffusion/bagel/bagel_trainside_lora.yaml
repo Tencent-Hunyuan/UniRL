@@ -123,7 +123,7 @@ reward:
       model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-5                   # flow_grpo clip_range_lt/gt
   clip_schedule: constant

@@ -146,7 +146,7 @@ def _flowdppo_kl_adv_loss(
 class FlowDPPO(StageAlgorithm):
     """FlowDPPO: KL-divergence-based masking for diffusion RL.
 
-    Replaces PPO's ratio clipping (``DiffusionGRPO``) with a KL-ADV masking
+    Replaces PPO's ratio clipping (``FlowGRPO``) with a KL-ADV masking
     criterion:
 
     1. Computes KL(current || old) from ``prev_sample_means`` (the Gaussian
@@ -200,7 +200,7 @@ class FlowDPPO(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         # v1 (track_builder) passes `stage`; v2 (DiffusionTrainer) passes the
-        # `pipeline` sibling and the stage is resolved off it (mirrors DiffusionGRPO).
+        # `pipeline` sibling and the stage is resolved off it (mirrors FlowGRPO).
         if stage is None and pipeline is not None:
             stage = getattr(pipeline, stage_attr)
         if stage is None:

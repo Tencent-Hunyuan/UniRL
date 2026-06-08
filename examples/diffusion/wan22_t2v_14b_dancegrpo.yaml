@@ -2,7 +2,7 @@
 # DanceGRPO WAN 2.2 T2V 14B trainside (FSDP) colocate, v2 trainer, 1x8.
 # Derived from wan22_t2v_14b.yaml; canonical DanceGRPO recipe is sd3_dancegrpo.yaml.
 #
-# DanceGRPO = DiffusionGRPO + the Dance SDE kernel. The ONLY difference from
+# DanceGRPO = FlowGRPO + the Dance SDE kernel. The ONLY difference from
 # wan22_t2v_14b is the SDE kernel:
 #   pipeline.strategy : FlowSDEStrategy -> DanceSDEStrategy
 # The step schedule (sampling.scheduler) is inherited unchanged from the base —
@@ -103,7 +103,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant

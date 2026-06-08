@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers used by DiffusionGRPO, FlowDPPO, DiffusionNFT
+# Shared helpers used by FlowGRPO, FlowDPPO, DiffusionNFT
 # ---------------------------------------------------------------------------
 
 
@@ -125,7 +125,7 @@ def _grpo_clip_loss(
     ``clip_range`` is the lower clip ε⁻ (ratio floor ``1-clip_range``).
     ``clip_range_high`` (DAPO "clip-higher") is the upper ε⁺ (ratio ceil
     ``1+clip_range_high``); ``None`` ⇒ symmetric (= ``clip_range``), the prior
-    behaviour, so ``DiffusionGRPO`` is unaffected.
+    behaviour, so ``FlowGRPO`` is unaffected.
 
     Returns ``(loss_per_element, ratio_metrics_dict)``. The metrics tensors are
     detached scalars suitable for logging.
@@ -201,7 +201,7 @@ class StageAlgorithm(Remote, ABC):
             ``num_updates_per_batch > 1`` (the train stack splitting one
             rollout into N optimizer steps over disjoint mini-batches).
             True only when the PPO ``old_logp`` anchor stays frozen across all
-            N steps: ``DiffusionGRPO`` / ``FlowDPPO`` capture
+            N steps: ``FlowGRPO`` / ``FlowDPPO`` capture
             ``segment.sde_logp`` once in :meth:`prepare_segment`; ``ARGRPO`` /
             ``ARDRPO`` keep the rollout log-prob as the anchor for all N steps
             (verl ``bypass_mode`` parity — the ratio then also carries the
@@ -230,7 +230,7 @@ class StageAlgorithm(Remote, ABC):
         sensitivity matters, so the train stack drives it per micro-slice over
         those exact slices; the old/new forwards then match bit-for-bit
         (on-policy ratio = 1; FlowDPPO on-policy KL = 0). FlowDPPO is always True
-        (``sde_means`` exist only via replay); ``DiffusionGRPO`` is True only
+        (``sde_means`` exist only via replay); ``FlowGRPO`` is True only
         under ``old_logp_source='replay'``. False (default) ⇒ one full-segment
         call suffices: the anchor is either the engine's own emission (no
         replay), or a replay where coarse geometry is acceptable (ratio ≈ 1) —
@@ -251,7 +251,7 @@ class StageAlgorithm(Remote, ABC):
         can ignore the hook entirely.
 
         Algorithms that establish a frozen anchor override this. The canonical
-        use case is :class:`DiffusionGRPO` / :class:`FlowDPPO`, which here
+        use case is :class:`FlowGRPO` / :class:`FlowDPPO`, which here
         set ``segment.sde_logp`` according to ``old_logp_source``: ``"rollout"``
         keeps the rollout engine's best-effort emission (raising if it emitted
         nothing); ``"replay"`` recomputes via a ``torch.no_grad``

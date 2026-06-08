@@ -253,7 +253,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
     precision policy. ``diffuse`` runs the full sampling loop over the engine-pinned
     ``schedule`` (``req.sigmas``), recording SDE log-probs at ``params.sde_indices``;
     ``replay`` recomputes those log-probs for GRPO. Reuses
-    ``unirl.algorithms.diffusion_grpo.DiffusionGRPO`` unchanged.
+    ``unirl.algorithms.flowgrpo.FlowGRPO`` unchanged.
 
     Implements the ``DiffusionStage`` protocol (``diffuse`` / ``replay`` /
     ``predict_noise_at_step``) so the trainside engine's ``isinstance(stage,

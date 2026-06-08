@@ -2,7 +2,7 @@
 # HunyuanImage3 think_recaption RL — v2 unified-backbone trainer, COLOCATE.
 #
 # One shared HunyuanImage3 transformer (mode=gen_text for AR, mode=gen_image for
-# DiT) trained jointly by ARGRPO (AR TextSegment) + DiffusionGRPO (DiT
+# DiT) trained jointly by ARGRPO (AR TextSegment) + FlowGRPO (DiT
 # LatentSegment), both backward-accumulating into ONE LoRA adapter with a single
 # optimizer step (UnifiedModelTrainStack). Rollout is a two-engine vLLM-Omni setup
 # (modality=ar_recaption: AR think/recaption → modality=dit_recaption: DiT); the
@@ -174,14 +174,14 @@ algorithm:
       path: unirl.models.hunyuan_image3.conditions.HunyuanImage3ARConditions
     sampling_temperature: ${sampling.ar.temperature}
   image:
-    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
     stage_attr: diffusion
     clip_range: 1.0e-4            # diffusion trust region (matches sd3/qwen_image; 0.2 never binds -> no clip on SDE-logprob ratio)
     clip_schedule: constant
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
-    # DiffusionGRPO.replay needs the same guidance_scale / eta the rollout
+    # FlowGRPO.replay needs the same guidance_scale / eta the rollout
     # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
     params: ${sampling.diffusion}
 

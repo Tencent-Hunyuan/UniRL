@@ -160,7 +160,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   # Loosened vs SD3's 1e-4 — Klein sigmas are heavily skewed to 1.0 and the
   # PPO ratio drifts past 1 +/- 1e-4 quickly.

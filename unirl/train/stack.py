@@ -183,7 +183,7 @@ class TrainStack(Remote):
             raise ValueError(
                 f"num_updates_per_batch={self.num_updates_per_batch} requires an algorithm whose "
                 f"old_logp anchor stays frozen across the N optimizer steps "
-                f"(DiffusionGRPO / FlowDPPO / ARGRPO / ARDRPO). "
+                f"(FlowGRPO / FlowDPPO / ARGRPO / ARDRPO). "
                 f"{type(algorithm).__name__} sets supports_multi_update=False, so >1 optimizer "
                 f"step would train against a moving anchor. Set num_updates_per_batch=1."
             )

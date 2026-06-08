@@ -1,7 +1,7 @@
 # @package _global_
 # MixGRPO SD3.5 trainside (FSDP) colocate, v2 trainer, 2x8.
 #
-# MixGRPO = DiffusionGRPO + Flow SDE + a progressive sliding-window SDE-index
+# MixGRPO = FlowGRPO + Flow SDE + a progressive sliding-window SDE-index
 # scheduler. The only difference from sd3_trainside (FlowGRPO) is the scheduler:
 #   AllSDEScheduler -> WindowScheduler(strategy=progressive), plus init_same_noise.
 #
@@ -96,7 +96,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant

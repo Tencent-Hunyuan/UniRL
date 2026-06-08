@@ -128,7 +128,7 @@ diffusion:
         - attn.to_q
         - attn.to_v
   algorithm:
-    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
     stage_attr: diffusion
     clip_range: 1.0e-4
     clip_schedule: constant

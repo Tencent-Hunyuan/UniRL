@@ -43,23 +43,23 @@ not just three-tensor arithmetic.
   whole forward — CFG batching, noise prediction, SDE stepping — to
   `stage.replay(...)` and gets back `new_logp` (NFT is the exception: it runs its own
   dual-adapter loop via `predict_noise_at_step`). The families: GRPO is a
-  PPO-clipped ratio (`diffusion_grpo.py` / `ar_grpo.py`); FlowDPPO masks `-A·r` by a
+  PPO-clipped ratio (`flowgrpo.py` / `ar_grpo.py`); FlowDPPO masks `-A·r` by a
   Gaussian-KL-vs-advantage criterion (`flowdppo.py`); NFT is a dual-adapter
-  reconstruction MSE (`nft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`).
+  reconstruction MSE (`nft.py`); DRPO is a token-adaptive SPO quadratic (`ar_drpo.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
   `anchor_fields` (which segment fields to freeze) and `recomputes_anchor()`
   (whether `prepare_segment` replays); `TrainStack` then recomputes the anchor over
   the *exact same* mini/micro slices it will train on. No hardcoded field names.
-- **Variants are recipes, not classes.** DanceGRPO and MixGRPO are `DiffusionGRPO`
+- **Variants are recipes, not classes.** DanceGRPO and MixGRPO are `FlowGRPO`
   with a different SDE strategy or a windowed index scheduler. Add a class only when
   the loss math itself changes.
 
 **Extending it:** a new diffusion loss subclasses `StageAlgorithm`, calls
 `stage.replay(...)`, computes a per-element loss, and `(loss * loss_scale).backward()`;
 if it needs multi-update, set `anchor_fields` and `supports_multi_update = True` and
-mirror `DiffusionGRPO`. A new AR loss mirrors `ARGRPO` (early-return on an empty
+mirror `FlowGRPO`. A new AR loss mirrors `ARGRPO` (early-return on an empty
 segment, expand advantages per token), keeping `supports_multi_update = False`.
 
 ## Gotchas
@@ -69,7 +69,7 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
 - **`num_updates_per_batch > 1` on NFT** raises in `TrainStack.__init__` — NFT keeps
   the default `supports_multi_update = False`. The four that allow it all freeze a
-  stable anchor: `DiffusionGRPO`/`FlowDPPO` freeze `sde_logp` once in
+  stable anchor: `FlowGRPO`/`FlowDPPO` freeze `sde_logp` once in
   `prepare_segment`, while `ARGRPO`/`ARDRPO` reuse the rollout log-prob as the anchor
   for all N steps (verl `bypass_mode` parity — so the AR ratio also carries the
   rollout-vs-train engine gap, by design).

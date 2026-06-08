@@ -43,7 +43,7 @@ class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack.
 
     Holds one shared :class:`FSDPBackend` and a dict of named
-    :class:`StageAlgorithm` siblings (``{"ar": ARGRPO, "image": DiffusionGRPO}``).
+    :class:`StageAlgorithm` siblings (``{"ar": ARGRPO, "image": FlowGRPO}``).
     Each algorithm trains its own track but backward-accumulates into the same
     shared transformer; one optimizer step applies all algorithms' gradients.
 

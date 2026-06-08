@@ -5,7 +5,7 @@
 #   - backend.ema_lora_cfg installs the "default" (trainable) + "old" (EMA)
 #     LoRA pair via inject_nft; the trainer rolls out under "old" and trains
 #     "default", then EMA-updates "old" at each rollout boundary.
-#   - algorithm._target_ = DiffusionNFT (vs DiffusionGRPO in the GRPO recipe);
+#   - algorithm._target_ = DiffusionNFT (vs FlowGRPO in the GRPO recipe);
 #     it pulls the EMA handle off backend.ema (trainer injects backend=...).
 #   - sampling.scheduler.num_sde_steps: 0 — KEY: NFT forward-process path,
 #     no per-step SDE log_prob recorded.

@@ -2,7 +2,7 @@
 # MixGRPO WAN 2.1 T2V trainside (FSDP) colocate, v2 trainer, 1x8.
 # Derived from wan21_t2v.yaml; canonical MixGRPO recipe is sd3_mixgrpo.yaml.
 #
-# MixGRPO = DiffusionGRPO + Flow SDE + a progressive sliding-window SDE-index
+# MixGRPO = FlowGRPO + Flow SDE + a progressive sliding-window SDE-index
 # scheduler. The ONLY differences from wan21_t2v are the scheduler
 # (AllSDEScheduler -> WindowScheduler, strategy=progressive) and init_same_noise.
 # The SDE kernel stays FlowSDEStrategy. Video shape (720p / 5 frames), 3D VAE,
@@ -101,7 +101,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant

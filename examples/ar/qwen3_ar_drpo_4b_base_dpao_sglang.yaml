@@ -149,7 +149,7 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  _target_: unirl.algorithms.drpo.ARDRPO
+  _target_: unirl.algorithms.ar_drpo.ARDRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   drpo_epsilon: 12.5 # paper §4 "regularization threshold to 12.5"
   # true = Binary-TV token-adaptive eps_t = eps/mu, penalty |A|·p_old·(r-1)²/(2ε)

@@ -146,7 +146,7 @@ class DiffusionNFT(StageAlgorithm):
         # Two wiring paths converge here:
         #   - v1 (track_builder) passes ``stage`` + ``nft_lora_policy=<EMA>``.
         #   - v2 (DiffusionTrainer) passes ``pipeline`` + ``backend`` siblings;
-        #     resolve ``stage`` off the pipeline (mirrors DiffusionGRPO) and the
+        #     resolve ``stage`` off the pipeline (mirrors FlowGRPO) and the
         #     EMA off ``backend.ema`` (the FSDPBackend owns the dual-adapter EMA).
         if stage is None and pipeline is not None:
             stage = getattr(pipeline, stage_attr)

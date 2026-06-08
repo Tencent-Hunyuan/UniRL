@@ -2,7 +2,7 @@
 # FlowDPPO SD3.5 trainside (FSDP) colocate, v2 trainer, 1x8.
 #
 # FlowDPPO replaces PPO ratio clipping with KL-divergence-based masking:
-#   - algorithm._target_ = FlowDPPO (vs DiffusionGRPO).
+#   - algorithm._target_ = FlowDPPO (vs FlowGRPO).
 #   - kl_mask_threshold: KL threshold below which updates pass unmasked.
 #   - add_kl_coefficient: normalize KL by sigma_t (flow-matching noise scale).
 #   - No clip_range (replaced by KL masking). FlowDPPO's prepare_segment replays at

@@ -37,7 +37,7 @@ Three behaviors on top of upstream ``HunyuanImage3Pipeline``
    ``stage_diffusion_proc.py:182``). Plain ``setattr`` on
    ``DiffusionOutput`` would not survive IPC. Parent-side
    ``_to_rollout_resp`` reads it back and surfaces it as
-   ``RolloutResp.tracks["image"].conditions["fused"]`` so ``DiffusionGRPO`` →
+   ``RolloutResp.tracks["image"].conditions["fused"]`` so ``FlowGRPO`` →
    ``HunyuanImage3DiffusionConditions.from_dict`` can consume it without
    a separate train-side rebuild.
 
