@@ -39,7 +39,7 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
 | `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_llm, vllm_omni, composed) |
 | `train/` | Train stack: `TrainStack`, FSDP backend, LoRA/NFT/mirror injection, EMA shadow, optimizer/lr |
-| `algorithms/` | Per-track loss algorithms (GRPO, NFT, DPPO, DRPO) |
+| `algorithms/` | Per-track loss algorithms (GRPO, NFT, FlowDPPO, DRPO) |
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
 | `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |

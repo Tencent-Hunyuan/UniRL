@@ -1,11 +1,11 @@
 # @package _global_
-# Flow-DPPO SD3.5 trainside (FSDP) colocate, v2 trainer, 1x8.
+# FlowDPPO SD3.5 trainside (FSDP) colocate, v2 trainer, 1x8.
 #
-# Flow-DPPO replaces PPO ratio clipping with KL-divergence-based masking:
-#   - algorithm._target_ = DiffusionDPPO (vs DiffusionGRPO).
+# FlowDPPO replaces PPO ratio clipping with KL-divergence-based masking:
+#   - algorithm._target_ = FlowDPPO (vs DiffusionGRPO).
 #   - kl_mask_threshold: KL threshold below which updates pass unmasked.
 #   - add_kl_coefficient: normalize KL by sigma_t (flow-matching noise scale).
-#   - No clip_range (replaced by KL masking). DPPO's prepare_segment replays at
+#   - No clip_range (replaced by KL masking). FlowDPPO's prepare_segment replays at
 #     pre-update weights to capture old means (the KL reference).
 # SDE indices: sparse over the first half (timestep_fraction [0.0, 0.5], 3 steps).
 #
@@ -14,7 +14,7 @@
 # Not carried over: v1 training.ema (full-model decay-0.99 mirror) — it was an
 #   eval/export EMA; the minimal v2 trainer does no eval-EMA swap, so a mirror
 #   would only double model memory unused. v1 num_updates_per_batch=2 IS restored
-#   (v2 TrainStack multi-update; DPPO freezes its KL anchor in prepare_segment).
+#   (v2 TrainStack multi-update; FlowDPPO freezes its KL anchor in prepare_segment).
 
 num_devices: 8                # 1 node x 8 GPUs (v1 actor_count 8)
 batch_size: 48                # prompts_per_rollout
@@ -106,13 +106,13 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.dppo.DiffusionDPPO
+  _target_: unirl.algorithms.flowdppo.FlowDPPO
   stage_attr: diffusion
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.sd3.conditions.SD3Conditions
   params: ${sampling}
-  # Flow-DPPO hyperparameters (v1 algorithm.algorithms.diffusion block).
+  # FlowDPPO hyperparameters (v1 algorithm.algorithms.diffusion block).
   kl_mask_threshold: 1.0e-5
   add_kl_coefficient: true
 
@@ -153,10 +153,10 @@ sampling:
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
-  project_name: ${oc.env:WANDB_PROJECT,unirl-flow-dppo}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flowdppo}
   run_name: ${oc.env:WANDB_RUN_NAME,sd3_flowdppo}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: ["sd3.5", "dppo", "flow-dppo", "kl-adv", "trainside", "v2"]
+  tags: ["sd3.5", "dppo", "flowdppo", "kl-adv", "trainside", "v2"]
   log_media: false
   media_max_items: 8
   media_log_interval: 1

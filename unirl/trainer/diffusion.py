@@ -59,7 +59,7 @@ class DiffusionTrainer(BaseTrainer):
         # default; only safe (and only set true) for layout=="colocate" with a
         # SEPARATE engine rollout under GRPO — gated again in train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        # Flow-DPPO advantage parity: when True, RolloutTrack.compute_advantages
+        # FlowDPPO advantage parity: when True, RolloutTrack.compute_advantages
         # keeps the per-group mean but divides by ONE batch-wide std (the v1
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.

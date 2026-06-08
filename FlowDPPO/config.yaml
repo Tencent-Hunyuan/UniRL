@@ -1,21 +1,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# flowDPPO — annotated config EXTRACT (for reading, not launching).
+# FlowDPPO — annotated config EXTRACT (for reading, not launching).
 #
 # Lifted from the full runnable recipe:
 #     examples/diffusion/sd3_flowdppo.yaml
-# Launch that recipe to actually train (see this folder's README.md). flowDPPO
+# Launch that recipe to actually train (see this folder's README.md). FlowDPPO
 # uses the SAME GRPO-style SDE rollout; it only swaps the loss (KL-mask instead of
 # ratio-clip) and so additionally records the per-step Gaussian means.
 # ─────────────────────────────────────────────────────────────────────────────
 
 algorithm:
-  _target_: unirl.algorithms.dppo.DiffusionDPPO
+  _target_: unirl.algorithms.flowdppo.FlowDPPO
   stage_attr: diffusion
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.sd3.conditions.SD3Conditions
   params: ${sampling}
-  # ── Flow-DPPO loss hyperparameters ──
+  # ── FlowDPPO loss hyperparameters ──
   kl_mask_threshold: 1.0e-5     # per-sample KL-style score below this ⇒ update
                                  # passes freely (no clipping). Above it, the
                                  # advantage-aware mask may zero the update
@@ -25,7 +25,7 @@ algorithm:
                                  # step noise scale. false ⇒ raw squared mean
                                  # shift / 2 (still mean-reduced).
 
-# Same GRPO-style SDE rollout (eta>0, SDE steps recorded). DPPO additionally needs
+# Same GRPO-style SDE rollout (eta>0, SDE steps recorded). FlowDPPO additionally needs
 # the per-step Gaussian transition means (prev_sample_means) — replay() emits them.
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams

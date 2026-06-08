@@ -1,12 +1,12 @@
-"""Flow-DPPO: KL-divergence-based masking for diffusion RL.
+"""FlowDPPO: KL-divergence-based masking for diffusion RL.
 
-Implements :class:`DiffusionDPPO` — a :class:`StageAlgorithm` that replaces
+Implements :class:`FlowDPPO` — a :class:`StageAlgorithm` that replaces
 PPO-style ratio clipping with a KL-ADV masking criterion. Uses
 ``prev_sample_means`` from replay to compute Gaussian KL between old and
 new policy, then masks updates where KL is high AND the ratio direction is
 aligned with advantage (i.e. overly aggressive policy updates).
 
-Module-level helpers ``_gaussian_kl_div`` and ``_dppo_kl_adv_loss`` contain
+Module-level helpers ``_gaussian_kl_div`` and ``_flowdppo_kl_adv_loss`` contain
 the core math; the class wires them into the stage-driven training contract.
 """
 
@@ -26,7 +26,7 @@ from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm, gath
 
 
 @dataclass
-class DiffusionDPPOConfig(BaseAlgorithmConfig):
+class FlowDPPOConfig(BaseAlgorithmConfig):
     stage_attr: str = "diffusion"
     conditions_cls: str = ""
     kl_mask_threshold: float = 1e-5
@@ -51,7 +51,7 @@ def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> t
     return (p - q) ** 2 / (2 * sigma**2)
 
 
-def _dppo_kl_adv_loss(
+def _flowdppo_kl_adv_loss(
     *,
     new_logp: torch.Tensor,
     old_logp: torch.Tensor,
@@ -61,7 +61,7 @@ def _dppo_kl_adv_loss(
     sigma_t: torch.Tensor,
     kl_mask_threshold: float,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Flow-DPPO KL-ADV masking loss.
+    """FlowDPPO KL-ADV masking loss.
 
     Instead of PPO's ratio clipping, this function:
     1. Computes per-sample KL between new and old policy means
@@ -143,8 +143,8 @@ def _dppo_kl_adv_loss(
 # ---------------------------------------------------------------------------
 
 
-class DiffusionDPPO(StageAlgorithm):
-    """Flow-DPPO: KL-divergence-based masking for diffusion RL.
+class FlowDPPO(StageAlgorithm):
+    """FlowDPPO: KL-divergence-based masking for diffusion RL.
 
     Replaces PPO's ratio clipping (``DiffusionGRPO``) with a KL-ADV masking
     criterion:
@@ -183,7 +183,7 @@ class DiffusionDPPO(StageAlgorithm):
     anchor_fields = ("sde_logp", "sde_means")
 
     def recomputes_anchor(self) -> bool:
-        # DPPO always replays sde_means for the KL term (regardless of
+        # FlowDPPO always replays sde_means for the KL term (regardless of
         # old_logp_source), so the anchor always needs train-time geometry.
         return True
 
@@ -204,7 +204,7 @@ class DiffusionDPPO(StageAlgorithm):
         if stage is None and pipeline is not None:
             stage = getattr(pipeline, stage_attr)
         if stage is None:
-            raise ValueError("DiffusionDPPO: either `stage` or `pipeline` must be provided")
+            raise ValueError("FlowDPPO: either `stage` or `pipeline` must be provided")
         self.stage = stage
         self.params = params
         self.kl_mask_threshold = float(kl_mask_threshold)
@@ -212,7 +212,7 @@ class DiffusionDPPO(StageAlgorithm):
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
             self.old_logp_source in ("rollout", "replay"),
-            f"DiffusionDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
+            f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
         self.conditions_cls = conditions_cls
 
@@ -226,7 +226,7 @@ class DiffusionDPPO(StageAlgorithm):
         (``segment.sde_means``) at pre-update weights, before the
         ``num_updates_per_batch`` loop.
 
-        ``stage.replay`` always runs under ``torch.no_grad`` — DPPO needs the
+        ``stage.replay`` always runs under ``torch.no_grad`` — FlowDPPO needs the
         old policy's ``prev_sample_means`` for the KL term — so ``sde_means``
         is always written from this pre-update replay. The log-prob anchor is
         chosen by ``old_logp_source``:
@@ -245,7 +245,7 @@ class DiffusionDPPO(StageAlgorithm):
             return
         if self.old_logp_source == "rollout" and segment.sde_logp is None:
             raise RuntimeError(
-                "DiffusionDPPO.prepare_segment: old_logp_source='rollout' but the "
+                "FlowDPPO.prepare_segment: old_logp_source='rollout' but the "
                 "rollout engine emitted no per-step log-probs (segment.sde_logp is "
                 "None). Pin a rollout build that emits trajectory log-probs, or set "
                 "old_logp_source='replay'."
@@ -256,10 +256,10 @@ class DiffusionDPPO(StageAlgorithm):
         # Log-prob anchor: replay overwrites; rollout keeps the engine's emission.
         if self.old_logp_source == "replay":
             segment.sde_logp = result.log_probs.detach().cpu()
-        # Always populate old means (core of DPPO)
+        # Always populate old means (core of FlowDPPO)
         if result.prev_sample_means is None:
             raise RuntimeError(
-                "DiffusionDPPO.prepare_segment: stage.replay() returned "
+                "FlowDPPO.prepare_segment: stage.replay() returned "
                 "prev_sample_means=None. Ensure the stage's replay method "
                 "produces means (required for KL-ADV masking)."
             )
@@ -290,7 +290,7 @@ class DiffusionDPPO(StageAlgorithm):
 
         if new_means is None:
             raise RuntimeError(
-                "DiffusionDPPO requires stage.replay() to return prev_sample_means, "
+                "FlowDPPO requires stage.replay() to return prev_sample_means, "
                 "but got None. Ensure the stage's replay method produces means."
             )
 
@@ -306,7 +306,7 @@ class DiffusionDPPO(StageAlgorithm):
 
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
 
-        loss_per_elem, ratio_metrics = _dppo_kl_adv_loss(
+        loss_per_elem, ratio_metrics = _flowdppo_kl_adv_loss(
             new_logp=new_logp,
             old_logp=old_logp,
             new_means=new_means,
@@ -354,7 +354,7 @@ class DiffusionDPPO(StageAlgorithm):
             return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
 
         if segment.sigmas is None:
-            raise ValueError("DiffusionDPPO with add_kl_coefficient=True requires segment.sigmas.")
+            raise ValueError("FlowDPPO with add_kl_coefficient=True requires segment.sigmas.")
         sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
         eta = float(self.params.eta)
 
@@ -368,4 +368,4 @@ class DiffusionDPPO(StageAlgorithm):
         return sigma_t.reshape(1, -1, 1, 1, 1)
 
 
-__all__ = ["DiffusionDPPO"]
+__all__ = ["FlowDPPO", "FlowDPPOConfig"]
