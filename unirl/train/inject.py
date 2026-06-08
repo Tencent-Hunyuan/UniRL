@@ -324,23 +324,24 @@ def fsdp_wrap(
             )
 
     if forward_prefetch:
-        # Cross-block forward prefetch: chain each module to prefetch the NEXT
-        # block's all-gather during its own forward (root → block 0 → … →
-        # block N, in named_modules forward order), so the per-block all-gather
-        # overlaps compute instead of stalling the critical path (a multi-node
-        # win; ~no-op over NVLink). Needs the root wrapped so FSDP2 has
-        # initialized the shared all-gather comm context at the root pre-forward
-        # — the default root wrap above provides it.
+        # Cross-block forward prefetch: chain each FSDP group to prefetch the
+        # NEXT group's all-gather during its own forward, in forward
+        # (named_modules) order — root → group 0 → … → group N — so the
+        # per-group all-gather overlaps compute instead of stalling the critical
+        # path (a multi-node win; ~no-op over NVLink). Iterates the ACTUAL FSDP
+        # groups (root + blocks + any separately-wrapped leftover group), not
+        # just block_instances, matching set_grad_sync's walk — so no wrapped
+        # group is left unchained. Needs the root wrapped (the default root wrap
+        # above) so FSDP2 has initialized the shared all-gather comm context.
         if not isinstance(model, FSDPModule):
             raise ValueError(
                 "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
                 "initializes the shared all-gather comm context, but root_wrap did not run "
                 "(training.fsdp.root_wrap=False). Set root_wrap=True, or forward_prefetch=False."
             )
-        prev: nn.Module = model
-        for layer in block_instances:
-            prev.set_modules_to_forward_prefetch([layer])
-            prev = layer
+        fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
+        for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
+            cur.set_modules_to_forward_prefetch([nxt])
 
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
