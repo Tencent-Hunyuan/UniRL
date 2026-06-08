@@ -197,7 +197,6 @@ def fsdp_wrap(
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
-    allow_root_wrap: bool = False,
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
@@ -331,9 +330,7 @@ def fsdp_wrap(
         # overlaps compute instead of stalling the critical path (a multi-node
         # win; ~no-op over NVLink). Needs the root wrapped so FSDP2 has
         # initialized the shared all-gather comm context at the root pre-forward
-        # — the default root wrap above provides it. (allow_root_wrap, the #283
-        # per-bundle capability gate, is now subsumed by the universal root wrap;
-        # see the integration follow-up.)
+        # — the default root wrap above provides it.
         if not isinstance(model, FSDPModule):
             raise ValueError(
                 "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "

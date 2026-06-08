@@ -126,9 +126,6 @@ class FSDPBackend(Remote):
             fsdp_mode=fsdp_cfg.fsdp_mode,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
-            # Root wrap (required by forward_prefetch) is only safe when the model's
-            # forward is driven entirely through its root module — declared per bundle.
-            allow_root_wrap=bundle.supports_fsdp_root_wrap,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
@@ -183,15 +180,16 @@ class FSDPBackend(Remote):
         self.optimizer.zero_grad()
 
     def set_grad_sync(self, enable: bool) -> None:
-        """Toggle the per-block FSDP2 gradient reduce-scatter for no-sync accumulation.
+        """Toggle the FSDP2 gradient reduce-scatter for no-sync accumulation.
 
         With ``defer_grad_sync`` on, the train loop disables sync on every
-        micro-batch except the last, so the wrapped blocks accumulate gradients
-        in their unsharded buffers and a single reduce-scatter runs per optimizer
-        step instead of one per micro-batch. The non-block (replicated) params
-        are already DP-averaged once per step by ``sync_unsharded_grads`` in
-        ``optimizer_step``, so deferring the block reduce-scatter completes "one
-        gradient sync per step" for the whole model on a multi-node fabric.
+        micro-batch except the last, so every FSDP group accumulates gradients
+        in its unsharded buffers and a single reduce-scatter runs per optimizer
+        step instead of one per micro-batch. Under the default root wrap the
+        whole model is sharded — the per-block groups AND the leftover root
+        group (embed / final norm / lm_head) — and the loop below toggles all of
+        them, so this defers one reduce-scatter per step for the *entire* model
+        on a multi-node fabric.
 
         No-op when deferral is off (the common case) or the flag is already in
         the wanted state. ``set_is_last_backward`` does not recurse, so every

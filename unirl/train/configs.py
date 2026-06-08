@@ -59,10 +59,9 @@ class FSDPConfig:
     # so reward / grad-norm parity must be confirmed before enabling in a recipe.
     defer_grad_sync: bool = False
     # Opt-in FSDP2 cross-block forward prefetch: overlap each block's all-gather
-    # with compute (a multi-node win, ~no-op over NVLink). Requires a root wrap to
-    # initialize the shared all-gather comm context, so fsdp_wrap raises unless the
-    # bundle declares supports_fsdp_root_wrap=True (its forward is driven entirely
-    # through the root module). Off keeps the historical per-block-only wrapping.
+    # with compute (a multi-node win, ~no-op over NVLink). Chains the default root
+    # wrap to prefetch block 0, then block i to prefetch block i+1; needs the root
+    # wrap (raises if root_wrap=False). Off keeps the default wrap with no prefetch.
     forward_prefetch: bool = False
     # Optional high-precision master dtype for the TRAINABLE params (e.g. "fp32").
     # When set, fsdp_wrap keeps the trainable (LoRA) sharded master + optimizer

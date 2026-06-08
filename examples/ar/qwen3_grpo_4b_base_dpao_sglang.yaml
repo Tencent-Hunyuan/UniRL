@@ -88,6 +88,8 @@ backend:
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
+    forward_prefetch: false  # true overlaps each block's all-gather with compute (multi-node win; uses the default root wrap)
+    defer_grad_sync: false  # true = one reduce-scatter per optimizer step (ZeRO-2 only — needs reshard_after_forward: false; parity-check before enabling)
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-6
