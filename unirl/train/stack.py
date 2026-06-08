@@ -183,7 +183,7 @@ class TrainStack(Remote):
             raise ValueError(
                 f"num_updates_per_batch={self.num_updates_per_batch} requires an algorithm whose "
                 f"old_logp anchor stays frozen across the N optimizer steps "
-                f"(DiffusionGRPO / FlowDPPO / ARGRPO / ARDRPO). "
+                f"(DiffusionGRPO / DiffusionDPPO / ARGRPO / ARDRPO). "
                 f"{type(algorithm).__name__} sets supports_multi_update=False, so >1 optimizer "
                 f"step would train against a moving anchor. Set num_updates_per_batch=1."
             )
@@ -201,7 +201,7 @@ class TrainStack(Remote):
         :meth:`prepare_segment` consume this, so the π_old anchor is frozen at
         exactly the ``(mini, micro)`` geometry ``new_logp`` is later computed at —
         the only way bf16 batch-shape sensitivity cancels and the on-policy ratio
-        is exactly 1 (FlowDPPO on-policy KL exactly 0).
+        is exactly 1 (DPPO on-policy KL exactly 0).
 
         Invariant: any *cross-sample* statistic (e.g. advantage mean/std) must be
         computed on the full shard BEFORE this slicing — the trainer does so in
@@ -226,13 +226,13 @@ class TrainStack(Remote):
         No-op if ``segment`` is None. If the algorithm does NOT replay the anchor
         (``recomputes_anchor() == False`` — e.g. rollout GRPO), the anchor is the
         rollout engine's own emission, so one full-segment call suffices. If it DOES
-        replay (replay GRPO; FlowDPPO always, for ``sde_means``), the recomputed
+        replay (replay GRPO; DPPO always, for ``sde_means``), the recomputed
         ``anchor_fields`` are computed at the SAME mini/micro geometry training will
         use — driven by the shared :meth:`_optimizer_step_slices` — so the old/new
         forwards match bf16-element-for-element on those fields. Concretely, the
         on-policy PPO ratio is exactly 1 only where ``sde_logp`` is replayed (replay
-        GRPO, or FlowDPPO under ``old_logp_source='replay'``), and the on-policy KL is
-        exactly 0 wherever ``sde_means`` is replayed (FlowDPPO always). FlowDPPO-rollout keeps
+        GRPO, or DPPO under ``old_logp_source='replay'``), and the on-policy KL is
+        exactly 0 wherever ``sde_means`` is replayed (DPPO always). DPPO-rollout keeps
         the engine's ``sde_logp``, so its KL is 0 on-policy but its ratio is not
         pinned to 1. A single slice degenerates to one full-segment call; only the
         algorithm's declared ``anchor_fields`` are re-sliced and reassembled (no

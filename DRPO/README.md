@@ -136,7 +136,7 @@ The practical consequence:
    expands advantages to tokens, calls `_ar_drpo_loss`, applies `segment.loss_mask`,
    reduces, and `backward()`s.
 
-Unlike diffusion GRPO/FlowDPPO, `ARDRPO` does **not** freeze a train-side `old_logp` in
+Unlike diffusion GRPO/DPPO, `ARDRPO` does **not** freeze a train-side `old_logp` in
 `prepare_segment` — it reuses the rollout log-prob, so the recipe must keep
 `stack.num_updates_per_batch: 1` (`TrainStack` raises otherwise:
 `supports_multi_update = False`).
@@ -183,7 +183,7 @@ modality-agnostic and shares the AR trainer.)
 ## Related tutorial
 
 - **[FlowDPPO](../FlowDPPO/)** is the closest conceptual sibling: both replace ratio
-  clipping with divergence-aware control. FlowDPPO has *exact* Gaussian KL over latent
+  clipping with divergence-aware control. flowDPPO has *exact* Gaussian KL over latent
   transitions; `ARDRPO` approximates token-distribution shift from chosen-token log-probs.
 
 ## References

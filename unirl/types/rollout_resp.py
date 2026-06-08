@@ -253,7 +253,7 @@ class RolloutTrack(Batch):
             prompts); the v2 single-controller reduces over all groups at once.
             The two share an expectation (both estimate the population reward std),
             but the full-batch scope is intentional — topology-independent and
-            lower-variance. Used by the FlowDPPO recipe; left ``False`` elsewhere.
+            lower-variance. Used by the Flow-DPPO recipe; left ``False`` elsewhere.
         :return: A new :class:`RolloutTrack` with ``advantages`` set.
 
         Population std (``unbiased=False``) is used so the math degenerates

@@ -6,7 +6,7 @@
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
-  <img src="../../assets/algorithm-contract-new.png" alt="UniRL algorithm contract: a StageAlgorithm combines new_logp from replay, the frozen pi_old anchor, and advantages into a loss (four interchangeable families: GRPO, FlowDPPO, DRPO, and NFT as the ratio-free exception), and declares knobs — requires_ema_rollout, supports_multi_update, anchor_fields/recomputes_anchor — that reconfigure the sampler and train stack around it" width="100%">
+  <img src="../../assets/algorithm-contract-new.png" alt="UniRL algorithm contract: a StageAlgorithm combines new_logp from replay, the frozen pi_old anchor, and advantages into a loss (four interchangeable families: GRPO, Flow-DPPO, DRPO, and NFT as the ratio-free exception), and declares knobs — requires_ema_rollout, supports_multi_update, anchor_fields/recomputes_anchor — that reconfigure the sampler and train stack around it" width="100%">
 </div>
 
 *A `StageAlgorithm` is two things: a **loss combine** (`stage.replay → new_logp`, mixed with the frozen **π_old** anchor and advantages — four interchangeable families) and a few **declared knobs** (`requires_ema_rollout`, `supports_multi_update`, `anchor_fields`/`recomputes_anchor()`) that reconfigure the sampler and the train loop around it.*
@@ -43,12 +43,12 @@ not just three-tensor arithmetic.
   whole forward — CFG batching, noise prediction, SDE stepping — to
   `stage.replay(...)` and gets back `new_logp` (NFT is the exception: it runs its own
   dual-adapter loop via `predict_noise_at_step`). The families: GRPO is a
-  PPO-clipped ratio (`diffusion_grpo.py` / `ar_grpo.py`); FlowDPPO masks `-A·r` by a
-  Gaussian-KL-vs-advantage criterion (`flowdppo.py`); NFT is a dual-adapter
+  PPO-clipped ratio (`diffusion_grpo.py` / `ar_grpo.py`); Flow-DPPO masks `-A·r` by a
+  Gaussian-KL-vs-advantage criterion (`dppo.py`); NFT is a dual-adapter
   reconstruction MSE (`nft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
-  drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
+  drifts the on-policy ratio off 1 (and DPPO's KL off 0). Algorithms just declare
   `anchor_fields` (which segment fields to freeze) and `recomputes_anchor()`
   (whether `prepare_segment` replays); `TrainStack` then recomputes the anchor over
   the *exact same* mini/micro slices it will train on. No hardcoded field names.
@@ -69,11 +69,11 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
 - **`num_updates_per_batch > 1` on NFT** raises in `TrainStack.__init__` — NFT keeps
   the default `supports_multi_update = False`. The four that allow it all freeze a
-  stable anchor: `DiffusionGRPO`/`FlowDPPO` freeze `sde_logp` once in
+  stable anchor: `DiffusionGRPO`/`DiffusionDPPO` freeze `sde_logp` once in
   `prepare_segment`, while `ARGRPO`/`ARDRPO` reuse the rollout log-prob as the anchor
   for all N steps (verl `bypass_mode` parity — so the AR ratio also carries the
   rollout-vs-train engine gap, by design).
-- **FlowDPPO isn't fully on-policy under `rollout`** — it always replays `sde_means`
+- **DPPO isn't fully on-policy under `rollout`** — it always replays `sde_means`
   (KL = 0) but keeps the engine's `sde_logp`, so its ratio isn't pinned to 1. Use
   `replay` to also pin the ratio.
 - **`params` must reuse the rollout `guidance_scale`/`eta`/`shift`** — single-track

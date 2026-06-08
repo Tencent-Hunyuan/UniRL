@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers used by DiffusionGRPO, FlowDPPO, DiffusionNFT
+# Shared helpers used by DiffusionGRPO, DiffusionDPPO, DiffusionNFT
 # ---------------------------------------------------------------------------
 
 
@@ -56,7 +56,7 @@ def gather_sde_field(
     ``torch.searchsorted`` (O(S' log S)) and returns
     ``tensor[:, positions, ...]``.
 
-    Used by GRPO (for ``sde_logp``) and FlowDPPO (for ``sde_logp`` + ``sde_means``).
+    Used by GRPO (for ``sde_logp``) and DPPO (for ``sde_logp`` + ``sde_means``).
     """
     if tensor is None or sde_indices is None:
         raise ValueError(
@@ -201,7 +201,7 @@ class StageAlgorithm(Remote, ABC):
             ``num_updates_per_batch > 1`` (the train stack splitting one
             rollout into N optimizer steps over disjoint mini-batches).
             True only when the PPO ``old_logp`` anchor stays frozen across all
-            N steps: ``DiffusionGRPO`` / ``FlowDPPO`` capture
+            N steps: ``DiffusionGRPO`` / ``DiffusionDPPO`` capture
             ``segment.sde_logp`` once in :meth:`prepare_segment`; ``ARGRPO`` /
             ``ARDRPO`` keep the rollout log-prob as the anchor for all N steps
             (verl ``bypass_mode`` parity — the ratio then also carries the
@@ -216,7 +216,7 @@ class StageAlgorithm(Remote, ABC):
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
     # Segment fields this algorithm freezes as the π_old anchor in
-    # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO:
+    # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; DPPO:
     # ``("sde_logp", "sde_means")``). When the anchor is recomputed
     # (:meth:`recomputes_anchor`), the train stack re-slices and reassembles
     # exactly these fields at train-time geometry — it never hardcodes them.
@@ -229,7 +229,7 @@ class StageAlgorithm(Remote, ABC):
         True ⇒ :meth:`prepare_segment` replays the anchor AND bf16 batch-shape
         sensitivity matters, so the train stack drives it per micro-slice over
         those exact slices; the old/new forwards then match bit-for-bit
-        (on-policy ratio = 1; FlowDPPO on-policy KL = 0). FlowDPPO is always True
+        (on-policy ratio = 1; DPPO on-policy KL = 0). DPPO is always True
         (``sde_means`` exist only via replay); ``DiffusionGRPO`` is True only
         under ``old_logp_source='replay'``. False (default) ⇒ one full-segment
         call suffices: the anchor is either the engine's own emission (no
@@ -251,7 +251,7 @@ class StageAlgorithm(Remote, ABC):
         can ignore the hook entirely.
 
         Algorithms that establish a frozen anchor override this. The canonical
-        use case is :class:`DiffusionGRPO` / :class:`FlowDPPO`, which here
+        use case is :class:`DiffusionGRPO` / :class:`DiffusionDPPO`, which here
         set ``segment.sde_logp`` according to ``old_logp_source``: ``"rollout"``
         keeps the rollout engine's best-effort emission (raising if it emitted
         nothing); ``"replay"`` recomputes via a ``torch.no_grad``

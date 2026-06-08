@@ -1,26 +1,26 @@
 # FlowDPPO — KL-masked diffusion policy optimization
 
-`FlowDPPO` keeps GRPO's setup — the same SDE rollout, the same group-relative
+`DiffusionDPPO` keeps GRPO's setup — the same SDE rollout, the same group-relative
 advantage, the same per-step ratio — but **replaces PPO's uniform clipping with a
 KL-ADV mask**. It computes the exact Gaussian KL between the old and new SDE transition
 policies and zeroes an update only when it *both* diverges far from the old policy *and*
 pushes too aggressively in the reward-improving direction.
 
-- **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`_gaussian_kl_div`, `_flowdppo_kl_adv_loss`, `FlowDPPO`)
+- **Loss:** [`unirl/algorithms/dppo.py`](../unirl/algorithms/dppo.py) (`_gaussian_kl_div`, `_dppo_kl_adv_loss`, `DiffusionDPPO`)
 - **SDE / replay path:** [`unirl/models/sd3/diffusion.py`](../unirl/models/sd3/diffusion.py), [`unirl/sde/kernels.py`](../unirl/sde/kernels.py)
 - **Recipe:** [`examples/diffusion/sd3_flowdppo.yaml`](../examples/diffusion/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
-- **Paper:** *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models."*
+- **Paper:** *"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models."*
 
-FlowDPPO builds on the same GRPO-style SDE rollout, trained-step gating, and
+flowDPPO builds on the same GRPO-style SDE rollout, trained-step gating, and
 group-relative advantage, then additionally records the per-step Gaussian means.
 
-> Do not confuse this with the robotics algorithm also abbreviated DPPO. Here, FlowDPPO
+> Do not confuse this with the robotics algorithm also abbreviated DPPO. Here, flowDPPO
 > is the flow-matching image/video trust-region method in
-> [`flowdppo.py`](../unirl/algorithms/flowdppo.py): GRPO replay plus a KL-ADV mask.
+> [`dppo.py`](../unirl/algorithms/dppo.py): GRPO replay plus a KL-ADV mask.
 
 ## What problem it solves
 
-GRPO-style diffusion RL clips the sampled ratio `ρ`. The FlowDPPO paper argues
+GRPO-style diffusion RL clips the sampled ratio `ρ`. The Flow-DPPO paper argues
 that for continuous latent Gaussian policies this ratio is a *noisy single-sample*
 proxy for the true policy divergence, so a fixed ratio window over-constrains some
 steps and under-constrains others. Flow models offer something better: each SDE step
@@ -28,7 +28,7 @@ is an **equal-covariance Gaussian** transition, so the old/new KL is a cheap clo
 form — the squared difference of two velocity-network forward passes, no Binary/Top-k
 surrogate (the LLM-DPPO needs one; flow models do not).
 
-![FlowDPPO overview: the same GRPO-style SDE rollout — denoise a prompt to an image, score it, and form a group-relative advantage A — then replay each SDE step for the new log-prob and the new Gaussian transition means. The trust region is a two-stage KL-ADV mask: if the per-step KL on the mean shift is small the update always passes (the safe regime runs at full speed); only if the KL is large AND the move is aggressive in the reward direction ((ratio>1 and A>0) or (ratio<1 and A<0)) is the update masked to 0. The loss is mean(-A*ratio*keep_mask), the policy anchor (old log-prob and old means) is frozen across the mini-batches, and the brake is applied only to the large, over-aggressive steps rather than uniformly clipping every step like GRPO.](../assets/flowdppo_overview.png)
+![flowDPPO overview: the same GRPO-style SDE rollout — denoise a prompt to an image, score it, and form a group-relative advantage A — then replay each SDE step for the new log-prob and the new Gaussian transition means. The trust region is a two-stage KL-ADV mask: if the per-step KL on the mean shift is small the update always passes (the safe regime runs at full speed); only if the KL is large AND the move is aggressive in the reward direction ((ratio>1 and A>0) or (ratio<1 and A<0)) is the update masked to 0. The loss is mean(-A*ratio*keep_mask), the policy anchor (old log-prob and old means) is frozen across the mini-batches, and the brake is applied only to the large, over-aggressive steps rather than uniformly clipping every step like GRPO.](../assets/flowdppo_overview.png)
 
 ## The math
 
@@ -54,7 +54,7 @@ $$ \text{drop} = (\mathrm{kl\_score} \ge \tau)\ \wedge\ \big[(\rho>1 \wedge A>0)
 
 $$ \mathcal{L} = \mathbb{E}_{i,k}\big[\, \ell_{i,k}\cdot\mathbb{1}[\neg\,\text{drop}]\,\big] $$
 
-The code in `_flowdppo_kl_adv_loss` follows this directly:
+The code in `_dppo_kl_adv_loss` follows this directly:
 
 ```python
 ratio = torch.exp(new_logp - old_logp)
@@ -80,10 +80,10 @@ policy. Like the GRPO-style diffusion recipes, the recipe sets
 | New transition log-prob | `stage.replay(...).log_probs` → `new_logp` |
 | Old Gaussian mean `µ_old` | `segment.sde_means`, populated by `prepare_segment` |
 | New Gaussian mean `µ_θ` | `stage.replay(...).prev_sample_means` → `new_means` |
-| Gaussian scale `σ_t` | `FlowDPPO._compute_sigma_t` (from `segment.sigmas`, `dt`, `params.eta`) |
+| Gaussian scale `σ_t` | `DiffusionDPPO._compute_sigma_t` (from `segment.sigmas`, `dt`, `params.eta`) |
 | KL threshold `τ` (paper `δ`) | `algorithm.kl_mask_threshold` |
 | Advantage `A_i` | `track.advantages`, broadcast to `[B, S]` |
-| Masked objective | `_flowdppo_kl_adv_loss` |
+| Masked objective | `_dppo_kl_adv_loss` |
 
 ## From rollout to update
 
@@ -94,7 +94,7 @@ The rollout follows the same GRPO-style SDE path, plus the per-step Gaussian mea
 2. `RewardService` scores the decoded images, then
    `RolloutTrack.compute_advantages(normalize=True, use_global_std=True)` writes
    prompt-centered, batch-std advantages.
-3. `TrainStack.train_track` calls `FlowDPPO.prepare_segment` once: a `no_grad`
+3. `TrainStack.train_track` calls `DiffusionDPPO.prepare_segment` once: a `no_grad`
    replay at pre-update weights that keeps `sde_logp` if present, fills it if missing,
    and **always** writes `segment.sde_means`.
 4. Each micro-batch calls `compute_loss_and_backward`: replay at current weights for
@@ -142,7 +142,7 @@ mean-difference / 2. The canonical recipe keeps it `true`.
 | No trained steps | `segment.sde_indices`, `num_sde_steps`, `sampling.eta` |
 
 Metric source: `masked_fraction`, `kl_mask_fraction`, `kl_new_old_mean/max`, and the
-`ratio_*` values are all emitted by `_flowdppo_kl_adv_loss`.
+`ratio_*` values are all emitted by `_dppo_kl_adv_loss`.
 
 ## Run it
 
@@ -151,7 +151,7 @@ PRETRAINED_MODEL=stabilityai/stable-diffusion-3.5-medium \
 python -m unirl.train_diffusion --config-name=diffusion/sd3_flowdppo num_devices=8
 ```
 
-![FlowDPPO training curve: rollout/reward_mean for SD3.5-medium rises from ~0.75 to ~0.89 over ~270 rollout steps.](../assets/flowdppo_wandb.png)
+![flowDPPO training curve: rollout/reward_mean for SD3.5-medium rises from ~0.75 to ~0.89 over ~270 rollout steps.](../assets/flowdppo_wandb.png)
 
 A healthy run climbs `rollout/reward_mean` quickly and then keeps inching up — here
 SD3.5-medium goes from ~0.75 to ~0.89 over ~270 steps.
@@ -164,8 +164,8 @@ SD3.5-medium goes from ~0.75 to ~0.89 over ~270 steps.
 
 ## References
 
-- FlowDPPO — the exact equal-covariance Gaussian KL is its Eq. 14, the asymmetric
+- Flow-DPPO — the exact equal-covariance Gaussian KL is its Eq. 14, the asymmetric
   mask its Eq. 18.
 - DPPO (the LLM ancestor of the divergence mask): Qi et al., *"Rethinking the Trust
   Region in LLM Reinforcement Learning"* — [arXiv:2602.04879](https://arxiv.org/abs/2602.04879).
-- Flow-GRPO (the SDE rollout FlowDPPO reuses): [arXiv:2505.05470](https://arxiv.org/abs/2505.05470).
+- Flow-GRPO (the SDE rollout flowDPPO reuses): [arXiv:2505.05470](https://arxiv.org/abs/2505.05470).

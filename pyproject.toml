@@ -96,8 +96,17 @@ index-strategy = "unsafe-best-match"
 # integration unpinned; kernels >=0.15 changed LayerRepository's signature and
 # breaks transformers 5.6.0 at import time. Hold it to transformers' own
 # declared bound.
+#
+# transformers 5.6.0 accepts tokenizers<=0.23.0, but tokenizers 0.23.0(rc)
+# dropped the `cls` kwarg from RobertaProcessing.__new__, so deserializing a
+# saved CLIP tokenizer.json raises TypeError at rollout init (the SD3 text
+# encoders, e2e-confirmed on H20). The sglang install's --prerelease=allow flag
+# (see INSTALL.md) otherwise selects 0.23.0rc*; this override outranks it AND
+# guards against 0.23.0 shipping stable. tokenizers 0.22.2 verified on both
+# engine venvs.
 override-dependencies = [
   "kernels>=0.12,<0.13",
+  "tokenizers>=0.22,<0.23",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
