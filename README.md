@@ -49,7 +49,7 @@ runtime loop, deployment modes, and module map.
 |---|---|---|---|
 | **FlowDPPO** | *"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
 | **DRPO** | *"Rethinking the Divergence Regularization in LLM RL"* | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
-| **FlowBP** | *"Exploring the Design Space of Reward Backpropagation for Flow Matching"* | [FlowBP/](FlowBP/) | Unified surrogate-trajectory framework for direct reward alignment for flow/diffusion. |
+| **FlowBP** | *"Exploring the Design Space of Reward Backpropagation for Flow Matching"* | [FlowBP/](FlowBP/) | Unified surrogate-trajectory framework for direct reward alignment of flow/diffusion. |
 
 UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **DiffusionNFT**,
 **DanceGRPO**, and **MixGRPO** — in [`unirl/algorithms/`](unirl/algorithms/README.md).
