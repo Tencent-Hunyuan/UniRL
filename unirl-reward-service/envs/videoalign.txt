@@ -1,0 +1,30 @@
+# VideoAlign / VideoReward scorer — Qwen2-VL-2B + LoRA reward head.
+#
+# Upstream: https://github.com/KwaiVGI/VideoAlign
+# Vendored inference subset lives at reward_service/scorers/_videoalign/.
+#
+# CRITICAL: flash-attn must be built against the active torch ABI.  Ray's
+# runtime_env venv is created with --system-site-packages, so torch is
+# inherited from the base env, but pip's PEP 517 build isolation will
+# install a *fresh* torch into a temporary build env when no isolation
+# flag is passed.  That fresh torch wheel then mismatches the inherited
+# ABI at import time → ImportError on flash_attn_2_cuda.
+# The pragma below is parsed by reward_service.workers.group and
+# forwarded to Ray as `pip_install_options`.
+#
+# pip-options: --no-build-isolation
+#
+# transformers / peft / trl / accelerate / decord versions match the
+# upstream environment.yaml.  liger-kernel and bitsandbytes are
+# training-only and intentionally omitted from the inference venv.
+transformers==4.45.2
+peft==0.10.0
+trl==0.8.6
+accelerate==0.34.0
+decord==0.6.0
+opencv-python-headless
+safetensors
+huggingface_hub
+einops
+flash-attn==2.5.8
+setuptools<70

@@ -1,0 +1,6 @@
+# Qwen3.5 VLM scorer — vLLM-based (MoE architecture)
+# Requires vLLM with Qwen3.5 MoE support (qwen3_5_moe model type).
+# vLLM added Qwen3 support in 0.8+; Qwen3.5 MoE
+# (Qwen3_5MoeForConditionalGeneration) needs the versions pinned below.
+vllm==0.20.0
+transformers==4.57.1

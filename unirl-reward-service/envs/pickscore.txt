@@ -1,0 +1,2 @@
+# PickScore scorer — same as CLIP (uses CLIPModel + CLIPProcessor)
+transformers>=4.55.2,<4.58

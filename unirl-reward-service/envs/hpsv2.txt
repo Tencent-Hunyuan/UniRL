@@ -1,0 +1,18 @@
+# HPSv2 scorer — requires transformers 4.45.2
+# NOTE: Fallback checkpoint download uses huggingface_hub (see hpsv2_scorer.py line 102)
+#
+# IMPORTANT: Must install hpsv2 from GitHub, NOT PyPI.
+# The PyPI wheel (1.2.0) has a packaging bug — it omits the BPE vocab
+# file (bpe_simple_vocab_16e6.txt.gz) required by the tokenizer at import
+# time. The GitHub source distribution includes it correctly.
+#
+# setuptools<70: openai-clip uses `from pkg_resources import packaging` which
+# was removed in setuptools 70+.
+transformers==4.45.2
+hpsv2 @ git+https://github.com/tgxs002/HPSv2.git
+ftfy
+braceexpand
+timm
+openai-clip
+huggingface_hub
+setuptools<70

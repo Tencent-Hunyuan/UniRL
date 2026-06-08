@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unirl-reward-service"
+version = "0.1.0"
+description = "Unified reward inference service: FastAPI gateway + Ray worker groups for T2I reward models."
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+
+# Minimal deps: what `reward_service.client` needs to talk to a running
+# service. Callers on a training / eval box only install this set by
+# default — no torch / ray / transformers get pulled in.
+dependencies = [
+    "requests>=2.31",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# Server-side install for the host that actually runs the scorers.
+# Use: pip install -e ".[server,dev]"
+#
+# Per-scorer dependencies (transformers, vllm, hpsv2, etc.) are NOT listed
+# here — they live in envs/*.txt and are pip-installed by Ray runtime_env
+# into isolated virtualenvs per actor. This avoids the transformers version
+# conflict between vllm (>=4.55.2) and legacy scorers (==4.45.2).
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    "ray>=2.10",
+    "virtualenv>=20.0",
+    "huggingface_hub>=0.30,<0.35",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "einops>=0.8",
+    "tqdm>=4.66",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+unirl-reward-service = "reward_service.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["reward_service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA GPU to run",
+    "slow: takes more than a few seconds; skipped in quick CI",
+    "integration: requires Ray + network; verifies venv install end-to-end",
+]
+asyncio_mode = "auto"

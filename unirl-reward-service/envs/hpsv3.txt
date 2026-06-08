@@ -1,0 +1,16 @@
+# HPSv3 scorer — Qwen2-VL-7B backbone with HPSv3 reward head
+#
+# CRITICAL: Must use HPSv3 from the `upgrade_transformers_version` branch
+# (commit ad33a29d). The PyPI 1.0.0 wheel is incompatible with transformers>=4.50.
+# See hpsv3_scorer.py lines 16-18 for details.
+#
+transformers>=4.55.2,<4.58
+git+https://github.com/MizzenAI/HPSv3.git@ad33a29d5896fe46ae74f9865444d6adbadbc750
+peft
+timm
+diffusers
+omegaconf
+fire
+matplotlib
+opencv-python-headless
+qwen-vl-utils

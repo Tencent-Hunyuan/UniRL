@@ -1,0 +1,28 @@
+source     = ByteDance-Seed/Bagel  (https://github.com/ByteDance-Seed/Bagel)
+commit     = a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f
+short      = a2fa77d
+commit_msg = Merge pull request #299 from Purshow/fix-wise-eval
+commit_date= 2026-05-05 01:01:02 +0800
+vendored   = 2026-06-06  (into unirl/models/bagel/vendor/)
+target     = UniRL-main (haonan3/UniRL main @ e799ff29)
+
+Migration: docs/BAGEL_MIGRATION_PLAN.md  (replace flow_grpo-vendored fork with
+pristine official modeling + external rl_ops.py).
+
+Mechanical changes (see vendor/__init__.py):
+  - import-root rewrite modeling./data./inferencer -> unirl.models.bagel.vendor.*
+  - added modeling/cache_utils/__init__.py
+  - data/ subset only (data_utils.py + transforms.py + __init__.py)
+Plus ONE grad-safety edit (NOT pristine): modeling/bagel/qwen2_navit.py
+  PackedAttention gen-mode output writes into a fresh torch.zeros_like tensor
+  instead of inplace-indexing the flash_attn view (autograd forbids inplace on a
+  custom-Function view during RL replay backprop). Math unchanged. Marked inline.
+
+To re-vendor a newer upstream:
+  1. git -C Bagel fetch && git -C Bagel checkout <new_commit>
+  2. recopy modeling/ + inferencer.py + data/{data_utils,transforms,__init__}.py
+  3. re-apply the 9 import-root rewrites + cache_utils/__init__.py
+  4. re-apply the qwen2_navit PackedAttention gen-mode grad-safety edit
+  5. bump this file; re-run the Phase 2 ratio==1 test AND a replay-backward/training
+     smoke before trusting (the ratio test alone runs under no_grad and won't catch
+     grad-only issues like the inplace-on-view above).

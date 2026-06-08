@@ -1,0 +1,4 @@
+# UnifiedReward scorer — vLLM-based
+# vllm 0.11.0 is incompatible with transformers 5.x (removed attributes).
+vllm==0.11.0
+transformers==4.57.0

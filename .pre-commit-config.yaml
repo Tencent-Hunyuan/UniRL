@@ -1,0 +1,38 @@
+default_stages: [pre-commit, pre-push, manual]
+
+# Vendored sub-trees excluded from this repo's hooks (own tooling and/or upstream code
+# that must stay byte-pristine so it can be re-vendored cleanly):
+#   - unirl-reward-service/ : vendored standalone sub-project (own pyproject + lint/test
+#     tooling); its upstream model code carries semantically-meaningful trailing
+#     whitespace (VideoAlign prompt templates) the whitespace/format hooks must not rewrite.
+#   - unirl/models/bagel/vendor/ : pristine official ByteDance-Seed/Bagel modeling
+#     (see VENDOR_COMMIT.txt); kept byte-identical to upstream, so the whitespace/format
+#     hooks must not rewrite it either.
+exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=2500']
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: debug-statements
+      - id: requirements-txt-fixer
+      - id: no-commit-to-branch
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format

@@ -1,0 +1,166 @@
+# @package _global_
+# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer), 4 nodes x 8 GPUs.
+#
+# Trainside (in-process) colocate: the training Qwen-VL pipeline IS the sampler,
+# so no rollout actors and no weight sync (the `sync` block is absent — trainside
+# shares the module).
+#
+# Scale: num_devices=32 → DevicePool auto-splits into 4 STRICT_PACK groups of
+# 8 (devices_per_node defaults to 8 in BaseTrainer), i.e. 4x8. Ray must already
+# span the 4 nodes (the multinode launcher brings the cluster up first).
+#
+# Data prep (one-time) — build the local Geometry3K-MC jsonl + images from the
+# public xyliu6/geometry3k dataset (no private cache needed):
+#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#   → data/geo3k_mc/{train.jsonl, val.jsonl} (+ images/)
+#
+# Launch (per node, SPMD; rank 0 owns the driver). The model defaults to the HF id
+# `Qwen/Qwen2.5-VL-7B-Instruct`; set QWEN_VL_PATH to a local dir to use a cache.
+# DATA_PATH is required (local jsonl):
+#   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen_vl_argrpo_geo3k_mc_4x8
+#
+# NOTE: ARTrainer runs a minimal rollout→reward→advantage→step loop — no eval,
+# no checkpoint, no num_updates_per_batch. Per-rollout loss/reward go to
+# logger.info (and wandb if the logging block below is set).
+
+num_devices: 32
+batch_size: 32 # prompts_per_rollout (MultimodalRLDataSource reads the actual
+# count from data_source.args.algorithm.prompts_per_rollout below).
+
+num_rollouts: 10000
+weight_sync_interval: 1 # ignored trainside (no `sync` block)
+
+# Run with `python -m unirl.train_ar` (ARTrainer).
+#
+# Advantage normalization scope (read by train_ar -> ARTrainer). "global":
+# adv = (r - mean_all)/(std_all+eps) over the whole 512-sample batch. The default
+# "group" is textbook GRPO (per-prompt mean/std; all-correct/all-wrong groups
+# get zero advantage).
+adv_normalization_scope: global
+
+# Online wandb reporting (driver/rank-0 only). Absent this block wandb is a
+# no-op. Per-rollout: rollout/reward_mean + train/{loss,grad_norm,lr,ratio_*,
+# clip_fraction,approx_kl} + perf/rollout_time_s. WANDB_API_KEY from launcher env.
+logging:
+  report_to_wandb: true
+  project_name: unirl-flowgrpo-newstac
+  run_name: qwen_vl_argrpo_geo3k_mc_bz4_10k_vlmtrainer
+  entity: null
+  tags: [argrpo, qwen-vl, geo3k-mc, 4x8]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    model_precision: bf16
+    autocast_precision: bf16
+    logprob_precision: fp32
+    freeze_vision_tower: true # train the LLM only; ViT frozen
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+
+pipeline:
+  # from_bundle wires chat-template + AR stages around the trainer-injected
+  # bundle (remote_hydra(pipeline_cfg, bundle=self.bundle)); from_config would
+  # instead load a second copy of the 7B model.
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+  # Dynamic per-batch padding (default). Cross-worker rollout shards no longer
+  # need a fixed length: TensorMeta is split by refs (each worker hydrates only
+  # its own shard) and forward_batch_size=1 generates each prompt unpadded.
+  # Fixed-length right-pad (pad_to_max_length) makes the model decode from after
+  # the pad run -> garbage generations, so it stays off.
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # Qwen2.5-VL language-model decoder block (HF Qwen2_5_VLDecoderLayer). The
+  # frozen vision tower's blocks are a different class and are not wrapped here.
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false # bundle already enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # No lora_cfg → FULL fine-tuning of the trainable_attr (transformer = the LLM
+  # decoder), vision tower frozen by the bundle. Full-FT at bz4/4x8 fits in
+  # optimizer/grad memory at micro_batch_size=4 (LoRA rank-16 is far lower
+  # capacity and kept reward flat).
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  # Multimodal AR forward is heavy; chunk generate one prompt-group at a time.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
+  clip_range: 1.0e-2 # AR/LLM trust region — match the lora/sglang siblings (diffusion uses 1e-4)
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+  # replay rescales logits by this temperature to match the rollout sampling
+  # distribution; MUST equal sampling.temperature (0.7) below.
+  sampling_temperature: 0.7
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  # Per-worker shard is 512/32 = 16 samples. Slice it into micro-batches of 4:
+  # replay() materializes out.logits [mb, full_seq_len, vocab=152064] in bf16
+  # and keeps it in the autograd graph, so a 16-sample micro-batch at long
+  # generations (~3k tokens) spikes ~15GB on the logits tensor alone and OOMs a
+  # 95GB card. 4 keeps that peak ~4x lower; grads
+  # accumulate across slices so it is equivalent, just more (tiny) backward
+  # iterations per worker.
+  micro_batch_size: 4
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 32 # 32 prompts x 16 samples = 512 sequences / rollout
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16 # GRPO group size per prompt
+  # Truncated sampling (top_p/top_k) keeps generations from getting too noisy
+  # (untruncated 1.0/1.0 depressed reward). NOTE: temperature MUST equal
+  # algorithm.sampling_temperature above so replay log-softmax matches the
+  # sampling distribution.
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 1024
+  max_new_tokens: 512

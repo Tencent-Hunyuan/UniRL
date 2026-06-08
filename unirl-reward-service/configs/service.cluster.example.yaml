@@ -1,0 +1,194 @@
+# Multi-host configuration for the reward service.
+#
+# Target deployment: 2 nodes × 8 GPU (symmetric) = 16 GPU total budget.
+# Use this file after scripts/cluster_up.sh has brought a Ray cluster up
+# across both hosts.
+#
+# Key differences vs configs/service.example.yaml:
+#   - cluster.ray_address tells WorkerPool to join the running Ray cluster
+#     instead of starting a local runtime.
+#   - Lightweight 1-GPU rewards run num_replicas=2 with scheduling: spread
+#     so Ray is hinted to split replicas across the two nodes (load balance
+#     + failure isolation).
+#   - GenEval2 (vLLM TP=2) stays scheduling: pack so its two GPUs land on
+#     one node — cross-node TP over Ethernet kills throughput.
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 120.0
+
+cluster:
+  # "auto" connects to a Ray cluster already running on this host. For a
+  # remote head node use "<head-ip>:6379" (printed by scripts/cluster_up.sh)
+  # or the Ray Client URI "ray://<head-ip>:10001".
+  ray_address: auto
+  # Optional: lets several reward services share one cluster without
+  # colliding on named actors. Leave unset for a single service.
+  # namespace: reward-service-prod
+
+rewards:
+  # ─────────────── vLLM-based scorers (schedule first) ───────────────
+  # Multi-GPU actors go first so they grab contiguous GPU slots before
+  # the 1-GPU spread actors fragment the cluster.  TP=2 actors need both
+  # GPUs on the same node — pack keeps that guarantee, spread on
+  # unified_reward is OK because each replica independently needs 2 GPU
+  # and Ray won't split a single actor across nodes.
+
+  - name: geneval2
+    scorer: geneval2
+    runtime_env: envs/geneval2.txt
+    num_replicas: 1
+    num_gpus: 2
+    num_cpus: 4
+    scheduling: pack      # keep TP=2 within one node
+    params:
+      model_name: Qwen/Qwen3-VL-8B-Instruct
+      weights_path: /path/to/RewardModel/Qwen3-VL-8B-Instruct
+      dataset_path: /path/to/datasets/geneval2
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.85
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: false
+      swap_space: 4
+      max_num_seqs: 256
+      seed: null
+      quantization: null
+      trust_remote_code: true
+      limit_mm_per_prompt: {image: 1}
+      extra_llm_kwargs: {}
+
+  - name: unified_reward
+    scorer: unified_reward
+    runtime_env: envs/unified_reward.txt
+    num_replicas: 2
+    num_gpus: 2
+    num_cpus: 4
+    scheduling: spread
+    params:
+      model_name: CodeGoat24/UnifiedReward-qwen-7b
+      weights_path: /path/to/RewardModel/UnifiedReward-qwen-7b
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.85
+      max_model_len: 8192
+      dtype: bfloat16
+      enforce_eager: false
+      swap_space: 4
+      max_num_seqs: 256
+      seed: null
+      quantization: null
+      trust_remote_code: true
+      limit_mm_per_prompt: {image: 1}
+      extra_llm_kwargs: {}
+
+  # ─────────────── transformers-based scorers (1 GPU each) ───────────────
+  # num_replicas=2 + scheduling=spread: Ray is hinted to distribute the
+  # two replicas across the two nodes for load balancing + fault isolation.
+
+  - name: clip
+    scorer: clip
+    runtime_env: envs/clip.txt
+    num_replicas: 2
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    scheduling: spread
+    params:
+      model_name: openai/clip-vit-large-patch14
+      weights_path: /path/to/RewardModel/CLIP-ViT-L-14
+      dtype: float32
+
+  - name: pickscore
+    scorer: pickscore
+    runtime_env: envs/pickscore.txt
+    num_replicas: 2
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    scheduling: spread
+    params:
+      model_name: yuvalkirstain/PickScore_v1
+      weights_path: /path/to/RewardModel/PickScore_v1
+      dtype: float32
+
+  - name: imagereward
+    scorer: imagereward
+    runtime_env: envs/imagereward.txt
+    num_replicas: 2
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    scheduling: spread
+    params:
+      model_name: ImageReward-v1.0
+      weights_path: /path/to/RewardModel/ImageReward
+      dtype: float32
+
+  - name: hpsv2
+    scorer: hpsv2
+    runtime_env: envs/hpsv2.txt
+    num_replicas: 2
+    num_gpus: 1
+    num_cpus: 2
+    scheduling: spread
+    params:
+      hps_version: "v2.1"
+      weights_path: /path/to/RewardModel/HPSv2
+
+  - name: hpsv3
+    scorer: hpsv3
+    runtime_env: envs/hpsv3.txt
+    num_replicas: 2
+    num_gpus: 1
+    num_cpus: 4
+    scheduling: spread
+    params:
+      weights_path: /path/to/RewardModel/HPSv3
+      config_path: null
+      max_batch_size: 4
+
+# Budget check (must not exceed total cluster GPUs = 2 × 8 = 16):
+#   geneval2:        1 replica  × 2 GPU =  2
+#   unified_reward:  2 replicas × 2 GPU =  4
+#   clip/pickscore/imagereward/hpsv2/hpsv3: 5 × 2 replicas × 1 GPU = 10
+#   ───────────────────────────────────────────────────────────────────
+#   total                                                          = 16 GPU
+#
+# Scheduling order matters: multi-GPU actors are listed first so they
+# grab contiguous slots before spread 1-GPU actors fragment the cluster.
+
+# ─────────────── Qwen3.5 VLM reward — DEDICATED 16×GPU DEPLOYMENT ───────────────
+# Qwen3.5-35B-A3B MoE (~70GB bf16) as a generic VLM reward (WISE-style 3-metric
+# rubric: Consistency / Realism / Aesthetic Quality). Each replica fills 73% of
+# one 96GB GPU → only ~11GB KV cache, so max_concurrency MUST be 1 (concurrent
+# requests OOM the KV cache). 16 replicas (8 per node, scheduling: spread)
+# saturate the cluster; excess requests queue at the Ray level.
+#
+# Mutually exclusive with the rewards above: this single reward consumes the
+# whole 16-GPU cluster. Bump server.score_timeout_s to ~600s — first-request
+# cold start is slow on a 70GB model. Uncomment, then comment out everything
+# else.
+#
+# - name: wise
+#   scorer: wise
+#   runtime_env: envs/wise.txt
+#   num_replicas: 16
+#   num_gpus: 1
+#   num_cpus: 4
+#   max_concurrency: 1
+#   scheduling: spread          # split replicas across the two nodes
+#   params:
+#     model_name: Qwen/Qwen3.5-35B-A3B
+#     weights_path: null
+#     tensor_parallel_size: 1
+#     gpu_memory_utilization: 0.85
+#     max_model_len: 8192
+#     max_tokens: 4096
+#     dtype: bfloat16
+#     enforce_eager: false
+#     swap_space: 4
+#     max_num_seqs: 16
+#     trust_remote_code: true
+#     limit_mm_per_prompt: {image: 1}
+#     enable_thinking: false

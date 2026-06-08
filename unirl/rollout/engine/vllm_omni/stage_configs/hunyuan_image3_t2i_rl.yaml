@@ -1,0 +1,126 @@
+# RL-aware copy of upstream hunyuan_image3_moe.yaml.
+# Diff vs upstream:
+#   - Stage 1 engine_args.custom_pipeline_args injected to install our
+#     RLHunyuanImage3Pipeline subclass (scheduler swap + trajectory drain
+#     for SDE-mode rollouts).
+# Stage 0 (AR) is unchanged: upstream already ships final_output: true,
+# which surfaces the AR text + per-token logp our ar_capture.py reads.
+#
+# Verified on 8x L40S-48G GPU (4 for AR + 4 for DiT) per upstream docs.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: AR
+      max_num_seqs: 1
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      # Side-effect import: ``HI3ARWeightSyncExtension`` subclasses
+      # ``HI3ARWorkerExtension`` (in ``compat/tokenizer``), so resolving
+      # the qualname imports that module and triggers ``install()`` —
+      # patching ``convert_tokens_to_ids`` -> 0-on-None for the Base
+      # HunyuanImage-3 ckpt (its tokenizer is missing ``<img_ratio_33+>``;
+      # vllm-omni's HI3 model does ratio_36 + 1 unconditionally and would
+      # otherwise TypeError). No-op on Instruct since the lookup returns
+      # a real id there. Composing the weight-sync mixin on top adds
+      # ``update_weights_from_ipc`` (bucketed CUDA-IPC) without losing
+      # the tokenizer fix.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.ar_extension.HI3ARWeightSyncExtension
+      # unirl-specific: enable LoRA on the AR stage so
+      # ``set_lora_from_tensors`` can install in-memory adapters via
+      # ``add_lora`` (the LoRA tensor-bag transport). Defaults from
+      # ``vllm.config.lora.LoRAConfig`` (max_loras=1, max_lora_rank=16)
+      # are sufficient for our single-adapter trainer-side LoRA flow.
+      enable_lora: true
+      gpu_memory_utilization: 0.9
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      # When running inside a Ray actor (e.g. RolloutActor), vllm's auto-
+      # detection picks the ray executor backend, but the StageEngineCoreProc
+      # subprocess loses the placement-group handle (KeyError: 'bundles').
+      # Force mp executor so each stage spawns workers via multiprocessing,
+      # matching the legacy in-process smoke and the DiT stage below.
+      distributed_executor_backend: "mp"
+      hf_overrides:
+        rope_parameters:
+          mrope_section: [0, 32, 32]
+          rope_type: default
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_stage: diffusion
+      enforce_eager: true
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      omni_kv_config:
+        need_recv_cache: true
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 4
+        enable_expert_parallel: false
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+      # unirl-specific: install RLHunyuanImage3Pipeline so SDE-mode
+      # rollouts get a swappable scheduler + per-step trajectory capture.
+      custom_pipeline_args:
+        pipeline_class: unirl.rollout.engine.vllm_omni.hi3.pipeline.RLHunyuanImage3Pipeline
+      # unirl-specific: install the weight-sync extension so the DiT
+      # worker exposes ``update_weights_from_ipc`` (bucketed CUDA-IPC) and
+      # later ``init_weight_transfer_engine`` / ``update_weights`` (NCCL).
+      # Must coexist with the custom pipeline above; vllm-omni's worker
+      # composes these via multiple inheritance at instantiation time.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.dit_extension.DiTWeightSyncExtension
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: image
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

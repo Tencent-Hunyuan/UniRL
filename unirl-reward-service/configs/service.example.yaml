@@ -1,0 +1,284 @@
+# Configuration for the reward service.
+#
+# Every reward (except geneval, see bottom) is enabled by default and points
+# at the locally-staged weights under
+# /path/to/RewardModel/. Each reward group
+# owns its GPUs exclusively (resource isolation); total GPU budget =
+# sum of (num_gpus * num_replicas). With the defaults below:
+#   CLIP / PickScore / ImageReward / HPSv2 / HPSv3 / UnifiedReward → 1 GPU each (6)
+#   ocr (GOT-OCR-2.0) → 1 GPU
+#   GenEval2 (Qwen3-VL-8B, TP=2) → 2 GPUs
+# = 9 GPUs; drop entries or fractionally share GPUs to fit your card count.
+#
+# geneval is commented out at the bottom: its mmdet/mmcv stack needs
+# Python 3.10 and cannot run under this service's Python-3.13 Ray cluster
+# via runtime_env (see envs/geneval.txt for the full rationale).
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  # Per-reward deadline inside /score. A reward exceeding this is
+  # reported as an error for that request but does not block other
+  # rewards in the same batch. Raise for cold-start latency on vLLM /
+  # hpsv3 the first request after startup.
+  score_timeout_s: 120.0
+
+rewards:
+  # ─────────────── transformers-based scorers ───────────────
+  #
+  # max_concurrency: how many in-flight score() calls one actor serves
+  # in parallel. Safe to raise on transformer forward-only scorers (GIL
+  # is released during CUDA kernels); keep at 1 for vLLM scorers whose
+  # own batcher already overlaps requests.
+
+  - name: clip
+    scorer: clip
+    runtime_env: envs/clip.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    params:
+      model_name: openai/clip-vit-large-patch14
+      weights_path: /path/to/RewardModel/CLIP-ViT-L-14
+      dtype: float32
+
+  - name: pickscore
+    scorer: pickscore
+    runtime_env: envs/pickscore.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    params:
+      model_name: yuvalkirstain/PickScore_v1
+      weights_path: /path/to/RewardModel/PickScore_v1
+      dtype: float32
+
+  # Local dir contains ImageReward.pt + med_config.json; the scorer
+  # auto-resolves both when `weights_path` is a directory.
+  - name: imagereward
+    scorer: imagereward
+    runtime_env: envs/imagereward.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 4
+    params:
+      model_name: ImageReward-v1.0
+      weights_path: /path/to/RewardModel/ImageReward
+      dtype: float32
+
+  # HPSv2: the scorer picks HPS_v2.1_compressed.pt from weights_path
+  # (or HPS_v2_compressed.pt for v2.0). The ViT-H-14 backbone still
+  # comes from HuggingFace cache the first time — set HF_HOME to the
+  # RewardModel directory or pre-populate the cache if you want fully
+  # offline startup. A local copy lives at
+  # RewardModel/HPSv2-CLIP-ViT-H-14/ if you need to bootstrap the cache.
+  - name: hpsv2
+    scorer: hpsv2
+    runtime_env: envs/hpsv2.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 2
+    params:
+      hps_version: "v2.1"
+      weights_path: /path/to/RewardModel/HPSv2
+
+  - name: hpsv3
+    scorer: hpsv3
+    runtime_env: envs/hpsv3.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    params:
+      # Directory containing HPSv3.safetensors; scorer auto-resolves it.
+      weights_path: /path/to/RewardModel/HPSv3
+      # Leave null to use the YAML packaged inside the hpsv3 library.
+      config_path: null
+      # Upper bound on samples per inferencer forward. Qwen2-VL-7B
+      # activation grows linearly with batch size; ~8 crashes a 95 GB
+      # H20 once the activation stack for all decoder layers is live.
+      # 4 keeps peak activation ≲ 10 GB on top of the ~50 GB weights +
+      # KV footprint. Raise only after confirming GPU headroom.
+      max_batch_size: 4
+
+  # ─────────────── vLLM-based scorers ───────────────
+  #
+  # All fields below (dtype / enforce_eager / swap_space / quantization /
+  # seed / max_num_seqs / limit_mm_per_prompt / extra_llm_kwargs) are
+  # forwarded verbatim to `vllm.LLM(...)`. The values here match the
+  # scorer's own defaults — edit in place instead of uncommenting.
+  #
+  # dtype: reads the model's `config.json` → `torch_dtype` field. For
+  # Qwen3-VL and UnifiedReward this is bfloat16. Override with an explicit
+  # value (float16 / bfloat16 / float32) if you need to force a dtype —
+  # e.g. float16 on pre-Ampere GPUs that lack bf16 support. Note that
+  # `auto` does NOT mean "pick the best dtype for my GPU".
+  # `extra_llm_kwargs` is an escape hatch for any vLLM option we have
+  # not surfaced as a first-class field yet (merged last, wins ties).
+
+  # UnifiedReward 1.0 qwen25-vl 7b (local available size); set
+  # tensor_parallel_size=1 to fit on a single card.
+  # Output sub-metrics: alignment / coherence / style (1-5).
+  - name: unified_reward
+    scorer: unified_reward
+    runtime_env: envs/unified_reward.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    params:
+      model_name: CodeGoat24/UnifiedReward-qwen-7b
+      weights_path: /path/to/RewardModel/UnifiedReward-qwen-7b
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: 8192
+      dtype: bfloat16              # auto=read model config.json; or float16/bfloat16/float32
+      enforce_eager: false         # true disables CUDA graphs (debugging)
+      swap_space: 4                # CPU swap in GiB per GPU
+      max_num_seqs: 256            # max concurrent sequences
+      seed: null                   # set an int for reproducibility
+      quantization: null           # e.g. "awq" / "gptq" if weights are quantised
+      trust_remote_code: true
+      limit_mm_per_prompt: {image: 1}
+      extra_llm_kwargs: {}         # any other vllm.LLM(...) kwarg
+
+  # GenEval2 — VQAScore via Qwen3-VL-8B-Instruct.
+  # When dataset_path is set, uses per-prompt VQA question lists from the
+  # GenEval2 JSONL dataset (Soft-TIFA scoring).  Without it, falls back to
+  # a degenerate single-question template.
+  # Deployed with tensor_parallel_size=2 because it is the largest vLLM
+  # model in this config (~17.5 GB weights + KV cache tight on a single
+  # card). This makes geneval2 own 2 GPUs; the other 6 rewards own 1
+  # GPU each → 8 GPUs total on the host.
+  # Same vLLM knobs as unified_reward above.
+  - name: geneval2
+    scorer: geneval2
+    runtime_env: envs/geneval2.txt
+    num_replicas: 1
+    num_gpus: 2
+    num_cpus: 4
+    params:
+      model_name: Qwen/Qwen3-VL-8B-Instruct
+      weights_path: /path/to/RewardModel/Qwen3-VL-8B-Instruct
+      dataset_path: /path/to/datasets/geneval2
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.85
+      max_model_len: 4096
+      dtype: bfloat16
+      enforce_eager: false
+      swap_space: 4
+      max_num_seqs: 256
+      seed: null
+      quantization: null
+      trust_remote_code: true
+      limit_mm_per_prompt: {image: 1}
+      extra_llm_kwargs: {}
+
+  # ─────────────── OCR scorer ───────────────
+  # GOT-OCR-2.0-hf reads text rendered in the image; reward = edit-distance
+  # similarity to the target text (the quoted span in the prompt). Pure
+  # transformers stack (no torch pin) → rides the shared base env (overlay).
+  # Autoregressive generation, so keep max_concurrency at 1.
+  - name: ocr
+    scorer: ocr
+    runtime_env: envs/ocr.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 2
+    max_concurrency: 1
+    params:
+      model_name_or_path: stepfun-ai/GOT-OCR-2.0-hf
+      # Set to a local GOT-OCR-2.0-hf directory for offline startup; null
+      # lets transformers auto-download from the HF hub.
+      weights_path: null
+      max_new_tokens: 4096
+      dtype: bfloat16
+      device: cuda
+
+  # ─────────────── GenEval (compositional) — DISABLED ───────────────
+  # Classic GenEval: Mask2Former (mmdet) object detection + CLIP color
+  # classification, scoring object count / color / position constraints
+  # carried in ScoreItem.metadata. Distinct from geneval2 (VQAScore).
+  #
+  # DISABLED: needs Python 3.10 (mmdet/mmcv stack); cannot run under this
+  # py3.13 Ray cluster via runtime_env. Full rationale + fixes: envs/geneval.txt.
+  #
+  # - name: geneval
+  #   scorer: geneval
+  #   runtime_env: envs/geneval.txt
+  #   num_replicas: 1
+  #   num_gpus: 1
+  #   num_cpus: 2
+  #   max_concurrency: 1
+  #   params:
+  #     mmdet_config: /path/to/mask2former_config.py
+  #     mmdet_checkpoint: /path/to/mask2former.pth
+  #     clip_arch: ViT-L-14
+  #     clip_pretrained: openai
+  #     score_type: score          # "strict" | "score" | "reward"
+  #     threshold: 0.3
+  #     counting_threshold: 0.9
+  #     max_objects: 16
+  #     nms_threshold: 1.0
+  #     position_threshold: 0.1
+  #     device: cuda
+
+  # ─────────────── VideoAlign (T2V reward) — needs video input ───────────────
+  # VideoReward (VLM-based) scores generated VIDEOS along Visual Quality (VQ),
+  # Motion Quality (MQ), Text Alignment (TA), + Overall. Unlike the T2I rewards
+  # above, a request must carry a video (video_b64 or video_path) on its last
+  # turn. Runs on this py3.13 cluster via the overlay env envs/videoalign.txt
+  # (transformers 4.45.2 + flash-attn). Commented out because this example is a
+  # T2I service; uncomment to serve video rewards (its own GPU).
+  #
+  # - name: videoalign
+  #   scorer: videoalign
+  #   runtime_env: envs/videoalign.txt
+  #   num_replicas: 1
+  #   num_gpus: 1
+  #   num_cpus: 4
+  #   max_concurrency: 1
+  #   params:
+  #     weights_path: /path/to/RewardModel/VideoReward
+  #     checkpoint_step: -1         # -1/null = latest checkpoint-<n>
+  #     dtype: bfloat16
+  #     use_norm: true
+  #     disable_flash_attn2: false  # true => sdpa, if flash-attn ABI mismatches
+  #     fps: null                   # override training fps (mutually exclusive with num_frames)
+  #     num_frames: null
+  #     max_pixels: null
+
+  # ─────────────── Qwen3.5 VLM reward — DEDICATED 8×GPU DEPLOYMENT ───────────────
+  # Qwen3.5-35B-A3B MoE (~70GB bf16) as a generic VLM reward (WISE-style 3-metric
+  # rubric: Consistency / Realism / Aesthetic Quality). Each replica fills 73% of
+  # one 96GB GPU → only ~11GB KV cache, so max_concurrency MUST be 1 (concurrent
+  # requests OOM the KV cache). 8 replicas serve 8 requests in parallel; the rest
+  # queue at the Ray level.
+  #
+  # Mutually exclusive with the rewards above on an 8-GPU host: this single reward
+  # consumes the entire box. Bump server.score_timeout_s to ~600s — first-request
+  # cold start is slow on a 70GB model. Uncomment, then comment out everything
+  # else.
+  #
+  # - name: wise
+  #   scorer: wise
+  #   runtime_env: envs/wise.txt
+  #   num_replicas: 8
+  #   num_gpus: 1
+  #   num_cpus: 4
+  #   max_concurrency: 1
+  #   params:
+  #     model_name: Qwen/Qwen3.5-35B-A3B
+  #     weights_path: null
+  #     tensor_parallel_size: 1
+  #     gpu_memory_utilization: 0.85
+  #     max_model_len: 8192
+  #     max_tokens: 4096
+  #     dtype: bfloat16
+  #     enforce_eager: false
+  #     swap_space: 4
+  #     max_num_seqs: 16
+  #     trust_remote_code: true
+  #     limit_mm_per_prompt: {image: 1}
+  #     enable_thinking: false

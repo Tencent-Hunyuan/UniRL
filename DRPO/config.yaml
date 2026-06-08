@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# drpo — annotated config EXTRACT (for reading, not launching).
+#
+# Lifted from the full runnable recipe:
+#     examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml
+# Build the data once (unirl/utils/prepare_dapo_math.py), then launch (see README.md):
+#     DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#     python -m unirl.train_ar --config-name=ar/qwen3_ar_drpo_4b_base_dpao_sglang num_devices=64
+#
+# Shown here: the algorithm + sampling blocks (what the loss does), the advantage
+# flag, and the SGLang rollout + LoRA-sync wiring. Omitted: bundle / pipeline /
+# backend(FSDP+LoRA) / reward / stack / data_source — model & infra, not algorithm.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Advantage normalization (top-level _global_ keys):
+adv_normalization_scope: group   # per-prompt-group mean/std (critic-free GRPO)
+normalize_adv_by_std: false      # mean-center only (reward − group_mean), NO std
+                                 #   division — drops GRPO's difficulty bias
+                                 #   (reference norm_adv_by_std_in_grpo=False).
+
+# ── The algorithm. ARDRPO implements the paper's DRPO loss (§3): the smooth,
+# advantage-weighted, token-adaptive SPO quadratic — NOT a hard tv/kl mask. ──
+algorithm:
+  _target_: unirl.algorithms.drpo.ARDRPO
+  stage_attr: ar                 # resolve the AR stage from the trainer-injected pipeline (.ar)
+  drpo_epsilon: 12.5             # ε: regularization threshold (paper §4). Loss is
+                                 #   L_t = −A_t*r_t + |A_t|*µ*(r_t − 1)² / (2*ε), the
+                                 #   token-adaptive SPO quadratic (per-token trust
+                                 #   region ε_t = ε/µ); larger ε ⇒ weaker regularization.
+  loss_agg_mode: seq-mean-token-sum-norm  # per-seq Σ(token loss) / horizon, mean over seqs
+  horizon: 8192                  # fixed length normalizer for seq-mean-token-sum-norm
+  # 1.0 — MUST equal sampling.temperature below. Replay tempers logits
+  #   (log_softmax(logits / T)) so new_logp (π) and rollout logp (µ) live on the
+  #   same distribution ⇒ ratio_mean ≈ 1 on update 1.
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+# AR sampling — no SDE scheduler (token-level, not diffusion). Group size drives
+# the critic-free GRPO advantage; temperature must match sampling_temperature above.
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8          # group size G for the per-prompt advantage (n=8 × batch=64 = 512/rollout)
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 20
+  max_new_tokens: 8192
+
+# ── SGLang rollout engine (colocate): time-shares each GPU with the FSDP train
+# shard via sleep()/wake_up(). tp_size=1 ⇒ one single-GPU engine per rank,
+# data-parallel across the ranks (mirrors the trainside engine). ──
+rollout:
+  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0             # keep == sampling.temperature / sampling_temperature
+    top_p: 0.9
+    samples_pre_expanded: true   # trainer pre-expands req by samples_per_prompt; engine emits n=1
+    system_instruction: /no_think         # keep the base model from emitting a long <think>
+    chat_template_kwargs:                  #   block before \boxed{}
+      enable_thinking: false
+    engine_kwargs:
+      mem_fraction_static: 0.6   # colocate headroom (FSDP shard shares the card)
+      attention_backend: triton  # the LoRA-pool sync rides the triton attention path
+      enable_lora: true          # serve the trained LoRA adapter (hot-loaded each sync)
+      max_lora_rank: 16
+      lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# ── Weight sync: extract the trained LoRA tensors from the FSDP model and
+# hot-load them into the SGLang server as an adapter (POST
+# /load_lora_adapter_from_tensors). This LoRA-pool path tracks the trained policy. ──
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: ""               # send HF-native key names
+  adapter_name: default
+  verify: false                  # verify path is vLLM-Omni-only
+
+# Trust region is single-update: ARDRPO reuses the rollout logp as old_logp, so
+# stack.num_updates_per_batch must stay 1 (TrainStack raises otherwise).

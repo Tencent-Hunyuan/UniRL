@@ -1,0 +1,5 @@
+# OCR scorer — GOT-OCR-2.0-hf (transformers-based vision-language model)
+# Uses transformers AutoModelForImageTextToText + Levenshtein for edit-distance scoring.
+transformers==4.57.0
+python-Levenshtein>=0.21.0
+accelerate

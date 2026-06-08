@@ -1,0 +1,184 @@
+# @package _global_
+# BAGEL-7B-MoT x PickScore x LoRA trainside GRPO — OFFICIAL-Bagel migration recipe
+# (8-GPU single node). UniRL-main port: pristine official ByteDance-Seed/Bagel modeling
+# (vendor/, two documented grad/dtype-safety edits) + external rl_ops.py (no monkeypatch).
+# See docs/BAGEL_MIGRATION_PLAN.md.
+#
+# 16 prompts/rollout, 16 samples/prompt, 2 optimizer updates/rollout, cfg=1.
+#
+# MINIMAL / v3-equivalent precision policy (the v4 strict-flow_grpo-parity knobs —
+# fp32 heads, gaussian LoRA init, adv fp64/clip/std-eps-outside, tf32, minibatch
+# shuffle — were stripped; all were measured minimal/no-op, see docs/BAGEL_REUSE_AUDIT.md
+# §Strip). The ONE load-bearing lever kept:
+#   - fp32 LoRA master (master_dtype=fp32): THE reward-collapse fix — bf16 master loses the
+#     ~1e-4 GRPO updates to rounding → reward hacks to white; fp32 master + bf16 compute is stable.
+# Everything else is bf16 (heads + transformer under autocast bf16), trajectory fp32 for
+# the diffuse↔replay ratio==1 bit-exactness. This = the known-good v3 config on the
+# central-kitchen (reuse) Bagel stack.
+#
+# Launch:  bash scripts/migration/run_reuse_smoke.sh   (offline smoke) or a long-run launcher
+# Compose: cd UniRL-main && PYTHONPATH=$PWD python -m unirl.train_diffusion \
+#            --config-name diffusion/bagel/bagel_trainside_lora --cfg job --resolve
+
+num_devices: 8
+batch_size: 16                 # prompts_per_rollout (one UniRL rollout ~ one flow_grpo epoch)
+adv_use_global_std: false      # per-group GRPO normalization (mainline default)
+num_rollouts: 10000            # intentionally large; stop manually
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: true
+  project_name: bagel-pickscore-lora
+  run_name: unirl_main_bagel_pickscore_lora_bs16_g16_cfg1_u2_v3eq_reuse
+  entity: gxhe-rl
+  tags: [bagel, pickscore, lora, trainside, cfg1, migration, official-bagel, rl_ops, reuse, v3eq, fp32master]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}   # set BAGEL_PATH to a pod-local copy for faster load
+    model_precision: bf16
+    # v3-equivalent: bf16 heads + bf16 transformer compute under autocast bf16 (no
+    # fp32-heads → vendor stays byte-pristine). fp32 LoRA master (below) is the only
+    # precision lever — it is THE reward-collapse fix.
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
+    logprob_precision: fp32
+    shift: 3.0
+    use_lora: true
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  # Shared SDE step kernel (flow-matching SDE + log-prob) — reused from UniRL, not a
+  # Bagel/flow_grpo reimplementation. diffuse + replay both call strategy.denoise.
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16                  # COMPUTE dtype (FSDP all-gather + forward/backward)
+    master_dtype: fp32                 # v3: trainable LoRA master + Adam states in fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true        # 7B base: reshard to keep resident memory low
+    activation_checkpointing: true     # 7B + 15-step replay: required
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4               # flow_grpo base default (NOT SD3's 0.0)
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # = BAGEL_MOE_GEN_LORA_TARGETS (gen experts only)
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1                # navit bs=1; one sample per generate call
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      # Env-overridable: a pod can point these at a pre-staged local /root copy (offline, fast)
+      # via PICKSCORE_{PROCESSOR,MODEL}_ID; unset -> HF hub ids (original proxy-download behavior).
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR_ID,laion/CLIP-ViT-H-14-laion2B-s32B-b79K}
+      model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
+
+algorithm:
+  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-5                   # flow_grpo clip_range_lt/gt
+  clip_schedule: constant
+  # Bagel samples and trains at bs=1 (same micro-geometry), so the rollout's
+  # stored sde_logp is a valid pi_old anchor → ratio=1 on update 1 without replay.
+  old_logp_source: native
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Bagel diffusion sampling params (one object shared by trainer expand + diffusion stage).
+sampling:
+  _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+  num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points; == old 15-point bagel schedule, 14 stepped)
+  guidance_scale: 1.0                  # cfg=1 (bagel uses cfg_text_scale below; kept consistent)
+  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
+  cfg_img_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: global
+  eta: 1.0                             # SDE noise scale (= flow_grpo noise_level); consumed by FlowSDEStrategy
+  samples_per_prompt: 16
+  height: 512
+  width: 512
+  seed: 42
+  init_same_noise: false               # per-sample x_T (NoiseRecipe r{rollout}:{sample}); diverse GRPO groups
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  # SDE steps: 2 random steps drawn from the early half [0, 7) of the 14-step schedule,
+  # resolved PER ROLLOUT via AllSDEScheduler → resolve_sde_indices (shared across the
+  # GRPO group, seeded by rollout_id). Uses UniRL's NATIVE timestep_fraction (early-half
+  # restriction) + num_sde_steps (random-k) — zero framework change. Differs from
+  # flow_grpo only in that the 2 SDE steps are SCATTERED, not a contiguous window;
+  # diffuse/replay are index-set-based (compute_trajectory_positions stores x_t
+  # before+after each SDE step independently), so non-contiguous is fully supported.
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    num_sde_steps: 2

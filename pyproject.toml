@@ -1,0 +1,160 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unirl"
+dynamic = ["version"]
+description = "Unified multimodal RL training framework"
+readme = "README.md"
+# Floor follows upstream (3.12); cap because st_attn/vsa (sglang[diffusion])
+# ship cp310-cp313 wheels only, with no sdist fallback.
+requires-python = ">=3.12,<3.14"
+license = { file = "LICENSE" }
+authors = [
+  { name = "unirl contributors" }
+]
+dependencies = [
+  # Engine-agnostic only. torch intentionally absent: it enters via exactly
+  # one engine extra below, which is what allows the per-engine CUDA stacks.
+  "numpy>=1.24,<3",
+  "ray[default]>=2.9,<2.55",  # 2.55 removed the ray.util.placement_group re-export of PlacementGroupSchedulingStrategy that unirl/distributed/utils.py imports
+  "diffusers>=0.30",
+  "hydra-core>=1.3",
+  "omegaconf>=2.3",
+  "transformers>=4.41",
+  "peft>=0.11",
+  "safetensors>=0.4",
+  "Pillow>=10",
+  "requests>=2.31",
+  "psutil>=5.9",
+  "tensordict>=0.5",
+]
+
+[project.optional-dependencies]
+# sglang pinned to the upstream release the UniRL sglang patch package
+# (unirl/rollout/engine/sglang/_patches/, LIN-365) is verified against
+# (sde/cps parity + SD3 GRPO e2e). sglang >=0.5.11 is CUDA-13-native: its
+# kernel stack (sglang-kernel, sgl-deep-gemm, cuda-python>=13) ships cu13
+# binaries only, so this extra pins the matching torch +cu130 family and the
+# nvidia-*-cu13 pip wheels supply libcudart/libnvrtc.so.13 — a pure-wheel,
+# zero-compile install. On the driver-535 fleet CUDA-13 user code runs via
+# NVIDIA's forward-compat layer: bake cuda-compat-13 into the image and point
+# LD_LIBRARY_PATH at its compat dir (verified on H20 + driver 535). The sglang
+# wheel itself is manylinux_2_34, so the image base must be glibc>=2.34
+# (upgrade pending; verified meanwhile via a 2.34-prefixed python).
+sglang = [
+  "sglang[diffusion]==0.5.12.post1 ; sys_platform == 'linux'",
+  # sglang pins a prerelease; a first-party declaration makes it "explicitly
+  # requested" under uv's default prerelease policy (scoped, not global).
+  "flash-attn-4>=4.0.0b9,<5 ; sys_platform == 'linux'",
+  # torchvision/torchaudio publish no PyPI linux wheels in this era — pin the
+  # flavor matching sglang 0.5.12.post1's torch==2.11.0 from the cu130 index
+  # (cu13-native like the rest of sglang's stack; verified on-pod under the
+  # forward-compat layer).
+  "torch==2.11.0+cu130 ; sys_platform == 'linux'",
+  "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
+  "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
+]
+# CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
+vllm = [
+  "vllm==0.20.0 ; sys_platform == 'linux'",
+  "vllm-omni==0.20.0 ; sys_platform == 'linux'",
+  "torch==2.11.0+cu129 ; sys_platform == 'linux'",
+  "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
+  "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+]
+train = [
+  "wandb>=0.16,<0.20",
+  "aiohttp>=3.9",
+  # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
+  "math-verify>=0.6",
+]
+infer = [
+  "accelerate>=0.30",
+]
+eval = [
+  "torchvision>=0.16",
+  "easyocr>=1.7",
+]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "ruff>=0.6",
+  "pre-commit>=3.6",
+]
+
+[tool.uv]
+conflicts = [
+  [{ extra = "sglang" }, { extra = "vllm" }],
+]
+# Local-version anchors only exist on the CUDA indexes; best-match lets every
+# other package take its newest from PyPI while +cuXXX outranks same-release
+# PyPI builds where it matters.
+index-strategy = "unsafe-best-match"
+# sglang 0.5.12.post1 pins transformers==5.6.0 but leaves its `kernels`
+# integration unpinned; kernels >=0.15 changed LayerRepository's signature and
+# breaks transformers 5.6.0 at import time. Hold it to transformers' own
+# declared bound.
+override-dependencies = [
+  "kernels>=0.12,<0.13",
+]
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# vllm's PyPI wheel is manylinux_2_35 and its GitHub +cu129 wheel manylinux_2_31;
+# the fleet pods are glibc 2.28, so vllm must build from sdist on-pod. Its
+# build-requires omits numpy (CMake configure fails), and the build-env torch
+# must match the runtime +cu129 flavor or the compiled kernels link CUDA 13 libs.
+# First build is slow (or export VLLM_USE_PRECOMPILED=1); uv caches it per pod.
+# (Plain-string pin instead of match-runtime: bump together with the torch
+# anchor in the vllm extra above.)
+[tool.uv.extra-build-dependencies]
+vllm = [
+  "numpy",
+  "torch==2.11.0+cu129",
+]
+
+# Non-explicit and ahead of the implicit PyPI default: participates in
+# resolution for ALL packages, including the engines' transitive torch pins.
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+
+[[tool.uv.index]]
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "unirl.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "unirl",
+  "unirl.*",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+# unirl-reward-service/ is a vendored standalone sub-project with its own pyproject and
+# lint/test tooling; it is not governed by this repo's lint (mirrors its
+# exclusion from this repo's pytest). Its vendored upstream model code carries
+# semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
+# must not be auto-stripped.
+extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["unirl"]
+
+[tool.ruff.format]
+quote-style = "double"

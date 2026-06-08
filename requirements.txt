@@ -1,0 +1,31 @@
+accelerate>=0.30
+aiohttp>=3.9
+diffusers>=0.30
+easyocr>=1.7
+hydra-core>=1.3
+# Core dependency set aligned with:
+#   pip install -e ".[train,infer,eval]"
+# Includes the pinned upstream SGLang diffusion dependency (v0.5.12.post1).
+#
+# Usage:
+#   pip install -r requirements.txt --no-build-isolation
+#   pip install -e . --no-deps --no-build-isolation
+#   pip install flash-attn==2.7.4.post1 --no-build-isolation
+#
+# Optional Geneval/OpenMMLab stack (mmcv/mmdet) is intentionally excluded.
+# Install it separately only when needed:
+#   docs/geneval_mmcv_setup.md
+numpy>=1.24,<3
+omegaconf>=2.3
+peft>=0.11
+Pillow>=10
+psutil>=5.9
+ray[default]>=2.9,<3
+requests>=2.31
+safetensors>=0.4
+sglang[diffusion]==0.5.12.post1
+tensordict>=0.5
+torch>=2.1
+torchvision>=0.16
+transformers>=4.41
+wandb>=0.16,<0.20

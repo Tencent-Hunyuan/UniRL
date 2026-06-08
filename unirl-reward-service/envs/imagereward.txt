@@ -1,0 +1,18 @@
+# ImageReward scorer — requires transformers 4.45.2 (legacy; pinned for consistency with hpsv2)
+# Note: image-reward internally uses transformers>=4.27.4, but we pin to 4.45.2
+# to avoid conflicts with vllm-based scorers (which require>=4.55.2).
+#
+# diffusers must be pinned: image-reward's ReFL.py unconditionally imports
+# diffusers at module load time. Latest diffusers (>=0.32) requires
+# Dinov2WithRegistersConfig which does not exist in transformers 4.45.2.
+#
+# setuptools<70: openai-clip uses `from pkg_resources import packaging` which
+# was removed in setuptools 70+. Pinning ensures the venv has a compatible version.
+transformers==4.45.2
+image-reward
+fairscale
+openai-clip
+timm
+diffusers==0.31.0
+huggingface_hub
+setuptools<70

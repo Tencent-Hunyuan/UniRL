@@ -1,0 +1,77 @@
+# Train Stack
+
+> **Where it fits:** the optimizer half of the *train* step —
+> rollout → reward → advantage → **train** → sync. In: a track with advantages
+> (plus the algorithm's gradients). Out: updated weights (synced back to rollout in
+> dedicated modes). Full map: [`../README.md`](../README.md).
+
+## What it is
+
+`unirl/train` is the optimizer half of the UniRL training loop. It owns the
+trainable model's parameters, optimizer, scheduler, EMA shadow, and structural
+injection (LoRA / NFT / mirror), and it sequences loss → backward → optimizer step
+for one rollout track at a time. The loss math itself belongs to the algorithms
+module; this module never computes a loss.
+
+## Why it exists
+
+The split exists because two correctness invariants live on the train side, not in
+the loss math, and both silently corrupt training if they slip. Under a partial FSDP
+wrap only the transformer blocks are `fully_shard`-wrapped, so the root params
+(embed / final norm / lm_head) are plain replicated tensors FSDP never reduces —
+`optimizer_step` must DP-average them by hand (`sync_unsharded_grads`) or the
+replicas drift apart across ranks and the grad-norm is wrong. The same partial wrap
+leaves the optimizer a mixed `Tensor` + `DTensor` param bag, which forces
+`foreach=False` or AdamW's fused kernel raises. Centralizing wrap + step here lets
+every algorithm inherit these fixes for free; the loss module legitimately knows
+nothing about DTensor sharding or DP grad-sync.
+
+## How it works
+
+- **`FSDPBackend`** (`backend/fsdp.py`) holds the FSDP2-wrapped module
+  (`bundle.<trainable_attr>`, default `transformer`), the optimizer, scheduler, and
+  EMA (when configured). Structural injection (`inject_lora` / `inject_nft` /
+  `inject_mirror`) happens once at construction, *before* `fsdp_wrap`.
+  `optimizer_step` is the single chokepoint: clip → step → schedule → EMA, and it
+  **skips the whole step on a non-finite grad norm** (stepping would scale every
+  parameter by the bad norm and poison the next rollout).
+- **`TrainStack`** (`stack.py`) takes one backend + one `StageAlgorithm` and runs
+  `train_track`: move the segment onto device → `prepare_segment` (freeze π_old
+  once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches, each a
+  micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes from
+  one source, `_optimizer_step_slices`, shared with `prepare_segment` — so when an
+  algorithm replays its anchor, it's recomputed at the *exact* geometry training
+  uses, which is what pins the on-policy PPO ratio to 1 under bf16's batch-shape
+  sensitivity.
+- **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
+  (`ar` + `image`) backward-accumulating into one shared optimizer step on one
+  shared backbone (HunyuanImage3).
+
+**Extending it:** a new structural injection mode is an `inject_<mode>` in
+`inject.py` (called before `fsdp_wrap`) plus a config in `configs.py`; a new
+optimizer or LR schedule is a branch in `factories.py` plus fields on
+`OptimizerConfig`/`LrSchedulerConfig`; a multi-update-capable algorithm sets
+`supports_multi_update = True` and declares `anchor_fields` (see
+`../algorithms/README.md`).
+
+## Gotchas
+
+- **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
+  divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
+  raises (a ragged mini-batch would silently drop samples and desync grad-accum
+  across DP ranks).
+- **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
+  and zeroes grads — a flat loss curve with a logged warning means grads went
+  non-finite.
+- **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
+  a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
+  away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
+  fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
+  ctor never warns.
+- **Advantages are not computed here** — `train` raises if
+  `resp_track.advantages is None`; the trainer must call `compute_advantages` on the
+  full shard first.
+- **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
+  says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
+  shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass
+  `block_class_names` explicitly in the recipe.

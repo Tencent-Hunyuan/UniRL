@@ -1,0 +1,2 @@
+# CLIP scorer — transformers CLIPModel + CLIPProcessor
+transformers>=4.55.2,<4.58

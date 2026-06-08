@@ -1,0 +1,26 @@
+# GenEval scorer — Mask2Former (mmdetection) + CLIP color classification
+#
+# !! ENVIRONMENT CONSTRAINT — read before deploying:
+# This stack (mmcv-full 1.7.2 / mmdet 2.28.2) only supports Python 3.8–3.10
+# and torch <= ~2.1. Two Ray runtime_env facts make it un-hostable on a
+# modern cluster:
+#   1. Ray pins every worker to the CLUSTER's Python version
+#      (ray/_private/runtime_env/conda.py appends `python={current}`), so a
+#      Python-3.10 env cannot be created on a Python-3.13 cluster.
+#   2. The pip backend always passes --system-site-packages
+#      (ray/_private/runtime_env/virtualenv_utils.py), so the venv inherits
+#      base torch and cannot drop down to torch 2.1.
+# => On a Python-3.13 / torch-2.x cluster this scorer CANNOT run via
+#    runtime_env (pip OR conda). It needs a Python-3.10 base/cluster, or to
+#    run as an out-of-cluster sidecar service proxied by a thin actor.
+#    geneval is left commented-out in configs/service.example.yaml for this
+#    reason — uncomment only on a compatible (py3.10) deployment.
+#
+# mmcv-full needs a pre-built wheel matched to (torch x CUDA); pick from
+# mmcv's index, e.g.:
+#   pip install -f https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+mmdet==2.28.2
+mmcv-full==1.7.2
+open_clip_torch>=2.20.0
+clip_benchmark>=1.4.0
+numpy<2

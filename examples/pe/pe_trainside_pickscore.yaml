@@ -1,0 +1,226 @@
+# @package _global_
+# PE (Prompt Enhancement) joint trainer — colocate trainside, v2.
+#
+# A Qwen3 AR LLM rewrites each prompt into N candidates; SD3 renders M images
+# per candidate; PickScore scores the image ("diffusion") track; the reward is
+# credit-assigned up the lineage to the AR track; ARGRPO + DiffusionGRPO train
+# jointly as two TrainStack siblings sharing one device pool. The composed
+# PEPipeline is driven as a trainside rollout (it samples the live FSDP modules)
+# so there is NO weight sync.
+#
+# Pairs with unirl/train_pe.py (PETrainer). Full baseline geometry:
+# P=8 prompts × N=4 rewrites × M=8 images = 256 diffusion / 32 ar samples per rollout.
+#
+# Confirm at smoke time (GPU-specific, can't be unit-checked):
+#   - ar.backend.block_class_names: the HF Qwen3 decoder-layer class name.
+#   - checkpoint paths via PRETRAINED_MODEL / LLM_MODEL env vars.
+
+num_devices: 8
+batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+# ── Diffusion side (SD3) — copied from sd3_trainside.yaml ──────────────────
+diffusion:
+  bundle:
+    _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+    config:
+      _target_: unirl.models.sd3.config.SD3PipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+      model_precision: bf16
+      autocast_precision: bf16
+      trajectory_precision: bf16
+      logprob_precision: fp32
+      shift: 3.0
+  pipeline:
+    _target_: unirl.models.sd3.pipeline.SD3Pipeline
+    shift: 3.0
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    strategy:
+      _target_: unirl.sde.kernels.FlowSDEStrategy
+  backend:
+    _target_: unirl.train.backend.fsdp.FSDPBackend
+    block_class_names: ["JointTransformerBlock"]
+    trainable_attr: transformer
+    fsdp_cfg:
+      _target_: unirl.train.configs.FSDPConfig
+      param_dtype: bf16
+      cpu_offload: false
+      mixed_precision: true
+      fsdp_mode: full
+      reshard_after_forward: true
+      activation_checkpointing: false
+      use_torch_compile: false
+    optimizer_cfg:
+      _target_: unirl.train.backend.base.OptimizerConfig
+      learning_rate: 3.0e-4
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_epsilon: 1.0e-8
+      weight_decay: 0.0
+    scheduler_cfg:
+      _target_: unirl.train.backend.base.LrSchedulerConfig
+      type: constant
+      warmup_steps: 0
+      total_steps: 10000
+    lora_cfg:
+      _target_: unirl.train.configs.LoraConfig
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      bias: none
+      task_type: FEATURE_EXTRACTION
+      target_modules:
+        - attn.add_k_proj
+        - attn.add_q_proj
+        - attn.add_v_proj
+        - attn.to_add_out
+        - attn.to_k
+        - attn.to_out.0
+        - attn.to_q
+        - attn.to_v
+  algorithm:
+    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-4
+    clip_schedule: constant
+    # Rollout samples the whole shard in one forward (no forward_batch_size set)
+    # but trains at micro_batch_size=1; bf16 GEMMs are batch-shape sensitive, so
+    # the on-policy ratio is exactly 1 only when pi_old is replayed at the train
+    # micro-geometry. See sd3_trainside.yaml / TrainStack.prepare_segment.
+    old_logp_source: replay
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.sd3.conditions.SD3Conditions
+    # DiffusionGRPO.replay needs the same guidance_scale / eta the rollout
+    # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
+    params: ${sampling.diffusion}
+  stack:
+    _target_: unirl.train.stack.TrainStack
+    micro_batch_size: 1
+    max_grad_norm: 1.0
+    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (ARGRPO is single-update only)
+
+# ── AR side (Qwen3) ───────────────────────────────────────────────────────
+ar:
+  bundle:
+    _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+    config:
+      _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
+      model_precision: bf16
+      autocast_precision: bf16
+      logprob_precision: fp32
+  pipeline:
+    # Qwen3Pipeline builds chat_template + ar stages from the (shared) bundle
+    # the trainer injects, so the rollout samples the SAME module the backend trains.
+    _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline
+    autocast_precision: bf16
+    logprob_precision: fp32
+  backend:
+    _target_: unirl.train.backend.fsdp.FSDPBackend
+    block_class_names: ["Qwen3DecoderLayer"]   # VERIFY at smoke: HF Qwen3 decoder-layer class
+    trainable_attr: transformer
+    fsdp_cfg:
+      _target_: unirl.train.configs.FSDPConfig
+      param_dtype: bf16
+      cpu_offload: false
+      mixed_precision: true
+      fsdp_mode: full
+      reshard_after_forward: true
+      activation_checkpointing: false
+      use_torch_compile: false
+    optimizer_cfg:
+      _target_: unirl.train.backend.base.OptimizerConfig
+      learning_rate: 5.0e-6      # ~60x smaller than diffusion: ARGRPO ratio is update-sensitive
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_epsilon: 1.0e-8
+      weight_decay: 0.0
+    scheduler_cfg:
+      _target_: unirl.train.backend.base.LrSchedulerConfig
+      type: constant
+      warmup_steps: 0
+      total_steps: 10000
+    lora_cfg:
+      _target_: unirl.train.configs.LoraConfig
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      bias: none
+      task_type: CAUSAL_LM
+      target_modules: [q_proj, k_proj, v_proj, o_proj]
+  algorithm:
+    # ARGRPO has no `params` kwarg (token-level replay reads conditions.prompt).
+    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    stage_attr: ar
+    clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.qwen3.conditions.Qwen3ARConditions
+  stack:
+    _target_: unirl.train.stack.TrainStack
+    micro_batch_size: 1
+    max_grad_norm: 1.0
+
+# ── Composed trainside rollout: shares both trained pipelines, eval-scopes both ──
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion, ar]
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# ComposedSamplingParams drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# rewrites, diffusion.samples_per_prompt = M images per rewrite.
+sampling:
+  _target_: unirl.types.sampling.ComposedSamplingParams
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 4       # N rewrites per prompt
+    temperature: 0.7
+    max_new_tokens: 512
+    top_p: 0.9
+  diffusion:
+    _target_: unirl.types.sampling.DiffusionSamplingParams
+    samples_per_prompt: 8       # M images per rewrite
+    num_inference_steps: 10
+    guidance_scale: 1.0
+    height: 512
+    width: 512
+    eta: 0.7
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    sde_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+num_rollouts: 300

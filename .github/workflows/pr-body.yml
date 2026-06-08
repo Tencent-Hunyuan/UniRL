@@ -1,0 +1,57 @@
+name: PR Body
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate-template:
+    name: Validate PR body sections
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require summary and test plan
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+
+          pull_request = event["pull_request"]
+          if pull_request.get("draft"):
+              print("Draft PR: skipping PR body validation.")
+              sys.exit(0)
+
+          body = pull_request.get("body") or ""
+          errors = []
+
+          def get_section(heading: str) -> str:
+              pattern = rf"(?ms)^{re.escape(heading)}\s*\n(?P<content>.*?)(?=^##\s+|\Z)"
+              match = re.search(pattern, body)
+              if not match:
+                  errors.append(f"Missing required section: {heading}")
+                  return ""
+              return match.group("content")
+
+          def visible_content(markdown: str) -> str:
+              return re.sub(r"(?s)<!--.*?-->", "", markdown).strip()
+
+          summary = visible_content(get_section("## Summary"))
+          if not summary:
+              errors.append("The Summary section must describe the change.")
+
+          test_plan = visible_content(get_section("## Test Plan"))
+          if not test_plan:
+              errors.append('The Test Plan section must describe validation, or say "Not run; reason: ...".')
+
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          PY

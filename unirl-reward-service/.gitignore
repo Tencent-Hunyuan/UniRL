@@ -1,0 +1,50 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Pip cache (locally bootstrapped)
+.pip-cache/
+.pycache/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Ray runtime temp (session symlinks, sockets — regenerated on ray start)
+.ray-tmp-*/
+
+# Local log / scratch output
+*.log
+.install.out
+.pytest.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# User-local config that may contain secrets or box-specific paths
+configs/service.yaml
+
+# Claude Code per-user local settings (skill content under .claude/skills/ is tracked)
+.claude/settings.local.json
+
+# Runtime logs
+logs/

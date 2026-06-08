@@ -1,0 +1,104 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*debug*/
+# C extensions
+*.so
+
+# Distribution / packaging
+/.Python
+/build/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Type check / lint caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Logs / experiment outputs
+wandb/
+outputs/
+logs/
+local/
+!unirl/reward/local/
+!unirl/reward/local/**
+**/rollout_data/
+**/buffer_stats/
+*.out
+*.pkl
+*.log
+
+# Datasets: keep the committed pickscore prompts, ignore other (local-only) datasets
+datasets/*
+!datasets/pickscore
+!datasets/geneval2
+
+# Large model artifacts (defense-in-depth)
+models/**/*.bin
+models/**/*.pt
+models/**/*.pth
+models/**/*.ckpt
+models/**/*.safetensors
+
+# IDE / editor metadata
+.vscode/
+.idea/
+settings.json
+*.iml
+*.code-workspace
+.DS_Store
+.claude/*
+!.claude/skills/
+!.claude/skills/**
+.cursor/*
+!.cursor/skills/
+!.cursor/skills/**
+!.cursor/rules/
+!.cursor/rules/**
+REFACTOR_LOG.md
+uv.lock

@@ -1,0 +1,177 @@
+# @package _global_
+# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer)
+# with the SGLang LLM rollout engine (rollout-anchored, colocate).
+#
+# Differs from the trainside config (qwen_vl_argrpo_geo3k_mc_4x8.yaml) only in:
+#   - rollout: SGLangLLMRolloutEngine (separate in-process SRT server) instead of
+#     TrainsideRolloutEngine.
+#   - sync: full-weight TensorWeightSync pushes the trained weights into the
+#     sglang server each rollout (trainside shares the module; sglang needs an
+#     explicit push).
+#
+# Data prep (one-time) — build the local Geometry3K-MC jsonl + images from the
+# public xyliu6/geometry3k dataset (no private cache needed):
+#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#
+# Launch (single node, rank 0). The model defaults to the HF id
+# `Qwen/Qwen2.5-VL-7B-Instruct`; set QWEN_VL_PATH to a local dir to use a cache.
+# DATA_PATH is required (local jsonl):
+#   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen_vl_argrpo_geo3k_mc_sglang_4x8 num_devices=8
+
+num_devices: 32
+batch_size: 32 # prompts_per_rollout
+
+num_rollouts: 2000
+# Fully on-policy: sync the trained LoRA into the sglang server every rollout
+# (== trainside, which shares the module). Reverted from 4 to align the reward
+# curve with the trainside baseline; revisit only if LoRA-pool reload degrades.
+weight_sync_interval: 1
+
+adv_normalization_scope: global
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-flowgrpo-newstac
+  run_name: qwen_vl_argrpo_sglang_v2_4x8
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [argrpo, qwen-vl, geo3k-mc, sglang, rollout, colocate, 4x8]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    model_precision: bf16
+    autocast_precision: bf16
+    logprob_precision: fp32
+    freeze_vision_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+
+pipeline:
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2000
+  # FULL fine-tuning (no lora_cfg). Requires the full-weight sync below + the
+  # per-bucket empty_cache in weight_sync/full/base+tensor.py (else the
+  # all-gathered model OOMs the colocated SRT server). FSDP shards the 7B
+  # (blocks=28, 336 DTensor params).
+
+# SGLang LLM rollout engine (separate in-process SRT server). The top-level
+# _target_ resolves to the engine class for remote(); the nested `config` block
+# is materialized worker-side into SGLangLLMEngineConfig.
+rollout:
+  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    tp_size: 1
+    # ARTrainer pre-expands the req to prompts*samples_per_prompt entries (one
+    # per GRPO sibling), so emit exactly ONE completion per entry. Without this
+    # the engine re-applies samples_per_prompt as n -> double-expansion (8->64->512)
+    # which collapses the GRPO group size and the reward never learns.
+    samples_pre_expanded: true
+    image_token: "<|vision_start|><|image_pad|><|vision_end|>"
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    concurrency: 8
+    engine_kwargs:
+      # Colocate on 95GB H20: sglang server + FSDP train share the GPU. The 4x8
+      # batch (512 samples) + the LoRA sync at rollout 8 OOM'd at 0.4. Drop the
+      # SRT KV reservation to 0.25 to give FSDP (model shard + optimizer + grad +
+      # 512-sample activations) headroom; ~24GB KV still ample for the batch.
+      mem_fraction_static: 0.25
+      skip_server_warmup: true
+      # disable_cuda_graph frees server memory for the per-rollout full-weight push.
+      disable_cuda_graph: true
+      # FULL fine-tuning: no LoRA pool; full dense weights pushed via TensorWeightSync.
+      enable_lora: false
+
+# On-policy weight sync: push the freshly-trained weights into the colocated
+# sglang server each rollout. tensor_payload (UpdateWeightFromTensor) is the
+# colocate handler explicitly "for sglang rollout engines" — the trainer injects
+# backend(->model) + rollout(->rollout_runtime); placement_cfg comes from the
+# active colocate scope.
+sync:
+  # FULL-weight colocate sync: push full dense FSDP weights via
+  # update_weights_from_tensor. name_remap (below) drops the frozen vision tower
+  # and remaps model.language_model.*→model.*; tensor.py frees each bucket's
+  # gathered tensors (empty_cache) so the ~13GB all-gather doesn't OOM the server.
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+  # Qwen2.5-VL-specific (config-driven; base.py stays generic), ordered
+  # first-match-wins: drop the frozen vision tower (not in the SRT LLM weight
+  # map), then remap the HF namespace to the server's (model.language_model.* ->
+  # model.*; qkv/gate_up fused on both sides). lm_head.weight matches neither and
+  # passes through unchanged.
+  name_remap: {"model.visual.*": null, "model.language_model.*": "model.*"}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+  sampling_temperature: 0.7
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 32
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 1024
+  max_new_tokens: 512

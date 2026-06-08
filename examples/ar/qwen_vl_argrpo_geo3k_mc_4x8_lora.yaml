@@ -1,0 +1,133 @@
+# @package _global_
+# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer),
+# 4 nodes x 8 GPUs, TRAINSIDE colocate + LoRA (rank 16).
+#
+# Variant of qwen_vl_argrpo_geo3k_mc_4x8.yaml (the full-FT trainside baseline):
+# the only change is backend.lora_cfg — the LLM decoder is trained as a rank-16
+# LoRA adapter (q/k/v/o_proj) instead of full fine-tuning, vision tower still
+# frozen by the bundle. Trainside (the training pipeline IS the sampler), so no
+# rollout actors and no weight sync.
+#
+# Data prep + paths: same as qwen_vl_argrpo_geo3k_mc_4x8.yaml — build the local
+# jsonl once with `python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc`,
+# then set DATA_PATH=data/geo3k_mc/train.jsonl (QWEN_VL_PATH defaults to the HF id).
+
+num_devices: 32
+batch_size: 32
+
+num_rollouts: 10000
+weight_sync_interval: 1 # ignored trainside (no `sync` block)
+
+adv_normalization_scope: global
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-flowgrpo-newstac
+  run_name: qwen_vl_argrpo_trainside_lora_4x8
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [argrpo, qwen-vl, geo3k-mc, 4x8, trainside, lora]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    model_precision: bf16
+    autocast_precision: bf16
+    logprob_precision: fp32
+    freeze_vision_tower: true # train the LLM only; ViT frozen
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+
+pipeline:
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false # bundle already enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    # LoRA LR (1e-4) is ~20x the full-FT 5e-6: LoRA's lora_B starts at 0 so the
+    # adapter needs a larger step to build an effective delta (at 5e-6 the policy
+    # stays ≈ base and reward is flat).
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # LoRA rank-16 on the LLM decoder attention projections (vision tower frozen
+  # by the bundle).
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+  sampling_temperature: 0.7
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 4
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 32
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 1024
+  max_new_tokens: 512
