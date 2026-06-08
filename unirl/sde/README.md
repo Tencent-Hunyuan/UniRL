@@ -5,7 +5,7 @@
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
-  <img src="../../assets/sde-kernel-modes-new.png" alt="UniRL SDE: one multi-step denoise loop (x_T to x_0) walked twice — rollout (diffuse) walks all T steps, drawing fresh noise and keeping a Gaussian log-prob on the eta>0 SDE steps while the rest stay deterministic, and stores the trajectory; train (replay) re-walks only those SDE steps, feeding the stored transitions back through the same kernel to get new log-probs for the GRPO/DPPO ratio" width="100%">
+  <img src="../../assets/sde-kernel-modes-new.png" alt="UniRL SDE: one multi-step denoise loop (x_T to x_0) walked twice — rollout (diffuse) walks all T steps, drawing fresh noise and keeping a Gaussian log-prob on the eta>0 SDE steps while the rest stay deterministic, and stores the trajectory; train (replay) re-walks only those SDE steps, feeding the stored transitions back through the same kernel to get new log-probs for the GRPO/FlowDPPO ratio" width="100%">
 </div>
 
 *One `strategy.denoise()` per step, under two **orthogonal** switches: **sampling** vs **replay** is the `prev_sample` argument; **stochastic** vs **deterministic** is the per-index `eta` (a step degenerates to deterministic at `eta=0` — there is no separate Euler solver).*
@@ -24,7 +24,7 @@ the *same* trajectory. That requires three things to be bit-identical across ver
 different engines (trainside, SGLang, vLLM-Omni): the σ schedule, the start noise
 `x_T`, and the per-step transition math. Centralizing all three here — instead of
 letting each engine compute its own — is what keeps the ratio honest. Get any of
-them wrong and GRPO/DPPO optimize noise.
+them wrong and GRPO/FlowDPPO optimize noise.
 
 ## How it works
 
@@ -64,7 +64,7 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 ## Gotchas
 
 - **`DPM2Strategy` can't train** — it returns `log_prob=None` everywhere, so
-  GRPO/DPPO have no ratio. Eval-only, and stateful (needs `init_schedule`/`reset`).
+  GRPO/FlowDPPO have no ratio. Eval-only, and stateful (needs `init_schedule`/`reset`).
 - **σ silently arrives as float64** — `torch.linspace` (the static-σ branch) defaults
   to float64, so without `denoise`'s `.float()` cast the transition computes in float64
   while SGLang uses float32; the `1/(2σ²)` term amplifies the gap into the replayed
