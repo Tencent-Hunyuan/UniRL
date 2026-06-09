@@ -65,7 +65,7 @@ related recipes sort together.
 | `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
 | `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
-| `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain GRPO (the default) |
+| `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
 | `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
 | `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay` | single-slab colocate default |
@@ -74,7 +74,7 @@ Worked examples:
 
 | Recipe | Reads as |
 |---|---|
-| `sd3_trainside` | SD3 · trainside engine · (default GRPO) |
+| `sd3_trainside` | SD3 · trainside engine · (default FlowGRPO) |
 | `sd3_nft_sglang` | SD3 · DiffusionNFT · SGLang engine |
 | `qwen_image_dancegrpo` | Qwen-Image · DanceGRPO |
 | `wan22_t2v_14b_dancegrpo` | WAN 2.2 · text-to-video · 14B · DanceGRPO |

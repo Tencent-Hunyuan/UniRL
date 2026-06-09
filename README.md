@@ -118,7 +118,7 @@ We are actively expanding model and algorithm coverage. Near-term directions:
 - Extend the team-proposed algorithms (FlowDPPO, DRPO) to more model families.
 - Broaden reward backends and rollout-engine coverage across domains.
 
-Want a model or algorithm prioritized? [Open an issue](https://github.com/haonan3/UniRL/issues) to discuss.
+Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues) to discuss.
 
 ## Contributing 🤝
 
@@ -127,7 +127,7 @@ repository conventions in [`AGENTS.md`](AGENTS.md), run the
 [pre-PR checks](examples/README.md#adding-or-editing-a-recipe) for the files you
 touched, and fill in the [pull request template](.github/pull_request_template.md).
 For questions, bug reports, and feature requests,
-[open an issue](https://github.com/haonan3/UniRL/issues).
+[open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues).
 
 ## Acknowledgement 🙏
 

@@ -344,4 +344,4 @@ class DRPO(StageAlgorithm):
         )
 
 
-__all__ = ["DRPO"]
+__all__ = ["DRPO", "DRPOConfig"]
