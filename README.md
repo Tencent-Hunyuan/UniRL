@@ -16,7 +16,7 @@
 ## News 🚀
 
 - **[2026-05]** **DRPO** released — *"Rethinking the Divergence Regularization in LLM RL"* ([arXiv](https://arxiv.org/abs/2606.09821)).
-- **[2026-05]** **FlowDPPO** released — *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* ([arXiv]()).
+- **[2026-06]** **Flow-DPPO** released — *"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* ([paper](FlowDPPO/HY_Flow_DPPO.pdf)).
 
 ## About 💡
 
@@ -46,7 +46,7 @@ runtime loop, deployment modes, and module map.
 
 | Algorithm | Paper | Tutorial | Notes |
 |---|---|---|---|
-| **FlowDPPO** | *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
+| **Flow-DPPO** | [*"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models"*](FlowDPPO/HY_Flow_DPPO.pdf) | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
 | **DRPO** | [*"Rethinking the Divergence Regularization in LLM RL"*](https://arxiv.org/abs/2606.09821) | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
 
 UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **DiffusionNFT**,
@@ -115,7 +115,7 @@ We are actively expanding model and algorithm coverage. Near-term directions:
 
 - Broaden algorithm coverage for the newer model families — FLUX.2-Klein,
   HunyuanVideo 1.0 / 1.5, and Bagel.
-- Extend the team-proposed algorithms (FlowDPPO, DRPO) to more model families.
+- Extend the team-proposed algorithms (Flow-DPPO, DRPO) to more model families.
 - Broaden reward backends and rollout-engine coverage across domains.
 
 Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues) to discuss.
@@ -149,5 +149,17 @@ If you find UniRL helpful, please cite:
   year         = {2026},
   howpublished = {\url{https://github.com/Tencent-Hunyuan/UniRL}},
   urldate      = {2026-06-05}
+}
+```
+
+If you use Flow-DPPO, please also cite:
+
+```bibtex
+@misc{ping2026flowdppo,
+  title        = {{Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models}},
+  author       = {Bowen Ping and Xiangxin Zhou and Penghui Qi and Minnan Luo and Liefeng Bo and Tianyu Pang},
+  year         = {2026},
+  howpublished = {\url{https://github.com/Tencent-Hunyuan/UniRL/tree/main/FlowDPPO}},
+  note         = {Manuscript dated June 8, 2026}
 }
 ```
