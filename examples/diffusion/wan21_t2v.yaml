@@ -1,7 +1,7 @@
 # @package _global_
 # GRPO WAN 2.1 T2V trainside (FSDP) colocate, v2 trainer, 1x8.
 #
-# Video diffusion GRPO: same trainside shape as sd3_trainside but the WAN 2.1
+# Video FlowGRPO: same trainside shape as sd3_trainside but the WAN 2.1
 # T2V pipeline (3D VAE, UMT5 text encoder) + video_pickscore reward.
 #
 # LoRA targets: v1's recipe inherited the generic `q_proj/k_proj/...` default,
