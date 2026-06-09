@@ -72,7 +72,7 @@ dimension; all listed models are supported (✅).
 | HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
 | Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
 | Qwen3 | LLM AR | Text → Text | ✅ |
-| Prompt-enhancer | LLM + diffusion | Text → Text → Image | ✅ |
+| Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
 | Bagel | Unified AR + diffusion | Text → Image | ✅ |
 
