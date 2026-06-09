@@ -7,7 +7,7 @@ train-side log-probs against the rollout log-probs, expands sample-level advanta
 tokens, and applies the paper's smooth quadratic DRPO loss (Eq. 8).
 
 - **Loss:** [`unirl/algorithms/drpo.py`](../unirl/algorithms/drpo.py) (`DRPO`, `_drpo_loss`)
-- **Recipe (SGLang):** [`examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml`](../examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml) — Qwen3-4B-Base on DAPO-Math
+- **Recipe (SGLang):** [`examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml`](../examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml) — Qwen3-4B-Base on DAPO-Math
 - **Config extract:** [`config.yaml`](config.yaml)
 
 Lineage: **PPO → GRPO → SPO → DPPO → DRPO**.
@@ -173,7 +173,7 @@ emitted by `_drpo_loss`.
 python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=64
+python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64
 ```
 
 The model defaults to `Qwen/Qwen3-4B-Base`; set `QWEN3_PATH` to a local checkpoint dir to

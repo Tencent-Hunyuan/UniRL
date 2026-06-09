@@ -292,7 +292,7 @@ sync:
   # skips sync via DiffusionTrainer.train's `rollout_id > 0` gate, which is why
   # single-node num_rollouts=1 smokes don't catch it). Matches every other working
   # actual-SGLang + LoRA config in the repo (pe_sglang_lora_pool / pe_sglang_full_merge /
-  # qwen_vl_grpo_geo3k_mc_sglang_4x8_lora / qwen3_drpo_4b_base_dpao_sglang). Flip
+  # qwen_vl_grpo_geo3k_mc_sglang_4x8_lora / qwen3_drpo_4b_base_dapo_sglang). Flip
   # back to true once SGLangRolloutEngine implements loaded_lora_checksums.
   verify: false
   # Mirrors Flux2KleinPipelineConfig.weight_sync_param_name_prefix; must match

@@ -1,4 +1,4 @@
-"""Build the local jsonl that ``qwen3_drpo_4b_base_dpao_sglang`` trains on.
+"""Build the local jsonl that ``qwen3_drpo_4b_base_dapo_sglang`` trains on.
 
 The AR data loader (``unirl/data/data_source.py``) reads a **local** jsonl of
 ``{"prompt": <str>, "metadata": {"answer": <str>}}`` records — it does not accept
@@ -14,7 +14,7 @@ Usage:
   # → data/dapo_math/train.jsonl  (+ aime_eval.jsonl)
 
   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-  python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=64
+  python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64
 
 The HF ids below are sensible defaults; override with the flags if your source
 differs. The extractor handles the common verl RL schema (``prompt`` chat list +

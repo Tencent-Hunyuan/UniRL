@@ -1,19 +1,17 @@
 # @package _global_
-# AR GRPO Qwen3-4B-Base on DAPO-Math — v2 trainer (ARTrainer), SGLang rollout, 32 GPU.
+# AR DRPO Qwen3-4B-Base on DAPO-Math — v2 trainer (ARTrainer), SGLang rollout, 32 GPU.
 #
-# GRPO baseline for the DRPO comparison: the SAME model / data / SGLang rollout /
-# full-weight TensorWeightSync / sampling / advantage normalization as
-# qwen3_drpo_4b_base_dpao_sglang, with the DRPO trust-region loss swapped for
-# plain PPO-clip (GRPO, _grpo_clip_loss). Matches verl's `vanilla` GRPO
-# reference (released run_qwen3_4b.sh):
-#   - DAPO clip-higher (eps_low 0.2 / eps_high 0.28)
-#   - loss_agg_mode=seq-mean-token-sum-norm (length-unbiased, per-seq token-sum
-#     / horizon)
+# Faithful port of the reference recipe (MaxwellJryao/SPO-DPPO run_qwen3_4b.sh +
+# verl core_algos.py) to reproduce the AdaSPO Figure-3 AIME curve:
+#   - DRPO (paper §3, = verl spo_adaptive_eps): the token-adaptive SPO quadratic
+#     L_t = -A_t*r_t + |A_t|*mu*(r_t-1)^2 / (2*drpo_epsilon)  — smooth, advantage-
+#     weighted Binary-TV trust region (gradient Eq 9, weight Table 1)
+#   - loss_agg_mode=seq-mean-token-sum-norm (per-seq token-sum / horizon)
 #   - normalize_adv_by_std=false (mean-center-only advantage)
-#   - 4 rollout-anchored mini-batch updates per rollout (old_logp = the frozen
-#     rollout log-prob = verl bypass_mode=True)
-# GRPO <-> DRPO therefore differ ONLY in the loss function (clip vs quadratic
-# penalty).
+#   - n=8 samples/prompt x batch=64 prompts = 512 samples/rollout
+#   - base model + temperature=1.0 (high-entropy exploration; the instruct model
+#     freezes — grad_norm ~0.0008 — because hard DAPO prompts give zero-std GRPO
+#     groups, while the base model yields mixed right/wrong groups → real gradient).
 #
 # Data prep (one-time) — build the local jsonl from the raw DAPO-Math-17k dataset:
 #   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
@@ -22,7 +20,7 @@
 # Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen3_grpo_4b_base_dpao_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=32
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -42,10 +40,10 @@ normalize_adv_by_std: false
 
 logging:
   report_to_wandb: true
-  project_name: unirl-grpo
-  run_name: grpo_qwen3-4b-base_dapo_sglang
+  project_name: unirl-drpo
+  run_name: drpo_qwen3-4b-base_dapo_sglang
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [grpo, qwen3, 4b-base, dapo, sglang, v2]
+  tags: [drpo, qwen3, 4b-base, dapo, sglang, v2]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -151,25 +149,25 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  # Plain PPO-clip GRPO (shares _grpo_clip_loss with FlowGRPO). old_logp =
-  # the SGLang rollout log-prob (segment.log_probs), frozen across the 4 mini-batch
-  # updates below (rollout-anchored ratio, = verl bypass_mode=True parity; the
-  # ratio also absorbs the rollout-vs-train engine gap — same trade-off as DRPO's
-  # old_logp_source: rollout).
-  _target_: unirl.algorithms.grpo.GRPO
+  _target_: unirl.algorithms.drpo.DRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
-  # Paper config (AdaSPO §4 + released run_qwen3_4b.sh, LOSS_MODE=vanilla):
-  # DAPO clip-higher eps_low=0.2, eps_high=0.28. Everything else (no-std
-  # advantages + seq-mean-token-sum-norm) is IDENTICAL to the DRPO recipe, so
-  # GRPO <-> DRPO differ only in the loss function.
-  clip_range: 0.2
-  clip_range_high: 0.28
-  clip_schedule: constant
+  drpo_epsilon: 12.5 # paper §4 "regularization threshold to 12.5"
+  # true = Binary-TV token-adaptive eps_t = eps/mu, penalty |A|·p_old·(r-1)²/(2ε)
+  # (= verl spo_adaptive_eps — the loss the reference run used, verified from its
+  # wandb config). false = plain SPO with FIXED eps (= verl spo).
+  penalty_mu_weighted: true
   loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
   horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
   # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1).
   sampling_temperature: 1.0
+  # rollout = anchor the PPO ratio on the SGLang sampler's emitted logprobs for ALL
+  # 4 mini-batch updates below — exact parity with the released verl run, which sets
+  # rollout_correction.bypass_mode=True (old_log_probs := rollout logprobs across its
+  # 4 steps). Trade-off (accepted for parity): the ratio also absorbs the rollout-vs-
+  # train engine gap, not just policy drift. 'replay' instead freezes a train-side
+  # π_old at pre-update weights (mb1 ratio≡1, isolates pure drift).
+  old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -191,10 +189,11 @@ stack:
   max_grad_norm: 1.0
   # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
   # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16
-  # prompts × n=8 = 128; 512/128 = 4 steps) and the DRPO recipe. GRPO's old_logp
-  # (the rollout log-prob) is frozen on the segment, so the PPO ratio stays
-  # anchored on the rollout policy across all 4 steps (verl bypass_mode=True
-  # parity). dp=32 → per-worker shard 16 samples, 16%4==0 OK.
+  # prompts × n=8 = 128; 512/128 = 4 steps). NOTE: paper Table 2 lists Mini Batch
+  # 32 (→ 2 steps); the released code uses 16 — we align to the code, which is
+  # what the reference curves were produced with. Engages DRPO's trust region on
+  # the increasingly off-policy steps 2-4 (π_old frozen per algorithm.
+  # old_logp_source). dp=32 → per-worker shard 16 samples, 16%4==0 OK.
   num_updates_per_batch: 4
 
 data_source:
