@@ -152,6 +152,20 @@ If you find UniRL helpful, please cite:
 }
 ```
 
+If you use DRPO, please also cite:
+
+```bibtex
+@misc{yao2026drpo,
+  title         = {{Rethinking the Divergence Regularization in LLM RL}},
+  author        = {Jiarui Yao and Xiangxin Zhou and Penghui Qi and Wee Sun Lee and Liefeng Bo and Tianyu Pang},
+  year          = {2026},
+  eprint        = {2606.09821},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2606.09821}
+}
+```
+
 If you use Flow-DPPO, please also cite:
 
 ```bibtex
