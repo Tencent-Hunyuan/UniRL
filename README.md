@@ -15,7 +15,7 @@
 
 ## News 🚀
 
-- **[2026-05]** **DRPO** released — *"Rethinking the Divergence Regularization in LLM Reinforcement Learning"* ([arXiv]()).
+- **[2026-05]** **DRPO** released — *"Rethinking the Divergence Regularization in LLM RL"* ([arXiv](https://arxiv.org/abs/2606.09821)).
 - **[2026-05]** **FlowDPPO** released — *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* ([arXiv]()).
 
 ## About 💡
@@ -47,7 +47,7 @@ runtime loop, deployment modes, and module map.
 | Algorithm | Paper | Tutorial | Notes |
 |---|---|---|---|
 | **FlowDPPO** | *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
-| **DRPO** | *"Rethinking the Divergence Regularization in LLM RL"* | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
+| **DRPO** | [*"Rethinking the Divergence Regularization in LLM RL"*](https://arxiv.org/abs/2606.09821) | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
 
 UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **DiffusionNFT**,
 **DanceGRPO**, and **MixGRPO** — in [`unirl/algorithms/`](unirl/algorithms/README.md).
