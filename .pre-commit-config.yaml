@@ -36,3 +36,14 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+
+  - repo: local
+    hooks:
+      # Static guard that every recipe `_target_` still resolves to a real symbol,
+      # so a rename can't leave a dead Hydra path to fail only at launch time.
+      - id: check-recipe-targets
+        name: recipe _target_ paths resolve
+        entry: python scripts/check_recipe_targets.py
+        language: python
+        pass_filenames: false
+        always_run: true
