@@ -2,10 +2,10 @@
 # drpo — annotated config EXTRACT (for reading, not launching).
 #
 # Lifted from the full runnable recipe:
-#     examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml
+#     examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml
 # Build the data once (unirl/utils/prepare_dapo_math.py), then launch (see README.md):
 #     DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#     python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=64
+#     python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64
 #
 # Shown here: the algorithm + sampling blocks (what the loss does), the advantage
 # flag, and the SGLang rollout + LoRA-sync wiring. Omitted: bundle / pipeline /

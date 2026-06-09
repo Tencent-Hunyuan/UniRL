@@ -11,7 +11,7 @@ Launch (per node, SPMD; rank 0 owns the driver):
 
 This AR entrypoint serves both vision-language (``qwen_vl``) and pure-LLM
 (``qwen3``) recipes under ``examples/ar/``
-(e.g. ``--config-name=ar/qwen3_drpo_4b_base_dpao_sglang``).
+(e.g. ``--config-name=ar/qwen3_drpo_4b_base_dapo_sglang``).
 """
 
 from __future__ import annotations

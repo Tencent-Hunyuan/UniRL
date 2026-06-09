@@ -1,0 +1,69 @@
+name: Publish to PyPI
+
+# Manual only — no push/tag/release triggers. A maintainer runs this from the
+# Actions tab and picks the target index. It can never fire on its own.
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Target index"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Check metadata and show artifacts
+        run: |
+          python -m twine check dist/*
+          ls -1 dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Environment name == chosen target, so PyPI's trusted publisher and
+    # GitHub's required-reviewer / branch-policy gates both key off it.
+    environment: ${{ inputs.repository }}
+    permissions:
+      id-token: write   # OIDC token for Trusted Publishing — no stored secret
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        if: inputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true   # re-runs of an existing version are a no-op, not a failure
+
+      - name: Publish to PyPI
+        if: inputs.repository == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
