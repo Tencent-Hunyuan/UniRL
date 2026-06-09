@@ -20,6 +20,10 @@ built-in `config_name` — a safe place to start.
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
+## Install dependencies
+
+See [INSTALL.md](../INSTALL.md) for both engines, CUDA requirements, and all extras.
+
 ## Running a recipe
 
 The bash launchers live in this directory. The first argument is the

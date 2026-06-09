@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/banner.png" alt="UniRL — A Reinforcement Learning Framework for Unified Multimodal Models" width="98%">
+<img src="assets/banner.png" alt="UniRL — A Reinforcement Learning Framework for Unified Multimodal Models" width="30%">
 
 ### A Reinforcement Learning Framework for Unified Multimodal Models
 
@@ -13,103 +13,89 @@
 
 </div>
 
-## News 🚀
+## News
 
-- **[2026-05]** **DRPO** released — *"Rethinking the Divergence Regularization in LLM RL"* ([arXiv](https://arxiv.org/abs/2606.09821)).
-- **[2026-06]** **Flow-DPPO** released — *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* ([paper](FlowDPPO/HY_FlowDPPO.pdf)).
+- **[2026-06]** 🔥  **UniRL** released! A unified RL framework for multimodal models.
+- **[2026-05]** 🔥 **DRPO** released! "Rethinking the Divergence Regularization in LLM RL" ([arXiv](https://arxiv.org/abs/2606.09821)).
+- **[2026-06]** 🔥 **Flow-DPPO** released! "Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models" ([paper](FlowDPPO/HY_FlowDPPO.pdf)).
 
-## About 💡
-
-UniRL applies one RL post-training loop — generate samples, score them, compute
-advantages, update the policy, and sync weights back to rollout workers —
-across multimodal model families.
+## About
 
 <div align="center">
-  <img src="assets/UniRL_arch_new.png" alt="UniRL architecture" width="900">
+  <img src="assets/UniRL_architecture.svg" alt="UniRL architecture" width="900">
 </div>
 
-UniRL is a layered, composable system. Each **entrypoint** (`train_diffusion`,
-`train_ar`, `train_pe`, `train_unified_model`) loads a **Hydra example config**
-covering model, algorithm, rollout, reward, placement, and sync, then creates the
-matching domain **trainer** (`DiffusionTrainer`, `ARTrainer`, `PETrainer`,
-`UnifiedModelTrainer`). The trainer coordinates the RL loop across pluggable
-**rollout engines**, **algorithms**, **model bundles**, **reward services**, and
-the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
-Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
-runtime loop, deployment modes, and module map.
+UniRL runs one RL post-training loop across every multimodal model family.
+What makes UniRL stand out:
 
-## Team-Proposed Algorithms 🌟
+**1. Unified**: a typed Segment contract abstracts latents and tokens alike, so one RL loop spans diffusion, autoregressive, prompt-enhancer, and unified models, where most RL stacks cover just one.
 
-> **🌟 These algorithms are proposed by our team — the highlight of UniRL.** Each
-> algorithm's folder holds a step-by-step tutorial and a runnable example recipe.
-> We highly recommend trying them in our framework!
+**2. Composable** : a typed Stage interface decouples loss from model, so one algorithm trains every same-modality model, and a new model inherits every algorithm.
 
-| Algorithm | Paper | Tutorial | Notes |
-|---|---|---|---|
-| **Flow-DPPO** | [*"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models"*](FlowDPPO/HY_FlowDPPO.pdf) | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
-| **DRPO** | [*"Rethinking the Divergence Regularization in LLM RL"*](https://arxiv.org/abs/2606.09821) | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
+**3. Scalable** : a typed engine interface decouples rollout from training, so one recipe scales from a single GPU to a high-throughput, disaggregated multi-node cluster.
 
-UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **DiffusionNFT**,
-**DanceGRPO**, and **MixGRPO** — in [`unirl/algorithms/`](unirl/algorithms/README.md).
+See [`unirl/README.md`](unirl/README.md) for the code architecture.
 
-## Model Support 🎨
+## Getting Started
 
-Model and algorithm support are **two independent dimensions** that compose within
-a domain: any diffusion algorithm (see above) runs on a diffusion
-model, AR algorithms on AR models — so UniRL covers many more model × algorithm
-combinations than the shipped example recipes alone. The table below is the model
-dimension; all listed models are supported (✅).
-
-<div align="center">
-
-| Model | Category | Modality | Status |
-|---|---|---|---|
-| Stable Diffusion 3 / 3.5 | Image diffusion | Text → Image | ✅ |
-| Qwen-Image | Image diffusion | Text → Image | ✅ |
-| FLUX.2-Klein | Image diffusion | Text → Image | ✅ |
-| WAN 2.1 | Video diffusion | Text / Image → Video | ✅ |
-| WAN 2.2 | Video diffusion | Text / Image → Video | ✅ |
-| HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
-| Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
-| Qwen3 | LLM AR | Text → Text | ✅ |
-| Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
-| HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
-| Bagel | Unified AR + diffusion | Text → Image | ✅ |
-
-</div>
-
-Each model maps to a domain entrypoint (`train_diffusion`, `train_ar`, `train_pe`,
-`train_unified_model`); see **Getting Started** below to run any of them.
-
-## Training Modes 🧩
-
-UniRL unifies four training modes, one Hydra example bucket and entrypoint each.
-Examples are self-contained YAML files selected with
-`--config-name=<domain>/<example>`:
-
-| Domain | Trains | Entrypoint | Example |
-|---|---|---|---|
-| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3_sglang_rollout_colocate` |
-| `ar/` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` |
-| `pe/` | Prompt-enhancer (AR rewriter + diffusion reward) | `train_pe` | `pe/pe_sglang_full_pickscore` |
-| `unified_model/` | Unified AR + diffusion models | `train_unified_model` | `unified_model/hi3_vllmomni` |
-
-See [`examples/README.md`](examples/README.md) for the full launch guide, naming
-schema, and how to add a recipe.
-
-## Getting Started ⚡
-
-Install dependencies first — see [INSTALL.md](INSTALL.md).
+Set up an environment. One engine extra (`vllm` or `sglang`) provides torch and its CUDA stack, and the trainside quickstart runs on either:
 
 ```bash
-# compose-check, then launch a single-node example
+uv venv --python 3.12 --seed .venv && source .venv/bin/activate
+export VLLM_USE_PRECOMPILED=1   # else a 30+ min CUDA build
+uv pip install -e ".[vllm,train,infer]"   # vllm = CUDA 12.9; for CUDA 13.0 use the [sglang,...] extra
+```
+
+Then compose-check and launch a single-node example:
+
+```bash
 python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job --resolve
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
 ```
 
-Full [launch guide](examples/README.md#running-a-recipe) — multi-node, every entrypoint, mooncake.
+See [`examples/README.md`](examples/README.md) for installation and the full launch guide.
 
-## Roadmap 🗺️
+
+## Support
+**Algorithms.**
+We highlight the algorithms proposed by our team. Each comes with a step-by-step tutorial! 🌟
+
+- 🌟 **Flow-DPPO** : "Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models" ([paper](FlowDPPO/HY_FlowDPPO.pdf)). Tutorial in [FlowDPPO/](FlowDPPO/)!
+- 🌟 **DRPO** : "Rethinking the Divergence Regularization in LLM RL" ([arXiv](https://arxiv.org/abs/2606.09821)). Tutorial in [DRPO/](DRPO/)!
+- **GRPO** : PPO-clipped ratio, group-relative advantages.
+- **FlowGRPO** : GRPO for flow-matching diffusion.
+- **DiffusionNFT** : ratio-free, dual-adapter reconstruction.
+- **DanceGRPO** : FlowGRPO variant.
+- **MixGRPO** : FlowGRPO variant.
+
+**Models.**
+All listed models are supported.
+- **Stable Diffusion 3 / 3.5** : Image diffusion, Text → Image.
+- **Qwen-Image** : Image diffusion, Text → Image.
+- **FLUX.2-Klein** : Image diffusion, Text → Image.
+- **WAN 2.1** : Video diffusion, Text / Image → Video.
+- **WAN 2.2** : Video diffusion, Text / Image → Video.
+- **HunyuanVideo 1.0 / 1.5** : Video diffusion, Text → Video.
+- **Qwen-VL** : Vision-language AR, Text + Image → Text.
+- **Qwen3** : LLM AR, Text → Text.
+- **Prompt-Enhancer** : LLM + diffusion, Text → Text → Image.
+- **HunyuanImage3** : Unified AR + diffusion, Text → Image.
+- **Bagel** : Unified AR + diffusion, Text → Image.
+
+**Engines.**
+Pick a rollout engine per recipe.
+- **Trainside** : in-process direct sampling, no separate server or weight sync.
+- **SGLang** : SGLang server, diffusion rollout.
+- **SGLang-LLM** : SGLang (SRT) server, autoregressive text rollout.
+- **vLLM-Omni** : vLLM-Omni server, unified models (HunyuanImage3).
+- **Composed** : pairs an LLM and a diffusion engine for the prompt-enhancer flow.
+
+**Deployment.**
+Place rollout and training across GPUs.
+- **Disaggregated** : rollout and training on separate GPU pools, weight sync required.
+- **Colocated** : rollout and training share GPUs via offload/onload, weight sync required.
+
+## Roadmap
 
 We are actively expanding model and algorithm coverage. Near-term directions:
 
@@ -120,7 +106,7 @@ We are actively expanding model and algorithm coverage. Near-term directions:
 
 Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues) to discuss.
 
-## Contributing 🤝
+## Contributing
 
 Contributions and questions are welcome. Before opening a pull request, read the
 repository conventions in [`AGENTS.md`](AGENTS.md), run the
@@ -129,7 +115,7 @@ touched, and fill in the [pull request template](.github/pull_request_template.m
 For questions, bug reports, and feature requests,
 [open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues).
 
-## Acknowledgement 🙏
+## Acknowledgement
 
 UniRL builds on ideas and infrastructure from the open-source RL and inference
 ecosystem. We especially thank
@@ -138,7 +124,7 @@ ecosystem. We especially thank
 [slime](https://github.com/THUDM/slime), and
 [verl](https://github.com/volcengine/verl).
 
-## Citation 📚
+## Citation
 
 If you find UniRL helpful, please cite:
 
