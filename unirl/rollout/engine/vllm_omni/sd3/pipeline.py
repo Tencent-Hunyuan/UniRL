@@ -102,7 +102,7 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         only thing that captures the dense latent trajectory inside the
         worker is THIS scheduler — upstream's
         ``FlowMatchEulerDiscreteScheduler`` doesn't stash anything. So
-        NFT / forward-process flows (which want ``eta == 0`` + no SDE
+        DiffusionNFT / forward-process flows (which want ``eta == 0`` + no SDE
         log-prob capture) still need us installed: the SDE math is
         dormant (gated on ``_sde_indices_set``), but the per-step
         ``prev_sample`` capture still fires.

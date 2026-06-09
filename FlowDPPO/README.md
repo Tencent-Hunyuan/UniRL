@@ -168,4 +168,4 @@ SD3.5-medium goes from ~0.75 to ~0.89 over ~270 steps.
   mask its Eq. 18.
 - DPPO (the LLM ancestor of the divergence mask): Qi et al., *"Rethinking the Trust
   Region in LLM Reinforcement Learning"* — [arXiv:2602.04879](https://arxiv.org/abs/2602.04879).
-- Flow-GRPO (the SDE rollout FlowDPPO reuses): [arXiv:2505.05470](https://arxiv.org/abs/2505.05470).
+- FlowGRPO (the SDE rollout FlowDPPO reuses): [arXiv:2505.05470](https://arxiv.org/abs/2505.05470).

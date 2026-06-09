@@ -2,10 +2,10 @@
 # drpo — annotated config EXTRACT (for reading, not launching).
 #
 # Lifted from the full runnable recipe:
-#     examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml
+#     examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml
 # Build the data once (unirl/utils/prepare_dapo_math.py), then launch (see README.md):
 #     DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#     python -m unirl.train_ar --config-name=ar/qwen3_ar_drpo_4b_base_dpao_sglang num_devices=64
+#     python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=64
 #
 # Shown here: the algorithm + sampling blocks (what the loss does), the advantage
 # flag, and the SGLang rollout + LoRA-sync wiring. Omitted: bundle / pipeline /
@@ -18,10 +18,10 @@ normalize_adv_by_std: false      # mean-center only (reward − group_mean), NO 
                                  #   division — drops GRPO's difficulty bias
                                  #   (reference norm_adv_by_std_in_grpo=False).
 
-# ── The algorithm. ARDRPO implements the paper's DRPO loss (§3): the smooth,
+# ── The algorithm. DRPO implements the paper's DRPO loss (§3): the smooth,
 # advantage-weighted, token-adaptive SPO quadratic — NOT a hard tv/kl mask. ──
 algorithm:
-  _target_: unirl.algorithms.drpo.ARDRPO
+  _target_: unirl.algorithms.drpo.DRPO
   stage_attr: ar                 # resolve the AR stage from the trainer-injected pipeline (.ar)
   drpo_epsilon: 12.5             # ε: regularization threshold (paper §4). Loss is
                                  #   L_t = −A_t*r_t + |A_t|*µ*(r_t − 1)² / (2*ε), the
@@ -79,5 +79,5 @@ sync:
   adapter_name: default
   verify: false                  # verify path is vLLM-Omni-only
 
-# Trust region is single-update: ARDRPO reuses the rollout logp as old_logp, so
+# Trust region is single-update: DRPO reuses the rollout logp as old_logp, so
 # stack.num_updates_per_batch must stay 1 (TrainStack raises otherwise).

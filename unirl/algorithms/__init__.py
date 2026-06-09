@@ -5,16 +5,16 @@ Public surface for the ``models`` training contract.
 
 from __future__ import annotations
 
-from .ar_grpo import ARGRPO
 from .base import AlgorithmStepResult, StageAlgorithm
-from .drpo import ARDRPO
+from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
+from .drpo import DRPO
 from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .flowgrpo import FlowGRPO, FlowGRPOConfig
-from .nft import DiffusionNFT, DiffusionNFTConfig
+from .grpo import GRPO
 
 __all__ = [
-    "ARGRPO",
-    "ARDRPO",
+    "GRPO",
+    "DRPO",
     "AlgorithmStepResult",
     "FlowGRPO",
     "FlowGRPOConfig",

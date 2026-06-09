@@ -7,11 +7,11 @@ Kept separate so the AR path never routes through diffusion / SDE code.
 
 Launch (per node, SPMD; rank 0 owns the driver):
   QWEN_VL_PATH=/path/to/Qwen2.5-VL-7B-Instruct DATA_PATH=/path/to/train.jsonl \
-  python -m unirl.train_ar --config-name=ar/qwen_vl_argrpo_geo3k_mc_4x8
+  python -m unirl.train_ar --config-name=ar/qwen_vl_grpo_geo3k_mc_4x8
 
 This AR entrypoint serves both vision-language (``qwen_vl``) and pure-LLM
 (``qwen3``) recipes under ``examples/ar/``
-(e.g. ``--config-name=ar/qwen3_ar_drpo_4b_base_dpao_sglang``).
+(e.g. ``--config-name=ar/qwen3_drpo_4b_base_dpao_sglang``).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from omegaconf import DictConfig
 from unirl.trainer.ar import ARTrainer
 
 
-@hydra.main(version_base=None, config_path="../examples", config_name="ar/qwen_vl_argrpo_geo3k_mc_4x8")
+@hydra.main(version_base=None, config_path="../examples", config_name="ar/qwen_vl_grpo_geo3k_mc_4x8")
 def main(cfg: DictConfig) -> None:
     trainer = ARTrainer(
         cfg=cfg,

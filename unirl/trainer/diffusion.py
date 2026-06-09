@@ -67,7 +67,7 @@ class DiffusionTrainer(BaseTrainer):
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
-        # Set in _build_train_side: True only for the NFT algorithm, which
+        # Set in _build_train_side: True only for the DiffusionNFT algorithm, which
         # needs the EMA dual-adapter swap around rollout. Stays False for GRPO
         # so its hot path is untouched.
         self._uses_ema = False
@@ -155,7 +155,7 @@ class DiffusionTrainer(BaseTrainer):
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         self.reward = remote_hydra(reward_cfg)
-        # NFT resolves its frozen reference adapter off ``backend.ema`` (the
+        # DiffusionNFT resolves its frozen reference adapter off ``backend.ema`` (the
         # FSDPBackend owns the dual-adapter EMA), so it needs the backend sibling
         # injected alongside ``pipeline``. GRPO takes neither and would reject the
         # extra kwarg, so gate on the algorithm's declared ``requires_ema_rollout``
@@ -320,18 +320,18 @@ class DiffusionTrainer(BaseTrainer):
         # Colocate FSDP offload: free the train state (params+grads+optimizer)
         # for the memory-heavy generate when a SEPARATE engine does the rollout.
         # Gated off for the trainside rollout (reuses the train model → can't be
-        # offloaded) and for NFT (``_uses_ema``; its EMA adapter swap touches the
+        # offloaded) and for DiffusionNFT (``_uses_ema``; its EMA adapter swap touches the
         # backend around generate). Off by default. ``sync`` above needs the base
         # onloaded, so offload only AFTER it.
         _do_fsdp_offload = (
             self._enable_fsdp_offload
             and self._layout != "separate"
             and not self._rollout_is_trainside
-            and not self._uses_ema  # _uses_ema == "is NFT"
+            and not self._uses_ema  # _uses_ema == "is DiffusionNFT"
         )
         if _do_fsdp_offload:
             self.backend.offload()
-        # NFT: sample under the EMA-smoothed ("old") adapter, then restore the
+        # DiffusionNFT: sample under the EMA-smoothed ("old") adapter, then restore the
         # trainable ("default") adapter before the loss. No-op for GRPO (gated).
         # Only effective for colocate/trainside where rollout shares the train
         # model; a separate sglang engine samples in its own process (see recipe).

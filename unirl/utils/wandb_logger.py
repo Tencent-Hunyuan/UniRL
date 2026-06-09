@@ -3,7 +3,7 @@ WandB Logger for unirl Training.
 
 Provides comprehensive logging for training metrics, rollout statistics,
 and image samples. Designed to match the logging behavior of DanceGRPO,
-flow_grpo, DiffusionNFT, and MixGRPO for comparison and reproducibility.
+FlowGRPO, DiffusionNFT, and MixGRPO for comparison and reproducibility.
 
 Usage:
     from unirl.utils.wandb_logger import init_logger, get_logger
@@ -34,7 +34,7 @@ except ImportError:
 class UniRLWandBLogger:
     """WandB logger for unirl training.
 
-    Logs metrics compatible with DanceGRPO, flow_grpo, DiffusionNFT, and MixGRPO
+    Logs metrics compatible with DanceGRPO, FlowGRPO, DiffusionNFT, and MixGRPO
     for cross-validation and comparison.
 
     Attributes:

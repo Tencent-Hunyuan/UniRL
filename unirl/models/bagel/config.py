@@ -24,7 +24,7 @@ from unirl.config.validation import validate_precision_type
 
 # LoRA targets = the BAGEL MoT generation-expert projections (flow_grpo
 # train_bagel.py:425-433). These are the only modules trained in the gen-only
-# Flow-GRPO setup; the und (understanding) path stays frozen.
+# FlowGRPO setup; the und (understanding) path stays frozen.
 BAGEL_MOE_GEN_LORA_TARGETS: Tuple[str, ...] = (
     "self_attn.q_proj_moe_gen",
     "self_attn.k_proj_moe_gen",

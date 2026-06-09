@@ -194,7 +194,7 @@ class StageAlgorithm(Remote, ABC):
             during rollout sampling. On-policy algorithms (GRPO) MUST
             sample with the same weights used in training replay so the
             importance ratio equals 1 on the first step (default False).
-            Off-policy / forward-process algorithms (NFT) override to
+            Off-policy / forward-process algorithms (DiffusionNFT) override to
             True so the rollout uses EMA-smoothed weights for higher-
             quality trajectories.
         supports_multi_update: Whether the algorithm is correct under
@@ -202,12 +202,12 @@ class StageAlgorithm(Remote, ABC):
             rollout into N optimizer steps over disjoint mini-batches).
             True only when the PPO ``old_logp`` anchor stays frozen across all
             N steps: ``FlowGRPO`` / ``FlowDPPO`` capture
-            ``segment.sde_logp`` once in :meth:`prepare_segment`; ``ARGRPO`` /
-            ``ARDRPO`` keep the rollout log-prob as the anchor for all N steps
+            ``segment.sde_logp`` once in :meth:`prepare_segment`; ``GRPO`` /
+            ``DRPO`` keep the rollout log-prob as the anchor for all N steps
             (verl ``bypass_mode`` parity — the ratio then also carries the
-            rollout-vs-train engine gap), and ``ARDRPO`` under
+            rollout-vs-train engine gap), and ``DRPO`` under
             ``old_logp_source='replay'`` instead freezes a train-side anchor in
-            :meth:`prepare_segment`. Default False — e.g. NFT's multi-update
+            :meth:`prepare_segment`. Default False — e.g. DiffusionNFT's multi-update
             path is unvalidated, and anchor-free algorithms (SFT) have nothing
             to freeze. ``TrainStack`` raises when a False algorithm is paired
             with ``num_updates_per_batch > 1``.
@@ -234,7 +234,7 @@ class StageAlgorithm(Remote, ABC):
         under ``old_logp_source='replay'``. False (default) ⇒ one full-segment
         call suffices: the anchor is either the engine's own emission (no
         replay), or a replay where coarse geometry is acceptable (ratio ≈ 1) —
-        e.g. ``ARDRPO`` replay mode, whose production path is rollout-anchored,
+        e.g. ``DRPO`` replay mode, whose production path is rollout-anchored,
         so the bf16 geometry term sits below the rollout-vs-train engine gap.
         """
         return False
@@ -247,7 +247,7 @@ class StageAlgorithm(Remote, ABC):
     ) -> None:
         """Optional pre-step hook called once before the multi-update loop.
 
-        Default no-op. Algorithms with no π_old anchor to freeze (e.g. NFT, SFT)
+        Default no-op. Algorithms with no π_old anchor to freeze (e.g. DiffusionNFT, SFT)
         can ignore the hook entirely.
 
         Algorithms that establish a frozen anchor override this. The canonical

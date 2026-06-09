@@ -72,7 +72,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # Euler ODE branch (we gate the SDE math on ``_sde_indices_set``,
         # not on eta — see ``step``). Installing this scheduler with eta=0
         # is the right call when the algorithm has no SDE step but we
-        # still need the dense latent trajectory captured (NFT and other
+        # still need the dense latent trajectory captured (DiffusionNFT and other
         # forward-process flows that go through ``resp_to_samples`` which
         # requires ``segment.latents`` to be non-empty). Negative eta is
         # still nonsense.
@@ -98,7 +98,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # set at request construction in the trainer's ``_build_req``):
         #
         # - ``None`` / ``frozenset()`` — NO step runs SDE (forward-process
-        #   / NFT path). Every step takes the Euler ODE branch and writes
+        #   / DiffusionNFT path). Every step takes the Euler ODE branch and writes
         #   no entry to ``_traj_log_probs``.
         # - ``frozenset({i,…})`` — those step indices run the SDE branch
         #   + capture log_prob; all other steps degenerate to Euler ODE.
@@ -271,7 +271,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         dt = sigma_prev - sigma
 
         # SDE vs ODE per step: gated entirely on ``_sde_indices_set``.
-        # ``None`` / empty → no step runs SDE (forward-process / NFT).
+        # ``None`` / empty → no step runs SDE (forward-process / DiffusionNFT).
         # Non-empty set → only those step indices run the SDE branch;
         # all others run pure Euler ODE.
         if self._sde_indices_set is None or len(self._sde_indices_set) == 0:
@@ -408,7 +408,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         - ``K == T`` when ``_sde_indices_set`` covers every step
         - ``K < T`` for any sparse subset
         - ``K == 0`` when ``_sde_indices_set`` is ``None`` or empty
-          (forward-process / NFT path; no SDE step fires, no log_prob
+          (forward-process / DiffusionNFT path; no SDE step fires, no log_prob
           captured). Returned as ``[B, 0]`` so downstream tensor ops
           have a real-but-empty tensor to consume — response.py then
           collapses this to ``segment.sde_logp = None``.
@@ -433,7 +433,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             log_probs = torch.stack(self._traj_log_probs, dim=1)
         else:
             # No SDE step fired (``_sde_indices_set`` was None or empty,
-            # i.e. NFT / forward-process). ``[B, 0]`` keeps tensor ops
+            # i.e. DiffusionNFT / forward-process). ``[B, 0]`` keeps tensor ops
             # alive; response.py collapses to ``sde_logp = None`` for the
             # clean-latents segment.
             B = post_latents.shape[0]

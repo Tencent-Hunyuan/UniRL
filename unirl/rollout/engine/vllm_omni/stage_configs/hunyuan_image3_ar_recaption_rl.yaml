@@ -4,7 +4,7 @@
 # generates <think>...</think><recaption>...</recaption><answer><boi><img_size>...
 # and stops at EOS. The full AR text is the recaption the DiT engine consumes as
 # cot_text (extra["ar_generated_text"]); per-token logp (logprobs=1) feeds
-# ar_capture.extract_ar_segment for ARGRPO replay.
+# ar_capture.extract_ar_segment for GRPO replay.
 #
 # Differs from upstream i2t/t2t (which are is_comprehension:true comprehension
 # answers, NOT think/recaption) — see hi3_v2_IMPL_spec.md plan-correction #1.

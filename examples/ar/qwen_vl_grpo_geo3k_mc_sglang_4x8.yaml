@@ -1,8 +1,8 @@
 # @package _global_
-# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer)
+# GRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer)
 # with the SGLang LLM rollout engine (rollout-anchored, colocate).
 #
-# Differs from the trainside config (qwen_vl_argrpo_geo3k_mc_4x8.yaml) only in:
+# Differs from the trainside config (qwen_vl_grpo_geo3k_mc_4x8.yaml) only in:
 #   - rollout: SGLangLLMRolloutEngine (separate in-process SRT server) instead of
 #     TrainsideRolloutEngine.
 #   - sync: full-weight TensorWeightSync pushes the trained weights into the
@@ -17,7 +17,7 @@
 # `Qwen/Qwen2.5-VL-7B-Instruct`; set QWEN_VL_PATH to a local dir to use a cache.
 # DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen_vl_argrpo_geo3k_mc_sglang_4x8 num_devices=8
+#   python -m unirl.train_ar --config-name=ar/qwen_vl_grpo_geo3k_mc_sglang_4x8 num_devices=8
 
 num_devices: 32
 batch_size: 32 # prompts_per_rollout
@@ -33,9 +33,9 @@ adv_normalization_scope: global
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac
-  run_name: qwen_vl_argrpo_sglang_v2_4x8
+  run_name: qwen_vl_grpo_sglang_v2_4x8
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [argrpo, qwen-vl, geo3k-mc, sglang, rollout, colocate, 4x8]
+  tags: [grpo, qwen-vl, geo3k-mc, sglang, rollout, colocate, 4x8]
 
 bundle:
   _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
@@ -144,7 +144,7 @@ reward:
       _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
 
 algorithm:
-  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar
   clip_range: 1.0e-2
   clip_schedule: constant

@@ -2,12 +2,12 @@
 
 Implementation of the paper "Rethinking the Divergence Regularization in LLM RL"
 
-`ARDRPO` is the repo's LLM RL algorithm. It replays the sampled tokens, compares
+`DRPO` is the repo's LLM RL algorithm. It replays the sampled tokens, compares
 train-side log-probs against the rollout log-probs, expands sample-level advantages to
 tokens, and applies the paper's smooth quadratic DRPO loss (Eq. 8).
 
-- **Loss:** [`unirl/algorithms/drpo.py`](../unirl/algorithms/drpo.py) (`ARDRPO`, `_ar_drpo_loss`)
-- **Recipe (SGLang):** [`examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml`](../examples/ar/qwen3_ar_drpo_4b_base_dpao_sglang.yaml) — Qwen3-4B-Base on DAPO-Math
+- **Loss:** [`unirl/algorithms/drpo.py`](../unirl/algorithms/drpo.py) (`DRPO`, `_drpo_loss`)
+- **Recipe (SGLang):** [`examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml`](../examples/ar/qwen3_drpo_4b_base_dpao_sglang.yaml) — Qwen3-4B-Base on DAPO-Math
 - **Config extract:** [`config.yaml`](config.yaml)
 
 Lineage: **PPO → GRPO → SPO → DPPO → DRPO**.
@@ -69,7 +69,7 @@ Because the weight depends on an **absolute probability shift** (bounded in [0,1
 than an importance ratio, it remains bounded even for low-probability tokens — unlike SPO,
 whose weight grows without bound as `µ → 0` (paper §3.2, Figure 1).
 
-## The code: `_ar_drpo_loss`
+## The code: `_drpo_loss`
 
 The loss helper in [`drpo.py`](../unirl/algorithms/drpo.py) implements Eq. 8 directly.
 The ratio `r_t` is kept differentiable (no `.detach()`, no TIS truncation), so the smooth
@@ -118,7 +118,7 @@ The practical consequence:
 | Behavior prob `µ_t` | `torch.exp(old_logp).detach()` |
 | Regularization threshold `δ` (paper) / `ε` (code) | `drpo_epsilon` (default 12.5; paper §4) |
 | Sample-level advantage `Â` | `track.advantages` |
-| Token-level advantage | `ARGRPO._expand_advantages_to_tokens(advantages, segment.lengths, ...)` |
+| Token-level advantage | `GRPO._expand_advantages_to_tokens(advantages, segment.lengths, ...)` |
 | Quadratic penalty `\|Â\|·µ·(r−1)²/(2ε)` | `adv.abs() * old_prob * ratio_delta.square() / (2.0 * epsilon)` |
 | Padding/eos mask | `segment.loss_mask` |
 
@@ -131,12 +131,12 @@ The practical consequence:
 4. `RolloutTrack.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
-5. `TrainStack.train_track` calls `ARDRPO.compute_loss_and_backward`, which replays the
+5. `TrainStack.train_track` calls `DRPO.compute_loss_and_backward`, which replays the
    sampled tokens at `temperature=sampling_temperature`, reads `old_logp = segment.log_probs`,
-   expands advantages to tokens, calls `_ar_drpo_loss`, applies `segment.loss_mask`,
+   expands advantages to tokens, calls `_drpo_loss`, applies `segment.loss_mask`,
    reduces, and `backward()`s.
 
-Unlike FlowGRPO/FlowDPPO, `ARDRPO` does **not** freeze a train-side `old_logp` in
+Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
 `prepare_segment` — it reuses the rollout log-prob, so the recipe must keep
 `stack.num_updates_per_batch: 1` (`TrainStack` raises otherwise:
 `supports_multi_update = False`).
@@ -164,7 +164,7 @@ Unlike FlowGRPO/FlowDPPO, `ARDRPO` does **not** freeze a train-side `old_logp` i
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl`, `drpo_penalty_mean`,
 `clipfrac_upper`, `clipfrac_lower`, and the AR-only `rollout_replay_logp_absdiff_mean` are
-emitted by `_ar_drpo_loss`.
+emitted by `_drpo_loss`.
 
 ## Run it
 
@@ -173,7 +173,7 @@ emitted by `_ar_drpo_loss`.
 python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-python -m unirl.train_ar --config-name=ar/qwen3_ar_drpo_4b_base_dpao_sglang num_devices=64
+python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=64
 ```
 
 The model defaults to `Qwen/Qwen3-4B-Base`; set `QWEN3_PATH` to a local checkpoint dir to
@@ -184,7 +184,7 @@ modality-agnostic and shares the AR trainer.)
 
 - **[FlowDPPO](../FlowDPPO/)** is the closest conceptual sibling: both replace ratio
   clipping with divergence-aware control. FlowDPPO has *exact* Gaussian KL over latent
-  transitions; `ARDRPO` approximates token-distribution shift from chosen-token log-probs.
+  transitions; `DRPO` approximates token-distribution shift from chosen-token log-probs.
 
 ## References
 

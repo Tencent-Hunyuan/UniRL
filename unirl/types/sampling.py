@@ -171,7 +171,7 @@ class SamplingRequirements:
 
     @property
     def is_forward_process(self) -> bool:
-        """Whether this is a forward process algorithm (NFT)."""
+        """Whether this is a forward process algorithm (DiffusionNFT)."""
         return self.requires_clean_latents and not self.requires_trajectory
 
     def to_dict(self) -> Dict[str, bool]:

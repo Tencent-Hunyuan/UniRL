@@ -1,8 +1,8 @@
 # @package _global_
 # SD3.5 + DiffusionNFT, v2 trainer — SGLang SEPARATE-mode variant.
 #
-# ⚠️ KNOWN LIMITATION — NOT FULLY RUNNABLE AS A FAITHFUL NFT RECIPE ⚠️
-# NFT is meant to roll out under the EMA-smoothed "old" adapter
+# ⚠️ KNOWN LIMITATION — NOT FULLY RUNNABLE AS A FAITHFUL DiffusionNFT RECIPE ⚠️
+# DiffusionNFT is meant to roll out under the EMA-smoothed "old" adapter
 # (requires_ema_rollout=True). In SEPARATE mode the rollout runs in a distinct
 # SGLang process, so the trainer's EMA swap (backend.apply_eval_ema, which
 # only touches the *train* process's model) does NOT reach the SGLang engine,
@@ -12,7 +12,7 @@
 # structure-aligned placeholder; the trainside family (sd3_nft.yaml,
 # sd3_nft_reward_service.yaml, qwen_image_nft*.yaml) is what runs cleanly.
 #
-# NFT loss math (dual-adapter reference via algorithm.use_shadow) still works,
+# DiffusionNFT loss math (dual-adapter reference via algorithm.use_shadow) still works,
 # and the recipe constructs/loads — but rollout fidelity differs from v1.
 
 num_devices: 16               # 2 nodes x 8 GPUs (v1: 4 train + 4 rollout / node)
@@ -74,7 +74,7 @@ backend:
     type: constant
     warmup_steps: 0
     total_steps: 10000
-  # NFT dual-adapter EMA. NOTE (see header): the weight sync pushes the
+  # DiffusionNFT dual-adapter EMA. NOTE (see header): the weight sync pushes the
   # "default" adapter, so SGLang rollout does not currently use "old".
   ema_lora_cfg:
     _target_: unirl.train.configs.EmaLoraConfig
@@ -130,7 +130,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.nft.DiffusionNFT
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
   stage_attr: diffusion
   conditions_cls:
     _target_: hydra.utils.get_class
@@ -181,7 +181,7 @@ sampling:
 
 # Merged full-weight sync → SGLang rollout (separate-slab NCCL broadcast).
 # ⚠️ Syncs the "default" adapter merged into base — NOT the EMA "old" shadow
-# (see header). Faithful NFT-SGLang needs a shadow-adapter sync path.
+# (see header). Faithful DiffusionNFT-SGLang needs a shadow-adapter sync path.
 sync:
   _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
   lora_merged: true

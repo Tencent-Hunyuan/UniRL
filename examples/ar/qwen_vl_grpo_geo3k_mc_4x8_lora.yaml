@@ -1,32 +1,31 @@
 # @package _global_
-# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer)
-# with the SGLang LLM rollout engine (colocate) + LoRA-POOL weight sync.
+# GRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer),
+# 4 nodes x 8 GPUs, TRAINSIDE colocate + LoRA (rank 16).
 #
-# Third path alongside:
-#   - qwen_vl_argrpo_geo3k_mc_sglang_4x8.yaml  (sglang + FULL-weight TensorWeightSync)
-#   - qwen_vl_argrpo_geo3k_mc_4x8_lora.yaml    (trainside + LoRA, no sync)
-# Here the LLM decoder is trained as a rank-16 LoRA adapter and pushed into the
-# colocated SRT server's versioned LoRA pool each rollout via LocalLoraWeightSync
-# (set_lora_from_tensors -> /load_lora_adapter_from_tensors, {name}_v{N}).
+# Variant of qwen_vl_grpo_geo3k_mc_4x8.yaml (the full-FT trainside baseline):
+# the only change is backend.lora_cfg — the LLM decoder is trained as a rank-16
+# LoRA adapter (q/k/v/o_proj) instead of full fine-tuning, vision tower still
+# frozen by the bundle. Trainside (the training pipeline IS the sampler), so no
+# rollout actors and no weight sync.
 #
-# Data prep + paths: same as qwen_vl_argrpo_geo3k_mc_4x8.yaml — build the local
+# Data prep + paths: same as qwen_vl_grpo_geo3k_mc_4x8.yaml — build the local
 # jsonl once with `python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc`,
 # then set DATA_PATH=data/geo3k_mc/train.jsonl (QWEN_VL_PATH defaults to the HF id).
 
 num_devices: 32
 batch_size: 32
 
-num_rollouts: 2000
-weight_sync_interval: 1 # push the trained LoRA adapter into SGLang every rollout
+num_rollouts: 10000
+weight_sync_interval: 1 # ignored trainside (no `sync` block)
 
 adv_normalization_scope: global
 
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac
-  run_name: qwen_vl_argrpo_sglang_lora_4x8
+  run_name: qwen_vl_grpo_trainside_lora_4x8
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [argrpo, qwen-vl, geo3k-mc, sglang, lora, colocate, 4x8]
+  tags: [grpo, qwen-vl, geo3k-mc, 4x8, trainside, lora]
 
 bundle:
   _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
@@ -36,7 +35,7 @@ bundle:
     model_precision: bf16
     autocast_precision: bf16
     logprob_precision: fp32
-    freeze_vision_tower: true
+    freeze_vision_tower: true # train the LLM only; ViT frozen
     use_gradient_checkpointing: true
     max_prompt_length: 2048
 
@@ -55,13 +54,13 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false
+    activation_checkpointing: false # bundle already enables HF gradient checkpointing
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    # LoRA LR (1e-4) — ~20x the full-FT 5e-6. At 5e-6 the LoRA adapter (lora_B=0
-    # init) barely moves and reward stays flat at the base; 1e-4 makes the policy
-    # actually move (approx_kl 1e-13->1e-5).
+    # LoRA LR (1e-4) is ~20x the full-FT 5e-6: LoRA's lora_B starts at 0 so the
+    # adapter needs a larger step to build an effective delta (at 5e-6 the policy
+    # stays ≈ base and reward is flat).
     learning_rate: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
@@ -71,7 +70,9 @@ backend:
     _target_: unirl.train.backend.base.LrSchedulerConfig
     type: constant
     warmup_steps: 0
-    total_steps: 2000
+    total_steps: 10000
+  # LoRA rank-16 on the LLM decoder attention projections (vision tower frozen
+  # by the bundle).
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 16
@@ -86,39 +87,9 @@ backend:
       - o_proj
 
 rollout:
-  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
-  config:
-    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
-    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
-    tp_size: 1
-    samples_pre_expanded: true
-    image_token: "<|vision_start|><|image_pad|><|vision_end|>"
-    max_new_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
-    concurrency: 8
-    engine_kwargs:
-      mem_fraction_static: 0.3
-      skip_server_warmup: true
-      disable_cuda_graph: true
-      # LoRA-pool sync. NOTE for Qwen2.5-VL: route LoRA through the triton
-      # backend (lora_backend), but KEEP the default fa3 multimodal attention —
-      # attention_backend=triton crashes the SRT server on Qwen2.5-VL (triton
-      # attn is incompatible with the VL vision/multimodal path). (Qwen3 text-only
-      # used attention_backend=triton; VL must use lora_backend instead.)
-      enable_lora: true
-      max_lora_rank: 16
-      lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
-      lora_backend: triton
-      max_loaded_loras: 8
-
-# LoRA-pool weight sync: serialize the trained LoRA adapter tensors and load
-# them into the colocated SRT server as a fresh versioned adapter each rollout.
-sync:
-  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
-  param_prefix: ""
-  adapter_name: default
-  verify: false
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -129,7 +100,7 @@ reward:
       _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
 
 algorithm:
-  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar
   clip_range: 1.0e-2
   clip_schedule: constant
@@ -140,7 +111,7 @@ algorithm:
 
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 2
+  micro_batch_size: 4
   max_grad_norm: 1.0
 
 data_source:

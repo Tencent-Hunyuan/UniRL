@@ -142,7 +142,7 @@ diffusion:
     _target_: unirl.train.stack.TrainStack
     micro_batch_size: 1
     max_grad_norm: 1.0
-    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (ARGRPO is single-update only)
+    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (GRPO is single-update only)
 
 # ── AR side (Qwen3) — copied from pe_trainside_pickscore.yaml ────────────────────────
 ar:
@@ -173,7 +173,7 @@ ar:
       use_torch_compile: false
     optimizer_cfg:
       _target_: unirl.train.backend.base.OptimizerConfig
-      learning_rate: 5.0e-6      # v1 e2e value (ARGRPO ratio is update-sensitive)
+      learning_rate: 5.0e-6      # v1 e2e value (GRPO ratio is update-sensitive)
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_epsilon: 1.0e-8
@@ -192,7 +192,7 @@ ar:
       task_type: CAUSAL_LM
       target_modules: [q_proj, k_proj, v_proj, o_proj]
   algorithm:
-    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    _target_: unirl.algorithms.grpo.GRPO
     stage_attr: ar
     clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
     clip_schedule: constant

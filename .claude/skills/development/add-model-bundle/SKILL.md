@@ -92,7 +92,7 @@ CFG belongs in the diffusion step, with the pipeline and embed stages preparing 
 - Store trajectories at `compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
 - Keep direct transformer calls inside `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
 - Implement `replay(...)` to recompute log-probs and previous-sample means from stored `LatentSegment` transitions for training.
-- Implement `predict_noise_at_step(conditions, *, sample, sigma, params)` for forward-process algorithms such as NFT; it should delegate to the same `predict_noise(...)` path so CFG and guidance behavior match `diffuse(...)` and `replay(...)`.
+- Implement `predict_noise_at_step(conditions, *, sample, sigma, params)` for forward-process algorithms such as DiffusionNFT; it should delegate to the same `predict_noise(...)` path so CFG and guidance behavior match `diffuse(...)` and `replay(...)`.
 - Expose `trainable_module()` and `_no_split_modules` on the stage when training-side injection or wrapping needs the trainable root or FSDP hints.
 
 ## ARStage Rules

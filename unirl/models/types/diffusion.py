@@ -112,7 +112,7 @@ class DiffusionStage(Protocol[C]):
     ``log_probs`` shape ``[B, S']`` aligned with ``segment.sde_logp`` (or
     a slice of it when ``step_indices`` selects a subset) and
     ``prev_sample_means`` shape ``[B, S', *latent_shape]``. Used by
-    GRPO/NFT-style replay during training.
+    GRPO/DiffusionNFT-style replay during training.
     """
 
     def diffuse(
@@ -143,7 +143,7 @@ class DiffusionStage(Protocol[C]):
         """Single ``(xt, sigma)`` model forward — no scheduler iteration.
 
         Returns the raw noise prediction at an arbitrary ``(sample, sigma)``
-        pair. Forward-process algorithms (NFT et al.) build ``xt`` via the
+        pair. Forward-process algorithms (DiffusionNFT et al.) build ``xt`` via the
         flow-matching forward diffusion ``xt = (1 - t) * x0 + t * noise``
         and call this to obtain the model's prediction without traversing
         an SDE trajectory. CFG batching + guidance scale handling are the

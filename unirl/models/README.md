@@ -46,7 +46,7 @@ A model package bridges three concerns through one shared bundle:
   it reads `req.primitives` / `sampling_params` / `sigmas`, builds the model's typed
   `Conditions`, runs the stage, and packs one or more `RolloutTrack`s.
 - **Stages** (`diffusion.py` / `ar.py`) — the trainable units. `DiffusionStage`
-  exposes `diffuse` (rollout), `replay` (train), and `predict_noise_at_step` (NFT);
+  exposes `diffuse` (rollout), `replay` (train), and `predict_noise_at_step` (DiffusionNFT);
   `ARStage` exposes `autoregress` and `replay`. Each exposes `trainable_module()`,
   returning the `nn.Module` the FSDP backend wraps and engines eval-scope.
 - **Conditions** (`conditions.py`) — typed `Batch` subclasses with

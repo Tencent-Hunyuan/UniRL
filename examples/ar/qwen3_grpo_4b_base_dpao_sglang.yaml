@@ -3,8 +3,8 @@
 #
 # GRPO baseline for the DRPO comparison: the SAME model / data / SGLang rollout /
 # full-weight TensorWeightSync / sampling / advantage normalization as
-# qwen3_ar_drpo_4b_base_dpao_sglang, with the DRPO trust-region loss swapped for
-# plain PPO-clip (ARGRPO, _grpo_clip_loss). Matches verl's `vanilla` GRPO
+# qwen3_drpo_4b_base_dpao_sglang, with the DRPO trust-region loss swapped for
+# plain PPO-clip (GRPO, _grpo_clip_loss). Matches verl's `vanilla` GRPO
 # reference (released run_qwen3_4b.sh):
 #   - DAPO clip-higher (eps_low 0.2 / eps_high 0.28)
 #   - loss_agg_mode=seq-mean-token-sum-norm (length-unbiased, per-seq token-sum
@@ -22,7 +22,7 @@
 # Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen3_ar_grpo_4b_base_dpao_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_grpo_4b_base_dpao_sglang num_devices=32
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -154,9 +154,9 @@ algorithm:
   # Plain PPO-clip GRPO (shares _grpo_clip_loss with FlowGRPO). old_logp =
   # the SGLang rollout log-prob (segment.log_probs), frozen across the 4 mini-batch
   # updates below (rollout-anchored ratio, = verl bypass_mode=True parity; the
-  # ratio also absorbs the rollout-vs-train engine gap — same trade-off as ARDRPO's
+  # ratio also absorbs the rollout-vs-train engine gap — same trade-off as DRPO's
   # old_logp_source: rollout).
-  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   # Paper config (AdaSPO §4 + released run_qwen3_4b.sh, LOSS_MODE=vanilla):
   # DAPO clip-higher eps_low=0.2, eps_high=0.28. Everything else (no-std
@@ -191,7 +191,7 @@ stack:
   max_grad_norm: 1.0
   # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
   # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16
-  # prompts × n=8 = 128; 512/128 = 4 steps) and the DRPO recipe. ARGRPO's old_logp
+  # prompts × n=8 = 128; 512/128 = 4 steps) and the DRPO recipe. GRPO's old_logp
   # (the rollout log-prob) is frozen on the segment, so the PPO ratio stays
   # anchored on the rollout policy across all 4 steps (verl bypass_mode=True
   # parity). dp=32 → per-worker shard 16 samples, 16%4==0 OK.

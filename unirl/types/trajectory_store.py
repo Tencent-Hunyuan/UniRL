@@ -64,7 +64,7 @@ class Trajectory(Batch):
         clean_latents: torch.Tensor,
         total_positions: int = 1,
     ) -> Trajectory:
-        """NFT path: store only clean latents as a single-position trajectory."""
+        """DiffusionNFT path: store only clean latents as a single-position trajectory."""
         data = clean_latents.unsqueeze(1)  # [B, 1, ...]
         index_map = torch.full((total_positions,), -1, dtype=torch.long)
         index_map[total_positions - 1] = 0

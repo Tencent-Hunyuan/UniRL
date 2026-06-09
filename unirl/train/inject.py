@@ -100,7 +100,7 @@ def inject_nft(
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
 ) -> Shadow:
-    """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
+    """Inject dual LoRA adapters for DiffusionNFT-style EMA.  Returns Shadow."""
     from peft import LoraConfig, inject_adapter_in_model
 
     peft_cfg = LoraConfig(

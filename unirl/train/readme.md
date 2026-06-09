@@ -9,7 +9,7 @@
 
 `unirl/train` is the optimizer half of the UniRL training loop. It owns the
 trainable model's parameters, optimizer, scheduler, EMA shadow, and structural
-injection (LoRA / NFT / mirror), and it sequences loss → backward → optimizer step
+injection (LoRA / DiffusionNFT / mirror), and it sequences loss → backward → optimizer step
 for one rollout track at a time. The loss math itself belongs to the algorithms
 module; this module never computes a loss.
 

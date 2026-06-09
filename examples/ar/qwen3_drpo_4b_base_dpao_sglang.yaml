@@ -20,7 +20,7 @@
 # Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen3_ar_drpo_4b_base_dpao_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dpao_sglang num_devices=32
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -149,7 +149,7 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  _target_: unirl.algorithms.drpo.ARDRPO
+  _target_: unirl.algorithms.drpo.DRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   drpo_epsilon: 12.5 # paper §4 "regularization threshold to 12.5"
   # true = Binary-TV token-adaptive eps_t = eps/mu, penalty |A|·p_old·(r-1)²/(2ε)

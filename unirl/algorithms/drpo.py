@@ -37,7 +37,6 @@ import torch
 from unirl.types.conditions import Condition
 from unirl.types.segments.text import TextSegment
 
-from .ar_grpo import ARGRPO
 from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
@@ -45,6 +44,7 @@ from .base import (
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
+from .grpo import GRPO
 
 # ---------------------------------------------------------------------------
 # Config
@@ -52,8 +52,8 @@ from .base import (
 
 
 @dataclass
-class ARDRPOConfig(BaseAlgorithmConfig):
-    """Config for :class:`ARDRPO` (the paper's DRPO method, §3).
+class DRPOConfig(BaseAlgorithmConfig):
+    """Config for :class:`DRPO` (the paper's DRPO method, §3).
 
     Attributes:
         stage_attr: Which stage slot to bind to (``"ar"``).
@@ -94,7 +94,7 @@ class ARDRPOConfig(BaseAlgorithmConfig):
 # ---------------------------------------------------------------------------
 
 
-def _ar_drpo_loss(
+def _drpo_loss(
     *,
     new_logp: torch.Tensor,
     old_logp: torch.Tensor,
@@ -164,7 +164,7 @@ def _ar_drpo_loss(
 # ---------------------------------------------------------------------------
 
 
-class ARDRPO(StageAlgorithm):
+class DRPO(StageAlgorithm):
     """DRPO for AR token-level policies — the paper's proposed method (§3).
 
     DRPO (Divergence Regularized Policy Optimization) replaces DPPO's hard
@@ -205,9 +205,9 @@ class ARDRPO(StageAlgorithm):
         super().__init__()
         # v2-only: the trainer injects the shared ``pipeline``
         # (remote_hydra(algorithm_cfg, pipeline=...)) and we resolve the stage
-        # from it. There is no v1 ``stage=`` path — ARDRPO is v2-only.
+        # from it. There is no v1 ``stage=`` path — DRPO is v2-only.
         if pipeline is None:
-            raise ValueError("ARDRPO: `pipeline` must be provided (the v2 trainer injects it)")
+            raise ValueError("DRPO: `pipeline` must be provided (the v2 trainer injects it)")
         self.stage = getattr(pipeline, stage_attr)
         self.drpo_epsilon = float(drpo_epsilon)
         # True: Binary-TV token-adaptive eps_t = eps/mu (verl spo_adaptive_eps).
@@ -217,7 +217,7 @@ class ARDRPO(StageAlgorithm):
         self.horizon = int(horizon)
         # replay rescales logits by this temperature so its log-softmax matches
         # the rollout sampling distribution (log_softmax(logits / T)); MUST equal
-        # sampling.temperature. Mirrors ARGRPO. Falls back to the ARSamplingParams
+        # sampling.temperature. Mirrors GRPO. Falls back to the ARSamplingParams
         # default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
@@ -237,7 +237,7 @@ class ARDRPO(StageAlgorithm):
         # is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
-            raise ValueError(f"ARDRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
+            raise ValueError(f"DRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
         self.supports_multi_update = True
 
     def prepare_segment(
@@ -303,11 +303,11 @@ class ARDRPO(StageAlgorithm):
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         # Expand per-sample advantages to per-token
-        adv_per_token = ARGRPO._expand_advantages_to_tokens(
+        adv_per_token = GRPO._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
         )
 
-        loss_per_elem, ratio_metrics = _ar_drpo_loss(
+        loss_per_elem, ratio_metrics = _drpo_loss(
             new_logp=new_logp,
             old_logp=old_logp,
             advantages=adv_per_token,
@@ -344,4 +344,4 @@ class ARDRPO(StageAlgorithm):
         )
 
 
-__all__ = ["ARDRPO"]
+__all__ = ["DRPO"]

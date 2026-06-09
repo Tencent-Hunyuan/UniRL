@@ -5,7 +5,7 @@
 #
 # The driver is one of the Hydra entrypoints, selected with ENTRY:
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
-#   train_ar                   examples/ar/ (qwen_vl_argrpo_*, qwen3_ar_drpo_*)
+#   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
 #   train_unified_model                  examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
 #
@@ -23,7 +23,7 @@
 # Examples:
 #   bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
 #   REPORT_TO_WANDB=true bash examples/run_experiment_single_node.sh diffusion/qwen_image_trainside
-#   ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_argrpo_geo3k_mc_4x8
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #   ENTRY=train_pe bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 #
 set -euo pipefail

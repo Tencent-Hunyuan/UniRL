@@ -1,6 +1,6 @@
-"""Stage-driven NFT (Negative Fine-Tuning): forward-process diffusion RL.
+"""Stage-driven DiffusionNFT (Negative Fine-Tuning): forward-process diffusion RL.
 
-NFT trains the policy across the diffusion noise spectrum without
+DiffusionNFT trains the policy across the diffusion noise spectrum without
 running an SDE rollout: each micro-step iterates over a set of
 timesteps :math:`\\{t_1, \\dots, t_K\\}` and, at every :math:`t_k`,
 
@@ -55,7 +55,7 @@ from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm
 
 @dataclass
 class DiffusionNFTConfig(BaseAlgorithmConfig):
-    """Per-call NFT loss hyperparameters.
+    """Per-call DiffusionNFT loss hyperparameters.
 
     Only the configuration surface exercised by current recipes is
     accepted; unsupported values fail fast in :meth:`DiffusionNFT.__init__`
@@ -72,7 +72,7 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     # ranked / per-timestep) can be reintroduced if a recipe needs them.
     adv_mode: str = "raw"
     # When True: divide each per-sample MSE by its mean-abs-error to
-    # equalize scales across timesteps (matches the original NFT recipe).
+    # equalize scales across timesteps (matches the original DiffusionNFT recipe).
     use_adaptive_weight: bool = True
     # ``"all"`` reads timesteps from ``segment.sigmas``; ``"random"`` draws
     # ``B`` fresh uniforms per micro-step. Both then run the K-iteration
@@ -90,16 +90,16 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
 
 
 class DiffusionNFT(StageAlgorithm):
-    """Forward-process NFT over a diffusion ``LatentSegment``.
+    """Forward-process DiffusionNFT over a diffusion ``LatentSegment``.
 
-    NFT is off-policy: the rollout uses EMA-smoothed weights to produce
+    DiffusionNFT is off-policy: the rollout uses EMA-smoothed weights to produce
     high-quality trajectories, and the dual-adapter loss trains against
     them (``requires_ema_rollout = True``).
 
     Args:
         stage: A :class:`DiffusionStage` exposing
             :meth:`predict_noise_at_step(conditions, *, sample, sigma, params)`.
-            All NFT-supported recipes today target SD3 (``SD3DiffusionStage``);
+            All DiffusionNFT-supported recipes today target SD3 (``SD3DiffusionStage``);
             the API works model-agnostically across the six NEW stages.
         params: Per-call params object the stage's predictor consumes
             (e.g. ``SD3DiffusionParams``). Held as algorithm state so the
@@ -310,7 +310,7 @@ class DiffusionNFT(StageAlgorithm):
         B: int,
         compute_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Single-timestep NFT loss. ``t_scalar`` is a 0-dim tensor that
+        """Single-timestep DiffusionNFT loss. ``t_scalar`` is a 0-dim tensor that
         is broadcast to the whole batch — every sample sees the same
         noise level in this iteration of the outer K-loop.
         """

@@ -160,7 +160,7 @@ def _build_image_segment(
     request at a time, so the per-prompt tensors are NOT shared refs to
     a full-batch tensor — each is shape ``[1, T+1, ...]`` / ``[1, K]``
     where ``K`` is the number of SDE-gated steps (``K`` ranges from
-    ``0`` for forward-process / NFT runs up to ``T`` for fully-SDE runs).
+    ``0`` for forward-process / DiffusionNFT runs up to ``T`` for fully-SDE runs).
     We concatenate across all outputs to recover ``[B, T+1, ...]`` /
     ``[B, K]`` where ``B = len(diff_outputs)``.
 
@@ -221,7 +221,7 @@ def _build_image_segment(
 
     indices: Optional[torch.Tensor] = None
     sde_indices: Optional[torch.Tensor] = None
-    # K == 0 happens when the algorithm requested zero SDE steps (NFT /
+    # K == 0 happens when the algorithm requested zero SDE steps (DiffusionNFT /
     # forward-process). Treat the empty case identically to "no log_probs
     # at all": clean-latents segment with no sde_logp / sde_indices.
     # Trainer-side `to_training_batch` already branches on
@@ -262,7 +262,7 @@ def _build_image_segment(
                 )
             sde_indices = torch.arange(K, dtype=torch.long)
     elif traj_latents is not None:
-        # Forward-process case (NFT): still emit ``indices`` so the
+        # Forward-process case (DiffusionNFT): still emit ``indices`` so the
         # clean-latents branch on the trainer side can look up the final
         # latent, but leave ``sde_indices`` / ``sde_logp`` as None (drop
         # the ``[B, 0]`` placeholder — it confuses downstream stage
@@ -496,7 +496,7 @@ def _build_hv15_conditions(
 
 
 def _build_ar_fused_condition(per_request_outputs: Sequence[Sequence[Any]]) -> Optional[Any]:
-    """AR fused condition for ARGRPO replay: per-sample prompt token ids.
+    """AR fused condition for GRPO replay: per-sample prompt token ids.
 
     Each AR request's Stage-0 ``OmniRequestOutput`` carries ``prompt_token_ids``
     (vLLM runs prompts per-request with no batch padding, so this is the
@@ -648,10 +648,10 @@ def _to_rollout_resp(
         # AR-only stages. ``ar_recaption`` (two-engine trainer) runs
         # is_comprehension:false so the decoded text is the think/recaption
         # the DiT engine later consumes as cot_text; ar_capture surfaces the
-        # token+logp TextSegment below for ARGRPO replay.
+        # token+logp TextSegment below for GRPO replay.
         decoded_text = _decoded_text_from_ar(per_request_outputs)
         if modality == "ar_recaption":
-            # ARGRPO.replay teacher-forces over prompt+response; it needs the
+            # GRPO.replay teacher-forces over prompt+response; it needs the
             # prompt token ids (conditions['fused'].input_ids). vLLM processes
             # each request's prompt independently (no batch padding), so the
             # output's prompt_token_ids is the sample's true, un-padded prompt.

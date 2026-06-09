@@ -22,7 +22,7 @@
 #
 # The driver is one of the Hydra entrypoints, selected with ENTRY:
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
-#   train_ar                   examples/ar/ (qwen_vl_argrpo_*, qwen3_ar_drpo_*)
+#   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
 #   train_unified_model                  examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
 #
@@ -39,7 +39,7 @@
 #   # ssh fan-out (run once on the head only):
 #   LAUNCH=ssh bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_rollout_colocate
 #   # VLM/AR recipe (4x8):
-#   ENTRY=train_ar bash examples/run_experiment_multinode_taiji.sh ar/qwen_vl_argrpo_geo3k_mc_4x8
+#   ENTRY=train_ar bash examples/run_experiment_multinode_taiji.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #
 set -euo pipefail
 

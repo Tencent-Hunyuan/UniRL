@@ -1,4 +1,4 @@
-"""Stage-driven ``ARGRPO`` over a ``TextSegment``.
+"""Stage-driven ``GRPO`` over a ``TextSegment``.
 
 Implements :class:`StageAlgorithm` and shares the module-level
 ``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
@@ -30,14 +30,14 @@ from .base import (
 
 
 @dataclass
-class ARGRPOConfig(BaseAlgorithmConfig):
+class GRPOConfig(BaseAlgorithmConfig):
     stage_attr: str = "ar"
     conditions_cls: str = ""
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
 
 
-class ARGRPO(StageAlgorithm):
+class GRPO(StageAlgorithm):
     """GRPO over an AR ``TextSegment`` via ``ARStage.replay``.
 
     The teacher-forced forward and per-token log-prob recompute is owned by
@@ -63,7 +63,7 @@ class ARGRPO(StageAlgorithm):
     # old_logp is the rollout (SGLang) log-prob, which is frozen on the segment
     # and does NOT change across mini-batch updates — so reusing it across
     # num_updates_per_batch>1 is the deliberate rollout-anchored PPO ratio
-    # (verl bypass_mode=True parity), matching ARDRPO. The ratio then absorbs the
+    # (verl bypass_mode=True parity), matching DRPO. The ratio then absorbs the
     # rollout-vs-train engine gap on later mini-batches (accepted for parity).
     supports_multi_update = True
 
@@ -83,7 +83,7 @@ class ARGRPO(StageAlgorithm):
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
-            raise ValueError("ARGRPO: either `stage` or `pipeline` must be provided")
+            raise ValueError("GRPO: either `stage` or `pipeline` must be provided")
         if stage is None:
             stage = getattr(pipeline, stage_attr)
         self.stage = stage
@@ -139,7 +139,7 @@ class ARGRPO(StageAlgorithm):
             clip_range_high=clip_high,
         )
 
-        # Loss aggregation (match ARDRPO / verl loss_agg_mode):
+        # Loss aggregation (match DRPO / verl loss_agg_mode):
         #  - "seq-mean-token-sum-norm" (Dr.GRPO/DAPO): per-seq token-SUM / horizon,
         #    then mean over sequences (length-UNbiased).
         #  - "seq-mean-token-mean" (ORIGINAL GRPO): per-seq token-MEAN, then mean
@@ -186,7 +186,7 @@ class ARGRPO(StageAlgorithm):
         """
         bs = int(advantages.shape[0])
         if int(lengths.shape[0]) != bs:
-            raise ValueError(f"ARGRPO advantage expansion: advantages batch={bs} != lengths={int(lengths.shape[0])}")
+            raise ValueError(f"GRPO advantage expansion: advantages batch={bs} != lengths={int(lengths.shape[0])}")
         chunks: List[torch.Tensor] = []
         adv_cast = advantages.detach().to(dtype=dtype, device=device)
         for k in range(bs):
@@ -198,4 +198,4 @@ class ARGRPO(StageAlgorithm):
         return torch.cat(chunks, dim=0)
 
 
-__all__ = ["ARGRPO", "ARGRPOConfig"]
+__all__ = ["GRPO", "GRPOConfig"]

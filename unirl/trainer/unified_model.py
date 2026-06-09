@@ -2,7 +2,7 @@
 
 One shared HunyuanImage3 backbone (a single MoE transformer that operates in
 ``mode="gen_text"`` for AR and ``mode="gen_image"`` for DiT) trained jointly by
-two algorithms — ``ARGRPO`` over the AR ``TextSegment`` and ``FlowGRPO``
+two algorithms — ``GRPO`` over the AR ``TextSegment`` and ``FlowGRPO``
 over the DiT ``LatentSegment`` — both backward-accumulating into ONE LoRA
 adapter with a single optimizer step (see :class:`UnifiedModelTrainStack`).
 

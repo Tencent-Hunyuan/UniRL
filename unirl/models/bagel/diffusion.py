@@ -557,7 +557,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     # ------------------------------------------------------------------
-    # Single-step velocity (forward-process algorithms: NFT et al.)
+    # Single-step velocity (forward-process algorithms: DiffusionNFT et al.)
     # ------------------------------------------------------------------
 
     def predict_noise_at_step(
@@ -571,11 +571,11 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """Single ``(x_t, sigma)`` velocity forward — no scheduler iteration.
 
         Completes the ``DiffusionStage`` protocol (used by forward-process algorithms
-        like NFT). Delegates to :meth:`BagelDiffusionStep.predict_velocity` — the same
+        like DiffusionNFT). Delegates to :meth:`BagelDiffusionStep.predict_velocity` — the same
         navit ``_forward_flow`` call ``diffuse`` / ``replay`` use — so CFG handling is
         identical. ``sample`` is packed ``[seq, C]`` (or ``[1, seq, C]``; the unit
         batch dim is squeezed). Bagel currently ships T2I GRPO only, so this is wired
-        for protocol-completeness / future NFT and not exercised by the GRPO path.
+        for protocol-completeness / future DiffusionNFT and not exercised by the GRPO path.
         """
         bagel = self.model.model
         device = torch.device(self.model.device)

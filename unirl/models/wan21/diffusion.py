@@ -554,7 +554,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: NFT et al.)
+    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
     # ------------------------------------------------------------------
 
     def predict_noise_at_step(

@@ -2,7 +2,7 @@
 
 Re-expression of :class:`unirl.models.sd3.SD3ModelBundle` against the
 typed ``Bundle`` / ``Pipeline`` / ``EmbedStage`` / ``DiffusionStage`` /
-``DecodeStage`` protocols. Legacy SD3 keeps serving production GRPO/NFT;
+``DecodeStage`` protocols. Legacy SD3 keeps serving production GRPO/DiffusionNFT;
 this package proves the new contracts end-to-end before the algorithm /
 training-backend migration lands.
 

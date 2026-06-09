@@ -269,7 +269,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
         Mirrors legacy ``samplers/sglang/engine.py:_resolve_rollout_sde_type``.
         Returns ``None`` when strategy is missing — ODE-mode callers (eval,
-        NFT) won't hit the SDE branch in the request translator anyway.
+        DiffusionNFT) won't hit the SDE branch in the request translator anyway.
 
         The returned string is the value of SGLang's ``rollout_sde_type``
         kwarg in the per-request kwargs (see ``request.py``). For each
@@ -278,7 +278,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         kernel in :mod:`unirl.sde.kernels`; otherwise iter-0
         importance ratios drift and the trainer-side replay diverges.
 
-        - ``flow`` → ``"sde"`` — flow-GRPO (SD3, Wan, Qwen-Image, etc.)
+        - ``flow`` → ``"sde"`` — FlowGRPO (SD3, Wan, Qwen-Image, etc.)
         - ``cps``  → ``"cps"`` — coefficient-preserving sampling
         - ``dance`` → ``"dance"`` — DanceGRPO (FLUX.2-Klein). Assumes the
           SGLang fork registers the Dance kernel under the string
@@ -414,7 +414,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         # land SGLang's native per-step log-probs on the segment. Whether they
         # are *used* (vs trainer-side replay) is decided downstream by the
         # algorithm's ``old_logp_source`` — not by the engine. An empty
-        # ``sde_indices`` (NFT / forward-process, num_sde_steps=0 resolves to [])
+        # ``sde_indices`` (DiffusionNFT / forward-process, num_sde_steps=0 resolves to [])
         # has no per-step log-probs to emit, so skip the block entirely —
         # matching the prior behavior for that path.
         emit_native_logprob = sde_indices is not None and len(sde_indices) > 0

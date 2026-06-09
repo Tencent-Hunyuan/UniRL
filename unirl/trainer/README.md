@@ -47,7 +47,7 @@ The four trainers are three shapes:
 
 | Trainer | Tracks | Train stack(s) | What's distinctive |
 |---|---|---|---|
-| `DiffusionTrainer`, `ARTrainer` | 1 | one `TrainStack` | the reference loop; diffusion adds the colocate FSDP-offload and NFT EMA-adapter dance around `generate` |
+| `DiffusionTrainer`, `ARTrainer` | 1 | one `TrainStack` | the reference loop; diffusion adds the colocate FSDP-offload and DiffusionNFT EMA-adapter dance around `generate` |
 | `PETrainer` | 2 (`ar` + `diffusion`) | two (one per model) | composed *trainside* rollout; the image reward is `propagate_rewards`-credited up to the `ar` track; each track trains its own model |
 | `UnifiedModelTrainer` | 2 (`ar` + `image`) | one `UnifiedModelTrainStack` | one shared backbone (HunyuanImage3); both losses backward-accumulate into a single optimizer step |
 
@@ -66,6 +66,6 @@ matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 - **`weight_sync` is built only when a `sync:` block is present** (dedicated engines);
   trainside sampling reads the live training weights and needs none (`self.weight_sync` stays `None`).
 - **FSDP offload during `generate` is off by default** and force-gated off for trainside
-  (it reuses the train model) and for NFT (its EMA swap touches the backend around `generate`).
+  (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).

@@ -43,7 +43,7 @@ class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack.
 
     Holds one shared :class:`FSDPBackend` and a dict of named
-    :class:`StageAlgorithm` siblings (``{"ar": ARGRPO, "image": FlowGRPO}``).
+    :class:`StageAlgorithm` siblings (``{"ar": GRPO, "image": FlowGRPO}``).
     Each algorithm trains its own track but backward-accumulates into the same
     shared transformer; one optimizer step applies all algorithms' gradients.
 
@@ -77,7 +77,7 @@ class UnifiedModelTrainStack(Remote):
 
     def prepare_segment(self, name: str, resp_track: RolloutTrack) -> None:
         """Pre-step hook for one algorithm — no-op if its ``segment`` is None
-        or the algorithm has no ``prepare_segment`` (ARGRPO doesn't)."""
+        or the algorithm has no ``prepare_segment`` (GRPO doesn't)."""
         if resp_track.segment is None:
             return
         algorithm = self.algorithms[name]

@@ -1,5 +1,5 @@
 # @package _global_
-# ARGRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer), 4 nodes x 8 GPUs.
+# GRPO Qwen2.5-VL on Geometry3K-MC — train_ar (ARTrainer), 4 nodes x 8 GPUs.
 #
 # Trainside (in-process) colocate: the training Qwen-VL pipeline IS the sampler,
 # so no rollout actors and no weight sync (the `sync` block is absent — trainside
@@ -18,7 +18,7 @@
 # `Qwen/Qwen2.5-VL-7B-Instruct`; set QWEN_VL_PATH to a local dir to use a cache.
 # DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen_vl_argrpo_geo3k_mc_4x8
+#   python -m unirl.train_ar --config-name=ar/qwen_vl_grpo_geo3k_mc_4x8
 #
 # NOTE: ARTrainer runs a minimal rollout→reward→advantage→step loop — no eval,
 # no checkpoint, no num_updates_per_batch. Per-rollout loss/reward go to
@@ -45,9 +45,9 @@ adv_normalization_scope: global
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac
-  run_name: qwen_vl_argrpo_geo3k_mc_bz4_10k_vlmtrainer
+  run_name: qwen_vl_grpo_geo3k_mc_bz4_10k_vlmtrainer
   entity: null
-  tags: [argrpo, qwen-vl, geo3k-mc, 4x8]
+  tags: [grpo, qwen-vl, geo3k-mc, 4x8]
 
 bundle:
   _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
@@ -120,7 +120,7 @@ reward:
       _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
 
 algorithm:
-  _target_: unirl.algorithms.ar_grpo.ARGRPO
+  _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   clip_range: 1.0e-2 # AR/LLM trust region — match the lora/sglang siblings (diffusion uses 1e-4)
   clip_schedule: constant

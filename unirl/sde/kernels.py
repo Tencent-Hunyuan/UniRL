@@ -183,7 +183,7 @@ class SDEStrategy(StepStrategy, ABC):
 
 
 class FlowSDEStrategy(SDEStrategy):
-    """Standard SDE formulation from flow-GRPO."""
+    """Standard SDE formulation from FlowGRPO."""
 
     canonical_name: ClassVar[str] = "flow"
 

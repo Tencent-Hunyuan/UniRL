@@ -234,7 +234,7 @@ def _to_sglang_kwargs(
         kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
 
     # Layer 4: SDE-kernel kwargs only apply when the algorithm requested
-    # per-step SDE noise (GRPO). ODE/non-SDE mode (eval, NFT) omits them.
+    # per-step SDE noise (GRPO). ODE/non-SDE mode (eval, DiffusionNFT) omits them.
     if sde_indices is not None:
         require(
             sde_label is not None,

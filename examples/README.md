@@ -16,7 +16,7 @@ built-in `config_name` — a safe place to start.
 | Domain | Entrypoint | Default recipe (start here) | Models |
 |---|---|---|---|
 | [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
-| [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_argrpo_geo3k_mc_4x8`, `ar/qwen3_ar_drpo_4b_base_dpao_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
+| [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dpao_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
@@ -34,7 +34,7 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job 
 
 # 1. Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
-ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_argrpo_geo3k_mc_4x8
+ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 
 # 2. Multi-node (taiji)
@@ -65,7 +65,7 @@ related recipes sort together.
 | `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
 | `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
-| `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `argrpo`, `ar_drpo` | plain GRPO (the default) |
+| `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain GRPO (the default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
 | `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
 | `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay` | single-slab colocate default |
@@ -75,17 +75,17 @@ Worked examples:
 | Recipe | Reads as |
 |---|---|
 | `sd3_trainside` | SD3 · trainside engine · (default GRPO) |
-| `sd3_nft_sglang` | SD3 · NFT · SGLang engine |
+| `sd3_nft_sglang` | SD3 · DiffusionNFT · SGLang engine |
 | `qwen_image_dancegrpo` | Qwen-Image · DanceGRPO |
 | `wan22_t2v_14b_dancegrpo` | WAN 2.2 · text-to-video · 14B · DanceGRPO |
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
-| `qwen_vl_argrpo_geo3k_mc_4x8` | Qwen-VL · ARGRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |
+| `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |
 
 Domain-specific trailing qualifiers extend the chain:
 
 - **`pe/`** appends the reward: `pe_sglang_full_pickscore`, `pe_sglang_full_wise`.
-- **`ar/`** (vision-language) appends dataset + task: `qwen_vl_argrpo_geo3k_mc_4x8` (`geo3k` · multiple-choice).
+- **`ar/`** (vision-language) appends dataset + task: `qwen_vl_grpo_geo3k_mc_4x8` (`geo3k` · multiple-choice).
 - AR recipes (`ar/`) append the cluster shape `<N>x<G>` (nodes × GPUs): `..._4x8`.
 
 ## Adding or editing a recipe

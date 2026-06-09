@@ -258,8 +258,8 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         transformer._check_inputs = lambda *a, **kw: None
 
         # Ensure runtime attributes that forward() reads off ``self`` are set.
-        # UNCONDITIONAL reset — ARGRPO sets num_image_tokens=0 on the same
-        # transformer instance. If DiffGRPO runs after ARGRPO, the 0 persists
+        # UNCONDITIONAL reset — GRPO sets num_image_tokens=0 on the same
+        # transformer instance. If DiffGRPO runs after GRPO, the 0 persists
         # → rope OOB / NaN.
         transformer.post_token_len = None
         n_img = int(fused.gen_image_mask.sum(dim=-1).max().item()) if fused.gen_image_mask is not None else 0
@@ -789,7 +789,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: NFT et al.)
+    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
     # ------------------------------------------------------------------
 
     def predict_noise_at_step(
@@ -803,7 +803,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         """Single ``(xt, sigma)`` model forward — no scheduler iteration.
 
         Stateless mode (``state=None``, ``step_index=0``); HI3's stateful
-        cache is only meaningful inside an SDE trajectory, which NFT-style
+        cache is only meaningful inside an SDE trajectory, which DiffusionNFT-style
         forward-process algorithms don't traverse.
         """
         return self.step.predict_noise(

@@ -110,7 +110,7 @@ class AllSDEScheduler(TimestepScheduler):
                 raise ValueError(f"num_sde_steps must be non-negative, got {num_sde_steps}")
 
     def get_sde_indices(self, step: Optional[int] = None) -> Set[int]:
-        # ``num_sde_steps=0`` is the forward-process / NFT path: no step runs
+        # ``num_sde_steps=0`` is the forward-process / DiffusionNFT path: no step runs
         # SDE, no log_prob is captured. The rollout driver reads ``None`` /
         # empty set the same way.
         if self.num_sde_steps == 0:

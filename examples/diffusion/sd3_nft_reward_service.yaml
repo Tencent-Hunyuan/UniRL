@@ -108,7 +108,7 @@ reward:
       aggregation_method: weighted_sum
 
 algorithm:
-  _target_: unirl.algorithms.nft.DiffusionNFT
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
   stage_attr: diffusion
   conditions_cls:
     _target_: hydra.utils.get_class

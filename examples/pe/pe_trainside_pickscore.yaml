@@ -3,7 +3,7 @@
 #
 # A Qwen3 AR LLM rewrites each prompt into N candidates; SD3 renders M images
 # per candidate; PickScore scores the image ("diffusion") track; the reward is
-# credit-assigned up the lineage to the AR track; ARGRPO + FlowGRPO train
+# credit-assigned up the lineage to the AR track; GRPO + FlowGRPO train
 # jointly as two TrainStack siblings sharing one device pool. The composed
 # PEPipeline is driven as a trainside rollout (it samples the live FSDP modules)
 # so there is NO weight sync.
@@ -106,7 +106,7 @@ diffusion:
     _target_: unirl.train.stack.TrainStack
     micro_batch_size: 1
     max_grad_norm: 1.0
-    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (ARGRPO is single-update only)
+    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (GRPO is single-update only)
 
 # ── AR side (Qwen3) ───────────────────────────────────────────────────────
 ar:
@@ -139,7 +139,7 @@ ar:
       use_torch_compile: false
     optimizer_cfg:
       _target_: unirl.train.backend.base.OptimizerConfig
-      learning_rate: 5.0e-6      # ~60x smaller than diffusion: ARGRPO ratio is update-sensitive
+      learning_rate: 5.0e-6      # ~60x smaller than diffusion: GRPO ratio is update-sensitive
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_epsilon: 1.0e-8
@@ -158,8 +158,8 @@ ar:
       task_type: CAUSAL_LM
       target_modules: [q_proj, k_proj, v_proj, o_proj]
   algorithm:
-    # ARGRPO has no `params` kwarg (token-level replay reads conditions.prompt).
-    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    # GRPO has no `params` kwarg (token-level replay reads conditions.prompt).
+    _target_: unirl.algorithms.grpo.GRPO
     stage_attr: ar
     clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
     clip_schedule: constant

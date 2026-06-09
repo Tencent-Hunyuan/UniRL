@@ -78,7 +78,7 @@ def nft_state_dict(
     full_sd: Optional[StateDict] = None,
     shadow_adapter: str = "old",
 ) -> StateDict:
-    """Export the shadow ('old') adapter state for NFT checkpoint.
+    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint.
 
     All ranks must call this (the DCP gather is a collective).  Returns
     the filtered dict on rank 0, empty dict on other ranks.

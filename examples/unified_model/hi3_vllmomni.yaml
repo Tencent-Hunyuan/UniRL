@@ -2,7 +2,7 @@
 # HunyuanImage3 think_recaption RL — v2 unified-backbone trainer, COLOCATE.
 #
 # One shared HunyuanImage3 transformer (mode=gen_text for AR, mode=gen_image for
-# DiT) trained jointly by ARGRPO (AR TextSegment) + FlowGRPO (DiT
+# DiT) trained jointly by GRPO (AR TextSegment) + FlowGRPO (DiT
 # LatentSegment), both backward-accumulating into ONE LoRA adapter with a single
 # optimizer step (UnifiedModelTrainStack). Rollout is a two-engine vLLM-Omni setup
 # (modality=ar_recaption: AR think/recaption → modality=dit_recaption: DiT); the
@@ -165,9 +165,9 @@ reward:
 # cfg.algorithm.ar / cfg.algorithm.image.
 algorithm:
   ar:
-    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    _target_: unirl.algorithms.grpo.GRPO
     stage_attr: ar
-    clip_range: 1.0e-2            # AR/LLM trust region (matches ar/qwen_vl argrpo; 0.2 never binds -> no clip)
+    clip_range: 1.0e-2            # AR/LLM trust region (matches ar/qwen_vl grpo; 0.2 never binds -> no clip)
     clip_schedule: constant
     conditions_cls:
       _target_: hydra.utils.get_class

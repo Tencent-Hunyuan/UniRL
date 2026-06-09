@@ -80,7 +80,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
 
         # Cast latent/embeds to the transformer's param dtype before the bf16
         # pos_embed conv — autocast doesn't reliably catch the first conv input
-        # under FSDP2 wrap (the NFT forward-process path hits this; GRPO/FlowDPPO
+        # under FSDP2 wrap (the DiffusionNFT forward-process path hits this; GRPO/FlowDPPO
         # replay feeds already-bf16 latents). Idempotent when dtype matches.
         try:
             model_dtype = next(model.transformer.parameters()).dtype
@@ -497,7 +497,7 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: NFT et al.)
+    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
     # ------------------------------------------------------------------
 
     def predict_noise_at_step(

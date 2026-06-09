@@ -1,6 +1,6 @@
 """FSDPBackend — single-track training-state Remote.
 
-Owns structural injection (LoRA / NFT / mirror EMA / FSDP wrap) on the
+Owns structural injection (LoRA / DiffusionNFT / mirror EMA / FSDP wrap) on the
 trainable module exposed by a :class:`Bundle`, plus the ongoing training
 state (optimizer, scheduler, EMA, eval-EMA swap, checkpoint, onload/
 offload).  Does NOT hold a ``Stage`` or an algorithm — the algorithm
@@ -80,7 +80,7 @@ class FSDPBackend(Remote):
         if lora_cfg is not None and ema_lora_cfg is not None:
             raise ValueError(
                 "FSDPBackend: lora_cfg and ema_lora_cfg are mutually exclusive "
-                "(both inject LoRA adapters). Use ema_lora_cfg for NFT-style "
+                "(both inject LoRA adapters). Use ema_lora_cfg for DiffusionNFT-style "
                 "adapter EMA, or lora_cfg for plain LoRA."
             )
 
@@ -224,7 +224,7 @@ class FSDPBackend(Remote):
     def apply_eval_ema(self) -> None:
         """Swap the EMA shadow ("old") adapter into live position for rollout.
 
-        Driver-callable (each worker swaps its own model); the NFT trainer
+        Driver-callable (each worker swaps its own model); the DiffusionNFT trainer
         wraps ``rollout.generate`` with this + :meth:`restore_from_eval`.
         No-op when ``ema is None`` (GRPO) or already swapped in.
         """

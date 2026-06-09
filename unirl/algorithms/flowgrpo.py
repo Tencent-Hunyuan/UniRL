@@ -2,7 +2,7 @@
 
 Implements :class:`StageAlgorithm` and shares the module-level
 ``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
-:mod:`unirl.algorithms.base`) with :class:`ARGRPO` so their loss math
+:mod:`unirl.algorithms.base`) with :class:`GRPO` so their loss math
 stays identical. CFG batching, predict_noise, SDE math, autocast, and per-step
 iteration are owned by ``stage.replay(...)``; the algorithm is ~20 lines of
 ratio-clip math.

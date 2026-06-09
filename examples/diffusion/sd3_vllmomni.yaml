@@ -166,7 +166,7 @@ sampling:
   trajectory_precision: bf16
   logprob_precision: fp32
   # SDE step schedule: which denoising steps record SDE log-probs.
-  # num_sde_steps: null = all steps; int = sparse subset; 0 = none (NFT).
+  # num_sde_steps: null = all steps; int = sparse subset; 0 = none (DiffusionNFT).
   # A static `sde_indices: [...]` overrides this. (WindowScheduler also available.)
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler

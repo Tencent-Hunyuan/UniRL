@@ -127,7 +127,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         ``resp_to_samples`` needs ``segment.latents`` to be non-empty and
         only this scheduler captures the dense per-step trajectory.
         ``eta == 0`` collapses the SDE branch in ``step`` to pure Euler
-        (gated on ``_sde_indices_set``), so NFT-style ``no SDE`` requests
+        (gated on ``_sde_indices_set``), so DiffusionNFT-style ``no SDE`` requests
         still get the trajectory they need.
         """
         # Force the inner pipeline + upstream scheduler into existence.
