@@ -111,10 +111,33 @@ def _build_request_for_track(
 class RewardService(Remote):
     """Actor-side reward entry: one backend, scores one track in place."""
 
-    def __init__(self, backend: RewardBackend) -> None:
+    def __init__(
+        self,
+        backend: RewardBackend,
+        truncated_reward: str = "zero",
+        overlong_buffer_len: int = 4096,
+        overlong_penalty_factor: float = 1.0,
+    ) -> None:
         super().__init__()
         self.backend = backend
-        logger.info("RewardService initialized with backend=%s", backend.get_model_name() or type(backend).__name__)
+        # How to score AR generations that hit max_new_tokens (sglang finish=="length"):
+        #   "zero" — force reward 0 on truncated traces (anti-ramble; the default).
+        #   "keep" — keep the raw score on the partial text (= verl dapo reward manager
+        #            with overlong_buffer.enable=False: no zeroing, no penalty).
+        #   "soft" — verl DAPO overlong reward shaping (overlong_buffer.enable=True): a
+        #            graded NEGATIVE penalty over the last `overlong_buffer_len` tokens
+        #            before max_new_tokens — never a hard zero. Mirrors
+        #            verl.workers.reward_manager.dapo: reward += min(-exceed/buf*factor, 0).
+        self.truncated_reward = str(truncated_reward)
+        self.overlong_buffer_len = int(overlong_buffer_len)
+        self.overlong_penalty_factor = float(overlong_penalty_factor)
+        if self.truncated_reward not in ("zero", "keep", "soft"):
+            raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
+        logger.info(
+            "RewardService initialized with backend=%s, truncated_reward=%s",
+            backend.get_model_name() or type(backend).__name__,
+            self.truncated_reward,
+        )
 
     @property
     def preferred_input_kind(self) -> str:
@@ -209,26 +232,37 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
-        # Zero reward for AR generations that hit max_new_tokens without
-        # terminating (sglang finish == "length"). A non-terminating trace whose
-        # text happens to contain a matching answer (e.g. a mid-reasoning
-        # \boxed{}) must not be rewarded, else training learns to ramble up to the
-        # token cap — a real failure mode at long max_new_tokens (32k thinking).
-        # response_length >= max_new_tokens is the truncation signal; segment
-        # lengths and rewards are shard-aligned (one entry per sample).
+        # Length-based reward shaping for AR generations that hit max_new_tokens
+        # (sglang finish == "length"). A non-terminating trace whose text happens to
+        # contain a matching answer (e.g. a mid-reasoning \boxed{}) can teach the
+        # model to ramble up to the token cap — a real failure mode at long
+        # max_new_tokens. `truncated_reward` (see __init__) picks the policy:
+        #   "zero" — force reward 0 on truncated traces (anti-ramble).
+        #   "keep" — leave the raw score (= verl dapo, overlong disabled). No-op here.
+        #   "soft" — verl DAPO graded overlong penalty (never a hard zero).
+        # seg_lengths and rewards are shard-aligned (one entry per sample).
         ar_params = get_ar_params(req.sampling_params)
-        if ar_params is not None and track.segment is not None:
+        if self.truncated_reward != "keep" and ar_params is not None and track.segment is not None:
             seg_lengths = getattr(track.segment, "lengths", None)
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
-                truncated = seg_lengths.to(rewards.device) >= int(ar_params.max_new_tokens)
-                rewards = torch.where(truncated, torch.zeros_like(rewards), rewards)
+                seg_lengths = seg_lengths.to(rewards.device).float()
+                max_len = float(int(ar_params.max_new_tokens))
+                if self.truncated_reward == "zero":
+                    truncated = seg_lengths >= max_len
+                    rewards = torch.where(truncated, torch.zeros_like(rewards), rewards)
+                else:  # "soft": verl overlong shaping — graded negative penalty over the
+                    # last overlong_buffer_len tokens before max_len, clamped to <= 0.
+                    buf = float(self.overlong_buffer_len)
+                    exceed = seg_lengths - (max_len - buf)
+                    penalty = torch.clamp(-exceed / buf * self.overlong_penalty_factor, max=0.0)
+                    rewards = rewards + penalty
             elif seg_lengths is not None:
                 # Mismatched counts are expected when the AR segment is not 1:1 with
                 # rewards (e.g. composed PE: N AR segments vs N*M rewards), so we skip
-                # rather than crash. But in a pure-AR run a mismatch means truncation
-                # zeroing silently did nothing — log it so the skip is discoverable.
+                # rather than crash. But in a pure-AR run a mismatch means the shaping
+                # silently did nothing — log it so the skip is discoverable.
                 logger.debug(
-                    "RewardService: skipped AR truncation-zeroing (seg_lengths=%d != rewards=%d).",
+                    "RewardService: skipped AR truncation shaping (seg_lengths=%d != rewards=%d).",
                     seg_lengths.numel(),
                     rewards.numel(),
                 )
