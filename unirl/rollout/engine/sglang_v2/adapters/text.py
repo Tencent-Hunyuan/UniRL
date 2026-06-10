@@ -134,12 +134,25 @@ class TextLMAdapter(ModelAdapter):
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": user_prompt})
 
-        return self._tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            **(self.cfg.chat_template_kwargs or {}),
-        )
+        # tokenize=True + return_dict=False yields a bare List[int]. transformers
+        # >=5 defaults return_dict=True, handing back a BatchEncoding that then
+        # leaks into the JSON /generate payload ("Object of type BatchEncoding is
+        # not JSON serializable"). Force the list form and normalize any
+        # tensor/batch dim a template kwarg might introduce.
+        template_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": True,
+            "return_dict": False,
+        }
+        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        ids = self._tokenizer.apply_chat_template(messages, **template_kwargs)
+        if hasattr(ids, "input_ids"):  # BatchEncoding (return_dict re-enabled)
+            ids = ids["input_ids"]
+        if hasattr(ids, "tolist"):  # torch / numpy tensor (return_tensors)
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], (list, tuple)):  # leading batch dim of 1
+            ids = ids[0]
+        return [int(t) for t in ids]
 
     # ------------------------------------------------------------------ #
     # build_response — the template: one fan-out stage per RolloutTrack field
