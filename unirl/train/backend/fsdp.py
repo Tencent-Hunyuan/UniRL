@@ -36,7 +36,6 @@ from unirl.train.fsdp_utils import (
     fsdp_onload,
     gather_state_dict,
     load_model_state_dict,
-    sync_unsharded_grads,
     trainable_params,
 )
 from unirl.train.inject import (
@@ -126,9 +125,11 @@ class FSDPBackend(Remote):
             mixed_precision=fsdp_cfg.mixed_precision,
             fsdp_mode=fsdp_cfg.fsdp_mode,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
+            forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            root_wrap=getattr(fsdp_cfg, "root_wrap", True),
         )
 
         bundle_materialize = getattr(bundle, "materialize", None)
@@ -165,6 +166,11 @@ class FSDPBackend(Remote):
         self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
+        # No-sync gradient accumulation (see set_grad_sync). Only active under
+        # ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the
+        # per-micro reshard/re-gather interacts badly with deferred sync.
+        self._defer_grad_sync: bool = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
+        self._grad_sync_enabled: bool = True
 
     # ------------------------------------------------------------------
     # Training step
@@ -172,6 +178,38 @@ class FSDPBackend(Remote):
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
+
+    def set_grad_sync(self, enable: bool) -> None:
+        """Toggle the FSDP2 gradient reduce-scatter for no-sync accumulation.
+
+        With ``defer_grad_sync`` on, the train loop disables sync on every
+        micro-batch except the last, so every FSDP group accumulates gradients
+        in its unsharded buffers and a single reduce-scatter runs per optimizer
+        step instead of one per micro-batch. Under the default root wrap the
+        whole model is sharded — the per-block groups AND the leftover root
+        group (embed / final norm / lm_head) — and the loop below toggles all of
+        them, so this defers one reduce-scatter per step for the *entire* model
+        on a multi-node fabric.
+
+        No-op when deferral is off (the common case) or the flag is already in
+        the wanted state. ``set_is_last_backward`` does not recurse, so every
+        FSDP module is toggled; ``set_requires_gradient_sync`` is idempotent
+        across nesting.
+        """
+        if not self._defer_grad_sync or enable == self._grad_sync_enabled:
+            return
+        from torch.distributed.fsdp import FSDPModule
+
+        for m in self.model.modules():
+            if isinstance(m, FSDPModule):
+                m.set_requires_gradient_sync(enable)
+                m.set_is_last_backward(enable)
+        self._grad_sync_enabled = enable
+
+    @property
+    def grad_sync_deferred(self) -> bool:
+        """True when no-sync accumulation is active (``defer_grad_sync`` under ZeRO-2)."""
+        return self._defer_grad_sync
 
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip, optimizer step, scheduler step, EMA step.
@@ -189,9 +227,9 @@ class FSDPBackend(Remote):
         ``TrainStack``) routes through, so the guard covers all of them.
         """
         params = list(trainable_params(self.model))
-        # DP-average the grads FSDP doesn't own (embed / final norm / lm_head sit
-        # outside the per-block fully_shard wrap) so their replicas don't drift.
-        sync_unsharded_grads(params)
+        # Every trainable grad is a sharded DTensor that FSDP reduce-scatters:
+        # the root wrap claims the leftover params, and fsdp_wrap fails fast on
+        # trainable params outside every group when root_wrap is disabled.
         clipped = clip_grad_norm(params, float(max_grad_norm))
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 

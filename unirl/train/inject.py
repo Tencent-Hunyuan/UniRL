@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
+from unirl.config.require import require
 from unirl.train.shadow import Shadow
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -195,9 +196,11 @@ def fsdp_wrap(
     mixed_precision: bool = True,
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
+    forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    root_wrap: bool = True,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors
     ARE the handle.  Ported from FSDPPolicy._wrap_model.
@@ -206,12 +209,23 @@ def fsdp_wrap(
     ``stage`` is ignored for discovery.  Otherwise we fall back to
     ``_discover_block_classes(model, stage)`` (model __mro__ then stage
     source chain).
+
+    ``root_wrap`` (default ON) adds a root ``fully_shard(model)`` after the
+    per-block wrap so the leftover params (embed / final norm / lm_head)
+    are sharded + mp_policy'd instead of staying plain replicated tensors.
+    The root group deliberately does NOT inherit ``reshard_after_forward``:
+    FSDP2's auto policy keeps the root's params materialized after forward,
+    which stages rely on for direct post-forward submodule calls (e.g. the
+    chunked ``lm_head`` in Qwen3 replay). See ``FSDPConfig.root_wrap`` for
+    when to disable it.
     """
     from torch.distributed.fsdp import (
         CPUOffloadPolicy,
+        FSDPModule,
         MixedPrecisionPolicy,
         fully_shard,
     )
+    from torch.distributed.tensor import DTensor
 
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
     # Optional high-precision optimizer master for the TRAINABLE (LoRA) params. When set
@@ -247,7 +261,9 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy):
+    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy),
+    # applied uniformly to EVERY param — blocks and leftovers alike; the wrap
+    # topology below is orthogonal to the dtype policy:
     #   * explicit master_dtype  → upcast the TRAINABLE (LoRA) params to it even under mixed
     #     precision; the mp_policy still all-gathers them as param_dtype for compute, so only
     #     the optimizer master gains precision (the bf16-base + fp32-LoRA-master case).
@@ -257,22 +273,75 @@ def fsdp_wrap(
     #     loaded dtype and casts to mp_policy.param_dtype per forward, so an fp32-loaded model
     #     gets Megatron-style fp32 master weights for free. Pre-casting to bf16 here would
     #     round away the ~1e-6 AdamW steps. (Historically a no-op: models were loaded in bf16.)
-    for layer in block_instances:
-        for p in layer.parameters(recurse=True):
-            if not p.dtype.is_floating_point:
-                continue
-            if trainable_dtype is not None and p.requires_grad:
-                dst = trainable_dtype
-            elif not mixed_precision:
-                dst = target_dtype
-            else:
-                continue
-            if p.dtype != dst:
-                p.data = p.data.to(dst)
-                casts += 1
+    for p in model.parameters():
+        if isinstance(p, DTensor) or not p.dtype.is_floating_point:
+            continue  # already-wrapped params and ints never cast
+        if trainable_dtype is not None and p.requires_grad:
+            dst = trainable_dtype
+        elif not mixed_precision:
+            dst = target_dtype
+        else:
+            continue
+        if p.dtype != dst:
+            p.data = p.data.to(dst)
+            casts += 1
 
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
+
+    if root_wrap and not isinstance(model, FSDPModule):
+        # Root wrap: claim the leftover params (everything the block wraps
+        # above did not own — embed / final norm / lm_head / time+patch
+        # embeds) into a root fully_shard group. The ``isinstance`` guard
+        # makes the wrap idempotent and skips the degenerate case where
+        # ``model`` itself is a wrapped block instance.
+        #
+        # The root group must NOT inherit reshard_after_forward: FSDP2's auto
+        # policy never reshards the root after forward, keeping its params
+        # materialized for post-forward direct submodule calls (Qwen3's chunked
+        # lm_head) and activation-checkpoint recomputes. Everything else
+        # (mesh / mp_policy / offload_policy) is shared with the block groups.
+        root_kwargs = dict(fsdp_kwargs)
+        root_kwargs.pop("reshard_after_forward", None)
+        fully_shard(model, **root_kwargs)
+    else:
+        # No root wrap: a TRAINABLE param outside every fully_shard group
+        # would receive grads no collective ever DP-syncs (the manual
+        # sync_unsharded_grads net was removed with the default root wrap),
+        # so its replicas would silently drift apart across ranks. Frozen
+        # leftovers (the bagel / hunyuan_image3 LoRA recipes) are fine —
+        # they carry no grads — and a single rank has no replicas to drift.
+        # Fail fast rather than corrupt the run.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            stray = [n for n, p in model.named_parameters() if p.requires_grad and not isinstance(p, DTensor)]
+            require(
+                not stray,
+                f"fsdp_wrap(root_wrap=false): {len(stray)} trainable param(s) sit outside "
+                f"every fully_shard group (e.g. {stray[:3]}); their grads would never be "
+                "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
+            )
+
+    if forward_prefetch:
+        # Cross-block forward prefetch: chain each FSDP group to prefetch the
+        # NEXT group's all-gather during its own forward, in forward
+        # (named_modules) order — root → group 0 → … → group N — so the
+        # per-group all-gather overlaps compute instead of stalling the critical
+        # path (a multi-node win; ~no-op over NVLink). Iterates the ACTUAL FSDP
+        # groups (root + blocks + any separately-wrapped leftover group), not
+        # just block_instances, matching set_grad_sync's walk — so no wrapped
+        # group is left unchained. Needs the root wrapped (the default root wrap
+        # above) so FSDP2 has initialized the shared all-gather comm context.
+        if not isinstance(model, FSDPModule):
+            raise ValueError(
+                "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
+                "initializes the shared all-gather comm context, but root_wrap did not run "
+                "(training.fsdp.root_wrap=False). Set root_wrap=True, or forward_prefetch=False."
+            )
+        fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
+        for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
+            cur.set_modules_to_forward_prefetch([nxt])
 
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
@@ -296,18 +365,20 @@ def fsdp_wrap(
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, "
-            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s)",
+            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
+            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             "HSDP" if mesh is not None else "FSDP2",
             cpu_offload,
             mixed_precision,
             reshard_after_forward,
+            forward_prefetch,
             activation_checkpointing,
             use_torch_compile,
             casts,
             master_dtype,
+            root_wrap,
         )
 
 

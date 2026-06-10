@@ -225,68 +225,34 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
-def sync_unsharded_grads(params: List[Parameter]) -> int:
-    """All-reduce-AVG the grads of plain (non-DTensor) params across ranks.
-
-    Per-block ``fully_shard`` leaves the params outside the wrapped blocks
-    (embed / final norm / lm_head — for Qwen3-4B the tied embed/head matrix
-    is ~10% of the model) as plain replicated tensors. FSDP never reduces
-    their grads, so without this every rank steps its own copy with its
-    local-batch gradient and the replicas silently drift apart. Average
-    them like DDP would, once per optimizer step (after accumulation,
-    before clipping). Returns the number of params synced.
-    """
-    import torch.distributed as dist
-
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
-        return 0
-    n = 0
-    for param in params:
-        grad = getattr(param, "grad", None)
-        if grad is None:
-            continue
-        if hasattr(grad, "to_local") and callable(getattr(grad, "to_local")):
-            continue  # sharded DTensor grad: FSDP reduce-scatter owns it
-        if not isinstance(grad, Tensor):
-            continue
-        dist.all_reduce(grad, op=dist.ReduceOp.AVG)
-        n += 1
-    return n
-
-
 def _global_clip_for_sharded_grads(
     params: List[Parameter],
     max_grad_norm: float,
 ) -> Tensor:
-    """Explicit global-norm gradient clipping for mixed Tensor/DTensor params.
+    """Explicit global-norm gradient clipping for FSDP DTensor grads.
 
     Ported from the deleted FSDPPolicy._global_clip_for_sharded_grads.
-    Handles two FSDP corner cases that the standard clip_grad_norm_ path
-    can't: (1) mixed regular Tensor + DTensor params from per-block
-    fully_shard without root wrap, and (2) CPU DTensor collectives
-    missing under cpu_offload.
+    Handles the FSDP corner case the standard clip_grad_norm_ path can't:
+    CPU DTensor collectives missing under cpu_offload. Every grad here is a
+    sharded DTensor: the root wrap claims all leftover params, and
+    ``fsdp_wrap`` fails fast on trainable params outside every group when
+    ``root_wrap`` is disabled — so per-shard square sums SUM-reduce to the
+    exact global norm with no replicated double counting.
     """
     import torch.distributed as dist
 
-    world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
     grads: list[Tensor] = []
     local_sq_sum = 0.0
     for param in params:
         grad = getattr(param, "grad", None)
         if grad is None:
             continue
-        is_sharded = hasattr(grad, "to_local") and callable(getattr(grad, "to_local"))
         local_grad = grad
-        if is_sharded:
-            local_grad = grad.to_local()
+        if hasattr(local_grad, "to_local") and callable(getattr(local_grad, "to_local")):
+            local_grad = local_grad.to_local()
         if not isinstance(local_grad, Tensor):
             continue
-        sq = float(torch.sum(local_grad.detach().float() ** 2).item())
-        if not is_sharded and world_size > 1:
-            # Replicated grad (identical on every rank after sync_unsharded_grads):
-            # count it once globally, not world_size times under the SUM all-reduce.
-            sq /= world_size
-        local_sq_sum += sq
+        local_sq_sum += float(torch.sum(local_grad.detach().float() ** 2).item())
         grads.append(grad)
 
     if not grads:
@@ -310,7 +276,6 @@ def _global_clip_for_sharded_grads(
 __all__ = [
     "StateDict",
     "clip_grad_norm",
-    "sync_unsharded_grads",
     "gather_state_dict",
     "load_model_state_dict",
     "local_view",
