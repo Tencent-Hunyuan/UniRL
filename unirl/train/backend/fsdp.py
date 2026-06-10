@@ -206,6 +206,11 @@ class FSDPBackend(Remote):
                 m.set_is_last_backward(enable)
         self._grad_sync_enabled = enable
 
+    @property
+    def grad_sync_deferred(self) -> bool:
+        """True when no-sync accumulation is active (``defer_grad_sync`` under ZeRO-2)."""
+        return self._defer_grad_sync
+
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip, optimizer step, scheduler step, EMA step.
 

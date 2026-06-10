@@ -313,6 +313,21 @@ class TrainStack(Remote):
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
 
+        # Under defer_grad_sync the deferred reduce-scatter only runs inside a
+        # backward that executes after set_grad_sync(True) — the last micro's.
+        # If that micro skipped backward while earlier ones ran, the accumulated
+        # grads were never synced: the optimizer would silently step on empty
+        # grads now, and the stale unsharded accumulation (which zero_grad
+        # cannot reach) would leak into the NEXT step's reduce-scatter. Fail
+        # fast instead — mirrors fsdp_wrap's stray-trainable guard.
+        if has_backward and not micros[-1].has_backward and self.fsdp_backend.grad_sync_deferred:
+            raise RuntimeError(
+                "TrainStack.train: defer_grad_sync deferred the gradient reduce-scatter to the "
+                "last micro-batch, but it reported no backward (all-empty micro?) while earlier "
+                "micro-batches did — the accumulated grads were never synced. Disable "
+                "training.fsdp.defer_grad_sync or investigate the empty micro-batch."
+            )
+
         if has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
         else:
