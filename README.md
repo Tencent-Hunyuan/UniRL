@@ -171,7 +171,7 @@ If you use Flow-DPPO, please also cite:
 ```bibtex
 @misc{ping2026flowdppo,
   title         = {{Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models}},
-  author        = {Jiarui Yao and Xiangxin Zhou and Penghui Qi and Wee Sun Lee and Liefeng Bo and Tianyu Pang},
+  author        = {Bowen Ping and Xiangxin Zhou and Penghui Qi and Minnan Luo and Liefeng Bo and Tianyu Pang},
   year          = {2026},
   eprint        = {2606.11025},
   archivePrefix = {arXiv},
@@ -179,4 +179,3 @@ If you use Flow-DPPO, please also cite:
   url           = {https://arxiv.org/abs/2606.11025}
 }
 ```
-
