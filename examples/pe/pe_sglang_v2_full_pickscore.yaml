@@ -53,6 +53,10 @@ batch_size: 8                 # P; MUST be divisible by num_devices (composed ro
 weight_sync_interval: 1
 num_rollouts: 300
 
+# Offload both tracks' FSDP train state to CPU during generate (separate-engine
+# recipe only; trainside leaves it off — it samples the live FSDP modules).
+enable_fsdp_offload: true
+
 # ── Diffusion side (SD3) — copied from pe_trainside_pickscore.yaml ───────────────────
 diffusion:
   bundle:
@@ -129,7 +133,7 @@ diffusion:
         - attn.to_q
         - attn.to_v
   algorithm:
-    _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
     stage_attr: diffusion
     clip_range: 1.0e-4
     clip_schedule: constant
@@ -195,7 +199,7 @@ ar:
       task_type: CAUSAL_LM
       target_modules: [q_proj, k_proj, v_proj, o_proj]
   algorithm:
-    _target_: unirl.algorithms.ar_grpo.ARGRPO
+    _target_: unirl.algorithms.grpo.GRPO
     stage_attr: ar
     clip_range: 1.0e-2
     clip_schedule: constant
@@ -248,10 +252,14 @@ rollout:
       top_p: 0.9
       concurrency: 4
       engine_kwargs:
-        mem_fraction_static: 0.05
+        mem_fraction_static: 0.25
         skip_server_warmup: true
         disable_cuda_graph: false
         attention_backend: triton
+        # Make this colocated SRT engine's sleep() actually free GPU (KV +
+        # weights→CPU); without both it is a silent no-op.
+        enable_memory_saver: true
+        enable_weights_cpu_backup: true
         # This config syncs AR via full-weight-sync merge (sync.ar =
         # TensorWeightSync lora_merged): /update_weights_from_tensor, never
         # set_lora → no LoRA pool needed here. The LoRA-pool variant lives in
