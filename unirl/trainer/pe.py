@@ -177,7 +177,7 @@ class PETrainer(BaseTrainer):
         ``sync_weights`` pushes each track's freshly-trained adapter into the
         engine between ``wake_up`` and ``generate`` — no-op trainside (the
         rollout shares the live FSDP modules, so the bridges are ``None``).
-        ``rollout_id`` only keys the wandb panels (see :meth:`_log_rollout`).
+        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
         self.rollout.wake_up()
@@ -229,13 +229,21 @@ class PETrainer(BaseTrainer):
         for name in TRACK_NAMES:
             resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
-        self._drop_decoded(resp)
+        # ``reward_req`` text is repeat_interleaved to the diffusion track size
+        # (one prompt per sample), so it captions the image previews correctly —
+        # unlike ``req`` (one prompt per group).
+        self._drop_decoded(
+            req,
+            resp,
+            rollout_id=rollout_id,
+            media_prompts={"diffusion": list(reward_req.primitives["text"].texts)},
+        )
         # 5. Route each track to its own stack (each DP_SCATTER-sharded on dispatch).
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(resp.tracks[name], training_progress=float(training_progress))
             for name in TRACK_NAMES
         }
-        self._log_rollout(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
+        self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
         return results, mean_reward
 
     def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
@@ -259,18 +267,6 @@ class PETrainer(BaseTrainer):
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
-                ar, di = results["ar"], results["diffusion"]
-                logger.info(
-                    "rollout %d/%d  reward=%.4f  ar[loss=%.4f gn=%.4f lr=%.2e]  diff[loss=%.4f gn=%.4f lr=%.2e]",
-                    rollout_id + 1,
-                    num_rollouts,
-                    mean_reward,
-                    ar.loss,
-                    ar.grad_norm,
-                    ar.lr,
-                    di.loss,
-                    di.grad_norm,
-                    di.lr,
-                )
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
         finally:
             self._finish_wandb()

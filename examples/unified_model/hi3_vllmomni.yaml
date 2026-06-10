@@ -38,6 +38,10 @@ logging:
   entity: ${oc.env:WANDB_ENTITY,null}
   logging_dir: null
   tags: [hi3, two-engine, grpo]
+  # Generated-image previews (off by default elsewhere; HI3 wants them).
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
 
 bundle:
   # 80B path: meta-init (no per-rank full load) → FSDPBackend wraps the meta

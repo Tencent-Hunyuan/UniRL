@@ -129,7 +129,7 @@ class ARTrainer(BaseTrainer):
 
         Returns ``(train_result, mean_reward)`` — the mean unnormalized
         per-sample reward of the single track (0.0 if none), for the log line.
-        ``rollout_id`` only keys the wandb panels (see :meth:`_log_rollout`).
+        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
         self.rollout.wake_up()
@@ -158,10 +158,16 @@ class ARTrainer(BaseTrainer):
                     normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
                 )
 
-        self._drop_decoded(resp)
+        self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
         result = self.stack.train_track(track, training_progress=float(training_progress))
-        self._log_rollout(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
+        self.wandb_logger.log_rollout_step(
+            rollout_id,
+            result,
+            resp,
+            step_time_s=time.perf_counter() - t0,
+            trunc_len=getattr(self.sampling_params, "max_new_tokens", None),
+        )
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
@@ -211,8 +217,7 @@ class ARTrainer(BaseTrainer):
             self.eval_num_prompts,
             acc,
         )
-        if self.wandb_logger is not None and self.wandb_logger.initialized:
-            self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
+        self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
         return acc
 
     def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
@@ -244,15 +249,7 @@ class ARTrainer(BaseTrainer):
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
-                logger.info(
-                    "rollout %d/%d  reward=%.4f  loss=%.4f  grad_norm=%.4f  lr=%.2e",
-                    rollout_id + 1,
-                    num_rollouts,
-                    mean_reward,
-                    result.loss,
-                    result.grad_norm,
-                    result.lr,
-                )
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id=rollout_id)
         finally:

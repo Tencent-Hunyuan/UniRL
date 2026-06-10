@@ -55,6 +55,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -150,21 +151,15 @@ class UnifiedModelTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
     ) -> None:
-        super().__init__(cfg=cfg)
+        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         # Colocate memory dance: offload the FSDP train state (base + grads +
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
 
-        # W&B reporting config (the top-level ``logging`` block). Logger is
-        # lazily created in ``train`` on the driver (rank 0); None / disabled
-        # block → no-op. Secrets (key, entity) come from env, never the conf.
-        self.logging_cfg = logging_cfg
-        self.wandb_logger = None
-        # Advances once per optimizer step (one per rollout today; per PPO
-        # inner update if num_updates_per_batch grows) — the train/ panel axis.
-        self._global_optimizer_step = 0
+        # W&B logging (logging_cfg, wandb_logger, optimizer-step counter) is owned
+        # by BaseTrainer + UniRLWandBLogger now — see super().__init__ above.
 
         # Intrusive debug dump: per rollout, write original prompt + AR output
         # text (= the think/recaption that conditions DiT) + decoded images +
@@ -507,12 +502,15 @@ class UnifiedModelTrainer(BaseTrainer):
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
+        rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
         """One ``rollout → reward → credit-assign → advantage → step`` pass.
 
         Returns ``(per_track_results, mean_reward)`` — ``mean_reward`` is the
-        mean unnormalized image reward (for the log line).
+        mean unnormalized image reward (for the log line). ``rollout_id`` keys
+        the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
+        t0 = time.perf_counter()
         # Colocate memory dance (150GB base can't coexist with an awake engine on
         # the same card). Steady state on entry: base offloaded, engines asleep.
         #   1. EXTRACT while engines ASLEEP + base ONLOADED — extract() runs a
@@ -586,13 +584,27 @@ class UnifiedModelTrainer(BaseTrainer):
         for name in (AR_TRACK, IMAGE_TRACK):
             resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
-        # after the debug dump (which reads decoded), before training
-        self._drop_decoded(resp)
+        # after the debug dump (which reads decoded), before training.
+        # ``reward_texts`` is 1:1 with the image track (built at scoring), so it
+        # captions the image previews correctly.
+        self._drop_decoded(
+            req,
+            resp,
+            rollout_id=rollout_id,
+            media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
+        )
         # 5. Two backward (shared backbone) → one optimizer step.
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             resp.tracks[AR_TRACK],
             resp.tracks[IMAGE_TRACK],
             training_progress=float(training_progress),
+        )
+        self.wandb_logger.log_rollout_step(
+            rollout_id,
+            results,
+            resp,
+            step_time_s=time.perf_counter() - t0,
+            extra_metrics={"sync_weights": float(bool(sync_weights))},
         )
 
         # 6. Back to steady state (base on CPU) so the next rollout's engines
@@ -678,126 +690,33 @@ class UnifiedModelTrainer(BaseTrainer):
     def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)
-        self._init_wandb()
-        for rollout_id in range(num_rollouts):
-            training_progress = rollout_id / max(1, num_rollouts - 1)
-            self._dump_rollout_id = rollout_id  # picked up by train_step's dump
-            inputs = self.data_source.get_samples(self.batch_size)
-            req = self._build_req(inputs, rollout_id)
-            # Sync before generate; skip step 0 (nothing trained yet). The
-            # HI3_SYNC_FIRST env forces a sync on rollout 0 too — a debug knob to
-            # exercise the LoRA-sync path early (cheaply) without a full extra
-            # rollout; the rollout-0 adapter is ~0 but that's fine for testing
-            # the register→activate mechanism.
-            sync_weights = (rollout_id > 0 or os.environ.get("HI3_SYNC_FIRST")) and rollout_id % interval == 0
-            results, mean_reward = self.train_step(
-                req,
-                training_progress=training_progress,
-                sync_weights=sync_weights,
-            )
-            ar, di = results[AR_TRACK], results[IMAGE_TRACK]
-
-            # Step-0 ratio probe (π_old vs π_θ alignment). On rollout 0 the LoRA
-            # is ~0 so a correct replay should give ratio≈1, std≈0; a systematic
-            # offset means the logp convention (temperature / top-k-p filtering /
-            # full-vs-renorm softmax) doesn't match vLLM's sampler — toggle the
-            # replay temperature and re-check before trusting the gradient.
-            def _m(res, key):
-                metrics = getattr(res, "metrics", None) or {}
-                v = metrics.get(key)
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    return float("nan")
-
-            logger.info(
-                "rollout %d/%d  reward=%.4f  "
-                "ar[loss=%.4f ratio=%.4f±%.4f clip=%.2f]  "
-                "image[loss=%.4f gn=%.4f lr=%.2e ratio=%.4f±%.4f clip=%.2f]",
-                rollout_id + 1,
-                num_rollouts,
-                mean_reward,
-                ar.loss,
-                _m(ar, "ratio_mean"),
-                _m(ar, "ratio_std"),
-                _m(ar, "clip_fraction"),
-                di.loss,
-                di.grad_norm,
-                di.lr,
-                _m(di, "ratio_mean"),
-                _m(di, "ratio_std"),
-                _m(di, "clip_fraction"),
-            )
-
-            if self.wandb_logger is not None:
-                # Mirror train.py (SD3.5): the per-track training scalars
-                # (loss / ratio / clip / grad_norm / lr) go to BOTH panels —
-                # ``rollout/*`` keyed by rollout_id (1 point per rollout) and
-                # ``train/*`` keyed by global_optimizer_step. With one update
-                # per rollout the two axes coincide; under PPO multi-epoch the
-                # train/ axis advances per optimizer step and shows the
-                # intra-rollout ratio drift. Reward stats stay rollout-only.
-                training_metrics = {
-                    "ar/loss": ar.loss,
-                    "ar/ratio_mean": _m(ar, "ratio_mean"),
-                    "ar/ratio_std": _m(ar, "ratio_std"),
-                    "ar/clip_fraction": _m(ar, "clip_fraction"),
-                    "image/loss": di.loss,
-                    "image/grad_norm": di.grad_norm,
-                    "image/lr": di.lr,
-                    "image/ratio_mean": _m(di, "ratio_mean"),
-                    "image/ratio_std": _m(di, "ratio_std"),
-                    "image/clip_fraction": _m(di, "clip_fraction"),
-                }
-                self.wandb_logger.log_rollout(
-                    rollout_id,
-                    {
-                        **training_metrics,
-                        "reward_mean": mean_reward,
-                        "sync_weights": float(bool(sync_weights)),
-                    },
+        self._init_wandb(num_rollouts=num_rollouts)
+        try:
+            for rollout_id in range(num_rollouts):
+                training_progress = rollout_id / max(1, num_rollouts - 1)
+                self._dump_rollout_id = rollout_id  # picked up by train_step's dump
+                inputs = self.data_source.get_samples(self.batch_size)
+                req = self._build_req(inputs, rollout_id)
+                # Sync before generate; skip step 0 (nothing trained yet). The
+                # HI3_SYNC_FIRST env forces a sync on rollout 0 too — a debug knob to
+                # exercise the LoRA-sync path early (cheaply) without a full extra
+                # rollout; the rollout-0 adapter is ~0 but that's fine for testing
+                # the register→activate mechanism.
+                sync_weights = (rollout_id > 0 or os.environ.get("HI3_SYNC_FIRST")) and rollout_id % interval == 0
+                results, mean_reward = self.train_step(
+                    req,
+                    training_progress=training_progress,
+                    sync_weights=sync_weights,
+                    rollout_id=rollout_id,
                 )
-                self._global_optimizer_step += 1
-                self.wandb_logger.log_step(self._global_optimizer_step, training_metrics)
-
-        if self.wandb_logger is not None:
-            self.wandb_logger.finish()
-
-    def _init_wandb(self) -> None:
-        """Create the driver-side W&B logger from the ``logging`` block.
-
-        No-op when the block is absent or ``report_to_wandb`` is off. Mirrors
-        ``train.py``: secrets (API key, entity) come from the environment
-        (``WANDB_API_KEY`` / ``WANDB_ENTITY``), never the committed conf.
-        """
-        cfg = self.logging_cfg
-        if cfg is None or not cfg.get("report_to_wandb") or not cfg.get("project_name"):
-            return
-        from unirl.utils.wandb_logger import init_logger
-
-        raw_tags = cfg.get("tags")
-        if isinstance(raw_tags, str):
-            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
-        elif raw_tags:
-            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
-        else:
-            tags = None
-        self.wandb_logger = init_logger(
-            project=str(cfg.get("project_name")),
-            run_name=cfg.get("run_name"),
-            config=None,
-            log_dir=cfg.get("logging_dir"),
-            rank=0,
-            tags=tags,
-            entity=cfg.get("entity") or os.environ.get("WANDB_ENTITY") or None,
-            require_success=True,
-        )
-        if self.wandb_logger.initialized:
-            logger.info(
-                "WandB initialized: project=%s run=%s",
-                cfg.get("project_name"),
-                cfg.get("run_name"),
-            )
+                # Per-track console line (ar / image) with the step-0 ratio probe
+                # (π_old vs π_θ alignment): on rollout 0 the LoRA is ~0 so a correct
+                # replay should give ratio≈1, std≈0; a systematic offset means the
+                # logp convention (temperature / top-k-p filtering / full-vs-renorm
+                # softmax) doesn't match vLLM's sampler.
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
+        finally:
+            self._finish_wandb()
 
 
 __all__ = ["UnifiedModelTrainer"]
