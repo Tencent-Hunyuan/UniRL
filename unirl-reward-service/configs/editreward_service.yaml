@@ -1,0 +1,28 @@
+# EditReward-only service configuration.
+#
+# Deploy on a dedicated node (1 GPU for the 7B VLM scorer).
+# The training node connects via REWARD_SERVICE_URL=http://<this_node_ip>:8080.
+#
+# Start:
+#   ray start --head --port=6379 --num-gpus=1
+#   python -m reward_service --config configs/editreward_service.yaml
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 300.0
+
+rewards:
+  - name: editreward
+    scorer: editreward
+    runtime_env: envs/editreward.txt  # empty file; deps installed by launcher
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      checkpoint_path: TIGER-Lab/EditReward-MiMo-VL-7B-SFT-2508
+      config_path: config/EditReward-MiMo-VL-7B-SFT-2508.yaml
+      device: cuda
+      dtype: bfloat16
+      rm_head_type: ranknet_multi_head
