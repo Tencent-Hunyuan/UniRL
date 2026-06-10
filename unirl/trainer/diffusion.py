@@ -10,8 +10,11 @@ from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor.transport import TensorMeta, map_tree
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
+from unirl.types.media_preview import build_media_preview_for_track
+from unirl.types.primitives import Images, Videos
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import _hydrate_tensor_meta
@@ -19,6 +22,47 @@ from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+
+def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
+    """Smallest sample count >= ``min_items`` landing on a TensorMeta ref boundary.
+
+    ``decoded`` reaches the driver dehydrated: its tensor leaf (``Images.pixels``
+    / ``Videos.frames``) is a ``TensorMeta`` whose refs partition the batch by DP
+    shard, and ``TensorMeta`` only supports ref-boundary slicing. The cheapest
+    preview prefix is therefore the first shard boundary covering ``min_items``
+    samples — slicing there lets media logging hydrate one shard instead of the
+    full decoded batch. ``Videos`` ref sizes count frames (PACKED), so shard
+    frame boundaries are mapped back to sample indices via the driver-side
+    ``cu_seqlens``. Returns the full batch size when the leaf is already a real
+    tensor (nothing to save) or a boundary cannot be mapped.
+    """
+    total = len(decoded)
+    want = max(1, min(int(min_items), total))
+    if isinstance(decoded, Images):
+        meta = decoded.pixels
+        if not isinstance(meta, TensorMeta):
+            return total
+        rows = 0
+        for size in meta.sizes:
+            rows += int(size)
+            if rows >= want:
+                return rows
+        return total
+    meta = decoded.frames
+    cu = decoded.cu_seqlens
+    if not isinstance(meta, TensorMeta) or cu is None:
+        return total
+    sample_at_frame = {int(v): i for i, v in enumerate(cu.tolist())}
+    frames = 0
+    for size in meta.sizes:
+        frames += int(size)
+        sample_idx = sample_at_frame.get(frames)
+        if sample_idx is None:
+            return total
+        if sample_idx >= want:
+            return sample_idx
+    return total
 
 
 class DiffusionTrainer(BaseTrainer):
@@ -311,22 +355,23 @@ class DiffusionTrainer(BaseTrainer):
         ``track.decoded`` arrives at the driver with its tensor leaves dehydrated
         to ``TensorMeta`` proxies (``Worker.call`` packs every returned tensor),
         so we hydrate them back to real ``Images`` / ``Videos`` before building
-        the preview. ``build_media_preview_for_track`` returns ``None`` for a
-        track without materialized media, so this stays safe across topologies.
-        Hydration pulls the full decoded batch to the driver, so keep
-        ``media_log_interval`` modest (not every rollout) on large batches."""
+        the preview. Only ``media_max_items`` samples end up in the preview, so
+        the dehydrated batch is first sliced to the smallest DP-shard
+        (ref-boundary) prefix covering them — the driver pulls one shard instead
+        of the full decoded batch (see :func:`_ref_aligned_prefix_len`).
+        Non-media tracks (``Texts``, ``Audios``, …) are skipped without any
+        fetch."""
         if not self._log_media or (rollout_id % self._media_log_interval != 0):
             return
         wb = self.wandb_logger
         if wb is None or not wb.initialized:
             return
-        from unirl.distributed.tensor.transport import map_tree
-        from unirl.types.media_preview import build_media_preview_for_track
-        from unirl.types.rollout_resp import _hydrate_tensor_meta
-
         for track in resp.tracks.values():
-            if track.decoded is None:
+            if not isinstance(track.decoded, (Images, Videos)):
                 continue
+            prefix = _ref_aligned_prefix_len(track.decoded, self._media_max_items)
+            if 0 < prefix < len(track.decoded):
+                track.decoded = track.decoded.slice(0, prefix)
             track.decoded = map_tree(track.decoded, _hydrate_tensor_meta)
             media = build_media_preview_for_track(req=req, track=track, max_items=self._media_max_items)
             if media is not None:
