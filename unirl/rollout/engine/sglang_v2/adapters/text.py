@@ -201,7 +201,6 @@ class TextLMAdapter(ModelAdapter):
         return TextSegment.pack(
             tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
             log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
-            sample_indices=torch.arange(len(raw), dtype=torch.long),
         )
 
     def build_decoded(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
