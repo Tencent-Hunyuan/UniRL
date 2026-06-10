@@ -16,7 +16,6 @@ PlacementGroup bundles reserve CPU quota for all slots upfront.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional, Set
 
 import ray
@@ -161,15 +160,6 @@ class DevicePool:
             "MASTER_PORT": str(master_port),
             "WORLD_SIZE": str(self.num_devices),
         }
-        # Ray's runtime_env env_vars do not inherit the driver's LD_LIBRARY_PATH;
-        # forward it so GPU workers — and the rollout-engine server subprocesses
-        # they spawn (e.g. the sglang SRT scheduler) — keep the loader paths the
-        # driver was launched with. On the cu13 / glibc-2.34 sglang image this
-        # carries cuda-compat-13 + the nvidia wheel lib dirs; without it the
-        # spawned SRT scheduler aborts with "NVIDIA driver too old".
-        _ld_library_path = os.environ.get("LD_LIBRARY_PATH")
-        if _ld_library_path:
-            env_vars_base["LD_LIBRARY_PATH"] = _ld_library_path
         for device_id in range(self.num_devices):
             self._device_to_workers[device_id] = []
             env_vars = {**env_vars_base, "RANK": str(device_id)}
@@ -254,13 +244,6 @@ class DevicePool:
                         "MASTER_PORT": self._master_port,
                         "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
                         "CUDA_VISIBLE_DEVICES": cvd,
-                        # Mirror slot0's LD_LIBRARY_PATH (see _create_workers):
-                        # the TensorWorker also runs cu13 GPU torch / NCCL.
-                        **(
-                            {"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]}
-                            if os.environ.get("LD_LIBRARY_PATH")
-                            else {}
-                        ),
                     }
                 },
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
