@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import List
 
 import torch
-from tqdm import tqdm
 
 from unirl.reward.base import BaseRewardComponentSpec
 from unirl.reward.local.device import resolve_device
@@ -58,12 +56,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
                 return output[0]
             raise TypeError(f"Unexpected output format: {type(output)}")
 
-        rank = int(os.environ.get("RANK", 0))
-        for i in tqdm(
-            range(0, len(images), self.batch_size),
-            desc="Computing PickScore rewards",
-            disable=(rank != 0),
-        ):
+        for i in range(0, len(images), self.batch_size):
             batch_images = images[i : i + self.batch_size]
             batch_prompts = prompts[i : i + self.batch_size]
 
