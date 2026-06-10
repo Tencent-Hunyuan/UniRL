@@ -57,6 +57,14 @@ num_rollouts: 300
 # recipe only; trainside leaves it off — it samples the live FSDP modules).
 enable_fsdp_offload: true
 
+# W&B logging (rank-0/driver only); inert unless REPORT_TO_WANDB=true is exported.
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-pe}
+  run_name: ${oc.env:WANDB_RUN_NAME,pe_sglang_v2_full_pickscore}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["pe", "pickscore", "sglang_v2", "full"]
+
 # ── Diffusion side (SD3) — copied from pe_trainside_pickscore.yaml ───────────────────
 diffusion:
   bundle:
