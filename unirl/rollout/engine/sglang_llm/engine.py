@@ -516,6 +516,12 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
             "mem_fraction_static": mem_fraction,
             "nccl_port": nccl_port,
         }
+        if self._tp_size > 1 and "disable_custom_all_reduce" not in engine_kwargs:
+            # Containerized colocate breaks sgl_kernel custom all-reduce CUDA-graph
+            # IPC across the tp worker processes (get_graph_buffer_ipc_meta →
+            # "invalid argument"). NCCL all-reduce is marginally slower but works
+            # everywhere; an explicit engine_kwargs override still wins.
+            server_kwargs["disable_custom_all_reduce"] = True
 
         current_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
         logger.info(
@@ -560,6 +566,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
             "max_loras_per_batch",
             "max_loaded_loras",
             "enable_multimodal",
+            "disable_custom_all_reduce",
+            "enable_p2p_check",
         ):
             if key in engine_kwargs:
                 server_kwargs[key] = engine_kwargs[key]
