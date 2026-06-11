@@ -198,6 +198,9 @@ stack:
   # sequence was its own fwd/bwd (severe GPU under-utilization). 10240 mirrors
   # the verl reference. null = legacy count-based micros.
   micro_token_budget: 10240
+  # 'sum' = packed varlen replay cost accounting (qwen3 packed path, verl parity);
+  # 'dense' for rectangular-padding replays.
+  micro_cost_model: sum
   max_grad_norm: 1.0
   # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
   # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16

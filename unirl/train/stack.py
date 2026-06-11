@@ -101,6 +101,36 @@ def _micro_indices(plan: MicroPlan) -> List[int]:
     return list(plan)
 
 
+def _build_token_budget_micros_sum(
+    *,
+    indices: Sequence[int],
+    lengths: Sequence[int],
+    token_budget: int,
+) -> List[List[int]]:
+    """Sum-cost packing for a PACKED (varlen) replay: a micro's compute cost is
+    the plain sum of its sequences' real tokens (no padding exists), exactly
+    verl's ppo_max_token_len_per_gpu accounting. First-fit decreasing.
+    """
+    if int(token_budget) < 1:
+        raise ValueError(f"micro_token_budget must be >= 1; got {token_budget}")
+    order = sorted(indices, key=lambda i: (-int(lengths[i]), i))
+    bins: List[List[int]] = []
+    bin_sum: List[int] = []
+    for i in order:
+        length = max(1, int(lengths[i]))
+        placed = False
+        for b in range(len(bins)):
+            if bin_sum[b] + length <= token_budget:
+                bins[b].append(i)
+                bin_sum[b] += length
+                placed = True
+                break
+        if not placed:
+            bins.append([i])
+            bin_sum.append(length)
+    return bins
+
+
 def _build_token_budget_micros_2d(
     *,
     indices: Sequence[int],
@@ -316,6 +346,7 @@ class TrainStack(Remote):
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
         micro_token_budget: Optional[int] = None,
+        micro_cost_model: str = "dense",
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -341,6 +372,13 @@ class TrainStack(Remote):
         self.micro_token_budget = None if micro_token_budget is None else _positive_int(
             name="TrainStack.micro_token_budget", value=micro_token_budget
         )
+        # 'dense': micro cost = (max_prompt + max_resp) * count — rectangular
+        #          replay that pads to the in-micro maxes.
+        # 'sum':   micro cost = sum of real tokens — packed varlen replay
+        #          (qwen3 packed path; = verl token accounting).
+        if micro_cost_model not in ("dense", "sum"):
+            raise ValueError(f"TrainStack.micro_cost_model must be dense|sum, got {micro_cost_model!r}")
+        self.micro_cost_model = str(micro_cost_model)
         self.max_grad_norm = float(max_grad_norm)
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
@@ -419,7 +457,13 @@ class TrainStack(Remote):
         padded_tokens = 0
         for mini_start, mini_end in _build_mini_batch_slices(total_size=total, num_updates=self.num_updates_per_batch):
             indices = list(range(mini_start, mini_end))
-            if prompt_lens is not None:
+            if self.micro_cost_model == "sum":
+                bins = _build_token_budget_micros_sum(
+                    indices=indices,
+                    lengths=totals,
+                    token_budget=self.micro_token_budget,
+                )
+            elif prompt_lens is not None:
                 bins = _build_token_budget_micros_2d(
                     indices=indices,
                     prompt_lens=prompt_lens,
@@ -444,9 +488,12 @@ class TrainStack(Remote):
             for b in bins:
                 n_micros += 1
                 real_tokens += sum(totals[i] for i in b)
-                pmax = max(prompt_lens[i] for i in b) if prompt_lens is not None else 0
-                tmax = max(resp_lens[i] for i in b)
-                padded_tokens += (pmax + tmax if prompt_lens is not None else tmax) * len(b)
+                if self.micro_cost_model == "sum":
+                    padded_tokens += sum(totals[i] for i in b)
+                else:
+                    pmax = max(prompt_lens[i] for i in b) if prompt_lens is not None else 0
+                    tmax = max(resp_lens[i] for i in b)
+                    padded_tokens += (pmax + tmax if prompt_lens is not None else tmax) * len(b)
         logger.info(
             "TrainStack packing: %d micros for %d samples (budget=%d), dense efficiency %.0f%% (%d/%d tokens)",
             n_micros,
