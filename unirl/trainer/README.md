@@ -113,8 +113,9 @@ so EMA decay schedules continue) and resumes the loop from the saved step:
 data stream fast-forwards to the resume point (exact when `run.seed` is set —
 the shuffle is generator-seeded), and the first rollout force-syncs the
 restored adapter into the rollout engine (which booted with fresh weights).
-RNG state is not yet checkpointed — sampling noise after resume differs from
-an uninterrupted run.
+The wandb run also continues: `trainer_state.json` (driver-written, beside
+`checkpoint.pt`) carries the run id and the `train/` step axis, and
+`_init_wandb` reattaches to that run instead of starting a fresh one.
 
 ### Export to Hugging Face format
 

@@ -202,6 +202,8 @@ class UniRLWandBLogger:
         enabled: bool = True,
         tags: Optional[List[str]] = None,
         entity: Optional[str] = None,
+        run_id: Optional[str] = None,
+        optimizer_step: int = 0,
     ):
         """Initialize WandB logger.
 
@@ -222,6 +224,9 @@ class UniRLWandBLogger:
             enabled: Whether to enable logging (disabled => no-op null-object)
             tags: List of tags for the WandB run. Defaults to ['unirl'] if not provided.
             entity: WandB entity (team or username). If None, uses the default entity.
+            run_id: Resume this wandb run id (from a checkpoint's
+                trainer_state.json) instead of starting a fresh run.
+            optimizer_step: Seed for the ``train/`` step axis on resume.
         """
         self.project = project
         self.run_name = run_name
@@ -232,10 +237,11 @@ class UniRLWandBLogger:
         self.log_media = bool(log_media)
         self.rank = rank
         self.tags = tags if tags is not None else ["unirl"]
+        self.run_id = run_id
         self._initialized = False
         # Optimizer-step counter for the ``train/`` panel (moved here from
         # BaseTrainer so all step-axis bookkeeping lives in the logger).
-        self._optimizer_step = 0
+        self._optimizer_step = int(optimizer_step)
 
         # Only enable on rank 0
         self.enabled = enabled and rank == 0
@@ -250,6 +256,11 @@ class UniRLWandBLogger:
     def initialized(self) -> bool:
         """Whether wandb.init completed successfully."""
         return bool(self._initialized)
+
+    @property
+    def optimizer_step(self) -> int:
+        """Current ``train/`` step-axis value — checkpointed for resume."""
+        return self._optimizer_step
 
     def _handle_init_failure(
         self,
@@ -292,7 +303,13 @@ class UniRLWandBLogger:
             )
             if self.entity:
                 init_kwargs["entity"] = self.entity
+            if self.run_id:
+                # Resume the checkpoint's run ("allow": append if the id
+                # exists, else create it) so curves continue in one run.
+                init_kwargs["id"] = self.run_id
+                init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
+            self.run_id = wandb.run.id
             self._init_metric_axes()
             self._initialized = True
         except Exception as e:

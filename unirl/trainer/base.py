@@ -1,4 +1,5 @@
 import functools
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -89,6 +90,10 @@ class BaseTrainer:
 
         self.logging_cfg = logging_cfg
         self.wandb_logger = UniRLWandBLogger(enabled=False)
+        # Driver-side state from a resumed checkpoint's trainer_state.json
+        # (wandb run id / step axis); populated by maybe_load_checkpoint,
+        # consumed by _init_wandb. Empty for fresh runs.
+        self._resume_state: Dict[str, Any] = {}
 
         # Reclaim per-rollout transport buffers after every train_step, centrally,
         # so each subclass train loop doesn't have to remember to.
@@ -187,6 +192,8 @@ class BaseTrainer:
             media_max_items=int(cfg.get("media_max_items", 8)),
             media_log_interval=int(cfg.get("media_log_interval", 1)),
             enabled=report,
+            run_id=self._resume_state.get("wandb_run_id"),
+            optimizer_step=int(self._resume_state.get("optimizer_step") or 0),
         )
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
@@ -288,6 +295,11 @@ class BaseTrainer:
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
         self.backend.save(path, step=step, mode=save_mode)
+        # Driver-owned state rides beside the worker-written checkpoint.pt:
+        # the wandb run id + train/ step axis let a resume append to the SAME
+        # wandb run instead of starting a fresh, misaligned one.
+        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from.
@@ -305,6 +317,10 @@ class BaseTrainer:
         if isinstance(result, list):  # BROADCAST dispatch collects one result per worker
             result = result[0]
         start = int(result or 0)
+        state_path = os.path.join(load_dir, "trainer_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                self._resume_state = json.load(f)
         logger.info("Checkpoint restored; resuming at rollout %d", start)
         if num_rollouts is not None and start >= num_rollouts:
             logger.warning(
