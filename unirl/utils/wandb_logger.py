@@ -79,9 +79,9 @@ class PhaseTimer:
         return time.perf_counter() - self._t0
 
 
-#: (trainer attribute, method, phase name) — the standard per-step collaborators
-#: every v2 trainer drives; missing ones (e.g. trainside has no ``weight_sync``)
-#: are skipped by :func:`install_phase_timing`.
+#: (handle attr, method, phase name) — the standard per-step collaborator
+#: handles every v2 trainer drives; missing ones (e.g. trainside has no
+#: ``weight_sync``) are skipped by :func:`install_phase_timing`.
 _STEP_PHASE_SPECS = (
     ("rollout", "wake_up", "wake_up"),
     ("rollout", "generate", "generate"),
@@ -122,34 +122,48 @@ def install_phase_timing(trainer: Any) -> None:
     inner = getattr(trainer, "train_step", None)
     if not callable(inner):
         return
-    trainer._step_timer = PhaseTimer()
-    trainer._phase_wraps_installed = False
 
     @functools.wraps(inner)
-    def _timed_train_step(*args, **kwargs):
+    def _steady_step(*args, **kwargs):
         trainer._step_timer = PhaseTimer()  # re-arm: fresh phases for this step
-        if not trainer._phase_wraps_installed:
-            _wrap_step_collaborators(trainer)
-            trainer._phase_wraps_installed = True
         return inner(*args, **kwargs)
 
-    trainer.train_step = _timed_train_step
+    @functools.wraps(inner)
+    def _first_step(*args, **kwargs):
+        # First step is the earliest point the collaborators and the live logger
+        # are all constructed; wrap them once, then rebind to the lean steady
+        # wrapper so later steps just re-arm (no per-step branch, no latch flag).
+        trainer._step_timer = PhaseTimer()
+        _wrap_step_collaborators(trainer)
+        trainer.train_step = _steady_step
+        return inner(*args, **kwargs)
+
+    trainer._step_timer = PhaseTimer()  # target for any pre-step evaluate()
+    trainer.train_step = _first_step
+
+
+def _timed_call(trainer: Any, fn, phase: str):
+    """Return ``fn`` wrapped to accumulate its wall-clock under ``phase``."""
+
+    @functools.wraps(fn)
+    def _timed(*args, **kwargs):
+        with trainer._step_timer.phase(phase):
+            return fn(*args, **kwargs)
+
+    return _timed
 
 
 def _wrap_step_collaborators(trainer: Any) -> None:
-    """Wrap the present ``_STEP_PHASE_SPECS`` callables + the live logger."""
-    for owner_name, method, phase in _STEP_PHASE_SPECS:
-        owner = getattr(trainer, owner_name, None)
-        fn = getattr(owner, method, None) if owner is not None else None
+    """Time each present collaborator method, and teach the logger to emit phases."""
+    for handle_attr, method, phase in _STEP_PHASE_SPECS:
+        handle = getattr(trainer, handle_attr, None)
+        fn = getattr(handle, method, None)
         if not callable(fn):
             continue
+        setattr(handle, method, _timed_call(trainer, fn, phase))
 
-        def _timed(*args, _fn=fn, _phase=phase, **kwargs):
-            with trainer._step_timer.phase(_phase):
-                return _fn(*args, **kwargs)
-
-        setattr(owner, method, functools.wraps(fn)(_timed))
-
+    # Inject the phases we collected into the logger boundary, unless the
+    # trainer already passed its own.
     log_inner = trainer.wandb_logger.log_rollout_step
 
     @functools.wraps(log_inner)
