@@ -26,7 +26,9 @@ Expected first milestone:
 3. UniRL core imports.
 4. Hydra configs compose.
 
-Only after that should we try the engine extras.
+This milestone has been verified on DGX Spark with Python 3.12.3,
+glibc 2.39, CUDA 13.0 user wheels, `torch==2.12.0+cu130`, and GB10 reporting
+`sm_121`. Only after this layer passes should we try the engine extras.
 
 ## Install
 
@@ -58,7 +60,9 @@ python scripts/dgx_spark_probe.py
 python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job --resolve
 ```
 
-The probe exits non-zero if the required DGX Spark smoke-test layer fails. It also
+A passing DGX Spark smoke test should report `torch.cuda.is_available=true`,
+`torch.version.cuda=13.0`, `torch.cuda.device=NVIDIA GB10`, and a successful CUDA
+tensor smoke test. The probe exits non-zero if the required layer fails. It also
 prints optional failures for `sglang`, `vllm`, `flash_attn`, and
 `sglang_kernel`; those are expected until their linux-aarch64 CUDA 13 wheels (or a
 working local source-build recipe) are available.
