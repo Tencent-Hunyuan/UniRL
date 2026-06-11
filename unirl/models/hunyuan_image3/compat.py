@@ -41,17 +41,21 @@ def apply_hi3_transformers5_compat() -> None:
     except Exception:  # noqa: BLE001 — best-effort; a transformers without StaticLayer doesn't need it
         pass
 
-    # B — Siglip2 image processor: default return_tensors="pt"
+    # B — Siglip2 image processor: default return_tensors="pt". Patch BOTH the
+    # Fast and non-Fast classes: the "Fast" suffix is deprecated in transformers
+    # 5.x and from_dict may yield a non-Fast instance.
     try:
         from transformers.models.siglip2 import image_processing_siglip2 as _sig
 
-        _cls = getattr(_sig, "Siglip2ImageProcessorFast", None)
-        if _cls is not None and not getattr(_cls.preprocess, "_hi3_compat", False):
+        for _clsname in ("Siglip2ImageProcessor", "Siglip2ImageProcessorFast"):
+            _cls = getattr(_sig, _clsname, None)
+            if _cls is None or getattr(_cls.preprocess, "_hi3_compat", False):
+                continue
             _orig_pp = _cls.preprocess
 
-            def _preprocess(self, *args, **kwargs):
+            def _preprocess(self, *args, _orig=_orig_pp, **kwargs):
                 kwargs.setdefault("return_tensors", "pt")
-                return _orig_pp(self, *args, **kwargs)
+                return _orig(self, *args, **kwargs)
 
             _preprocess._hi3_compat = True
             _cls.preprocess = _preprocess
