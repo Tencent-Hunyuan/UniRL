@@ -9,6 +9,7 @@ pushes too aggressively in the reward-improving direction.
 - **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`_gaussian_kl_div`, `_flowdppo_kl_adv_loss`, `FlowDPPO`)
 - **SDE / replay path:** [`unirl/models/sd3/diffusion.py`](../unirl/models/sd3/diffusion.py), [`unirl/sde/kernels.py`](../unirl/sde/kernels.py)
 - **Recipe:** [`examples/diffusion/sd3_flowdppo.yaml`](../examples/diffusion/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
+- **Checkpoints:** [🤗 FlowDPPO](https://huggingface.co/Eculid/sd3.5-flowdppo)
 - **Paper:** *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models."*
 
 FlowDPPO builds on the same GRPO-style SDE rollout, trained-step gating, and
