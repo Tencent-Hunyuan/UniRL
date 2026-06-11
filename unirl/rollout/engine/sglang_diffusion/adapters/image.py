@@ -269,14 +269,19 @@ class ImageAdapter(ModelAdapter):
         sde_indices: Optional[List[int]],
         emit_native_logprob: bool,
     ):
-        """Latent-trajectory stage: collect, convert to image form, assemble.
+        """Latent-trajectory stage: collect, gate the 5-D image-form shape, assemble.
 
-        Image-form families keep latents 5-D throughout (the ``to_image_form``
-        default is a passthrough); packed-token families override ``to_image_form``
-        with their unpack.
+        Image-form families keep latents 5-D throughout; packed-token families
+        (FLUX.2-Klein, Qwen-Image) override this stage to unpack their packed
+        trajectory to image form first.
         """
         traj = utils.collect_trajectory_latents(results)
-        traj = self.to_image_form(traj, req)
+        if traj.ndim != 5:
+            raise ValueError(
+                f"{self.model_family}: expected a 5-D image-form trajectory "
+                f"[B, T+1, C, H, W]; got rank {traj.ndim}, shape {tuple(traj.shape)}. "
+                f"Packed-trajectory families override build_segment."
+            )
         return utils.build_latent_segment(
             traj,
             results=results,
@@ -286,20 +291,6 @@ class ImageAdapter(ModelAdapter):
             emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
-
-    def to_image_form(self, traj, req: RolloutReq):
-        """Convert the collected trajectory to 5-D image form ``[B, T+1, C, H, W]``.
-
-        Default: trajectories already arrive image-form; packed-token families
-        (FLUX.2-Klein, Qwen-Image) override this stage with their unpack.
-        """
-        if traj.ndim != 5:
-            raise ValueError(
-                f"{self.model_family}: expected a 5-D image-form trajectory "
-                f"[B, T+1, C, H, W]; got rank {traj.ndim}, shape {tuple(traj.shape)}. "
-                f"Packed-trajectory families override to_image_form."
-            )
-        return traj
 
     def build_decoded(self, results: List[RawResult]):
         return utils.stack_decoded_images(results)

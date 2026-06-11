@@ -3,7 +3,7 @@
 Qwen-Image's transformer is a packed-token model like FLUX.2-Klein: SGLang's
 denoising loop carries ``[B, S, C*4]`` tokens (2×2 patchify over a 16-channel
 VAE latent), so the trajectory arrives packed ``[B, T+1, S, 64]`` and
-``to_image_form`` unpacks it before assembly. Unlike Klein (which keeps
+``build_segment`` unpacks it before assembly. Unlike Klein (which keeps
 packed channels at patch resolution), the unpack target is the **true**
 channel form ``[B, T+1, 16, latent_h, latent_w]`` — exactly what the
 trainside replay consumes (``models/qwen_image/diffusion.py`` stores segments
@@ -21,7 +21,7 @@ same norm-preserving true-CFG blend as the trainside replay).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
@@ -38,25 +38,42 @@ _QWEN_DOWNSAMPLE = 16
 class QwenImageAdapter(ImageAdapter):
     """Qwen-Image — packed sequence-style trajectory unpacked to true channels."""
 
-    def to_image_form(self, traj, req: RolloutReq):
-        """Unpack Qwen's packed ``[B, T, S, C*4]`` to true-channel ``[B, T, C, H_lat, W_lat]``.
+    def build_segment(
+        self,
+        req: RolloutReq,
+        results: List[RawResult],
+        *,
+        num_steps: int,
+        sde_indices: Optional[List[int]],
+        emit_native_logprob: bool,
+    ):
+        """Collect, unpack Qwen's packed ``[B, T, S, C*4]`` to true channels, assemble.
 
         Depatchifies 2×2 to the true 16-channel latent grid. Grid arithmetic is
         the canonical ``latent_h = 2 * (height // 16)`` (mirrors
         ``QwenImagePipeline.latent_shape`` / the server's ``prepare_latent_shape``),
         NOT ``height // 8`` — the two differ for dims that are multiples of 8 but
-        not of 16. 5-D input passes through untouched (image-form arrivals).
+        not of 16. 5-D arrivals (image-form) skip the unpack.
         """
-        if traj.ndim == 5:
-            return traj
-        B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
-            traj, req, family="qwen_image", downsample=_QWEN_DOWNSAMPLE
-        )
-        from unirl.models.qwen_image.diffusion import _unpack_latents
+        traj = utils.collect_trajectory_latents(results)
+        if traj.ndim != 5:
+            B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
+                traj, req, family="qwen_image", downsample=_QWEN_DOWNSAMPLE
+            )
+            from unirl.models.qwen_image.diffusion import _unpack_latents
 
-        flat = traj.reshape(B * T, S, C)
-        unpacked = _unpack_latents(flat, latent_h=2 * h_pat, latent_w=2 * w_pat)
-        return unpacked.reshape(B, T, C // 4, 2 * h_pat, 2 * w_pat).contiguous()
+            flat = traj.reshape(B * T, S, C)
+            unpacked = _unpack_latents(flat, latent_h=2 * h_pat, latent_w=2 * w_pat)
+            traj = unpacked.reshape(B, T, C // 4, 2 * h_pat, 2 * w_pat).contiguous()
+        return utils.build_latent_segment(
+            traj,
+            results=results,
+            expected_sigmas=req.sigmas,
+            num_steps=num_steps,
+            sde_indices=sde_indices,
+            emit_native_logprob=emit_native_logprob,
+            segment_factory=self.segment_factory,
+        )
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Stage override: backfill the attention masks the serving stack drops.
