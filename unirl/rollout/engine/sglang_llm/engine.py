@@ -462,6 +462,41 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         force_set_cuda = bool(engine_kwargs.get("force_set_cuda_visible_devices", False))
         mem_fraction = float(engine_kwargs.get("mem_fraction_static", 0.88))
 
+        # --- TP>1 colocate topology (owner/client) -------------------------
+        # Colocate gives every worker (one per GPU) its own engine object, but a
+        # tp>1 SRT server spans tp GPUs — so only one rank per tp-group (the
+        # "owner", lowest physical GPU id in the group) launches the server; the
+        # other ranks become pure HTTP clients of it. The owner widens the
+        # server child's CUDA_VISIBLE_DEVICES to the group's physical GPUs (ray
+        # restricts each worker to its own GPU) and publishes the server URL via
+        # a /dev/shm rendezvous file once healthy. Engine-lifecycle calls
+        # (sleep/wake/weight push) no-op on clients — the owner's single call
+        # covers the whole server, and the FSDP-gathered full weights are
+        # identical on every rank so one push suffices.
+        self._tp_owner = True
+        self._owner_url_file: Optional[str] = None
+        self._tp_child_cvd: Optional[str] = None
+        if self._tp_size > 1:
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            phys: Optional[int] = None
+            if cvd and "," not in cvd:
+                try:
+                    phys = int(cvd.strip())
+                except ValueError:
+                    phys = None
+            if phys is None:
+                idx = self._device.index if self._device.type == "cuda" else None
+                phys = int(idx if idx is not None else 0)
+            group_base = (phys // self._tp_size) * self._tp_size
+            self._tp_owner = phys == group_base
+            self._owner_url_file = f"/dev/shm/unirl_sglang_tp{self._tp_size}_base{group_base}.url"
+            if self._tp_owner:
+                self._tp_child_cvd = ",".join(str(group_base + i) for i in range(self._tp_size))
+                try:
+                    os.unlink(self._owner_url_file)
+                except FileNotFoundError:
+                    pass
+
         # Colocate: N engines share a node, each initializing its own (tp=1)
         # torch.distributed env. SGLang leaves nccl_port=None → it calls
         # get_free_port() at model-init time, so the instances that finish
@@ -538,20 +573,33 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         os.environ["no_proxy"] = f"{_cur_no_proxy},{_extra_no_proxy}" if _cur_no_proxy else _extra_no_proxy
         os.environ["NO_PROXY"] = os.environ["no_proxy"]
 
-        logger.info(
-            "Launching SGLang SRT server: model=%s tp=%d port=%d",
-            self._model_path,
-            self._tp_size,
-            self._port,
-        )
-
-        self._server_process = self._launch_server(server_kwargs)
         health_timeout = float(engine_kwargs.get("health_timeout_s", 300.0))
-        wait_server_healthy(
-            self._base_url,
-            timeout_s=health_timeout,
-            is_alive_fn=lambda: self._server_process is not None and self._server_process.is_alive(),
-        )
+        if not self._tp_owner:
+            # TP client: another rank on this node owns the (tp>1) server that
+            # covers this GPU. Resolve its URL via the rendezvous file (written
+            # only after the owner's server passed its health check).
+            self._base_url = self._wait_owner_url(timeout_s=health_timeout)
+            logger.info("SGLangLLMRolloutEngine[tp-client]: using owner server at %s", self._base_url)
+        else:
+            logger.info(
+                "Launching SGLang SRT server: model=%s tp=%d port=%d child_cvd=%s",
+                self._model_path,
+                self._tp_size,
+                self._port,
+                self._tp_child_cvd,
+            )
+
+            self._server_process = self._launch_server(server_kwargs, child_cuda_visible=self._tp_child_cvd)
+            wait_server_healthy(
+                self._base_url,
+                timeout_s=health_timeout,
+                is_alive_fn=lambda: self._server_process is not None and self._server_process.is_alive(),
+            )
+            if self._owner_url_file is not None:
+                tmp = self._owner_url_file + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(self._base_url)
+                os.replace(tmp, self._owner_url_file)
 
         if httpx is not None:
             self._http_client = httpx.AsyncClient(
@@ -584,12 +632,22 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
     # Server lifecycle
     # ------------------------------------------------------------------
 
-    def _launch_server(self, server_kwargs: Dict[str, Any]) -> multiprocessing.Process:
+    def _launch_server(
+        self,
+        server_kwargs: Dict[str, Any],
+        child_cuda_visible: Optional[str] = None,
+    ) -> multiprocessing.Process:
         """Launch sglang SRT in a subprocess.
 
         ``multiprocessing.set_start_method("spawn", force=True)`` is
         process-global; PE-tested, Ray-compatible. Forcing matches the PE
         engine so torch CUDA init in the child happens cleanly.
+
+        ``child_cuda_visible`` (TP>1 colocate): ray restricts this worker to a
+        single GPU via CUDA_VISIBLE_DEVICES, but a tp>1 server child must see
+        the whole tp group. Spawn snapshots the parent env, so set the widened
+        value just around ``p.start()`` and restore — the parent's own CUDA
+        context (already initialized on its one GPU) is unaffected.
         """
         from sglang.srt.entrypoints.http_server import launch_server
         from sglang.srt.server_args import ServerArgs
@@ -604,8 +662,45 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         multiprocessing.set_start_method("spawn", force=True)
         server_args = ServerArgs(**server_kwargs)
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
-        p.start()
+        if child_cuda_visible is not None:
+            prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = child_cuda_visible
+            try:
+                p.start()
+            finally:
+                if prev_cvd is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+        else:
+            p.start()
         return p
+
+    def _wait_owner_url(self, *, timeout_s: float) -> str:
+        """TP client: poll the owner's rendezvous file until its server is up.
+
+        The owner writes the file atomically only AFTER its health check passes,
+        so a successful read here implies a live server. A stale file from a
+        previous run is impossible on the same boot: the owner unlinks it at
+        construction before launching.
+        """
+        import time as _time
+
+        assert self._owner_url_file is not None
+        deadline = _time.monotonic() + float(timeout_s)
+        while _time.monotonic() < deadline:
+            try:
+                with open(self._owner_url_file) as f:
+                    url = f.read().strip()
+                if url:
+                    return url
+            except FileNotFoundError:
+                pass
+            _time.sleep(2.0)
+        raise TimeoutError(
+            f"SGLangLLMRolloutEngine[tp-client]: owner URL file {self._owner_url_file} "
+            f"did not appear within {timeout_s:.0f}s — did the tp-owner rank fail to launch?"
+        )
 
     def shutdown(self) -> None:
         """Kill SRT server + router and close HTTP client."""
@@ -1137,6 +1232,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
 
     def update_weights_from_path(self, checkpoint_path: str) -> None:
         """Update weights from a checkpoint on disk."""
+        if not self._tp_owner:
+            return  # TP client: the owner rank manages the shared tp>1 server
         resp = self._post(
             "/update_weights_from_disk",
             {"model_path": checkpoint_path, "flush_cache": True},
@@ -1158,6 +1255,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         default ``["transformer"]`` doesn't match LLM module naming. Omitting
         the field lets the SRT server accept all incoming weights correctly.
         """
+        if not self._tp_owner:
+            return  # TP client: the owner rank manages the shared tp>1 server
         del track_prefix
         payload: Dict[str, Any] = {
             "serialized_named_tensors": serialized_named_tensors,
@@ -1226,6 +1325,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         ``target_modules`` is intentionally NOT forwarded (see
         ``update_weights_from_tensor`` for rationale).
         """
+        if not self._tp_owner:
+            return  # TP client: the owner rank manages the shared tp>1 server
         # sglang expects bare dtype strings like "bfloat16", not "torch.bfloat16".
         clean_dtypes = [d.replace("torch.", "") if isinstance(d, str) else d for d in dtypes]
         logger.info(
@@ -1323,6 +1424,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         handles the routing; this child sees only the calls that actually
         target it.
         """
+        if not self._tp_owner:
+            return  # TP client: the owner rank manages the shared tp>1 server
         release_tags = None if tags is None or len(tags) == 0 else list(tags)
         if release_tags is None and self._is_offloaded:
             if not self._weights_onloaded_for_sync:
@@ -1391,6 +1494,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         ``wake_up(tags=["kv_cache", "cuda_graph"])`` before generation.
 
         """
+        if not self._tp_owner:
+            return  # TP client: the owner rank manages the shared tp>1 server
         full_wake = tags is None or len(tags) == 0
         resume_tags = None if full_wake else list(tags)
         if resume_tags is None:
