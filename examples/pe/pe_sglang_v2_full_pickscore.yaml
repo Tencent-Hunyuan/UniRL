@@ -258,6 +258,9 @@ rollout:
       max_new_tokens: 512
       temperature: 0.7
       top_p: 0.9
+      # Transport: "http" (SRT server subprocess, default) or "native"
+      # (in-process sglang.Engine). Env-driven so one recipe serves both.
+      backend: ${oc.env:SGLANG_V2_BACKEND,http}
       concurrency: 4
       engine_kwargs:
         mem_fraction_static: 0.25
