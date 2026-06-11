@@ -64,7 +64,7 @@ full via DCP — not per-rank shards), the scheduler state, and the step counter
 (`step`, `optimizer_step_count`) — enough to resume training. Each one is
 written to `<save_dir>/checkpoint-<step>/checkpoint.pt`. Save and load are
 collectives (every rank participates in the gather/broadcast); only dist rank 0
-reads or writes the file.
+writes the file, and on load every rank reads it from the shared filesystem.
 
 **Meta-init caveat**: full-state-dict checkpointing rejects bundles with
 never-materialized params — the hi3 80B recipe keeps frozen vae/vit on meta, so
@@ -101,6 +101,28 @@ bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
 so EMA decay schedules continue) and forces a weight sync into the rollout
 engine on the first rollout — but the rollout loop itself still counts from 0:
 step numbering, `training_progress`, and the data/noise schedule restart.
+
+### Export to Hugging Face format
+
+`checkpoint.pt` is a raw training checkpoint (PEFT-injected names, optimizer
+state), not a release artifact. `unirl/utils/export_hf.py` folds the LoRA delta
+into the base weights and writes a standard `save_pretrained` folder you can
+`from_pretrained` or `hf upload`:
+
+```bash
+python -m unirl.utils.export_hf \
+    --checkpoint /path/to/checkpoints/sd3_trainside/checkpoint-500 \
+    --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
+    --lora-alpha 64 \
+    --output /path/to/sd3-grpo-hf
+```
+
+`--lora-alpha` is `backend.lora_cfg.alpha` from the recipe (the checkpoint
+stores weights only; scaling = alpha / rank, rank inferred from the weights).
+AR models: `--library transformers`, no `--subfolder`. NFT runs can export the
+EMA shadow adapter with `--adapter old`. Load the SD3 result back with
+`AutoModel.from_pretrained(out_dir)` and plug it into the base pipeline via
+`StableDiffusion3Pipeline.from_pretrained(base, transformer=...)`.
 
 ## Gotchas
 
