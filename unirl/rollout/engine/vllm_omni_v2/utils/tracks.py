@@ -125,32 +125,30 @@ def collect_dit_outputs(
     if not pil_images:
         # TEMP DIAG (LIN-382 hv15): characterize the wire results so we can see
         # where the decoded frames actually landed (images vs multimodal vs ...).
-        def _shape_of(v):
+        def _desc(v):
+            if v is None or isinstance(v, str):
+                return repr(v)
             s = getattr(v, "shape", None)
             if s is not None:
-                return "shape%s" % (tuple(s),)
-            return "len%s" % (len(v),) if hasattr(v, "__len__") else type(v).__name__
+                return "%s%s" % (type(v).__name__, tuple(s))
+            if isinstance(v, dict):
+                return "dict{%s}" % ",".join("%s:%s" % (k, _desc(val)) for k, val in list(v.items())[:6])
+            if hasattr(v, "__len__"):
+                n = len(v)
+                head = _desc(v[0]) if n else ""
+                return "%s[%d]<%s>" % (type(v).__name__, n, head)
+            return type(v).__name__
 
         _diag = []
         for d in diff_outputs[:1]:
-            _imgs = getattr(d, "images", "NO_ATTR")
-            _mm = getattr(d, "multimodal_output", None)
-            _mm_desc = "none"
-            if isinstance(_mm, dict):
-                _mm_desc = {k: _shape_of(v) for k, v in list(_mm.items())[:8]}
-            elif _mm is not None:
-                _mm_desc = type(_mm).__name__
-            _pub = [a for a in dir(d) if not a.startswith("_") and not callable(getattr(d, a, None))]
-            _diag.append(
-                "type=%s fot=%s images=%s:%s mm=%s pub_attrs=%s" % (
-                    type(d).__name__,
-                    getattr(d, "final_output_type", None),
-                    type(_imgs).__name__,
-                    (len(_imgs) if hasattr(_imgs, "__len__") else _imgs),
-                    _mm_desc,
-                    _pub,
-                )
-            )
+            _fields = {
+                k: _desc(getattr(d, k, "NO_ATTR"))
+                for k in ("images", "num_images", "outputs", "latents",
+                          "trajectory_decoded", "trajectory_latents", "multimodal_output")
+            }
+            _diag.append("type=%s fot=%s %s" % (
+                type(d).__name__, getattr(d, "final_output_type", None), _fields,
+            ))
         raise RuntimeError(
             "collect_dit_outputs: DiT outputs carry no PIL images; "
             "check pipeline forward populated DiffusionOutput.output. "
