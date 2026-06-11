@@ -661,6 +661,14 @@ class TrainStack(Remote):
 
         if has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+        if torch.cuda.is_available():
+            # CUDA memory watermark per optimizer step (leak diagnosis: tp2 path
+            # showed progressive OOM). Surfaces as train/cuda_alloc_gb|cuda_reserved_gb.
+            aggregated_metrics = {
+                **dict(aggregated_metrics),
+                "cuda_alloc_gb": torch.cuda.memory_allocated() / 2**30,
+                "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
+            }
         else:
             grad_norm = 0.0
             logger.warning("TrainStack.train: no micro-batch reported backward; skipping optimizer step.")
