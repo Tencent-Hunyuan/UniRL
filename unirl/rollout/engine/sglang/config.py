@@ -50,7 +50,16 @@ _SGLANG_PORT_STRIDE = 100
 # ``_patches/patch_sd3_lora_pipeline``), add a Videos primitive to the response
 # translator (video samples are currently dropped, see response.py TODO), then
 # re-add the family string here.
-_VALID_MODEL_FAMILIES = ("sd3", "flux2_klein")
+#
+# "qwen_image": the fork ships ``QwenImagePipeline(LoRAPipeline,
+# ComposedPipelineBase)`` (LoRA already mixed in — no per-family LoRA patch
+# needed). Its denoising runs in PACKED token form, so the rollout trajectory
+# arrives 4-D ``[B, T, S, C_packed]`` like FLUX.2-Klein; the response
+# translator unpacks it back to image-form ``[B, T, C, H, W]`` (see
+# ``_maybe_unpack_packed_trajectory``). Verified for CFG-off (guidance_scale=1)
+# FlowGRPO/DanceGRPO only — the fork's CFG is a one-sided norm clamp, not the
+# trainside norm-corrected blend, so guidance_scale>1 is not commissioned here.
+_VALID_MODEL_FAMILIES = ("sd3", "flux2_klein", "qwen_image")
 
 
 @dataclass

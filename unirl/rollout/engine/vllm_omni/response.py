@@ -428,6 +428,64 @@ def _build_sd3_text_condition(
     )
 
 
+def _build_qwen_text_condition(
+    diff_outputs: Sequence[Any],
+) -> Optional[TextEmbedCondition]:
+    """Concat per-request Qwen-Image ``text_capture`` dicts into one TextEmbedCondition.
+
+    Reads ``OmniRequestOutput.custom_output["text_capture"]`` — the dict
+    :class:`RLQwenImagePipeline` writes after intercepting ``encode_prompt``.
+    Plain runtime attrs on ``DiffusionOutput`` don't survive vllm-omni's IPC
+    boundary, so the capture rides ``custom_output``.
+
+    Qwen-Image uses a SINGLE text encoder (Qwen2.5-VL) and produces NO pooled
+    vector; the per-prompt ``prompt_embeds_mask`` is load-bearing because
+    prompts are variable-length after the chat-template prefix strip. We pack
+    ``embeds`` + ``attn_mask`` (pooled=None) — exactly the shape the trainer-side
+    ``QwenImageConditions.text`` expects.
+
+    Prompts may have different post-strip lengths → different ``L`` per capture.
+    Right-pad shorter sequences to ``max_L`` (zeros for embeds, 0 for mask) so
+    ``torch.cat`` on dim 0 works; the trainer reads the mask to ignore pad
+    positions.
+
+    Returns ``None`` when any diff output is missing the capture (e.g. the
+    worker-side hook didn't fire). The training side requires this condition for
+    :meth:`QwenImageDiffusionStage.replay`; the call site raises on ``None`` so a
+    pipeline-hook regression surfaces at the rollout boundary, not deep in replay.
+    """
+    if not diff_outputs:
+        return None
+    captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+    if any(c is None for c in captures):
+        return None
+
+    embeds_list = [c["prompt_embeds"] for c in captures]
+    mask_list = [c.get("prompt_embeds_mask") for c in captures]
+    have_mask = all(m is not None for m in mask_list)
+
+    # Right-pad to the batch-max sequence length so dim-0 concat is well-formed.
+    max_L = max(int(e.shape[1]) for e in embeds_list)
+
+    def _pad_embeds(e: torch.Tensor) -> torch.Tensor:
+        cur = int(e.shape[1])
+        if cur >= max_L:
+            return e
+        # e: [1, L, D] -> pad L (dim=1) on the right with zeros.
+        return torch.nn.functional.pad(e, (0, 0, 0, max_L - cur), value=0.0)
+
+    def _pad_mask(m: torch.Tensor) -> torch.Tensor:
+        cur = int(m.shape[1])
+        if cur >= max_L:
+            return m
+        # m: [1, L] -> pad L (dim=1) on the right with 0 (pad positions).
+        return torch.nn.functional.pad(m, (0, max_L - cur), value=0)
+
+    embeds = torch.cat([_pad_embeds(e) for e in embeds_list], dim=0)
+    attn_mask = torch.cat([_pad_mask(m) for m in mask_list], dim=0) if have_mask else None
+    return TextEmbedCondition(embeds=embeds, pooled=None, attn_mask=attn_mask)
+
+
 def _build_hv15_conditions(
     diff_outputs: Sequence[Any],
 ) -> Optional[Dict[str, Condition]]:
@@ -555,13 +613,13 @@ def _to_rollout_resp(
     segments_for_track: Dict[str, Segment] = {}
     conditions: Dict[str, Condition] = {}
 
-    if modality in ("t2i", "it2i", "sd35_t2i", "t2v", "dit_recaption"):
+    if modality in ("t2i", "it2i", "sd35_t2i", "t2v", "dit_recaption", "qwen_image_t2i"):
         # Per-request DiT (image/video) output. For HI3 (t2i/it2i) it's Stage 1;
-        # for SD3.5 (sd35_t2i), HV1.5 (t2v) and the standalone HI3 DiT
-        # (dit_recaption) the diffusion stage is the only stage so stage_id=0.
-        # Either way, ``_pick_stage_output`` matches by ``final_output_type``
-        # first and falls back to stage_id.
-        dit_stage_id = 0 if modality in ("sd35_t2i", "t2v", "dit_recaption") else 1
+        # for SD3.5 (sd35_t2i), HV1.5 (t2v), Qwen-Image (qwen_image_t2i) and the
+        # standalone HI3 DiT (dit_recaption) the diffusion stage is the only
+        # stage so stage_id=0. Either way, ``_pick_stage_output`` matches by
+        # ``final_output_type`` first and falls back to stage_id.
+        dit_stage_id = 0 if modality in ("sd35_t2i", "t2v", "dit_recaption", "qwen_image_t2i") else 1
         final_output_type = "video" if modality == "t2v" else "image"
         # Track key matches training.tracks.<name>: video models use "video".
         diffusion_track_key = "video" if modality == "t2v" else "image"
@@ -618,6 +676,17 @@ def _to_rollout_resp(
                     "in every DiT worker — the subclass swap may not have taken "
                     "effect (verify custom_pipeline_args.pipeline_class in the "
                     "stage YAML)."
+                )
+            conditions["text"] = text_cond
+        elif modality == "qwen_image_t2i":
+            text_cond = _build_qwen_text_condition(diff_outputs)
+            if text_cond is None:
+                raise RuntimeError(
+                    "_to_rollout_resp: Qwen-Image rollout returned no 'text_capture' "
+                    "on DiffusionOutput.custom_output. Check that "
+                    "RLQwenImagePipeline._install_encode_prompt_hook ran in every DiT "
+                    "worker — the subclass swap may not have taken effect (verify "
+                    "custom_pipeline_args.pipeline_class in the stage YAML)."
                 )
             conditions["text"] = text_cond
         elif modality == "t2v":

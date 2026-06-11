@@ -1,0 +1,191 @@
+# @package _global_
+# Qwen-Image v2 trainer — LoRA training, LoRA-ADAPTER sync via Ray RPC (SEPARATE slabs).
+# Qwen-Image twin of sd3_vllmomni_lora_separate.yaml: same train/rollout structure,
+# swapped to the Qwen-Image bundle/pipeline + the qwen_image_t2i vLLM-Omni modality.
+#   - layout: separate — train on `train_fraction` of the pool, rollout on the rest.
+#   - LoRA training, pushed as the bare ADAPTER each sync (RemoteLoraWeightSync ships
+#     lora_A/lora_B to the engine's set_lora_from_tensors).
+#   - No NCCL group / merged-model broadcast: rank 0 ships the few-MB adapter over a
+#     plain Ray RPC to each rollout Worker. The vLLM-Omni qwen_image_t2i stage config
+#     enables LoRA (enable_lora: true, max_lora_rank: 64), so the engine accepts it.
+#
+# ⚠️ CFG: guidance_scale=1 (CFG OFF) ONLY. The request translator pins
+# true_cfg_scale = guidance_scale, so upstream QwenImagePipeline runs a single
+# transformer forward (do_true_cfg=False). guidance_scale>1 would engage
+# upstream's cfg_normalize clamp, which is NOT the trainside norm-corrected blend
+# (QwenImageDiffusionStep) — it would drift the GRPO ratio. Keep guidance=1.
+
+num_devices: 8
+batch_size: 48 # prompts_per_rollout
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity)
+
+# Layout: two sibling device slabs.
+layout: separate
+train_fraction: 0.5 # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool.
+
+weight_sync_interval: 1
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    max_sequence_length: 512
+    # Static-shift fallback only; the real checkpoint enables dynamic shifting.
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # LoRA training — synced as the bare adapter (RemoteLoraWeightSync), so the
+  # rollout engine keeps the frozen base and only its adapter changes each sync.
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # JointAttnProcessor naming — image stream + text stream. Verified against
+    # the diffusers QwenImageTransformer2DModel attention layer. Rank 64 ≤ the
+    # stage config's max_lora_rank=64.
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
+    # qwen_image_t2i stage config enables LoRA (enable_lora: true,
+    # max_lora_rank: 64), so the engine accepts the adapter pushed by
+    # RemoteLoraWeightSync.
+    modality: qwen_image_t2i
+    default_height: 384
+    default_width: 384
+    default_num_inference_steps: 12
+    default_guidance_scale: 1.0
+    default_eta: 0.7
+    # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
+    enable_sleep_mode: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via
+  # QwenImageDiffusionStage.replay. vLLM-Omni also emits native trajectory
+  # log-probs (FlowMatchSDEDiscreteScheduler) — switch old_logp_source to
+  # 'rollout' to use those instead once parity is verified.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0           # CFG OFF — required (see header)
+  height: 384
+  width: 384
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps.
+    timestep_fraction: [0, 0.5]
+
+# LoRA adapter sync → vLLM-Omni rollout (separate-slab Ray RPC). RemoteLoraWeightSync
+# ships the adapter from rank 0 to each rollout Worker each sync.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  # vLLM-Omni supports the loaded_lora_checksums read-back; verify asserts the
+  # synced adapter landed bit-exactly each sync. Set false once trusted.
+  verify: true
+  # Mirrors QwenImagePipelineConfig.weight_sync_param_name_prefix; must match the
+  # engine-side LoRA key naming.
+  param_prefix: "transformer."
+  adapter_name: default

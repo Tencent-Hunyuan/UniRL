@@ -1,0 +1,76 @@
+# Single-stage Qwen-Image text-to-image config for RL rollout.
+#
+# Mirrors sd35_t2i_rl.yaml (single diffusion stage, no AR prelude). Diffs:
+#   - custom_pipeline_args installs RLQwenImagePipeline so SDE-mode rollouts get
+#     a swappable trajectory-capturing scheduler + per-step trajectory capture
+#     (latents, sigmas, log_probs), with the packed-token trajectory unpacked to
+#     image form before it leaves the worker.
+#   - worker_extension_cls installs DiTWeightSyncExtension so the worker exposes
+#     update_weights_from_ipc (bucketed CUDA-IPC) and the NCCL update_weights
+#     paths the trainer needs.
+#   - max_lora_rank=64 to fit the recipe's LoRAPolicy rank (qwen_image LoRA uses
+#     rank 64; the vllm default 16 silently rejects larger adapters at add time).
+#
+# step_execution is intentionally NOT set (defaults False), so the engine drives
+# the monolithic pipeline.forward() path that RLQwenImagePipeline.forward hooks —
+# NOT the per-step denoise_step()/step_scheduler() path. QwenImagePipeline
+# declares supports_step_execution=True, but the gate at
+# diffusion_model_runner.py:151 only activates it when step_execution=True.
+#
+# Sized for Qwen-Image on TP=1. Single-GPU rollout matches the trainer's
+# full-forward math most closely and avoids tensor-parallel bf16 drift in replay
+# log-prob parity.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 4
+    engine_args:
+      model_stage: diffusion
+      enforce_eager: true
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      # Required for vLLM to wrap DiT Linear modules in LoRA-aware variants.
+      # max_lora_rank must be >= the recipe's LoRAPolicy rank (64 in
+      # qwen_image_vllmomni); the vllm.config.lora default of 16 silently
+      # rejects larger adapters at add time.
+      enable_lora: true
+      max_lora_rank: 64
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 1
+        enable_expert_parallel: false
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+      # unirl-specific: install RLQwenImagePipeline so SDE-mode rollouts get a
+      # swappable scheduler + per-step trajectory capture (unpacked to image form).
+      custom_pipeline_args:
+        pipeline_class: unirl.rollout.engine.vllm_omni.qwen_image.pipeline.RLQwenImagePipeline
+      # unirl-specific: install the weight-sync extension so the DiT worker
+      # exposes update_weights_from_ipc (bucketed CUDA-IPC) and later
+      # init_weight_transfer_engine / update_weights (NCCL). Must coexist with
+      # the custom pipeline above; vllm-omni composes them via multiple
+      # inheritance at instantiation time.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.dit_extension.DiTWeightSyncExtension
+    final_output: true
+    final_output_type: image
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1

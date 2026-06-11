@@ -159,6 +159,15 @@ def _maybe_unpack_packed_trajectory(
     spatial dims preserved) — and fails fast on the 4-D packed shape with
     ``expected latents [B, K, C, H_pat, W_pat]``.
 
+    Qwen-Image's SGLang pipeline is the same shape story: its DiT is a
+    sequence transformer over packed ``[B, S, C_packed=64]`` tokens (16
+    latent channels × a 2×2 patch), so the rollout trajectory arrives
+    ``[B, T, S, 64]``. The trainer-side ``QwenImageDiffusionStage`` keeps
+    latents in image form ``[B, K, C=16, latent_h, latent_w]`` (its own
+    ``_unpack_latents`` runs at the transformer boundary), so we unpack
+    here too — but back to TRUE latent channels (16), not packed (64), to
+    match what ``QwenImageDiffusionStage.replay`` reads.
+
     Other model families (SD3 etc.) keep latents in image form throughout
     the SGLang stack so their trajectories arrive 5-D and pass through
     untouched. The 4-D → 5-D unpack only fires when the rollout-side fork
@@ -173,30 +182,59 @@ def _maybe_unpack_packed_trajectory(
             f"{trajectories.ndim}, want 4 (packed) or 5 (image-form); shape="
             f"{tuple(trajectories.shape)}."
         )
-    if model_family != "flux2_klein":
+    if model_family not in ("flux2_klein", "qwen_image"):
         raise ValueError(
             f"_maybe_unpack_packed_trajectory: 4-D trajectory only supported for "
-            f"model_family='flux2_klein' (Klein emits packed [B, T, H*W, C] from "
-            f"SGLang); got model_family={model_family!r}, shape="
+            f"model_family in {{'flux2_klein', 'qwen_image'}} (both emit packed "
+            f"[B, T, H*W, C] from SGLang); got model_family={model_family!r}, shape="
             f"{tuple(trajectories.shape)}."
         )
     if height is None or width is None:
         raise ValueError(
             "_maybe_unpack_packed_trajectory: need height/width from "
-            "req.sampling_params to unpack Klein's packed [B, T, H*W, C] "
+            "req.sampling_params to unpack a packed [B, T, H*W, C] "
             "trajectory; both must be set."
         )
-    # FLUX.2 patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
-    # Mirrors Flux2KleinDiffusionStage._patchified_shape.
+    # Both families share a VAE(8×) × patchify(2×2) = 16 downsample.
+    # Mirrors Flux2KleinDiffusionStage._patchified_shape /
+    # QwenImageDiffusionStage.diffuse's latent-grid arithmetic.
     _DOWNSAMPLE = 16
     if height % _DOWNSAMPLE or width % _DOWNSAMPLE:
         raise ValueError(
-            f"_maybe_unpack_packed_trajectory: Klein height ({height}) and width "
+            f"_maybe_unpack_packed_trajectory: height ({height}) and width "
             f"({width}) must be divisible by VAE x patchify downsample ({_DOWNSAMPLE})."
         )
+
+    B, T, S, C_packed = trajectories.shape
+
+    if model_family == "qwen_image":
+        # Qwen-Image: unpack packed tokens back to image-form TRUE latent
+        # channels. ``QwenImageDiffusionStage.diffuse`` stores the latent
+        # grid as ``latent_h = 2 * (H // 16)`` (the doubled-mod rounding
+        # keeps it even for the 2×2 pack), so the inverse divisor here is
+        # the same 16. ``_unpack_latents`` returns ``[B*T, C=16, latent_h,
+        # latent_w]``; reshape back to 5-D ``[B, T, C, latent_h, latent_w]``
+        # — the exact shape ``QwenImageDiffusionStage.replay`` expects.
+        from unirl.models.qwen_image.diffusion import _unpack_latents
+
+        latent_h = 2 * (height // _DOWNSAMPLE)
+        latent_w = 2 * (width // _DOWNSAMPLE)
+        expected_s = (latent_h // 2) * (latent_w // 2)
+        if S != expected_s:
+            raise ValueError(
+                f"_maybe_unpack_packed_trajectory: Qwen-Image packed token count "
+                f"S={S} != (latent_h/2)*(latent_w/2) = {expected_s} (derived from "
+                f"height={height}, width={width}). Schedule/recipe drift — fix the "
+                f"source rather than silently reshape to a wrong spatial layout."
+            )
+        flat = trajectories.reshape(B * T, S, C_packed)
+        unpacked = _unpack_latents(flat, latent_h=latent_h, latent_w=latent_w)
+        channels = int(unpacked.shape[1])
+        return unpacked.reshape(B, T, channels, latent_h, latent_w).contiguous()
+
+    # FLUX.2-Klein: keep packed channels + patchified spatial dims.
     h_pat = height // _DOWNSAMPLE
     w_pat = width // _DOWNSAMPLE
-    B, T, S, C_packed = trajectories.shape
     if S != h_pat * w_pat:
         raise ValueError(
             f"_maybe_unpack_packed_trajectory: packed token count S={S} != "

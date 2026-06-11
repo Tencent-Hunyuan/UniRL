@@ -259,6 +259,104 @@ def _to_omni_sd35_t2i(
     return prompts, [dit_sampling]
 
 
+def _to_omni_qwen_image_t2i(
+    req: RolloutReq,
+    cfg: "VLLMOmniEngineConfig",
+    sampling_params_cls: Any,
+) -> Tuple[List[Any], List[Any]]:
+    """Qwen-Image single-stage text-to-image builder.
+
+    Mirrors :func:`_to_omni_sd35_t2i` (single-stage pure-DiT, no AR prelude).
+    Per-prompt entries are the dict shape ``QwenImagePipeline.forward`` accepts
+    (``{"prompt": text, "negative_prompt": ...}``); the sampling-params list is
+    single-element ``[dit_sampling]``.
+
+    ⚠️ CFG-off pin. Qwen's ``forward`` does ``true_cfg_scale =
+    req.sampling_params.true_cfg_scale or 4.0`` — a None/0 ``true_cfg_scale``
+    would SILENTLY enable CFG at scale 4.0. The trainside Qwen recipes run
+    guidance=1 (CFG off; ``QwenImageDiffusionStep`` only norm-corrects at
+    guidance>1, and upstream's ``cfg_normalize`` clamp is NOT that same math),
+    so we pin ``true_cfg_scale = guidance_scale`` here. With guidance_scale=1
+    upstream sets ``do_true_cfg = true_cfg_scale > 1 → False`` and runs a single
+    transformer forward, matching trainside rollout + replay. A guidance>1 Qwen
+    recipe is NOT commissioned on this engine (see the pipeline subclass header).
+    """
+    if req.primitives.get("image") is not None:
+        raise ValueError("modality='qwen_image_t2i' does not accept req.primitives['image']")
+
+    texts = _texts_from_req(req)
+    diff_params = get_diffusion_params(req.sampling_params)
+
+    height = int(getattr(diff_params, "height", cfg.default_height))
+    width = int(getattr(diff_params, "width", cfg.default_width))
+    negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
+    guidance_scale = float(getattr(diff_params, "guidance_scale", cfg.default_guidance_scale))
+
+    prompts: List[Any] = [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
+
+    num_inference_steps = int(getattr(diff_params, "num_inference_steps", cfg.default_num_inference_steps))
+    diff_kwargs: Dict[str, Any] = dict(
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        guidance_scale=guidance_scale,
+        guidance_scale_provided=True,
+        # CFG-off pin: keep true_cfg_scale == guidance_scale (== 1.0 for the
+        # commissioned recipes) so upstream's do_true_cfg gate stays False.
+        true_cfg_scale=guidance_scale,
+        eta=float(getattr(diff_params, "eta", cfg.default_eta)),
+        return_trajectory_latents=True,
+        return_trajectory_decoded=False,
+        num_outputs_per_prompt=1,
+    )
+    sigmas = _sigmas_list_from_req(req, num_inference_steps)
+    if sigmas is not None:
+        diff_kwargs["sigmas"] = sigmas
+    max_seq_len = getattr(diff_params, "max_sequence_length", None)
+    if max_seq_len is not None:
+        diff_kwargs["max_sequence_length"] = int(max_seq_len)
+    seed = getattr(diff_params, "seed", None)
+    if seed is not None:
+        diff_kwargs["seed"] = int(seed)
+
+    # Sparse SDE indices + driver-authoritative x_T, packed through ``extra_args``
+    # exactly as _to_omni_sd35_t2i documents. RLQwenImagePipeline reads
+    # ``sde_indices`` onto the scheduler gate and ``initial_noise_batch`` /
+    # the recipe in prepare_latents.
+    extra_args = dict(diff_kwargs.get("extra_args") or {})
+    sde_indices = getattr(diff_params, "sde_indices", None)
+    if sde_indices is not None:
+        extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
+    initial_latent_cond = (req.request_conditions or {}).get("initial_latents")
+    if initial_latent_cond is not None:
+        initial_noise = getattr(initial_latent_cond, "latents", None)
+        if initial_noise is None:
+            raise RuntimeError(
+                "_to_omni_qwen_image_t2i: request_conditions['initial_latents'] "
+                f"has no .latents tensor (got {type(initial_latent_cond).__name__})."
+            )
+        if int(initial_noise.shape[0]) != len(texts.texts):
+            raise RuntimeError(
+                f"_to_omni_qwen_image_t2i: initial_latents.shape[0]={int(initial_noise.shape[0])} "
+                f"!= prompt count {len(texts.texts)} after sharding."
+            )
+        extra_args["initial_noise_batch"] = initial_noise
+    elif req.init_noise_group_ids and req.init_noise_latent_shape:
+        if len(req.init_noise_group_ids) != len(texts.texts):
+            raise RuntimeError(
+                f"_to_omni_qwen_image_t2i: init_noise_group_ids len {len(req.init_noise_group_ids)} "
+                f"!= prompt count {len(texts.texts)} after sharding."
+            )
+        extra_args["init_noise_group_ids"] = [str(g) for g in req.init_noise_group_ids]
+        extra_args["init_noise_latent_shape"] = [int(x) for x in req.init_noise_latent_shape]
+        extra_args["init_noise_seed"] = int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0
+    if extra_args:
+        diff_kwargs["extra_args"] = extra_args
+
+    dit_sampling = sampling_params_cls(**diff_kwargs)
+    return prompts, [dit_sampling]
+
+
 def _to_omni_t2v(
     req: RolloutReq,
     cfg: "VLLMOmniEngineConfig",
@@ -465,6 +563,8 @@ def _to_omni_per_stage(
 
     if modality == "sd35_t2i":
         return _to_omni_sd35_t2i(req, cfg, OmniDiffusionSamplingParams)
+    if modality == "qwen_image_t2i":
+        return _to_omni_qwen_image_t2i(req, cfg, OmniDiffusionSamplingParams)
     if modality == "t2v":
         return _to_omni_t2v(req, cfg, OmniDiffusionSamplingParams)
     if modality == "dit_recaption":

@@ -1,0 +1,244 @@
+# @package _global_
+# Qwen-Image GRPO — SGLang colocate, REPLAY logprob.
+# Mirrors examples/diffusion/flux2_klein_sglang.yaml in structure (both are
+# packed-token DiTs whose SGLang trajectory must be unpacked to image-form on
+# the trainer side); swaps in Qwen-Image knobs from qwen_image_trainside.yaml.
+#
+# SGLang = rollout runs in a separate per-actor worker process (DiffGenerator),
+# weight-synced from the trainer via LoRA. algorithm.old_logp_source=replay: the
+# trainer recomputes the π_old anchor via QwenImageDiffusionStage.replay at
+# update time (so the SGLang fork does NOT need to emit trajectory_log_probs).
+#
+# Upstream SGLang fork prerequisites (engine fails fast otherwise):
+#   1. Qwen-Image pipeline registered so DiffGenerator.from_pretrained can load
+#      it (Qwen2.5-VL text encoder + QwenImageTransformer2DModel + 16-ch video
+#      VAE). The fork ships QwenImagePipeline(LoRAPipeline, ComposedPipelineBase)
+#      and selects it from the HF model path "Qwen/Qwen-Image" — no model_type
+#      enum.
+#   2. Flow SDE kernel registered under "sde" (the engine's _resolve_sde_label
+#      maps FlowSDEStrategy -> "sde").
+#
+# ⚠️ CFG: guidance_scale=1 (CFG OFF) ONLY. The fork's Qwen CFG is a one-sided
+# norm clamp, not the trainside norm-corrected blend (QwenImageDiffusionStep),
+# so guidance_scale>1 would drift the GRPO ratio between rollout and replay.
+# Keep guidance_scale=1.0 here — matches every trainside Qwen recipe.
+#
+# Launch (multi-node taiji SPMD):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/qwen_image_sglang
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 48                # prompts_per_rollout (48 x 16 samples = 768 global)
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (SGLang needs both at init).
+model_config:
+  _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
+  model_precision: bf16
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  # Static-shift fallback only; Qwen-Image's checkpoint enables dynamic shifting.
+  # build_schedule_policy + use_dynamic_shifting/dynamic_shift_overrides on the
+  # config drive the engine's FlowMatchSchedulePolicy at startup, so this value
+  # is ignored at runtime.
+  shift: 3.0
+  # SGLang builds its LoRA ServerArgs from these fields. MUST stay in lockstep
+  # with backend.lora_cfg.target_modules and rollout.config.target_modules below.
+  use_lora: true
+  lora_target_modules:
+    # JointAttnProcessor naming — image stream + text stream. Verified against
+    # the diffusers QwenImageTransformer2DModel attention layer.
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+
+# Shared SDE strategy; SGLang resolves its sde_label ("sde") from it.
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # MUST stay in sync with model_config.lora_target_modules and
+    # rollout.config.target_modules.
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    model_family: qwen_image
+    # SGLang's Qwen pipeline emits the Qwen2.5-VL prompt_embeds +
+    # encoder_attention_mask (single encoder, no pooled); populate_conditions
+    # packs them into TextEmbedCondition so trainer-side replay sees the same
+    # conditions as rollout (no fallback path).
+    populate_conditions: true
+    # Mirrors sampling.init_same_noise (false for SGLang). When false the engine
+    # ships no initial_noise and SGLang draws its own.
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate so sglang bounds its DiT-forward / VAE-decode peak memory
+    # (Qwen-Image + Qwen2.5-VL is heavy). Mirrors qwen_image_trainside
+    # forward_batch_size=1. NOTE: with SGLang-side noise (init_same_noise=false,
+    # no x_T recipe), chunking changes which samples are drawn vs unchunked —
+    # fine for RL (each chunk is a valid rollout), just not byte-reproducible.
+    forward_batch_size: 1
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    # MUST stay in sync with model_config.lora_target_modules and
+    # backend.lora_cfg.target_modules above.
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+  # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via
+  # QwenImageDiffusionStage.replay (the SGLang fork need not emit log-probs).
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0           # CFG OFF — required (see header)
+  height: 384
+  width: 384
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train).
+weight_sync_interval: 1
+
+# LoRA weight sync -> SGLang rollout. verify=false: only vLLM-Omni implements the
+# loaded_lora_checksums read-back API; SGLangRolloutEngine exposes only
+# loaded_param_checksums, so verify=true crashes with AttributeError on the first
+# weight sync. Matches every other actual-SGLang + LoRA config in the repo.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false
+  # Mirrors QwenImagePipelineConfig.weight_sync_param_name_prefix; must match
+  # the engine-side LoRA key naming.
+  param_prefix: "transformer."
+  adapter_name: default
