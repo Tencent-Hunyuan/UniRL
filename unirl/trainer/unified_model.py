@@ -675,9 +675,23 @@ class UnifiedModelTrainer(BaseTrainer):
         except Exception as exc:  # noqa: BLE001 — dump must never break training
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
-    def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+    ) -> None:
+        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
+
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one); ``0`` disables it. ``save_dir`` defaults to ``./checkpoints``.
+        ``load_dir``: restore from a checkpoint directory before training.
+        """
         interval = max(1, weight_sync_interval)
+        self.maybe_load_checkpoint(load_dir)
         self._init_wandb()
         for rollout_id in range(num_rollouts):
             training_progress = rollout_id / max(1, num_rollouts - 1)
@@ -759,6 +773,10 @@ class UnifiedModelTrainer(BaseTrainer):
                 )
                 self._global_optimizer_step += 1
                 self.wandb_logger.log_step(self._global_optimizer_step, training_metrics)
+
+            self.maybe_save_checkpoint(
+                rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir
+            )
 
         if self.wandb_logger is not None:
             self.wandb_logger.finish()

@@ -55,11 +55,47 @@ The four trainers are three shapes:
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the
 matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 
+## Checkpointing
+
+Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
+`UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the full
+model `state_dict` (frozen base + LoRA adapters), the optimizer state, and the
+scheduler state — enough to resume training. Each one is written to
+`<save_dir>/checkpoint-<step>/checkpoint.pt`.
+
+Driven by three top-level config keys, read by the entrypoints and forwarded to
+`train(...)`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `save_interval` | `0` | Save every N rollouts (and on the last); `0` disables saving. |
+| `save_dir` | `./checkpoints` | Output folder for `checkpoint-<step>/`. |
+| `load_dir` | unset | A checkpoint dir to restore from before training starts; unset trains fresh. |
+
+These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax:
+
+```bash
+# Save every 200 rollouts
+bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
+    +save_interval=200 \
+    +save_dir=/path/to/checkpoints/sd3_trainside
+
+# Resume from a saved step (point load_dir at the checkpoint-<step> dir)
+bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
+    +load_dir=/path/to/checkpoints/sd3_trainside/checkpoint-500 \
+    +save_interval=200 \
+    +save_dir=/path/to/checkpoints/sd3_trainside
+```
+
+`load_dir` only restores model/optimizer/scheduler — the rollout loop still
+counts from 0, so step numbering and saved filenames restart.
+
 ## Gotchas
 
 - **The reference loop is intentionally minimal** — `num_updates_per_batch` multi-epoch
-  replay, **checkpoint cadence, and eval cadence are deferred**. `FSDPBackend.save()/load()`
-  exist as primitives, but the loop never schedules them; there is no resume entrypoint yet.
+  replay and **eval cadence are deferred**. Checkpointing is wired (see
+  [Checkpointing](#checkpointing)) for the single-backend trainers; `PETrainer` (two
+  backends) is not covered.
 - **`layout` only branches on `"separate"`** (`"colocate"` == `"colocated"`). The
   trainside direct-sampling engine cannot live on a `separate` slab — `_build_rollout`
   raises (it needs the pipeline as a local sibling).

@@ -49,6 +49,9 @@ Pass cluster-local paths and W&B identity through env vars (`PRETRAINED_MODEL`,
 The mooncake-backed recipe (`*_tq_mooncake`) needs its metadata server up first —
 start it on the head node with `bash examples/mooncake_master.sh start` before launching.
 
+To save or resume checkpoints, append the `+save_interval` / `+save_dir` / `+load_dir`
+overrides (diffusion/ar/unified trainers) — see [Checkpointing](../unirl/trainer/README.md#checkpointing).
+
 ## Reading a recipe name
 
 A recipe filename is a fixed-order, `_`-joined chain of segments. Every segment

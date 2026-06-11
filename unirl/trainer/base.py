@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from omegaconf import DictConfig
@@ -257,3 +258,37 @@ class BaseTrainer:
         """Close the wandb run if one is open."""
         if self.wandb_logger is not None:
             self.wandb_logger.finish()
+
+    # ---- checkpointing (shared by single-backend trainers) -----------------
+
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+    ) -> None:
+        """Save every ``save_interval`` rollouts (and on the last one).
+
+        ``save_interval <= 0`` disables saving. Writes the backend state to
+        ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
+        to ``./checkpoints``).
+        """
+        if save_interval <= 0:
+            return
+        step = rollout_id + 1
+        # Save on the interval, and always on the final rollout.
+        if step % save_interval != 0 and step < num_rollouts:
+            return
+        base_dir = save_dir or os.path.join(os.getcwd(), "checkpoints")
+        path = os.path.join(base_dir, f"checkpoint-{step}")
+        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        self.backend.save(path)
+
+    def maybe_load_checkpoint(self, load_dir: Optional[str]) -> None:
+        """Restore model/optimizer/scheduler from ``load_dir`` before training (skip if empty)."""
+        if not load_dir:
+            return
+        logger.info("Loading checkpoint from %s", load_dir)
+        self.backend.load(load_dir)

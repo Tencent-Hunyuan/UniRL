@@ -215,16 +215,29 @@ class ARTrainer(BaseTrainer):
             self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
         return acc
 
-    def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+    ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
         ``weight_sync_interval``: sync the adapter into the engine every N
         rollouts (fused into ``train_step``'s generate; no-op trainside).
 
-        Deferred: ``num_updates_per_batch`` multi-epoch replay, checkpoint /
-        eval cadence.
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
+        ``./checkpoints``). ``load_dir``: restore from a checkpoint directory
+        before training (``None`` starts fresh).
+
+        Deferred: ``num_updates_per_batch`` multi-epoch replay, eval cadence.
         """
         interval = max(1, weight_sync_interval)
+        self.maybe_load_checkpoint(load_dir)
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={"adv_normalization_scope": self.adv_normalization_scope},
@@ -255,5 +268,8 @@ class ARTrainer(BaseTrainer):
                 )
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id=rollout_id)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir
+                )
         finally:
             self._finish_wandb()

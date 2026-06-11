@@ -282,6 +282,7 @@ class FSDPBackend(Remote):
     # Checkpoint
     # ------------------------------------------------------------------
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def save(self, path: str) -> None:
         """Gather state on all ranks; write to ``path/checkpoint.pt`` on rank 0."""
         state: Dict[str, object] = {
@@ -296,6 +297,7 @@ class FSDPBackend(Remote):
         os.makedirs(path, exist_ok=True)
         torch.save(state, os.path.join(path, "checkpoint.pt"))
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> None:
         checkpoint_path = os.path.join(path, "checkpoint.pt")
         if not os.path.exists(checkpoint_path):
