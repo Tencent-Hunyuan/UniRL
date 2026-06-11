@@ -242,7 +242,7 @@ class ARTrainer(BaseTrainer):
         Deferred: ``num_updates_per_batch`` multi-epoch replay, eval cadence.
         """
         interval = max(1, weight_sync_interval)
-        self.maybe_load_checkpoint(load_dir)
+        resumed = self.maybe_load_checkpoint(load_dir)
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={"adv_normalization_scope": self.adv_normalization_scope},
@@ -254,8 +254,10 @@ class ARTrainer(BaseTrainer):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet).
-                sync_weights = rollout_id > 0 and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet) —
+                # unless resuming: the engine booted with fresh weights and
+                # needs the restored adapter before its first generate.
+                sync_weights = (rollout_id > 0 or resumed) and rollout_id % interval == 0
                 result, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,

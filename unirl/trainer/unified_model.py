@@ -703,7 +703,7 @@ class UnifiedModelTrainer(BaseTrainer):
         ``load_dir``: restore from a checkpoint directory before training.
         """
         interval = max(1, weight_sync_interval)
-        self.maybe_load_checkpoint(load_dir)
+        resumed = self.maybe_load_checkpoint(load_dir)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
             for rollout_id in range(num_rollouts):
@@ -711,12 +711,16 @@ class UnifiedModelTrainer(BaseTrainer):
                 self._dump_rollout_id = rollout_id  # picked up by train_step's dump
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet). The
-                # HI3_SYNC_FIRST env forces a sync on rollout 0 too — a debug knob to
-                # exercise the LoRA-sync path early (cheaply) without a full extra
-                # rollout; the rollout-0 adapter is ~0 but that's fine for testing
-                # the register→activate mechanism.
-                sync_weights = (rollout_id > 0 or os.environ.get("HI3_SYNC_FIRST")) and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet) — unless
+                # resuming (the engine booted with fresh weights and needs the
+                # restored adapter before its first generate). The HI3_SYNC_FIRST
+                # env forces a sync on rollout 0 too — a debug knob to exercise the
+                # LoRA-sync path early (cheaply) without a full extra rollout; the
+                # rollout-0 adapter is ~0 but that's fine for testing the
+                # register→activate mechanism.
+                sync_weights = (
+                    rollout_id > 0 or resumed or bool(os.environ.get("HI3_SYNC_FIRST"))
+                ) and rollout_id % interval == 0
                 results, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,

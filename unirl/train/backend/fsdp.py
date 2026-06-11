@@ -31,11 +31,14 @@ from unirl.train.configs import (
 from unirl.train.ema import EMA, make_decay_fn
 from unirl.train.factories import build_lr_scheduler, build_optimizer
 from unirl.train.fsdp_utils import (
+    _current_rank,
     clip_grad_norm,
     fsdp_offload,
     fsdp_onload,
+    gather_optimizer_state_dict,
     gather_state_dict,
     load_model_state_dict,
+    load_optimizer_state_dict,
     trainable_params,
 )
 from unirl.train.inject import (
@@ -283,31 +286,96 @@ class FSDPBackend(Remote):
     # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def save(self, path: str) -> None:
-        """Gather state on all ranks; write to ``path/checkpoint.pt`` on rank 0."""
+    def save(self, path: str, step: Optional[int] = None) -> None:
+        """Gather full state (collective on every rank); write ``path/checkpoint.pt`` on dist rank 0.
+
+        ``step`` is the trainer's rollout step — stored for checkpoint
+        inspection and future loop-resume logic.
+        """
+        self._reject_meta_params("save")
         state: Dict[str, object] = {
             "policy_state_dict": gather_state_dict(self.model),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_state_dict": gather_optimizer_state_dict(self.model, self.optimizer),
+            "optimizer_step_count": self._optimizer_step_count,
+            "step": step,
         }
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        if self._rank != 0:
+        # The DCP gathers above populate dist rank 0 only — that rank writes.
+        # (NOT self._rank: that is a constructor kwarg, identical on every worker.)
+        if _current_rank() != 0:
             return
         os.makedirs(path, exist_ok=True)
         torch.save(state, os.path.join(path, "checkpoint.pt"))
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> None:
-        checkpoint_path = os.path.join(path, "checkpoint.pt")
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"FSDPBackend.load: checkpoint not found: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self._device)
+        """Restore the state written by :meth:`save`.
 
-        load_model_state_dict(self.model, checkpoint["policy_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        Every rank participates (the DCP set is a collective): dist rank 0
+        reads the file, tensors broadcast from rank 0 and re-shard into each
+        rank's local model/optimizer state. The small header (scheduler state,
+        counters — or the error verdict) broadcasts first, so a bad checkpoint
+        raises on EVERY rank together instead of stranding the others in a
+        collective.
+        """
+        self._reject_meta_params("load")
+        checkpoint_path = os.path.join(path, "checkpoint.pt")
+        is_rank_zero = _current_rank() == 0
+
+        checkpoint: Dict[str, object] = {}
+        header: Optional[Dict[str, object]] = None
+        if is_rank_zero:
+            if not os.path.exists(checkpoint_path):
+                header = {"error": f"checkpoint not found: {checkpoint_path}"}
+            else:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                missing = [k for k in ("policy_state_dict", "optimizer_state_dict") if k not in checkpoint]
+                if missing:
+                    header = {"error": f"malformed checkpoint {checkpoint_path}: missing {missing}"}
+                else:
+                    header = {
+                        "scheduler_state_dict": checkpoint.get("scheduler_state_dict"),
+                        "optimizer_step_count": checkpoint.get("optimizer_step_count"),
+                    }
+        header = self._broadcast_obj(header)
+        if header.get("error"):
+            raise RuntimeError(f"FSDPBackend.load: {header['error']}")
+
+        load_model_state_dict(self.model, checkpoint.get("policy_state_dict", {}))
+        load_optimizer_state_dict(self.model, self.optimizer, checkpoint.get("optimizer_state_dict", {}))
+        if self.scheduler is not None and header.get("scheduler_state_dict") is not None:
+            self.scheduler.load_state_dict(header["scheduler_state_dict"])
+        if header.get("optimizer_step_count") is not None:
+            self._optimizer_step_count = int(header["optimizer_step_count"])
+
+    def _reject_meta_params(self, op: str) -> None:
+        """Fail fast when the trainable module still has never-materialized params.
+
+        Meta-init bundles (hi3 80B) keep frozen aux (vae / vit) on meta; a
+        full-state-dict gather would die deep inside DCP ("Cannot copy out of
+        meta tensor"). Same verdict on every rank, so raising here is
+        collective-safe. Sharded DCP checkpointing is the planned path for
+        these bundles.
+        """
+        meta = [name for name, p in self.model.named_parameters() if p.is_meta]
+        if meta:
+            raise RuntimeError(
+                f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
+                "full-state-dict checkpointing of meta-init bundles is not supported yet."
+            )
+
+    @staticmethod
+    def _broadcast_obj(obj):
+        """Broadcast a small picklable object from dist rank 0 (identity without dist)."""
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return obj
+        box = [obj]
+        dist.broadcast_object_list(box, src=0)
+        return box[0]
 
     # ------------------------------------------------------------------
     # Memory lifecycle

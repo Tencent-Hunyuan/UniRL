@@ -265,7 +265,8 @@ class BaseTrainer:
 
         ``save_interval <= 0`` disables saving. Writes the backend state to
         ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
-        to ``./checkpoints``).
+        to ``./checkpoints``). Paths resolve to absolute here, on the driver —
+        the backend runs in Ray workers whose CWD differs from the driver's.
         """
         if save_interval <= 0:
             return
@@ -273,14 +274,23 @@ class BaseTrainer:
         # Save on the interval, and always on the final rollout.
         if step % save_interval != 0 and step < num_rollouts:
             return
-        base_dir = save_dir or os.path.join(os.getcwd(), "checkpoints")
+        base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
-        self.backend.save(path)
+        self.backend.save(path, step=step)
 
-    def maybe_load_checkpoint(self, load_dir: Optional[str]) -> None:
-        """Restore model/optimizer/scheduler from ``load_dir`` before training (skip if empty)."""
+    def maybe_load_checkpoint(self, load_dir: Optional[str]) -> bool:
+        """Restore model/optimizer/scheduler from ``load_dir`` before training.
+
+        Returns True when a checkpoint was restored — callers use it to force a
+        weight sync into the rollout engine on the first rollout (the restored
+        adapter is no longer ~0, so the engine's fresh-load weights are stale).
+        No-op returning False when ``load_dir`` is empty. Resolved to an
+        absolute path on the driver (worker CWDs differ).
+        """
         if not load_dir:
-            return
+            return False
+        load_dir = os.path.abspath(load_dir)
         logger.info("Loading checkpoint from %s", load_dir)
         self.backend.load(load_dir)
+        return True

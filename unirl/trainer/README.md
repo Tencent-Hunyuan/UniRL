@@ -59,9 +59,17 @@ matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 
 Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
 `UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the full
-model `state_dict` (frozen base + LoRA adapters), the optimizer state, and the
-scheduler state — enough to resume training. Each one is written to
-`<save_dir>/checkpoint-<step>/checkpoint.pt`.
+model `state_dict` (frozen base + LoRA adapters), the optimizer state (gathered
+full via DCP — not per-rank shards), the scheduler state, and the step counters
+(`step`, `optimizer_step_count`) — enough to resume training. Each one is
+written to `<save_dir>/checkpoint-<step>/checkpoint.pt`. Save and load are
+collectives (every rank participates in the gather/broadcast); only dist rank 0
+reads or writes the file.
+
+**Meta-init caveat**: full-state-dict checkpointing rejects bundles with
+never-materialized params — the hi3 80B recipe keeps frozen vae/vit on meta, so
+`UnifiedModelTrainer` checkpointing currently works only for fully-materialized
+bundles. Sharded DCP checkpointing is the planned follow-up.
 
 Driven by three top-level config keys, read by the entrypoints and forwarded to
 `train(...)`:
@@ -69,7 +77,7 @@ Driven by three top-level config keys, read by the entrypoints and forwarded to
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `save_interval` | `0` | Save every N rollouts (and on the last); `0` disables saving. |
-| `save_dir` | `./checkpoints` | Output folder for `checkpoint-<step>/`. |
+| `save_dir` | `./checkpoints` | Output folder for `checkpoint-<step>/`, resolved on the driver (with Hydra's legacy chdir the default lands in the run output dir). |
 | `load_dir` | unset | A checkpoint dir to restore from before training starts; unset trains fresh. |
 
 These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax:
@@ -80,15 +88,19 @@ bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
     +save_interval=200 \
     +save_dir=/path/to/checkpoints/sd3_trainside
 
-# Resume from a saved step (point load_dir at the checkpoint-<step> dir)
+# Resume from a saved step (point load_dir at the checkpoint-<step> dir).
+# Use a FRESH save_dir: the loop counts from 0 again on resume, so the same
+# save_dir would overwrite the first run's checkpoint-<N> dirs.
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
     +load_dir=/path/to/checkpoints/sd3_trainside/checkpoint-500 \
     +save_interval=200 \
-    +save_dir=/path/to/checkpoints/sd3_trainside
+    +save_dir=/path/to/checkpoints/sd3_trainside_resumed
 ```
 
-`load_dir` only restores model/optimizer/scheduler — the rollout loop still
-counts from 0, so step numbering and saved filenames restart.
+`load_dir` restores model/optimizer/scheduler (plus the optimizer-step counter,
+so EMA decay schedules continue) and forces a weight sync into the rollout
+engine on the first rollout — but the rollout loop itself still counts from 0:
+step numbering, `training_progress`, and the data/noise schedule restart.
 
 ## Gotchas
 
