@@ -68,8 +68,7 @@ def validate_packed_trajectory(
     """
     require(
         traj.ndim == 4,
-        f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, "
-        f"shape {tuple(traj.shape)}.",
+        f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
     diffusion = get_diffusion_params(req.sampling_params)
     height = int(diffusion.height) if diffusion.height is not None else None
