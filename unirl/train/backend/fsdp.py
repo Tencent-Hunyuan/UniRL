@@ -313,51 +313,31 @@ class FSDPBackend(Remote):
     def load(self, path: str) -> None:
         """Restore the state written by :meth:`save`.
 
-        Every rank participates (the DCP set is a collective): dist rank 0
-        reads the file, tensors broadcast from rank 0 and re-shard into each
-        rank's local model/optimizer state. The small header (scheduler state,
-        counters — or the error verdict) broadcasts first, so a bad checkpoint
-        raises on EVERY rank together instead of stranding the others in a
-        collective.
+        Every rank runs this (the DCP set is a collective): each reads the
+        checkpoint from the shared filesystem to CPU, then tensors broadcast
+        from dist rank 0 and re-shard into the local model/optimizer state.
+        Identical checks on the identical file mean a bad path raises on
+        every rank together.
         """
         self._reject_meta_params("load")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
-        is_rank_zero = _current_rank() == 0
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"FSDPBackend.load: checkpoint not found: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        checkpoint: Dict[str, object] = {}
-        header: Optional[Dict[str, object]] = None
-        if is_rank_zero:
-            if not os.path.exists(checkpoint_path):
-                header = {"error": f"checkpoint not found: {checkpoint_path}"}
-            else:
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
-                missing = [k for k in ("policy_state_dict", "optimizer_state_dict") if k not in checkpoint]
-                if missing:
-                    header = {"error": f"malformed checkpoint {checkpoint_path}: missing {missing}"}
-                else:
-                    header = {
-                        "scheduler_state_dict": checkpoint.get("scheduler_state_dict"),
-                        "optimizer_step_count": checkpoint.get("optimizer_step_count"),
-                    }
-        header = self._broadcast_obj(header)
-        if header.get("error"):
-            raise RuntimeError(f"FSDPBackend.load: {header['error']}")
-
-        load_model_state_dict(self.model, checkpoint.get("policy_state_dict", {}))
-        load_optimizer_state_dict(self.model, self.optimizer, checkpoint.get("optimizer_state_dict", {}))
-        if self.scheduler is not None and header.get("scheduler_state_dict") is not None:
-            self.scheduler.load_state_dict(header["scheduler_state_dict"])
-        if header.get("optimizer_step_count") is not None:
-            self._optimizer_step_count = int(header["optimizer_step_count"])
+        load_model_state_dict(self.model, checkpoint["policy_state_dict"])
+        load_optimizer_state_dict(self.model, self.optimizer, checkpoint["optimizer_state_dict"])
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if checkpoint.get("optimizer_step_count") is not None:
+            self._optimizer_step_count = int(checkpoint["optimizer_step_count"])
 
     def _reject_meta_params(self, op: str) -> None:
-        """Fail fast when the trainable module still has never-materialized params.
+        """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).
 
-        Meta-init bundles (hi3 80B) keep frozen aux (vae / vit) on meta; a
-        full-state-dict gather would die deep inside DCP ("Cannot copy out of
-        meta tensor"). Same verdict on every rank, so raising here is
-        collective-safe. Sharded DCP checkpointing is the planned path for
-        these bundles.
+        Their frozen aux (vae / vit) stays on meta and a full-state-dict gather
+        would die deep inside DCP ("Cannot copy out of meta tensor"). Same
+        verdict on every rank, so raising here is collective-safe.
         """
         meta = [name for name, p in self.model.named_parameters() if p.is_meta]
         if meta:
@@ -365,17 +345,6 @@ class FSDPBackend(Remote):
                 f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
                 "full-state-dict checkpointing of meta-init bundles is not supported yet."
             )
-
-    @staticmethod
-    def _broadcast_obj(obj):
-        """Broadcast a small picklable object from dist rank 0 (identity without dist)."""
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized()):
-            return obj
-        box = [obj]
-        dist.broadcast_object_list(box, src=0)
-        return box[0]
 
     # ------------------------------------------------------------------
     # Memory lifecycle
