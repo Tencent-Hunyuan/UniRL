@@ -191,25 +191,31 @@ class BaseTrainer:
         rollout_id: int,
         media_prompts: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        """Capture media previews (if logging this rollout) then free ``decoded``.
+        """Upload media previews (if due this rollout) then free ``decoded``.
 
-        Two jobs at the single pre-train chokepoint every trainer hits:
+        Two jobs at the single pre-train chokepoint every trainer hits — and
+        both FINISH here, so no preview payload (PIL images / raw video
+        tensors) ever rides into the ``train_track`` dispatch (the track is
+        DP_SCATTER-serialized to the training workers right after this call):
 
-        1. **Media capture (driver-side).** When the logger wants media this
-           rollout (``UniRLWandBLogger.should_log_media``), build a
-           :class:`MediaPreview` from each track's still-live ``decoded``
-           (``build_media_preview_for_track``) unless the track already carries a
-           forwarded preview, then cap to ``media_max_items``. This MUST run
-           before step 2 because the builder reads ``decoded``. ``media_prompts``
-           supplies per-track, sample-aligned captions for multi-track recipes
-           whose ``req`` text is shorter than the expanded track.
-        2. **Free ``decoded``.** ``decoded`` (generated Images/Videos/Texts) is
-           consumed upstream by ``reward.score_and_attach`` and never read by
-           training (which uses only segment/conditions/advantages). Nulling it on
-           the driver ``resp`` before ``train_track`` releases the driver-held
-           TensorStore handles so the (often GPU-resident, trainside) storage can
-           free before the optimizer-step memory peak. ``media_preview`` is left
-           intact for logging.
+        1. **Media logging (driver-side).** When the logger wants media this
+           rollout (``UniRLWandBLogger.should_log_media``), take each track's
+           inbound ``media_preview`` (populated upstream by an actor-side
+           collector — none exist today) or build one from the still-live
+           ``decoded`` (``build_media_preview_for_track`` hydrates a single DP
+           shard), cap to ``media_max_items``, and upload it immediately at the
+           same ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step`
+           uses, so the panels align. ``media_prompts`` supplies per-track,
+           sample-aligned captions for multi-track recipes whose ``req`` text is
+           shorter than the expanded track.
+        2. **Free the per-rollout payloads.** ``decoded`` (generated
+           Images/Videos/Texts) is consumed upstream by
+           ``reward.score_and_attach`` and never read by training (which uses
+           only segment/conditions/advantages); ``media_preview`` was just
+           uploaded (or skipped — off-cadence rollouts drop it unlogged).
+           Nulling both on the driver ``resp`` before ``train_track`` releases
+           the driver-held TensorStore handles before the optimizer-step memory
+           peak and keeps the training dispatch free of logging payloads.
 
         Call after scoring / advantages (and any decoded-reading debug dump),
         immediately before dispatching to ``train_track``.
@@ -219,21 +225,26 @@ class BaseTrainer:
             from unirl.types.media_preview import build_media_preview_for_track
 
             prompts_by_track = media_prompts or {}
+            multi = len(resp.tracks) > 1
             for name, track in resp.tracks.items():
-                if track.media_preview is not None or track.decoded is None:
+                preview = track.media_preview
+                if preview is None and track.decoded is not None:
+                    preview = build_media_preview_for_track(
+                        req=req,
+                        track=track,
+                        max_items=wb.media_max_items,
+                        prompts=prompts_by_track.get(name),
+                    )
+                if preview is None:
                     continue
-                preview = build_media_preview_for_track(
-                    req=req,
-                    track=track,
-                    max_items=wb.media_max_items,
-                    prompts=prompts_by_track.get(name),
-                )
-                if preview is not None:
-                    track.media_preview = preview
-            resp.cap_media_preview(wb.media_max_items)
+                if len(preview) > wb.media_max_items:
+                    preview = preview.slice(0, wb.media_max_items)
+                key = f"rollout/{name}/generated_media" if multi else "rollout/generated_media"
+                wb.log_generated_media(rollout_id + 1, preview, key=key)
 
         for track in resp.tracks.values():
             track.decoded = None
+            track.media_preview = None
 
     def _finish_wandb(self) -> None:
         """Close the wandb run if one is open."""

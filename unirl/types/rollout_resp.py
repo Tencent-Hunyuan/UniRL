@@ -526,18 +526,6 @@ class RolloutResp(Batch):
             results.append(type(self)(tracks=shard_tracks))
         return results
 
-    # ---- media-preview cap -------------------------------------------------
-
-    def cap_media_preview(self, max_items: int) -> None:
-        """Truncate every track's ``media_preview`` to at most ``max_items``."""
-        limit = max(1, int(max_items))
-        for t in self.tracks.values():
-            if t.media_preview is None:
-                continue
-            if len(t.media_preview) <= limit:
-                continue
-            t.media_preview = t.media_preview.slice(0, limit)
-
     # ---- leaf-to-root reward propagation -----------------------------------
 
     def propagate_rewards(

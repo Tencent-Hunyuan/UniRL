@@ -468,22 +468,26 @@ class UniRLWandBLogger:
         trunc_len: Optional[int] = None,
         extra_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Log one rollout's metrics + media to wandb. No-op when disabled.
+        """Log one rollout's metrics to wandb. No-op when disabled.
 
         The single per-step entry point shared by every trainer. It consumes
         only framework-universal objects: a :class:`RolloutResp` (``resp``)
         and a :class:`TrainStepResult` (single-track) or a ``{track:
-        TrainStepResult}`` dict (multi-track). All wandb/metric/media/step
-        logic lives here so trainers stay logging-free.
+        TrainStepResult}`` dict (multi-track). All wandb/metric/step logic
+        lives here so trainers stay logging-free.
 
         - ``rollout/*``: reward/advantage (and AR response-length) distribution
           stats from ``resp.tracks`` via ``compute_rollout_resp_metrics``, plus
           any ``extra_metrics`` (e.g. ``sync_weights``) merged in.
         - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
           (see :meth:`_log_train`).
-        - ``rollout/generated_media``: each track's surviving ``media_preview``
-          (built driver-side before ``decoded`` was freed); no-op on ``None``.
         - ``perf/rollout_time_s``: optional wall-clock for the step.
+
+        Generated media is NOT logged here: this runs after ``train_track``,
+        so a preview still attached to the track would have ridden into the
+        DP_SCATTER training dispatch. ``BaseTrainer._drop_decoded`` uploads
+        previews via :meth:`log_generated_media` at this same step value and
+        frees them before dispatch.
         """
         if not self.enabled or not self._initialized:
             return
@@ -497,16 +501,6 @@ class UniRLWandBLogger:
         self.log_rollout(step, rollout_metrics)
 
         self._log_train(results)
-
-        tracks = getattr(resp, "tracks", None)
-        if isinstance(tracks, dict):
-            multi = len(tracks) > 1
-            for name, track in tracks.items():
-                media_preview = getattr(track, "media_preview", None)
-                if media_preview is None:
-                    continue
-                key = f"rollout/{name}/generated_media" if multi else "rollout/generated_media"
-                self.log_generated_media(step, media_preview, key=key)
 
         if step_time_s is not None:
             self.log_perf(step, {"rollout_time_s": float(step_time_s)})
