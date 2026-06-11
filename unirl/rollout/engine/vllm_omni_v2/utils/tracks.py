@@ -253,20 +253,12 @@ def build_image_segment(
         indices = torch.arange(T_plus_1, dtype=torch.long)
         sde_indices = None
 
-    batch_size = 0
-    if traj_latents is not None:
-        batch_size = int(traj_latents.shape[0])
-    elif traj_log_probs is not None:
-        batch_size = int(traj_log_probs.shape[0])
-    sample_indices = torch.arange(batch_size, dtype=torch.long) if batch_size > 0 else None
-
     return make_image_segment(
         latents=traj_latents,
         sigmas=seg_sigmas,
         indices=indices,
         sde_logp=traj_log_probs,
         sde_indices=sde_indices,
-        sample_indices=sample_indices,
     )
 
 
