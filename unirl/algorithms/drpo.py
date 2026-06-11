@@ -292,6 +292,15 @@ class DRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
+        # Per-micro fwd/bwd wall-clock (cuda-synced) -> train/replay_time_s and
+        # train/backward_time_s via metrics aggregation: attributes the train
+        # phase without an external profiler. Sync cost is negligible next to
+        # multi-second micros.
+        import time as _time
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = _time.perf_counter()
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
@@ -328,11 +337,19 @@ class DRPO(StageAlgorithm):
             loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
         else:
             loss = loss_per_elem.mean()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t1 = _time.perf_counter()
         (loss * loss_scale).backward()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t2 = _time.perf_counter()
 
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "drpo_epsilon": self.drpo_epsilon,
+            "replay_time_s": _t1 - _t0,
+            "backward_time_s": _t2 - _t1,
             **rollout_replay_logp_absdiff(new_logp, old_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }

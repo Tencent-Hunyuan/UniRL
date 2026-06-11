@@ -101,6 +101,45 @@ def _micro_indices(plan: MicroPlan) -> List[int]:
     return list(plan)
 
 
+def _build_token_budget_micros_2d(
+    *,
+    indices: Sequence[int],
+    prompt_lens: Sequence[int],
+    resp_lens: Sequence[int],
+    token_budget: int,
+) -> List[List[int]]:
+    """2D dense-cost packing: the replay forwards ``[B, P_max + T_max]`` where the
+    prompt and response blocks pad SEPARATELY to their own in-micro maxes — so the
+    true compute cost of a bin is ``(max(prompt) + max(resp)) * count``, not
+    ``max(total) * count``. Packing on total length lets anti-correlated rows
+    (long-prompt/short-resp with short-prompt/long-resp) blow up both pads at
+    once. First-fit decreasing on total length with the exact 2D cost check.
+    """
+    if int(token_budget) < 1:
+        raise ValueError(f"micro_token_budget must be >= 1; got {token_budget}")
+    order = sorted(indices, key=lambda i: (-(int(prompt_lens[i]) + int(resp_lens[i])), i))
+    bins: List[List[int]] = []
+    bin_pmax: List[int] = []
+    bin_tmax: List[int] = []
+    for i in order:
+        p = max(0, int(prompt_lens[i]))
+        t = max(1, int(resp_lens[i]))
+        placed = False
+        for b in range(len(bins)):
+            cost = (max(bin_pmax[b], p) + max(bin_tmax[b], t)) * (len(bins[b]) + 1)
+            if cost <= token_budget:
+                bins[b].append(i)
+                bin_pmax[b] = max(bin_pmax[b], p)
+                bin_tmax[b] = max(bin_tmax[b], t)
+                placed = True
+                break
+        if not placed:
+            bins.append([i])
+            bin_pmax.append(p)
+            bin_tmax.append(t)
+    return bins
+
+
 def _build_token_budget_micros(
     *,
     indices: Sequence[int],
@@ -346,23 +385,22 @@ class TrainStack(Remote):
         are re-weighted by sample count in :meth:`train`).
         """
         total = int(resp_track.batch_size)
-        lengths: Optional[List[int]] = None
+        resp_lens: Optional[List[int]] = None
+        prompt_lens: Optional[List[int]] = None
         if self.micro_token_budget is not None:
             segment = resp_track.segment
             raw = getattr(segment, "lengths", None) if segment is not None else None
             if isinstance(raw, torch.Tensor) and raw.numel() == total:
-                lengths = [int(x) for x in raw.tolist()]
-                # Dense replay cost is (prompt + response) per row — the replay
-                # forwards prompt+response together and trims the prompt block to
-                # the micro's true max. Budget on the TOTAL row length so packing
-                # groups by what the forward actually pays (verl's
-                # ppo_max_token_len_per_gpu also counts prompt+response tokens).
+                resp_lens = [int(x) for x in raw.tolist()]
+                # The dense replay forwards [B, P_max + T_max] with the prompt and
+                # response blocks padded SEPARATELY — pack with the exact 2D cost
+                # when prompt lengths are available (verl's token accounting also
+                # covers prompt+response).
                 conditions = getattr(resp_track, "conditions", None)
                 prompt = getattr(conditions, "prompt", None) if conditions is not None else None
                 pmask = getattr(prompt, "attention_mask", None) if prompt is not None else None
                 if isinstance(pmask, torch.Tensor) and pmask.dim() == 2 and int(pmask.shape[0]) == total:
-                    plens = pmask.long().sum(dim=-1).tolist()
-                    lengths = [resp + int(p) for resp, p in zip(lengths, plens)]
+                    prompt_lens = [int(p) for p in pmask.long().sum(dim=-1).tolist()]
             else:
                 logger.warning(
                     "TrainStack: micro_token_budget=%s set but segment has no per-sample "
@@ -370,16 +408,30 @@ class TrainStack(Remote):
                     self.micro_token_budget,
                     self.micro_batch_size,
                 )
-        if lengths is None:
+        if resp_lens is None:
             return [list(step) for step in self._optimizer_step_slices(total)]
+        totals = (
+            [r + p for r, p in zip(resp_lens, prompt_lens)] if prompt_lens is not None else list(resp_lens)
+        )
         steps: List[List[MicroPlan]] = []
+        n_micros = 0
+        real_tokens = 0
+        padded_tokens = 0
         for mini_start, mini_end in _build_mini_batch_slices(total_size=total, num_updates=self.num_updates_per_batch):
             indices = list(range(mini_start, mini_end))
-            bins = _build_token_budget_micros(
-                indices=indices,
-                lengths=lengths,
-                token_budget=self.micro_token_budget,
-            )
+            if prompt_lens is not None:
+                bins = _build_token_budget_micros_2d(
+                    indices=indices,
+                    prompt_lens=prompt_lens,
+                    resp_lens=resp_lens,
+                    token_budget=self.micro_token_budget,
+                )
+            else:
+                bins = _build_token_budget_micros(
+                    indices=indices,
+                    lengths=totals,
+                    token_budget=self.micro_token_budget,
+                )
             # NCCL micro-count parity: FSDP fwd/bwd run collectives per micro, so
             # every DP rank must execute the SAME number of micros per optimizer
             # step or the process group deadlocks (watchdog kills the job). Packing
@@ -387,8 +439,23 @@ class TrainStack(Remote):
             # and re-partition into exactly that many bins when short.
             k = _sync_micro_count(len(bins))
             if k != len(bins):
-                bins = _partition_into_k(indices=indices, lengths=lengths, k=k)
+                bins = _partition_into_k(indices=indices, lengths=totals, k=k)
             steps.append(list(bins))
+            for b in bins:
+                n_micros += 1
+                real_tokens += sum(totals[i] for i in b)
+                pmax = max(prompt_lens[i] for i in b) if prompt_lens is not None else 0
+                tmax = max(resp_lens[i] for i in b)
+                padded_tokens += (pmax + tmax if prompt_lens is not None else tmax) * len(b)
+        logger.info(
+            "TrainStack packing: %d micros for %d samples (budget=%d), dense efficiency %.0f%% (%d/%d tokens)",
+            n_micros,
+            total,
+            self.micro_token_budget,
+            100.0 * real_tokens / max(1, padded_tokens),
+            real_tokens,
+            padded_tokens,
+        )
         return steps
 
     @staticmethod
