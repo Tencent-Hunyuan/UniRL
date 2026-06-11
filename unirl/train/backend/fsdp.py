@@ -16,6 +16,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
@@ -286,18 +287,30 @@ class FSDPBackend(Remote):
     # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def save(self, path: str, step: Optional[int] = None) -> None:
-        """Gather full state (collective on every rank); write ``path/checkpoint.pt`` on dist rank 0.
+    def save(self, path: str, step: Optional[int] = None, mode: str = "full") -> None:
+        """Gather state (collective on every rank); write ``path/checkpoint.pt`` on dist rank 0.
 
-        ``step`` is the trainer's rollout step — stored for checkpoint
-        inspection and future loop-resume logic.
+        ``step`` is the trainer's rollout step — :meth:`load` returns it so
+        the loop resumes where it stopped. ``mode="adapter"`` keeps only the
+        LoRA keys in the model state (MBs instead of GBs; the frozen base
+        reloads from the pretrained snapshot on resume). The optimizer state
+        is identical under both modes — it only ever covers the trainable
+        (LoRA) params.
         """
+        if mode not in ("full", "adapter"):
+            raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'full' or 'adapter')")
+        if mode == "adapter" and not any("lora_" in name for name, _ in self.model.named_parameters()):
+            raise RuntimeError("FSDPBackend.save: mode='adapter' but the model has no LoRA params")
         self._reject_meta_params("save")
+        policy_state = gather_state_dict(self.model)
+        if mode == "adapter":
+            policy_state = {k: v for k, v in policy_state.items() if "lora_A" in k or "lora_B" in k}
         state: Dict[str, object] = {
-            "policy_state_dict": gather_state_dict(self.model),
+            "policy_state_dict": policy_state,
             "optimizer_state_dict": gather_optimizer_state_dict(self.model, self.optimizer),
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
+            "save_mode": mode,
         }
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
@@ -310,27 +323,42 @@ class FSDPBackend(Remote):
         torch.save(state, os.path.join(path, "checkpoint.pt"))
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def load(self, path: str) -> None:
-        """Restore the state written by :meth:`save`.
+    def load(self, path: str) -> int:
+        """Restore the state written by :meth:`save`; return the saved rollout step (0 if absent).
 
         Every rank runs this (the DCP set is a collective): each reads the
-        checkpoint from the shared filesystem to CPU, then tensors broadcast
-        from dist rank 0 and re-shard into the local model/optimizer state.
-        Identical checks on the identical file mean a bad path raises on
-        every rank together.
+        checkpoint from shared storage to CPU, then tensors broadcast from
+        dist rank 0 and re-shard into the local model/optimizer state.
+        Adapter-mode checkpoints load non-strict — only the LoRA keys are
+        present; the frozen base keeps the weights the bundle loaded.
         """
         self._reject_meta_params("load")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"FSDPBackend.load: checkpoint not found: {checkpoint_path}")
+        # Agree on visibility BEFORE the collectives: on multi-node, a rank
+        # whose node does not mount the checkpoint path would raise alone and
+        # strand the others in the DCP broadcast until the NCCL timeout.
+        exists = os.path.exists(checkpoint_path)
+        if dist.is_available() and dist.is_initialized():
+            verdicts: List[Optional[bool]] = [None] * dist.get_world_size()
+            dist.all_gather_object(verdicts, exists)
+            missing_on = [rank for rank, ok in enumerate(verdicts) if not ok]
+        else:
+            missing_on = [] if exists else [0]
+        if missing_on:
+            raise FileNotFoundError(
+                f"FSDPBackend.load: checkpoint not visible on rank(s) {missing_on}: {checkpoint_path} "
+                "(save_dir/load_dir must live on storage mounted on every node)"
+            )
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        load_model_state_dict(self.model, checkpoint["policy_state_dict"])
+        strict = checkpoint.get("save_mode", "full") == "full"
+        load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
         load_optimizer_state_dict(self.model, self.optimizer, checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if checkpoint.get("optimizer_step_count") is not None:
             self._optimizer_step_count = int(checkpoint["optimizer_step_count"])
+        return int(checkpoint.get("step") or 0)
 
     def _reject_meta_params(self, op: str) -> None:
         """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).

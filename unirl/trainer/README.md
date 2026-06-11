@@ -58,65 +58,83 @@ matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 ## Checkpointing
 
 Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
-`UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the full
-model `state_dict` (frozen base + LoRA adapters), the optimizer state (gathered
-full via DCP — not per-rank shards), the scheduler state, and the step counters
-(`step`, `optimizer_step_count`) — enough to resume training. Each one is
-written to `<save_dir>/checkpoint-<step>/checkpoint.pt`. Save and load are
-collectives (every rank participates in the gather/broadcast); only dist rank 0
-writes the file, and on load every rank reads it from the shared filesystem.
+`UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the
+model state (`save_mode=full`: frozen base + LoRA adapters; `save_mode=adapter`:
+LoRA keys only — MBs instead of GBs), the optimizer state (gathered full via
+DCP — not per-rank shards; it only ever covers the trainable params, so it is
+adapter-sized either way), the scheduler state, and the step counters (`step`,
+`optimizer_step_count`) — enough to resume training. Each one is written to
+`<save_dir>/checkpoint-<step>/checkpoint.pt`. Save and load are collectives
+(every rank participates in the gather/broadcast); only dist rank 0 writes the
+file, and on load every rank reads it.
+
+**Multi-node**: `save_dir` / `load_dir` must live on storage mounted on every
+node — the same contract the recipes already place on `PRETRAINED_MODEL` and
+data paths. A rank that cannot see the checkpoint fails fast on every rank at
+load (instead of stranding the others in the broadcast until the NCCL timeout).
 
 **Meta-init caveat**: full-state-dict checkpointing rejects bundles with
 never-materialized params — the hi3 80B recipe keeps frozen vae/vit on meta, so
 `UnifiedModelTrainer` checkpointing currently works only for fully-materialized
 bundles. Sharded DCP checkpointing is the planned follow-up.
 
-Driven by three top-level config keys, read by the entrypoints and forwarded to
+Driven by top-level config keys, read by the entrypoints and forwarded to
 `train(...)`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `save_interval` | `0` | Save every N rollouts (and on the last); `0` disables saving. |
 | `save_dir` | `./checkpoints` | Output folder for `checkpoint-<step>/`, resolved on the driver (with Hydra's legacy chdir the default lands in the run output dir). |
-| `load_dir` | unset | A checkpoint dir to restore from before training starts; unset trains fresh. |
+| `save_mode` | `full` | `full` = whole model state; `adapter` = LoRA keys only (the frozen base reloads from the pretrained snapshot on resume). |
+| `load_dir` | unset | A checkpoint dir to restore and resume from; unset trains fresh. |
 
 These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax:
 
 ```bash
-# Save every 200 rollouts
+# Save every 200 rollouts (LoRA-only checkpoints)
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
     +save_interval=200 \
-    +save_dir=/path/to/checkpoints/sd3_trainside
+    +save_dir=/path/to/checkpoints/sd3_trainside \
+    +save_mode=adapter
 
-# Resume from a saved step (point load_dir at the checkpoint-<step> dir).
-# Use a FRESH save_dir: the loop counts from 0 again on resume, so the same
-# save_dir would overwrite the first run's checkpoint-<N> dirs.
+# Resume from checkpoint-500. num_rollouts is the TOTAL budget (here: rollouts
+# 500..699); the same save_dir is fine — checkpoint numbering continues.
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
+    num_rollouts=700 \
     +load_dir=/path/to/checkpoints/sd3_trainside/checkpoint-500 \
     +save_interval=200 \
-    +save_dir=/path/to/checkpoints/sd3_trainside_resumed
+    +save_dir=/path/to/checkpoints/sd3_trainside \
+    +save_mode=adapter
 ```
 
 `load_dir` restores model/optimizer/scheduler (plus the optimizer-step counter,
-so EMA decay schedules continue) and forces a weight sync into the rollout
-engine on the first rollout — but the rollout loop itself still counts from 0:
-step numbering, `training_progress`, and the data/noise schedule restart.
+so EMA decay schedules continue) and resumes the loop from the saved step:
+`training_progress` and the driver-authored x_T noise schedule continue, the
+data stream fast-forwards to the resume point (exact when `run.seed` is set —
+the shuffle is generator-seeded), and the first rollout force-syncs the
+restored adapter into the rollout engine (which booted with fresh weights).
+RNG state is not yet checkpointed — sampling noise after resume differs from
+an uninterrupted run.
 
 ### Export to Hugging Face format
 
 `checkpoint.pt` is a raw training checkpoint (PEFT-injected names, optimizer
-state), not a release artifact. `unirl/utils/export_hf.py` folds the LoRA delta
-into the base weights and writes a standard `save_pretrained` folder you can
+state), not a release artifact. The offline checkpoint toolset lives in
+`unirl/tools/` (the runtime counterpart for engine weight sync is
+`unirl/utils/peft_merge.py`): `export_hf` folds the LoRA delta into the base
+weights and writes a standard `save_pretrained` folder you can
 `from_pretrained` or `hf upload`:
 
 ```bash
-python -m unirl.utils.export_hf \
+python -m unirl.tools.export_hf \
     --checkpoint /path/to/checkpoints/sd3_trainside/checkpoint-500 \
     --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
     --lora-alpha 64 \
     --output /path/to/sd3-grpo-hf
 ```
 
+Works with both checkpoint flavors: `save_mode=full` merges self-contained;
+`save_mode=adapter` folds the LoRA keys onto the freshly loaded base weights.
 `--lora-alpha` is `backend.lora_cfg.alpha` from the recipe (the checkpoint
 stores weights only; scaling = alpha / rank, rank inferred from the weights).
 AR models: `--library transformers`, no `--subfolder`. NFT runs can export the

@@ -695,32 +695,42 @@ class UnifiedModelTrainer(BaseTrainer):
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
+        save_mode: str = "full",
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
         ``save_interval``: write a checkpoint every N rollouts (and on the last
-        one); ``0`` disables it. ``save_dir`` defaults to ``./checkpoints``.
-        ``load_dir``: restore from a checkpoint directory before training.
+        one); ``0`` disables it. ``save_dir`` defaults to ``./checkpoints``;
+        ``save_mode="adapter"`` keeps only the LoRA keys. ``load_dir``: restore
+        from a checkpoint directory and RESUME from its saved step —
+        ``num_rollouts`` is the TOTAL budget.
         """
         interval = max(1, weight_sync_interval)
-        resumed = self.maybe_load_checkpoint(load_dir)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
-            for rollout_id in range(num_rollouts):
+            for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 self._dump_rollout_id = rollout_id  # picked up by train_step's dump
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet) — unless
-                # resuming (the engine booted with fresh weights and needs the
-                # restored adapter before its first generate). The HI3_SYNC_FIRST
-                # env forces a sync on rollout 0 too — a debug knob to exercise the
-                # LoRA-sync path early (cheaply) without a full extra rollout; the
-                # rollout-0 adapter is ~0 but that's fine for testing the
-                # register→activate mechanism.
-                sync_weights = (
-                    rollout_id > 0 or resumed or bool(os.environ.get("HI3_SYNC_FIRST"))
-                ) and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate. The
+                # HI3_SYNC_FIRST env forces a sync on rollout 0 too — a debug knob
+                # to exercise the LoRA-sync path early (cheaply) without a full
+                # extra rollout; the rollout-0 adapter is ~0 but that's fine for
+                # testing the register→activate mechanism.
+                force_sync = (resumed and rollout_id == start_rollout) or (
+                    rollout_id == 0 and bool(os.environ.get("HI3_SYNC_FIRST"))
+                )
+                sync_weights = force_sync or (rollout_id > 0 and rollout_id % interval == 0)
                 results, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,
@@ -733,7 +743,9 @@ class UnifiedModelTrainer(BaseTrainer):
                 # logp convention (temperature / top-k-p filtering / full-vs-renorm
                 # softmax) doesn't match vLLM's sampler.
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
-                self.maybe_save_checkpoint(rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                )
         finally:
             self._finish_wandb()
 

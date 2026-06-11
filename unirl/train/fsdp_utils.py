@@ -27,14 +27,19 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     return _to_cpu_state_dict(full)
 
 
-def load_model_state_dict(model: nn.Module, state_dict: StateDict) -> None:
-    """Load a full state dict, broadcasting from rank 0 across ranks."""
+def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
+    """Load a full state dict, broadcasting from rank 0 across ranks.
+
+    ``strict=False`` loads a partial dict (adapter-only checkpoints): keys
+    absent from ``state_dict`` keep the model's current weights.
+    """
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(
         full_state_dict=True,
         broadcast_from_rank0=True,
         cpu_offload=False,
+        strict=strict,
     )
     try:
         set_model_state_dict(model, state_dict, options=options)

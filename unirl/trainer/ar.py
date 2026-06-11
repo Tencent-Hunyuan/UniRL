@@ -228,6 +228,7 @@ class ARTrainer(BaseTrainer):
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
+        save_mode: str = "full",
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
@@ -236,13 +237,20 @@ class ARTrainer(BaseTrainer):
 
         ``save_interval``: write a checkpoint every N rollouts (and on the last
         one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
-        ``./checkpoints``). ``load_dir``: restore from a checkpoint directory
-        before training (``None`` starts fresh).
+        ``./checkpoints``); ``save_mode="adapter"`` keeps only the LoRA keys.
+        ``load_dir``: restore from a checkpoint directory and RESUME from its
+        saved step — ``num_rollouts`` is the TOTAL budget.
 
         Deferred: ``num_updates_per_batch`` multi-epoch replay, eval cadence.
         """
         interval = max(1, weight_sync_interval)
-        resumed = self.maybe_load_checkpoint(load_dir)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={"adv_normalization_scope": self.adv_normalization_scope},
@@ -250,14 +258,16 @@ class ARTrainer(BaseTrainer):
         try:
             if self.eval_interval > 0:
                 self.evaluate(rollout_id=-1)  # baseline AIME accuracy, logged at eval step 0
-            for rollout_id in range(num_rollouts):
+            for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet) —
-                # unless resuming: the engine booted with fresh weights and
-                # needs the restored adapter before its first generate.
-                sync_weights = (rollout_id > 0 or resumed) and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate.
+                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                    resumed and rollout_id == start_rollout
+                )
                 result, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,
@@ -267,6 +277,8 @@ class ARTrainer(BaseTrainer):
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id=rollout_id)
-                self.maybe_save_checkpoint(rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                )
         finally:
             self._finish_wandb()
