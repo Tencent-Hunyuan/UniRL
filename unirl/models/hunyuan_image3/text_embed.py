@@ -121,12 +121,20 @@ class HunyuanImage3TextEmbedStage:
             transformer.load_tokenizer(bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
 
+        # Cond-image kwarg name differs by checkpoint snapshot (base:
+        # batch_cond_image_info, Instruct: batch_cond_images).
+        import inspect as _inspect
+
+        _cond_kw = (
+            "batch_cond_images"
+            if "batch_cond_images" in _inspect.signature(tkw.apply_chat_template).parameters
+            else "batch_cond_image_info"
+        )
         out = tkw.apply_chat_template(
             batch_prompt=prompts,
             batch_message_list=batch_message_list,
             mode="gen_text",
             batch_gen_image_info=None,
-            batch_cond_images=batch_cond_image_info,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,
             max_length=max_length,
@@ -135,6 +143,7 @@ class HunyuanImage3TextEmbedStage:
             sequence_template=gen_config.sequence_template,
             cfg_factor=1,
             drop_think=gen_config.drop_think,
+            **{_cond_kw: batch_cond_image_info},
         )
         output, sections = out["output"], out["sections"]
 

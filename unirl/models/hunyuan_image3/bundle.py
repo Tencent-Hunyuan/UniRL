@@ -320,12 +320,20 @@ class HunyuanImage3Bundle(Bundle):
         # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
         # cfg_factor=2, the wrapper internally duplicates the prompt slot
         # for the unconditional branch.
+        # The cond-image kwarg was renamed across checkpoint snapshots
+        # (base: batch_cond_image_info, Instruct: batch_cond_images). Detect it.
+        import inspect as _inspect
+
+        _cond_kw = (
+            "batch_cond_images"
+            if "batch_cond_images" in _inspect.signature(tkw.apply_chat_template).parameters
+            else "batch_cond_image_info"
+        )
         out = tkw.apply_chat_template(
             batch_prompt=list(prompts),
             batch_message_list=None,
             mode="gen_image",
             batch_gen_image_info=batch_gen_image_info,
-            batch_cond_images=batch_cond_image_info,
             batch_system_prompt=None,
             batch_cot_text=None,
             max_length=None,
@@ -334,6 +342,7 @@ class HunyuanImage3Bundle(Bundle):
             sequence_template=gen_config.sequence_template,
             cfg_factor=cfg_factor,
             drop_think=gen_config.drop_think,
+            **{_cond_kw: batch_cond_image_info},
         )
         output, sections = out["output"], out["sections"]
 
