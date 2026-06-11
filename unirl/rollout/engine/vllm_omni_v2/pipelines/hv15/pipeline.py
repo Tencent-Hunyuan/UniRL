@@ -215,23 +215,15 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         with self._sigma_override(req):
             out = super().forward(req, **kwargs)
 
-        # TEMP DIAG (LIN-382 hv15 "no PIL images"): the engine resolves the
-        # video post-process via od_config.model_class_name in the registry —
-        # if the custom pipeline class isn't keyed there it returns None and the
-        # video tensor is never converted to PIL frames.
-        try:
-            import logging as _logging
-            from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
-            _mcn = getattr(self.od_config, "model_class_name", "?")
-            _o = getattr(out, "output", None)
-            _logging.getLogger(__name__).warning(
-                "DIFFRL_HV15_DIAG model_class_name=%s in_postproc_registry=%s out.output=%s shape=%s",
-                _mcn, _mcn in _DIFFUSION_POST_PROCESS_FUNCS,
-                type(_o).__name__, getattr(_o, "shape", None),
-            )
-        except Exception as _e:  # pragma: no cover - diagnostic only
-            import logging as _logging
-            _logging.getLogger(__name__).warning("DIFFRL_HV15_DIAG failed: %s", _e)
+        # The engine post-processes out.output into PIL frames, but for video
+        # those do NOT survive the worker->client wire — only tensors carried in
+        # custom_output / trajectory_* cross; PIL image lists are dropped, so the
+        # trainer-side response would see empty ``images`` (LIN-382). Stamp the
+        # decoded video tensor (CHW-by-frame, [B, C, F, H, W]) onto custom_output
+        # so ``collect_dit_outputs`` can recover frames for the reward.
+        decoded = getattr(out, "output", None)
+        if decoded is not None:
+            stamp_custom_output(out, "rl_decoded_video", detach_cpu(decoded))
 
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)

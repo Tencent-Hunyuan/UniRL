@@ -94,6 +94,34 @@ def pick_stage_output(
     return None
 
 
+_VIDEO_PROCESSOR = None
+
+
+def _video_frames_from_custom_output(diff_out: Any) -> List[Any]:
+    """Recover a video sample's PIL frames from the decoded-video tensor the RL
+    pipeline stamped onto ``custom_output["rl_decoded_video"]``.
+
+    The engine decodes video to PIL frames, but those don't survive the engine
+    worker->client wire (only tensors carried on custom_output / trajectory_*
+    cross). The hv15 RL pipeline stamps the decoded tensor ``[B, C, F, H, W]``
+    (``B == 1`` per request) so we can rebuild the frames here for the reward.
+    """
+    co = getattr(diff_out, "custom_output", None) or {}
+    vid = co.get("rl_decoded_video")
+    if vid is None or not torch.is_tensor(vid):
+        return []
+    global _VIDEO_PROCESSOR
+    if _VIDEO_PROCESSOR is None:
+        from diffusers.video_processor import VideoProcessor
+
+        _VIDEO_PROCESSOR = VideoProcessor(vae_scale_factor=16)
+    frames = _VIDEO_PROCESSOR.postprocess_video(vid, output_type="pil")
+    # postprocess_video returns List[List[PIL]] (batch x frames); B == 1.
+    if frames and isinstance(frames[0], list):
+        return frames[0]
+    return list(frames)
+
+
 def collect_dit_outputs(
     per_request: Sequence[Sequence[Any]],
     *,
@@ -120,39 +148,17 @@ def collect_dit_outputs(
             )
         diff_outputs.append(diff_out)
         imgs = getattr(diff_out, "images", None) or []
+        if not imgs and final_output_type == "video":
+            # Video PIL frames don't survive the engine worker->client wire; the
+            # RL pipeline stamped the decoded video tensor onto custom_output —
+            # recover this sample's frames from there. (LIN-382)
+            imgs = _video_frames_from_custom_output(diff_out)
         pil_frames_per_prompt.append(list(imgs))
         pil_images.extend(imgs)
     if not pil_images:
-        # TEMP DIAG (LIN-382 hv15): characterize the wire results so we can see
-        # where the decoded frames actually landed (images vs multimodal vs ...).
-        def _desc(v):
-            if v is None or isinstance(v, str):
-                return repr(v)
-            s = getattr(v, "shape", None)
-            if s is not None:
-                return "%s%s" % (type(v).__name__, tuple(s))
-            if isinstance(v, dict):
-                return "dict{%s}" % ",".join("%s:%s" % (k, _desc(val)) for k, val in list(v.items())[:6])
-            if hasattr(v, "__len__"):
-                n = len(v)
-                head = _desc(v[0]) if n else ""
-                return "%s[%d]<%s>" % (type(v).__name__, n, head)
-            return type(v).__name__
-
-        _diag = []
-        for d in diff_outputs[:1]:
-            _fields = {
-                k: _desc(getattr(d, k, "NO_ATTR"))
-                for k in ("images", "num_images", "outputs", "latents",
-                          "trajectory_decoded", "trajectory_latents", "multimodal_output")
-            }
-            _diag.append("type=%s fot=%s %s" % (
-                type(d).__name__, getattr(d, "final_output_type", None), _fields,
-            ))
         raise RuntimeError(
             "collect_dit_outputs: DiT outputs carry no PIL images; "
-            "check pipeline forward populated DiffusionOutput.output. "
-            "[diag: %s]" % " || ".join(_diag)
+            "check pipeline forward populated DiffusionOutput.output."
         )
     return diff_outputs, pil_frames_per_prompt, pil_images
 
