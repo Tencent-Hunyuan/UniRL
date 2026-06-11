@@ -435,6 +435,20 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             predict_index = (
                 torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
             )
+            # Bucket the packed length to a multiple of 1024 so flex_attention
+            # compiles O(10) shapes instead of one per distinct L (a ~40s
+            # first-compile per shape). The filler tokens carry restarting
+            # position_ids, so they form their own isolated "sequence" under the
+            # packed block-causal mask and no prediction is gathered from them.
+            bucket = 1024
+            L = int(packed_ids.shape[1])
+            target = ((L + bucket - 1) // bucket) * bucket
+            if target > L:
+                n_fill = target - L
+                fill_ids = torch.full((1, n_fill), pad_id, dtype=packed_ids.dtype, device=device)
+                fill_pos = torch.arange(n_fill, device=device).unsqueeze(0)
+                packed_ids = torch.cat([packed_ids, fill_ids], dim=1)
+                packed_pos = torch.cat([packed_pos, fill_pos], dim=1)
             per_token_flat = self.model.transformer(
                 input_ids=packed_ids,
                 attention_mask=None,
