@@ -352,6 +352,17 @@ class TrainStack(Remote):
             raw = getattr(segment, "lengths", None) if segment is not None else None
             if isinstance(raw, torch.Tensor) and raw.numel() == total:
                 lengths = [int(x) for x in raw.tolist()]
+                # Dense replay cost is (prompt + response) per row — the replay
+                # forwards prompt+response together and trims the prompt block to
+                # the micro's true max. Budget on the TOTAL row length so packing
+                # groups by what the forward actually pays (verl's
+                # ppo_max_token_len_per_gpu also counts prompt+response tokens).
+                conditions = getattr(resp_track, "conditions", None)
+                prompt = getattr(conditions, "prompt", None) if conditions is not None else None
+                pmask = getattr(prompt, "attention_mask", None) if prompt is not None else None
+                if isinstance(pmask, torch.Tensor) and pmask.dim() == 2 and int(pmask.shape[0]) == total:
+                    plens = pmask.long().sum(dim=-1).tolist()
+                    lengths = [resp + int(p) for resp, p in zip(lengths, plens)]
             else:
                 logger.warning(
                     "TrainStack: micro_token_budget=%s set but segment has no per-sample "

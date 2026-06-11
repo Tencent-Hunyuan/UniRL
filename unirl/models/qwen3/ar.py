@@ -405,6 +405,20 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             prompt_ids = left_padded_ids
             prompt_mask = left_padded_mask
 
+        # Trim the prompt block to THIS batch's true max length. The track-level
+        # concat right-pads prompts to the global (worker-shard) max, so every
+        # replay micro otherwise forwards at the widest prompt in the shard —
+        # pure dense-pad waste (with token-budget packing the micro members are
+        # length-sorted, making the waste systematic). After the LEFT re-pad all
+        # real tokens sit at the right end, so dropping the leading all-pad
+        # columns preserves prompt-end position (= new prompt_len - 1) and the
+        # cumsum position_ids below are pad-invariant.
+        max_real_prompt = int(real_prompt_lens.max().item())
+        if 0 < max_real_prompt < prompt_len:
+            prompt_ids = prompt_ids[:, prompt_len - max_real_prompt :]
+            prompt_mask = prompt_mask[:, prompt_len - max_real_prompt :]
+            prompt_len = max_real_prompt
+
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
             full_mask = torch.cat([prompt_mask, response_mask], dim=1)
