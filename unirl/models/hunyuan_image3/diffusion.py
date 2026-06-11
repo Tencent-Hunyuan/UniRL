@@ -282,24 +282,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # is_first it uses image_mask instead (None is correct there).
         transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
-        import os as _os
-
-        if _os.environ.get("HI3_DEBUG"):
-            import sys as _sys
-
-            _ii = model_inputs.get("input_ids")
-            _im = model_inputs.get("image_mask")
-            _imgs = model_inputs.get("images")
-            print(
-                f"[hi3-dbg] input_ids={tuple(_ii.shape) if hasattr(_ii, 'shape') else _ii} "
-                f"image_mask={tuple(_im.shape) if hasattr(_im, 'shape') else _im} "
-                f"images={tuple(_imgs.shape) if hasattr(_imgs, 'shape') else type(_imgs).__name__} "
-                f"n_img={n_img} gim_sum={int(fused.gen_image_mask.sum().item())} "
-                f"pos={tuple(fused.position_ids.shape)}",
-                file=_sys.stderr,
-                flush=True,
-            )
-
         output = transformer(**model_inputs, first_step=is_first)
 
         # Restore _check_inputs
