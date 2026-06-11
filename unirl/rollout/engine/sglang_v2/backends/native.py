@@ -152,6 +152,10 @@ class NativeBackend:
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
         engine_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
+        # The Engine entrypoint defaults log_level to "error" (the HTTP
+        # server path runs at "info") — restore parity so scheduler logs and
+        # this module's post-init lines stay visible. Intent overrides win.
+        engine_kwargs.setdefault("log_level", "info")
 
         # --- Env quarantine: the HTTP impl's block minus the no_proxy
         # whitelist (no HTTP warmup self-check to misroute). The rest is
