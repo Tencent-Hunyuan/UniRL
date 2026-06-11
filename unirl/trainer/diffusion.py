@@ -404,8 +404,6 @@ class DiffusionTrainer(BaseTrainer):
                     rollout_id=rollout_id,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-                self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir
-                )
+                self.maybe_save_checkpoint(rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir)
         finally:
             self._finish_wandb()

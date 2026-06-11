@@ -265,8 +265,6 @@ class ARTrainer(BaseTrainer):
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id=rollout_id)
-                self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir
-                )
+                self.maybe_save_checkpoint(rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir)
         finally:
             self._finish_wandb()
