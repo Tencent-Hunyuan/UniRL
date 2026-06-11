@@ -23,12 +23,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import get_diffusion_params
 
 # Qwen-Image patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
 _QWEN_DOWNSAMPLE = 16
@@ -49,34 +49,14 @@ class QwenImageAdapter(ImageAdapter):
         """
         if traj.ndim == 5:
             return traj
-        if traj.ndim != 4:
-            raise ValueError(
-                f"qwen_image: SGLang trajectory has rank {traj.ndim}, want 4 (packed) "
-                f"or 5 (image-form); shape={tuple(traj.shape)}."
-            )
-        diffusion = get_diffusion_params(req.sampling_params)
-        height = int(diffusion.height) if diffusion.height is not None else None
-        width = int(diffusion.width) if diffusion.width is not None else None
-        if height is None or width is None:
-            raise ValueError(
-                "qwen_image: need height/width from req.sampling_params to unpack "
-                "the packed [B, T, S, C*4] trajectory; both must be set."
-            )
-        latent_h = 2 * (height // _QWEN_DOWNSAMPLE)
-        latent_w = 2 * (width // _QWEN_DOWNSAMPLE)
-        B, T, S, C_packed = traj.shape
-        if S != (latent_h // 2) * (latent_w // 2):
-            raise ValueError(
-                f"qwen_image: packed token count S={S} != (latent_h/2)*(latent_w/2)="
-                f"{(latent_h // 2) * (latent_w // 2)} (from height={height}, "
-                f"width={width}). Schedule/recipe drift — fix the source rather "
-                f"than silently reshape to a wrong spatial layout."
-            )
+        B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
+            traj, req, family="qwen_image", downsample=_QWEN_DOWNSAMPLE
+        )
         from unirl.models.qwen_image.diffusion import _unpack_latents
 
-        flat = traj.reshape(B * T, S, C_packed)
-        unpacked = _unpack_latents(flat, latent_h=latent_h, latent_w=latent_w)
-        return unpacked.reshape(B, T, C_packed // 4, latent_h, latent_w).contiguous()
+        flat = traj.reshape(B * T, S, C)
+        unpacked = _unpack_latents(flat, latent_h=2 * h_pat, latent_w=2 * w_pat)
+        return unpacked.reshape(B, T, C // 4, 2 * h_pat, 2 * w_pat).contiguous()
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Stage override: backfill the attention masks the serving stack drops.

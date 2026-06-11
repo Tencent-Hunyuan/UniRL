@@ -11,10 +11,10 @@ The Dance-GRPO SDE label rides on the base ``resolve_sde_label``.
 from __future__ import annotations
 
 from unirl.config.require import require
+from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import get_diffusion_params
 
 
 @register_adapter("flux")
@@ -52,37 +52,13 @@ class Flux2KleinAdapter(ImageAdapter):
         """
         if traj.ndim == 5:
             return traj
-        if traj.ndim != 4:
-            raise ValueError(
-                f"flux2_klein: SGLang trajectory has rank {traj.ndim}, want 4 (packed) "
-                f"or 5 (image-form); shape={tuple(traj.shape)}."
-            )
-        diffusion = get_diffusion_params(req.sampling_params)
-        height = int(diffusion.height) if diffusion.height is not None else None
-        width = int(diffusion.width) if diffusion.width is not None else None
-        if height is None or width is None:
-            raise ValueError(
-                "flux2_klein: need height/width from req.sampling_params to unpack "
-                "the packed [B, T, H*W, C] trajectory; both must be set."
-            )
-        if height % _KLEIN_DOWNSAMPLE or width % _KLEIN_DOWNSAMPLE:
-            raise ValueError(
-                f"flux2_klein: height ({height}) and width ({width}) must be "
-                f"divisible by the VAE×patchify downsample ({_KLEIN_DOWNSAMPLE})."
-            )
-        h_pat = height // _KLEIN_DOWNSAMPLE
-        w_pat = width // _KLEIN_DOWNSAMPLE
-        B, T, S, C_packed = traj.shape
-        if S != h_pat * w_pat:
-            raise ValueError(
-                f"flux2_klein: packed token count S={S} != h_pat*w_pat={h_pat * w_pat} "
-                f"(from height={height}, width={width}). Schedule/recipe drift — fix the "
-                f"source rather than silently reshape to a wrong spatial layout."
-            )
+        B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
+            traj, req, family="flux2_klein", downsample=_KLEIN_DOWNSAMPLE, require_divisible=True
+        )
         from unirl.models.flux2_klein.flux2_klein_utils import unpack_latents
 
-        flat = traj.reshape(B * T, S, C_packed)
-        return unpack_latents(flat, h_pat, w_pat).reshape(B, T, C_packed, h_pat, w_pat).contiguous()
+        flat = traj.reshape(B * T, S, C)
+        return unpack_latents(flat, h_pat, w_pat).reshape(B, T, C, h_pat, w_pat).contiguous()
 
 
 __all__ = ["FluxAdapter", "Flux2KleinAdapter"]

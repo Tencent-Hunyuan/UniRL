@@ -25,6 +25,8 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images
+from unirl.types.rollout_req import RolloutReq
+from unirl.types.sampling import get_diffusion_params
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
 
@@ -43,6 +45,56 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
         require(r.trajectory_latents is not None, "SGLang result missing trajectory_latents")
         latents.append(r.trajectory_latents.detach().cpu())
     return torch.cat(latents, dim=0)
+
+
+def validate_packed_trajectory(
+    traj: torch.Tensor,
+    req: RolloutReq,
+    *,
+    family: str,
+    downsample: int,
+    require_divisible: bool = False,
+) -> Tuple[int, int, int, int, int, int]:
+    """Validate a packed ``[B, T, S, C]`` denoising trajectory; return its dims.
+
+    Packed-token families (FLUX.2-Klein, Qwen-Image) receive the SGLang trajectory
+    as 4-D ``[B, T, S, C_packed]`` (``S`` patch tokens). Checks ``S`` against the patch
+    grid ``(height // downsample, width // downsample)`` and returns
+    ``(B, T, S, C_packed, h_pat, w_pat)`` so the caller can flatten and apply its own
+    model-specific unpack + reshape. The caller handles the 5-D image-form passthrough;
+    this raises if ``traj`` is not the expected 4-D packed rank. ``family`` only feeds
+    error messages; ``require_divisible`` rejects H/W not divisible by ``downsample``
+    (Klein) vs. silently flooring (Qwen).
+    """
+    require(
+        traj.ndim == 4,
+        f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, "
+        f"shape {tuple(traj.shape)}.",
+    )
+    diffusion = get_diffusion_params(req.sampling_params)
+    height = int(diffusion.height) if diffusion.height is not None else None
+    width = int(diffusion.width) if diffusion.width is not None else None
+    require(
+        height is not None and width is not None,
+        f"{family}: need height/width from req.sampling_params to unpack the packed "
+        f"[B, T, S, C] trajectory; both must be set.",
+    )
+    if require_divisible:
+        require(
+            height % downsample == 0 and width % downsample == 0,
+            f"{family}: height ({height}) and width ({width}) must be divisible by the "
+            f"VAE×patchify downsample ({downsample}).",
+        )
+    h_pat = height // downsample
+    w_pat = width // downsample
+    B, T, S, C_packed = traj.shape
+    require(
+        S == h_pat * w_pat,
+        f"{family}: packed token count S={S} != h_pat*w_pat={h_pat * w_pat} "
+        f"(from height={height}, width={width}). Schedule/recipe drift — fix the source "
+        f"rather than silently reshape to a wrong spatial layout.",
+    )
+    return B, T, S, C_packed, h_pat, w_pat
 
 
 def derive_timestep_alignment(
