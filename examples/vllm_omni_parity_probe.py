@@ -58,7 +58,7 @@ def main() -> int:
     lat_h = lat_w = hw // 8
 
     from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
-    from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts, VLLMOmniEngineConfig
+    from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
     from unirl.sde.runtime import FlowMatchSchedulePolicy
     from unirl.types.noise_recipe import NoiseRecipe
     from unirl.types.primitives import Texts
@@ -78,8 +78,11 @@ def main() -> int:
     # ---------------- 1. engine rollout (ODE) ----------------------------
     cfg = VLLMOmniEngineConfig(model_path=model_path, modality="qwen_image_t2i", enable_sleep_mode=False)
     model_config = SimpleNamespace(
-        shift=3.0, use_lora=False, use_dynamic_shifting=True,
-        dynamic_shift_overrides=overrides, max_sequence_length=512,
+        shift=3.0,
+        use_lora=False,
+        use_dynamic_shifting=True,
+        dynamic_shift_overrides=overrides,
+        max_sequence_length=512,
     )
     log("booting engine ...")
     engine = cfg.make_engine(model_config=model_config, ports=VLLMOmniPorts.reserve())
@@ -88,8 +91,12 @@ def main() -> int:
         group_ids=["g0"],
         primitives={"text": Texts(texts=[prompt])},
         sampling_params=DiffusionSamplingParams(
-            num_inference_steps=steps, height=hw, width=hw,
-            guidance_scale=1.0, eta=0.0, seed=seed,
+            num_inference_steps=steps,
+            height=hw,
+            width=hw,
+            guidance_scale=1.0,
+            eta=0.0,
+            seed=seed,
         ),
         init_noise_group_ids=["s0"],
         init_noise_latent_shape=[16, lat_h, lat_w],
@@ -117,9 +124,11 @@ def main() -> int:
     from unirl.models.qwen_image.diffusion import QwenImageDiffusionStep
     from unirl.types.conditions.text import TextEmbedCondition
 
-    transformer = QwenImageTransformer2DModel.from_pretrained(
-        model_path, subfolder="transformer", torch_dtype=torch.bfloat16
-    ).to("cuda").eval()
+    transformer = (
+        QwenImageTransformer2DModel.from_pretrained(model_path, subfolder="transformer", torch_dtype=torch.bfloat16)
+        .to("cuda")
+        .eval()
+    )
 
     # Optional fp32-island alignment: vllm-omni's reimplementation runs
     # time-embed / AdaLN modulation / norm_out / proj_out in FULL fp32;
@@ -148,7 +157,9 @@ def main() -> int:
                 if torch.is_tensor(out):
                     return out.to(torch.bfloat16)
                 if isinstance(out, tuple):
-                    return tuple(o.to(torch.bfloat16) if torch.is_tensor(o) and o.is_floating_point() else o for o in out)
+                    return tuple(
+                        o.to(torch.bfloat16) if torch.is_tensor(o) and o.is_floating_point() else o for o in out
+                    )
                 return out
 
             mod.forward = fp32_forward
@@ -159,9 +170,7 @@ def main() -> int:
     shim = SimpleNamespace(transformer=transformer)
     step_impl = QwenImageDiffusionStep()
     conds = QwenImageConditions(
-        text=TextEmbedCondition(
-            embeds=embeds.to("cuda", torch.bfloat16), pooled=None, attn_mask=mask.to("cuda")
-        )
+        text=TextEmbedCondition(embeds=embeds.to("cuda", torch.bfloat16), pooled=None, attn_mask=mask.to("cuda"))
     )
     log("trainside transformer up")
 

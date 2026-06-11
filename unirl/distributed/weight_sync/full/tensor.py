@@ -60,13 +60,13 @@ class TensorWeightSync(FullWeightSync):
         all-gathers each shard on every rank in lockstep. Each rank talks to
         its own co-located engine, so no cross-rank gather is needed.
         """
+        import torch
+
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             FlattenedTensorBucket,
             MultiprocessingSerializer,
             monkey_patch_torch_reductions,
         )
-
-        import torch
 
         monkey_patch_torch_reductions()
 

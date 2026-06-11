@@ -32,7 +32,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
-from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts, VLLMOmniEngineConfig
+from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.sde.runtime import ensure_req_sigmas
 from unirl.types.rollout_req import RolloutReq

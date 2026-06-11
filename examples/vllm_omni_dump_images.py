@@ -44,7 +44,7 @@ def main() -> int:
     log(f"{len(prompts)} prompts from {prompts_file}")
 
     from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
-    from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts, VLLMOmniEngineConfig
+    from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
     from unirl.types.primitives import Texts
     from unirl.types.rollout_req import RolloutReq
     from unirl.types.sampling import DiffusionSamplingParams
@@ -67,8 +67,12 @@ def main() -> int:
             group_ids=[f"g{i}" for i in range(len(prompts))],
             primitives={"text": Texts(texts=prompts)},
             sampling_params=DiffusionSamplingParams(
-                num_inference_steps=steps, height=hw, width=hw,
-                guidance_scale=1.0, eta=0.0, seed=seed,
+                num_inference_steps=steps,
+                height=hw,
+                width=hw,
+                guidance_scale=1.0,
+                eta=0.0,
+                seed=seed,
             ),
         )
         t = time.time()

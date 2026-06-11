@@ -173,7 +173,7 @@ def main() -> int:
     results: Dict[str, str] = {}
 
     from unirl.distributed.weight_sync.transfer.checksum import fingerprint_tensor
-    from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts, VLLMOmniEngineConfig
+    from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 
     # ---- 1. boot -----------------------------------------------------------
     log(f"phase 1 boot: modality={modality} model={model_path} steps={steps} hw={hw}")

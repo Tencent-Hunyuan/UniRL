@@ -71,9 +71,6 @@ class QwenImageBundle(Bundle):
         alternate VAE / text-encoder checkpoints without re-downloading
         the transformer. Both default to ``pretrained_model_ckpt_path``.
         """
-        from diffusers import AutoencoderKLQwenImage, QwenImageTransformer2DModel
-        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-        from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
         import fcntl
 

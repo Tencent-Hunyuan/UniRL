@@ -44,8 +44,12 @@ def build_req(prompt: str, *, shared_noise: bool, steps: int, hw: int, seed: int
         group_ids=["g0"] * G,
         primitives={"text": Texts(texts=[prompt] * G)},
         sampling_params=DiffusionSamplingParams(
-            num_inference_steps=steps, height=hw, width=hw,
-            guidance_scale=1.0, eta=0.7, seed=seed,
+            num_inference_steps=steps,
+            height=hw,
+            width=hw,
+            guidance_scale=1.0,
+            eta=0.7,
+            seed=seed,
             sde_indices=[1, 3, 5],  # 3 SDE steps in the recipes' [0, 0.5] window
         ),
         init_noise_group_ids=gids,
@@ -64,7 +68,8 @@ def score_images(prompt: str, decoded) -> list:
 
 
 def save_group(tag: str, dump_dir: str, pixels: torch.Tensor, scores: list) -> None:
-    from PIL import Image as PILImage, ImageDraw
+    from PIL import Image as PILImage
+    from PIL import ImageDraw
 
     d = os.path.join(dump_dir, tag)
     os.makedirs(d, exist_ok=True)
@@ -90,23 +95,22 @@ def save_group(tag: str, dump_dir: str, pixels: torch.Tensor, scores: list) -> N
 def main() -> int:
     model_path = os.environ.get("PRETRAINED_MODEL", "/root/diffusionrl/models/local/Qwen-Image")
     dump_dir = os.environ.get("DUMP_DIR", "/mnt/bj/dump/lin382-qwen-group")
-    prompt = os.environ.get(
-        "PROMPT", "a jung male cyborg with white hair sitting down on a throne in a dystopian city"
-    )
+    prompt = os.environ.get("PROMPT", "a jung male cyborg with white hair sitting down on a throne in a dystopian city")
     steps = int(os.environ.get("STEPS", "12"))
     hw = int(os.environ.get("HW", "384"))
     seed = int(os.environ.get("SEED", "42"))
     os.makedirs(dump_dir, exist_ok=True)
 
     from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
-    from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts, VLLMOmniEngineConfig
+    from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 
-    cfg = VLLMOmniEngineConfig(
-        model_path=model_path, modality="qwen_image_t2i", enable_sleep_mode=False
-    )
+    cfg = VLLMOmniEngineConfig(model_path=model_path, modality="qwen_image_t2i", enable_sleep_mode=False)
     model_config = SimpleNamespace(
-        shift=3.0, use_lora=False, use_dynamic_shifting=True,
-        dynamic_shift_overrides=_qwen_image_dynamic_overrides(), max_sequence_length=512,
+        shift=3.0,
+        use_lora=False,
+        use_dynamic_shifting=True,
+        dynamic_shift_overrides=_qwen_image_dynamic_overrides(),
+        max_sequence_length=512,
     )
     log("booting engine ...")
     engine = cfg.make_engine(model_config=model_config, ports=VLLMOmniPorts.reserve())
