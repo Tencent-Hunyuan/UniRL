@@ -231,7 +231,10 @@ class HunyuanImage3Pipeline(Pipeline):
             a = int(text_seg.cu_seqlens[k].item())
             b = int(text_seg.cu_seqlens[k + 1].item())
             ids = text_seg.tokens[a:b].tolist()
-            out.append(tokenizer.decode(ids, skip_special_tokens=True))
+            # clean_up_tokenization_spaces=False: the HunyuanImage3 BPE tokenizer
+            # warns that the WordPiece-oriented cleanup is destructive for BPE
+            # (inserts spaces between characters) — disable it for coherent text.
+            out.append(tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False))
         return Texts(texts=out)
 
 

@@ -307,19 +307,25 @@ class HunyuanImage3Bundle(Bundle):
         # populated upstream — ``load_tokenizer`` must be called explicitly
         # after ``from_pretrained``. Do it here so callers (the smoke script
         # and ``from_config``) don't need to remember.
-        if getattr(transformer, "_tkwrapper", None) is None:
-            transformer.load_tokenizer(self.tokenizer)
+        # Resolve the tokenizer wrapper across checkpoint snapshots: newer ones
+        # (modeling_hunyuan_image_3.py) expose it as ``_tokenizer`` (set lazily by
+        # ``load_tokenizer``); older ones auto-populate ``_tkwrapper``.
+        # ``load_tokenizer`` resolves its arg as a path via ``from_pretrained(arg)``
+        # — pass the checkpoint path, not the loaded tokenizer object.
+        if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
+            transformer.load_tokenizer(self.pretrained_path)
+        tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
 
         # Tokenize + splice in special markers (<boi>, <img>, <timestep>,
         # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
         # cfg_factor=2, the wrapper internally duplicates the prompt slot
         # for the unconditional branch.
-        out = transformer._tkwrapper.apply_chat_template(
+        out = tkw.apply_chat_template(
             batch_prompt=list(prompts),
             batch_message_list=None,
             mode="gen_image",
             batch_gen_image_info=batch_gen_image_info,
-            batch_cond_image_info=batch_cond_image_info,
+            batch_cond_images=batch_cond_image_info,
             batch_system_prompt=None,
             batch_cot_text=None,
             max_length=None,
@@ -392,9 +398,14 @@ class HunyuanImage3Bundle(Bundle):
         # cond_vit_image_mask) and the cond-timestep scatter index.
         # ``None`` for vanilla t2i.
         cond_vae_image_mask = getattr(output, "cond_vae_image_mask", None)
+        if cond_vae_image_mask is None:
+            cond_vae_image_mask = getattr(output, "vae_image_mask", None)
         if cond_vae_image_mask is not None:
             cond_vae_image_mask = cond_vae_image_mask.to(device)
         cond_vit_image_mask = getattr(output, "cond_vit_image_mask", None)
+        if cond_vit_image_mask is None:
+            # Newer (Instruct) output names these vit_image_mask / vae_image_mask.
+            cond_vit_image_mask = getattr(output, "vit_image_mask", None)
         if cond_vit_image_mask is not None:
             cond_vit_image_mask = cond_vit_image_mask.to(device)
         cond_timestep_scatter_index = getattr(output, "cond_timestep_scatter_index", None)

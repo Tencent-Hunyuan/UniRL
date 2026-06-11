@@ -115,15 +115,18 @@ class HunyuanImage3TextEmbedStage:
 
         # Ensure the tokenizer wrapper is loaded -- AutoModelForCausalLM
         # leaves ``_tkwrapper`` as None until ``load_tokenizer`` is called.
-        if getattr(transformer, "_tkwrapper", None) is None:
-            transformer.load_tokenizer(bundle.tokenizer)
+        if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
+            # ``load_tokenizer`` resolves its arg as a path (from_pretrained),
+            # so pass the checkpoint path, not the tokenizer object.
+            transformer.load_tokenizer(bundle.pretrained_path)
+        tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
 
-        out = transformer._tkwrapper.apply_chat_template(
+        out = tkw.apply_chat_template(
             batch_prompt=prompts,
             batch_message_list=batch_message_list,
             mode="gen_text",
             batch_gen_image_info=None,
-            batch_cond_image_info=batch_cond_image_info,
+            batch_cond_images=batch_cond_image_info,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,
             max_length=max_length,
@@ -176,6 +179,9 @@ class HunyuanImage3TextEmbedStage:
         # to scatter ViT patch embeds into ``inputs_embeds`` via
         # ``instantiate_vit_image_tokens``.
         cond_vit_image_mask = getattr(output, "cond_vit_image_mask", None)
+        if cond_vit_image_mask is None:
+            # Newer (Instruct) output names the cond-ViT scatter mask vit_image_mask.
+            cond_vit_image_mask = getattr(output, "vit_image_mask", None)
         if cond_vit_image_mask is not None:
             cond_vit_image_mask = cond_vit_image_mask.to(device)
 

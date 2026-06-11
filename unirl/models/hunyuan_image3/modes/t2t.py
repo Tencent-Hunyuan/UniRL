@@ -174,7 +174,7 @@ def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
     ``ar_params.stop_token_ids`` to override.
     """
     transformer = bundle.transformer
-    tkw = getattr(transformer, "_tkwrapper", None)
+    tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
     if tkw is None:
         # Bundle hasn't had its tokenizer loaded yet (fake-bundle path
         # or pre-prefill). Return empty -- ``autoregress`` then runs

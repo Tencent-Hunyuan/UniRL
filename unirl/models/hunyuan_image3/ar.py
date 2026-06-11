@@ -258,6 +258,10 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         # right-padded batches).
         model_kwargs: Dict[str, Any] = {
             "mode": "gen_text",
+            # Newer checkpoints' _update_model_kwargs_for_generation reads
+            # model_kwargs["rope_image_info"] unconditionally; AR (gen_text) has
+            # no image tokens, so pass an empty per-sample list.
+            "rope_image_info": [[] for _ in range(batch_size)],
             "attention_mask": fused.attention_mask,  # [B, 1, L, L] bool
             "position_ids": fused.position_ids,  # [B, L] long
             "custom_pos_emb": fused.rope_cache,  # ([B, L, D], [B, L, D])
@@ -276,6 +280,13 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
+        # Newer checkpoints' gen_text forward reads runtime attrs off ``self`` that a
+        # prior diffusion/FlowGRPO pass may leave stale (or never sets on this
+        # snapshot). Reset for text generation: zero image tokens.
+        transformer.post_token_len = None
+        transformer.num_image_tokens = 0
+        transformer.num_special_tokens = None
+
         for step_idx in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
@@ -285,10 +296,14 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                 position_ids=model_kwargs["position_ids"],
                 custom_pos_emb=model_kwargs["custom_pos_emb"],
                 mode="gen_text",
+                rope_image_info=model_kwargs.get("rope_image_info"),
                 use_cache=True,
                 cond_vit_images=model_kwargs.get("cond_vit_images"),
                 cond_vit_image_mask=model_kwargs.get("cond_vit_image_mask"),
                 vit_kwargs=model_kwargs.get("vit_kwargs"),
+                # Newer (Instruct) forward reads the ViT attn/spatial kwargs under
+                # cond_vit_image_kwargs; older ones use vit_kwargs. Pass both.
+                cond_vit_image_kwargs=model_kwargs.get("vit_kwargs"),
             )
             with torch.no_grad():
                 out = transformer(**model_inputs, first_step=(step_idx == 0))
@@ -346,7 +361,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             # [B, H, q_len=1, kv_len] shape. Keep the cond_* / vit_kwargs
             # i2t/it2i pass-throughs alive across steps.
             new_kwargs: Dict[str, Any] = dict(updated)
-            for carry in ("cond_vit_images", "cond_vit_image_mask", "vit_kwargs"):
+            for carry in ("cond_vit_images", "cond_vit_image_mask", "vit_kwargs", "custom_pos_emb", "rope_image_info"):
                 if carry not in new_kwargs and carry in model_kwargs:
                     new_kwargs[carry] = model_kwargs[carry]
             new_kwargs["use_cache"] = True
