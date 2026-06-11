@@ -1238,6 +1238,22 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
     # Weight sync — HTTP POST to sglang SRT
     # ------------------------------------------------------------------
 
+    @property
+    def weight_payload_fanout(self) -> int:
+        """How many INDEPENDENTLY-serialized weight payload copies a sync must ship.
+
+        sglang's scheduler indexes ``serialized_named_tensors[tp_rank]`` — one
+        entry per tp rank, and each entry must be its OWN serialization (its own
+        CUDA-IPC export): duplicating one serialized string across ranks
+        unbalances the IPC refcount handshake and leaks the exporter's gathered
+        tensors (~16 GB/step measured). Owners report tp_size; TP clients report
+        0 (their update_weights_from_tensor no-ops — the owner's push covers the
+        shared server).
+        """
+        if self._tp_size <= 1:
+            return 1
+        return self._tp_size if self._tp_owner else 0
+
     def update_weights_from_path(self, checkpoint_path: str) -> None:
         """Update weights from a checkpoint on disk."""
         if not self._tp_owner:
@@ -1266,13 +1282,6 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         if not self._tp_owner:
             return  # TP client: the owner rank manages the shared tp>1 server
         del track_prefix
-        if self._tp_size > 1 and len(serialized_named_tensors) == 1:
-            # sglang's scheduler indexes serialized_named_tensors[tp_rank] — the
-            # list must carry one entry PER TP RANK. Senders serialize the full
-            # (FSDP-gathered) tensors once; replicate the payload so every tp
-            # rank deserializes the same full tensors and its weight loader takes
-            # its own shard (the official sglang tp>1 usage).
-            serialized_named_tensors = list(serialized_named_tensors) * self._tp_size
         payload: Dict[str, Any] = {
             "serialized_named_tensors": serialized_named_tensors,
             "flush_cache": flush_cache,
