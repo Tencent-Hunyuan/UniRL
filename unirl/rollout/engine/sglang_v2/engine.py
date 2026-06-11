@@ -3,7 +3,8 @@
 A thin core over the backend seam: it names no concrete model (the adapter,
 picked from the registry by ``config.model_family``, owns the
 ``RolloutReq``↔``RolloutResp`` conversion) and no concrete transport (the seam
-owns the SRT server + HTTP). Weight sync is a :class:`WeightSync` component
+owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
+picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
 constructed over the seam; the offload lifecycle (the two staged flags) lives
 directly on the engine. The frozen ``base.py`` surface is implemented as thin
 forwards here — they must be real class attributes anyway (``Worker.call``
@@ -14,8 +15,8 @@ signatures.
 One-shot construction: after ``__init__`` returns, the SRT server is spawned and
 healthy and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
 re-apply ``@distributed`` (the decorator is not inherited — see ``base.py``).
-No environment mutation happens here — the spawn-scoped env the SRT subprocess
-needs is quarantined in the seam's :meth:`HTTPBackend.boot`.
+No environment mutation happens here — the spawn-scoped env the SRT
+subprocesses need is quarantined in the backends' ``boot``.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang_v2.adapters import get_adapter
-from unirl.rollout.engine.sglang_v2.backends import HTTPBackend
+from unirl.rollout.engine.sglang_v2.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig, SGLangV2Ports
 from unirl.rollout.engine.sglang_v2.utils import resolve_sampling
 from unirl.rollout.engine.sglang_v2.weight_sync import WeightSync
@@ -102,32 +103,37 @@ class SGLangV2RolloutEngine(BaseRolloutEngine):
             config.tp_size,
         )
 
-        # The address peers reach this server at (the bind host is usually the
-        # 0.0.0.0 wildcard). Node-identity discovery, not runtime I/O — so it
-        # lives here, beside the port reservation for the same node.
-        bind_host = str(engine_kwargs.get("host") or config.host or "0.0.0.0")
-        advertise_host = engine_kwargs.get("advertise_host")
-        if not advertise_host:
-            try:
-                import ray
-
-                advertise_host = ray.util.get_node_ip_address()
-            except Exception:
-                advertise_host = bind_host if bind_host not in ("0.0.0.0", "") else "127.0.0.1"
-
         # Ports — engine-reserved on this node at the last moment before the
-        # spawn. Tests inject a fixed set.
+        # spawn (both backends: nccl_port de-syncs colocated engines). Tests
+        # inject a fixed set.
         if ports is None:
             ports = SGLangV2Ports.reserve()
 
         # Backend (the seam) — booted from the config-spelled intent.
         intent = config.server_intent(ports=ports, extra=self.adapter.boot_kwargs())
-        self._backend = HTTPBackend.boot(
-            intent,
-            advertise_host=str(advertise_host),
-            concurrency=int(engine_kwargs.get("concurrency", config.concurrency)),
-            health_timeout_s=float(engine_kwargs.get("health_timeout_s", 300.0)),
-        )
+        concurrency = int(engine_kwargs.get("concurrency", config.concurrency))
+        if config.backend == "native":
+            self._backend = NativeBackend.boot(intent, concurrency=concurrency)
+        else:
+            # The address peers reach this server at (the bind host is usually
+            # the 0.0.0.0 wildcard). Node-identity discovery, not runtime I/O —
+            # and HTTP-only: it exists to build the client base_url.
+            bind_host = str(engine_kwargs.get("host") or config.host or "0.0.0.0")
+            advertise_host = engine_kwargs.get("advertise_host")
+            if not advertise_host:
+                try:
+                    import ray
+
+                    advertise_host = ray.util.get_node_ip_address()
+                except Exception:
+                    advertise_host = bind_host if bind_host not in ("0.0.0.0", "") else "127.0.0.1"
+
+            self._backend = HTTPBackend.boot(
+                intent,
+                advertise_host=str(advertise_host),
+                concurrency=concurrency,
+                health_timeout_s=float(engine_kwargs.get("health_timeout_s", 300.0)),
+            )
 
         # Weight sync — owns all sync/LoRA state, over the live seam.
         self._weight_sync = WeightSync(

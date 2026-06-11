@@ -107,6 +107,13 @@ def test_validation_errors():
         make_config(top_p=1.5)
 
 
+def test_backend_default_normalization_and_validation():
+    assert make_config().backend == "http"
+    assert make_config(backend="NATIVE ").backend == "native"
+    with pytest.raises(ValueError, match="backend"):
+        make_config(backend="grpc")
+
+
 def test_model_family_derived_from_image_token():
     assert make_config().model_family == "text"
     assert make_config(image_token="<img>").model_family == "vlm"

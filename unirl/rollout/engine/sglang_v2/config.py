@@ -66,6 +66,12 @@ class SGLangV2EngineConfig(BaseEngineConfig):
     host: Optional[str] = None
     port: Optional[int] = None
 
+    # --- Backend transport selection ---
+    # "http" (default): SRT server subprocess + HTTP client. "native":
+    # in-process sglang.Engine (no HTTP hop; the schedulers are still
+    # subprocesses).
+    backend: str = "http"
+
     # --- Concurrency / async ---
     concurrency: int = 8
 
@@ -130,6 +136,12 @@ class SGLangV2EngineConfig(BaseEngineConfig):
         require(
             0.0 < self.top_p <= 1.0,
             f"SGLangV2EngineConfig.top_p must be in (0, 1]; got {self.top_p!r}",
+        )
+
+        self.backend = str(self.backend).strip().lower()
+        require(
+            self.backend in ("http", "native"),
+            f"SGLangV2EngineConfig.backend must be 'http' or 'native'; got {self.backend!r}",
         )
 
         # Adapter selection: derive from the predecessor's VLM switch when not
