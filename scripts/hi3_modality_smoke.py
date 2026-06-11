@@ -93,7 +93,11 @@ def build_pipeline():
     from unirl.models.hunyuan_image3.bundle import HunyuanImage3Bundle
     from unirl.models.hunyuan_image3.config import HunyuanImage3PipelineConfig
     from unirl.models.hunyuan_image3.pipeline import HunyuanImage3Pipeline
+    from unirl.models.hunyuan_image3.compat import apply_hi3_transformers5_compat
     from unirl.sde.kernels import FlowSDEStrategy
+
+    # transformers-5.x compat shims (replaces the on-disk checkpoint patcher).
+    apply_hi3_transformers5_compat()
 
     dtype = torch.bfloat16
     log(f"loading transformer (device_map=auto, bf16) from {PRETRAINED} ...")

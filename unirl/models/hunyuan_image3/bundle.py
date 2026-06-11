@@ -111,6 +111,9 @@ class HunyuanImage3Bundle(Bundle):
         """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        from .compat import apply_hi3_transformers5_compat
+
+        apply_hi3_transformers5_compat()
         path = config.pretrained_model_ckpt_path
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
@@ -465,6 +468,9 @@ class HunyuanImage3Bundle(Bundle):
             GenerationConfig,
         )
 
+        from .compat import apply_hi3_transformers5_compat
+
+        apply_hi3_transformers5_compat()
         path = config.pretrained_model_ckpt_path
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
