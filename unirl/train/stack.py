@@ -142,6 +142,56 @@ def _build_token_budget_micros(
     return bins
 
 
+def _partition_into_k(
+    *,
+    indices: Sequence[int],
+    lengths: Sequence[int],
+    k: int,
+) -> List[List[int]]:
+    """Partition ``indices`` into EXACTLY ``k`` non-empty bins, balancing dense cost.
+
+    Used to equalize the micro-batch COUNT across DP ranks (see
+    :func:`_build_token_budget_micros` callers): FSDP forward/backward issues
+    collectives per micro, so every rank must run the same number of micros or
+    NCCL deadlocks. Greedy LPT: longest-first, each item goes to the bin whose
+    dense cost (``max_len * count``) stays smallest after insertion; the first
+    ``k`` items seed the bins so none is empty. May exceed the token budget —
+    the budget is a throughput hint, parity is a correctness requirement.
+    """
+    if k < 1 or k > len(indices):
+        raise ValueError(f"_partition_into_k: k={k} out of range for {len(indices)} samples")
+    order = sorted(indices, key=lambda i: (-int(lengths[i]), i))
+    bins: List[List[int]] = [[order[j]] for j in range(k)]
+    bin_max: List[int] = [max(1, int(lengths[order[j]])) for j in range(k)]
+    for i in order[k:]:
+        length = max(1, int(lengths[i]))
+        best, best_cost = 0, None
+        for b in range(k):
+            cost = max(bin_max[b], length) * (len(bins[b]) + 1)
+            if best_cost is None or cost < best_cost:
+                best, best_cost = b, cost
+        bins[best].append(i)
+        bin_max[best] = max(bin_max[best], length)
+    return bins
+
+
+def _sync_micro_count(local_count: int) -> int:
+    """All-reduce(MAX) the per-rank micro count over the default process group.
+
+    Token-budget packing depends on each rank's local sequence lengths, so the
+    natural bin count differs across DP ranks — but FSDP collectives require
+    micro-count parity (see :func:`_partition_into_k`). No-op (returns the local
+    count) when torch.distributed is not initialized or world_size == 1.
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
+        return local_count
+    t = torch.tensor([int(local_count)], dtype=torch.long, device="cuda" if torch.cuda.is_available() else "cpu")
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t.item())
+
+
 def _build_mini_batch_slices(*, total_size: int, num_updates: int) -> Tuple[Tuple[int, int], ...]:
     """Partition ``[0, total_size)`` into ``num_updates`` equal contiguous slices.
 
@@ -313,15 +363,21 @@ class TrainStack(Remote):
             return [list(step) for step in self._optimizer_step_slices(total)]
         steps: List[List[MicroPlan]] = []
         for mini_start, mini_end in _build_mini_batch_slices(total_size=total, num_updates=self.num_updates_per_batch):
-            steps.append(
-                list(
-                    _build_token_budget_micros(
-                        indices=range(mini_start, mini_end),
-                        lengths=lengths,
-                        token_budget=self.micro_token_budget,
-                    )
-                )
+            indices = list(range(mini_start, mini_end))
+            bins = _build_token_budget_micros(
+                indices=indices,
+                lengths=lengths,
+                token_budget=self.micro_token_budget,
             )
+            # NCCL micro-count parity: FSDP fwd/bwd run collectives per micro, so
+            # every DP rank must execute the SAME number of micros per optimizer
+            # step or the process group deadlocks (watchdog kills the job). Packing
+            # is local (depends on this rank's lengths), so sync to the global max
+            # and re-partition into exactly that many bins when short.
+            k = _sync_micro_count(len(bins))
+            if k != len(bins):
+                bins = _partition_into_k(indices=indices, lengths=lengths, k=k)
+            steps.append(list(bins))
         return steps
 
     @staticmethod
