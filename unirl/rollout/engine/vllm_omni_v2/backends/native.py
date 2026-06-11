@@ -568,6 +568,21 @@ class VLLMOmniBackend:
         """
         import torch
 
+        # The zero-copy CUDA-IPC push below needs SGLang's
+        # MultiprocessingSerializer, which is absent from the vllm-omni-only venv
+        # on the two-venv image. Fall back to the byte-copy transport
+        # (:meth:`set_lora_copy`: torch.save + base64; its worker receiver
+        # ``set_lora_from_tensor_dict_copy`` is torch.load) — both sglang-free,
+        # and LoRA is tiny so the per-rank copy is free. (LIN-382)
+        try:
+            import sglang.srt.utils  # noqa: F401
+        except ModuleNotFoundError:
+            return self.set_lora_copy(
+                adapter_name=adapter_name,
+                lora_tensors=lora_tensors,
+                peft_config=peft_config,
+            )
+
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
             DIFFRL_LORA_INT_ID,
             DIFFRL_LORA_NAME,
