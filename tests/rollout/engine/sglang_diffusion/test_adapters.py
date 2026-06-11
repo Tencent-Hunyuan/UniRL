@@ -251,45 +251,6 @@ def test_build_sampling_override_merges_into_template():
     assert kw["num_inference_steps"] == 2
 
 
-def test_build_inputs_matches_legacy_translator():
-    # Transitional parity gate: the staged template must emit the exact kwargs
-    # dict the legacy engine's translator builds. Dies with the legacy engine.
-    from unirl.rollout.engine.sglang.request import _to_sglang_kwargs
-
-    noise = torch.randn(1, 4, 2, 2)
-    cases = [
-        # (prompts, group_ids, req_kwargs, strategy, sde_label, initial_noise)
-        (["a photo"], None, {}, None, None, None),
-        (["p"], None, {"sde_indices": [1, 0]}, _Flow(), "sde", None),
-        (["a", "a"], ["g", "g"], {}, None, None, None),
-        (["a", "b"], None, {}, None, None, None),
-        (
-            ["p"],
-            None,
-            {"sampler_kwargs": {"negative_prompt": "bad", "return_negative_prompt_embeds": True}},
-            None,
-            None,
-            None,
-        ),
-        (["p"], None, {}, None, None, noise),
-    ]
-    for prompts, gids, rkw, strategy, sde_label, init_noise in cases:
-        a = SD3Adapter(_cfg(), _model_config(), strategy=strategy)
-        req = _req(prompts, group_ids=gids, **rkw)
-        got = a.build_inputs(req, initial_noise=init_noise)
-        # Legacy translator reads cfg.populate_conditions post-migration — feed
-        # it the same posture as the v2 adapter's _cfg() (True).
-        legacy_cfg = SimpleNamespace(populate_conditions=True)
-        want = _to_sglang_kwargs(req, cfg=legacy_cfg, sde_label=sde_label, initial_noise=init_noise)
-        # Documented v2 delta: rollout machinery is always on (v1 sends it only
-        # under SDE — v1 never runs non-SDE rollouts; the patched stack returns
-        # the usable trajectory only via rtd.dit_trajectory). SDE-case kwargs
-        # are identical between the engines.
-        if rkw.get("sde_indices") is None:
-            want = dict(want, rollout=True, rollout_return_dit_trajectory=True, rollout_sde_step_indices=[])
-        assert got == want, f"kwargs drift vs legacy for case {prompts}, {rkw}"
-
-
 # --------------------------------------------------------------------------- #
 # build_response
 # --------------------------------------------------------------------------- #

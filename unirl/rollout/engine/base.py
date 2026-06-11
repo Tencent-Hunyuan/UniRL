@@ -1,6 +1,6 @@
 """Rollout engine base class for the ``RolloutReq``/``RolloutResp`` path.
 
-Subclasses (``VLLMOmniRolloutEngine``, ``SGLangRolloutEngine``,
+Subclasses (``VLLMOmniRolloutEngine``, ``SGLangDiffusionRolloutEngine``,
 ``TrainsideRolloutEngine``) take all runtime deps as ``__init__`` kwargs
 and complete construction in one shot — no separate ``initialize(device)``
 step. After ``__init__`` returns the engine is fully usable: model loaded,

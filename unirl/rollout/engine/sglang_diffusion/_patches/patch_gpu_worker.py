@@ -54,7 +54,7 @@ def patch_gpu_worker() -> None:
                 TorchMemorySaverAdapter,
             )
 
-            from unirl.rollout.engine.sglang._patches.memory_saver import (
+            from unirl.rollout.engine.sglang_diffusion._patches.memory_saver import (
                 MemorySaverHandler,
             )
 

@@ -27,7 +27,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 
     Stock upstream sglang (>= 0.5.12.post1) replaced the fork: the RL additions
     (weight-sync verbs, in-memory LoRA, sleep/wake, rollout IO fields) are
-    re-hosted as in-process patches under ``unirl.rollout.engine.sglang._patches``
+    re-hosted as in-process patches under ``unirl.rollout.engine.sglang_diffusion._patches``
     and MUST be installed before any scheduler/worker spawns — ``hijack()`` also
     wraps the mp process target so spawned children re-install (mirrors the v1
     engine, ``sglang/engine.py``).
@@ -36,7 +36,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     fork-only req types come from ``_patches.io_struct`` / ``_patches.lora_req``
     (``patch_scheduler`` registers handlers keyed on those exact classes).
     """
-    from unirl.rollout.engine.sglang._patches import SglangDiffusionHijack
+    from unirl.rollout.engine.sglang_diffusion._patches import SglangDiffusionHijack
 
     SglangDiffusionHijack.hijack()
 
@@ -49,7 +49,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-    from unirl.rollout.engine.sglang._patches.io_struct import (
+    from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         InitWeightsUpdateGroupReqInput,
         ReleaseMemoryOccupationReqInput,
@@ -57,7 +57,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         UpdateWeightsFromDistributedReqInput,
         UpdateWeightsFromTensorReqInput,
     )
-    from unirl.rollout.engine.sglang._patches.lora_req import SetLoraFromTensorsReq
+    from unirl.rollout.engine.sglang_diffusion._patches.lora_req import SetLoraFromTensorsReq
 
     return {
         "DiffGenerator": DiffGenerator,

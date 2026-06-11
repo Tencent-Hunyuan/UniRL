@@ -20,7 +20,7 @@ sched_mod = pytest.importorskip(
 )
 torch = pytest.importorskip("torch")
 
-from unirl.rollout.engine.sglang._patches.patch_set_timesteps import (  # noqa: E402
+from unirl.rollout.engine.sglang_diffusion._patches.patch_set_timesteps import (  # noqa: E402
     patch_set_timesteps,
 )
 

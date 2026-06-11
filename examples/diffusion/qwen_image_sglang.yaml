@@ -1,7 +1,7 @@
 # @package _global_
 # Qwen-Image + sglang_diffusion (v2 engine) colocate, REPLAY logprob, DanceGRPO, 1x8 H20.
 #
-# Composition: the rollout/sync blocks of sd3_sglang_diffusion_replay_colocate.yaml
+# Composition: the rollout/sync blocks of sd3_sglang_replay_colocate.yaml
 # (v2 engine, stock sglang 0.5.12.post1 + in-process _patches) x the model/training
 # blocks of qwen_image_dancegrpo.yaml (trainside reference — the parity oracle:
 # same prompts/seeds/x_T must produce matching trajectories/logprobs).
@@ -21,7 +21,7 @@
 #     (single-space negative — empty "" degenerates after the 34-token chat-template
 #     strip and divides the norm-preserving CFG blend by ~0; see QwenImagePipeline.)
 #
-#   1x8:  bash scripts/run_experiment_single_node.sh diffusion_rl/qwen_image_sglang_diffusion
+#   1x8:  bash scripts/run_experiment_single_node.sh diffusion_rl/qwen_image_sglang
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout (matches qwen_image_dancegrpo)
@@ -31,7 +31,7 @@ num_rollouts: 10000
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
   project_name: unirl
-  run_name: qwen_image_sglang_diffusion
+  run_name: qwen_image_sglang
   entity: null
   tags: ["qwen-image", "dancegrpo", "grpo", "sglang-diffusion", "v2"]
 
@@ -175,7 +175,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 
 algorithm:
-  _target_: unirl.algorithms.diffusion_grpo.DiffusionGRPO
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant

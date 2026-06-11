@@ -251,7 +251,7 @@ rollout:
         # max_lora_rank: 16
         # lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     diffusion:
-      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
       model_family: sd3
       tp_size: 1
       local_mode: true

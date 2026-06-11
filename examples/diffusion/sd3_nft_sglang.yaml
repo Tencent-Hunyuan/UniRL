@@ -101,11 +101,11 @@ backend:
       - attn.to_v
 
 rollout:
-  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   model_config: ${bundle.config}
   strategy: ${pipeline.strategy}
   config:
-    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: sd3
     tp_size: 1
     populate_conditions: true

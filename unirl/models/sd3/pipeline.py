@@ -10,7 +10,7 @@ the four stages with the precision policy from the config.
 
 σ schedule contract
 -------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangRolloutEngine`` /
+The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` /
 ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
 :func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
 ``generate(req)``; this pipeline reads ``req.sigmas`` and uses it

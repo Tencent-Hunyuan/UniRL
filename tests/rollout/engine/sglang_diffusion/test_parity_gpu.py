@@ -1,24 +1,19 @@
-"""GPU integration: real-seam smoke + per-family parity gate vs the legacy engine.
+"""GPU integration: real-seam smoke for the ``sglang_diffusion`` engine.
 
-GATED — skipped unless a CUDA device and the SGLang fork are both present, so CI
-skips it. Run on the target box (with ``PRETRAINED_MODEL`` set) to validate the
-``sglang_diffusion`` rewrite end-to-end and to gate it against the legacy ``sglang``
-engine before retiring the latter:
+GATED — skipped unless a CUDA device and SGLang are both present, so CI skips it.
+Run on the target box (with ``PRETRAINED_MODEL`` set) to validate the engine
+end-to-end:
 
     PRETRAINED_MODEL=stabilityai/stable-diffusion-3.5-medium \
         pytest tests/rollout/engine/sglang_diffusion/test_parity_gpu.py -v
 
-What it checks (per the testing convention):
-  - smoke: build the v2 engine, generate one tiny batch, run one tensor weight
-    sync, and sleep/wake — proves the seam wiring is live.
-  - parity: build the legacy ``sglang`` engine and the v2 ``sglang_diffusion``
-    engine with an identical config / model_config / fixed seed, generate the same
-    ``RolloutReq``, and assert the ``LatentSegment`` latents + σ schedule match
-    (tolerance per impl-time decision D4 — start with allclose, tighten to
-    bit-identity once the SDE-noise kernels are confirmed equal).
+What it checks:
+  - smoke: build the v2 engine, assert ServerArgs keeps the reserved ports,
+    generate one tiny batch, and sleep/wake — proves the seam wiring is live.
 
-The driver/Handle/Ray placement path is exercised separately; here we construct the
-engines directly so the gate is a single-process, two-engine comparison.
+Per-family numeric parity is gated against the **trainside oracle** (the
+ground-truth replay), not the now-removed legacy ``sglang`` engine — see the
+qwen trainside-oracle gate for the pattern.
 """
 
 from __future__ import annotations
@@ -33,8 +28,6 @@ if not torch.cuda.is_available():
     pytest.skip("parity gate needs a CUDA device", allow_module_level=True)
 
 from unirl.models.sd3.config import SD3PipelineConfig  # noqa: E402
-from unirl.rollout.engine.sglang.config import SGLangEngineConfig  # noqa: E402
-from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine  # noqa: E402
 from unirl.rollout.engine.sglang_diffusion.config import (  # noqa: E402
     SGLangDiffusionEngineConfig,
     SGLangDiffusionPorts,
@@ -90,22 +83,6 @@ def _build_v2(ports: SGLangDiffusionPorts | None = None):
     )
 
 
-def _build_v1():
-    cfg = SGLangEngineConfig(
-        sampling=None,
-        model_family="sd3",
-        populate_conditions=True,
-        local_mode=True,
-    )
-    return SGLangRolloutEngine(
-        cfg,
-        device=torch.device("cuda"),
-        strategy=FlowSDEStrategy(),
-        model_config=_model_config(),
-        rank=0,
-    )
-
-
 def test_smoke_generate_sleep_wake():
     ports = SGLangDiffusionPorts.reserve()
     engine = _build_v2(ports)
@@ -129,20 +106,3 @@ def test_smoke_generate_sleep_wake():
         assert not engine.is_offloaded
     finally:
         engine.shutdown()
-
-
-def test_parity_sd3_latents_match_legacy():
-    new, old = _build_v2(), _build_v1()
-    try:
-        resp_new = new.generate(_req(seed=42))
-        resp_old = old.generate(_req(seed=42))
-        seg_new = resp_new.tracks["image"].segment
-        seg_old = resp_old.tracks["image"].segment
-        assert torch.equal(seg_new.sigmas, seg_old.sigmas), "σ schedule diverged"
-        # Tolerance per D4; tighten to torch.equal once SDE kernels are confirmed equal.
-        assert torch.allclose(seg_new.latents.float(), seg_old.latents.float(), atol=1e-3, rtol=1e-3), (
-            "v2 latents diverged from legacy sglang for a fixed seed"
-        )
-    finally:
-        new.shutdown()
-        old.shutdown()

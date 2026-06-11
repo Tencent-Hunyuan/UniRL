@@ -17,7 +17,7 @@ constructs the four stages with the precision policy from the config.
 
 σ schedule contract
 -------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangRolloutEngine``
+The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
 / ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
 :func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
 ``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
@@ -106,7 +106,7 @@ class QwenImagePipeline(Pipeline):
         self.vae_decode = vae_decode if vae_decode is not None else QwenImageVAEDecodeStage(bundle)
         # ``shift`` is retained as an attribute so the hosting engine
         # (TrainsideRolloutEngine / VLLMOmniRolloutEngine /
-        # SGLangRolloutEngine) can read it when constructing the
+        # SGLangDiffusionRolloutEngine) can read it when constructing the
         # FlowMatchSchedulePolicy at startup. For Qwen-Image, the
         # checkpoint's scheduler_config.json enables dynamic shifting,
         # so the static ``shift`` value is only used as a fallback when
