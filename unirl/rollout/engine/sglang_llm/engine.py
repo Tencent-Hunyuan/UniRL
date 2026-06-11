@@ -1266,6 +1266,13 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         if not self._tp_owner:
             return  # TP client: the owner rank manages the shared tp>1 server
         del track_prefix
+        if self._tp_size > 1 and len(serialized_named_tensors) == 1:
+            # sglang's scheduler indexes serialized_named_tensors[tp_rank] — the
+            # list must carry one entry PER TP RANK. Senders serialize the full
+            # (FSDP-gathered) tensors once; replicate the payload so every tp
+            # rank deserializes the same full tensors and its weight loader takes
+            # its own shard (the official sglang tp>1 usage).
+            serialized_named_tensors = list(serialized_named_tensors) * self._tp_size
         payload: Dict[str, Any] = {
             "serialized_named_tensors": serialized_named_tensors,
             "flush_cache": flush_cache,
