@@ -123,9 +123,27 @@ def collect_dit_outputs(
         pil_frames_per_prompt.append(list(imgs))
         pil_images.extend(imgs)
     if not pil_images:
+        # TEMP DIAG (LIN-382 hv15): characterize the wire results so we can see
+        # where the decoded frames actually landed (images vs output vs custom).
+        _diag = []
+        for d in diff_outputs[:2]:
+            _imgs = getattr(d, "images", "NO_ATTR")
+            _present = [a for a in ("images", "frames", "videos", "output", "decoded", "multimodal_output") if hasattr(d, a)]
+            _co = getattr(d, "custom_output", None)
+            _diag.append(
+                "type=%s fot=%s images=%s:%s present=%s custom_keys=%s" % (
+                    type(d).__name__,
+                    getattr(d, "final_output_type", None),
+                    type(_imgs).__name__,
+                    (len(_imgs) if hasattr(_imgs, "__len__") else _imgs),
+                    _present,
+                    (list(_co)[:8] if isinstance(_co, dict) else _co),
+                )
+            )
         raise RuntimeError(
             "collect_dit_outputs: DiT outputs carry no PIL images; "
-            "check pipeline forward populated DiffusionOutput.output."
+            "check pipeline forward populated DiffusionOutput.output. "
+            "[diag: %s]" % " || ".join(_diag)
         )
     return diff_outputs, pil_frames_per_prompt, pil_images
 
