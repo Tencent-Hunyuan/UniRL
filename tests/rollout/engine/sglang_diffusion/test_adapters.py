@@ -14,7 +14,7 @@ import torch
 from unirl.rollout.engine.sglang_diffusion import adapters
 from unirl.rollout.engine.sglang_diffusion.adapters.base import get_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.flux import Flux2KleinAdapter
-from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
+from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.types.primitives import Images, Texts
@@ -338,7 +338,7 @@ def test_build_response_populate_conditions_false():
     [(_Flow(), "sde"), (_Cps(), "cps"), (_Dance(), "dance"), (None, None)],
 )
 def test_resolve_sde_label(strategy, expected):
-    assert ImageDiTAdapter.resolve_sde_label(strategy) == expected
+    assert ImageAdapter.resolve_sde_label(strategy) == expected
 
 
 def test_resolve_sde_label_unknown_raises():
@@ -346,7 +346,7 @@ def test_resolve_sde_label_unknown_raises():
         canonical_name = "weird"
 
     with pytest.raises(ValueError, match="supports sde_type"):
-        ImageDiTAdapter.resolve_sde_label(_Weird())
+        ImageAdapter.resolve_sde_label(_Weird())
 
 
 def test_lora_spec_defaults():

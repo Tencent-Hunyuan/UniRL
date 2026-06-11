@@ -1,4 +1,4 @@
-"""``ImageDiTAdapter`` — per-output-shape base adapter holding the conversion logic.
+"""``ImageAdapter`` — per-output-shape base adapter holding the conversion logic.
 
 Output shape = a 5-D image-form latent trajectory ``[B, T+1, C, H, W]`` decoded to
 ``Images``. Holds ``build_inputs`` / ``build_response`` once and exposes the per-model
@@ -31,8 +31,8 @@ from unirl.types.sampling import get_diffusion_params
 from unirl.types.segments.latent import make_image_segment
 
 
-class ImageDiTAdapter(ModelAdapter):
-    """Conversion for image DiT families (SD3, FLUX, …). Default path end-to-end."""
+class ImageAdapter(ModelAdapter):
+    """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
     #: RolloutResp track key the segment/decoded/conditions are stored under.
     track_name: str = "image"
@@ -305,4 +305,4 @@ class ImageDiTAdapter(ModelAdapter):
         return out
 
 
-__all__ = ["ImageDiTAdapter"]
+__all__ = ["ImageAdapter"]

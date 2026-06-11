@@ -10,25 +10,25 @@ Proper video output (a ``video`` track, ``make_video_segment``, and ``Videos``
 decoded via ``from_list``) is a deliberate follow-up — it would diverge from the
 current engine, needs the packed/ragged ``Videos`` wiring, and has no parity
 baseline until a video reward consumer lands. When that happens, give these a
-``VideoDiTAdapter`` base that overrides ``segment_factory`` / ``build_decoded`` /
+``VideoAdapter`` base that overrides ``segment_factory`` / ``build_decoded`` /
 ``track_name``.
 """
 
 from __future__ import annotations
 
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
-from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
+from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 
 
 @register_adapter("mochi")
-class MochiAdapter(ImageDiTAdapter):
+class MochiAdapter(ImageAdapter):
     """Mochi — image-path parity (see module note); proper video output is a follow-up."""
 
     pass
 
 
 @register_adapter("hunyuan_video")
-class HunyuanVideoAdapter(ImageDiTAdapter):
+class HunyuanVideoAdapter(ImageAdapter):
     """HunyuanVideo — image-path parity (see module note); proper video output is a follow-up."""
 
     pass

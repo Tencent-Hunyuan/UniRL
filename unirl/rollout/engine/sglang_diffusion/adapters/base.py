@@ -1,7 +1,7 @@
 """Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + boilerplate with sensible defaults) over a per-output-
-shape base adapter (:mod:`image_dit`) that holds the conversion logic as overridable
+shape base adapter (:mod:`image`) that holds the conversion logic as overridable
 methods. Concrete adapters override only what differs and self-register by
 ``model_family`` key. Selected once at engine construction via :func:`get_adapter`.
 
@@ -64,7 +64,7 @@ def registered_adapters() -> Tuple[str, ...]:
 class ModelAdapter(ABC):
     """Thin ABC: registry key + boilerplate defaults + the two conversion seams.
 
-    The conversion *logic* lives on the per-shape base adapter (``ImageDiTAdapter``);
+    The conversion *logic* lives on the per-shape base adapter (``ImageAdapter``);
     this ABC only declares the boilerplate every adapter shares (SDE-label resolution,
     schedule policy, LoRA spec, server-boot extras, validation) and the two abstract
     methods the engine drives.

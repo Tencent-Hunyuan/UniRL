@@ -14,7 +14,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.flux import (
     Flux2KleinAdapter,
     FluxAdapter,
 )
-from unirl.rollout.engine.sglang_diffusion.adapters.image_dit import ImageDiTAdapter
+from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
+from unirl.rollout.engine.sglang_diffusion.adapters.packed_image import PackedImageAdapter
 
 # Concrete adapters — imported for their registration side-effects.
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
@@ -26,7 +27,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.video import (
 
 __all__ = [
     "ModelAdapter",
-    "ImageDiTAdapter",
+    "ImageAdapter",
+    "PackedImageAdapter",
     "get_adapter",
     "register_adapter",
     "registered_adapters",
