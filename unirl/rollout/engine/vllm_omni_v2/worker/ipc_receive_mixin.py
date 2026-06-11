@@ -50,32 +50,19 @@ class BucketedIPCReceiveMixin:
         # accept tensor-bag requests (matches verl-omni utils.py:40-46
         # pattern). Safe to call repeatedly — the patch is idempotent.
         VLLMOmniHijack.hijack()
-        # The trainer pickles IPC handles whose rebuild fn is SGLang's
-        # ``_rebuild_cuda_tensor_modified``. Unpickling on this worker
-        # imports the same function, which then calls
-        # ``reductions._rebuild_cuda_tensor_original`` — only present
-        # after ``monkey_patch_torch_reductions()`` has run here too.
-        # Without this, the first IPC bucket trips an AttributeError
-        # the moment ``rebuild_ipc`` invokes ``func(*list_args)``.
-        #
-        # This patch is only needed for the CUDA-IPC receive path
-        # (``update_weights_from_ipc``). SGLang is not part of the
-        # vllm-omni-only venv on the two-venv image, so degrade gracefully
-        # when it is absent: non-IPC syncs (LoRA / NCCL) never unpickle IPC
-        # handles and so don't need it. (The lazy imports inside
-        # ``update_weights_from_ipc`` will still raise a clear error if the
-        # IPC path is actually used without SGLang installed.)
-        try:
-            try:
-                from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-            except ImportError:
-                from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-            monkey_patch_torch_reductions()
-        except ModuleNotFoundError:
-            logger.warning(
-                "sglang not importable; CUDA-IPC weight receive disabled "
-                "(OK for LoRA/NCCL weight sync, which don't use IPC handles)"
-            )
+        # The trainer pickles IPC handles whose rebuild fn is the vendored
+        # ``_rebuild_cuda_tensor_modified``. Unpickling on this worker imports
+        # the SAME function (same module path), which then calls
+        # ``reductions._rebuild_cuda_tensor_original`` — only present after
+        # ``monkey_patch_torch_reductions()`` has run here too. We use the
+        # sglang reductions vendored under unirl because the vllm-omni venv
+        # intentionally has no sglang; trainer and worker both import this one
+        # module so the CUDA-IPC pickle round-trips.
+        from unirl.rollout.engine.vllm_omni.weight_sync.sgl_compat import (
+            monkey_patch_torch_reductions,
+        )
+
+        monkey_patch_torch_reductions()
         return super().__new__(cls)
 
     # ------------------------------------------------------------------
@@ -215,17 +202,12 @@ class BucketedIPCReceiveMixin:
         venv that runs the rollout actor and the worker shares this dep.
         """
         del target_modules, flush_cache  # accepted for SGLang-shape parity
-        # Deferred import: keeps the mixin importable on hosts without sglang
-        # (the engine + bucketed-IPC paths don't need it).
-        try:
-            from sglang.srt.utils import MultiprocessingSerializer
-            from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-        except ImportError as exc:
-            raise RuntimeError(
-                f"{type(self).__name__}.update_weights_from_tensor: sglang is "
-                f"not installed in this worker. Install sglang or use "
-                f"update_weights_from_ipc instead. ({exc})"
-            ) from exc
+        # Vendored sglang serializer/bucket (engine venv has no sglang); the
+        # TensorWeightSync sender imports the SAME module so the pickle matches.
+        from unirl.rollout.engine.vllm_omni.weight_sync.sgl_compat import (
+            FlattenedTensorBucket,
+            MultiprocessingSerializer,
+        )
 
         local_rank = int(getattr(self, "local_rank", 0))
         if local_rank >= len(serialized_named_tensors):
@@ -282,12 +264,9 @@ class BucketedIPCReceiveMixin:
         deserialises into a real ``dict[str, torch.Tensor]`` and rebuilds
         the request locally.
         """
-        try:
-            from sglang.srt.utils import MultiprocessingSerializer
-        except ImportError as exc:
-            raise RuntimeError(
-                f"{type(self).__name__}.set_lora_from_tensor_dict: sglang is not installed in this worker. ({exc})"
-            ) from exc
+        from unirl.rollout.engine.vllm_omni.weight_sync.sgl_compat import (
+            MultiprocessingSerializer,
+        )
         from unirl.rollout.engine.vllm_omni_v2.patches.runtime import (
             OmniTensorLoRARequest,
         )
