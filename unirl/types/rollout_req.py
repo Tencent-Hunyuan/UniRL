@@ -21,8 +21,6 @@ Pairs with ``RolloutResp`` (in ``unirl/types/rollout_resp.py``). Carries:
   relevant sub-config.
 - ``stage_config: Dict[str, Any]`` — model-specific routing metadata
   (``"task"``, ``"bot_task"``, ``"sys_type"``, ``"chat"``).
-- ``collect_media_preview`` / ``media_max_items`` — operational flags for
-  media preview collection on the actor side.
 - ``sigmas: Optional[torch.Tensor]`` — the σ schedule for this rollout,
   computed main-side via
   :func:`unirl.sde.runtime.ensure_req_sigmas` (which applies the
@@ -72,8 +70,6 @@ class RolloutReq(Batch):
     request_conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
     sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
     stage_config: Dict[str, Any] = shared_field(default_factory=dict)
-    collect_media_preview: bool = shared_field(default=False)
-    media_max_items: int = shared_field(default=8)
     # σ schedule is shared across all samples in the request — every
     # sample runs the same num_inference_steps / shift / dynamic-shift μ
     # by construction (geometry varies per-sample only via height/width,
