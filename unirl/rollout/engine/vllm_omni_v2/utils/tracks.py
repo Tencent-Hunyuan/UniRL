@@ -124,20 +124,31 @@ def collect_dit_outputs(
         pil_images.extend(imgs)
     if not pil_images:
         # TEMP DIAG (LIN-382 hv15): characterize the wire results so we can see
-        # where the decoded frames actually landed (images vs output vs custom).
+        # where the decoded frames actually landed (images vs multimodal vs ...).
+        def _shape_of(v):
+            s = getattr(v, "shape", None)
+            if s is not None:
+                return "shape%s" % (tuple(s),)
+            return "len%s" % (len(v),) if hasattr(v, "__len__") else type(v).__name__
+
         _diag = []
-        for d in diff_outputs[:2]:
+        for d in diff_outputs[:1]:
             _imgs = getattr(d, "images", "NO_ATTR")
-            _present = [a for a in ("images", "frames", "videos", "output", "decoded", "multimodal_output") if hasattr(d, a)]
-            _co = getattr(d, "custom_output", None)
+            _mm = getattr(d, "multimodal_output", None)
+            _mm_desc = "none"
+            if isinstance(_mm, dict):
+                _mm_desc = {k: _shape_of(v) for k, v in list(_mm.items())[:8]}
+            elif _mm is not None:
+                _mm_desc = type(_mm).__name__
+            _pub = [a for a in dir(d) if not a.startswith("_") and not callable(getattr(d, a, None))]
             _diag.append(
-                "type=%s fot=%s images=%s:%s present=%s custom_keys=%s" % (
+                "type=%s fot=%s images=%s:%s mm=%s pub_attrs=%s" % (
                     type(d).__name__,
                     getattr(d, "final_output_type", None),
                     type(_imgs).__name__,
                     (len(_imgs) if hasattr(_imgs, "__len__") else _imgs),
-                    _present,
-                    (list(_co)[:8] if isinstance(_co, dict) else _co),
+                    _mm_desc,
+                    _pub,
                 )
             )
         raise RuntimeError(
