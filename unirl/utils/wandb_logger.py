@@ -18,9 +18,12 @@ Usage:
     logger.log_rollout(rollout_id=10, metrics={"reward_mean": 0.8})
 """
 
+import functools
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+import time
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import torch
 
@@ -35,6 +38,127 @@ if TYPE_CHECKING:
     from unirl.train.stack import TrainStepResult
 
 module_logger = logging.getLogger(__name__)
+
+
+class PhaseTimer:
+    """Per-phase wall-clock timer for one train step.
+
+    Construction starts the step total; each ``phase(name)`` block accumulates
+    into :attr:`phases` (re-entering a name adds to it, so a phase split across
+    code paths still reports one number). Feed the results straight to
+    :meth:`UniRLWandBLogger.log_rollout_step`::
+
+        timer = PhaseTimer()
+        with timer.phase("generate"):
+            resp = self.rollout.generate(req)
+        ...
+        logger.log_rollout_step(
+            rollout_id, result, resp,
+            step_time_s=timer.total(), phase_times=timer.phases,
+        )
+
+    Phases sum to ~``total()``; the residual is whatever ran outside any
+    ``phase`` block (cheap glue like logging).
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.perf_counter()
+        self.phases: Dict[str, float] = {}
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        """Time the enclosed block and accumulate it under ``name``."""
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t)
+
+    def total(self) -> float:
+        """Wall-clock seconds since construction (the whole step)."""
+        return time.perf_counter() - self._t0
+
+
+#: (trainer attribute, method, phase name) — the standard per-step collaborators
+#: every v2 trainer drives; missing ones (e.g. trainside has no ``weight_sync``)
+#: are skipped by :func:`install_phase_timing`.
+_STEP_PHASE_SPECS = (
+    ("rollout", "wake_up", "wake_up"),
+    ("rollout", "generate", "generate"),
+    ("rollout", "sleep", "sleep"),
+    ("weight_sync", "sync", "weight_sync"),
+    ("reward", "score_and_attach", "reward"),
+    ("stack", "train_track", "train"),
+)
+
+
+def install_phase_timing(trainer: Any) -> None:
+    """Attribute every train step into ``perf/<phase>_time_s`` — no trainer edits.
+
+    Wraps ``trainer.train_step`` to arm a fresh :class:`PhaseTimer` per step and,
+    lazily on the first step (the collaborators are created by the subclass
+    ``__init__`` after this installs, and ``_init_wandb`` replaces the logger
+    before stepping), wraps the standard collaborators from
+    ``_STEP_PHASE_SPECS`` to accumulate their wall-clocks, plus the live
+    logger's :meth:`UniRLWandBLogger.log_rollout_step` to inject the collected
+    ``phase_times`` unless the caller already passed them. The trainers' own
+    ``log_rollout_step(step_time_s=...)`` call sites stay the boundary —
+    untouched.
+
+    Handle methods are instance attributes (``handle.py`` binds them via
+    ``setattr``), so instance-level re-``setattr`` wrapping is the framework's
+    own extension mechanism. ``evaluate`` between steps also hits the wrapped
+    collaborators, but it accumulates into the stale timer of the
+    already-logged step and is discarded at the next re-arm.
+
+    Timing semantics: handle dispatch is a blocking barrier (``handle_fn``
+    does ``ray.get`` on all workers before returning), so each phase is the
+    step's true critical-path wall-clock and phases sum to ~the step total.
+    If a collaborator ever becomes async-submit (returns before the work
+    finishes), its phase collapses to submission time and the wait leaks into
+    the residual — a sudden near-zero phase plus a large
+    ``rollout_time_s - sum(phases)`` residual is the tell.
+    """
+    inner = getattr(trainer, "train_step", None)
+    if not callable(inner):
+        return
+    trainer._step_timer = PhaseTimer()
+    trainer._phase_wraps_installed = False
+
+    @functools.wraps(inner)
+    def _timed_train_step(*args, **kwargs):
+        trainer._step_timer = PhaseTimer()  # re-arm: fresh phases for this step
+        if not trainer._phase_wraps_installed:
+            _wrap_step_collaborators(trainer)
+            trainer._phase_wraps_installed = True
+        return inner(*args, **kwargs)
+
+    trainer.train_step = _timed_train_step
+
+
+def _wrap_step_collaborators(trainer: Any) -> None:
+    """Wrap the present ``_STEP_PHASE_SPECS`` callables + the live logger."""
+    for owner_name, method, phase in _STEP_PHASE_SPECS:
+        owner = getattr(trainer, owner_name, None)
+        fn = getattr(owner, method, None) if owner is not None else None
+        if not callable(fn):
+            continue
+
+        def _timed(*args, _fn=fn, _phase=phase, **kwargs):
+            with trainer._step_timer.phase(_phase):
+                return _fn(*args, **kwargs)
+
+        setattr(owner, method, functools.wraps(fn)(_timed))
+
+    log_inner = trainer.wandb_logger.log_rollout_step
+
+    @functools.wraps(log_inner)
+    def _log_with_phases(*args, **kwargs):
+        if kwargs.get("phase_times") is None and trainer._step_timer.phases:
+            kwargs["phase_times"] = dict(trainer._step_timer.phases)
+        return log_inner(*args, **kwargs)
+
+    trainer.wandb_logger.log_rollout_step = _log_with_phases
 
 
 class UniRLWandBLogger:
@@ -465,6 +589,7 @@ class UniRLWandBLogger:
         resp: Any,
         *,
         step_time_s: Optional[float] = None,
+        phase_times: Optional[Dict[str, float]] = None,
         trunc_len: Optional[int] = None,
         extra_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -482,6 +607,10 @@ class UniRLWandBLogger:
         - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
           (see :meth:`_log_train`).
         - ``perf/rollout_time_s``: optional wall-clock for the step.
+        - ``perf/<phase>_time_s``: optional per-phase wall-clocks from
+          ``phase_times`` (e.g. ``generate``/``weight_sync``/``reward``/
+          ``train``), so the step total can be attributed without log
+          archaeology.
 
         Generated media is NOT logged here: this runs after ``train_track``,
         so a preview still attached to the track would have ridden into the
@@ -502,8 +631,13 @@ class UniRLWandBLogger:
 
         self._log_train(results)
 
+        perf: Dict[str, float] = {}
         if step_time_s is not None:
-            self.log_perf(step, {"rollout_time_s": float(step_time_s)})
+            perf["rollout_time_s"] = float(step_time_s)
+        if phase_times:
+            perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
+        if perf:
+            self.log_perf(step, perf)
 
     def _log_train(
         self,

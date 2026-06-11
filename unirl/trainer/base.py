@@ -94,6 +94,14 @@ class BaseTrainer:
         # so each subclass train loop doesn't have to remember to.
         self._install_train_step_reset_hook()
 
+        # Time the standard step collaborators (rollout / weight_sync / reward /
+        # stack) and surface them as perf/<phase>_time_s, centrally, so every
+        # trainer gets step attribution without per-trainer edits. The machinery
+        # lives with the rest of the logging stack in wandb_logger.
+        from unirl.utils.wandb_logger import install_phase_timing
+
+        install_phase_timing(self)
+
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 
     def _install_train_step_reset_hook(self) -> None:
