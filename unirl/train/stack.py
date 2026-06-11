@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -86,6 +86,60 @@ def _build_micro_batch_slices(
         slices.append((start, end))
         start = end
     return tuple(slices)
+
+
+# A micro-batch plan is either a contiguous ``(start, end)`` range (the classic
+# count-based path) or an explicit index list (the token-budget packed path,
+# where samples are length-sorted so a range cannot express the grouping).
+MicroPlan = Union[Tuple[int, int], List[int]]
+
+
+def _micro_indices(plan: MicroPlan) -> List[int]:
+    """Absolute sample indices covered by a micro plan."""
+    if isinstance(plan, tuple):
+        return list(range(plan[0], plan[1]))
+    return list(plan)
+
+
+def _build_token_budget_micros(
+    *,
+    indices: Sequence[int],
+    lengths: Sequence[int],
+    token_budget: int,
+) -> List[List[int]]:
+    """Pack ``indices`` into micro-batches under a dense-compute token budget.
+
+    verl-style token-budget micro-batching (``ppo_max_token_len_per_gpu``)
+    adapted to a DENSE-padded replay: a micro's compute cost is
+    ``max_len_in_micro * batch_size`` (every row pads to the micro max), so the
+    bin constraint is ``max_len * (count + 1) <= token_budget``. First-fit
+    decreasing on length keeps rows of similar length together, which makes the
+    dense pad waste ~0 without needing varlen attention. A sequence longer than
+    the whole budget still gets its own micro (never dropped).
+
+    Replaces the count-based ``micro_batch_size`` slicing: with mbs=1 every
+    sequence is its own forward/backward (massive GPU under-utilization); with
+    a 10k budget and ~1-2k sequences one micro carries ~5-10 packed rows.
+    """
+    if int(token_budget) < 1:
+        raise ValueError(f"micro_token_budget must be >= 1; got {token_budget}")
+    order = sorted(indices, key=lambda i: (-int(lengths[i]), i))
+    bins: List[List[int]] = []
+    bin_max: List[int] = []
+    for i in order:
+        length = max(1, int(lengths[i]))
+        placed = False
+        for b in range(len(bins)):
+            new_max = max(bin_max[b], length)
+            if new_max * (len(bins[b]) + 1) <= token_budget:
+                bins[b].append(i)
+                bin_max[b] = new_max
+                placed = True
+                break
+        if not placed:
+            bins.append([i])
+            bin_max.append(length)
+    return bins
 
 
 def _build_mini_batch_slices(*, total_size: int, num_updates: int) -> Tuple[Tuple[int, int], ...]:
@@ -172,6 +226,7 @@ class TrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        micro_token_budget: Optional[int] = None,
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -190,6 +245,13 @@ class TrainStack(Remote):
         self.fsdp_backend = fsdp_backend
         self.algorithm = algorithm
         self.micro_batch_size = int(micro_batch_size)
+        # verl-parity perf knob (ppo_max_token_len_per_gpu analogue): when set and
+        # the segment exposes per-sample ``lengths``, micro-batches are built by
+        # length-sorted token-budget packing (see _build_token_budget_micros)
+        # instead of fixed-count slicing. None preserves the legacy behavior.
+        self.micro_token_budget = None if micro_token_budget is None else _positive_int(
+            name="TrainStack.micro_token_budget", value=micro_token_budget
+        )
         self.max_grad_norm = float(max_grad_norm)
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
@@ -220,7 +282,56 @@ class TrainStack(Remote):
             )
         return steps
 
-    def prepare_segment(self, resp_track: RolloutTrack) -> None:
+    def _plan_optimizer_steps(self, resp_track: RolloutTrack) -> List[List[MicroPlan]]:
+        """Plan the per-step micro-batches, preferring token-budget packing.
+
+        Mini-batch (optimizer-step) partitioning is unchanged — contiguous equal
+        slices in sample order. WITHIN each mini-batch, when ``micro_token_budget``
+        is set and the segment exposes per-sample ``lengths``, micros are built by
+        length-sorted dense-cost bin packing (index plans); otherwise the legacy
+        count-based contiguous ranges are used. Sample membership of each
+        optimizer step is identical in both modes — packing only regroups the
+        forward geometry inside a step, never which samples it trains on, so the
+        accumulated gradient per step is the same set-sum either way (micro losses
+        are re-weighted by sample count in :meth:`train`).
+        """
+        total = int(resp_track.batch_size)
+        lengths: Optional[List[int]] = None
+        if self.micro_token_budget is not None:
+            segment = resp_track.segment
+            raw = getattr(segment, "lengths", None) if segment is not None else None
+            if isinstance(raw, torch.Tensor) and raw.numel() == total:
+                lengths = [int(x) for x in raw.tolist()]
+            else:
+                logger.warning(
+                    "TrainStack: micro_token_budget=%s set but segment has no per-sample "
+                    "lengths; falling back to count-based micro_batch_size=%s.",
+                    self.micro_token_budget,
+                    self.micro_batch_size,
+                )
+        if lengths is None:
+            return [list(step) for step in self._optimizer_step_slices(total)]
+        steps: List[List[MicroPlan]] = []
+        for mini_start, mini_end in _build_mini_batch_slices(total_size=total, num_updates=self.num_updates_per_batch):
+            steps.append(
+                list(
+                    _build_token_budget_micros(
+                        indices=range(mini_start, mini_end),
+                        lengths=lengths,
+                        token_budget=self.micro_token_budget,
+                    )
+                )
+            )
+        return steps
+
+    @staticmethod
+    def _materialize_micro(resp_track: RolloutTrack, plan: MicroPlan) -> RolloutTrack:
+        """Materialize one micro-batch from its plan (range slice or index gather)."""
+        if isinstance(plan, tuple):
+            return resp_track.slice(plan[0], plan[1])
+        return resp_track.select(plan)
+
+    def prepare_segment(self, resp_track: RolloutTrack, *, plans: Optional[List[List[MicroPlan]]] = None) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop.
 
         No-op if ``segment`` is None. If the algorithm does NOT replay the anchor
@@ -244,14 +355,26 @@ class TrainStack(Remote):
         if not algorithm.recomputes_anchor():
             algorithm.prepare_segment(conditions=resp_track.conditions, segment=resp_track.segment)
             return
-        micro_slices = [sl for step in self._optimizer_step_slices(int(resp_track.batch_size)) for sl in step]
-        if len(micro_slices) == 1:
+        if plans is None:
+            plans = self._plan_optimizer_steps(resp_track)
+        micro_plans: List[MicroPlan] = [plan for step in plans for plan in step]
+        if len(micro_plans) == 1:
             algorithm.prepare_segment(conditions=resp_track.conditions, segment=resp_track.segment)
             return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = resp_track.slice(start, end)
+        total = int(resp_track.batch_size)
+        # Per-sample anchor chunks keyed by ORIGINAL index, so index plans (token-
+        # budget packing reorders samples inside a micro) reassemble in track
+        # order. Contiguous range plans land on the same path (their indices are
+        # already in order), so one reassembly covers both modes.
+        collected: Dict[str, List[Optional[torch.Tensor]]] = {
+            field: [None] * total for field in algorithm.anchor_fields
+        }
+        for plan in micro_plans:
+            indices = _micro_indices(plan)
+            micro = self._materialize_micro(resp_track, plan)
             algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
+            micro_bs = len(indices)
+            micro_lengths = getattr(micro.segment, "lengths", None)
             for field in collected:
                 value = getattr(micro.segment, field, None)
                 if value is None:
@@ -259,15 +382,36 @@ class TrainStack(Remote):
                         f"TrainStack.prepare_segment: {type(algorithm).__name__} declares anchor "
                         f"field {field!r} but a micro-slice produced None."
                     )
-                collected[field].append(value)
+                if value.dim() > 0 and int(value.shape[0]) == micro_bs:
+                    chunks = [value[j] .unsqueeze(0) for j in range(micro_bs)]
+                elif (
+                    isinstance(micro_lengths, torch.Tensor)
+                    and value.dim() > 0
+                    and int(value.shape[0]) == int(micro_lengths.sum().item())
+                ):
+                    chunks = list(torch.split(value, [int(n) for n in micro_lengths.tolist()], dim=0))
+                else:
+                    raise RuntimeError(
+                        f"TrainStack.prepare_segment: cannot map anchor field {field!r} of shape "
+                        f"{tuple(value.shape)} back to {micro_bs} samples (lengths="
+                        f"{None if micro_lengths is None else int(micro_lengths.sum().item())})."
+                    )
+                for j, orig in enumerate(indices):
+                    collected[field][orig] = chunks[j]
         for field, parts in collected.items():
+            missing = [i for i, p in enumerate(parts) if p is None]
+            if missing:
+                raise RuntimeError(
+                    f"TrainStack.prepare_segment: anchor field {field!r} missing chunks for "
+                    f"sample indices {missing[:5]}... — micro plans must cover every sample."
+                )
             setattr(resp_track.segment, field, torch.cat(parts, dim=0))
 
     def train(
         self,
         resp_track: RolloutTrack,
         *,
-        micro_slices: List[Tuple[int, int]],
+        micro_slices: List[MicroPlan],
         training_progress: float,
     ) -> TrainStepResult:
         """Run one optimizer step over the given absolute ``micro_slices``.
@@ -287,19 +431,25 @@ class TrainStack(Remote):
         bs = int(resp_track.batch_size)
         self.fsdp_backend.zero_grad()
 
-        loss_scale = 1.0 / len(micro_slices)
+        step_total = sum(len(_micro_indices(plan)) for plan in micro_slices)
         micros: List[AlgorithmStepResult] = []
         total_loss = 0.0
         has_backward = False
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
         last_micro = len(micro_slices) - 1
-        for i, (start, end) in enumerate(micro_slices):
+        for i, plan in enumerate(micro_slices):
             # Defer the per-block gradient reduce-scatter to the last micro-batch
             # so it runs once per optimizer step instead of once per micro-batch
             # (no-op unless defer_grad_sync + ZeRO-2). Must precede the backward.
             self.fsdp_backend.set_grad_sync(i == last_micro)
-            micro_track = resp_track if single_micro else resp_track.slice(start, end)
+            micro_track = resp_track if single_micro else self._materialize_micro(resp_track, plan)
+            # Sample-count weighting: the algorithm's micro loss is a MEAN over the
+            # micro's sequences (seq-mean agg modes), so the step gradient equals
+            # the mini-batch mean only when each micro is weighted by its share of
+            # samples. With equal count-based micros this reduces to the old
+            # 1/len(micro_slices); with token-budget packing micros vary in size.
+            loss_scale = len(_micro_indices(plan)) / float(step_total)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
                 segment=micro_track.segment,
@@ -369,8 +519,11 @@ class TrainStack(Remote):
         :meth:`_train_mini_batches`.
         """
         self._align_track_inputs(resp_track)
-        self.prepare_segment(resp_track)
-        result = self._train_mini_batches(resp_track, training_progress=float(training_progress))
+        # Plan once (mini partition + micro packing) and share it between the
+        # anchor freeze and the train loop so both run the exact same geometry.
+        plans = self._plan_optimizer_steps(resp_track)
+        self.prepare_segment(resp_track, plans=plans)
+        result = self._train_mini_batches(resp_track, plans=plans, training_progress=float(training_progress))
         self.on_rollout_end()
         return result
 
@@ -378,6 +531,7 @@ class TrainStack(Remote):
         self,
         resp_track: RolloutTrack,
         *,
+        plans: Optional[List[List[MicroPlan]]] = None,
         training_progress: float,
     ) -> TrainStepResult:
         """Run ``num_updates_per_batch`` optimizer steps over disjoint mini-batches.
@@ -391,9 +545,10 @@ class TrainStack(Remote):
         summary and each step's own metrics are attached on ``per_update`` (see
         :func:`_aggregate_update_results`).
         """
+        if plans is None:
+            plans = self._plan_optimizer_steps(resp_track)
         results = [
-            self.train(resp_track, micro_slices=micros, training_progress=training_progress)
-            for micros in self._optimizer_step_slices(int(resp_track.batch_size))
+            self.train(resp_track, micro_slices=micros, training_progress=training_progress) for micros in plans
         ]
         if len(results) == 1:
             return results[0]
