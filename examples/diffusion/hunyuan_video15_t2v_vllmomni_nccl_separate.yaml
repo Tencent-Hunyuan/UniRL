@@ -110,12 +110,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
-    modality: t2v
-    default_height: 480
-    default_width: 480
-    default_num_inference_steps: 16
-    default_guidance_scale: 0.0
-    default_eta: 0.25
+    modality: hv15_t2v
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
     enable_sleep_mode: false
     # HV1.5 has ~30GB DiT shards on cephfs; checkpoint load alone takes

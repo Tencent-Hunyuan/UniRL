@@ -55,16 +55,13 @@ def validate_precision_type(value: Any, *, field: str) -> str:
 
 _SGLANG_ENGINE_TARGET_SUFFIX = "SGLangRolloutEngine"
 _VLLM_OMNI_ENGINE_TARGET_SUFFIX = "VLLMOmniRolloutEngine"
-# Strangler replacement (rollout/engine/vllm_omni_v2) — same IPC receivers,
-# distinct class name; both accepted until v1 retires.
-_VLLM_OMNI_V2_ENGINE_TARGET_SUFFIX = "VLLMOmniV2RolloutEngine"
 _TRAINSIDE_ENGINE_TARGET_SUFFIX = "TrainsideRolloutEngine"
 _DIRECT_SAMPLING_ENGINE_SUFFIXES: tuple = (_TRAINSIDE_ENGINE_TARGET_SUFFIX,)
 # Sync handlers that only one engine implements. Listed here so the validator
 # can fail fast on a mismatched pairing. UpdateWeightFromTensor /
 # UpdateWeightFromDistributed work on BOTH sglang and vllm-omni — they're
 # transport-shape contracts, not engine-specific (vllm-omni's receivers live
-# in unirl.rollout.engine.vllm_omni.weight_sync.{ipc,nccl}_receive_mixin).
+# in unirl.rollout.engine.vllm_omni.worker.{ipc,nccl}_receive_mixin).
 _IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})  # vllm-omni only
 
 
@@ -134,7 +131,7 @@ def validate_weight_sync_contract(cfg: DictConfig) -> None:
         if sync_name in _IPC_SYNC_SUFFIXES:
             engine_target = str(cfg.rollout.engine.get("_target_") or "")
             require(
-                engine_target.endswith((_VLLM_OMNI_ENGINE_TARGET_SUFFIX, _VLLM_OMNI_V2_ENGINE_TARGET_SUFFIX)),
+                engine_target.endswith(_VLLM_OMNI_ENGINE_TARGET_SUFFIX),
                 f"sync={sync_name} (bucketed CUDA-IPC) is only implemented by the "
                 f"vllm-omni rollout engines; got rollout.engine._target_={engine_target!r}",
             )
