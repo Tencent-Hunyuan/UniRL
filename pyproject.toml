@@ -70,6 +70,20 @@ train = [
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
 ]
+# DGX Spark / GB10 smoke-test stack.  This intentionally keeps rollout engines
+# out: sglang/vllm/flash-attn remain the volatile native-extension boundary on
+# linux/aarch64, while this extra pins the first layer we can validate locally
+# (PyTorch CUDA + UniRL core/config/training imports).
+#
+# Install with uv so the torch-cu130 index below participates in resolution:
+#   uv pip install -e ".[spark,train,infer,dev]"
+# If using pip directly, add:
+#   --extra-index-url https://download.pytorch.org/whl/cu130
+spark = [
+  "torch>=2.11,<2.13 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "torchvision>=0.26,<0.28 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "torchaudio>=2.11,<2.13 ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 infer = [
   "accelerate>=0.30",
 ]
@@ -110,6 +124,7 @@ override-dependencies = [
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 
 # vllm's PyPI wheel is manylinux_2_35 and its GitHub +cu129 wheel manylinux_2_31;

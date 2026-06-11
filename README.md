@@ -99,7 +99,10 @@ schema, and how to add a recipe.
 
 ## Getting Started ⚡
 
-Install dependencies first — see [INSTALL.md](INSTALL.md).
+Install dependencies first — see [INSTALL.md](INSTALL.md). DGX Spark / GB10
+linux-aarch64 users should begin with the `spark` smoke-test path in
+[`docs/dgx-spark-aarch64.md`](docs/dgx-spark-aarch64.md) before attempting
+`sglang` or `vllm` engine extras.
 
 ```bash
 # compose-check, then launch a single-node example

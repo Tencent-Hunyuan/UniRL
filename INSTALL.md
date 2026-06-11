@@ -1,11 +1,29 @@
 # Installation
 
 UniRL ships two mutually exclusive inference engines (`vllm` and `sglang`) — install each in its own virtual environment.
+DGX Spark / GB10 / linux-aarch64 users should start with the `spark` smoke-test
+extra before attempting engine extras; see [DGX Spark bring-up](docs/dgx-spark-aarch64.md).
 
-| Engine | CUDA | glibc |
-|---|---|---|
-| **vllm-omni** | 12.9 | ≥ 2.28 |
-| **sglang** | 13.0 | ≥ 2.34 |
+| Engine / stack | CUDA | glibc | Arch |
+|---|---|---|---|
+| **spark smoke test** | 13.0 | ≥ 2.39 | linux/aarch64 |
+| **vllm-omni** | 12.9 | ≥ 2.28 | linux/x86_64 verified |
+| **sglang** | 13.0 | ≥ 2.34 | linux/x86_64 verified |
+
+## DGX Spark / GB10 / linux-aarch64
+
+```bash
+python3 -m venv .venv-spark && source .venv-spark/bin/activate
+python -m pip install -U pip uv
+uv pip install -e ".[spark,train,infer,dev]"
+python scripts/dgx_spark_probe.py
+```
+
+The probe validates the layer order that usually finds the first Arm/CUDA break:
+PyTorch CUDA → Diffusers/Transformers/PEFT/Ray → UniRL core → optional rollout
+engines. Optional failures for `sglang`, `vllm`, `flash_attn`, and
+`sglang_kernel` are expected until their linux-aarch64 CUDA 13 wheels or local
+source-build recipes are confirmed.
 
 ## vllm-omni
 
