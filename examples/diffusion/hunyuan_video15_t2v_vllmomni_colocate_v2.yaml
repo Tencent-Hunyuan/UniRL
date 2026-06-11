@@ -16,11 +16,13 @@
 #   - rollout enable_sleep_mode false -> true: colocate time-shares the GPU, so
 #     the engine must sleep (release GPU memory) while the trainer runs and wake
 #     to generate.
-#   - sync NCCLWeightSync -> IPCWeightSync (lora_merged: true): SAME merged
-#     full-weight semantics (we LoRA-train but push the merged full model), only
-#     the transport changes from cross-node NCCL broadcast to same-node CUDA-IPC
-#     — which is what colocate requires. hv15's stage config reuses SD3's
-#     DiTWeightSyncExtension, so the modality-agnostic name_remap path applies.
+#   - sync NCCLWeightSync -> LocalLoraWeightSync: the proven colocate weight
+#     sync (sd3/qwen v2 use it). Pushes the trained LoRA adapter into the
+#     co-located sibling engine in-process; the engine runs base + adapter,
+#     which is mathematically the merged model the separate recipe pushed.
+#     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
+#     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
+#     which the vllm-omni-only venv (two-venv image) does not provide.
 #   - algorithm.old_logp_source: replay — the separate-ENGINE anchor (the
 #     vllm-omni engine is a separate process even when colocated; without replay
 #     the cross-process rollout<->replay logp gap dilutes the first-epoch ratio
@@ -212,16 +214,16 @@ sampling:
     timestep_fraction: [0.0, 0.6]
     num_sde_steps: 8
 
-# Merged full-weight sync → colocated vLLM-Omni rollout. SAME semantics as the
-# separate recipe's NCCLWeightSync (use_merged: true) — fold the trained LoRA
-# delta into the base and push the merged full model — but over same-node
-# CUDA-IPC instead of cross-node NCCL broadcast (colocate requirement). hv15
-# weights are rooted at transformer.*, so the "*" catch-all name_remap nests
-# every key under the receiver's transformer.* namespace (same as sd3 full_ipc).
+# LoRA-adapter sync → colocated vLLM-Omni rollout (same bridge as
+# sd3_flowdppo_vllmomni_v2 / qwen_image_dancegrpo_vllmomni_v2). Extracts the
+# trained FSDP LoRA adapter and loads it into the co-located sibling engine
+# in-process via set_lora_from_tensors; the engine then runs base + adapter,
+# i.e. the merged model the separate recipe pushed over NCCL. Chosen over the
+# full-weight IPC/tensor handlers because those require SGLang's CUDA-IPC
+# serializer, which is absent from the vllm-omni-only venv on the two-venv
+# image; the LoRA path is in-process and SGLang-free.
 sync:
-  _target_: unirl.distributed.weight_sync.full.ipc.IPCWeightSync
-  lora_merged: true
-  bucket_size_mb: 2048
-  use_shm: false
-  flush_cache: true
-  name_remap: {"*": "transformer.*"}
+  _target_: unirl.distributed.weight_sync.lora.local.LocalLoraWeightSync
+  verify: true
+  param_prefix: "transformer."
+  adapter_name: default

@@ -57,11 +57,25 @@ class BucketedIPCReceiveMixin:
         # after ``monkey_patch_torch_reductions()`` has run here too.
         # Without this, the first IPC bucket trips an AttributeError
         # the moment ``rebuild_ipc`` invokes ``func(*list_args)``.
+        #
+        # This patch is only needed for the CUDA-IPC receive path
+        # (``update_weights_from_ipc``). SGLang is not part of the
+        # vllm-omni-only venv on the two-venv image, so degrade gracefully
+        # when it is absent: non-IPC syncs (LoRA / NCCL) never unpickle IPC
+        # handles and so don't need it. (The lazy imports inside
+        # ``update_weights_from_ipc`` will still raise a clear error if the
+        # IPC path is actually used without SGLang installed.)
         try:
-            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-        except ImportError:
-            from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
-        monkey_patch_torch_reductions()
+            try:
+                from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+            except ImportError:
+                from sglang.srt.patch_torch import monkey_patch_torch_reductions  # type: ignore[import]
+            monkey_patch_torch_reductions()
+        except ModuleNotFoundError:
+            logger.warning(
+                "sglang not importable; CUDA-IPC weight receive disabled "
+                "(OK for LoRA/NCCL weight sync, which don't use IPC handles)"
+            )
         return super().__new__(cls)
 
     # ------------------------------------------------------------------
