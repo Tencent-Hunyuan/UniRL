@@ -21,6 +21,10 @@
 
 num_devices: 32
 batch_size: 32 # prompts_per_rollout
+# Driver-side DP seqlen balancing (verl balance_batch parity): GRPO groups
+# dispatch as consecutive siblings, so one rank draws a hard prompt's 16 long
+# answers and straggles every FSDP micro.
+balance_dp_batch: true
 
 num_rollouts: 2000
 # Fully on-policy: sync the trained LoRA into the sglang server every rollout
@@ -156,6 +160,11 @@ algorithm:
 stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 2
+  # verl ppo_max_token_len_per_gpu parity: pack each mini-batch into micro
+  # batches under a token budget (length-sorted, dense 2D cost: the VL replay
+  # is rectangular [B, P_max+T_max] with per-micro prompt strip).
+  micro_token_budget: 10240
+  micro_cost_model: dense
   max_grad_norm: 1.0
 
 data_source:
