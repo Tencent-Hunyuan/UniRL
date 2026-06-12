@@ -128,6 +128,26 @@ def _replay_aware_forward(
     return torch.cat(parts, dim=1)
 
 
+def _packed_replay_supported() -> bool:
+    """Feature-detect the packed varlen replay prerequisites (review #43).
+
+    The packed path relies on transformers building a block-causal mask from
+    restarting position_ids (masking_utils.find_packed_sequence_indices,
+    transformers >= 4.53). On older versions the forward would silently attend
+    ACROSS sequence boundaries — wrong logps with no error — so fall back to the
+    dense path. ``UNIRL_DISABLE_PACKED_REPLAY=1`` is the explicit kill switch.
+    """
+    import os as _os
+
+    if _os.environ.get("UNIRL_DISABLE_PACKED_REPLAY") == "1":
+        return False
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 @dataclass
 class Qwen3ARParams:
     """Per-request AR-mode knobs for Qwen3.
@@ -413,7 +433,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # the standalone layout, so logp semantics are unchanged; the dense
         # [B, P_max + T_max] path below stays for B == 1 (identical cost) and as
         # the fallback.
-        if batch_size > 1 and segment.lengths is not None:
+        if batch_size > 1 and segment.lengths is not None and _packed_replay_supported():
             real_prompt_lens_p = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
             cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
             flat_resp = segment.tokens.to(device=device, dtype=torch.long)
