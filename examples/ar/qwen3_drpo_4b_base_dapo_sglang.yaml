@@ -117,7 +117,7 @@ rollout:
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
-    concurrency: 16
+    concurrency: 32
     # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
     # one completion per entry (n=1); else samples double-count.
     samples_pre_expanded: true
@@ -135,7 +135,7 @@ rollout:
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs: 32
       enable_lora: false
 
 reward:
