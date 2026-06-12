@@ -36,19 +36,19 @@ if TYPE_CHECKING:
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
     texts = req.primitives.get("text")
-    if not isinstance(texts, Texts):
-        raise TypeError(
-            f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
-            f"must be Texts, "
-            f"got {type(texts).__name__ if texts is not None else 'None'}"
-        )
+    require(
+        isinstance(texts, Texts),
+        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
+        f"must be Texts, "
+        f"got {type(texts).__name__ if texts is not None else 'None'}",
+    )
     images = req.primitives.get("image")
-    if not isinstance(images, Images):
-        raise TypeError(
-            f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
-            f"must be Images, "
-            f"got {type(images).__name__ if images is not None else 'None'}"
-        )
+    require(
+        isinstance(images, Images),
+        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
+        f"must be Images, "
+        f"got {type(images).__name__ if images is not None else 'None'}",
+    )
     require(
         req.primitives.get("negative_text") is None,
         "HunyuanImage3Pipeline.generate (it2i): negative_text is not supported — "

@@ -73,29 +73,9 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         state: Optional[HunyuanImage3DiffusionState] = None,
         step_index: int = 0,
     ) -> torch.Tensor:
-        """Run the unified MM transformer in ``mode="gen_image"`` and return
+        """
+        Run the unified MM transformer in ``mode="gen_image"`` and return
         the CFG-combined noise prediction.
-
-        Two paths:
-
-        1. **Stateless** (``state is None``): every call uses
-           ``past_key_values=None, use_cache=False, first_step=True``.
-           Pays the full O(L²) cost per step but is correct and matches
-           ``replay``'s call shape (each replay step is independent).
-
-        2. **KV-cached** (``state is not None``): on ``step_index == 0``
-           runs forward with ``first_step=True, use_cache=True`` and
-           captures ``past_key_values`` into ``state`` via
-           ``transformer._update_model_kwargs_for_generation``. On
-           ``step_index > 0`` reuses ``state.past_key_values`` /
-           ``state.position_ids`` / ``state.attention_mask`` /
-           ``state.gen_timestep_scatter_index`` and runs forward with
-           ``first_step=False, use_cache=True`` — the model only
-           processes the changed slice (image+timestep tokens).
-
-        Output ``pred`` is split into ``[cond, uncond]`` along axis 0 to
-        match the upstream pipeline ordering
-        (``hunyuan_image_3_pipeline.py:830``).
         """
         fused = conditions.fused
         if fused is None or fused.input_ids is None:
