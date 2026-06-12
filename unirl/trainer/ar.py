@@ -255,6 +255,17 @@ class ARTrainer(BaseTrainer):
             return track
         cap = total // dp
         lens = [int(x) for x in lengths.tolist()]
+        if len(lens) != total:
+            logger.warning("balance_dp_batch: lengths (%d) != batch_size (%d); skipping.", len(lens), total)
+            return track
+        # Cheap skip guard (review #45): compute the CURRENT-order per-rank token
+        # sums in pure Python — when the spread is already tiny (uniform-length
+        # workloads, e.g. multiple-choice answers), the hydrate + reorder +
+        # real-tensor dispatch is pure overhead (measured +9.6s/step on VL geo3k).
+        current = [sum(lens[r * cap : (r + 1) * cap]) for r in range(dp)]
+        avg = sum(current) / dp
+        if avg <= 0 or (max(current) - min(current)) / avg < 0.05:
+            return track
         order = sorted(range(total), key=lambda i: (-lens[i], i))
         buckets = [[] for _ in range(dp)]
         sums = [0] * dp

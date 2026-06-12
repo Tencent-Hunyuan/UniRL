@@ -479,10 +479,19 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         if self._tp_size > 1:
             cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
             phys: Optional[int] = None
-            if cvd and "," not in cvd:
+            entries = [e.strip() for e in cvd.split(",") if e.strip()] if cvd else []
+            if len(entries) == 1:
                 try:
-                    phys = int(cvd.strip())
+                    phys = int(entries[0])
                 except ValueError:
+                    phys = None
+            elif len(entries) > 1:
+                # Multi-entry CVD: device.index is a LOGICAL index into the visible
+                # list — map it through to the physical id (review #46 N2).
+                idx = self._device.index if self._device.type == "cuda" else 0
+                try:
+                    phys = int(entries[int(idx or 0)])
+                except (ValueError, IndexError):
                     phys = None
             if phys is None:
                 idx = self._device.index if self._device.type == "cuda" else None
@@ -695,15 +704,25 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         import time as _time
 
         assert self._owner_url_file is not None
-        deadline = _time.monotonic() + float(timeout_s)
+        deadline = _time.monotonic() + float(timeout_s) + 60.0  # margin over the owner's own health budget
         while _time.monotonic() < deadline:
             try:
                 with open(self._owner_url_file) as f:
                     url = f.read().strip()
-                if url:
-                    return url
             except FileNotFoundError:
-                pass
+                url = ""
+            if url:
+                # Health-validate before accepting (review #46 B1): a stale file
+                # from a previous run may name a dead server — keep polling until
+                # the URL actually answers.
+                try:
+                    import urllib.request as _rq
+
+                    with _rq.urlopen(url + "/health", timeout=5) as resp:
+                        if resp.status == 200:
+                            return url
+                except Exception:
+                    pass
             _time.sleep(2.0)
         raise TimeoutError(
             f"SGLangLLMRolloutEngine[tp-client]: owner URL file {self._owner_url_file} "
@@ -733,6 +752,14 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
             kill_process_tree(self._server_process.pid)
             self._server_process.join(timeout=10)
             self._server_process = None
+        # TP owner: remove the rendezvous file so the next run never observes a
+        # stale URL (review #46 B1 — ctor order between the new owner's unlink
+        # and a client's first read is unordered across ray actors).
+        if self._tp_owner and self._owner_url_file is not None:
+            try:
+                os.unlink(self._owner_url_file)
+            except FileNotFoundError:
+                pass
 
     def __del__(self):
         try:
@@ -1308,6 +1335,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         backend: str = "nccl",
         track_prefix: str = "",
     ) -> None:
+        if not self._tp_owner:
+            return  # TP client: NCCL weight-update groups are owner-managed (review #46 N1)
         resp = self._post(
             "/init_weights_update_group",
             {
@@ -1333,6 +1362,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         group_name: str,
         track_prefix: str = "",
     ) -> None:
+        if not self._tp_owner:
+            return  # TP client: NCCL weight-update groups are owner-managed (review #46 N1)
         resp = self._post(
             "/destroy_weights_update_group",
             {"group_name": str(group_name)},
@@ -1398,6 +1429,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         handled by the parent :class:`ComposedRolloutEngine`; this child sees
         only its own (prefix-stripped) tensors.
         """
+        if not self._tp_owner:
+            return  # TP client: the owner's single push covers the shared server (review #46 B2)
         try:
             from sglang.srt.utils import MultiprocessingSerializer
         except ImportError:
