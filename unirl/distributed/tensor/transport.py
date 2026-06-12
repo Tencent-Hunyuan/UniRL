@@ -1,11 +1,12 @@
 """TensorTransport: backend-agnostic tensor storage and retrieval.
 
 ``TensorMeta`` is the universal tensor proxy — a ``Batch`` subclass that
-holds per-handle opaque refs and their sizes. Each ref corresponds to one
-``put()`` call; ``sizes[i]`` records how many rows that ref covers.
-``concat`` merges ref/size lists; ``batch_size`` is ``sum(sizes)``.
-Per-row ``select`` / ``slice`` is not supported on dehydrated data —
-hydrate first.
+holds per-handle opaque refs and their sizes. Each ref is either a backend
+handle from one ``put()`` call or a :class:`HandleView` (a row/unit-range
+view of such a handle); ``sizes[i]`` records how many rows ref ``i``
+covers. ``concat`` merges ref/size lists; ``batch_size`` is ``sum(sizes)``.
+Per-row ``select`` / ``slice`` builds ``HandleView`` refs — no data motion,
+no hydration.
 
 ``TensorMeta`` also serves as a compute proxy: ``transform``, ``reshape``,
 ``permute``, ``local`` delegate to the active backend.
@@ -37,13 +38,124 @@ from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 logger = logging.getLogger(__name__)
 
 
+class HandleView:
+    """A unit-range (row/token) view of a parent ref — the addressing primitive.
+
+    ``TensorMeta`` selection/permutation emits these instead of moving data:
+    a view addresses ``base[start:end)`` along dim 0 while the bytes stay in
+    the producing worker's store. Backends resolve a view by resolving the
+    base and slicing (zero-copy on the IPC/store path); ``localize`` ships
+    only the ``[start:end)`` rows cross-device, not the whole base block.
+
+    Lifecycle: a view holds a PYTHON REFERENCE to the parent ref object, so
+    CPython's own reference counting aggregates all views' lifetimes onto the
+    parent — the parent's single GC finalizer fires only when the last view
+    (and the parent itself) is gone. Views carry no finalizer, no store_key
+    of their own, and trigger no extra decref RPCs.
+
+    Nested views flatten at construction (``HandleView(HandleView(b,2,8),1,3)``
+    is ``HandleView(b,3,5)``), so ``base`` is always a backend handle.
+    """
+
+    __slots__ = ("base", "start", "end")
+
+    def __init__(self, base: Any, start: int, end: int) -> None:
+        start, end = int(start), int(end)
+        if isinstance(base, HandleView):
+            start, end = base.start + start, base.start + end
+            base = base.base
+        if not (0 <= start <= end):
+            raise ValueError(f"HandleView range [{start}, {end}) is invalid")
+        self.base = base
+        self.start = start
+        self.end = end
+
+    # ── delegated identity (what transports/localize read off a ref) ──
+
+    @property
+    def source_id(self):
+        return self.base.source_id
+
+    @property
+    def object_ref(self):
+        return getattr(self.base, "object_ref", None)
+
+    @property
+    def store_key(self):
+        return self.base.store_key
+
+    @property
+    def shape(self) -> tuple:
+        base_shape = tuple(self.base.shape)
+        return (self.end - self.start, *base_shape[1:])
+
+    @property
+    def dtype(self):
+        return self.base.dtype
+
+    @property
+    def device(self):
+        return self.base.device
+
+    def local(self) -> torch.Tensor:
+        return self.base.local()[self.start : self.end]
+
+    def routing_copy(self) -> "HandleView":
+        """Bare placeholder for localize's id()-keyed NCCL substitution.
+
+        Carries the base's routing copy plus this view's range so the send
+        side can slice — dropping it must not touch the parent's ref count
+        (the parent's routing_copy is equally bare).
+        """
+        return HandleView(self.base.routing_copy(), self.start - 0, self.end - 0)
+
+    def __getstate__(self) -> dict:
+        return {"base": self.base, "start": self.start, "end": self.end}
+
+    def __setstate__(self, state: dict) -> None:
+        self.base = state["base"]
+        self.start = state["start"]
+        self.end = state["end"]
+
+    def __repr__(self) -> str:
+        return f"HandleView({self.base!r}[{self.start}:{self.end}])"
+
+
+def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
+    """Concatenate per-ref tensors along dim 0 — the single assembly funnel.
+
+    Trailing-dim CONTRACT: parts may be padded to different widths per
+    producing shard (e.g. per-worker prompt blocks); 2D+ parts are
+    right-padded with zeros to the max width before the cat — consumers of
+    2D+ per-shard-padded fields must be mask-driven (the convention
+    ``TextTokenCondition.concat`` already establishes).
+    """
+    if not parts:
+        return torch.empty(0)
+    if len(parts) == 1:
+        return parts[0]
+    if parts[0].dim() >= 2:
+        widths = {int(t.shape[1]) for t in parts}
+        if len(widths) > 1:
+            target = max(widths)
+            padded = []
+            for t in parts:
+                if int(t.shape[1]) < target:
+                    pad = t.new_zeros((t.shape[0], target - t.shape[1]) + tuple(t.shape[2:]))
+                    t = torch.cat([t, pad], dim=1)
+                padded.append(t)
+            parts = padded
+    return torch.cat(parts, dim=0)
+
+
 @dataclass
 class TensorMeta(Batch):
     """Per-handle tensor proxy.
 
     Each element in ``refs`` is an opaque handle from a single ``put()``
-    call; ``sizes[i]`` records how many rows that handle covers.
-    ``batch_size`` is ``sum(sizes)``, not ``len(refs)``.
+    call or a :class:`HandleView` over one; ``sizes[i]`` records how many
+    rows ref ``i`` covers. ``batch_size`` is ``sum(sizes)``, not
+    ``len(refs)``.
     """
 
     refs: List[Any] = concat_field(default_factory=list)
@@ -53,18 +165,9 @@ class TensorMeta(Batch):
     device: Optional[str] = shared_field(default=None)
     grad: Optional["TensorMeta"] = shared_field(default=None)
     retain_grad_flag: bool = shared_field(default=False)
-    # Row/segment VIEW over the refs (the permutation primitive): an ordered
-    # list of ``(ref_idx, start, end)`` segments in ref-local units (rows for
-    # CONCAT fields, tokens for PACKED fields). None = the legacy identity
-    # view (all of every ref, in ref order). A view keeps the data remote —
-    # selection/permutation across the dispatch boundary no longer needs
-    # driver-side hydration; segments are gathered lazily at materialize().
-    view_plan: Optional[List[Tuple[int, int, int]]] = shared_field(default=None)
 
     @property
     def batch_size(self) -> int:
-        if self.view_plan is not None:
-            return sum(int(e) - int(s) for _, s, e in self.view_plan)
         return sum(self.sizes) if self.sizes else 0
 
     @classmethod
@@ -85,116 +188,43 @@ class TensorMeta(Batch):
         )
 
     def select(self, indices) -> "TensorMeta":
-        """Re-index along the unit axis by building a segment VIEW (no data motion)."""
+        """Re-index along the unit axis by building ref VIEWS (no data motion)."""
         idx = [int(i) for i in (indices.tolist() if hasattr(indices, "tolist") else indices)]
         return self.select_units(idx)
 
-    def _identity_plan(self) -> List[Tuple[int, int, int]]:
-        return [(r, 0, int(n)) for r, n in enumerate(self.sizes)]
-
-    def _resolve_unit(self, g: int) -> Tuple[int, int]:
-        """Global unit index (in THIS view's order) -> (ref_idx, ref-local unit)."""
-        plan = self.view_plan if self.view_plan is not None else self._identity_plan()
-        off = 0
-        for r, s, e in plan:
-            n = int(e) - int(s)
-            if g < off + n:
-                return int(r), int(s) + (g - off)
-            off += n
-        raise IndexError(f"unit {g} out of range for view of size {off}")
-
-    def select_units(self, idx: List[int]) -> "TensorMeta":
-        """Arbitrary re-index (gather/permute) as a lazy segment view."""
-        pairs = [self._resolve_unit(int(g)) for g in idx]
-        plan: List[Tuple[int, int, int]] = []
-        for r, u in pairs:
-            if plan and plan[-1][0] == r and plan[-1][2] == u:
-                plan[-1] = (r, plan[-1][1], u + 1)  # extend the run
-            else:
-                plan.append((r, u, u + 1))
-        return self._with_plan(plan)
-
-    def select_segments(self, segments: List[Tuple[int, int]]) -> "TensorMeta":
-        """Re-index by global (start, end) unit ranges (PACKED token ranges)."""
-        plan: List[Tuple[int, int, int]] = []
-        for g0, g1 in segments:
-            g0, g1 = int(g0), int(g1)
-            while g0 < g1:
-                r, u = self._resolve_unit(g0)
-                # extend within the same source segment as far as possible
-                src_plan = self.view_plan if self.view_plan is not None else self._identity_plan()
-                # find the containing segment's end in ref-local units
-                off = 0
-                seg_end = None
-                for rr, ss, ee in src_plan:
-                    n = int(ee) - int(ss)
-                    if g0 < off + n:
-                        seg_end = int(ee)
-                        break
-                    off += n
-                take = min(g1 - g0, seg_end - u)
-                if plan and plan[-1][0] == r and plan[-1][2] == u:
-                    plan[-1] = (r, plan[-1][1], u + take)
-                else:
-                    plan.append((r, u, u + take))
-                g0 += take
-        return self._with_plan(plan)
-
-    def _with_plan(self, plan: List[Tuple[int, int, int]]) -> "TensorMeta":
-        total = sum(int(e) - int(s) for _, s, e in plan)
-        return TensorMeta(
-            refs=list(self.refs),
-            sizes=list(self.sizes),
-            shape=(total, *self.shape[1:]) if self.shape else None,
-            dtype=self.dtype,
-            device=self.device,
-            view_plan=plan,
-        )
-
-    def with_refs(self, refs: List[Any]) -> "TensorMeta":
-        """Clone with substituted (routed) refs, PRESERVING the view plan.
-
-        ``localize`` rebuilds metas after routing; ``from_handles`` would drop
-        the plan and re-derive sizes — views must survive the trip.
-        """
-        return TensorMeta(
-            refs=list(refs),
-            sizes=list(self.sizes),
-            shape=self.shape,
-            dtype=self.dtype,
-            device=self.device,
-            view_plan=None if self.view_plan is None else list(self.view_plan),
-        )
-
-    def _slice_by_refs(self, start: int, end: int) -> "TensorMeta":
-        """Partition refs for the row range ``[start:end)`` — inverse of concat.
-
-        ``concat`` stacks per-source ref/size lists, so a range that lands on
-        ref boundaries hands the corresponding refs back untouched: the exact
-        structural inverse of the DP collect→re-dispatch round-trip that built
-        this handle. Both callers pass a range in the same unit as ``sizes``
-        (CONCAT: per-sample rows; PACKED: token offsets via ``cu_seqlens``), so
-        a round-trip range always aligns. An arbitrary intra-ref range has no
-        representation here — the data is remote and opaque — and still needs
-        hydration first.
-        """
-        start, end = int(start), int(end)
-        if self.view_plan is not None:
-            # Views slice anywhere: just trim the segment list.
-            return self.select_segments([(start, end)])
+    def _offsets(self) -> List[int]:
         offsets = [0]
         for s in self.sizes:
             offsets.append(offsets[-1] + int(s))
-        try:
-            i0 = offsets.index(start)
-            i1 = offsets.index(end)
-        except ValueError:
-            # Misaligned range on a non-view: degrade gracefully to a segment
-            # view instead of demanding hydration (the data stays remote).
-            return self.select_segments([(start, end)])
-        refs = list(self.refs[i0:i1])
-        sizes = list(self.sizes[i0:i1])
-        total = sum(int(s) for s in sizes)
+        return offsets
+
+    def _pieces_for_range(self, g0: int, g1: int, offsets: List[int]) -> List[Tuple[int, int, int]]:
+        """Global unit range [g0, g1) -> ordered (ref_idx, local_start, local_end) pieces."""
+        if not (0 <= g0 <= g1 <= offsets[-1]):
+            raise IndexError(f"unit range [{g0}, {g1}) out of bounds for size {offsets[-1]}")
+        pieces: List[Tuple[int, int, int]] = []
+        r = 0
+        while g0 < g1:
+            while offsets[r + 1] <= g0:
+                r += 1
+            take = min(g1, offsets[r + 1]) - g0
+            pieces.append((r, g0 - offsets[r], g0 - offsets[r] + take))
+            g0 += take
+        return pieces
+
+    def _from_pieces(self, pieces: List[Tuple[int, int, int]]) -> "TensorMeta":
+        """Build the selected meta: whole-ref pieces pass the ref through untouched
+        (a boundary-aligned selection costs nothing); partial pieces become
+        :class:`HandleView` refs (nested views flatten in the ctor)."""
+        refs: List[Any] = []
+        sizes: List[int] = []
+        for r, s, e in pieces:
+            if s == 0 and e == int(self.sizes[r]):
+                refs.append(self.refs[r])
+            else:
+                refs.append(HandleView(self.refs[r], s, e))
+            sizes.append(e - s)
+        total = sum(sizes)
         return TensorMeta(
             refs=refs,
             sizes=sizes,
@@ -202,6 +232,54 @@ class TensorMeta(Batch):
             dtype=self.dtype,
             device=self.device,
         )
+
+    def select_units(self, idx: List[int]) -> "TensorMeta":
+        """Arbitrary re-index (gather/permute) as lazy ref views."""
+        offsets = self._offsets()
+        # Coalesce consecutive indices into ranges, then map ranges to pieces.
+        pieces: List[Tuple[int, int, int]] = []
+        i = 0
+        while i < len(idx):
+            j = i + 1
+            while j < len(idx) and idx[j] == idx[j - 1] + 1:
+                j += 1
+            pieces.extend(self._pieces_for_range(int(idx[i]), int(idx[j - 1]) + 1, offsets))
+            i = j
+        return self._from_pieces(pieces)
+
+    def select_segments(self, segments: List[Tuple[int, int]]) -> "TensorMeta":
+        """Re-index by global (start, end) unit ranges (PACKED token ranges)."""
+        offsets = self._offsets()
+        pieces: List[Tuple[int, int, int]] = []
+        for g0, g1 in segments:
+            pieces.extend(self._pieces_for_range(int(g0), int(g1), offsets))
+        return self._from_pieces(pieces)
+
+    def with_refs(self, refs: List[Any]) -> "TensorMeta":
+        """Clone with substituted (routed) refs, preserving sizes/shape.
+
+        ``localize`` rebuilds metas after routing; ``from_handles`` would
+        re-derive sizes from ``ref.shape[0]`` — equivalent, but this keeps the
+        substitution structural (same ref count, same sizes, no re-derivation).
+        """
+        return TensorMeta(
+            refs=list(refs),
+            sizes=list(self.sizes),
+            shape=self.shape,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def _slice_by_refs(self, start: int, end: int) -> "TensorMeta":
+        """Contiguous row range ``[start:end)`` — the structural inverse of concat.
+
+        A range on ref boundaries hands the refs back untouched (the exact
+        inverse of the DP collect→re-dispatch round-trip); an intra-ref range
+        wraps the boundary refs in :class:`HandleView` — same code path, the
+        whole-piece pass-through in ``_from_pieces`` is what preserves the
+        zero-cost aligned case.
+        """
+        return self.select_segments([(int(start), int(end))])
 
     def slice(self, start, end) -> "TensorMeta":
         # CONCAT path: Batch.slice → _slice_value → value.slice(start, end).
@@ -233,63 +311,20 @@ class TensorMeta(Batch):
         return self.materialize()
 
     def materialize(self, backend: "Optional[TensorTransport]" = None) -> torch.Tensor:
-        """Fetch + assemble this (possibly viewed) meta into a real tensor.
+        """Fetch this meta into a real tensor (driver- or worker-side).
 
-        Legacy metas (no plan) keep the exact old path: ``backend.get(refs)``.
-        Views fetch each NEEDED ref once, then gather the plan's segments in
-        order. Trailing-dim CONTRACT for views: refs may be padded to
-        different widths per producing shard (e.g. per-worker prompt blocks);
-        segments crossing such refs are right-padded with zeros to the max
-        width — consumers of 2D+ per-shard-padded fields must be mask-driven
-        (the convention TextTokenCondition.concat already establishes).
+        With a backend: one ``get`` over the refs (backends resolve
+        :class:`HandleView` refs by resolving the base and slicing). Without:
+        per-ref ``local()`` round-trips assembled via :func:`cat_rows` (its
+        ragged right-pad contract applies to 2D+ per-shard-padded fields).
         """
         if backend is None:
             backend = TensorTransportRuntime.current()
-        def fetch(ref):
-            if backend is not None:
-                return backend.get([ref])
-            return ref.local()
-        if self.view_plan is None and backend is not None:
+        if not self.refs:
+            return torch.empty(0)
+        if backend is not None:
             return backend.get(self.refs)
-        resolved = {}
-        if self.view_plan is None:
-            resolved = {i: fetch(r) for i, r in enumerate(self.refs)}
-        else:
-            for r in sorted({r for r, _, _ in self.view_plan}):
-                resolved[r] = fetch(self.refs[r])
-        return self.assemble(resolved)
-
-    def assemble(self, resolved: "Dict[int, torch.Tensor]") -> torch.Tensor:
-        """Assemble pre-fetched per-ref tensors into this meta's tensor.
-
-        ``resolved`` maps ref index -> that ref's full tensor (only the refs a
-        view actually needs must be present). Legacy metas concatenate in ref
-        order. Views gather their plan segments in order; trailing-dim CONTRACT:
-        segments crossing refs padded to different widths are right-padded with
-        zeros to the max width — consumers of 2D+ per-shard-padded fields must
-        be mask-driven (the TextTokenCondition.concat convention).
-        """
-        if self.view_plan is None:
-            parts = [resolved[i] for i in range(len(self.refs))]
-            return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
-        if not self.view_plan:
-            base = next(iter(resolved.values()), None)
-            return base[:0] if base is not None else torch.empty(0)
-        parts = [resolved[r][s:e] for r, s, e in self.view_plan]
-        if len(parts) == 1:
-            return parts[0]
-        if parts[0].dim() >= 2:
-            widths = {int(t.shape[1]) for t in parts}
-            if len(widths) > 1:
-                target = max(widths)
-                padded = []
-                for t in parts:
-                    if int(t.shape[1]) < target:
-                        pad = t.new_zeros((t.shape[0], target - t.shape[1]) + tuple(t.shape[2:]))
-                        t = torch.cat([t, pad], dim=1)
-                    padded.append(t)
-                parts = padded
-        return torch.cat(parts, dim=0)
+        return cat_rows([r.local() for r in self.refs])
 
     def retain_grad(self) -> "TensorMeta":
         self.retain_grad_flag = True
@@ -469,15 +504,7 @@ class TensorTransport(abc.ABC):
 
     def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
         """Fetch multiple named tensors. Default: iterate per key."""
-        out: Dict[str, torch.Tensor] = {}
-        for k, m in metas.items():
-            if getattr(m, "view_plan", None) is not None:
-                # Segment views assemble themselves (plan-ordered gather with
-                # the documented ragged right-pad contract).
-                out[k] = m.materialize(backend=self)
-            else:
-                out[k] = self.get(m.refs)
-        return out
+        return {k: self.get(m.refs) for k, m in metas.items()}
 
     def transform(self, meta: TensorMeta, fn: Callable[[torch.Tensor], torch.Tensor]) -> TensorMeta:
         """Apply fn to the remote tensor, return new TensorMeta.
@@ -572,11 +599,7 @@ class TensorTransport(abc.ABC):
         if not meta_map:
             return value
 
-        viewed = {k: m for k, m in meta_map.items() if m.view_plan is not None}
-        plain = {k: m for k, m in meta_map.items() if m.view_plan is None}
-        tensors = self.get_batch(plain) if plain else {}
-        for key, meta in viewed.items():
-            tensors[key] = meta.materialize(backend=self)
+        tensors = self.get_batch(meta_map)
         for key, tensor in tensors.items():
             if key in setters:
                 setters[key](tensor)
@@ -704,8 +727,9 @@ class WorkerLocalTransport(TensorTransport):
 
         def unwrap(obj: Any, dst_worker_id: str, dst_device_id: int) -> Any:
             if isinstance(obj, TensorMeta):
-                # with_refs (NOT from_handles): a permuted shard is a segment
-                # VIEW over the refs — the plan must survive routing.
+                # HandleView refs route like any ref (source_id/shape delegate
+                # to the base); a foreign view ships ONLY its [start:end) rows —
+                # the send side slices by the routing copy's range.
                 return obj.with_refs([route(h, dst_worker_id, dst_device_id) for h in obj.refs])
             return obj
 
@@ -821,10 +845,12 @@ class TensorTransportRuntime:
 
 
 __all__ = [
+    "HandleView",
     "TensorMeta",
     "TensorTransport",
     "TensorTransportRuntime",
     "TransportSession",
     "WorkerLocalTransport",
+    "cat_rows",
     "map_tree",
 ]
