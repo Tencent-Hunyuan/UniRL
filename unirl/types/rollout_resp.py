@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
+import logging
+
 import torch
 
 from unirl.distributed.tensor.batch import (
@@ -61,6 +63,8 @@ from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+
+logger = logging.getLogger(__name__)
 
 TR = TypeVar("TR", bound="RolloutTrack")
 TT = TypeVar("TT", bound="RolloutResp")
@@ -375,6 +379,10 @@ def _hydrate_tensor_meta(value: Any) -> Any:
         return value
     if not value.refs:
         return None
+    if getattr(value, "view_plan", None) is not None:
+        # Segment views know how to assemble themselves (plan-ordered gather
+        # with the documented ragged right-pad contract).
+        return value.materialize(backend=None)
     tensors = [h.local() for h in value.refs]
     if len(tensors) == 1:
         return tensors[0]

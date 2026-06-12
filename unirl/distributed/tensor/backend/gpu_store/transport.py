@@ -88,8 +88,8 @@ class GPUStoreTransport(WorkerLocalTransport):
         borrow_map = self._batch_borrow(all_handles)
         out: Dict[str, torch.Tensor] = {}
         for k, m in metas.items():
-            parts = [self._resolve_handle(h, borrow_map) for h in m.refs]
-            out[k] = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+            resolved = {i: self._resolve_handle(h, borrow_map) for i, h in enumerate(m.refs)}
+            out[k] = m.assemble(resolved)
         return out
 
     def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorMeta]:
