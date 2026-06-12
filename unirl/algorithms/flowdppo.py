@@ -363,7 +363,10 @@ class FlowDPPO(StageAlgorithm):
         s = sigmas[idx]
         s_next = sigmas[idx + 1]
         dt = s_next - s  # negative for denoising
-        std_dev_t = torch.sqrt(s / (1.0 - torch.clamp(s, max=0.99))) * eta
+        # Match FlowSDEStrategy.step at sigma==1: denominator uses sigma_max=sigmas[1],
+        # not a 0.99 clamp, so sigma_t equals the transition's std_var.
+        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
+        std_dev_t = torch.sqrt(s / (1.0 - torch.where(s == 1.0, sigma_max, s))) * eta
         sigma_t = std_dev_t * torch.sqrt(-dt)
         return sigma_t.reshape(1, -1, 1, 1, 1)
 
