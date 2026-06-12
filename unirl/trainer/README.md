@@ -89,23 +89,35 @@ Driven by top-level config keys, read by the entrypoints and forwarded to
 | `save_mode` | `full` | `full` = whole model state; `adapter` = LoRA keys only (the frozen base reloads from the pretrained snapshot on resume). |
 | `load_dir` | unset | A checkpoint dir to restore and resume from; unset trains fresh. |
 
-These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax:
+These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax.
+The whole lifecycle — train with saves, resume, fold the LoRA into the base and
+export to Hugging Face, share:
 
 ```bash
-# Save every 200 rollouts (LoRA-only checkpoints)
+# 1. Train, saving LoRA-only checkpoints every 200 rollouts
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
-    +save_interval=200 \
-    +save_dir=/path/to/checkpoints/sd3_trainside \
-    +save_mode=adapter
+    num_rollouts=500 \
+    +save_interval=200 +save_dir=/ckpts/sd3_run +save_mode=adapter
 
-# Resume from checkpoint-500. num_rollouts is the TOTAL budget (here: rollouts
-# 500..699); the same save_dir is fine — checkpoint numbering continues.
+# 2. Resume (after a preemption, or to extend the budget). num_rollouts is the
+#    TOTAL budget (here: rollouts 400..999); the same save_dir is fine —
+#    checkpoint numbering continues, and the wandb run reattaches.
 bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
-    num_rollouts=700 \
-    +load_dir=/path/to/checkpoints/sd3_trainside/checkpoint-500 \
-    +save_interval=200 \
-    +save_dir=/path/to/checkpoints/sd3_trainside \
-    +save_mode=adapter
+    num_rollouts=1000 \
+    +load_dir=/ckpts/sd3_run/checkpoint-400 \
+    +save_interval=200 +save_dir=/ckpts/sd3_run +save_mode=adapter
+
+# 3. Export: fold the LoRA into the base weights (scaling from the checkpoint's
+#    recorded lora_config) and write a standard save_pretrained folder
+python -m unirl.tools.export_hf \
+    --checkpoint /ckpts/sd3_run/checkpoint-1000 \
+    --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
+    --output /ckpts/sd3_run/hf-1000
+
+# 4. Share / use
+hf upload <user>/<repo> /ckpts/sd3_run/hf-1000
+#   transformer = AutoModel.from_pretrained("<user>/<repo>", torch_dtype=torch.bfloat16)
+#   pipe = StableDiffusion3Pipeline.from_pretrained(base, transformer=transformer)
 ```
 
 `load_dir` restores model/optimizer/scheduler (plus the optimizer-step counter,
@@ -124,24 +136,14 @@ The wandb run also continues: `trainer_state.json` (driver-written, beside
 state), not a release artifact. The offline checkpoint toolset lives in
 `unirl/tools/` (the runtime counterpart for engine weight sync is
 `unirl/utils/peft_merge.py`): `export_hf` folds the LoRA delta into the base
-weights and writes a standard `save_pretrained` folder you can
-`from_pretrained` or `hf upload`:
-
-```bash
-python -m unirl.tools.export_hf \
-    --checkpoint /path/to/checkpoints/sd3_trainside/checkpoint-500 \
-    --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
-    --output /path/to/sd3-grpo-hf
-```
+weights and writes a standard `save_pretrained` folder — step 3 above.
 
 Works with both checkpoint flavors: `save_mode=full` merges self-contained;
 `save_mode=adapter` folds the LoRA keys onto the freshly loaded base weights.
 The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
 `--lora-alpha` overrides it (needed only for checkpoints predating the record).
 AR models: `--library transformers`, no `--subfolder`. NFT runs can export the
-EMA shadow adapter with `--adapter old`. Load the SD3 result back with
-`AutoModel.from_pretrained(out_dir)` and plug it into the base pipeline via
-`StableDiffusion3Pipeline.from_pretrained(base, transformer=...)`.
+EMA shadow adapter with `--adapter old`.
 
 ## Gotchas
 
