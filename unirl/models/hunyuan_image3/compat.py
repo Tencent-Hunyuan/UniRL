@@ -18,8 +18,16 @@ re-downloads, and travel with the unirl code:
 The base-only forward ``rope_image_info`` kwarg (Patch C in the on-disk patcher)
 is intentionally NOT shimmed here: base's forward tolerates the extra kwarg, and
 base's DiT path is not bundle-supported anyway.
+
+Separately, :func:`repair_hi3_tokenizer_backend` fixes a transformers-5.x
+tokenizer-load defect (the checkpoint's ``HunyuanImage3TokenizerFast`` Rust
+backend loads with ``pre_tokenizer``/``decoder`` = ``None`` -> char-level). It
+needs the *loaded* tokenizer instance, so it is called from the text-embed stage
+after ``load_tokenizer``, not from :func:`apply_hi3_transformers5_compat`.
 """
 from __future__ import annotations
+
+from typing import Any
 
 
 def apply_hi3_transformers5_compat() -> None:
@@ -61,3 +69,41 @@ def apply_hi3_transformers5_compat() -> None:
             _cls.preprocess = _preprocess
     except Exception:  # noqa: BLE001
         pass
+
+
+def repair_hi3_tokenizer_backend(tokenizer: Any, pretrained_path: Any) -> bool:
+    """Re-attach the correct BPE Rust backend to a char-level HI3 tokenizer.
+
+    Under transformers 5.x the checkpoint's ``HunyuanImage3TokenizerFast``
+    (a ``PreTrainedTokenizerFast`` subclass) loads its ``tokenizers.Tokenizer``
+    backend with ``pre_tokenizer``/``decoder`` = ``None`` — i.e. char-level:
+    ``"Good"`` -> ``['G','o','o','d']`` with inter-word spaces dropped. The model
+    is then fed char-level, space-less prompts via ``apply_chat_template`` and
+    generates text character-by-character (the garbled, space-less AR output).
+    ``AutoTokenizer`` (transformers-5.x ``TokenizersBackend``) loads the *same*
+    ``tokenizer.json`` correctly (ByteLevel pre-tokenizer + decoder).
+
+    Fix: load ``tokenizer.json`` directly via ``tokenizers.Tokenizer.from_file``
+    and swap it in. The special-token vocab (``<boi>``/``<img>``/``</think>`` …)
+    is carried in ``tokenizer.json``, so chat-template marker splicing is
+    preserved. Mutates ``tokenizer`` in place.
+
+    Idempotent: only acts when the backend is the broken (``pre_tokenizer is
+    None``) variant. Returns ``True`` if a repair was applied.
+    """
+    import os
+
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is None or getattr(backend, "pre_tokenizer", None) is not None:
+        # Not a fast tokenizer, or already has the ByteLevel pre-tokenizer.
+        return False
+    tok_json = os.path.join(str(pretrained_path), "tokenizer.json")
+    if not os.path.exists(tok_json):
+        return False
+    try:
+        from tokenizers import Tokenizer as _RustTokenizer
+
+        tokenizer._tokenizer = _RustTokenizer.from_file(tok_json)
+    except Exception:  # noqa: BLE001 — best-effort; leave the tokenizer untouched on failure
+        return False
+    return True

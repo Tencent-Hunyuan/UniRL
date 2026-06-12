@@ -28,6 +28,7 @@ import torch
 from unirl.types.primitives import Texts
 
 from .bundle import HunyuanImage3Bundle
+from .compat import repair_hi3_tokenizer_backend
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
@@ -108,6 +109,11 @@ class HunyuanImage3TextEmbedStage:
         if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
+        # transformers 5.x loads HunyuanImage3TokenizerFast's Rust backend
+        # char-level (pre_tokenizer/decoder=None) -> char-level, space-less
+        # prompts -> char-by-char generation. Re-attach the correct BPE backend
+        # from tokenizer.json. Idempotent (no-op once repaired). See compat.py.
+        repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
 
         # Cond-image kwarg name differs by checkpoint snapshot (base:
         # batch_cond_image_info, Instruct: batch_cond_images).
