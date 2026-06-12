@@ -143,8 +143,8 @@ class BaseTrainer:
         """Opt-in DP seqlen balancing — thin policy wrapper over the mechanism.
 
         The mechanism (hydrate + LPT reorder) lives with the data type:
-        :func:. This wrapper only
-        owns the POLICY: the balance_dp_batch flag (False by default; AR
+        :func:`unirl.types.rollout_resp.balance_track_for_dp`. This wrapper
+        only owns the POLICY: the ``balance_dp_batch`` flag (False by default; AR
         workloads with variable response lengths opt in) and the dp size. Safe
         to call unconditionally from any train_step.
         """
