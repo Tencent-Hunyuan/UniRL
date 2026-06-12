@@ -170,6 +170,18 @@ class FSDPBackend(Remote):
         self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
+        # Checkpointed for export tooling: the LoRA fold needs scaling =
+        # alpha / rank, and alpha is not derivable from the weights.
+        active_lora = lora_cfg or ema_lora_cfg
+        self._lora_meta: Optional[Dict[str, object]] = (
+            {
+                "rank": int(active_lora.rank),
+                "alpha": int(active_lora.alpha),
+                "target_modules": list(active_lora.target_modules),
+            }
+            if active_lora is not None
+            else None
+        )
         # No-sync gradient accumulation (see set_grad_sync). Only active under
         # ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the
         # per-micro reshard/re-gather interacts badly with deferred sync.
@@ -311,6 +323,7 @@ class FSDPBackend(Remote):
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
             "save_mode": mode,
+            "lora_config": self._lora_meta,
         }
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()

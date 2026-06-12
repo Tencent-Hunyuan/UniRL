@@ -12,22 +12,22 @@ self-contained, ``save_mode=adapter`` folds the LoRA keys onto the freshly
 loaded base weights.
 
 The fold mirrors :func:`unirl.utils.peft_merge.merged_state_dict` (fp32 merge,
-same key grammar) but runs offline on the checkpoint dict, so the LoRA scaling
-cannot be read off a live ``peft_config`` — pass ``--lora-alpha`` from the
-recipe (``backend.lora_cfg.alpha``; scaling = alpha / rank, rank is inferred
-from the weights).
+same key grammar) but runs offline on the checkpoint dict. The LoRA scaling
+(alpha / rank) comes from the ``lora_config`` the checkpoint records;
+``--lora-alpha`` overrides it (and is the only path for checkpoints predating
+the record).
 
 Examples:
-    # SD3.5 LoRA run (alpha from the recipe), diffusers transformer subfolder
+    # SD3.5 LoRA run, diffusers transformer subfolder
     python -m unirl.tools.export_hf \\
         --checkpoint /ckpts/sd3_trainside/checkpoint-500 \\
         --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \\
-        --lora-alpha 64 --output /ckpts/sd3_trainside/hf-500
+        --output /ckpts/sd3_trainside/hf-500
 
     # AR (transformers CausalLM)
     python -m unirl.tools.export_hf \\
         --checkpoint /ckpts/qwen3/checkpoint-300 --library transformers \\
-        --base Qwen/Qwen3-4B-Base --lora-alpha 64 --output /ckpts/qwen3/hf-300
+        --base Qwen/Qwen3-4B-Base --output /ckpts/qwen3/hf-300
 
 Loading the SD3 result back into a pipeline:
     transformer = AutoModel.from_pretrained("/ckpts/sd3_trainside/hf-500", torch_dtype=torch.bfloat16)
@@ -48,7 +48,8 @@ DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 def _require_alpha(alpha: Optional[float]) -> float:
     if alpha is None:
         raise SystemExit(
-            "checkpoint contains LoRA adapters — pass --lora-alpha (backend.lora_cfg.alpha in the training recipe)"
+            "checkpoint contains LoRA adapters but records no lora_config — "
+            "pass --lora-alpha (backend.lora_cfg.alpha in the training recipe)"
         )
     return float(alpha)
 
@@ -133,7 +134,12 @@ def main() -> None:
     parser.add_argument("--subfolder", default=None, help='base subfolder, e.g. "transformer" for diffusers pipelines')
     parser.add_argument("--library", choices=("diffusers", "transformers"), default="diffusers")
     parser.add_argument("--adapter", default="default", help='LoRA adapter to fold ("old" = the NFT EMA shadow)')
-    parser.add_argument("--lora-alpha", type=float, default=None, help="backend.lora_cfg.alpha from the recipe")
+    parser.add_argument(
+        "--lora-alpha",
+        type=float,
+        default=None,
+        help="override the lora alpha recorded in the checkpoint (required only for checkpoints without one)",
+    )
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bf16")
     args = parser.parse_args()
 
@@ -142,7 +148,9 @@ def main() -> None:
         path = os.path.join(path, "checkpoint.pt")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     state_dict = checkpoint["policy_state_dict"]
-    print(f"loaded {path}: {len(state_dict)} tensors, step={checkpoint.get('step')}")
+    recorded = checkpoint.get("lora_config") or {}
+    alpha = args.lora_alpha if args.lora_alpha is not None else recorded.get("alpha")
+    print(f"loaded {path}: {len(state_dict)} tensors, step={checkpoint.get('step')}, lora_alpha={alpha}")
 
     dtype = DTYPES[args.dtype]
     from_pretrained_kwargs = {"torch_dtype": dtype}
@@ -158,9 +166,9 @@ def main() -> None:
         model = AutoModelForCausalLM.from_pretrained(args.base, **from_pretrained_kwargs)
 
     if any(".base_layer." in k for k in state_dict):  # save_mode=full: self-contained
-        merged = merge_lora_state_dict(state_dict, adapter=args.adapter, alpha=args.lora_alpha)
+        merged = merge_lora_state_dict(state_dict, adapter=args.adapter, alpha=alpha)
     elif any(".lora_A." in k for k in state_dict):  # save_mode=adapter: fold onto the base
-        merged = fold_adapter_into_base(model.state_dict(), state_dict, adapter=args.adapter, alpha=args.lora_alpha)
+        merged = fold_adapter_into_base(model.state_dict(), state_dict, adapter=args.adapter, alpha=alpha)
     else:  # full finetune, no LoRA
         merged = dict(state_dict)
 

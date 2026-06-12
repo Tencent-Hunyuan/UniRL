@@ -62,8 +62,9 @@ Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
 model state (`save_mode=full`: frozen base + LoRA adapters; `save_mode=adapter`:
 LoRA keys only — MBs instead of GBs), the optimizer state (gathered full via
 DCP — not per-rank shards; it only ever covers the trainable params, so it is
-adapter-sized either way), the scheduler state, and the step counters (`step`,
-`optimizer_step_count`) — enough to resume training. Each one is written to
+adapter-sized either way), the scheduler state, the step counters (`step`,
+`optimizer_step_count`), and the LoRA config (rank / alpha / target_modules —
+export tooling reads its scaling from it) — enough to resume training. Each one is written to
 `<save_dir>/checkpoint-<step>/checkpoint.pt`. Save and load are collectives
 (every rank participates in the gather/broadcast); only dist rank 0 writes the
 file, and on load every rank reads it.
@@ -130,14 +131,13 @@ weights and writes a standard `save_pretrained` folder you can
 python -m unirl.tools.export_hf \
     --checkpoint /path/to/checkpoints/sd3_trainside/checkpoint-500 \
     --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
-    --lora-alpha 64 \
     --output /path/to/sd3-grpo-hf
 ```
 
 Works with both checkpoint flavors: `save_mode=full` merges self-contained;
 `save_mode=adapter` folds the LoRA keys onto the freshly loaded base weights.
-`--lora-alpha` is `backend.lora_cfg.alpha` from the recipe (the checkpoint
-stores weights only; scaling = alpha / rank, rank inferred from the weights).
+The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
+`--lora-alpha` overrides it (needed only for checkpoints predating the record).
 AR models: `--library transformers`, no `--subfolder`. NFT runs can export the
 EMA shadow adapter with `--adapter old`. Load the SD3 result back with
 `AutoModel.from_pretrained(out_dir)` and plug it into the base pipeline via
