@@ -24,7 +24,7 @@ It reads the prepared multimodal tensors from
 ``HunyuanImage3FusedMultimodalCondition`` carrying ``input_ids``,
 ``attention_mask``, ``position_ids``, ``rope_cache``, plus the 5
 scatter-layout masks/indices), all built by
-:meth:`HunyuanImage3Bundle.build_t2i_inputs`. It calls
+:meth:`HunyuanImage3TextEmbedStage.embed_for_gen_image`. It calls
 ``transformer.prepare_inputs_for_generation(...)`` followed by the
 forward with ``first_step=True, use_cache=False`` — KV-cache reuse
 across diffusion steps is intentionally out of scope and tracked as a
@@ -103,13 +103,13 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 "HunyuanImage3DiffusionStep.predict_noise: "
                 "conditions.fused.input_ids is None. The smoke t2i path expects the "
                 "pipeline to populate conditions via "
-                "HunyuanImage3Bundle.build_t2i_inputs(...)."
+                "HunyuanImage3TextEmbedStage.embed_for_gen_image(...)."
             )
         if fused.gen_image_mask is None or fused.gen_timestep_scatter_index is None:
             raise ValueError(
                 "HunyuanImage3DiffusionStep.predict_noise: "
                 "conditions.fused.gen_image_mask / gen_timestep_scatter_index missing — "
-                "did you call HunyuanImage3Bundle.build_t2i_inputs(...)?"
+                "did you call HunyuanImage3TextEmbedStage.embed_for_gen_image(...)?"
             )
 
         transformer = model.transformer

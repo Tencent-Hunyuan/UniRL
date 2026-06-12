@@ -47,12 +47,14 @@ class HunyuanImage3Pipeline(Pipeline):
     Reads from ``RolloutReq``:
 
     - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
+    - ``primitives["negative_text"]`` — rejected for t2i / it2i: the HI3
+      tokenizer never consumes negative-prompt text; CFG derives from
+      ``guidance_scale > 1.0``.
     - ``primitives["image"]: Images`` — required for i2t / it2i.
     - ``stage_params["task"]: str`` — one of ``{"t2t", "i2t", "t2i", "it2i"}``.
       Defaults to ``"t2i"`` if absent.
     - ``stage_params["bot_task"]: str`` — chat-template flag forwarded to
-      ``Bundle.build_t2i_inputs`` (t2i / it2i).
+      ``HunyuanImage3TextEmbedStage.embed_for_gen_image`` (t2i / it2i).
     - ``stage_params["diffusion"]: dict`` — kwargs for
       :class:`HunyuanImage3DiffusionParams` (t2i / it2i).
     - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t).

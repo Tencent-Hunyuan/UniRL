@@ -1,9 +1,13 @@
 """t2i — text-to-image diffusion.
 
-Reads ``primitives["text"]: Texts`` (and optionally ``negative_text``)
-plus ``stage_params["diffusion"]: dict``. Builds the unified-MM input
-tensors via ``Bundle.build_t2i_inputs``, runs the diffusion stage in
-``mode="gen_image"``, and decodes the final latent to pixels.
+Reads ``primitives["text"]: Texts`` plus ``stage_params["diffusion"]:
+dict``. Builds the unified-MM input tensors via
+``HunyuanImage3TextEmbedStage.embed_for_gen_image``, runs the diffusion
+stage in ``mode="gen_image"``, and decodes the final latent to pixels.
+
+``negative_text`` is rejected: the HI3 tokenizer never consumes
+negative-prompt text — CFG is derived from ``guidance_scale > 1.0`` and
+the unconditional branch is built internally from ``<cfg>`` tokens.
 
 The ``bot_task`` knob (``stage_params["bot_task"]``) is a chat-template
 flag: ``"image"`` is vllm-omni's t2i_vanilla preset; ``"think"`` /
@@ -16,8 +20,9 @@ prefix lives in ``input_ids`` only (see vllm-omni
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
+from unirl.config.require import require
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
@@ -32,19 +37,16 @@ if TYPE_CHECKING:
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     """t2i — single-stage text-to-image."""
     texts = req.primitives.get("text")
-    if not isinstance(texts, Texts):
-        raise TypeError(
-            f"HunyuanImage3Pipeline.generate (t2i): req.primitives['text'] "
-            f"must be Texts, "
-            f"got {type(texts).__name__ if texts is not None else 'None'}"
-        )
-    negatives_raw = req.primitives.get("negative_text")
-    negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-    if negatives is not None and len(negatives.texts) != len(texts.texts):
-        raise ValueError(
-            f"HunyuanImage3Pipeline.generate (t2i): negative_text length "
-            f"{len(negatives.texts)} != text length {len(texts.texts)}"
-        )
+    require(
+        isinstance(texts, Texts),
+        f"HunyuanImage3Pipeline.generate (t2i): input must be Texts, got {type(texts).__name__ if texts is not None else 'None'}",
+    )
+    require(
+        req.primitives.get("negative_text") is None,
+        "HunyuanImage3Pipeline.generate (t2i): negative_text is not supported — "
+        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
+        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
+    )
 
     params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
     bot_task: str = str(req.stage_config.get("bot_task", "image"))
@@ -52,16 +54,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     # Build the upstream multimodal input tensors. CFG-batched [cond, uncond]
     # when guidance > 1; else single batch axis. ``mm`` is
     # ``{"fused": HunyuanImage3FusedMultimodalCondition, "tokenizer_output": Any}``.
-    cfg_on = float(params.guidance_scale) > 1.0
-    if negatives is not None:
-        neg_strs: Optional[List[str]] = list(negatives.texts)
-    elif cfg_on:
-        neg_strs = ["" for _ in texts.texts]
-    else:
-        neg_strs = None
-    mm = pipeline.bundle.build_t2i_inputs(
-        list(texts.texts),
-        neg_strs,
+    mm = pipeline.text_embed.embed_for_gen_image(
+        texts,
+        cfg=float(params.guidance_scale) > 1.0,
         height=int(params.height),
         width=int(params.width),
         bot_task=bot_task,
