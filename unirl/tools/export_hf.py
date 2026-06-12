@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Export a UniRL training checkpoint to a Hugging Face ``save_pretrained`` folder.
 
 ``checkpoint.pt`` (see ``FSDPBackend.save``) is a raw trainer pickle: the
