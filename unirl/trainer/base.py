@@ -90,17 +90,20 @@ class BaseTrainer:
         self.logging_cfg = logging_cfg
         self.wandb_logger = UniRLWandBLogger(enabled=False)
 
+        # DP seqlen balancing (verl trainer.balance_batch parity) — OFF by
+        # default; subclasses whose workloads have variable response lengths
+        # (currently ARTrainer) override this from their config. The methods
+        # below are trainer-agnostic: any train_step may call
+        # ``track = self._balance_track(track)`` unconditionally — it no-ops
+        # unless the flag is set, the segment carries per-sample lengths, AND
+        # the current per-rank token spread exceeds 5% (uniform workloads such
+        # as diffusion's fixed-step latents or short multiple-choice answers
+        # would only pay the hydrate/reorder overhead).
+        self.balance_dp_batch = False
+
         # Reclaim per-rollout transport buffers after every train_step, centrally,
         # so each subclass train loop doesn't have to remember to.
         self._install_train_step_reset_hook()
-
-        # Time the standard step collaborators (rollout / weight_sync / reward /
-        # stack) and surface them as perf/<phase>_time_s, centrally, so every
-        # trainer gets step attribution without per-trainer edits. The machinery
-        # lives with the rest of the logging stack in wandb_logger.
-        from unirl.utils.wandb_logger import install_phase_timing
-
-        install_phase_timing(self)
 
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 
@@ -131,6 +134,23 @@ class BaseTrainer:
     def _reset_transport_buffers(self) -> None:
         """Reclaim per-rollout mooncake zero-copy buffers (no-op for other backends)."""
         self.pool.reset_transfer_queue_buffers()
+
+    # ---- DP seqlen balancing (opt-in via balance_dp_batch) -----------------
+
+    def _balance_track(self, track):
+        """Opt-in DP seqlen balancing — thin policy wrapper over the mechanism.
+
+        The mechanism (hydrate + LPT reorder) lives with the data type:
+        :func:`unirl.types.rollout_resp.balance_track_for_dp`. This wrapper only
+        owns the POLICY: the ``balance_dp_batch`` flag (False by default; AR
+        workloads with variable response lengths opt in) and the dp size. Safe
+        to call unconditionally from any train_step.
+        """
+        if not self.balance_dp_batch:
+            return track
+        from unirl.types.rollout_resp import balance_track_for_dp
+
+        return balance_track_for_dp(track, dp_size=int(self.num_devices))
 
     # ---- wandb logging (shared by all v2 trainers) -------------------------
 
