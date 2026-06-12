@@ -435,7 +435,13 @@ class TrainStack(Remote):
                 # when prompt lengths are available (verl's token accounting also
                 # covers prompt+response).
                 conditions = getattr(resp_track, "conditions", None)
-                prompt = getattr(conditions, "prompt", None) if conditions is not None else None
+                # conditions is a Dict[str, Condition] — getattr never finds "prompt"
+                # (review #42 B2: the 2D packer was unreachable and the budget
+                # counted response tokens only). Use the dict accessor.
+                if isinstance(conditions, dict):
+                    prompt = conditions.get("prompt")
+                else:
+                    prompt = getattr(conditions, "prompt", None) if conditions is not None else None
                 pmask = getattr(prompt, "attention_mask", None) if prompt is not None else None
                 if isinstance(pmask, torch.Tensor) and pmask.dim() == 2 and int(pmask.shape[0]) == total:
                     prompt_lens = [int(p) for p in pmask.long().sum(dim=-1).tolist()]
@@ -661,6 +667,9 @@ class TrainStack(Remote):
 
         if has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+        else:
+            grad_norm = 0.0
+            logger.warning("TrainStack.train: no micro-batch reported backward; skipping optimizer step.")
         if torch.cuda.is_available():
             # CUDA memory watermark per optimizer step (leak diagnosis: tp2 path
             # showed progressive OOM). Surfaces as train/cuda_alloc_gb|cuda_reserved_gb.
@@ -669,9 +678,6 @@ class TrainStack(Remote):
                 "cuda_alloc_gb": torch.cuda.memory_allocated() / 2**30,
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
-        else:
-            grad_norm = 0.0
-            logger.warning("TrainStack.train: no micro-batch reported backward; skipping optimizer step.")
 
         return TrainStepResult(
             loss=total_loss,
