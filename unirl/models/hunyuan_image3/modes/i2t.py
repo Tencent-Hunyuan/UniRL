@@ -27,7 +27,7 @@ from unirl.types.sampling import get_ar_params
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
-from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task
+from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
@@ -67,9 +67,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         taylor_cache_order=model_cfg.get("taylor_cache_order"),
     )
     bot_task = str(ar_params.bot_task)
+    tok_bot_task = _tokenizer_bot_task(bot_task)
 
     system_prompt = _resolve_system_prompt(
-        pipeline.bundle, bot_task, ar_params.use_system_prompt, ar_params.system_prompt
+        pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
     )
     system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
 
@@ -84,7 +85,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     # ViT scatter target.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
-        bot_task=bot_task,
+        bot_task=tok_bot_task,
         system_prompt=system_prompt_list,
         cot_text=([ar_params.cot_text] * len(texts.texts) if ar_params.cot_text else None),
         batch_cond_image_info=vit["joint_image_info"],

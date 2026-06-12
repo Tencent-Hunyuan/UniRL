@@ -308,6 +308,8 @@ class HunyuanImage3TextEmbedStage:
         height: int,
         width: int,
         bot_task: str = "image",
+        cot_text: Optional[List[str]] = None,
+        system_prompt: Optional[List[str]] = None,
         batch_cond_image_info: Optional[List[List[Any]]] = None,
     ) -> Dict[str, Any]:
         """Build the unified-MM input tensors for ``mode="gen_image"``.
@@ -347,6 +349,17 @@ class HunyuanImage3TextEmbedStage:
                 ``Assistant:`` system prompt — the model treats this as
                 a reasoning-mode signal during the diffusion forward.
                 Per vllm-omni ``prompt_utils.py:23-31``.
+            cot_text:
+                Optional per-sample chain-of-thought text (length B,
+                NOT B*cfg — the wrapper duplicates internally and drops
+                the CoT to ``<cfg>`` tokens on the uncond branch).
+                Entries should carry literal ``<think>…</think>`` /
+                ``<recaption>…</recaption>`` tag pairs so the wrapper's
+                section parsing works (t2ti's AR phase produces these).
+            system_prompt:
+                Optional per-sample system prompts (length B), spliced
+                ahead of the user prompt — t2ti passes the same resolved
+                system prompt used for its AR phase.
             batch_cond_image_info:
                 Optional per-sample list of ``JointImageInfo`` for
                 cond-image marker insertion (it2i).
@@ -406,6 +419,8 @@ class HunyuanImage3TextEmbedStage:
             bot_task=bot_task,
             cfg_factor=cfg_factor,
             batch_gen_image_info=batch_gen_image_info,
+            batch_system_prompt=system_prompt,
+            batch_cot_text=cot_text,
             batch_cond_image_info=batch_cond_image_info,
         )
 

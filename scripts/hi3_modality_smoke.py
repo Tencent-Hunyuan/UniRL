@@ -3,12 +3,13 @@
 
 Loads the hi3 bundle ONCE with ``device_map="auto"`` (the 80B MoE sharded
 across the visible GPUs, single process — no Ray, no FSDP), then drives
-``HunyuanImage3Pipeline.generate(req)`` for each of the four task topologies:
+``HunyuanImage3Pipeline.generate(req)`` for each of the five task topologies:
 
     t2t  : text         -> text    (AR / gen_text)
     i2t  : image + text -> text    (AR / gen_text, image comprehension)
     t2i  : text         -> image   (diffusion / gen_image)
     it2i : image + text -> image   (diffusion / gen_image, image edit)
+    t2ti : text         -> text+image (AR think_recaption CoT, then diffusion)
 
 Each mode is isolated in its own try/except so one failure doesn't mask the
 others; a PASS/FAIL summary is printed at the end. Generated images are saved
@@ -23,8 +24,10 @@ Env knobs:
     HI3_STEPS         default 16    (diffusion num_inference_steps)
     HI3_HW            default 1024  (square image side)
     HI3_MAX_TOKENS    default 128   (AR max_new_tokens)
-    HI3_MODES         default "t2t,i2t,t2i,it2i" (comma list to run a subset)
+    HI3_COT_TOKENS    default 512   (t2ti CoT max_new_tokens — think+recaption needs room)
+    HI3_MODES         default "t2t,i2t,t2i,it2i,t2ti" (comma list to run a subset)
 """
+
 from __future__ import annotations
 
 import os
@@ -44,7 +47,8 @@ OUT_DIR = os.environ.get("OUT_DIR", "/tmp/hi3_smoke_out")
 STEPS = int(os.environ.get("HI3_STEPS", "16"))
 HW = int(os.environ.get("HI3_HW", "1024"))
 MAX_TOKENS = int(os.environ.get("HI3_MAX_TOKENS", "128"))
-MODES = [m.strip() for m in os.environ.get("HI3_MODES", "t2t,i2t,t2i,it2i").split(",") if m.strip()]
+COT_TOKENS = int(os.environ.get("HI3_COT_TOKENS", "512"))
+MODES = [m.strip() for m in os.environ.get("HI3_MODES", "t2t,i2t,t2i,it2i,t2ti").split(",") if m.strip()]
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -91,9 +95,9 @@ def build_pipeline():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from unirl.models.hunyuan_image3.bundle import HunyuanImage3Bundle
+    from unirl.models.hunyuan_image3.compat import apply_hi3_transformers5_compat
     from unirl.models.hunyuan_image3.config import HunyuanImage3PipelineConfig
     from unirl.models.hunyuan_image3.pipeline import HunyuanImage3Pipeline
-    from unirl.models.hunyuan_image3.compat import apply_hi3_transformers5_compat
     from unirl.sde.kernels import FlowSDEStrategy
 
     # transformers-5.x compat shims (replaces the on-disk checkpoint patcher).
@@ -271,7 +275,9 @@ def run() -> int:
             req = RolloutReq(
                 sample_ids=["t2i:0"],
                 group_ids=["g_t2i"],
-                primitives={"text": Texts(texts=["A photorealistic red panda sitting on a mossy rock in a misty forest."])},
+                primitives={
+                    "text": Texts(texts=["A photorealistic red panda sitting on a mossy rock in a misty forest."])
+                },
                 sampling_params=diff_params(gs=7.5),
                 stage_config={"task": "t2i", "bot_task": "image", "diffusion": {}},
             )
@@ -281,8 +287,10 @@ def run() -> int:
                 resp = pipeline.generate(req)
             px = resp.tracks["image"].decoded.pixels
             outp = save_first_image(resp.tracks["image"].decoded, "t2i.png")
-            log(f"t2i output ({time.time() - t0:.1f}s): pixels {tuple(px.shape)} {px.dtype} "
-                f"min {px.min().item():.3f} max {px.max().item():.3f} -> {outp}")
+            log(
+                f"t2i output ({time.time() - t0:.1f}s): pixels {tuple(px.shape)} {px.dtype} "
+                f"min {px.min().item():.3f} max {px.max().item():.3f} -> {outp}"
+            )
             ok = px.ndim == 4 and px.shape[0] == 1 and px.shape[1] == 3
             results["t2i"] = ("PASS" if ok else "BADSHAPE", f"{tuple(px.shape)} -> {outp}")
         except Exception as e:  # noqa: BLE001
@@ -296,7 +304,10 @@ def run() -> int:
             req = RolloutReq(
                 sample_ids=["it2i:0"],
                 group_ids=["g_it2i"],
-                primitives={"text": Texts(texts=["Change the background to a golden sunset sky."]), "image": image_primitive(512)},
+                primitives={
+                    "text": Texts(texts=["Change the background to a golden sunset sky."]),
+                    "image": image_primitive(512),
+                },
                 sampling_params=diff_params(gs=2.5),
                 stage_config={"task": "it2i", "bot_task": "image", "diffusion": {}},
             )
@@ -306,17 +317,62 @@ def run() -> int:
                 resp = pipeline.generate(req)
             px = resp.tracks["image"].decoded.pixels
             outp = save_first_image(resp.tracks["image"].decoded, "it2i.png")
-            log(f"it2i output ({time.time() - t0:.1f}s): pixels {tuple(px.shape)} {px.dtype} "
-                f"min {px.min().item():.3f} max {px.max().item():.3f} -> {outp}")
+            log(
+                f"it2i output ({time.time() - t0:.1f}s): pixels {tuple(px.shape)} {px.dtype} "
+                f"min {px.min().item():.3f} max {px.max().item():.3f} -> {outp}"
+            )
             ok = px.ndim == 4 and px.shape[0] == 1 and px.shape[1] == 3
             results["it2i"] = ("PASS" if ok else "BADSHAPE", f"{tuple(px.shape)} -> {outp}")
         except Exception as e:  # noqa: BLE001
             log(f"it2i FAILED: {e}\n{traceback.format_exc()}")
             results["it2i"] = ("FAIL", f"{type(e).__name__}: {e}")
 
+    # ---- t2ti : text -> CoT text + image (think_recaption chain) -----------
+    if "t2ti" in MODES:
+        try:
+            log("=== t2ti (text -> CoT text + image) ===")
+            from unirl.types.sampling import ComposedSamplingParams
+
+            req = RolloutReq(
+                sample_ids=["t2ti:0"],
+                group_ids=["g_t2ti"],
+                primitives={
+                    "text": Texts(texts=["A photorealistic red panda sitting on a mossy rock in a misty forest."])
+                },
+                sampling_params=ComposedSamplingParams(
+                    ar=ARSamplingParams(temperature=0.7, max_new_tokens=COT_TOKENS, top_p=0.9, top_k=1024),
+                    diffusion=diff_params(gs=7.5),
+                ),
+                stage_config={"task": "t2ti", "bot_task": "think_recaption", "ar": {}},
+            )
+            ensure_req_sigmas(req, policy)
+            t0 = time.time()
+            with torch.no_grad():
+                resp = pipeline.generate(req)
+            cot = resp.tracks["ar"].decoded.texts[0]
+            px = resp.tracks["image"].decoded.pixels
+            outp = save_first_image(resp.tracks["image"].decoded, "t2ti.png")
+            lineage_ok = resp.tracks["image"].parent_track == "ar" and list(resp.tracks["image"].parent_ids) == [
+                "t2ti:0"
+            ]
+            # Marker presence is informational, not a failure: without upstream's
+            # stage-transition forcing the model may skip the recaption block.
+            log(
+                f"t2ti CoT ({len(cot)} chars; </think>={'</think>' in cot} </recaption>={'</recaption>' in cot}): {cot!r}"
+            )
+            log(
+                f"t2ti output ({time.time() - t0:.1f}s): pixels {tuple(px.shape)} {px.dtype} "
+                f"min {px.min().item():.3f} max {px.max().item():.3f} lineage_ok={lineage_ok} -> {outp}"
+            )
+            ok = px.ndim == 4 and px.shape[0] == 1 and px.shape[1] == 3 and bool(cot.strip()) and lineage_ok
+            results["t2ti"] = ("PASS" if ok else "BAD", f"{tuple(px.shape)} cot_chars={len(cot)} -> {outp}")
+        except Exception as e:  # noqa: BLE001
+            log(f"t2ti FAILED: {e}\n{traceback.format_exc()}")
+            results["t2ti"] = ("FAIL", f"{type(e).__name__}: {e}")
+
     # ---- summary -----------------------------------------------------------
     log("================ SUMMARY ================")
-    for m in ["t2t", "i2t", "t2i", "it2i"]:
+    for m in ["t2t", "i2t", "t2i", "it2i", "t2ti"]:
         if m in results:
             status, detail = results[m]
             log(f"{m:5s}: {status:9s} | {detail}")
