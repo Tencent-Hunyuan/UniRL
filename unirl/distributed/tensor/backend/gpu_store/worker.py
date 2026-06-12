@@ -283,12 +283,20 @@ class TensorWorker:
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
 
-    def _nccl_send(self, dst_rank: int, store_keys: List[str]) -> None:
-        """Send tensors identified by store_keys to dst_rank via NCCL."""
+    def _nccl_send(self, dst_rank: int, items: List) -> None:
+        """Send stored tensors (or row ranges of them) to dst_rank via NCCL.
+
+        Each item is ``(store_key, start, end)`` — a ``HandleView`` routing copy
+        ships only its ``[start:end)`` rows; ``(key, None, None)`` sends the whole
+        block. Bare ``str`` items are accepted for backward compatibility.
+        """
         assert self._global_pg is not None, "Global PG not initialized."
-        for key in store_keys:
+        for item in items:
+            key, start, end = (item, None, None) if isinstance(item, str) else item
             with self._lock:
                 tensor = self._store[key]
+            if start is not None:
+                tensor = tensor[start:end]
             self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
 
     def _nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[TensorHandle]:

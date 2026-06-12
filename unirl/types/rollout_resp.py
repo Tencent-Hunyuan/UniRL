@@ -379,14 +379,9 @@ def _hydrate_tensor_meta(value: Any) -> Any:
         return value
     if not value.refs:
         return None
-    if getattr(value, "view_plan", None) is not None:
-        # Segment views know how to assemble themselves (plan-ordered gather
-        # with the documented ragged right-pad contract).
-        return value.materialize(backend=None)
-    tensors = [h.local() for h in value.refs]
-    if len(tensors) == 1:
-        return tensors[0]
-    return torch.cat(tensors, dim=0)
+    # materialize(None) = per-ref local() fetch + cat_rows (HandleView refs
+    # slice their base; ragged 2D parts follow the documented right-pad contract).
+    return value.materialize(backend=None)
 
 
 def hydrate_track(track: "RolloutTrack") -> "RolloutTrack":

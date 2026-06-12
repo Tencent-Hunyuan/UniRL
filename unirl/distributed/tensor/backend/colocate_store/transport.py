@@ -24,7 +24,7 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.colocate_store.handle import TensorHandle
-from unirl.distributed.tensor.transport import TensorMeta, WorkerLocalTransport
+from unirl.distributed.tensor.transport import HandleView, TensorMeta, WorkerLocalTransport, cat_rows
 
 
 class ColocateStoreTransport(WorkerLocalTransport):
@@ -37,7 +37,9 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def store(self) -> Any:
         return self._store
 
-    def _resolve_handle(self, handle: TensorHandle) -> torch.Tensor:
+    def _resolve_handle(self, handle: Any) -> torch.Tensor:
+        if isinstance(handle, HandleView):
+            return self._resolve_handle(handle.base)[handle.start : handle.end]
         if handle.object_ref is not None:
             return ray.get(handle.object_ref).detach()
         if handle.source_id != self._store.worker_id:
@@ -53,8 +55,7 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def get(self, refs: List[Any]) -> torch.Tensor:
         if not refs:
             raise ValueError("ColocateStoreTransport.get: empty refs list")
-        parts = [self._resolve_handle(h) for h in refs]
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        return cat_rows([self._resolve_handle(h) for h in refs])
 
     def is_ref(self, value: Any) -> bool:
         return isinstance(value, TensorMeta)

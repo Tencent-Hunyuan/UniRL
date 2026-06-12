@@ -164,10 +164,14 @@ class TensorStore:
         """
         assert self._global_pg is not None, "Global PG not initialized. Call setup_global_pg first."
 
+        from unirl.distributed.tensor.transport import HandleView
+
         for h in handles:
             assert h.object_ref is None, "CPU tensor (object_ref set) must not go through NCCL. Check localize routing."
-            tensor = self.get(h).contiguous()
-            self._global_pg.send([tensor], dst_rank, 0).wait()
+            tensor = self.get(h.base if isinstance(h, HandleView) else h)
+            if isinstance(h, HandleView):
+                tensor = tensor[h.start : h.end]  # exact-row routing: ship only the view's rows
+            self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
 
     def _nccl_recv(
         self,

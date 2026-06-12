@@ -15,9 +15,11 @@ from unirl.distributed.tensor.backend.transfer_queue.runtime import (
     _run_async_in_temp_loop,
 )
 from unirl.distributed.tensor.transport import (
+    HandleView,
     TensorMeta,
     TensorTransport,
     TensorTransportRuntime,
+    cat_rows,
 )
 
 
@@ -152,8 +154,14 @@ class TQTransport(TensorTransport):
 
     def get(self, refs: List[Any]) -> torch.Tensor:
         async def _get() -> torch.Tensor:
-            tensors = await self._fetch(refs)
-            return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            # HandleView refs fetch their base row-block, then slice locally.
+            bases = [h.base if isinstance(h, HandleView) else h for h in refs]
+            tensors = await self._fetch(bases)
+            parts = [
+                t[h.start : h.end] if isinstance(h, HandleView) else t
+                for h, t in zip(refs, tensors)
+            ]
+            return cat_rows(parts)
 
         return _run_async_in_temp_loop(_get)
 
@@ -212,13 +220,6 @@ class TQTransport(TensorTransport):
     def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
         if not metas:
             return {}
-        viewed = {k: m for k, m in metas.items() if getattr(m, "view_plan", None) is not None}
-        if viewed:
-            plain = {k: m for k, m in metas.items() if k not in viewed}
-            out = self.get_batch(plain) if plain else {}
-            for k, m in viewed.items():
-                out[k] = m.materialize(backend=self)
-            return out
 
         async def _get_batch() -> Dict[str, torch.Tensor]:
             # Flatten every key's refs into one handle list (each handle carries
@@ -226,18 +227,21 @@ class TQTransport(TensorTransport):
             # in _fetch, then regroup back per consumer key (cat a key's multiple
             # refs). Extracting by handle.field — not by the consumer's positional
             # key — is what lets a producer's output 'i' resolve under the
-            # consumer's input 'j'.
+            # consumer's input 'j'. HandleView refs fetch their base block and
+            # slice locally before the per-key cat.
             handles: List[TQTensorHandle] = []
+            views: List[Any] = []
             owners: List[str] = []
             for k, m in metas.items():
                 for h in m.refs:
-                    handles.append(h)
+                    views.append(h)
+                    handles.append(h.base if isinstance(h, HandleView) else h)
                     owners.append(k)
             tensors = await self._fetch(handles)
             parts: Dict[str, list] = defaultdict(list)
-            for k, t in zip(owners, tensors):
-                parts[k].append(t)
-            return {k: (lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)) for k, lst in parts.items()}
+            for k, h, t in zip(owners, views, tensors):
+                parts[k].append(t[h.start : h.end] if isinstance(h, HandleView) else t)
+            return {k: cat_rows(lst) for k, lst in parts.items()}
 
         return _run_async_in_temp_loop(_get_batch)
 
