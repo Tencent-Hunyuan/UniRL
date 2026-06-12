@@ -193,6 +193,10 @@ stack:
   # slicing; with mbs=1 every sequence ran its own forward/backward. null keeps
   # the legacy count-based behavior.
   micro_token_budget: 10240
+  # 'sum' = packed varlen replay cost accounting (no padding exists, cost is the
+  # plain sum of real tokens = verl token accounting); 'dense' for rectangular
+  # padding replays.
+  micro_cost_model: sum
   max_grad_norm: 1.0
   # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
   # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16

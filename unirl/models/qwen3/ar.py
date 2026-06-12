@@ -43,6 +43,7 @@ def _replay_aware_forward(
     prompt_len: Optional[int] = None,
     temperature: float = 1.0,
     autocast_dtype: Optional[torch.dtype] = None,
+    packed_predict_index: Optional[torch.Tensor] = None,
     **kw: Any,
 ) -> Any:
     """Dual-mode ``forward`` installed on the Qwen3 CausalLM instance.
@@ -76,6 +77,34 @@ def _replay_aware_forward(
     # [B, chunk, vocab] FP32 transient stays ~1.2 GiB, and each chunk is
     # gradient-checkpointed (recomputed in backward rather than held).
     T = float(temperature) if float(temperature) > 0.0 else 1.0
+
+    if packed_predict_index is not None:
+        # Packed varlen replay: ``hidden`` is one packed row [1, L_total, H]
+        # holding every sequence back-to-back (block-causal mask built by
+        # transformers from the restarting position_ids). Predictions for the
+        # FLAT response stream (``response_tokens`` = segment-order targets,
+        # [T_total]) live at ``packed_predict_index`` — gather those hidden
+        # states and run the same chunked fp32 ``x[tok] - logsumexp(x)`` over
+        # the flat stream. No pad tokens exist anywhere on this path.
+        h_pred = hidden[0].index_select(0, packed_predict_index)  # [T_total, H]
+        targets = response_tokens
+
+        def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+            lf = self.lm_head(h).float() / T  # [chunk, vocab] FP32
+            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+
+        flat_parts: List[torch.Tensor] = []
+        flat_chunk = 2048
+        for s in range(0, int(h_pred.size(0)), flat_chunk):
+            h = h_pred[s : s + flat_chunk]
+            tok = targets[s : s + flat_chunk]
+            if torch.is_grad_enabled() and h.requires_grad:
+                flat_parts.append(checkpoint(_flat_logp_chunk, h, tok, use_reentrant=False))
+            else:
+                flat_parts.append(_flat_logp_chunk(h, tok))
+        if not flat_parts:
+            return hidden.new_zeros((0,), dtype=torch.float32)
+        return torch.cat(flat_parts, dim=0)
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
@@ -374,6 +403,50 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
         pad_id = self.model.tokenizer.pad_token_id or 0
+
+        # ---- Packed varlen replay (B > 1): zero padding anywhere. -----------
+        # Concatenate every sample's REAL prompt tokens + its flat response
+        # tokens into ONE row; position_ids restart at 0 per sequence, and with
+        # attention_mask=None transformers' masking_utils detects the packed
+        # layout from the restarting positions and builds the block-causal mask
+        # (verl remove_padding equivalence). Per-sequence RoPE positions equal
+        # the standalone layout, so logp semantics are unchanged; the dense
+        # [B, P_max + T_max] path below stays for B == 1 (identical cost) and as
+        # the fallback.
+        if batch_size > 1 and segment.lengths is not None:
+            real_prompt_lens_p = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
+            cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
+            flat_resp = segment.tokens.to(device=device, dtype=torch.long)
+            streams: List[torch.Tensor] = []
+            pos_parts: List[torch.Tensor] = []
+            pred_parts: List[torch.Tensor] = []
+            offset = 0
+            for b in range(batch_size):
+                n_p = int(real_prompt_lens_p[b].item())
+                n_r = lengths[b]
+                seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
+                streams.append(seq)
+                pos_parts.append(torch.arange(seq.numel(), device=device))
+                if n_r > 0:
+                    pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
+                offset += int(seq.numel())
+            packed_ids = torch.cat(streams).unsqueeze(0)
+            packed_pos = torch.cat(pos_parts).unsqueeze(0)
+            predict_index = (
+                torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
+            )
+            per_token_flat = self.model.transformer(
+                input_ids=packed_ids,
+                attention_mask=None,
+                position_ids=packed_pos,
+                response_tokens=flat_resp,
+                packed_predict_index=predict_index,
+                prompt_len=0,
+                temperature=temperature,
+                autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
+            )
+            return per_token_flat.to(dtype=self.logprob_dtype)
+
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -404,6 +477,20 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 left_padded_mask[b, prompt_len - n_real :] = 1
             prompt_ids = left_padded_ids
             prompt_mask = left_padded_mask
+
+        # Trim the prompt block to THIS batch's true max length. The track-level
+        # concat right-pads prompts to the global (worker-shard) max, so every
+        # replay micro otherwise forwards at the widest prompt in the shard —
+        # pure dense-pad waste (with token-budget packing the micro members are
+        # length-sorted, making the waste systematic). After the LEFT re-pad all
+        # real tokens sit at the right end, so dropping the leading all-pad
+        # columns preserves prompt-end position (= new prompt_len - 1) and the
+        # cumsum position_ids below are pad-invariant.
+        max_real_prompt = int(real_prompt_lens.max().item())
+        if 0 < max_real_prompt < prompt_len:
+            prompt_ids = prompt_ids[:, prompt_len - max_real_prompt :]
+            prompt_mask = prompt_mask[:, prompt_len - max_real_prompt :]
+            prompt_len = max_real_prompt
 
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
