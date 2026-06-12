@@ -212,6 +212,13 @@ class TQTransport(TensorTransport):
     def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
         if not metas:
             return {}
+        viewed = {k: m for k, m in metas.items() if getattr(m, "view_plan", None) is not None}
+        if viewed:
+            plain = {k: m for k, m in metas.items() if k not in viewed}
+            out = self.get_batch(plain) if plain else {}
+            for k, m in viewed.items():
+                out[k] = m.materialize(backend=self)
+            return out
 
         async def _get_batch() -> Dict[str, torch.Tensor]:
             # Flatten every key's refs into one handle list (each handle carries
