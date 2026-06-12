@@ -947,6 +947,12 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         for key in ("stop", "stop_token_ids", "skip_special_tokens"):
             if key in params:
                 extra_sampling[key] = params[key]
+        # Benchmark hack (env-gated, default off): force fixed-length decode so a
+        # heavy-regime perf measurement does not have to wait ~100 training steps
+        # for natural response-length growth. Every sequence decodes to exactly
+        # max_new_tokens (uniform lengths also remove straggler noise).
+        if os.environ.get("UNIRL_FORCE_IGNORE_EOS") == "1":
+            extra_sampling["ignore_eos"] = True
 
         async def _generate_one(prompt: str, mm_enc: Optional["MMEncoding"] = None) -> List[Dict[str, Any]]:
             has_image = mm_enc is not None and mm_enc.image is not None
