@@ -193,9 +193,34 @@ class ARTrainer(BaseTrainer):
         from unirl.distributed.tensor.batch import Batch
         from unirl.distributed.tensor.transport import TensorMeta
 
+        def hydrate_ragged(tm):
+            # _hydrate_tensor_meta cats per-worker parts along dim 0, which fails
+            # for 2D fields whose per-shard pad WIDTH differs (each worker padded
+            # its prompt block to its own max). Right-pad parts to the global max
+            # first — the same layout TextTokenCondition.concat produces (real
+            # tokens left, pad right; replay reads real lengths from the mask, so
+            # the pad value is immaterial).
+            if not tm.refs:
+                return None
+            parts = [h.local() for h in tm.refs]
+            if len(parts) == 1:
+                return parts[0]
+            if parts[0].dim() >= 2:
+                widths = {int(p.shape[1]) for p in parts}
+                if len(widths) > 1:
+                    target = max(widths)
+                    padded = []
+                    for p in parts:
+                        if int(p.shape[1]) < target:
+                            pad = p.new_zeros((p.shape[0], target - p.shape[1]) + tuple(p.shape[2:]))
+                            p = torch.cat([p, pad], dim=1)
+                        padded.append(p)
+                    parts = padded
+            return torch.cat(parts, dim=0)
+
         def walk(value):
             if isinstance(value, TensorMeta):
-                return _hydrate_tensor_meta(value)
+                return hydrate_ragged(value)
             if isinstance(value, Batch):
                 for f in dc_fields(value):
                     object.__setattr__(value, f.name, walk(getattr(value, f.name)))
