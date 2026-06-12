@@ -84,21 +84,33 @@ class TensorWeightSync(FullWeightSync):
                 # config) is applied once in the base-class walk, shard-side.
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
 
+            # One payload entry per tp rank, each its OWN serialization (own
+            # CUDA-IPC export): sglang indexes serialized_named_tensors[tp_rank],
+            # and reusing one serialized string across ranks unbalances the IPC
+            # refcount handshake — the gathered full weights leak (~16 GB/step
+            # measured on tp=2). fanout==0 → this rank is a TP client whose
+            # engine no-ops; skip serialize/send but keep the collective gather
+            # and the bucket release below in lockstep with the other ranks.
+            fanout = int(getattr(self._rollout, "weight_payload_fanout", 1))
             serialized = []
-            for grouped in by_dtype.values():
-                flat = FlattenedTensorBucket(named_tensors=grouped)
-                payload = {
-                    "flattened_tensor": flat.get_flattened_tensor(),
-                    "metadata": flat.get_metadata(),
-                }
-                serialized.append(MultiprocessingSerializer.serialize(payload, output_str=True))
+            if fanout > 0:
+                for grouped in by_dtype.values():
+                    flat = FlattenedTensorBucket(named_tensors=grouped)
+                    payload = {
+                        "flattened_tensor": flat.get_flattened_tensor(),
+                        "metadata": flat.get_metadata(),
+                    }
+                    serialized.append(
+                        [
+                            MultiprocessingSerializer.serialize(payload, output_str=True)
+                            for _ in range(fanout)
+                        ]
+                    )
 
             n_dtypes = len(serialized)
-            for i, payload in enumerate(serialized):
-                # TP=1 → the worker picks serialized_named_tensors[0], so ship a
-                # single-element list. flush only on the very last payload.
+            for i, payload_per_rank in enumerate(serialized):
                 self._rollout.update_weights_from_tensor(
-                    serialized_named_tensors=[payload],
+                    serialized_named_tensors=payload_per_rank,
                     load_format="flattened_bucket",
                     flush_cache=(self._flush_cache and is_last and i == n_dtypes - 1),
                     track_prefix=self._track_prefix,
