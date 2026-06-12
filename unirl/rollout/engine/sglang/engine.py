@@ -409,7 +409,12 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         diffusion = get_diffusion_params(req.sampling_params)
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
-        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
+        # Normalize empty -> None: DiffusionNFT (num_sde_steps=0) resolves to ``[]``,
+        # which is ODE/forward-process (no SDE subset). ``None`` makes the response
+        # builder keep the FULL trajectory (no SDE-subset trim) and emit
+        # ``sde_indices = arange(num_steps)``, rather than treating ``[]`` as a
+        # zero-length subset and trimming the trajectory.
+        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw else None
         # Best-effort emit: whenever the rollout ran SDE-gated steps, try to
         # land SGLang's native per-step log-probs on the segment. Whether they
         # are *used* (vs trainer-side replay) is decided downstream by the

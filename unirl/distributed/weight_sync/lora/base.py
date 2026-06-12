@@ -19,7 +19,7 @@ eagerly pulling torch-heavy or vLLM-only deps.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from unirl.distributed.group.remote import Remote
 
@@ -37,7 +37,7 @@ def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: st
     from unirl.utils.peft_merge import extract_lora_tensors
 
     model = backend.model
-    lora_tensors = extract_lora_tensors(model, param_prefix=param_prefix)
+    lora_tensors = extract_lora_tensors(model, param_prefix=param_prefix, adapter_name=adapter_name)
     peft_config = _peft_config_dict(model, adapter_name)
     return lora_tensors, peft_config
 
@@ -47,6 +47,9 @@ class LoraWeightSyncBase(Remote):
 
     ``param_prefix`` is the pipeline prefix prepended to the canonical keys (e.g.
     ``"transformer."``; stripped engine-side by ``adapt_lora_for_sglang``).
+    ``adapter_name`` selects which PEFT adapter to ship; ``None`` (default) defers
+    to ``backend.rollout_adapter_name`` (the EMA shadow ``"old"`` for DiffusionNFT,
+    else ``"default"``), so an off-policy engine receives the EMA adapter.
     ``track_prefix`` (e.g. ``"ar"`` / ``"diffusion"``) further prefixes the keys so
     a :class:`~unirl.rollout.engine.composed.engine.ComposedRolloutEngine`
     can demux the update to one child; empty for a single-model trainer. ``verify``
@@ -62,14 +65,16 @@ class LoraWeightSyncBase(Remote):
         *,
         backend: Any,
         param_prefix: str = "",
-        adapter_name: str = "default",
+        adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
     ) -> None:
         super().__init__()
         self._backend = backend
         self._param_prefix = str(param_prefix or "")
-        self._adapter_name = str(adapter_name or "default")
+        # None defers to the backend's single source of truth (the EMA shadow
+        # "old" for DiffusionNFT, else "default"); an explicit value overrides.
+        self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
         self._verify = bool(verify)
         self._track_prefix = str(track_prefix or "")
 
