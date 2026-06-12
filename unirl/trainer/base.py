@@ -135,104 +135,22 @@ class BaseTrainer:
         """Reclaim per-rollout mooncake zero-copy buffers (no-op for other backends)."""
         self.pool.reset_transfer_queue_buffers()
 
-    # ---- DP seqlen balancing (shared, opt-in via balance_dp_batch) ---------
-
-    def _hydrate_track(self, track):
-        """Driver-side hydrate of every TensorMeta field so ``Batch.select`` works.
-
-        ``Batch.select`` silently passes unknown leaf types through unchanged and
-        ``TensorMeta.select`` raises — so permuting a track that still carries
-        TensorMeta proxies would desync those fields from the permuted ones.
-        Hydrating first costs one fetch of the per-rollout tensors (~10-20 MB).
-        """
-        from dataclasses import fields as dc_fields
-
-        import torch
-
-        from unirl.distributed.tensor.batch import Batch
-        from unirl.distributed.tensor.transport import TensorMeta
-
-        def hydrate_ragged(tm):
-            # _hydrate_tensor_meta cats per-worker parts along dim 0, which fails
-            # for 2D fields whose per-shard pad WIDTH differs (each worker padded
-            # its prompt block to its own max). Right-pad parts to the global max
-            # first — the same layout TextTokenCondition.concat produces (real
-            # tokens left, pad right; replay reads real lengths from the mask, so
-            # the pad value is immaterial).
-            if not tm.refs:
-                return None
-            parts = [h.local() for h in tm.refs]
-            if len(parts) == 1:
-                return parts[0]
-            if parts[0].dim() >= 2:
-                widths = {int(p.shape[1]) for p in parts}
-                if len(widths) > 1:
-                    target = max(widths)
-                    padded = []
-                    for p in parts:
-                        if int(p.shape[1]) < target:
-                            pad = p.new_zeros((p.shape[0], target - p.shape[1]) + tuple(p.shape[2:]))
-                            p = torch.cat([p, pad], dim=1)
-                        padded.append(p)
-                    parts = padded
-            return torch.cat(parts, dim=0)
-
-        def walk(value):
-            if isinstance(value, TensorMeta):
-                return hydrate_ragged(value)
-            if isinstance(value, Batch):
-                for f in dc_fields(value):
-                    object.__setattr__(value, f.name, walk(getattr(value, f.name)))
-                return value
-            if isinstance(value, dict):
-                return {k: walk(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [walk(v) for v in value]
-            if isinstance(value, tuple):
-                return tuple(walk(v) for v in value)
-            return value
-
-        return walk(track)
+    # ---- DP seqlen balancing (opt-in via balance_dp_batch) -----------------
 
     def _balance_track(self, track):
-        """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
+        """Opt-in DP seqlen balancing — thin policy wrapper over the mechanism.
 
-        Greedy LPT under an equal-count constraint (DP_SCATTER splits the batch
-        into dp_size EQUAL contiguous chunks): longest sample first, into the
-        eligible bucket with the smallest running token sum. Advantages are
-        computed BEFORE this point (per-group stats already attached per
-        sample), so sample order is free to change — the same invariant verl
-        relies on. Buckets are laid out contiguously in worker order.
+        The mechanism (hydrate + LPT reorder) lives with the data type:
+        :func:`unirl.types.rollout_resp.balance_track_for_dp`. This wrapper only
+        owns the POLICY: the ``balance_dp_batch`` flag (False by default; AR
+        workloads with variable response lengths opt in) and the dp size. Safe
+        to call unconditionally from any train_step.
         """
         if not self.balance_dp_batch:
             return track
-        lengths = getattr(track.segment, "lengths", None) if track.segment is not None else None
-        if lengths is None:
-            logger.warning("balance_dp_batch: track has no segment lengths; skipping balance.")
-            return track
-        total = int(track.batch_size)
-        dp = int(self.num_devices)
-        if total % dp != 0 or dp <= 1:
-            return track
-        cap = total // dp
-        lens = [int(x) for x in lengths.tolist()]
-        order = sorted(range(total), key=lambda i: (-lens[i], i))
-        buckets = [[] for _ in range(dp)]
-        sums = [0] * dp
-        for i in order:
-            best = min((b for b in range(dp) if len(buckets[b]) < cap), key=lambda b: sums[b])
-            buckets[best].append(i)
-            sums[best] += lens[i]
-        perm = [i for bucket in buckets for i in bucket]
-        track = self._hydrate_track(track)
-        balanced = track.select(perm)
-        logger.info(
-            "balance_dp_batch: rank token sums min=%d max=%d (spread %.1f%%)",
-            min(sums),
-            max(sums),
-            100.0 * (max(sums) - min(sums)) / max(1, sum(sums) // dp),
-        )
-        return balanced
+        from unirl.types.rollout_resp import balance_track_for_dp
+
+        return balance_track_for_dp(track, dp_size=int(self.num_devices))
 
     # ---- wandb logging (shared by all v2 trainers) -------------------------
 
