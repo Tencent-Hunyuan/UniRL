@@ -188,6 +188,11 @@ sync:
 stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
+  # verl ppo_max_token_len_per_gpu parity: pack each mini-batch into micro-batches
+  # under a token budget (length-sorted bin packing) instead of fixed-count
+  # slicing; with mbs=1 every sequence ran its own forward/backward. null keeps
+  # the legacy count-based behavior.
+  micro_token_budget: 10240
   max_grad_norm: 1.0
   # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
   # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16
