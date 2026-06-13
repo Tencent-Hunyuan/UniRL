@@ -101,10 +101,7 @@ class TensorWeightSync(FullWeightSync):
                         "metadata": flat.get_metadata(),
                     }
                     serialized.append(
-                        [
-                            MultiprocessingSerializer.serialize(payload, output_str=True)
-                            for _ in range(fanout)
-                        ]
+                        [MultiprocessingSerializer.serialize(payload, output_str=True) for _ in range(fanout)]
                     )
 
             n_dtypes = len(serialized)
