@@ -36,6 +36,12 @@ class Qwen3PipelineConfig:
     trust_remote_code: bool = True
 
     model_precision: Any = "bf16"
+    # HF attention backend for the TRAIN-side model (replay teacher-forcing).
+    # 'flex_attention' makes the packed varlen replay fast: transformers builds a
+    # BlockMask from the restarting position_ids and the flex kernel skips the
+    # fully-masked cross-sequence blocks (sdpa falls back to the math kernel on
+    # packed masks — ~3x slower and memory-bound). None = HF default (sdpa).
+    attn_implementation: Optional[str] = None
     device: Any = None
 
     autocast_precision: str = "bf16"
