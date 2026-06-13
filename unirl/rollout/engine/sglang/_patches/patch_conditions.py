@@ -90,19 +90,27 @@ _COND_FIELDS = (
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
 # Positives gate on return_prompt_embeds; negatives on return_negative_prompt_embeds.
 #
-# NOTE (LIN-365): ``encoder_attention_mask`` is deliberately NOT emitted. The SD3
-# pipeline's ``SD3ConditioningStage`` merges the prompt embeds (CLIP-L⊕CLIP-G along
-# hidden → 77, + T5 → 333) but leaves ``prompt_attention_mask`` as the raw
-# per-encoder list (77 + 77 + 256 → 410). Emitting that raw mask makes
-# ``TextEmbedCondition.concat`` pad the merged 333-token embeds up to the 410-token
-# mask (``target_seq_len = max(embeds_seq, mask_seq)``), injecting 77 spurious zero
-# tokens that the trainer's replay forwards through the DiT — diluting the LoRA
-# policy gradient ~68x (flat reward). SD3's ``predict_noise`` ignores the mask, so
-# dropping it is safe and matches the working vLLM-Omni / fork behavior. A model
-# that genuinely needs the mask must emit it merged to the embed sequence length.
+# NOTE (LIN-365): ``encoder_attention_mask`` IS emitted, but the response
+# translator (``response.py:_build_text_conditions``) **length-gates** it: it
+# attaches the mask to ``TextEmbedCondition`` only when the fused mask sequence
+# length equals the fused embed sequence length, and drops it otherwise. This
+# makes the mask model-agnostic and correct for both shapes:
+#   * Multi-encoder models (SD3: CLIP-L⊕CLIP-G→77 + T5→333 = 333 fused embeds,
+#     but raw per-encoder mask concat = 77+77+256 = 410) FAIL the length check,
+#     so the mask is dropped — exactly the prior SD3 behavior. (SD3's
+#     ``predict_noise`` ignores the mask, and carrying the 410-len mask would
+#     make ``TextEmbedCondition.concat`` pad the 333-token embeds up to 410,
+#     injecting spurious zero tokens that dilute the LoRA gradient ~68x.)
+#   * Single-encoder models (Z-Image: one Qwen3 encoder, mask_seq == embed_seq)
+#     PASS the check and KEEP the mask — which Z-Image genuinely needs, because
+#     its ``predict_noise`` rebuilds the per-prompt variable-length caption list
+#     by trimming the zero-padded embeds with this mask (see
+#     ``models/z_image/diffusion.py:_caption_list``). Without it, replay would
+#     forward the zero-pad positions through the DiT and diverge from rollout.
 _POS_MAP = {
     "prompt_embeds": "prompt_embeds",
     "pooled_prompt_embeds": "pooled_embeds",
+    "encoder_attention_mask": "prompt_attention_mask",
 }
 _NEG_MAP = {
     "negative_prompt_embeds": "negative_prompt_embeds",

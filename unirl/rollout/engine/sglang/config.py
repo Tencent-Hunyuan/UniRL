@@ -50,7 +50,7 @@ _SGLANG_PORT_STRIDE = 100
 # ``_patches/patch_sd3_lora_pipeline``), add a Videos primitive to the response
 # translator (video samples are currently dropped, see response.py TODO), then
 # re-add the family string here.
-_VALID_MODEL_FAMILIES = ("sd3", "flux2_klein")
+_VALID_MODEL_FAMILIES = ("sd3", "flux2_klein", "z_image")
 
 
 @dataclass
