@@ -407,6 +407,7 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         self._server_process: Optional[multiprocessing.Process] = None
         self._router_process: Optional[multiprocessing.Process] = None
         self._router_url: Optional[str] = None
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._http_client: Any = None
         self._tokenizer: Any = None
         self._chat_template_logged: bool = False
@@ -554,10 +555,8 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         )
 
         if httpx is not None:
-            self._http_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(None),
-                trust_env=False,
-            )
+            self._async_loop = asyncio.new_event_loop()
+            self._http_client = self._run_async(self._make_http_client())
 
         from transformers import AutoTokenizer
 
@@ -607,18 +606,35 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         p.start()
         return p
 
+    async def _make_http_client(self) -> Any:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(None),
+            trust_env=False,
+        )
+
+    def _run_async(self, awaitable: Any) -> Any:
+        if self._async_loop is None or self._async_loop.is_closed():
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise RuntimeError("SGLangLLMRolloutEngine async event loop is not available.")
+        return self._async_loop.run_until_complete(awaitable)
+
     def shutdown(self) -> None:
         """Kill SRT server + router and close HTTP client."""
         if self._http_client is not None:
             try:
-                loop = asyncio.new_event_loop()
-                try:
-                    loop.run_until_complete(self._http_client.aclose())
-                finally:
-                    loop.close()
+                self._run_async(self._http_client.aclose())
             except Exception:
                 logger.debug("Failed to close SGLang HTTP client during shutdown.", exc_info=True)
             self._http_client = None
+        if self._async_loop is not None:
+            try:
+                if not self._async_loop.is_closed():
+                    self._async_loop.close()
+            except Exception:
+                logger.debug("Failed to close SGLang async event loop during shutdown.", exc_info=True)
+            self._async_loop = None
         if self._router_process is not None:
             logger.info("Shutting down sglang router (pid=%s)", self._router_process.pid)
             kill_process_tree(self._router_process.pid)
@@ -798,17 +814,13 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
         sampling_params: Dict[str, Any],
         mm_encs: Optional[List["MMEncoding"]] = None,
     ) -> List[Dict[str, Any]]:
-        """Drive ``_generate_text_async`` from a fresh event loop."""
+        """Drive ``_generate_text_async`` from the engine's persistent event loop."""
         if self._http_client is None:
             raise RuntimeError(
                 "httpx is required for SGLangLLMRolloutEngine.generate. Install httpx: pip install httpx"
             )
         t0 = time.perf_counter()
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(self._generate_text_async(prompts, sampling_params, mm_encs=mm_encs))
-        finally:
-            loop.close()
+        results = self._run_async(self._generate_text_async(prompts, sampling_params, mm_encs=mm_encs))
         elapsed = time.perf_counter() - t0
         logger.info(
             "SGLangLLMRolloutEngine.generate: %d prompts -> %d results in %.2fs",
