@@ -178,8 +178,6 @@ class ARTrainer(BaseTrainer):
         )
         return result, mean_reward
 
-
-
     def evaluate(self, rollout_id: int) -> float:
         """Periodic eval — ``avg@k`` accuracy on the eval prompt set (no training).
 

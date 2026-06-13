@@ -43,6 +43,7 @@ Pairs with ``RolloutReq`` (in ``unirl/types/rollout_req.py``).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
@@ -61,6 +62,8 @@ from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+
+logger = logging.getLogger(__name__)
 
 TR = TypeVar("TR", bound="RolloutTrack")
 TT = TypeVar("TT", bound="RolloutResp")
@@ -437,6 +440,7 @@ def hydrate_track(track: "RolloutTrack") -> "RolloutTrack":
         return value
 
     return walk(track)
+
 
 def balance_track_for_dp(track: "RolloutTrack", *, dp_size: int, min_spread: float = 0.05) -> "RolloutTrack":
     """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
