@@ -12,6 +12,9 @@ Pure-CPU: plain ``torch`` tensors and locally-declared ``Batch`` subclasses,
 no transport backend, no Ray, no GPU.
 """
 
+from dataclasses import dataclass
+from typing import List, Optional
+
 import pytest
 import torch
 
@@ -35,10 +38,6 @@ pytestmark = pytest.mark.cpu
 
 
 # ── sample Batch subclasses ──────────────────────────────────────────────────
-
-
-from dataclasses import dataclass
-from typing import List, Optional
 
 
 @dataclass

@@ -16,11 +16,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Generic, List, Optional, Protocol, Tuple, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Generic, List, Optional, Protocol, Tuple, TypeVar, runtime_checkable
 
 import torch
 
 from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
+
+if TYPE_CHECKING:
+    from unirl.distributed.tensor.transport import TensorTransport
 
 @runtime_checkable
 class TensorHandle(Protocol):
