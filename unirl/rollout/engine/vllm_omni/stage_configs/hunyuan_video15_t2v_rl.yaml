@@ -58,13 +58,13 @@ stage_args:
       # (latents, sigmas, log_probs), and dual-text-encoder condition
       # extraction (text_mllm + text_glyph from the dual-encoder architecture).
       custom_pipeline_args:
-        pipeline_class: unirl.rollout.engine.vllm_omni.hv15.pipeline.RLHunyuanVideo15Pipeline
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.hv15.pipeline.RLHunyuanVideo15Pipeline
       # unirl-specific: install the weight-sync extension so the DiT
       # worker exposes update_weights_from_ipc (bucketed CUDA-IPC) and
       # later init_weight_transfer_engine / update_weights (NCCL).
       # Must coexist with the custom pipeline above; vllm-omni's worker
       # composes these via multiple inheritance at instantiation time.
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.dit_extension.DiTWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
     final_output: true
     final_output_type: video
 

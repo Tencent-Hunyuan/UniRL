@@ -30,7 +30,7 @@ stage_args:
       # a real id there. Composing the weight-sync mixin on top adds
       # ``update_weights_from_ipc`` (bucketed CUDA-IPC) without losing
       # the tokenizer fix.
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.ar_extension.HI3ARWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.ar_extension.HI3ARWeightSyncExtension
       # unirl-specific: enable LoRA on the AR stage so
       # ``set_lora_from_tensors`` can install in-memory adapters via
       # ``add_lora`` (the LoRA tensor-bag transport). Defaults from
@@ -104,13 +104,13 @@ stage_args:
       # unirl-specific: install RLHunyuanImage3Pipeline so SDE-mode
       # rollouts get a swappable scheduler + per-step trajectory capture.
       custom_pipeline_args:
-        pipeline_class: unirl.rollout.engine.vllm_omni.hi3.pipeline.RLHunyuanImage3Pipeline
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.hi3.pipeline.RLHunyuanImage3Pipeline
       # unirl-specific: install the weight-sync extension so the DiT
       # worker exposes ``update_weights_from_ipc`` (bucketed CUDA-IPC) and
       # later ``init_weight_transfer_engine`` / ``update_weights`` (NCCL).
       # Must coexist with the custom pipeline above; vllm-omni's worker
       # composes these via multiple inheritance at instantiation time.
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.dit_extension.DiTWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
     engine_input_source: [0]
     final_output: true
     final_output_type: image

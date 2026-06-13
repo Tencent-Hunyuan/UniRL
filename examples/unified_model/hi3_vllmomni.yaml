@@ -128,14 +128,7 @@ ar_rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
     # AR-only think/recaption stage (is_comprehension:false), GPUs 0-3.
-    modality: ar_recaption
-    default_height: 1024
-    default_width: 1024
-    # AR decode defaults — match the old hi3 stage config.
-    default_ar_max_tokens: 4096
-    default_ar_temperature: 0.6
-    default_ar_top_p: 0.95
-    default_ar_top_k: 1024
+    modality: hi3_ar_recaption
     enable_sleep_mode: true
 
 dit_rollout:
@@ -145,12 +138,7 @@ dit_rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
     # Standalone DiT stage that eats an externally-injected recaption, GPUs 4-7.
-    modality: dit_recaption
-    default_height: 1024
-    default_width: 1024
-    default_num_inference_steps: 16
-    default_guidance_scale: 1.0
-    default_eta: 1.0
+    modality: hi3_dit_recaption
     enable_sleep_mode: true
 
 reward:
