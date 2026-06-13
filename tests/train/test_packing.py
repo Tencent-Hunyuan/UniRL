@@ -1,4 +1,4 @@
-"""Unit tests for micro-batch planning (unirl/train/stack.py) + the
+"""Unit tests for micro-batch planning (unirl/train/stack/planning.py) + the
 TokenBudgetPlanner seq-mean guard. Pure / CPU-only — no GPU, no FSDP backend.
 
 Run with ``pytest tests/train/test_packing.py`` or directly:
@@ -12,8 +12,8 @@ import types
 import pytest
 import torch
 
-from unirl.train.stack import (
-    TokenBudgetPlanner,
+from unirl.train.stack import TokenBudgetPlanner
+from unirl.train.stack.planning import (
     _arrange_packed,
     _build_micro_batch_slices,
     _count_plan,
