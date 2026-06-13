@@ -19,7 +19,7 @@ dependencies = [
   # one engine extra below, which is what allows the per-engine CUDA stacks.
   "numpy>=1.24,<3",
   "ray[default]>=2.9,<2.55",  # 2.55 removed the ray.util.placement_group re-export of PlacementGroupSchedulingStrategy that unirl/distributed/utils.py imports
-  "diffusers>=0.30",
+  "diffusers>=0.37.0",  # Qwen-Image RoPE: <0.37 requires txt_seq_lens (max(None) crash); 0.37 derives text len from encoder_hidden_states_mask
   "hydra-core>=1.3",
   "omegaconf>=2.3",
   "transformers>=4.41",

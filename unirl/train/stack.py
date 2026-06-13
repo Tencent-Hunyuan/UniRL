@@ -293,7 +293,12 @@ class TrainStack(Remote):
         has_backward = False
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
-        for start, end in micro_slices:
+        last_micro = len(micro_slices) - 1
+        for i, (start, end) in enumerate(micro_slices):
+            # Defer the per-block gradient reduce-scatter to the last micro-batch
+            # so it runs once per optimizer step instead of once per micro-batch
+            # (no-op unless defer_grad_sync + ZeRO-2). Must precede the backward.
+            self.fsdp_backend.set_grad_sync(i == last_micro)
             micro_track = resp_track if single_micro else resp_track.slice(start, end)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
@@ -307,6 +312,21 @@ class TrainStack(Remote):
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
+
+        # Under defer_grad_sync the deferred reduce-scatter only runs inside a
+        # backward that executes after set_grad_sync(True) — the last micro's.
+        # If that micro skipped backward while earlier ones ran, the accumulated
+        # grads were never synced: the optimizer would silently step on empty
+        # grads now, and the stale unsharded accumulation (which zero_grad
+        # cannot reach) would leak into the NEXT step's reduce-scatter. Fail
+        # fast instead — mirrors fsdp_wrap's stray-trainable guard.
+        if has_backward and not micros[-1].has_backward and self.fsdp_backend.grad_sync_deferred:
+            raise RuntimeError(
+                "TrainStack.train: defer_grad_sync deferred the gradient reduce-scatter to the "
+                "last micro-batch, but it reported no backward (all-empty micro?) while earlier "
+                "micro-batches did — the accumulated grads were never synced. Disable "
+                "training.fsdp.defer_grad_sync or investigate the empty micro-batch."
+            )
 
         if has_backward:
             grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))

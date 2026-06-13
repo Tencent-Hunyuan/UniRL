@@ -61,6 +61,8 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
+    defer_grad_sync: false  # true = one gradient reduce-scatter per optimizer step instead of per micro-batch (ZeRO-2 only; multi-node win; parity-check before enabling)
+    forward_prefetch: false  # true overlaps each block's all-gather with compute (multi-node win; uses the default root wrap)
     activation_checkpointing: false   # diverges 】om reference (bf16_full_ac) per user request
     use_torch_compile: false
   optimizer_cfg:

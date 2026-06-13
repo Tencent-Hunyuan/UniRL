@@ -16,15 +16,16 @@ module; this module never computes a loss.
 ## Why it exists
 
 The split exists because two correctness invariants live on the train side, not in
-the loss math, and both silently corrupt training if they slip. Under a partial FSDP
-wrap only the transformer blocks are `fully_shard`-wrapped, so the root params
-(embed / final norm / lm_head) are plain replicated tensors FSDP never reduces —
-`optimizer_step` must DP-average them by hand (`sync_unsharded_grads`) or the
-replicas drift apart across ranks and the grad-norm is wrong. The same partial wrap
-leaves the optimizer a mixed `Tensor` + `DTensor` param bag, which forces
-`foreach=False` or AdamW's fused kernel raises. Centralizing wrap + step here lets
-every algorithm inherit these fixes for free; the loss module legitimately knows
-nothing about DTensor sharding or DP grad-sync.
+the loss math, and both silently corrupt training if they slip. Per-block
+`fully_shard` alone would leave the root params (embed / final norm / lm_head) as
+plain replicated tensors FSDP never reduces — their replicas would drift apart
+across ranks and the grad-norm would be wrong — so `fsdp_wrap` claims them into a
+root `fully_shard` group by default (`root_wrap`) and fails fast when a multi-rank
+run leaves a trainable param outside every group. The uniform wrap also keeps the
+optimizer an all-`DTensor` param bag (a mixed `Tensor` + `DTensor` bag forces
+`foreach=False` or AdamW's fused kernel raises). Centralizing wrap + step here lets
+every algorithm inherit these invariants for free; the loss module legitimately
+knows nothing about DTensor sharding or wrap topology.
 
 ## How it works
 
@@ -75,3 +76,14 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
   shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass
   `block_class_names` explicitly in the recipe.
+- **`fsdp_wrap` shards the leftover params (embed / final norm / lm_head) into a
+  root `fully_shard` group by default** (`root_wrap`, on) — the root group never
+  reshards after forward. Set `root_wrap: false` for models whose stages call
+  submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
+  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
+  every group then fails fast.
+- **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
+  backward** — the deferred reduce-scatter only fires inside it. If that micro
+  skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
+  raises instead of silently stepping on never-synced grads (which would also
+  leak the stale accumulation into the next step's reduce-scatter).

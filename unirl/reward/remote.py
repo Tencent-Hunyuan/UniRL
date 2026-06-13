@@ -299,12 +299,21 @@ class RemoteRewardBackend(RewardBackend):
         ``history = [{"text": prompt, "image_b64": ...}]`` and
         ``required_rewards`` set to ``self.required_rewards``.
 
+        When the request carries condition images in ``primitives["image"]``
+        (e.g. image-editing pipelines), a two-turn history is built:
+            history[0] = {"text": prompt, "image_b64": condition_image}
+            history[1] = {"text": prompt, "image_b64": generated_image}
+        This matches the EditReward scorer's input convention.
+
         Per-sample metadata from ``request.metadata`` is forwarded when present.
         """
         images = request.images or []
         prompts = request.prompts
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
+
+        # Check for condition images in primitives (source images for editing)
+        condition_images = self._get_condition_images(request)
 
         for idx in range(len(images)):
             prompt = prompts[idx] if idx < len(prompts) else ""
@@ -316,15 +325,44 @@ class RemoteRewardBackend(RewardBackend):
             sample_metadata = None
             if metadata_list is not None and idx < len(metadata_list):
                 sample_metadata = metadata_list[idx]
+
+            if condition_images is not None and idx < len(condition_images):
+                # Two-turn history: condition (source) image + generated (edited) image
+                condition_b64 = _encode_image_b64(
+                    condition_images[idx],
+                    image_format=self.image_format,
+                    quality=self.image_quality,
+                )
+                history = [
+                    {"text": prompt, "image_b64": condition_b64},
+                    {"text": prompt, "image_b64": image_b64},
+                ]
+            else:
+                # Single-turn history: generated image only (T2I)
+                history = [{"text": prompt, "image_b64": image_b64}]
+
             wire_requests.append(
                 {
-                    "history": [{"text": prompt, "image_b64": image_b64}],
+                    "history": history,
                     "required_rewards": list(self.required_rewards),
                     "metadata": sample_metadata,
                 }
             )
 
         return {"requests": wire_requests}
+
+    def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
+        """Extract per-sample condition images from request primitives.
+
+        Returns None if no condition images are present (pure T2I case).
+        """
+        prim_image = request.primitives.get("image")
+        if prim_image is None:
+            return None
+        # Images batch has .pixels [B, C, H, W]
+        from unirl.utils.media import tensor_frame_to_pil
+
+        return [tensor_frame_to_pil(img) for img in prim_image.pixels.unbind(0)]
 
     # ------------------------------------------------------------------
     # Video reward support

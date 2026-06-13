@@ -1,0 +1,167 @@
+# @package _global_
+# FLUX.2-klein-4B GRPO — trainside + RemoteRewardBackend (EditReward).
+#
+# Same as flux2_klein_editreward.yaml but targets the 4B model.
+# 4B is lighter → can use larger batch or same batch with less memory pressure.
+#
+# 2-node deployment:
+#   Node 0: EditReward service (1 GPU for 7B VLM scorer)
+#   Node 1: Flux2 Klein 4B training (8 GPU FSDP + LoRA, trainside rollout)
+#
+# Launch:
+#   Node 0 (reward): same as 9B version
+#   Node 1 (train):
+#     export REWARD_SERVICE_URL=http://<node0_ip>:8080
+#     export NUM_NODES=1 GPUS_PER_NODE=8
+#     bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_4b_editreward
+
+num_devices: 8
+batch_size: 64
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein-editreward}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: null
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-4B}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    max_sequence_length: 512
+    shift: 1.0
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 16
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: mean
+      aggregation_method: weighted_sum
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/image_edit/train.jsonl
+      eval_data_path: datasets/image_edit/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: true
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

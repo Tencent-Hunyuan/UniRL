@@ -59,4 +59,5 @@ SCORER_MODULES: dict[str, str] = {
     "ocr": "reward_service.scorers.ocr",
     "videoalign": "reward_service.scorers.videoalign",
     "wise": "reward_service.scorers.wise",
+    "editreward": "reward_service.scorers.editreward",
 }
