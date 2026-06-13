@@ -22,12 +22,12 @@ import torch
 
 pytest.importorskip("transfer_queue")
 
+from unirl.distributed.tensor import TensorRef  # noqa: E402
 from unirl.distributed.tensor.backend.transfer_queue.transport import (  # noqa: E402
     TQTensorHandle,
     _restore,
     _store_shape,
 )
-from unirl.distributed.tensor import TensorRef  # noqa: E402
 
 pytestmark = pytest.mark.cpu
 

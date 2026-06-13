@@ -20,6 +20,9 @@ import torch
 
 from unirl.distributed.tensor.batch import (
     Batch,
+    _concat_cu_seqlens,
+    _select_cu_seqlens,
+    _slice_cu_seqlens,
     concat_field,
     max_field,
     mean_field,
@@ -27,11 +30,6 @@ from unirl.distributed.tensor.batch import (
     packed_field,
     shared_field,
     sum_field,
-)
-from unirl.distributed.tensor.batch import (
-    _concat_cu_seqlens,
-    _select_cu_seqlens,
-    _slice_cu_seqlens,
 )
 
 pytestmark = pytest.mark.cpu

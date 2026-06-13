@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 # ── availability probes ──────────────────────────────────────────────────────
 
 
@@ -137,8 +136,8 @@ def transport(request, ray_session):
 
 @pytest.fixture
 def colocate_transport(ray_session):
-    from unirl.distributed.tensor.factory import build_transport
     from unirl.distributed.tensor import TensorTransportRuntime
+    from unirl.distributed.tensor.factory import build_transport
 
     yield _install(
         build_transport("colocate_store", worker_id="dw0", device="cpu", device_id=0, global_rank=0, world_size=1)
@@ -148,9 +147,9 @@ def colocate_transport(ray_session):
 
 @pytest.fixture
 def tq_simple_transport(_tq_simple_runtime):
+    from unirl.distributed.tensor import TensorTransportRuntime
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor import TensorTransportRuntime
 
     yield _install(TQTransport(_tq_simple_runtime, partition_id=_DEFAULT_PARTITION_ID))
     TensorTransportRuntime.clear_current()

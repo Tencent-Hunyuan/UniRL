@@ -22,8 +22,8 @@ import torch
 from torch import Tensor
 
 from unirl.distributed.group.remote import RankInfo, Remote
-from unirl.distributed.tensor.factory import build_transport
 from unirl.distributed.tensor import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
+from unirl.distributed.tensor.factory import build_transport
 from unirl.distributed.utils import collect_leaves
 
 
@@ -302,9 +302,7 @@ class Worker:
         if grad_mode:
             # get_batch returns detached views/copies, so resolved tensors are
             # fresh objects that don't alias store contents — mark them directly.
-            tensors = collect_leaves(resolved_args, Tensor) + collect_leaves(
-                tuple(resolved_kwargs.values()), Tensor
-            )
+            tensors = collect_leaves(resolved_args, Tensor) + collect_leaves(tuple(resolved_kwargs.values()), Tensor)
             for t in tensors:
                 t.requires_grad_(True)
                 t.retain_grad()

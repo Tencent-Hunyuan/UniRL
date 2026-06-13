@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 import torch
 
+from unirl.distributed.tensor import TensorRef, TensorSpan
 from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 from unirl.distributed.tensor.pytree import (
     _value_batch_size,
@@ -25,7 +26,6 @@ from unirl.distributed.tensor.pytree import (
     pytree_cat,
     pytree_chunk,
 )
-from unirl.distributed.tensor import TensorRef, TensorSpan
 from unirl.distributed.utils import Broadcast
 
 pytestmark = pytest.mark.cpu

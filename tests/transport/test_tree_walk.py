@@ -25,8 +25,8 @@ from typing import Optional
 import pytest
 import torch
 
-from unirl.distributed.tensor.batch import Batch, packed_field, shared_field
 from unirl.distributed.tensor import TensorRef, TensorSpan, TensorTransport, map_tree
+from unirl.distributed.tensor.batch import Batch, packed_field, shared_field
 from unirl.distributed.tensor.transport import _collect_leaves
 
 pytestmark = pytest.mark.cpu

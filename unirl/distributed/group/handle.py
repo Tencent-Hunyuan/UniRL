@@ -41,13 +41,13 @@ from unirl.distributed.group.dispatch import (
     resolve_backward_dispatch_mode,
 )
 from unirl.distributed.group.remote import RankInfo, Remote
+from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 from unirl.distributed.tensor.grad_context import (
     RPCBackwardNode,
     current_grad_context,
 )
 from unirl.distributed.tensor.pytree import infer_batch_size
-from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.utils import collect_leaves
 
 if TYPE_CHECKING:

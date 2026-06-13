@@ -25,6 +25,7 @@ from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 if TYPE_CHECKING:
     from unirl.distributed.tensor.transport import TensorTransport
 
+
 @runtime_checkable
 class TensorHandle(Protocol):
     """The minimal handle contract a :class:`TensorSpan` resolves through.
@@ -197,9 +198,7 @@ class TensorRef(Batch):
         for range_start, range_stop in ranges:
             range_start, range_stop = int(range_start), int(range_stop)
             if not (0 <= range_start <= range_stop <= span_offsets[-1]):
-                raise IndexError(
-                    f"row range [{range_start}, {range_stop}) out of bounds for size {span_offsets[-1]}"
-                )
+                raise IndexError(f"row range [{range_start}, {range_stop}) out of bounds for size {span_offsets[-1]}")
             cursor = range_start
             span_idx = 0
             while cursor < range_stop:
@@ -329,8 +328,6 @@ class TensorRef(Batch):
 # ---------------------------------------------------------------------------
 
 
-
-
 def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:
     """Rebuild a value tree, applying ``leaf_fn`` to every node.
 
@@ -359,8 +356,6 @@ def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:
     if isinstance(obj, dict):
         return {k: map_tree(v, leaf_fn) for k, v in obj.items()}
     return obj
-
-
 
 
 __all__ = ["TensorHandle", "TensorSpan", "TensorRef", "cat_rows", "map_tree"]

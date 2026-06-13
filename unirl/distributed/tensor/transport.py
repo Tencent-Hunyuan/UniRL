@@ -25,6 +25,7 @@ from unirl.distributed.tensor.ref import TensorRef, TensorSpan, cat_rows
 
 logger = logging.getLogger(__name__)
 
+
 def _collect_leaves(
     value: Any,
     prefix: str,
@@ -126,8 +127,6 @@ def _collect_list(
 # ---------------------------------------------------------------------------
 # TensorTransport ABC
 # ---------------------------------------------------------------------------
-
-
 
 
 class TensorTransport(abc.ABC):
@@ -308,8 +307,6 @@ class TensorTransport(abc.ABC):
             sess._flush()
 
 
-
-
 class TransportSession:
     """Accumulates dehydrate calls; flushes on close."""
 
@@ -365,7 +362,6 @@ class TensorTransportRuntime:
     @classmethod
     def clear_current(cls) -> None:
         cls._current = None
-
 
 
 __all__ = ["TensorTransport", "TensorTransportRuntime", "TransportSession"]

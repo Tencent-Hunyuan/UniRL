@@ -150,7 +150,10 @@ class WorkerLocalTransport(TensorTransport):
 
         moved = cls._move(pool, to_move)
         return [
-            (map_tree(s_args, cls._replace_leaf(moved, dst, pool)), map_tree(s_kwargs, cls._replace_leaf(moved, dst, pool)))
+            (
+                map_tree(s_args, cls._replace_leaf(moved, dst, pool)),
+                map_tree(s_kwargs, cls._replace_leaf(moved, dst, pool)),
+            )
             for (s_args, s_kwargs), dst in zip(shards, dsts)
         ]
 
