@@ -91,9 +91,9 @@ class ZImageBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            path, subfolder="transformer", torch_dtype=dtype
-        ).to(device)
+        transformer = ZImageTransformer2DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype).to(
+            device
+        )
 
         vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
         vae.requires_grad_(False)
