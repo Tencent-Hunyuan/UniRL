@@ -39,86 +39,93 @@ logger = logging.getLogger(__name__)
 
 
 class TensorSpan:
-    """A unit-range (row/token) view of a parent ref — the addressing primitive.
+    """A contiguous half-open ``[start:stop)`` row-window over one handle — the addressing primitive.
 
     ``TensorRef`` selection/permutation emits these instead of moving data:
-    a view addresses ``base[start:end)`` along dim 0 while the bytes stay in
-    the producing worker's store. Backends resolve a view by resolving the
-    base and slicing (zero-copy on the IPC/store path); ``localize`` ships
-    only the ``[start:end)`` rows cross-device, not the whole base block.
+    a span addresses ``handle[start:stop)`` along dim 0 while the bytes stay in
+    the producing worker's store. Backends resolve a span by resolving the
+    handle and slicing (zero-copy on the IPC/store path); ``localize`` ships
+    only the ``[start:stop)`` rows cross-device, not the whole handle block.
 
-    Lifecycle: a view holds a PYTHON REFERENCE to the parent ref object, so
-    CPython's own reference counting aggregates all views' lifetimes onto the
-    parent — the parent's single GC finalizer fires only when the last view
-    (and the parent itself) is gone. Views carry no finalizer, no store_key
+    Lifecycle: a span holds a PYTHON REFERENCE to the handle object, so
+    CPython's own reference counting aggregates all spans' lifetimes onto the
+    handle — the handle's single GC finalizer fires only when the last span
+    (and the handle itself) is gone. Spans carry no finalizer, no store_key
     of their own, and trigger no extra decref RPCs.
 
-    Nested views flatten at construction (``TensorSpan(TensorSpan(b,2,8),1,3)``
-    is ``TensorSpan(b,3,5)``), so ``base`` is always a backend handle.
+    Nested spans flatten at construction (``TensorSpan(TensorSpan(h,2,8),1,3)``
+    is ``TensorSpan(h,3,5)``), so ``handle`` is always a backend handle.
     """
 
-    __slots__ = ("base", "start", "end")
+    __slots__ = ("handle", "start", "stop")
 
-    def __init__(self, base: Any, start: int, end: int) -> None:
-        start, end = int(start), int(end)
-        if isinstance(base, TensorSpan):
-            start, end = base.start + start, base.start + end
-            base = base.base
-        if not (0 <= start <= end):
-            raise ValueError(f"TensorSpan range [{start}, {end}) is invalid")
-        self.base = base
+    def __init__(self, handle: Any, start: int, stop: int) -> None:
+        start, stop = int(start), int(stop)
+        if isinstance(handle, TensorSpan):
+            start, stop = handle.start + start, handle.start + stop
+            handle = handle.handle
+        if not (0 <= start <= stop):
+            raise ValueError(f"TensorSpan range [{start}, {stop}) is invalid")
+        self.handle = handle
         self.start = start
-        self.end = end
+        self.stop = stop
 
-    # ── delegated identity (what transports/localize read off a ref) ──
+    @property
+    def nrows(self) -> int:
+        return self.stop - self.start
+
+    def __len__(self) -> int:
+        return self.stop - self.start
+
+    # ── delegated identity (what transports/localize read off a span) ──
 
     @property
     def source_id(self):
-        return self.base.source_id
+        return self.handle.source_id
 
     @property
     def object_ref(self):
-        return getattr(self.base, "object_ref", None)
+        return getattr(self.handle, "object_ref", None)
 
     @property
     def store_key(self):
-        return self.base.store_key
+        return self.handle.store_key
 
     @property
     def shape(self) -> tuple:
-        base_shape = tuple(self.base.shape)
-        return (self.end - self.start, *base_shape[1:])
+        handle_shape = tuple(self.handle.shape)
+        return (self.stop - self.start, *handle_shape[1:])
 
     @property
     def dtype(self):
-        return self.base.dtype
+        return self.handle.dtype
 
     @property
     def device(self):
-        return self.base.device
+        return self.handle.device
 
     def local(self) -> torch.Tensor:
-        return self.base.local()[self.start : self.end]
+        return self.handle.local()[self.start : self.stop]
 
     def routing_copy(self) -> "TensorSpan":
         """Bare placeholder for localize's id()-keyed NCCL substitution.
 
-        Carries the base's routing copy plus this view's range so the send
-        side can slice — dropping it must not touch the parent's ref count
-        (the parent's routing_copy is equally bare).
+        Carries the handle's routing copy plus this span's range so the send
+        side can slice — dropping it must not touch the handle's ref count
+        (the handle's routing_copy is equally bare).
         """
-        return TensorSpan(self.base.routing_copy(), self.start, self.end)
+        return TensorSpan(self.handle.routing_copy(), self.start, self.stop)
 
     def __getstate__(self) -> dict:
-        return {"base": self.base, "start": self.start, "end": self.end}
+        return {"handle": self.handle, "start": self.start, "stop": self.stop}
 
     def __setstate__(self, state: dict) -> None:
-        self.base = state["base"]
+        self.handle = state["handle"]
         self.start = state["start"]
-        self.end = state["end"]
+        self.stop = state["stop"]
 
     def __repr__(self) -> str:
-        return f"TensorSpan({self.base!r}[{self.start}:{self.end}])"
+        return f"TensorSpan({self.handle!r}[{self.start}:{self.stop}])"
 
 
 def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
@@ -150,16 +157,15 @@ def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
 
 @dataclass
 class TensorRef(Batch):
-    """Per-handle tensor proxy.
+    """The dehydrated-tensor proxy — an ordered list of row-window spans.
 
-    Each element in ``refs`` is an opaque handle from a single ``put()``
-    call or a :class:`TensorSpan` over one; ``sizes[i]`` records how many
-    rows ref ``i`` covers. ``batch_size`` is ``sum(sizes)``, not
-    ``len(refs)``.
+    Each element of ``spans`` is a :class:`TensorSpan` over one backend handle;
+    ``spans`` is the concat axis. Per-span row counts derive ``sizes`` and
+    ``batch_size`` — there is no stored size array. ``batch_size`` is the total
+    row count, not ``len(spans)``.
     """
 
-    refs: List[Any] = concat_field(default_factory=list)
-    sizes: List[int] = concat_field(default_factory=list)
+    spans: List[TensorSpan] = concat_field(default_factory=list)
     shape: Optional[Tuple[int, ...]] = shared_field(default=None)
     dtype: Optional[torch.dtype] = shared_field(default=None)
     device: Optional[str] = shared_field(default=None)
@@ -167,21 +173,22 @@ class TensorRef(Batch):
     retain_grad_flag: bool = shared_field(default=False)
 
     @property
+    def sizes(self) -> List[int]:
+        return [s.stop - s.start for s in self.spans]
+
+    @property
     def batch_size(self) -> int:
-        return sum(self.sizes) if self.sizes else 0
+        return sum(s.stop - s.start for s in self.spans)
 
     @classmethod
     def concat(cls, items: "list[TensorRef]") -> "TensorRef":
-        refs: List[Any] = []
-        sizes: List[int] = []
+        spans: List[TensorSpan] = []
         for m in items:
-            refs.extend(m.refs)
-            sizes.extend(m.sizes)
+            spans.extend(m.spans)
         first = items[0]
-        total = sum(sizes)
+        total = sum(s.stop - s.start for s in spans)
         return TensorRef(
-            refs=refs,
-            sizes=sizes,
+            spans=spans,
             shape=(total, *first.shape[1:]) if first.shape else None,
             dtype=first.dtype,
             device=first.device,
@@ -194,8 +201,8 @@ class TensorRef(Batch):
 
     def _offsets(self) -> List[int]:
         offsets = [0]
-        for s in self.sizes:
-            offsets.append(offsets[-1] + int(s))
+        for s in self.spans:
+            offsets.append(offsets[-1] + (s.stop - s.start))
         return offsets
 
     def _pieces_for_range(self, g0: int, g1: int, offsets: List[int]) -> List[Tuple[int, int, int]]:
@@ -213,21 +220,19 @@ class TensorRef(Batch):
         return pieces
 
     def _from_pieces(self, pieces: List[Tuple[int, int, int]]) -> "TensorRef":
-        """Build the selected meta: whole-ref pieces pass the ref through untouched
-        (a boundary-aligned selection costs nothing); partial pieces become
-        :class:`TensorSpan` refs (nested views flatten in the ctor)."""
-        refs: List[Any] = []
-        sizes: List[int] = []
+        """Build the selected ref: a whole-span piece passes the span through
+        untouched (a boundary-aligned selection costs nothing); a partial piece
+        becomes a new :class:`TensorSpan` (nested spans flatten in the ctor)."""
+        spans: List[TensorSpan] = []
         for r, s, e in pieces:
-            if s == 0 and e == int(self.sizes[r]):
-                refs.append(self.refs[r])
+            src = self.spans[r]
+            if s == 0 and e == src.stop - src.start:
+                spans.append(src)
             else:
-                refs.append(TensorSpan(self.refs[r], s, e))
-            sizes.append(e - s)
-        total = sum(sizes)
+                spans.append(TensorSpan(src, s, e))
+        total = sum(sp.stop - sp.start for sp in spans)
         return TensorRef(
-            refs=refs,
-            sizes=sizes,
+            spans=spans,
             shape=(total, *self.shape[1:]) if self.shape else None,
             dtype=self.dtype,
             device=self.device,
@@ -255,16 +260,14 @@ class TensorRef(Batch):
             pieces.extend(self._pieces_for_range(int(g0), int(g1), offsets))
         return self._from_pieces(pieces)
 
-    def with_refs(self, refs: List[Any]) -> "TensorRef":
-        """Clone with substituted (routed) refs, preserving sizes/shape.
+    def with_spans(self, spans: List[Any]) -> "TensorRef":
+        """Clone with substituted (routed) spans, preserving shape/dtype/device.
 
-        ``localize`` rebuilds metas after routing; ``from_handles`` would
-        re-derive sizes from ``ref.shape[0]`` — equivalent, but this keeps the
-        substitution structural (same ref count, same sizes, no re-derivation).
+        ``localize`` rebuilds refs after routing; this keeps the substitution
+        structural (same span count, derived sizes, no re-derivation).
         """
         return TensorRef(
-            refs=list(refs),
-            sizes=list(self.sizes),
+            spans=list(spans),
             shape=self.shape,
             dtype=self.dtype,
             device=self.device,
@@ -313,18 +316,18 @@ class TensorRef(Batch):
     def materialize(self, backend: "Optional[TensorTransport]" = None) -> torch.Tensor:
         """Fetch this meta into a real tensor (driver- or worker-side).
 
-        With a backend: one ``get`` over the refs (backends resolve
-        :class:`TensorSpan` refs by resolving the base and slicing). Without:
-        per-ref ``local()`` round-trips assembled via :func:`cat_rows` (its
+        With a backend: one ``get`` over the spans (backends resolve a
+        :class:`TensorSpan` by resolving its handle and slicing). Without:
+        per-span ``local()`` round-trips assembled via :func:`cat_rows` (its
         ragged right-pad contract applies to 2D+ per-shard-padded fields).
         """
         if backend is None:
             backend = TensorTransportRuntime.current()
-        if not self.refs:
+        if not self.spans:
             return torch.empty(0)
         if backend is not None:
-            return backend.get(self.refs)
-        return cat_rows([r.local() for r in self.refs])
+            return backend.get(self.spans)
+        return cat_rows([s.local() for s in self.spans])
 
     def retain_grad(self) -> "TensorRef":
         self.retain_grad_flag = True
@@ -332,16 +335,17 @@ class TensorRef(Batch):
 
     @classmethod
     def from_handles(cls, handles: list) -> "TensorRef":
+        """Wrap freshly-put handles as full-range spans — the single wrap chokepoint."""
+        spans = [TensorSpan(h, 0, int(h.shape[0])) for h in handles]
         return cls(
-            refs=handles,
-            sizes=[h.shape[0] for h in handles],
-            shape=(sum(h.shape[0] for h in handles), *handles[0].shape[1:]) if handles else None,
+            spans=spans,
+            shape=(sum(int(h.shape[0]) for h in handles), *handles[0].shape[1:]) if handles else None,
             dtype=handles[0].dtype if handles else None,
             device=str(handles[0].device) if handles else None,
         )
 
     def __len__(self) -> int:
-        return sum(self.sizes) if self.sizes else 0
+        return self.batch_size
 
 
 # ---------------------------------------------------------------------------
@@ -494,8 +498,7 @@ class TensorTransport(abc.ABC):
             ref = self.put(t)
             bs = int(t.shape[0]) if isinstance(t, torch.Tensor) and t.dim() > 0 else 1
             result[k] = TensorRef(
-                refs=[ref],
-                sizes=[bs],
+                spans=[TensorSpan(ref, 0, bs)],
                 shape=tuple(t.shape) if isinstance(t, torch.Tensor) else None,
                 dtype=t.dtype if isinstance(t, torch.Tensor) else None,
                 device=str(t.device) if isinstance(t, torch.Tensor) else None,
@@ -504,7 +507,7 @@ class TensorTransport(abc.ABC):
 
     def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
         """Fetch multiple named tensors. Default: iterate per key."""
-        return {k: self.get(m.refs) for k, m in metas.items()}
+        return {k: self.get(m.spans) for k, m in metas.items()}
 
     def transform(self, meta: TensorRef, fn: Callable[[torch.Tensor], torch.Tensor]) -> TensorRef:
         """Apply fn to the remote tensor, return new TensorRef.
@@ -513,13 +516,12 @@ class TensorTransport(abc.ABC):
         memory). Backends with remote compute (TensorStore) can override to
         execute on the worker without moving data.
         """
-        tensor = self.get(meta.refs)
+        tensor = self.get(meta.spans)
         result = fn(tensor)
         ref = self.put(result)
         bs = int(result.shape[0]) if result.dim() > 0 else 1
         return TensorRef(
-            refs=[ref],
-            sizes=[bs],
+            spans=[TensorSpan(ref, 0, bs)],
             shape=tuple(result.shape),
             dtype=result.dtype,
             device=str(result.device),
@@ -556,8 +558,7 @@ class TensorTransport(abc.ABC):
             ref = self.put(value)
             bs = int(value.shape[0]) if value.dim() > 0 else 1
             return TensorRef(
-                refs=[ref],
-                sizes=[bs],
+                spans=[TensorSpan(ref, 0, bs)],
                 shape=tuple(value.shape),
                 dtype=value.dtype,
                 device=str(value.device),
@@ -715,22 +716,21 @@ class WorkerLocalTransport(TensorTransport):
         """
         foreign: Dict[Tuple[int, int], List[Any]] = {}  # (src_device_id, dst_device_id) → [routing_copy, ...]
 
-        def route(ref: Any, dst_worker_id: str, dst_device_id: int) -> Any:
-            if getattr(ref, "object_ref", None) is not None:
-                return ref  # CPU/plasma → resolvable anywhere
-            if cls._is_local(ref, dst_worker_id, dst_device_id, pool):
-                return ref
-            src_device_id = pool.device_id_of(ref.source_id)
-            routing = ref.routing_copy()
+        def route(span: Any, dst_worker_id: str, dst_device_id: int) -> Any:
+            if getattr(span.handle, "object_ref", None) is not None:
+                return span  # CPU/plasma → resolvable anywhere
+            if cls._is_local(span.handle, dst_worker_id, dst_device_id, pool):
+                return span
+            src_device_id = pool.device_id_of(span.handle.source_id)
+            routing = span.routing_copy()
             foreign.setdefault((src_device_id, dst_device_id), []).append(routing)
             return routing
 
         def unwrap(obj: Any, dst_worker_id: str, dst_device_id: int) -> Any:
             if isinstance(obj, TensorRef):
-                # TensorSpan refs route like any ref (source_id/shape delegate
-                # to the base); a foreign view ships ONLY its [start:end) rows —
-                # the send side slices by the routing copy's range.
-                return obj.with_refs([route(h, dst_worker_id, dst_device_id) for h in obj.refs])
+                # A foreign span ships ONLY its [start:stop) rows — the send side
+                # slices by the routing copy's range (its .shape is sliced).
+                return obj.with_spans([route(s, dst_worker_id, dst_device_id) for s in obj.spans])
             return obj
 
         routed: list = []
@@ -760,13 +760,14 @@ class WorkerLocalTransport(TensorTransport):
         subs: Dict[int, Any] = {}
         for (src_device_id, dst_device_id), new_handles in zip(keys, recv_results):
             dst_worker = pool.slot0_worker(dst_device_id)
-            for old_h, new_h in zip(foreign[(src_device_id, dst_device_id)], new_handles):
+            for old_span, new_h in zip(foreign[(src_device_id, dst_device_id)], new_handles):
                 new_h.rebind(dst_worker)
-                subs[id(old_h)] = new_h
+                # The recv handle holds exactly the sliced rows → full-range span.
+                subs[id(old_span)] = TensorSpan(new_h, 0, int(new_h.shape[0]))
 
         def substitute(obj: Any) -> Any:
             if isinstance(obj, TensorRef):
-                return obj.with_refs([subs.get(id(h), h) for h in obj.refs])
+                return obj.with_spans([subs.get(id(s), s) for s in obj.spans])
             return obj
 
         return [(map_tree(a, substitute), map_tree(k, substitute)) for a, k in routed]
@@ -779,12 +780,12 @@ class WorkerLocalTransport(TensorTransport):
         Default: round-trip get -> op -> put. Backends with on-worker compute
         override to avoid moving data.
         """
-        result = _apply_tensor_op(self.get([handle]), op, *op_args).contiguous()
+        result = _apply_tensor_op(self.get([TensorSpan(handle, 0, int(handle.shape[0]))]), op, *op_args).contiguous()
         return self.put(result)
 
     def get_cpu(self, handle: Any) -> torch.Tensor:
         """Return the stored tensor as a CPU tensor."""
-        return self.get([handle]).cpu()
+        return self.get([TensorSpan(handle, 0, int(handle.shape[0]))]).cpu()
 
 
 class TransportSession:

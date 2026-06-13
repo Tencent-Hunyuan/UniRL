@@ -351,8 +351,8 @@ class Handle:
                     o.rebind(worker_handle)
                 return TensorRef.from_handles([o])
             if isinstance(o, TensorRef) and worker_local:
-                for h in o.refs:
-                    h.rebind(worker_handle)
+                for s in o.spans:
+                    s.handle.rebind(worker_handle)
             return o
 
         return map_tree(obj, rebind_leaf)
