@@ -33,6 +33,7 @@ follow-up.
 
 from __future__ import annotations
 
+import logging
 import sys
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -51,6 +52,8 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import HunyuanImage3Bundle
 from .conditions import HunyuanImage3DiffusionConditions
 from .diffusion_state import HunyuanImage3DiffusionState
+
+logger = logging.getLogger(__name__)
 
 
 class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
@@ -594,8 +597,36 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        latent_h = int(params.height) // int(self.vae_scale_factor)
-        latent_w = int(params.width) // int(self.vae_scale_factor)
+        # HI3 snaps any requested H×W to the nearest preset at base_size² area
+        # (image_base_size=1024 → ~1MP) — the text-embed stage's
+        # build_gen_image_info does this, so the <img> placeholder span it
+        # splices is sized from the SNAPPED token grid. Size the latent from that
+        # SAME snapped grid, else a non-preset request (e.g. 512²) yields a
+        # latent (raw H//vae_scale) shorter than the placeholder span → the
+        # image-token scatter mismatches (index N vs src M). At a preset size
+        # (e.g. 1024²) get_target_size is a no-op, so this is identical to before.
+        ip = getattr(self.model.transformer, "image_processor", None)
+        info = None
+        if ip is not None:
+            if hasattr(ip, "build_image_info"):
+                info = ip.build_image_info(f"{int(params.height)}x{int(params.width)}")
+            elif hasattr(ip, "build_gen_image_info"):
+                info = ip.build_gen_image_info(f"{int(params.height)}x{int(params.width)}")
+        if info is not None:
+            # token_{height,width} are computed from the snapped image dims; the
+            # DiT treats each latent spatial position as one image token, so the
+            # latent grid == the placeholder grid.
+            latent_h, latent_w = int(info.token_height), int(info.token_width)
+            snapped_hw = (latent_h * int(self.vae_scale_factor), latent_w * int(self.vae_scale_factor))
+            if snapped_hw != (int(params.height), int(params.width)):
+                logger.warning(
+                    "HunyuanImage3DiffusionStage.diffuse: requested %dx%d is not a supported HI3 preset; "
+                    "snapped to %dx%d (nearest preset at ~%dpx base area).",
+                    int(params.height), int(params.width), snapped_hw[0], snapped_hw[1], int(self.vae_scale_factor) * latent_h,
+                )
+        else:
+            latent_h = int(params.height) // int(self.vae_scale_factor)
+            latent_w = int(params.width) // int(self.vae_scale_factor)
         per_sample_shape = (int(self.latent_channels), latent_h, latent_w)
         # latents: [B, C, H, W]. Driver-authoritative x_T via the shared
         # ``NoiseRecipe`` — the SAME ``for_batch(...).resolve(...)`` path the
