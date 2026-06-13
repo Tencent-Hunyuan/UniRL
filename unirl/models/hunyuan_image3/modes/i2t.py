@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import torch
+
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
@@ -90,6 +92,19 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=1
     )
+
+    # ``cond_vae_images`` is the raw VAE-input image (float). The AR forward runs
+    # the bf16 VAE encoder WITHOUT autocast (the diffusion path wraps its forward
+    # in torch.autocast; the autoregress loop does not), so a float input hits
+    # bf16 conv weights → dtype mismatch. Cast float tensors to the model dtype.
+    def _cast_floats(x: Any) -> Any:
+        if isinstance(x, torch.Tensor):
+            return x.to(dtype=pipeline.bundle.dtype) if x.is_floating_point() else x
+        if isinstance(x, (list, tuple)):
+            return type(x)(_cast_floats(e) for e in x)
+        return x
+
+    cond_vae_images = _cast_floats(cond_vae_images)
 
     # Chat template path: pass batch_cond_image_info so the wrapper splices in
     # the cond-image markers; the resulting cond_vae_image_mask /
