@@ -1,12 +1,12 @@
 """TensorTransport: backend-agnostic tensor storage and retrieval.
 
 ``TensorRef`` is the universal tensor proxy — a ``Batch`` subclass that
-holds per-handle opaque refs and their sizes. Each ref is either a backend
-handle from one ``put()`` call or a :class:`TensorSpan` (a row/unit-range
-view of such a handle); ``sizes[i]`` records how many rows ref ``i``
-covers. ``concat`` merges ref/size lists; ``batch_size`` is ``sum(sizes)``.
-Per-row ``select`` / ``slice`` builds ``TensorSpan`` refs — no data motion,
-no hydration.
+holds an ordered list of :class:`TensorSpan`, each a contiguous row-window
+over one backend handle (from a single ``put()`` call). ``spans`` is the
+concat axis; per-span row counts derive ``sizes`` and ``batch_size`` (no
+stored size array). Per-row ``select`` / ``slice`` builds new spans — no data
+motion, no hydration. A :class:`TensorSpan` is generic over its handle type,
+bound by the :class:`TensorHandle` protocol.
 
 ``TensorRef`` also serves as a compute proxy: ``transform``, ``reshape``,
 ``permute``, ``local`` delegate to the active backend.
@@ -28,7 +28,21 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    runtime_checkable,
+)
 
 import ray
 import torch
@@ -38,7 +52,24 @@ from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 logger = logging.getLogger(__name__)
 
 
-class TensorSpan:
+@runtime_checkable
+class TensorHandle(Protocol):
+    """The minimal handle contract a :class:`TensorSpan` resolves through.
+
+    The worker-local store handle (``GPUTensorHandle`` / ``ColocateTensorHandle``)
+    and the global ``TQTensorHandle`` both satisfy it structurally. The
+    worker-local-only surface (``store_key`` / ``source_id`` / ``object_ref`` /
+    ``routing_copy``) is reached via ``span.handle`` in the backends that need it,
+    never off the span — so it is intentionally absent from this protocol.
+    """
+
+    def local(self) -> torch.Tensor: ...
+
+
+T = TypeVar("T", bound=TensorHandle)
+
+
+class TensorSpan(Generic[T]):
     """A contiguous half-open ``[start:stop)`` row-window over one handle — the addressing primitive.
 
     ``TensorRef`` selection/permutation emits these instead of moving data:
@@ -58,8 +89,9 @@ class TensorSpan:
     """
 
     __slots__ = ("handle", "start", "stop")
+    handle: T
 
-    def __init__(self, handle: Any, start: int, stop: int) -> None:
+    def __init__(self, handle: T | "TensorSpan[T]", start: int, stop: int) -> None:
         start, stop = int(start), int(stop)
         if isinstance(handle, TensorSpan):
             start, stop = handle.start + start, handle.start + stop
@@ -77,19 +109,9 @@ class TensorSpan:
     def __len__(self) -> int:
         return self.stop - self.start
 
-    # ── delegated identity (what transports/localize read off a span) ──
-
-    @property
-    def source_id(self):
-        return self.handle.source_id
-
-    @property
-    def object_ref(self):
-        return getattr(self.handle, "object_ref", None)
-
-    @property
-    def store_key(self):
-        return self.handle.store_key
+    # ── delegated metadata: shape (sliced) / dtype / device — read by nccl_recv
+    #    and repr. Handle-specific identity (store_key/source_id/object_ref) is
+    #    reached via ``span.handle`` in the worker-local backends, not off the span.
 
     @property
     def shape(self) -> tuple:
@@ -846,6 +868,7 @@ class TensorTransportRuntime:
 
 
 __all__ = [
+    "TensorHandle",
     "TensorSpan",
     "TensorRef",
     "TensorTransport",
