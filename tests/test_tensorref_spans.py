@@ -1,14 +1,14 @@
-"""Unit tests for TensorRef ref views (select/slice without hydration).
+"""Unit tests for TensorRef span views (select/slice without hydration).
 
-Selection emits :class:`TensorSpan` refs — unit-range views of the parent
-refs — instead of moving data. Pure-CPU: parent refs are faked with a minimal
-handle protocol (.local/.shape/.dtype/.device), no transport backend required
-(materialize falls back to per-ref fetch when backend is None).
+Selection emits :class:`TensorSpan` spans — contiguous row-windows over the
+parent handles — instead of moving data. Pure-CPU: handles are faked with a
+minimal protocol (.local/.shape/.dtype/.device), no transport backend required
+(materialize falls back to per-span fetch when backend is None).
 """
 
 import torch
 
-from unirl.distributed.tensor.transport import TensorSpan, TensorRef, cat_rows
+from unirl.distributed.tensor.transport import TensorRef, TensorSpan, cat_rows
 
 
 class _FakeHandle:
@@ -24,8 +24,7 @@ class _FakeHandle:
 
 def _meta(*tensors: torch.Tensor) -> TensorRef:
     return TensorRef(
-        refs=[_FakeHandle(t) for t in tensors],
-        sizes=[int(t.shape[0]) for t in tensors],
+        spans=[TensorSpan(_FakeHandle(t), 0, int(t.shape[0])) for t in tensors],
         shape=(sum(int(t.shape[0]) for t in tensors), *tensors[0].shape[1:]),
         dtype=tensors[0].dtype,
         device="cpu",
@@ -40,9 +39,9 @@ def test_select_permutation_with_ragged_pad():
     perm = [5, 0, 3, 6, 2, 1, 4]
     v = tm.select(perm)
     assert v.batch_size == 7
-    assert any(isinstance(r, TensorSpan) for r in v.refs)
+    assert any(isinstance(r, TensorSpan) for r in v.spans)
     out = v.materialize(backend=None)
-    assert out.shape == (7, 6)  # ragged refs right-padded to the max width
+    assert out.shape == (7, 6)  # ragged spans right-padded to the max width
     assert torch.equal(out[0, :5], t2[0])
     assert torch.equal(out[1, :4], t0[0])
     assert torch.all(out[1, 4:] == 0)
@@ -57,23 +56,25 @@ def test_view_slice_matches_materialized_rows():
     assert torch.equal(half.materialize(backend=None), full[1:3])
 
 
-def test_aligned_slice_passes_refs_through():
-    # A ref-boundary-aligned slice is the structural inverse of concat:
-    # the original ref objects come back untouched (no TensorSpan wrapping).
+def test_aligned_slice_passes_spans_through():
+    # A span-boundary-aligned slice is the structural inverse of concat:
+    # the original span object (and its handle) comes back untouched.
     t0 = torch.arange(12).reshape(3, 4).float()
     t1 = torch.arange(100, 108).reshape(2, 4).float()
     tm = _meta(t0, t1)
     head = tm.slice(0, 3)
-    assert head.refs == [tm.refs[0]] and head.sizes == [3]
+    assert head.spans == [tm.spans[0]] and head.sizes == [3]
+    assert head.spans[0] is tm.spans[0]
+    assert head.spans[0].handle is tm.spans[0].handle
 
 
-def test_misaligned_slice_wraps_boundary_refs():
+def test_misaligned_slice_wraps_boundary_spans():
     t0 = torch.arange(12).reshape(3, 4).float()
     t1 = torch.arange(100, 108).reshape(2, 4).float()
     tm = _meta(t0, t1)
-    mid = tm.slice(1, 4)  # crosses the ref boundary off-alignment
+    mid = tm.slice(1, 4)  # crosses the span boundary off-alignment
     assert mid.batch_size == 3
-    assert isinstance(mid.refs[0], TensorSpan) and isinstance(mid.refs[1], TensorSpan)
+    assert isinstance(mid.spans[0], TensorSpan) and isinstance(mid.spans[1], TensorSpan)
     assert torch.equal(mid.materialize(backend=None), torch.cat([t0[1:], t1[:1]]))
 
 
@@ -87,19 +88,19 @@ def test_packed_segment_view():
 
 
 def test_nested_views_flatten():
-    # A view of a view flattens to a single TensorSpan over the parent ref —
+    # A span of a span flattens to a single TensorSpan over the handle —
     # repeated selection never builds an indirection chain.
     t0 = torch.arange(40).reshape(8, 5).float()
-    v1 = _meta(t0).select([3, 4, 5, 6])  # rows 3..6 (one coalesced view)
+    v1 = _meta(t0).select([3, 4, 5, 6])  # rows 3..6 (one coalesced span)
     v2 = v1.select([1, 2])  # rows 4..5 of the original
-    assert all(isinstance(r, TensorSpan) and isinstance(r.base, _FakeHandle) for r in v2.refs)
+    assert all(isinstance(r, TensorSpan) and isinstance(r.handle, _FakeHandle) for r in v2.spans)
     assert torch.equal(v2.materialize(backend=None), t0[4:6])
 
 
-def test_with_refs_preserves_sizes():
+def test_with_spans_preserves_sizes():
     t0 = torch.arange(8).reshape(2, 4).float()
     v = _meta(t0).select([1, 0])
-    v2 = v.with_refs(list(v.refs))
+    v2 = v.with_spans(list(v.spans))
     assert v2.sizes == v.sizes and v2.batch_size == v.batch_size
 
 
@@ -110,7 +111,7 @@ def test_empty_selection():
     assert e.materialize(backend=None).numel() == 0
 
 
-def test_view_shape_and_local():
+def test_span_shape_and_local():
     t0 = torch.arange(12).reshape(3, 4).float()
     h = _FakeHandle(t0)
     v = TensorSpan(h, 1, 3)

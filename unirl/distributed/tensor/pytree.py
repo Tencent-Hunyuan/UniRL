@@ -141,21 +141,19 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
             return [value] * dp_size
         if batch_size % dp_size != 0:
             raise ValueError(f"batch_size={batch_size} not divisible by dp_size={dp_size}")
-        n_refs = len(value.refs)
-        if n_refs % dp_size != 0:
-            raise ValueError(f"TensorRef has {n_refs} refs, not divisible by dp_size={dp_size}")
-        refs_per_shard = n_refs // dp_size
+        n_spans = len(value.spans)
+        if n_spans % dp_size != 0:
+            raise ValueError(f"TensorRef has {n_spans} spans, not divisible by dp_size={dp_size}")
+        spans_per_shard = n_spans // dp_size
         parts = []
         for i in range(dp_size):
-            start = i * refs_per_shard
-            end = start + refs_per_shard
-            shard_refs = value.refs[start:end]
-            shard_sizes = value.sizes[start:end]
-            shard_total = sum(shard_sizes)
+            start = i * spans_per_shard
+            end = start + spans_per_shard
+            shard_spans = value.spans[start:end]
+            shard_total = sum(s.stop - s.start for s in shard_spans)
             parts.append(
                 TensorRef(
-                    refs=shard_refs,
-                    sizes=shard_sizes,
+                    spans=shard_spans,
                     shape=(shard_total, *value.shape[1:]) if value.shape else None,
                     dtype=value.dtype,
                     device=value.device,
@@ -219,15 +217,12 @@ def pytree_cat(results: list) -> Any:
     elif isinstance(first, torch.Tensor):
         return torch.cat(results, dim=0)
     elif isinstance(first, TensorRef):
-        all_refs = []
-        all_sizes = []
+        all_spans = []
         for m in results:
-            all_refs.extend(m.refs)
-            all_sizes.extend(m.sizes)
-        total = sum(all_sizes)
+            all_spans.extend(m.spans)
+        total = sum(s.stop - s.start for s in all_spans)
         return TensorRef(
-            refs=all_refs,
-            sizes=all_sizes,
+            spans=all_spans,
             shape=(total, *first.shape[1:]) if first.shape else None,
             dtype=first.dtype,
             device=first.device,

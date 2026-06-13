@@ -19,7 +19,7 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
-from unirl.distributed.tensor.transport import TensorSpan, TensorRef, WorkerLocalTransport, cat_rows
+from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport, cat_rows
 
 
 class GPUStoreTransport(WorkerLocalTransport):
@@ -46,8 +46,8 @@ class GPUStoreTransport(WorkerLocalTransport):
     def _batch_borrow(self, handles: List[GPUTensorHandle]) -> Dict[str, tuple]:
         """One ``batch_borrow`` RPC for all not-yet-open CUDA store_keys.
 
-        ``TensorSpan`` refs borrow their BASE key once — the dict.fromkeys dedup
-        means N views of one block still cost a single IPC open.
+        Borrowing is block-level: callers pass span handles, so N spans of one
+        block dedup (``dict.fromkeys``) to a single IPC open.
         """
         unique = list(
             dict.fromkeys(
@@ -58,42 +58,43 @@ class GPUStoreTransport(WorkerLocalTransport):
             return {}
         return dict(zip(unique, ray.get(self._tw.batch_borrow.remote(unique))))
 
-    def _resolve_handle(self, handle: Any, borrow_map: Dict[str, tuple]) -> torch.Tensor:
-        if isinstance(handle, TensorSpan):
-            # Resolve the base once (cached), slice the view's rows — the slice
-            # is a zero-copy view of the open IPC mapping.
-            return self._resolve_handle(handle.base, borrow_map)[handle.start : handle.end]
-        if handle.object_ref is not None:
-            return ray.get(handle.object_ref).detach()
-        cached = self._resolved_map.get(handle.store_key)
-        if cached is not None:
-            return cached
-        ipc_h, shape, stride = borrow_map[handle.store_key]
-        storage = torch.UntypedStorage._new_shared_cuda(*ipc_h)
-        view = torch.empty(0, dtype=handle.dtype, device=self.device)
-        view.set_(storage, 0, shape, stride)  # offset=0; TW stores contiguous
-        self._open_storages.append(storage)
-        resolved = view.detach()
-        self._resolved_map[handle.store_key] = resolved
-        return resolved
+    def _resolve_span(self, span: Any, borrow_map: Dict[str, tuple]) -> torch.Tensor:
+        # Resolve the handle (cached per store_key), then slice the span's rows —
+        # the slice is a zero-copy view of the open IPC mapping.
+        h = span.handle
+        if h.object_ref is not None:
+            base = ray.get(h.object_ref).detach()
+        else:
+            cached = self._resolved_map.get(h.store_key)
+            if cached is not None:
+                base = cached
+            else:
+                ipc_h, shape, stride = borrow_map[h.store_key]
+                storage = torch.UntypedStorage._new_shared_cuda(*ipc_h)
+                view = torch.empty(0, dtype=h.dtype, device=self.device)
+                view.set_(storage, 0, shape, stride)  # offset=0; TW stores contiguous
+                self._open_storages.append(storage)
+                base = view.detach()
+                self._resolved_map[h.store_key] = base
+        return base[span.start : span.stop]
 
     # ── single-tensor primitives (used by transform / dehydrate defaults) ──
 
     def put(self, tensor: torch.Tensor) -> Any:
-        return self.put_batch({"_": tensor})["_"].refs[0]
+        return self.put_batch({"_": tensor})["_"].spans[0].handle
 
-    def get(self, refs: List[Any]) -> torch.Tensor:
-        if not refs:
-            raise ValueError("GPUStoreTransport.get: empty refs list")
-        borrow_map = self._batch_borrow(refs)
-        return cat_rows([self._resolve_handle(h, borrow_map) for h in refs])
+    def get(self, spans: List[Any]) -> torch.Tensor:
+        if not spans:
+            raise ValueError("GPUStoreTransport.get: empty spans list")
+        borrow_map = self._batch_borrow([s.handle for s in spans])
+        return cat_rows([self._resolve_span(s, borrow_map) for s in spans])
 
     # ── batched resolve / pack (the Worker's path) ──
 
     def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
-        all_handles = [h for m in metas.values() for h in m.refs]
+        all_handles = [s.handle for m in metas.values() for s in m.spans]
         borrow_map = self._batch_borrow(all_handles)
-        return {k: cat_rows([self._resolve_handle(h, borrow_map) for h in m.refs]) for k, m in metas.items()}
+        return {k: cat_rows([self._resolve_span(s, borrow_map) for s in m.spans]) for k, m in metas.items()}
 
     def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorRef]:
         items = list(tensors.items())
@@ -154,7 +155,7 @@ class GPUStoreTransport(WorkerLocalTransport):
                 continue
             bs = handle.shape[0] if handle.shape else 1
             result[k] = TensorRef(
-                refs=[handle], sizes=[bs], shape=tuple(handle.shape), dtype=handle.dtype, device=str(handle.device)
+                spans=[TensorSpan(handle, 0, bs)], shape=tuple(handle.shape), dtype=handle.dtype, device=str(handle.device)
             )
         if extra_incref:
             self._tw.batch_incref.remote(extra_incref)
@@ -188,12 +189,8 @@ class GPUStoreTransport(WorkerLocalTransport):
         ray.get(self._tw.setup_global_pg.remote(global_rank, world_size))
 
     def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
-        # TensorSpan → send ONLY its [start:end) rows (exact-row routing);
-        # whole handles send the full block (range None).
-        items = [
-            (h.store_key, h.start, h.end) if isinstance(h, TensorSpan) else (h.store_key, None, None)
-            for h in handles
-        ]
+        # Each ref is a span → send ONLY its [start:stop) rows (exact-row routing).
+        items = [(s.handle.store_key, s.start, s.stop) for s in handles]
         ray.get(self._tw._nccl_send.remote(dst_rank, items))
 
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:

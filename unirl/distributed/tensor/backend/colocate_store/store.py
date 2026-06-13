@@ -154,23 +154,22 @@ class TensorStore:
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
 
-    def _nccl_send(self, dst_rank: int, handles: List[ColocateTensorHandle]) -> None:
-        """Send tensors to dst_rank via NCCL.
+    def _nccl_send(self, dst_rank: int, items: List) -> None:
+        """Send stored tensors (or row ranges of them) to dst_rank via NCCL.
 
-        Uses ProcessGroupNCCL.send() natively so that privately-created PG
-        (not registered in the global dist world) works correctly.
-        Each tensor is sent separately so send and recv always stay in sync.
-        Single-slot per device, so every handle reads from this worker's own store.
+        Each item is ``(store_key, start, stop)`` — a span ships only its
+        ``[start:stop)`` rows (exact-row routing); ``(key, None, None)`` sends the
+        whole block. Uses ProcessGroupNCCL.send() natively so a privately-created
+        PG (not registered in the global dist world) works; each tensor is sent
+        separately so send/recv stay in sync. Single-slot per device, so every
+        key is in this worker's own store.
         """
         assert self._global_pg is not None, "Global PG not initialized. Call setup_global_pg first."
-
-        from unirl.distributed.tensor.transport import TensorSpan
-
-        for h in handles:
-            assert h.object_ref is None, "CPU tensor (object_ref set) must not go through NCCL. Check localize routing."
-            tensor = self.get(h.base if isinstance(h, TensorSpan) else h)
-            if isinstance(h, TensorSpan):
-                tensor = tensor[h.start : h.end]  # exact-row routing: ship only the view's rows
+        for item in items:
+            key, start, stop = (item, None, None) if isinstance(item, str) else item
+            tensor = self._store[key].detach()
+            if start is not None:
+                tensor = tensor[start:stop]
             self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
 
     def _nccl_recv(

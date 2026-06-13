@@ -43,11 +43,10 @@ Pairs with ``RolloutReq`` (in ``unirl/types/rollout_req.py``).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
-
-import logging
 
 import torch
 
@@ -377,10 +376,10 @@ def _hydrate_tensor_meta(value: Any) -> Any:
 
     if not isinstance(value, TensorRef):
         return value
-    if not value.refs:
+    if not value.spans:
         return None
-    # materialize(None) = per-ref local() fetch + cat_rows (TensorSpan refs
-    # slice their base; ragged 2D parts follow the documented right-pad contract).
+    # materialize(None) = per-span local() fetch + cat_rows (each span slices its
+    # handle; ragged 2D parts follow the documented right-pad contract).
     return value.materialize(backend=None)
 
 
@@ -406,9 +405,9 @@ def hydrate_track(track: "RolloutTrack") -> "RolloutTrack":
         # first — the same layout TextTokenCondition.concat produces (real
         # tokens left, pad right; replay reads real lengths from the mask, so
         # the pad value is immaterial).
-        if not tm.refs:
+        if not tm.spans:
             return None
-        parts = [h.local() for h in tm.refs]
+        parts = [s.local() for s in tm.spans]
         if len(parts) == 1:
             return parts[0]
         if parts[0].dim() >= 2:
