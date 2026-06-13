@@ -1,7 +1,7 @@
 """Lifecycle GC + no-leak for the refcount-driven gpu_store borrow GC.
 
 Marker: gpu (the 300-iter churn is additionally ``slow``). The churn runs
-make -> select_segments -> [localize if >=2 GPU] -> borrow -> drop, repeated, and
+make -> select_ranges -> [localize if >=2 GPU] -> borrow -> drop, repeated, and
 asserts the per-GPU TensorWorker store size and allocated memory return to
 baseline — i.e. neither the put handles nor the borrowed IPC views leak.
 """

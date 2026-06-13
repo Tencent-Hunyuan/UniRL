@@ -112,7 +112,7 @@ def drain_store(pool, device_id: int, timeout_s: float = 12.0) -> int:
 def leak_loop(pool, role: str, iters: Optional[int] = None) -> dict:
     """Sustained churn for the no-leak assertion (gpu_store pool).
 
-    Each iter: make → ``select_segments`` (partial spans) → borrow → drop. On a
+    Each iter: make → ``select_ranges`` (partial spans) → borrow → drop. On a
     >=2-device pool it also cross-device ``localize``s the partial spans first,
     so the NCCL move + its received-handle GC are churned too. On a 1-device pool
     it exercises the put/borrow/decref path alone.
@@ -133,7 +133,7 @@ def leak_loop(pool, role: str, iters: Optional[int] = None) -> dict:
     bad = 0
     for i in range(iters):
         r = make_ref(pool, role, src, 8, 16, i)
-        seg = r.select_segments([(1, 4), (6, 8)])  # 5 rows, 2 partial spans
+        seg = r.select_ranges([(1, 4), (6, 8)])  # 5 rows, 2 partial spans
         if dst != src:
             target = GPUStoreTransport.localize([((seg,), {})], pool, [dst], [f"dw{dst}"])[0][0][0]
         else:

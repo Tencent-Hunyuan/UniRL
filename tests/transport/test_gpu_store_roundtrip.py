@@ -25,10 +25,10 @@ def test_put_then_borrow_roundtrip(gpu1_probe):
     assert n == 6 and w == 4 and abs(s - float(p.h.expected(6, 4, 100).sum())) < 1e-3
 
 
-def test_select_segments_borrow(gpu1_probe):
+def test_select_ranges_borrow(gpu1_probe):
     p = gpu1_probe
     ref = p.h.make_ref(p.pool, p.role, 0, 8, 4, 200)
-    seg = ref.select_segments([(5, 8), (0, 2)])  # rows 5,6,7,0,1 — partial spans
+    seg = ref.select_ranges([(5, 8), (0, 2)])  # rows 5,6,7,0,1 — partial spans
     exp = p.h.expected(8, 4, 200)[[5, 6, 7, 0, 1]]
     assert torch.equal(seg.local(), exp)
     n, w, s = p.h.borrow_sum(p.pool, p.role, 0, seg)

@@ -34,7 +34,7 @@ def test_move_full_block(multigpu_probe):
 def test_move_partial_spans(multigpu_probe):
     p = multigpu_probe
     ref = p.h.make_ref(p.pool, p.role, 0, 6, 4, 100)
-    part = ref.select_segments([(2, 5), (0, 1)])  # rows 2,3,4,0 — two partial spans
+    part = ref.select_ranges([(2, 5), (0, 1)])  # rows 2,3,4,0 — two partial spans
     exp = p.h.expected(6, 4, 100)[[2, 3, 4, 0]]
     moved = _cls(p.backend).localize([((part,), {})], p.pool, [1], ["dw1"])[0][0][0]
     assert moved.batch_size == 4  # only the selected rows shipped
