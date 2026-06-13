@@ -463,10 +463,10 @@ def _concat_packed_data(values: List[Optional[torch.Tensor]]) -> Optional[torch.
     if not non_none:
         return None
     if all(isinstance(v, Batch) for v in non_none):
-        # Transport placeholders (e.g. TensorMeta returned from a DP_SCATTER
+        # Transport placeholders (e.g. TensorRef returned from a DP_SCATTER
         # dispatch) carry routing handles, not real tensors — defer to their own
         # concat, exactly like _concat_value's Batch branch. A raw torch.cat
-        # would choke on them ("expected Tensor ... but got TensorMeta").
+        # would choke on them ("expected Tensor ... but got TensorRef").
         return type(non_none[0]).concat(non_none)
     return torch.cat(non_none, dim=0)
 
@@ -507,7 +507,7 @@ def _select_packed_data(
             return value.select_segments([])
         return value[:0].clone()
     if hasattr(value, "select_segments"):
-        # TensorMeta: token-range gather as a lazy segment view (no data motion).
+        # TensorRef: token-range gather as a lazy segment view (no data motion).
         return value.select_segments(
             [(int(cu[i].item()), int(cu[i + 1].item())) for i in indices]
         )
@@ -875,7 +875,7 @@ class Batch:
 
         The precomputed-values sibling of :meth:`map` (which takes a per-field
         ``fn``). For the generic transport-layer tree-walkers that rebuild a
-        ``Batch`` from already-transformed field values — TensorMeta<->Tensor
+        ``Batch`` from already-transformed field values — TensorRef<->Tensor
         swaps and ref rerouting, representation-only changes that don't alter the
         batch dimension or per-sample lengths — so the framework-managed
         ``_packed_cu_seqlens`` carries over unchanged. Without this carry, those

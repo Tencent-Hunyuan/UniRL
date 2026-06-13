@@ -1,6 +1,6 @@
-"""Unit tests for TensorMeta ref views (select/slice without hydration).
+"""Unit tests for TensorRef ref views (select/slice without hydration).
 
-Selection emits :class:`HandleView` refs — unit-range views of the parent
+Selection emits :class:`TensorSpan` refs — unit-range views of the parent
 refs — instead of moving data. Pure-CPU: parent refs are faked with a minimal
 handle protocol (.local/.shape/.dtype/.device), no transport backend required
 (materialize falls back to per-ref fetch when backend is None).
@@ -8,7 +8,7 @@ handle protocol (.local/.shape/.dtype/.device), no transport backend required
 
 import torch
 
-from unirl.distributed.tensor.transport import HandleView, TensorMeta, cat_rows
+from unirl.distributed.tensor.transport import TensorSpan, TensorRef, cat_rows
 
 
 class _FakeHandle:
@@ -22,8 +22,8 @@ class _FakeHandle:
         return self.t
 
 
-def _meta(*tensors: torch.Tensor) -> TensorMeta:
-    return TensorMeta(
+def _meta(*tensors: torch.Tensor) -> TensorRef:
+    return TensorRef(
         refs=[_FakeHandle(t) for t in tensors],
         sizes=[int(t.shape[0]) for t in tensors],
         shape=(sum(int(t.shape[0]) for t in tensors), *tensors[0].shape[1:]),
@@ -40,7 +40,7 @@ def test_select_permutation_with_ragged_pad():
     perm = [5, 0, 3, 6, 2, 1, 4]
     v = tm.select(perm)
     assert v.batch_size == 7
-    assert any(isinstance(r, HandleView) for r in v.refs)
+    assert any(isinstance(r, TensorSpan) for r in v.refs)
     out = v.materialize(backend=None)
     assert out.shape == (7, 6)  # ragged refs right-padded to the max width
     assert torch.equal(out[0, :5], t2[0])
@@ -59,7 +59,7 @@ def test_view_slice_matches_materialized_rows():
 
 def test_aligned_slice_passes_refs_through():
     # A ref-boundary-aligned slice is the structural inverse of concat:
-    # the original ref objects come back untouched (no HandleView wrapping).
+    # the original ref objects come back untouched (no TensorSpan wrapping).
     t0 = torch.arange(12).reshape(3, 4).float()
     t1 = torch.arange(100, 108).reshape(2, 4).float()
     tm = _meta(t0, t1)
@@ -73,7 +73,7 @@ def test_misaligned_slice_wraps_boundary_refs():
     tm = _meta(t0, t1)
     mid = tm.slice(1, 4)  # crosses the ref boundary off-alignment
     assert mid.batch_size == 3
-    assert isinstance(mid.refs[0], HandleView) and isinstance(mid.refs[1], HandleView)
+    assert isinstance(mid.refs[0], TensorSpan) and isinstance(mid.refs[1], TensorSpan)
     assert torch.equal(mid.materialize(backend=None), torch.cat([t0[1:], t1[:1]]))
 
 
@@ -87,12 +87,12 @@ def test_packed_segment_view():
 
 
 def test_nested_views_flatten():
-    # A view of a view flattens to a single HandleView over the parent ref —
+    # A view of a view flattens to a single TensorSpan over the parent ref —
     # repeated selection never builds an indirection chain.
     t0 = torch.arange(40).reshape(8, 5).float()
     v1 = _meta(t0).select([3, 4, 5, 6])  # rows 3..6 (one coalesced view)
     v2 = v1.select([1, 2])  # rows 4..5 of the original
-    assert all(isinstance(r, HandleView) and isinstance(r.base, _FakeHandle) for r in v2.refs)
+    assert all(isinstance(r, TensorSpan) and isinstance(r.base, _FakeHandle) for r in v2.refs)
     assert torch.equal(v2.materialize(backend=None), t0[4:6])
 
 
@@ -113,7 +113,7 @@ def test_empty_selection():
 def test_view_shape_and_local():
     t0 = torch.arange(12).reshape(3, 4).float()
     h = _FakeHandle(t0)
-    v = HandleView(h, 1, 3)
+    v = TensorSpan(h, 1, 3)
     assert v.shape == (2, 4) and v.dtype == t0.dtype
     assert torch.equal(v.local(), t0[1:3])
 

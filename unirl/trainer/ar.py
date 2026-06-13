@@ -154,7 +154,7 @@ class ARTrainer(BaseTrainer):
             if track.rewards is None:
                 continue
             # Hydrate in place so the wandb reward/advantage stats reuse this
-            # fetch instead of re-pulling the TensorMeta from the worker.
+            # fetch instead of re-pulling the TensorRef from the worker.
             track.rewards = _hydrate_tensor_meta(track.rewards)
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands

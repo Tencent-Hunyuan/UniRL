@@ -23,8 +23,8 @@ from typing import Any, List
 import ray
 import torch
 
-from unirl.distributed.tensor.backend.colocate_store.handle import TensorHandle
-from unirl.distributed.tensor.transport import HandleView, TensorMeta, WorkerLocalTransport, cat_rows
+from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
+from unirl.distributed.tensor.transport import TensorSpan, TensorRef, WorkerLocalTransport, cat_rows
 
 
 class ColocateStoreTransport(WorkerLocalTransport):
@@ -38,7 +38,7 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return self._store
 
     def _resolve_handle(self, handle: Any) -> torch.Tensor:
-        if isinstance(handle, HandleView):
+        if isinstance(handle, TensorSpan):
             return self._resolve_handle(handle.base)[handle.start : handle.end]
         if handle.object_ref is not None:
             return ray.get(handle.object_ref).detach()
@@ -58,7 +58,7 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return cat_rows([self._resolve_handle(h) for h in refs])
 
     def is_ref(self, value: Any) -> bool:
-        return isinstance(value, TensorMeta)
+        return isinstance(value, TensorRef)
 
     # ── lifecycle ──
 

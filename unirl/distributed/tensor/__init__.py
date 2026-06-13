@@ -13,7 +13,7 @@ from unirl.distributed.tensor.batch import (
     sum_field,
 )
 from unirl.distributed.tensor.transport import (
-    TensorMeta,
+    TensorRef,
     TensorTransport,
     TensorTransportRuntime,
     TransportSession,
@@ -22,7 +22,7 @@ from unirl.distributed.tensor.transport import (
 __all__ = [
     "Batch",
     "FieldKind",
-    "TensorMeta",
+    "TensorRef",
     "TensorTransport",
     "TensorTransportRuntime",
     "TransportSession",

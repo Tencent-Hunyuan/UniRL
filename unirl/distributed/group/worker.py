@@ -23,7 +23,7 @@ from torch import Tensor
 
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor.factory import build_transport
-from unirl.distributed.tensor.transport import TensorMeta, TensorTransport, TensorTransportRuntime, map_tree
+from unirl.distributed.tensor.transport import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
 from unirl.distributed.utils import collect_leaves
 
 
@@ -275,8 +275,8 @@ class Worker:
     def call(self, role_name: str, method_name: str, args: tuple, kwargs: dict, grad_mode: bool = False, call_id=None):
         """Generic RPC entry point.
 
-        Resolves inputs (TensorMeta → Tensor via transport.get_batch) and packs
-        outputs (Tensor → TensorMeta via transport.put_batch). Non-tensor
+        Resolves inputs (TensorRef → Tensor via transport.get_batch) and packs
+        outputs (Tensor → TensorRef via transport.put_batch). Non-tensor
         args/kwargs/results pass through unchanged.
 
         grad_mode and call_id are dedicated parameters (not via kwargs) so
@@ -287,14 +287,14 @@ class Worker:
         """
         role = self._roles[role_name]
 
-        # Resolve: collect TensorMeta leaves (tree order), batch-fetch, substitute.
+        # Resolve: collect TensorRef leaves (tree order), batch-fetch, substitute.
         # Keys are positional indices so get_batch results align with the walk.
-        in_metas = self._collect(args, TensorMeta) + self._collect(kwargs, TensorMeta)
+        in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
         in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
 
         def resolve(o):
-            return next(in_iter) if isinstance(o, TensorMeta) else o
+            return next(in_iter) if isinstance(o, TensorRef) else o
 
         resolved_args = map_tree(args, resolve)
         resolved_kwargs = map_tree(kwargs, resolve)
