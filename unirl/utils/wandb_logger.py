@@ -259,7 +259,11 @@ class UniRLWandBLogger:
 
     @property
     def optimizer_step(self) -> int:
-        """Current ``train/`` step-axis value — checkpointed for resume."""
+        """Cumulative optimizer-update count — checkpointed for resume.
+
+        No longer the ``train/`` x-axis (that is now rollout-anchored); this is
+        the running optimizer-update total kept only for resume bookkeeping.
+        """
         return self._optimizer_step
 
     def _handle_init_failure(
@@ -660,7 +664,7 @@ class UniRLWandBLogger:
             rollout_metrics.update(extra_metrics)
         self.log_rollout(step, rollout_metrics)
 
-        self._log_train(results)
+        self._log_train(results, step)
 
         perf: Dict[str, float] = {}
         if step_time_s is not None:
@@ -673,20 +677,33 @@ class UniRLWandBLogger:
     def _log_train(
         self,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+        step: int,
     ) -> None:
-        """Emit ``train/*`` points, per optimizer step, single- and multi-track.
+        """Emit ``train/*`` points for one rollout, single- and multi-track.
 
-        Step-axis matrix (``train/step`` == ``self._optimizer_step``):
+        ``train/step`` is anchored to the rollout id (``step`` == ``rollout_id
+        + 1``), so it shares an x-axis with ``rollout/*`` and overlays directly
+        against runs that log one row per rollout. A multi-update recipe
+        (``per_update`` len N>1) no longer scatters N points along the optimizer
+        counter; the N updates fold into a SINGLE rollout row, each update's
+        metrics namespaced ``update{i}/...`` (so ``train/update0/grad_norm`` …
+        ``train/updateN/...`` sit side by side — the on-policy update0 then
+        off-policy drift, readable within one rollout instead of strung along
+        the wandb step axis).
+
+        ``self._optimizer_step`` is advanced by the exact same amount it always
+        was (cumulative optimizer-update count, checkpointed via the
+        :attr:`optimizer_step` property for resume); it simply no longer drives
+        the wandb ``train/step`` x-axis.
 
         - single result, ``per_update`` empty → one aggregate point per backward.
-        - single result, ``per_update`` len N>1 → N points (one per optimizer
-          update), metrics unprefixed (the on-policy update0 then off-policy drift).
+        - single result, ``per_update`` len N>1 → one row, keys ``update{i}/<metric>``.
         - dict results → metrics namespaced ``<track>/<key>``. Cross-track
           per-update merge ONLY when every track's ``per_update`` shares the same
-          length L>1 (one optimizer driving all tracks, e.g. unified_model);
-          otherwise one aggregate point per rollout. This never interleaves the
-          independent optimizers of a per-track recipe (e.g. PE), and is
-          byte-identical to the legacy path for every single-update recipe.
+          length L>1 (one optimizer driving all tracks, e.g. unified_model),
+          keys ``update{i}/<track>/<key>``; otherwise one aggregate point per
+          rollout. This never interleaves the independent optimizers of a
+          per-track recipe (e.g. PE).
         """
         if not self.enabled or not self._initialized:
             return
@@ -696,14 +713,14 @@ class UniRLWandBLogger:
             mergeable = bool(per_update_lens) and len(set(per_update_lens)) == 1 and per_update_lens[0] > 1
             if mergeable:
                 length = per_update_lens[0]
-                for i in range(length):
-                    merged: Dict[str, Any] = {
-                        f"{name}/{key}": value
-                        for name, result in results.items()
-                        for key, value in dict(result.per_update[i]).items()
-                    }
-                    self._optimizer_step += 1
-                    self.log_step(self._optimizer_step, merged)
+                merged: Dict[str, Any] = {
+                    f"update{i}/{name}/{key}": value
+                    for i in range(length)
+                    for name, result in results.items()
+                    for key, value in dict(result.per_update[i]).items()
+                }
+                self._optimizer_step += length
+                self.log_step(step, merged)
                 return
             train_metrics: Dict[str, Any] = {
                 f"{name}/{key}": value
@@ -712,18 +729,22 @@ class UniRLWandBLogger:
             }
             if any(bool(getattr(r, "has_backward", False)) for r in results.values()):
                 self._optimizer_step += 1
-                self.log_step(self._optimizer_step, train_metrics)
+                self.log_step(step, train_metrics)
             return
 
         # Single-track result.
         per_update = getattr(results, "per_update", ()) or ()
         if len(per_update) > 1:
-            for metrics in per_update:
-                self._optimizer_step += 1
-                self.log_step(self._optimizer_step, dict(metrics))
+            merged_single: Dict[str, Any] = {
+                f"update{i}/{key}": value
+                for i, metrics in enumerate(per_update)
+                for key, value in dict(metrics).items()
+            }
+            self._optimizer_step += len(per_update)
+            self.log_step(step, merged_single)
         elif getattr(results, "has_backward", False):
             self._optimizer_step += 1
-            self.log_step(self._optimizer_step, dict(aggregate_stage_results([results])))
+            self.log_step(step, dict(aggregate_stage_results([results])))
 
     def log_progress(
         self,
