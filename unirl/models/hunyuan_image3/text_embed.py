@@ -293,12 +293,21 @@ class HunyuanImage3TextEmbedStage:
             output, sections, rope_seq_len=rope_seq_len
         )
 
+        # HI3-Instruct cond images are dual-encoded: the wrapper also splices
+        # VAE <img> slots + a cond <timestep> token (i2t/it2i). Pin them so the
+        # AR forward can scatter the VAE latents (else those slots stay bare
+        # <img> embeddings → garbage comprehension). None for t2t (no cond image).
+        cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), _device)
+        cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), _device)
+
         fused = HunyuanImage3FusedMultimodalCondition(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             rope_cache=rope_cache,
+            cond_vae_image_mask=cond_vae_image_mask,
             cond_vit_image_mask=cond_vit_image_mask,
+            cond_timestep_scatter_index=cond_timestep_scatter_index,
         )
         return {"fused": fused, "tokenizer_output": output}
 

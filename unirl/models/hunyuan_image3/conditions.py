@@ -306,16 +306,26 @@ class HunyuanImage3ARConditions(Batch):
 
         fused           : HunyuanImage3FusedMultimodalCondition
                           carries input_ids, 4D attention_mask, position_ids,
-                          rope_cache, plus cond_vit_image_mask (i2t/it2i)
+                          rope_cache, plus cond_vae_image_mask /
+                          cond_vit_image_mask / cond_timestep_scatter_index (i2t/it2i)
+        cond_vae        : ImageLatentCondition — cond VAE latents (i2t/it2i).
+                          HI3-Instruct represents a cond image as VAE + ViT
+                          tokens, so comprehension needs BOTH halves scattered
+                          (ViT-only leaves the VAE <img> slots as bare
+                          embeddings → garbage comprehension).
         cond_vit        : ImageEmbedCondition — cond ViT patch embeds + attn
                           mask + spatial_shapes (i2t/it2i)
+        cond_timestep   : Tensor — per-cond t values for the VAE-latent scatter
+                          (clean cond image → t≈0)
         tokenizer_output: opaque upstream apply_chat_template output, used
                           on step 0 to derive position_ids from real_pos
                           for right-padded batches
     """
 
     fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
+    cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod
@@ -331,6 +341,13 @@ class HunyuanImage3ARConditions(Batch):
             raise TypeError(
                 "HunyuanImage3ARConditions.from_dict: 'fused.input_ids' is required for the AR stage to consume."
             )
+        cond_vae = d.get("cond_vae")
+        if cond_vae is not None and not isinstance(cond_vae, ImageLatentCondition):
+            raise TypeError(
+                f"HunyuanImage3ARConditions.from_dict: expected d['cond_vae'] "
+                f"to be an ImageLatentCondition or absent, "
+                f"got {type(cond_vae).__name__}"
+            )
         cond_vit = d.get("cond_vit")
         if cond_vit is not None and not isinstance(cond_vit, ImageEmbedCondition):
             raise TypeError(
@@ -340,7 +357,9 @@ class HunyuanImage3ARConditions(Batch):
             )
         return cls(
             fused=fused,
+            cond_vae=cond_vae,
             cond_vit=cond_vit,
+            cond_timestep=d.get("cond_timestep"),
             tokenizer_output=d.get("tokenizer_output"),
         )
 
@@ -350,8 +369,12 @@ class HunyuanImage3ARConditions(Batch):
                 "HunyuanImage3ARConditions.to_dict: `fused.input_ids` is None — required for the AR stage to consume."
             )
         out: Dict[str, Any] = {"fused": self.fused}
+        if self.cond_vae is not None:
+            out["cond_vae"] = self.cond_vae
         if self.cond_vit is not None:
             out["cond_vit"] = self.cond_vit
+        if self.cond_timestep is not None:
+            out["cond_timestep"] = self.cond_timestep
         if self.tokenizer_output is not None:
             out["tokenizer_output"] = self.tokenizer_output
         return out

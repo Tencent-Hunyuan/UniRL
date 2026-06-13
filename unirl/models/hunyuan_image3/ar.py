@@ -200,6 +200,13 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
                 "attention_mask": cond_vit.attn_mask,
             }
 
+        # i2t / it2i cond-VAE half (HI3-Instruct dual cond-image: VAE latents +
+        # a cond timestep alongside the ViT patches). None for t2t. The forward
+        # scatters these into the VAE <img> slots in any mode; without them the
+        # 4096 VAE slots stay bare <img> embeddings → garbage comprehension.
+        cond_vae = conditions.cond_vae
+        cond_vae_images = cond_vae.latents if cond_vae is not None else None
+
         # Standard HF-style ``model_kwargs`` carried across the per-token
         # loop. Carries the rope tables, the 4D attention mask, and the
         # opaque tokenizer_output for the prefill ``_update_model_kwargs``
@@ -219,6 +226,10 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             "cond_vit_images": cond_vit_images,
             "cond_vit_image_mask": fused.cond_vit_image_mask,
             "vit_kwargs": vit_kwargs,
+            "cond_vae_images": cond_vae_images,
+            "cond_vae_image_mask": fused.cond_vae_image_mask,
+            "cond_timesteps": conditions.cond_timestep,
+            "cond_timesteps_index": fused.cond_timestep_scatter_index,
         }
         if conditions.tokenizer_output is not None:
             model_kwargs["tokenizer_output"] = conditions.tokenizer_output
@@ -251,6 +262,26 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         batch_size = int(state.input_ids.shape[0])
         model_kwargs = state.model_kwargs
 
+        # Cond-image scatter (i2t/it2i) only applies on the prefill: the cond
+        # VAE + ViT embeds land in the full-sequence hidden states and are
+        # cached, so decode steps (a single new token with no <img> positions)
+        # pass None. ``_encode_cond_image``/the wrapper supply the VAE half
+        # (cond_vae_images + cond_timesteps + cond_*_image_mask /
+        # cond_timesteps_index) — the upstream forward asserts they come as a
+        # set and scatters cond-VAE in gen_text mode too (not mode-gated).
+        cond_kwargs: Dict[str, Any] = {}
+        if state.step_idx == 0:
+            cond_kwargs = {
+                "cond_vit_images": model_kwargs.get("cond_vit_images"),
+                "cond_vit_image_mask": model_kwargs.get("cond_vit_image_mask"),
+                # Newer (Instruct) forward reads the ViT attn/spatial kwargs
+                # under cond_vit_image_kwargs; older ones use vit_kwargs.
+                "cond_vit_image_kwargs": model_kwargs.get("vit_kwargs"),
+                "cond_vae_images": model_kwargs.get("cond_vae_images"),
+                "cond_vae_image_mask": model_kwargs.get("cond_vae_image_mask"),
+                "cond_timesteps": model_kwargs.get("cond_timesteps"),
+                "cond_timesteps_index": model_kwargs.get("cond_timesteps_index"),
+            }
         model_inputs = transformer.prepare_inputs_for_generation(
             state.input_ids,
             past_key_values=model_kwargs.get("past_key_values"),
@@ -261,12 +292,7 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             mode="gen_text",
             rope_image_info=model_kwargs.get("rope_image_info"),
             use_cache=True,
-            cond_vit_images=model_kwargs.get("cond_vit_images"),
-            cond_vit_image_mask=model_kwargs.get("cond_vit_image_mask"),
-            vit_kwargs=model_kwargs.get("vit_kwargs"),
-            # Newer (Instruct) forward reads the ViT attn/spatial kwargs under
-            # cond_vit_image_kwargs; older ones use vit_kwargs. Pass both.
-            cond_vit_image_kwargs=model_kwargs.get("vit_kwargs"),
+            **cond_kwargs,
         )
         with torch.no_grad():
             out = transformer(**model_inputs, first_step=(state.step_idx == 0))

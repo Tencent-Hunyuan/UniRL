@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from unirl.models.types.ar import ARSamplingParams
-from unirl.types.conditions import ImageEmbedCondition
+from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
@@ -79,10 +79,22 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #       "attention_mask"}}
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # Chat template path: pass batch_cond_image_info so the wrapper
-    # splices in <img> markers; the resulting ``cond_vit_image_mask``
-    # (now on ``fused``) pins which ``input_ids`` positions hold the
-    # ViT scatter target.
+    # HI3-Instruct represents a cond image as a DUAL VAE + ViT block (the
+    # chat template splices VAE <img> slots + a cond <timestep> alongside the
+    # ViT <img> slots). ``_encode_cond_image`` VAE-encodes the cond image and
+    # returns the per-sample VAE latents + timestep + the (re-shaped) ViT
+    # features the unified-MM forward scatters — same call it2i uses.
+    # ``cfg_factor=1``: the AR/comprehension forward has no CFG batching.
+    # Without the VAE half, the 4096 VAE <img> slots stay bare <img>
+    # embeddings → the model sees garbage and can't comprehend the image.
+    cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
+        vit["joint_image_info"], cfg_factor=1
+    )
+
+    # Chat template path: pass batch_cond_image_info so the wrapper splices in
+    # the cond-image markers; the resulting cond_vae_image_mask /
+    # cond_vit_image_mask / cond_timestep_scatter_index (now on ``fused``) pin
+    # which ``input_ids`` positions hold the VAE / ViT / timestep scatter targets.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
         bot_task=tok_bot_task,
@@ -91,14 +103,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
+    cond_vae = ImageLatentCondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
-        embeds=vit["cond_vit_images"],
+        embeds=cond_vit_images,
         attn_mask=vit["vit_kwargs"]["attention_mask"],
         spatial_shapes=vit["vit_kwargs"]["spatial_shapes"],
     )
     ar_conds = HunyuanImage3ARConditions(
         fused=mm["fused"],
+        cond_vae=cond_vae,
         cond_vit=cond_vit,
+        cond_timestep=cond_timestep,
         tokenizer_output=mm["tokenizer_output"],
     )
 
