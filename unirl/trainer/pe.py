@@ -209,7 +209,7 @@ class PETrainer(BaseTrainer):
         reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
         scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
         # propagate_rewards reshapes child.rewards directly (no hydration), so
-        # turn the worker-returned TensorMeta into a real tensor first.
+        # turn the worker-returned TensorRef into a real tensor first.
         if scored.rewards is not None:
             scored.rewards = _hydrate_tensor_meta(scored.rewards)
         resp.tracks["diffusion"] = scored

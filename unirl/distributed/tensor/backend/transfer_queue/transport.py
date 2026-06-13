@@ -15,9 +15,11 @@ from unirl.distributed.tensor.backend.transfer_queue.runtime import (
     _run_async_in_temp_loop,
 )
 from unirl.distributed.tensor.transport import (
-    TensorMeta,
+    TensorRef,
+    TensorSpan,
     TensorTransport,
     TensorTransportRuntime,
+    cat_rows,
 )
 
 
@@ -27,10 +29,10 @@ class TQTensorHandle:
     field name it occupies in its originating put, and its original shape.
 
     Wrapping the upstream meta (rather than dropping it straight into
-    ``TensorMeta.refs``) keeps three contracts that worker-local handles satisfy
+    ``TensorRef.spans``) keeps three contracts that worker-local handles satisfy
     for free:
 
-    * **Uniform ref interface.** Every ``TensorMeta.refs`` element exposes
+    * **Uniform ref interface.** Every ``TensorRef.spans`` element exposes
       ``.local()``, so driver-side hydration (``_hydrate_tensor_meta``) resolves a
       worker-local ``TensorHandle`` and a global TQ ref the same way.
     * **Field identity travels with the ref.** ``Worker.call`` keys put/get by
@@ -150,21 +152,24 @@ class TQTransport(TensorTransport):
 
         return _run_async_in_temp_loop(_put)
 
-    def get(self, refs: List[Any]) -> torch.Tensor:
+    def get(self, spans: List[TensorSpan[TQTensorHandle]]) -> torch.Tensor:
         async def _get() -> torch.Tensor:
-            tensors = await self._fetch(refs)
-            return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+            # Each ref is a span: fetch its handle's row-block, then slice locally.
+            handles = [s.handle for s in spans]
+            tensors = await self._fetch(handles)
+            parts = [t[s.start : s.stop] for s, t in zip(spans, tensors)]
+            return cat_rows(parts)
 
         return _run_async_in_temp_loop(_get)
 
     def is_ref(self, value: Any) -> bool:
-        return isinstance(value, TensorMeta)
+        return isinstance(value, TensorRef)
 
-    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorMeta]:
+    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorRef]:
         if not tensors:
             return {}
 
-        async def _put_batch() -> Dict[str, TensorMeta]:
+        async def _put_batch() -> Dict[str, TensorRef]:
             # Group keys by leading-dim batch size: a TensorDict requires one
             # uniform batch_size, so a mixed-dim object (e.g. a rollout's 96-row
             # per-sample tensors alongside an 11-step trajectory) must split into
@@ -181,7 +186,7 @@ class TQTransport(TensorTransport):
                     raise TypeError(f"TQTransport.put_batch: unsupported type {type(t).__name__} for key {k!r}")
                 groups.setdefault(_bs(t), []).append(k)
 
-            result: Dict[str, TensorMeta] = {}
+            result: Dict[str, TensorRef] = {}
             for bs, keys in groups.items():
                 d: dict = {}
                 for k in keys:
@@ -192,15 +197,18 @@ class TQTransport(TensorTransport):
                 for k in keys:
                     t = tensors[k]
                     is_tensor = isinstance(t, torch.Tensor)
-                    result[k] = TensorMeta(
-                        refs=[
-                            TQTensorHandle(
-                                meta=put_meta.select_fields([k]),
-                                field=k,
-                                orig_shape=tuple(t.shape) if is_tensor else None,
+                    result[k] = TensorRef(
+                        spans=[
+                            TensorSpan(
+                                TQTensorHandle(
+                                    meta=put_meta.select_fields([k]),
+                                    field=k,
+                                    orig_shape=tuple(t.shape) if is_tensor else None,
+                                ),
+                                0,
+                                bs,
                             )
                         ],
-                        sizes=[bs],
                         shape=tuple(t.shape) if is_tensor else None,
                         dtype=t.dtype if is_tensor else None,
                         device=str(t.device) if is_tensor else None,
@@ -209,28 +217,31 @@ class TQTransport(TensorTransport):
 
         return _run_async_in_temp_loop(_put_batch)
 
-    def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
+    def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
         if not metas:
             return {}
 
         async def _get_batch() -> Dict[str, torch.Tensor]:
-            # Flatten every key's refs into one handle list (each handle carries
+            # Flatten every key's spans into one handle list (each handle carries
             # its own producer field + original shape), fetch them grouped-by-put
             # in _fetch, then regroup back per consumer key (cat a key's multiple
-            # refs). Extracting by handle.field — not by the consumer's positional
+            # spans). Extracting by handle.field — not by the consumer's positional
             # key — is what lets a producer's output 'i' resolve under the
-            # consumer's input 'j'.
+            # consumer's input 'j'. Each span fetches its handle block and slices
+            # locally before the per-key cat.
             handles: List[TQTensorHandle] = []
+            spans_list: List[Any] = []
             owners: List[str] = []
             for k, m in metas.items():
-                for h in m.refs:
-                    handles.append(h)
+                for s in m.spans:
+                    spans_list.append(s)
+                    handles.append(s.handle)
                     owners.append(k)
             tensors = await self._fetch(handles)
             parts: Dict[str, list] = defaultdict(list)
-            for k, t in zip(owners, tensors):
-                parts[k].append(t)
-            return {k: (lst[0] if len(lst) == 1 else torch.cat(lst, dim=0)) for k, lst in parts.items()}
+            for k, s, t in zip(owners, spans_list, tensors):
+                parts[k].append(t[s.start : s.stop])
+            return {k: cat_rows(lst) for k, lst in parts.items()}
 
         return _run_async_in_temp_loop(_get_batch)
 

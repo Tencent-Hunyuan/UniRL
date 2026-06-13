@@ -23,8 +23,8 @@ from typing import Any, List
 import ray
 import torch
 
-from unirl.distributed.tensor.backend.colocate_store.handle import TensorHandle
-from unirl.distributed.tensor.transport import TensorMeta, WorkerLocalTransport
+from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
+from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport, cat_rows
 
 
 class ColocateStoreTransport(WorkerLocalTransport):
@@ -37,27 +37,29 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def store(self) -> Any:
         return self._store
 
-    def _resolve_handle(self, handle: TensorHandle) -> torch.Tensor:
-        if handle.object_ref is not None:
-            return ray.get(handle.object_ref).detach()
-        if handle.source_id != self._store.worker_id:
+    def _resolve_span(self, span: TensorSpan[ColocateTensorHandle]) -> torch.Tensor:
+        h = span.handle
+        if h.object_ref is not None:
+            base = ray.get(h.object_ref).detach()
+        elif h.source_id != self._store.worker_id:
             raise RuntimeError(
-                f"ColocateStoreTransport: handle from '{handle.source_id}' is not local to "
+                f"ColocateStoreTransport: handle from '{h.source_id}' is not local to "
                 f"'{self._store.worker_id}'. localize should have transferred it."
             )
-        return self._store.get(handle)
+        else:
+            base = self._store.get(h)
+        return base[span.start : span.stop]
 
     def put(self, tensor: torch.Tensor) -> Any:
         return self._store.put(tensor)
 
-    def get(self, refs: List[Any]) -> torch.Tensor:
-        if not refs:
-            raise ValueError("ColocateStoreTransport.get: empty refs list")
-        parts = [self._resolve_handle(h) for h in refs]
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    def get(self, spans: List[TensorSpan[ColocateTensorHandle]]) -> torch.Tensor:
+        if not spans:
+            raise ValueError("ColocateStoreTransport.get: empty spans list")
+        return cat_rows([self._resolve_span(s) for s in spans])
 
     def is_ref(self, value: Any) -> bool:
-        return isinstance(value, TensorMeta)
+        return isinstance(value, TensorRef)
 
     # ── lifecycle ──
 
@@ -77,7 +79,9 @@ class ColocateStoreTransport(WorkerLocalTransport):
         self._store.setup_global_pg(global_rank, world_size)
 
     def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
-        self._store._nccl_send(dst_rank, handles)
+        # Each ref is a span → send ONLY its [start:stop) rows (exact-row routing).
+        items = [(s.handle.store_key, s.start, s.stop) for s in handles]
+        self._store._nccl_send(dst_rank, items)
 
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:
         return self._store._nccl_recv(src_rank, shapes, dtypes)

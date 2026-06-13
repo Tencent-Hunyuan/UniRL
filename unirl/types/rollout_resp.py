@@ -43,6 +43,7 @@ Pairs with ``RolloutReq`` (in ``unirl/types/rollout_req.py``).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
@@ -61,6 +62,8 @@ from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+
+logger = logging.getLogger(__name__)
 
 TR = TypeVar("TR", bound="RolloutTrack")
 TT = TypeVar("TT", bound="RolloutResp")
@@ -267,7 +270,7 @@ class RolloutTrack(Batch):
             return self  # trivially nothing to do
 
         # The reward service runs on workers; its returned ``rewards`` arrives
-        # at the driver as a TensorMeta proxy (Worker._pack_output dehydrates
+        # at the driver as a TensorRef proxy (Worker._pack_output dehydrates
         # every Tensor leaf). Driver-side arithmetic below needs a real Tensor.
         rewards_local = _hydrate_tensor_meta(self.rewards)
 
@@ -358,27 +361,139 @@ def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
 
 
 def _hydrate_tensor_meta(value: Any) -> Any:
-    """Driver-side hydrate of a ``TensorMeta`` proxy back to a real ``torch.Tensor``.
+    """Driver-side hydrate of a ``TensorRef`` proxy back to a real ``torch.Tensor``.
 
     ``Worker._pack_output`` stores every ``torch.Tensor`` leaf in the return
     value into the TensorStore, so fields like ``track.rewards`` arrive at
-    the driver as ``TensorMeta`` proxies even though downstream driver-side
+    the driver as ``TensorRef`` proxies even though downstream driver-side
     code (advantage computation) does arithmetic on them as if they were
     tensors. This helper
     fetches the underlying tensor(s) via each handle's bound worker and cats
     them. Returns the value unchanged when it is already a ``torch.Tensor``
     or ``None``.
     """
-    from unirl.distributed.tensor.transport import TensorMeta
+    from unirl.distributed.tensor.transport import TensorRef
 
-    if not isinstance(value, TensorMeta):
+    if not isinstance(value, TensorRef):
         return value
-    if not value.refs:
+    if not value.spans:
         return None
-    tensors = [h.local() for h in value.refs]
-    if len(tensors) == 1:
-        return tensors[0]
-    return torch.cat(tensors, dim=0)
+    # materialize(None) = per-span local() fetch + cat_rows (each span slices its
+    # handle; ragged 2D parts follow the documented right-pad contract).
+    return value.materialize(backend=None)
+
+
+def hydrate_track(track: "RolloutTrack") -> "RolloutTrack":
+    """Driver-side hydrate of every TensorRef field of a track (so ``Batch.select`` works).
+
+    ``Batch.select`` silently passes unknown leaf types through unchanged and
+    ``TensorRef.select`` raises — so permuting a track that still carries
+    TensorRef proxies would desync those fields from the permuted ones.
+    Hydrating first costs one fetch of the per-rollout tensors (~10-20 MB).
+    """
+    from dataclasses import fields as dc_fields
+
+    import torch
+
+    from unirl.distributed.tensor.batch import Batch
+    from unirl.distributed.tensor.transport import TensorRef
+
+    def hydrate_ragged(tm):
+        # _hydrate_tensor_meta cats per-worker parts along dim 0, which fails
+        # for 2D fields whose per-shard pad WIDTH differs (each worker padded
+        # its prompt block to its own max). Right-pad parts to the global max
+        # first — the same layout TextTokenCondition.concat produces (real
+        # tokens left, pad right; replay reads real lengths from the mask, so
+        # the pad value is immaterial).
+        if not tm.spans:
+            return None
+        parts = [s.local() for s in tm.spans]
+        if len(parts) == 1:
+            return parts[0]
+        if parts[0].dim() >= 2:
+            widths = {int(p.shape[1]) for p in parts}
+            if len(widths) > 1:
+                target = max(widths)
+                padded = []
+                for p in parts:
+                    if int(p.shape[1]) < target:
+                        pad = p.new_zeros((p.shape[0], target - p.shape[1]) + tuple(p.shape[2:]))
+                        p = torch.cat([p, pad], dim=1)
+                    padded.append(p)
+                parts = padded
+        return torch.cat(parts, dim=0)
+
+    def walk(value):
+        if isinstance(value, TensorRef):
+            return hydrate_ragged(value)
+        if isinstance(value, Batch):
+            for f in dc_fields(value):
+                object.__setattr__(value, f.name, walk(getattr(value, f.name)))
+            return value
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [walk(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(walk(v) for v in value)
+        return value
+
+    return walk(track)
+
+
+def balance_track_for_dp(track: "RolloutTrack", *, dp_size: int, min_spread: float = 0.05) -> "RolloutTrack":
+    """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
+
+    Greedy LPT under an equal-count constraint (DP_SCATTER splits the batch
+    into dp_size EQUAL contiguous chunks): longest sample first, into the
+    eligible bucket with the smallest running token sum. Advantages are
+    computed BEFORE this point (per-group stats already attached per
+    sample), so sample order is free to change — the same invariant verl
+    relies on. Buckets are laid out contiguously in worker order.
+    """
+    lengths = getattr(track.segment, "lengths", None) if track.segment is not None else None
+    if lengths is None:
+        logger.warning("balance_dp_batch: track has no segment lengths; skipping balance.")
+        return track
+    total = int(track.batch_size)
+    dp = int(dp_size)
+    if total % dp != 0 or dp <= 1:
+        return track
+    cap = total // dp
+    lens = [int(x) for x in lengths.tolist()]
+    if len(lens) != total:
+        logger.warning("balance_dp_batch: lengths (%d) != batch_size (%d); skipping.", len(lens), total)
+        return track
+    # Cheap skip guard: compute the CURRENT-order per-rank token sums in pure
+    # Python — when the spread is already tiny (uniform-length workloads, e.g.
+    # multiple-choice answers or fixed-step diffusion latents), the hydrate +
+    # reorder + real-tensor dispatch is pure overhead (measured +9.6s/step on
+    # VL geo3k).
+    current = [sum(lens[r * cap : (r + 1) * cap]) for r in range(dp)]
+    avg = sum(current) / dp
+    if avg <= 0 or (max(current) - min(current)) / avg < float(min_spread):
+        return track
+    order = sorted(range(total), key=lambda i: (-lens[i], i))
+    buckets = [[] for _ in range(dp)]
+    sums = [0] * dp
+    for i in order:
+        best = min((b for b in range(dp) if len(buckets[b]) < cap), key=lambda b: sums[b])
+        buckets[best].append(i)
+        sums[best] += lens[i]
+    perm = [i for bucket in buckets for i in bucket]
+    # TensorRef fields now support native select (lazy segment views over the
+    # remote refs — see TensorRef.select_units), so the permutation needs NO
+    # driver-side hydration: data stays worker-resident and materializes on the
+    # destination worker. hydrate_track() remains available as a utility but is
+    # no longer on this path.
+    balanced = track.select(perm)
+    logger.info(
+        "balance_dp_batch: rank token sums min=%d max=%d (spread %.1f%%)",
+        min(sums),
+        max(sums),
+        100.0 * (max(sums) - min(sums)) / max(1, sum(sums) // dp),
+    )
+    return balanced
 
 
 def _track_with_field(track: TR, field_name: str, value: Any) -> TR:
