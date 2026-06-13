@@ -197,21 +197,14 @@ class TensorRef(Batch):
     @classmethod
     def concat(cls, items: "list[TensorRef]") -> "TensorRef":
         spans: List[TensorSpan] = []
-        for m in items:
-            spans.extend(m.spans)
-        first = items[0]
-        total = sum(s.stop - s.start for s in spans)
-        return TensorRef(
-            spans=spans,
-            shape=(total, *first.shape[1:]) if first.shape else None,
-            dtype=first.dtype,
-            device=first.device,
-        )
+        for item in items:
+            spans.extend(item.spans)
+        return items[0]._from_spans(spans)
 
     def select(self, indices) -> "TensorRef":
-        """Re-index along the unit axis by building ref VIEWS (no data motion)."""
+        """Re-index along the row axis by building ref VIEWS (no data motion)."""
         idx = [int(i) for i in (indices.tolist() if hasattr(indices, "tolist") else indices)]
-        return self.select_units(idx)
+        return self._gather(idx)
 
     def _offsets(self) -> List[int]:
         offsets = [0]
@@ -219,60 +212,64 @@ class TensorRef(Batch):
             offsets.append(offsets[-1] + (s.stop - s.start))
         return offsets
 
-    def _pieces_for_range(self, g0: int, g1: int, offsets: List[int]) -> List[Tuple[int, int, int]]:
-        """Global unit range [g0, g1) -> ordered (ref_idx, local_start, local_end) pieces."""
-        if not (0 <= g0 <= g1 <= offsets[-1]):
-            raise IndexError(f"unit range [{g0}, {g1}) out of bounds for size {offsets[-1]}")
-        pieces: List[Tuple[int, int, int]] = []
-        r = 0
-        while g0 < g1:
-            while offsets[r + 1] <= g0:
-                r += 1
-            take = min(g1, offsets[r + 1]) - g0
-            pieces.append((r, g0 - offsets[r], g0 - offsets[r] + take))
-            g0 += take
-        return pieces
+    def select_ranges(self, ranges: List[Tuple[int, int]]) -> "TensorRef":
+        """Re-index by global ``[start, stop)`` row ranges — the single selection engine.
 
-    def _from_pieces(self, pieces: List[Tuple[int, int, int]]) -> "TensorRef":
-        """Build the selected ref: a whole-span piece passes the span through
-        untouched (a boundary-aligned selection costs nothing); a partial piece
-        becomes a new :class:`TensorSpan` (nested spans flatten in the ctor)."""
-        spans: List[TensorSpan] = []
-        for r, s, e in pieces:
-            src = self.spans[r]
-            if s == 0 and e == src.stop - src.start:
-                spans.append(src)
-            else:
-                spans.append(TensorSpan(src, s, e))
-        total = sum(sp.stop - sp.start for sp in spans)
+        Splits each range at span boundaries into views: a boundary-aligned piece
+        reuses its span untouched (zero-cost); a partial piece wraps in a new
+        :class:`TensorSpan` (nested spans flatten in the ctor). No sort/dedup, so
+        out-of-order, overlapping, and empty range lists behave as given.
+        """
+        span_offsets = self._offsets()  # cumulative row boundaries; span_offsets[-1] == total rows
+        selected: List[TensorSpan] = []
+        for range_start, range_stop in ranges:
+            range_start, range_stop = int(range_start), int(range_stop)
+            if not (0 <= range_start <= range_stop <= span_offsets[-1]):
+                raise IndexError(
+                    f"row range [{range_start}, {range_stop}) out of bounds for size {span_offsets[-1]}"
+                )
+            cursor = range_start
+            span_idx = 0
+            while cursor < range_stop:
+                while span_offsets[span_idx + 1] <= cursor:
+                    span_idx += 1
+                take = min(range_stop, span_offsets[span_idx + 1]) - cursor
+                src_span = self.spans[span_idx]
+                local_start = cursor - span_offsets[span_idx]
+                local_stop = local_start + take
+                selected.append(
+                    src_span
+                    if (local_start == 0 and local_stop == src_span.nrows)
+                    else TensorSpan(src_span, local_start, local_stop)
+                )
+                cursor += take
+        return self._from_spans(selected)
+
+    def _from_spans(self, spans: List[TensorSpan]) -> "TensorRef":
+        """Build a ref over the given spans, deriving shape from the row total.
+
+        Deliberately does NOT carry ``grad`` / ``retain_grad_flag`` — matches the
+        existing constructor default for a freshly selected/sliced view.
+        """
+        total_rows = sum(span.nrows for span in spans)
         return TensorRef(
             spans=spans,
-            shape=(total, *self.shape[1:]) if self.shape else None,
+            shape=(total_rows, *self.shape[1:]) if self.shape else None,
             dtype=self.dtype,
             device=self.device,
         )
 
-    def select_units(self, idx: List[int]) -> "TensorRef":
-        """Arbitrary re-index (gather/permute) as lazy ref views."""
-        offsets = self._offsets()
-        # Coalesce consecutive indices into ranges, then map ranges to pieces.
-        pieces: List[Tuple[int, int, int]] = []
-        i = 0
-        while i < len(idx):
-            j = i + 1
-            while j < len(idx) and idx[j] == idx[j - 1] + 1:
-                j += 1
-            pieces.extend(self._pieces_for_range(int(idx[i]), int(idx[j - 1]) + 1, offsets))
-            i = j
-        return self._from_pieces(pieces)
-
-    def select_segments(self, segments: List[Tuple[int, int]]) -> "TensorRef":
-        """Re-index by global (start, end) unit ranges (PACKED token ranges)."""
-        offsets = self._offsets()
-        pieces: List[Tuple[int, int, int]] = []
-        for g0, g1 in segments:
-            pieces.extend(self._pieces_for_range(int(g0), int(g1), offsets))
-        return self._from_pieces(pieces)
+    def _gather(self, idx: List[int]) -> "TensorRef":
+        """Arbitrary re-index (gather/permute): coalesce consecutive runs into ranges."""
+        ranges: List[Tuple[int, int]] = []
+        run_start = 0
+        while run_start < len(idx):
+            run_end = run_start + 1
+            while run_end < len(idx) and idx[run_end] == idx[run_end - 1] + 1:
+                run_end += 1
+            ranges.append((int(idx[run_start]), int(idx[run_end - 1]) + 1))
+            run_start = run_end
+        return self.select_ranges(ranges)
 
     def with_spans(self, spans: List[Any]) -> "TensorRef":
         """Clone with substituted (routed) spans, preserving shape/dtype/device.
@@ -287,29 +284,18 @@ class TensorRef(Batch):
             device=self.device,
         )
 
-    def _slice_by_refs(self, start: int, end: int) -> "TensorRef":
-        """Contiguous row range ``[start:end)`` — the structural inverse of concat.
-
-        A range on ref boundaries hands the refs back untouched (the exact
-        inverse of the DP collect→re-dispatch round-trip); an intra-ref range
-        wraps the boundary refs in :class:`TensorSpan` — same code path, the
-        whole-piece pass-through in ``_from_pieces`` is what preserves the
-        zero-cost aligned case.
-        """
-        return self.select_segments([(int(start), int(end))])
-
     def slice(self, start, end) -> "TensorRef":
         # CONCAT path: Batch.slice → _slice_value → value.slice(start, end).
-        return self._slice_by_refs(start, end)
+        return self.select_ranges([(int(start), int(end))])
 
     def __getitem__(self, key) -> "TensorRef":
         # PACKED path: _slice_packed_data does ``value[cu[start]:cu[end]]``.
         if isinstance(key, slice):
             if key.step not in (None, 1):
                 raise NotImplementedError("TensorRef supports only contiguous (step=1) slicing")
-            lo = 0 if key.start is None else int(key.start)
-            hi = self.batch_size if key.stop is None else int(key.stop)
-            return self._slice_by_refs(lo, hi)
+            start = 0 if key.start is None else int(key.start)
+            stop = self.batch_size if key.stop is None else int(key.stop)
+            return self.select_ranges([(start, stop)])
         raise NotImplementedError(f"TensorRef indexing supports slices only, got {type(key).__name__}")
 
     def transform(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "TensorRef":

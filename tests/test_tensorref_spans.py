@@ -97,7 +97,7 @@ def test_packed_segment_view():
     p0 = torch.arange(10).float()
     p1 = torch.arange(100, 106).float()
     pm = _meta(p0, p1)
-    pv = pm.select_segments([(12, 16), (0, 3)])  # out-of-order token ranges
+    pv = pm.select_ranges([(12, 16), (0, 3)])  # out-of-order token ranges
     assert pv.batch_size == 7
     assert torch.equal(pv.materialize(backend=None), torch.cat([p1[2:6], p0[0:3]]))
 
@@ -121,7 +121,7 @@ def test_with_spans_preserves_sizes():
 
 def test_empty_selection():
     p0 = torch.arange(10).float()
-    e = _meta(p0).select_segments([])
+    e = _meta(p0).select_ranges([])
     assert e.batch_size == 0
     assert e.materialize(backend=None).numel() == 0
 

@@ -503,12 +503,12 @@ def _select_packed_data(
             "construct via the regular dataclass __init__ with per-sample lists."
         )
     if not indices:
-        if hasattr(value, "select_segments"):
-            return value.select_segments([])
+        if hasattr(value, "select_ranges"):
+            return value.select_ranges([])
         return value[:0].clone()
-    if hasattr(value, "select_segments"):
-        # TensorRef: token-range gather as a lazy segment view (no data motion).
-        return value.select_segments(
+    if hasattr(value, "select_ranges"):
+        # TensorRef: token-range gather as a lazy range view (no data motion).
+        return value.select_ranges(
             [(int(cu[i].item()), int(cu[i + 1].item())) for i in indices]
         )
     chunks = [value[int(cu[i].item()) : int(cu[i + 1].item())] for i in indices]
