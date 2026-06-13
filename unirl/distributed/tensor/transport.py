@@ -107,7 +107,7 @@ class HandleView:
         side can slice — dropping it must not touch the parent's ref count
         (the parent's routing_copy is equally bare).
         """
-        return HandleView(self.base.routing_copy(), self.start - 0, self.end - 0)
+        return HandleView(self.base.routing_copy(), self.start, self.end)
 
     def __getstate__(self) -> dict:
         return {"base": self.base, "start": self.start, "end": self.end}
