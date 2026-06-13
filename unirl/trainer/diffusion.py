@@ -3,18 +3,15 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor.transport import TensorMeta, map_tree
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
-from unirl.types.media_preview import build_media_preview_for_track
-from unirl.types.primitives import Images, Videos
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import _hydrate_tensor_meta
@@ -22,47 +19,6 @@ from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
-
-
-def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
-    """Smallest sample count >= ``min_items`` landing on a TensorMeta ref boundary.
-
-    ``decoded`` reaches the driver dehydrated: its tensor leaf (``Images.pixels``
-    / ``Videos.frames``) is a ``TensorMeta`` whose refs partition the batch by DP
-    shard, and ``TensorMeta`` only supports ref-boundary slicing. The cheapest
-    preview prefix is therefore the first shard boundary covering ``min_items``
-    samples — slicing there lets media logging hydrate one shard instead of the
-    full decoded batch. ``Videos`` ref sizes count frames (PACKED), so shard
-    frame boundaries are mapped back to sample indices via the driver-side
-    ``cu_seqlens``. Returns the full batch size when the leaf is already a real
-    tensor (nothing to save) or a boundary cannot be mapped.
-    """
-    total = len(decoded)
-    want = max(1, min(int(min_items), total))
-    if isinstance(decoded, Images):
-        meta = decoded.pixels
-        if not isinstance(meta, TensorMeta):
-            return total
-        rows = 0
-        for size in meta.sizes:
-            rows += int(size)
-            if rows >= want:
-                return rows
-        return total
-    meta = decoded.frames
-    cu = decoded.cu_seqlens
-    if not isinstance(meta, TensorMeta) or cu is None:
-        return total
-    sample_at_frame = {int(v): i for i, v in enumerate(cu.tolist())}
-    frames = 0
-    for size in meta.sizes:
-        frames += int(size)
-        sample_idx = sample_at_frame.get(frames)
-        if sample_idx is None:
-            return total
-        if sample_idx >= want:
-            return sample_idx
-    return total
 
 
 class DiffusionTrainer(BaseTrainer):
@@ -108,15 +64,6 @@ class DiffusionTrainer(BaseTrainer):
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.
         self._adv_use_global_std = bool(adv_use_global_std)
-        # WandB rollout media (generated images/videos): read from the optional
-        # ``logging`` block. ``log_media`` gates it; ``media_log_interval`` throttles
-        # it (every N rollouts); ``media_max_items`` caps samples per panel. Logged
-        # from the rollout's ``decoded`` payload before it is dropped (see train_step).
-        self._log_media = bool(logging_cfg.get("log_media", False)) if logging_cfg is not None else False
-        self._media_max_items = int(logging_cfg.get("media_max_items", 8)) if logging_cfg is not None else 8
-        self._media_log_interval = (
-            max(1, int(logging_cfg.get("media_log_interval", 1))) if logging_cfg is not None else 1
-        )
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -344,40 +291,6 @@ class DiffusionTrainer(BaseTrainer):
             init_noise_latent_shape=init_noise_latent_shape,
         )
 
-    def _maybe_log_media(self, rollout_id: int, req: RolloutReq, resp: Any) -> None:
-        """Log generated rollout media (images/videos) to wandb.
-
-        No-op unless ``logging.log_media`` is set and this rollout falls on the
-        ``media_log_interval`` cadence. Must be called AFTER scoring (rewards
-        drive the captions) and BEFORE :meth:`_drop_decoded` nulls the generated
-        payload.
-
-        ``track.decoded`` arrives at the driver with its tensor leaves dehydrated
-        to ``TensorMeta`` proxies (``Worker.call`` packs every returned tensor),
-        so we hydrate them back to real ``Images`` / ``Videos`` before building
-        the preview. Only ``media_max_items`` samples end up in the preview, so
-        the dehydrated batch is first sliced to the smallest DP-shard
-        (ref-boundary) prefix covering them — the driver pulls one shard instead
-        of the full decoded batch (see :func:`_ref_aligned_prefix_len`).
-        Non-media tracks (``Texts``, ``Audios``, …) are skipped without any
-        fetch."""
-        if not self._log_media or (rollout_id % self._media_log_interval != 0):
-            return
-        wb = self.wandb_logger
-        if wb is None or not wb.initialized:
-            return
-        for track in resp.tracks.values():
-            if not isinstance(track.decoded, (Images, Videos)):
-                continue
-            prefix = _ref_aligned_prefix_len(track.decoded, self._media_max_items)
-            if 0 < prefix < len(track.decoded):
-                track.decoded = track.decoded.slice(0, prefix)
-            track.decoded = map_tree(track.decoded, _hydrate_tensor_meta)
-            media = build_media_preview_for_track(req=req, track=track, max_items=self._media_max_items)
-            if media is not None:
-                wb.log_generated_media(rollout_id, media)
-                break  # single-track for now; revisit if multi-track lands
-
     def train_step(
         self,
         req: RolloutReq,
@@ -391,7 +304,7 @@ class DiffusionTrainer(BaseTrainer):
         ``training_progress`` in ``[0, 1]`` drives clip-range / LR schedules
         inside the algorithm. The reference trainer is stateless — the
         outer training loop owns step counting; ``rollout_id`` only keys the
-        wandb panels (see :meth:`_log_rollout`).
+        wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
 
         ``sync_weights`` pushes the latest LoRA into the engine between
         ``wake_up`` and ``generate`` — one wake/sleep instead of two, with this
@@ -449,47 +362,63 @@ class DiffusionTrainer(BaseTrainer):
             if track.rewards is not None:
                 resp.tracks[name] = track.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
 
-        # Log generated media (images/videos) to wandb BEFORE decoded is dropped.
-        self._maybe_log_media(rollout_id, req, resp)
-        self._drop_decoded(resp)
+        self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
         result = self.stack.train_track(track, training_progress=float(training_progress))
-        self._log_rollout(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
+        self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
-    def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+        save_mode: str = "full",
+    ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
         ``weight_sync_interval``: sync the adapter into the engine every N
         rollouts (fused into ``train_step``'s generate; no-op trainside).
 
-        Deferred (out of scope for the first runnable trainer):
-        ``num_updates_per_batch`` multi-epoch replay, checkpoint cadence,
-        evaluation cadence.
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
+        ``./checkpoints``); ``save_mode="adapter"`` keeps only the LoRA keys.
+        ``load_dir``: restore from a checkpoint directory and RESUME from its
+        saved step — ``num_rollouts`` is the TOTAL budget, so resuming
+        checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.
         """
         interval = max(1, weight_sync_interval)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
-            for rollout_id in range(num_rollouts):
+            for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet).
-                sync_weights = rollout_id > 0 and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate.
+                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                    resumed and rollout_id == start_rollout
+                )
                 result, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
-                logger.info(
-                    "rollout %d/%d  reward=%.4f  loss=%.4f  grad_norm=%.4f  lr=%.2e",
-                    rollout_id + 1,
-                    num_rollouts,
-                    mean_reward,
-                    result.loss,
-                    result.grad_norm,
-                    result.lr,
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
             self._finish_wandb()

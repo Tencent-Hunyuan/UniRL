@@ -1,13 +1,12 @@
 import functools
+import json
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+import os
+from typing import Any, Dict, List, Optional
 
 from omegaconf import DictConfig
 
 from unirl.distributed.group.device_pool import DevicePool
-
-if TYPE_CHECKING:
-    from unirl.train.stack import TrainStepResult
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +53,11 @@ class BaseTrainer:
     """Owns a DevicePool. Subclasses use ``placement(self.pool, ...)`` to
     instantiate their ``Remote`` roles inside ``__init__`` / ``setup``.
 
-    Also owns the optional (rank-0/driver) Weights & Biases logger shared by
-    every v2 trainer. Subclasses call :meth:`_init_wandb` once at the top of
-    ``train``, :meth:`_log_rollout` after each ``train_step`` (a no-op when
-    reporting is off), and :meth:`_finish_wandb` in a ``finally``.
+    Also owns the (rank-0/driver) Weights & Biases logger shared by every
+    trainer. Subclasses call :meth:`_init_wandb` once at the top of ``train``
+    (it always builds a logger — a no-op null-object when reporting is off),
+    then ``self.wandb_logger.log_rollout_step(...)`` / ``log_progress(...)``
+    after each ``train_step``, and :meth:`_finish_wandb` in a ``finally``.
     """
 
     def __init__(
@@ -81,16 +81,31 @@ class BaseTrainer:
         )
         self.pool.setup()
 
-        # Optional wandb logging (driver/rank-0). Stays ``None`` until
-        # _init_wandb runs, and remains ``None`` when the ``logging`` block is
-        # absent or ``report_to_wandb`` is off — every _log_rollout then no-ops.
+        # Driver/rank-0 wandb logger. Starts as a disabled null-object so trainers
+        # can call ``self.wandb_logger.X(...)`` without guards even before
+        # _init_wandb runs; _init_wandb replaces it with the configured (possibly
+        # live) logger. Disabled => wandb methods no-op, log_progress still prints.
+        # The optimizer-step counter now lives on the logger.
+        from unirl.utils.wandb_logger import UniRLWandBLogger
+
         self.logging_cfg = logging_cfg
-        self.wandb_logger = None
-        self._optimizer_step = 0
+        self.wandb_logger = UniRLWandBLogger(enabled=False)
+        # Driver-side state from a resumed checkpoint's trainer_state.json
+        # (wandb run id / step axis); populated by maybe_load_checkpoint,
+        # consumed by _init_wandb. Empty for fresh runs.
+        self._resume_state: Dict[str, Any] = {}
 
         # Reclaim per-rollout transport buffers after every train_step, centrally,
         # so each subclass train loop doesn't have to remember to.
         self._install_train_step_reset_hook()
+
+        # Time the standard step collaborators (rollout / weight_sync / reward /
+        # stack) and surface them as perf/<phase>_time_s, centrally, so every
+        # trainer gets step attribution without per-trainer edits. The machinery
+        # lives with the rest of the logging stack in wandb_logger.
+        from unirl.utils.wandb_logger import install_phase_timing
+
+        install_phase_timing(self)
 
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 
@@ -124,23 +139,36 @@ class BaseTrainer:
 
     # ---- wandb logging (shared by all v2 trainers) -------------------------
 
-    def _init_wandb(self, *, num_rollouts: int, extra: Optional[Dict[str, Any]] = None) -> None:
-        """Open the (rank-0/driver) wandb run from the optional ``logging`` block.
+    def _init_wandb(self, *, num_rollouts: Optional[int] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+        """Build the (rank-0/driver) wandb logger from the optional ``logging`` block.
 
-        No-op when the block is absent or ``report_to_wandb`` is off — every
-        subsequent :meth:`_log_rollout` then short-circuits. The whole ``train``
-        loop runs on the driver, so ``rank=0``.
+        The single logger factory shared by every trainer. ALWAYS assigns
+        ``self.wandb_logger`` — a live run when ``report_to_wandb`` is on and a
+        ``project_name`` is set, otherwise a disabled null-object whose wandb
+        methods no-op (so trainers call ``self.wandb_logger.X(...)`` without
+        guards, while ``log_progress`` still prints). The whole ``train`` loop
+        runs on the driver, so ``rank=0``.
+
+        Reads (all under the ``logging`` block, all optional): ``report_to_wandb``,
+        ``project_name``, ``run_name``, ``entity`` (falls back to ``WANDB_ENTITY``),
+        ``tags`` (list or comma-separated string), ``logging_dir``, and the media
+        knobs ``log_media`` / ``media_max_items`` / ``media_log_interval``. Enabling
+        reporting inherently requires a successful wandb init (it raises on
+        failure) — there is no opt-out flag.
         """
-        cfg = self.logging_cfg
-        if cfg is None:
-            return
-        if not bool(cfg.get("report_to_wandb", False)) or not cfg.get("project_name"):
-            return
-
         from unirl.utils.wandb_logger import init_logger
 
+        cfg = self.logging_cfg or {}
+        report = bool(cfg.get("report_to_wandb", False)) and bool(cfg.get("project_name"))
+
         raw_tags = cfg.get("tags")
-        tags = [str(t) for t in raw_tags] if raw_tags else None
+        if isinstance(raw_tags, str):
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        elif raw_tags:
+            tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+        else:
+            tags = None
+
         sampling_params = getattr(self, "sampling_params", None)
         run_config: Dict[str, Any] = {
             "num_devices": self.num_devices,
@@ -153,107 +181,151 @@ class BaseTrainer:
 
         project = cfg.get("project_name")
         self.wandb_logger = init_logger(
-            project=str(project),
+            project=str(project) if project else None,
             run_name=cfg.get("run_name"),
             config=run_config,
+            log_dir=cfg.get("logging_dir"),
             rank=0,
             tags=tags,
-            entity=cfg.get("entity") or None,
+            entity=(cfg.get("entity") or os.environ.get("WANDB_ENTITY") or None),
+            log_media=bool(cfg.get("log_media", False)),
+            media_max_items=int(cfg.get("media_max_items", 8)),
+            media_log_interval=int(cfg.get("media_log_interval", 1)),
+            enabled=report,
+            run_id=self._resume_state.get("wandb_run_id"),
+            optimizer_step=int(self._resume_state.get("optimizer_step") or 0),
         )
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
 
-    @staticmethod
-    def _drop_decoded(resp: Any) -> None:
-        """Free the reward-only ``decoded`` payload before training.
-
-        ``decoded`` (generated Images/Videos/Texts) is consumed upstream by
-        ``reward.score_and_attach`` and is never read by training (which uses
-        only segment/conditions/advantages). Nulling it on the driver ``resp``
-        before ``train_track`` releases the driver-held TensorStore handles so
-        the (often GPU-resident, trainside) storage can free before the
-        optimizer-step memory peak — worker-side nulling alone leaves the driver
-        refs alive through ``_log_rollout``. ``media_preview`` is left intact
-        for logging. Call after scoring / advantages (and any decoded-reading
-        debug dump), immediately before dispatching to ``train_track``.
-        """
-        for track in resp.tracks.values():
-            track.decoded = None
-
-    def _log_rollout(
+    def _drop_decoded(
         self,
-        rollout_id: int,
-        results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+        req: Any,
         resp: Any,
         *,
-        step_time_s: Optional[float] = None,
+        rollout_id: int,
+        media_prompts: Optional[Dict[str, List[str]]] = None,
     ) -> None:
-        """Log one rollout's metrics to wandb. No-op when reporting is off.
+        """Upload media previews (if due this rollout) then free ``decoded``.
 
-        ``rollout/*`` carries reward/advantage (and, for AR tracks, response-length)
-        distribution stats (single-track keys unprefixed; multi-track auto-prefixed
-        by track name). ``train/*``
-        carries optimizer scalars + algorithm metrics — per-track namespaced
-        (``<track>/<key>``) when ``results`` is a ``{track: TrainStepResult}``
-        dict, as for the PE trainer. ``perf/rollout_time_s`` is the optional
-        wall-clock for the step.
+        Two jobs at the single pre-train chokepoint every trainer hits — and
+        both FINISH here, so no preview payload (PIL images / raw video
+        tensors) ever rides into the ``train_track`` dispatch (the track is
+        DP_SCATTER-serialized to the training workers right after this call):
+
+        1. **Media logging (driver-side).** When the logger wants media this
+           rollout (``UniRLWandBLogger.should_log_media``), take each track's
+           inbound ``media_preview`` (populated upstream by an actor-side
+           collector — none exist today) or build one from the still-live
+           ``decoded`` (``build_media_preview_for_track`` hydrates a single DP
+           shard), cap to ``media_max_items``, and upload it immediately at the
+           same ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step`
+           uses, so the panels align. ``media_prompts`` supplies per-track,
+           sample-aligned captions for multi-track recipes whose ``req`` text is
+           shorter than the expanded track.
+        2. **Free the per-rollout payloads.** ``decoded`` (generated
+           Images/Videos/Texts) is consumed upstream by
+           ``reward.score_and_attach`` and never read by training (which uses
+           only segment/conditions/advantages); ``media_preview`` was just
+           uploaded (or skipped — off-cadence rollouts drop it unlogged).
+           Nulling both on the driver ``resp`` before ``train_track`` releases
+           the driver-held TensorStore handles before the optimizer-step memory
+           peak and keeps the training dispatch free of logging payloads.
+
+        Call after scoring / advantages (and any decoded-reading debug dump),
+        immediately before dispatching to ``train_track``.
         """
         wb = self.wandb_logger
-        if wb is None or not wb.initialized:
-            return
+        if wb is not None and wb.should_log_media(rollout_id):
+            from unirl.types.media_preview import build_media_preview_for_track
 
-        from unirl.utils.wandb_logger import aggregate_stage_results
-        from unirl.utils.wandb_metrics import compute_rollout_resp_metrics
+            prompts_by_track = media_prompts or {}
+            multi = len(resp.tracks) > 1
+            for name, track in resp.tracks.items():
+                preview = track.media_preview
+                if preview is None and track.decoded is not None:
+                    preview = build_media_preview_for_track(
+                        req=req,
+                        track=track,
+                        max_items=wb.media_max_items,
+                        prompts=prompts_by_track.get(name),
+                    )
+                if preview is None:
+                    continue
+                if len(preview) > wb.media_max_items:
+                    preview = preview.slice(0, wb.media_max_items)
+                key = f"rollout/{name}/generated_media" if multi else "rollout/generated_media"
+                wb.log_generated_media(rollout_id + 1, preview, key=key)
 
-        step = rollout_id + 1
-        # ``trunc_len`` (AR ``max_new_tokens``) keys ``rollout/trunc_ratio``; trainers
-        # without AR sampling params (diffusion) give ``None`` → trunc_ratio is skipped
-        # while any AR track's response-length stats still log.
-        trunc_len = getattr(getattr(self, "sampling_params", None), "max_new_tokens", None)
-        wb.log_rollout(step, compute_rollout_resp_metrics(resp=resp, trunc_len=trunc_len))
-
-        if isinstance(results, dict):
-            # PE multi-track: one optimizer step, metrics namespaced by track name.
-            train_metrics: Dict[str, Any] = {
-                f"{name}/{key}": value
-                for name, result in results.items()
-                for key, value in aggregate_stage_results([result]).items()
-            }
-            if any(bool(r.has_backward) for r in results.values()):
-                self._optimizer_step += 1
-                wb.log_step(self._optimizer_step, train_metrics)
-        else:
-            self._log_train_per_step(results)
-
-        if step_time_s is not None:
-            wb.log_perf(step, {"rollout_time_s": float(step_time_s)})
-
-    def _log_train_per_step(self, result: "TrainStepResult") -> None:
-        """Log the ``train/`` panel one wandb point PER optimizer step.
-
-        With ``num_updates_per_batch > 1`` the train stack attaches each optimizer
-        step's own metrics on ``result.per_update`` (one Mapping per update, in
-        order). We emit one ``log_step`` per update at its own ``_optimizer_step``
-        with the metrics **unprefixed**, so each metric (e.g. ``train/ratio_mean``)
-        stays a single per-step series — truthful and never averaged across updates,
-        so it reads as a sawtooth (the on-policy step 1.0, the off-policy steps
-        drifting). One series regardless of ``num_updates_per_batch`` (no
-        ``update{i}/`` proliferation). A single update logs the aggregate once.
-        """
-        from unirl.utils.wandb_logger import aggregate_stage_results
-
-        wb = self.wandb_logger
-        if wb is None:
-            return
-        if len(result.per_update) > 1:
-            for metrics in result.per_update:
-                self._optimizer_step += 1
-                wb.log_step(self._optimizer_step, dict(metrics))
-        elif result.has_backward:
-            self._optimizer_step += 1
-            wb.log_step(self._optimizer_step, dict(aggregate_stage_results([result])))
+        for track in resp.tracks.values():
+            track.decoded = None
+            track.media_preview = None
 
     def _finish_wandb(self) -> None:
         """Close the wandb run if one is open."""
         if self.wandb_logger is not None:
             self.wandb_logger.finish()
+
+    # ---- checkpointing (shared by single-backend trainers) -----------------
+
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+        save_mode: str = "full",
+    ) -> None:
+        """Save every ``save_interval`` rollouts (and on the last one).
+
+        ``save_interval <= 0`` disables saving. Writes the backend state to
+        ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
+        to ``./checkpoints``; ``save_mode="adapter"`` keeps only the LoRA keys).
+        Paths resolve to absolute here, on the driver — the backend runs in
+        Ray workers whose CWD differs from the driver's.
+        """
+        if save_interval <= 0:
+            return
+        step = rollout_id + 1
+        # Save on the interval, and always on the final rollout.
+        if step % save_interval != 0 and step < num_rollouts:
+            return
+        base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
+        path = os.path.join(base_dir, f"checkpoint-{step}")
+        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        self.backend.save(path, step=step, mode=save_mode)
+        # Driver-owned state rides beside the worker-written checkpoint.pt:
+        # the wandb run id + train/ step axis let a resume append to the SAME
+        # wandb run instead of starting a fresh, misaligned one.
+        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+
+    def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
+        """Restore training state from ``load_dir``; return the rollout step to resume from.
+
+        Returns 0 for a fresh run (``load_dir`` empty) or a checkpoint that
+        predates step recording. Restores model/optimizer/scheduler plus the
+        optimizer-step counter; the trainer loop continues from the returned
+        step. Resolved to an absolute path on the driver (worker CWDs differ).
+        """
+        if not load_dir:
+            return 0
+        load_dir = os.path.abspath(load_dir)
+        logger.info("Loading checkpoint from %s", load_dir)
+        result = self.backend.load(load_dir)
+        if isinstance(result, list):  # BROADCAST dispatch collects one result per worker
+            result = result[0]
+        start = int(result or 0)
+        state_path = os.path.join(load_dir, "trainer_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                self._resume_state = json.load(f)
+        logger.info("Checkpoint restored; resuming at rollout %d", start)
+        if num_rollouts is not None and start >= num_rollouts:
+            logger.warning(
+                "Checkpoint step %d >= num_rollouts %d — nothing left to train (num_rollouts is the TOTAL budget).",
+                start,
+                num_rollouts,
+            )
+        return start

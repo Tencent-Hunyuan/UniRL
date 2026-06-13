@@ -146,6 +146,12 @@ reward:
   # without \boxed{} (Qwen3-Base + thinking often reasons to the answer unboxed),
   # so it does not under-count correct generations / inflate zero-advantage groups.
   _target_: unirl.reward.service.RewardService
+  # keep = score the partial text of truncated (length-capped) traces instead of
+  # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.
+  # As responses lengthen and truncation approaches 100%, the default "zero" would
+  # collapse reward_mean; "keep" stays flat (verl parity). Use "soft" for verl's
+  # graded overlong penalty, or "zero" to restore the anti-ramble hard zeroing.
+  truncated_reward: keep
   backend:
     _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
     base_device: cpu

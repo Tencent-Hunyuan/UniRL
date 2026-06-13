@@ -27,9 +27,55 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     return _to_cpu_state_dict(full)
 
 
-def load_model_state_dict(model: nn.Module, state_dict: StateDict) -> None:
-    """Load a full state dict, broadcasting from rank 0 across ranks."""
+def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
+    """Load a full state dict, broadcasting from rank 0 across ranks.
+
+    ``strict=False`` loads a partial dict (adapter-only checkpoints): keys
+    absent from ``state_dict`` keep the model's current weights.
+    """
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+    options = _build_state_dict_options(
+        full_state_dict=True,
+        broadcast_from_rank0=True,
+        cpu_offload=False,
+        strict=strict,
+    )
+    try:
+        set_model_state_dict(model, state_dict, options=options)
+    except TypeError:
+        set_model_state_dict(model, state_dict)
+
+
+def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
+    """Rank-0 DCP gather of optimizer state.  Full state on rank 0, empty on others.
+
+    All ranks must call this (the gather is a collective).  Values are full
+    (unsharded) CPU tensors keyed by parameter FQN — symmetric with
+    :func:`gather_state_dict`.  ``optimizer.state_dict()`` is NOT a substitute:
+    under FSDP2 its values are this rank's local DTensor shards.
+    """
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
+    try:
+        full = dict(get_optimizer_state_dict(model, optimizer, options=options))
+    except TypeError:
+        full = dict(get_optimizer_state_dict(model, optimizer))
+
+    if _current_rank() != 0:
+        return {}
+    return full
+
+
+def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
+    """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
+
+    Pass the rank-0 dict from :func:`gather_optimizer_state_dict`; other ranks
+    pass ``{}`` (their input is ignored — tensors broadcast from rank 0 and
+    re-shard into each rank's local state).
+    """
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(
         full_state_dict=True,
@@ -37,9 +83,9 @@ def load_model_state_dict(model: nn.Module, state_dict: StateDict) -> None:
         cpu_offload=False,
     )
     try:
-        set_model_state_dict(model, state_dict, options=options)
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
     except TypeError:
-        set_model_state_dict(model, state_dict)
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
 def local_view(tensor: Tensor) -> Tensor:
@@ -276,8 +322,10 @@ def _global_clip_for_sharded_grads(
 __all__ = [
     "StateDict",
     "clip_grad_norm",
+    "gather_optimizer_state_dict",
     "gather_state_dict",
     "load_model_state_dict",
+    "load_optimizer_state_dict",
     "local_view",
     "is_materialized",
     "trainable_params",
