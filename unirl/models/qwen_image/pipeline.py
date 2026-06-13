@@ -17,7 +17,7 @@ constructs the four stages with the precision policy from the config.
 
 σ schedule contract
 -------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangRolloutEngine``
+The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
 / ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
 :func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
 ``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
@@ -106,7 +106,7 @@ class QwenImagePipeline(Pipeline):
         self.vae_decode = vae_decode if vae_decode is not None else QwenImageVAEDecodeStage(bundle)
         # ``shift`` is retained as an attribute so the hosting engine
         # (TrainsideRolloutEngine / VLLMOmniRolloutEngine /
-        # SGLangRolloutEngine) can read it when constructing the
+        # SGLangDiffusionRolloutEngine) can read it when constructing the
         # FlowMatchSchedulePolicy at startup. For Qwen-Image, the
         # checkpoint's scheduler_config.json enables dynamic shifting,
         # so the static ``shift`` value is only used as a fallback when
@@ -133,25 +133,20 @@ class QwenImagePipeline(Pipeline):
         either uses the upstream-canonical ``dynamic_overrides`` below
         OR raises loudly.
 
-        Canonical overrides come from upstream QwenImage scheduler
-        defaults (``diffusers/src/diffusers/pipelines/qwen_image
-        /pipeline_qwen_image.py``).
+        Canonical overrides live in
+        :func:`unirl.models.qwen_image.config._qwen_image_dynamic_overrides`
+        (mirrors ``Qwen/Qwen-Image``'s ``scheduler_config.json``, incl.
+        ``shift_terminal: 0.02``) — one source for the trainside and
+        rollout-engine paths.
         """
+        from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.from_pretrained(
             getattr(self.bundle, "pretrained_path", None),
             shift=float(self.shift),
             require_dynamic=True,
-            dynamic_overrides={
-                "base_shift": 0.5,
-                "max_shift": 1.15,
-                "base_image_seq_len": 256,
-                "max_image_seq_len": 4096,
-                "time_shift_type": "exponential",
-                "vae_scale_factor": 8,
-                "patch_size": 2,
-            },
+            dynamic_overrides=_qwen_image_dynamic_overrides(),
         )
 
     @classmethod

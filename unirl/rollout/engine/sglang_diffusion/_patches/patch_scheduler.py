@@ -53,7 +53,7 @@ def patch_scheduler() -> None:
     # The request classes used to key the dispatch dict. Imported from the
     # UniRL single-definition sites so they are the SAME objects the
     # adapter sends (dispatch is keyed by identity of `type(req)`).
-    from unirl.rollout.engine.sglang._patches.io_struct import (
+    from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         EncodePromptReqInput,
         GetWeightsDetailReqInput,
@@ -63,7 +63,7 @@ def patch_scheduler() -> None:
         UpdateWeightsFromDistributedReqInput,
         UpdateWeightsFromTensorReqInput,
     )
-    from unirl.rollout.engine.sglang._patches.lora_req import (
+    from unirl.rollout.engine.sglang_diffusion._patches.lora_req import (
         SetLoraFromTensorsReq,
     )
 

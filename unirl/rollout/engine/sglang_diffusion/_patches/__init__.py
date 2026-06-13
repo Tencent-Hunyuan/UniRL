@@ -5,6 +5,6 @@ UniRL can depend on stock upstream sglang instead of a hard fork. Install
 via ``SglangDiffusionHijack.hijack()`` -- see ``hijack.py``.
 """
 
-from unirl.rollout.engine.sglang._patches.hijack import SglangDiffusionHijack
+from unirl.rollout.engine.sglang_diffusion._patches.hijack import SglangDiffusionHijack
 
 __all__ = ["SglangDiffusionHijack"]

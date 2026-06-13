@@ -4,7 +4,7 @@ Consumed by :class:`SGLangLLMRolloutEngine`; the rollout actor (or, as a
 composed-engine child, :meth:`SGLangLLMEngineConfig.make_engine`) constructs it
 with ``config=<this>`` + ``device`` / ``strategy`` / ``rank`` / ``model_config``.
 
-Unlike :class:`unirl.rollout.engine.sglang.config.SGLangEngineConfig`
+Unlike :class:`unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig`
 (which delegates the model path to the per-actor ``model_config``), this
 LLM engine carries its own ``pretrained_model_ckpt_path`` field — PE-style
 LLM rollouts don't surface a diffusion ``ModelBundleConfig``.

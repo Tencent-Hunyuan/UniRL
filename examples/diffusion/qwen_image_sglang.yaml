@@ -1,27 +1,54 @@
 # @package _global_
-# SD3 + SGLang colocate, REPLAY logprob, v2 trainer, 2x8 H20 (matches v1 reference geometry).
+# Qwen-Image + sglang_diffusion (v2 engine) colocate, REPLAY logprob, DanceGRPO, 1x8 H20.
 #
-# Same as sd3_sglang_rollout_colocate.yaml except:
-#   - algorithm.old_logp_source: replay
-#       Trainer recomputes the π_old anchor via stage.replay at update time
-#       (the engine's best-effort native log-probs, if any, are ignored).
+# Composition: the rollout/sync blocks of sd3_sglang_replay_colocate.yaml
+# (v2 engine, stock sglang 0.5.12.post1 + in-process _patches) x the model/training
+# blocks of qwen_image_dancegrpo.yaml (trainside reference — the parity oracle:
+# same prompts/seeds/x_T must produce matching trajectories/logprobs).
 #
-#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_replay_colocate
+# Qwen-Image specifics vs the SD3 recipe:
+#   - model_family: qwen_image — adapter unpacks the packed [B,T+1,S,64]
+#     trajectory to true channels [B,T+1,16,H_lat,W_lat] (trainside segment form).
+#   - engine_kwargs.model_id pins SGLang pipeline resolution explicitly
+#     (otherwise the registry detector requires "qwen-image" in the lowercased
+#     checkpoint path).
+#   - σ schedule: scheduler_config.json declares dynamic shifting + shift_terminal
+#     0.02; the driver policy bakes both and the server uses the σ verbatim.
+#   - CFG: guidance_scale 1.0 (no CFG — matches the dancegrpo/mixgrpo recipes).
+#     For CFG runs use the official inference strength:
+#       sampling.guidance_scale: 4.0
+#       sampling.sampler_kwargs: {negative_prompt: " ", return_negative_prompt_embeds: true}
+#     (single-space negative — empty "" degenerates after the 34-token chat-template
+#     strip and divides the norm-preserving CFG blend by ~0; see QwenImagePipeline.)
+#
+#   1x8:  bash scripts/run_experiment_single_node.sh diffusion_rl/qwen_image_sglang
 
-num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
-batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
+num_devices: 8
+batch_size: 48                # prompts_per_rollout (matches qwen_image_dancegrpo)
 adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 num_rollouts: 10000
 
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: qwen_image_sglang
+  entity: null
+  tags: ["qwen-image", "dancegrpo", "grpo", "sglang-diffusion", "v2"]
+
 # Shared nodes: model_config + strategy defined once, referenced by
-# bundle / pipeline / rollout (SGLang needs both at init).
+# bundle / pipeline / rollout (the sglang engine needs both at init).
 model_config:
-  _target_: unirl.models.sd3.config.SD3PipelineConfig
-  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+  _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
   model_precision: bf16
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  max_sequence_length: 512
+  # Static-shift fallback only; the real checkpoint enables dynamic shifting
+  # (+ shift_terminal 0.02) via scheduler/scheduler_config.json — and the
+  # config's dynamic_shift_overrides carry the same canonical values for
+  # HF-repo-id paths.
   shift: 3.0
   # SGLang builds its LoRA ServerArgs from these two fields.
   use_lora: true
@@ -35,25 +62,29 @@ model_config:
     - attn.to_q
     - attn.to_v
 
-# Shared SDE strategy; SGLang resolves its sde_label from it.
+# Shared SDE strategy; the adapter resolves its sde_label from it.
+# DanceGRPO: Dance SDE kernel (the one algorithmic difference from FlowGRPO).
 strategy:
-  _target_: unirl.sde.kernels.FlowSDEStrategy
+  _target_: unirl.sde.kernels.DanceSDEStrategy
 
 bundle:
-  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
   config: ${model_config}
 
+# Trainer-side pipeline (REPLAY recomputes π_old via stage.replay); rollout
+# itself runs on the sglang engine below.
 pipeline:
-  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
   shift: 3.0
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  max_sequence_length: 512
   strategy: ${strategy}
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
-  block_class_names: ["JointTransformerBlock"]
+  block_class_names: ["QwenImageTransformerBlock"]
   trainable_attr: transformer
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
@@ -61,8 +92,10 @@ backend:
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
-    reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
-    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -78,11 +111,15 @@ backend:
     total_steps: 10000
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
-    rank: 32
-    alpha: 64
+    rank: 64
+    alpha: 128
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
+    # JointAttnProcessor naming — image stream (to_q/k/v, to_out.0) plus
+    # text stream (add_*_proj, to_add_out). Verified against the diffusers
+    # QwenImageTransformer2DModel attention layer; the sglang qwen DiT uses
+    # the same names in its non-quantized path, so LoRA wire keys land 1:1.
     target_modules:
       - attn.add_k_proj
       - attn.add_q_proj
@@ -97,12 +134,13 @@ rollout:
   _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
-    model_family: sd3
+    model_family: qwen_image
+    # Replay consumes the SERVER's fused text embeds (+ masks), so the 8B
+    # Qwen2.5-VL's rollout-vs-trainside numeric drift cancels out of the ratio.
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
     # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
-    # / VAE-decode peak memory (it runs the whole batch in one forward otherwise),
-    # without shrinking the logical batch. Mirrors sd3_trainside.
+    # / VAE-decode peak memory, without shrinking the logical batch.
     forward_batch_size: 16
     num_gpus: 1
     tp_size: 1
@@ -117,8 +155,10 @@ rollout:
       - attn.to_q
       - attn.to_v
     engine_kwargs:
-      model_type: sd3
-  # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
+      # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
+      # name "Qwen-Image") — local checkpoint dirs then need no special naming.
+      model_id: Qwen-Image
+  # The adapter reads ckpt/LoRA off model_config and sde_label off strategy.
   model_config: ${model_config}
   strategy: ${strategy}
 
@@ -144,7 +184,7 @@ algorithm:
   old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
-    path: unirl.models.sd3.conditions.SD3Conditions
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
   params: ${sampling}
 
 stack:
@@ -154,9 +194,6 @@ stack:
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
 
 data_source:
-  # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
-  # via data_path and exposes get_samples(bs). (DefaultDataSource returns only
-  # 8 hardcoded prompts — smoke-test use; training on it over-optimizes/collapses.)
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
@@ -168,10 +205,10 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 10
+  num_inference_steps: 12       # qwen_384 preset default
   guidance_scale: 1.0
-  height: 512
-  width: 512
+  height: 384
+  width: 384
   eta: 0.7
   samples_per_prompt: 16
   seed: 42
@@ -187,21 +224,10 @@ sampling:
     # (the validated reproduce setting); [0,1] spreads it across all steps.
     timestep_fraction: [0, 0.5]
 
-# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train).
-# Every N rollouts the loop pushes the freshly-trained adapter into SGLang.
-# 1 = on-policy; >1 lags rollout weights (off-policy drift).
 weight_sync_interval: 1
 
-# LoRA weight sync → SGLang rollout. Same bridge that vllm-omni uses; the
-# trainer's `weight_sync_interval` drives cadence — every N rollouts it calls
-# bridge.sync() to push the freshly-trained LoRA adapter into the engine
-# (fused into the generate wake/sleep, so a synced step costs one wake instead
-# of two).
 sync:
   _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
   verify: false  # SGLang engine lacks loaded_lora_checksums (only loaded_param_checksums); skip read-back
-  # Mirrors SD3PipelineConfig.weight_sync_param_name_prefix; must match the
-  # engine-side LoRA key naming (a wrong prefix yields wrong/zero loaded layers,
-  # which `verify` catches).
   param_prefix: "transformer."
   adapter_name: default
