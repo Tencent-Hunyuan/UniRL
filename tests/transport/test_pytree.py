@@ -25,7 +25,7 @@ from unirl.distributed.tensor.pytree import (
     pytree_cat,
     pytree_chunk,
 )
-from unirl.distributed.tensor.transport import TensorRef, TensorSpan
+from unirl.distributed.tensor import TensorRef, TensorSpan
 from unirl.distributed.utils import Broadcast
 
 pytestmark = pytest.mark.cpu

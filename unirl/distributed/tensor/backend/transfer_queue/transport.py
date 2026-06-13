@@ -13,12 +13,8 @@ from unirl.distributed.tensor.backend.transfer_queue.runtime import (
     TransferQueueRuntime,
     _run_async_in_temp_loop,
 )
-from unirl.distributed.tensor.transport import (
-    TensorRef,
-    TensorSpan,
-    TensorTransport,
-    TensorTransportRuntime,
-)
+from unirl.distributed.tensor.ref import TensorRef, TensorSpan
+from unirl.distributed.tensor.transport import TensorTransport, TensorTransportRuntime
 
 
 @dataclass

@@ -20,7 +20,8 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
-from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport
+from unirl.distributed.tensor.ref import TensorRef, TensorSpan
+from unirl.distributed.tensor.worker_local import WorkerLocalTransport
 
 
 class GPUStoreTransport(WorkerLocalTransport):

@@ -64,7 +64,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.batch import Batch
-from unirl.distributed.tensor.transport import TensorRef
+from unirl.distributed.tensor import TensorRef
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.primitives import Texts

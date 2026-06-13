@@ -16,7 +16,7 @@ it — so those assertions are guarded by ``isinstance(transport, WorkerLocalTra
 import pytest
 import torch
 
-from unirl.distributed.tensor.transport import TensorRef, WorkerLocalTransport
+from unirl.distributed.tensor import TensorRef, WorkerLocalTransport
 
 pytestmark = pytest.mark.cpu
 

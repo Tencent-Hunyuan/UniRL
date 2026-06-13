@@ -11,7 +11,7 @@ Pure-CPU: just plain torch tensors, no transport backend.
 import pytest
 import torch
 
-from unirl.distributed.tensor.transport import cat_rows
+from unirl.distributed.tensor import cat_rows
 
 pytestmark = pytest.mark.cpu
 

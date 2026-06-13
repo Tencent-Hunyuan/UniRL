@@ -30,7 +30,7 @@ def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     from unirl.distributed.tensor.backend.transfer_queue import TransferQueueRuntime
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     rt = TransferQueueRuntime().install()
     handoffs = rt.init(cfg)

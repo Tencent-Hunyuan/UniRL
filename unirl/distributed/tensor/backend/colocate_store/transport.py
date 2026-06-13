@@ -24,7 +24,8 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
-from unirl.distributed.tensor.transport import TensorRef, WorkerLocalTransport
+from unirl.distributed.tensor.ref import TensorRef
+from unirl.distributed.tensor.worker_local import WorkerLocalTransport
 
 
 class ColocateStoreTransport(WorkerLocalTransport):

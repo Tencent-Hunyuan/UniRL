@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-from unirl.distributed.tensor.transport import TensorRef
+from unirl.distributed.tensor.ref import TensorRef
 
 if TYPE_CHECKING:
     from unirl.distributed.group.dispatch import Dispatch

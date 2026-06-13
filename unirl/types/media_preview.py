@@ -97,7 +97,7 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     full batch size when the leaf is already a real tensor (nothing to save) or a
     boundary cannot be mapped.
     """
-    from unirl.distributed.tensor.transport import TensorRef
+    from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
     want = max(1, min(int(min_items), total))
@@ -170,7 +170,7 @@ def build_media_preview_for_track(
     # ref-boundary prefix covering ``limit`` samples, then hydrate only that
     # shard so we pull one shard instead of the full decoded batch. Both steps
     # are no-ops when the leaf is already a real tensor (e.g. unit tests).
-    from unirl.distributed.tensor.transport import map_tree
+    from unirl.distributed.tensor import map_tree
     from unirl.types.rollout_resp import _hydrate_tensor_meta
 
     prefix = _ref_aligned_prefix_len(decoded, limit)

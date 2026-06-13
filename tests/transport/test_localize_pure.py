@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport
+from unirl.distributed.tensor import TensorRef, TensorSpan, WorkerLocalTransport
 
 pytestmark = pytest.mark.cpu
 

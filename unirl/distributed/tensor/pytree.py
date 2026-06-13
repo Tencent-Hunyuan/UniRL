@@ -25,7 +25,7 @@ import torch
 
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 from unirl.distributed.tensor.batch import Batch
-from unirl.distributed.tensor.transport import TensorRef
+from unirl.distributed.tensor.ref import TensorRef
 from unirl.distributed.utils import Broadcast
 
 # ── Batch-size inference ──

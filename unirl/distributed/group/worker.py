@@ -23,7 +23,7 @@ from torch import Tensor
 
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor.factory import build_transport
-from unirl.distributed.tensor.transport import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
+from unirl.distributed.tensor import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
 from unirl.distributed.utils import collect_leaves
 
 

@@ -13,7 +13,7 @@ import torch
 
 from unirl.distributed.tensor.backend.gpu_store.transport import GPUStoreTransport
 from unirl.distributed.tensor.batch import Batch, shared_field
-from unirl.distributed.tensor.transport import (
+from unirl.distributed.tensor import (
     TensorRef,
     TensorSpan,
     WorkerLocalTransport,

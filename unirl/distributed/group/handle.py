@@ -47,7 +47,7 @@ from unirl.distributed.tensor.grad_context import (
     current_grad_context,
 )
 from unirl.distributed.tensor.pytree import infer_batch_size
-from unirl.distributed.tensor.transport import TensorRef, WorkerLocalTransport, map_tree
+from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.utils import collect_leaves
 
 if TYPE_CHECKING:

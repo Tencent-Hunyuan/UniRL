@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from unirl.distributed.tensor import Batch, concat_field
-from unirl.distributed.tensor.transport import TensorRef
+from unirl.distributed.tensor import TensorRef
 
 pytestmark = pytest.mark.cpu
 

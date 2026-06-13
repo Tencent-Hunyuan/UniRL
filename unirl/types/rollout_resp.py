@@ -372,7 +372,7 @@ def _hydrate_tensor_meta(value: Any) -> Any:
     them. Returns the value unchanged when it is already a ``torch.Tensor``
     or ``None``.
     """
-    from unirl.distributed.tensor.transport import TensorRef
+    from unirl.distributed.tensor import TensorRef
 
     if not isinstance(value, TensorRef):
         return value

@@ -12,22 +12,34 @@ from unirl.distributed.tensor.batch import (
     shared_field,
     sum_field,
 )
-from unirl.distributed.tensor.transport import (
+from unirl.distributed.tensor.ref import (
+    TensorHandle,
     TensorRef,
+    TensorSpan,
+    cat_rows,
+    map_tree,
+)
+from unirl.distributed.tensor.transport import (
     TensorTransport,
     TensorTransportRuntime,
     TransportSession,
 )
+from unirl.distributed.tensor.worker_local import WorkerLocalTransport
 
 __all__ = [
     "Batch",
     "FieldKind",
+    "TensorHandle",
     "TensorRef",
+    "TensorSpan",
     "TensorTransport",
     "TensorTransportRuntime",
     "TransportSession",
+    "WorkerLocalTransport",
+    "cat_rows",
     "concat_field",
     "field",
+    "map_tree",
     "max_field",
     "mean_field",
     "min_field",

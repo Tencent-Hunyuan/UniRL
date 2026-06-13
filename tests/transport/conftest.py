@@ -102,7 +102,7 @@ def _tq_simple_runtime(ray_session):
 
 
 def _install(t):
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     TensorTransportRuntime.install(t)
     return t
@@ -129,7 +129,7 @@ def _build_driver_transport(kind, request):
 def transport(request, ray_session):
     """Active driver-resolvable TensorTransport, parametrized over every backend
     available on this host. Test IDs read ``[colocate]`` / ``[tq_simple]``."""
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     yield _install(_build_driver_transport(request.param, request))
     TensorTransportRuntime.clear_current()
@@ -138,7 +138,7 @@ def transport(request, ray_session):
 @pytest.fixture
 def colocate_transport(ray_session):
     from unirl.distributed.tensor.factory import build_transport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     yield _install(
         build_transport("colocate_store", worker_id="dw0", device="cpu", device_id=0, global_rank=0, world_size=1)
@@ -150,7 +150,7 @@ def colocate_transport(ray_session):
 def tq_simple_transport(_tq_simple_runtime):
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     yield _install(TQTransport(_tq_simple_runtime, partition_id=_DEFAULT_PARTITION_ID))
     TensorTransportRuntime.clear_current()

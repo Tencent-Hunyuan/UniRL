@@ -27,7 +27,7 @@ from unirl.distributed.tensor.backend.transfer_queue.transport import (  # noqa:
     _restore,
     _store_shape,
 )
-from unirl.distributed.tensor.transport import TensorRef  # noqa: E402
+from unirl.distributed.tensor import TensorRef  # noqa: E402
 
 pytestmark = pytest.mark.cpu
 

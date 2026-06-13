@@ -33,7 +33,7 @@ def mooncake_transport(ray_session):
 
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID, TransferQueueRuntime
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
+    from unirl.distributed.tensor import TensorTransportRuntime
 
     cfg = OmegaConf.create(
         {
