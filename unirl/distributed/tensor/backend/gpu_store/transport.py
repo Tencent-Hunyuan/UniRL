@@ -58,7 +58,7 @@ class GPUStoreTransport(WorkerLocalTransport):
             return {}
         return dict(zip(unique, ray.get(self._tw.batch_borrow.remote(unique))))
 
-    def _resolve_span(self, span: Any, borrow_map: Dict[str, tuple]) -> torch.Tensor:
+    def _resolve_span(self, span: TensorSpan[GPUTensorHandle], borrow_map: Dict[str, tuple]) -> torch.Tensor:
         # Resolve the handle (cached per store_key), then slice the span's rows —
         # the slice is a zero-copy view of the open IPC mapping.
         h = span.handle
@@ -83,7 +83,7 @@ class GPUStoreTransport(WorkerLocalTransport):
     def put(self, tensor: torch.Tensor) -> Any:
         return self.put_batch({"_": tensor})["_"].spans[0].handle
 
-    def get(self, spans: List[Any]) -> torch.Tensor:
+    def get(self, spans: List[TensorSpan[GPUTensorHandle]]) -> torch.Tensor:
         if not spans:
             raise ValueError("GPUStoreTransport.get: empty spans list")
         borrow_map = self._batch_borrow([s.handle for s in spans])

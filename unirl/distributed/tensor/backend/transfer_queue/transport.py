@@ -152,7 +152,7 @@ class TQTransport(TensorTransport):
 
         return _run_async_in_temp_loop(_put)
 
-    def get(self, spans: List[Any]) -> torch.Tensor:
+    def get(self, spans: List[TensorSpan[TQTensorHandle]]) -> torch.Tensor:
         async def _get() -> torch.Tensor:
             # Each ref is a span: fetch its handle's row-block, then slice locally.
             handles = [s.handle for s in spans]

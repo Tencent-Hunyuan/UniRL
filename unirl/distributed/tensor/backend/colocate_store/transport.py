@@ -23,7 +23,8 @@ from typing import Any, List
 import ray
 import torch
 
-from unirl.distributed.tensor.transport import TensorRef, WorkerLocalTransport, cat_rows
+from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
+from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport, cat_rows
 
 
 class ColocateStoreTransport(WorkerLocalTransport):
@@ -36,7 +37,7 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def store(self) -> Any:
         return self._store
 
-    def _resolve_span(self, span: Any) -> torch.Tensor:
+    def _resolve_span(self, span: TensorSpan[ColocateTensorHandle]) -> torch.Tensor:
         h = span.handle
         if h.object_ref is not None:
             base = ray.get(h.object_ref).detach()
@@ -52,7 +53,7 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def put(self, tensor: torch.Tensor) -> Any:
         return self._store.put(tensor)
 
-    def get(self, spans: List[Any]) -> torch.Tensor:
+    def get(self, spans: List[TensorSpan[ColocateTensorHandle]]) -> torch.Tensor:
         if not spans:
             raise ValueError("ColocateStoreTransport.get: empty spans list")
         return cat_rows([self._resolve_span(s) for s in spans])
