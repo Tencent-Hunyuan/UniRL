@@ -15,8 +15,8 @@ from unirl.distributed.tensor.backend.transfer_queue.runtime import (
     _run_async_in_temp_loop,
 )
 from unirl.distributed.tensor.transport import (
-    HandleView,
-    TensorMeta,
+    TensorSpan,
+    TensorRef,
     TensorTransport,
     TensorTransportRuntime,
     cat_rows,
@@ -29,10 +29,10 @@ class TQTensorHandle:
     field name it occupies in its originating put, and its original shape.
 
     Wrapping the upstream meta (rather than dropping it straight into
-    ``TensorMeta.refs``) keeps three contracts that worker-local handles satisfy
+    ``TensorRef.refs``) keeps three contracts that worker-local handles satisfy
     for free:
 
-    * **Uniform ref interface.** Every ``TensorMeta.refs`` element exposes
+    * **Uniform ref interface.** Every ``TensorRef.refs`` element exposes
       ``.local()``, so driver-side hydration (``_hydrate_tensor_meta``) resolves a
       worker-local ``TensorHandle`` and a global TQ ref the same way.
     * **Field identity travels with the ref.** ``Worker.call`` keys put/get by
@@ -154,11 +154,11 @@ class TQTransport(TensorTransport):
 
     def get(self, refs: List[Any]) -> torch.Tensor:
         async def _get() -> torch.Tensor:
-            # HandleView refs fetch their base row-block, then slice locally.
-            bases = [h.base if isinstance(h, HandleView) else h for h in refs]
+            # TensorSpan refs fetch their base row-block, then slice locally.
+            bases = [h.base if isinstance(h, TensorSpan) else h for h in refs]
             tensors = await self._fetch(bases)
             parts = [
-                t[h.start : h.end] if isinstance(h, HandleView) else t
+                t[h.start : h.end] if isinstance(h, TensorSpan) else t
                 for h, t in zip(refs, tensors)
             ]
             return cat_rows(parts)
@@ -166,13 +166,13 @@ class TQTransport(TensorTransport):
         return _run_async_in_temp_loop(_get)
 
     def is_ref(self, value: Any) -> bool:
-        return isinstance(value, TensorMeta)
+        return isinstance(value, TensorRef)
 
-    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorMeta]:
+    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorRef]:
         if not tensors:
             return {}
 
-        async def _put_batch() -> Dict[str, TensorMeta]:
+        async def _put_batch() -> Dict[str, TensorRef]:
             # Group keys by leading-dim batch size: a TensorDict requires one
             # uniform batch_size, so a mixed-dim object (e.g. a rollout's 96-row
             # per-sample tensors alongside an 11-step trajectory) must split into
@@ -189,7 +189,7 @@ class TQTransport(TensorTransport):
                     raise TypeError(f"TQTransport.put_batch: unsupported type {type(t).__name__} for key {k!r}")
                 groups.setdefault(_bs(t), []).append(k)
 
-            result: Dict[str, TensorMeta] = {}
+            result: Dict[str, TensorRef] = {}
             for bs, keys in groups.items():
                 d: dict = {}
                 for k in keys:
@@ -200,7 +200,7 @@ class TQTransport(TensorTransport):
                 for k in keys:
                     t = tensors[k]
                     is_tensor = isinstance(t, torch.Tensor)
-                    result[k] = TensorMeta(
+                    result[k] = TensorRef(
                         refs=[
                             TQTensorHandle(
                                 meta=put_meta.select_fields([k]),
@@ -217,7 +217,7 @@ class TQTransport(TensorTransport):
 
         return _run_async_in_temp_loop(_put_batch)
 
-    def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
+    def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
         if not metas:
             return {}
 
@@ -227,7 +227,7 @@ class TQTransport(TensorTransport):
             # in _fetch, then regroup back per consumer key (cat a key's multiple
             # refs). Extracting by handle.field — not by the consumer's positional
             # key — is what lets a producer's output 'i' resolve under the
-            # consumer's input 'j'. HandleView refs fetch their base block and
+            # consumer's input 'j'. TensorSpan refs fetch their base block and
             # slice locally before the per-key cat.
             handles: List[TQTensorHandle] = []
             views: List[Any] = []
@@ -235,12 +235,12 @@ class TQTransport(TensorTransport):
             for k, m in metas.items():
                 for h in m.refs:
                     views.append(h)
-                    handles.append(h.base if isinstance(h, HandleView) else h)
+                    handles.append(h.base if isinstance(h, TensorSpan) else h)
                     owners.append(k)
             tensors = await self._fetch(handles)
             parts: Dict[str, list] = defaultdict(list)
             for k, h, t in zip(owners, views, tensors):
-                parts[k].append(t[h.start : h.end] if isinstance(h, HandleView) else t)
+                parts[k].append(t[h.start : h.end] if isinstance(h, TensorSpan) else t)
             return {k: cat_rows(lst) for k, lst in parts.items()}
 
         return _run_async_in_temp_loop(_get_batch)

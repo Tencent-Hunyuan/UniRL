@@ -18,8 +18,8 @@ from typing import Any, Dict, List
 import ray
 import torch
 
-from unirl.distributed.tensor.backend.gpu_store.handle import TensorHandle
-from unirl.distributed.tensor.transport import HandleView, TensorMeta, WorkerLocalTransport, cat_rows
+from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
+from unirl.distributed.tensor.transport import TensorSpan, TensorRef, WorkerLocalTransport, cat_rows
 
 
 class GPUStoreTransport(WorkerLocalTransport):
@@ -39,14 +39,14 @@ class GPUStoreTransport(WorkerLocalTransport):
         self._tw = tw
 
     def is_ref(self, value: Any) -> bool:
-        return isinstance(value, TensorMeta)
+        return isinstance(value, TensorRef)
 
     # ── resolve helpers: batched borrow + zero-copy IPC views ──
 
-    def _batch_borrow(self, handles: List[TensorHandle]) -> Dict[str, tuple]:
+    def _batch_borrow(self, handles: List[GPUTensorHandle]) -> Dict[str, tuple]:
         """One ``batch_borrow`` RPC for all not-yet-open CUDA store_keys.
 
-        ``HandleView`` refs borrow their BASE key once — the dict.fromkeys dedup
+        ``TensorSpan`` refs borrow their BASE key once — the dict.fromkeys dedup
         means N views of one block still cost a single IPC open.
         """
         unique = list(
@@ -59,7 +59,7 @@ class GPUStoreTransport(WorkerLocalTransport):
         return dict(zip(unique, ray.get(self._tw.batch_borrow.remote(unique))))
 
     def _resolve_handle(self, handle: Any, borrow_map: Dict[str, tuple]) -> torch.Tensor:
-        if isinstance(handle, HandleView):
+        if isinstance(handle, TensorSpan):
             # Resolve the base once (cached), slice the view's rows — the slice
             # is a zero-copy view of the open IPC mapping.
             return self._resolve_handle(handle.base, borrow_map)[handle.start : handle.end]
@@ -90,12 +90,12 @@ class GPUStoreTransport(WorkerLocalTransport):
 
     # ── batched resolve / pack (the Worker's path) ──
 
-    def get_batch(self, metas: Dict[str, TensorMeta]) -> Dict[str, torch.Tensor]:
+    def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
         all_handles = [h for m in metas.values() for h in m.refs]
         borrow_map = self._batch_borrow(all_handles)
         return {k: cat_rows([self._resolve_handle(h, borrow_map) for h in m.refs]) for k, m in metas.items()}
 
-    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorMeta]:
+    def put_batch(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, TensorRef]:
         items = list(tensors.items())
 
         # Pass 1: one batch_allocate for the unique CUDA tensors (by id).
@@ -104,7 +104,7 @@ class GPUStoreTransport(WorkerLocalTransport):
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 cuda_unique.setdefault(id(t), t)
 
-        handle_map: Dict[int, TensorHandle] = {}
+        handle_map: Dict[int, GPUTensorHandle] = {}
         if cuda_unique:
             tl = list(cuda_unique.values())
             allocs = ray.get(self._tw.batch_allocate.remote([(tuple(t.shape), t.dtype) for t in tl]))
@@ -120,28 +120,28 @@ class GPUStoreTransport(WorkerLocalTransport):
                 del v, s  # counter 1→0
             ray.get(self._tw.batch_write_done.remote([sk for sk, _, _ in allocs]))
             for t, (sk, _, _) in zip(tl, allocs):
-                handle_map[id(t)] = TensorHandle(
+                handle_map[id(t)] = GPUTensorHandle(
                     store_key=sk, source_id=self.worker_id, shape=tuple(t.shape), dtype=t.dtype, device=self.device
                 )
 
-        # Pass 2: one TensorMeta per key; duplicate output tensors share a
+        # Pass 2: one TensorRef per key; duplicate output tensors share a
         # store_key but get distinct handles (independent rebind/GC) + batch_incref.
         emitted: set = set()
         extra_incref: list = []
-        result: Dict[str, TensorMeta] = {}
+        result: Dict[str, TensorRef] = {}
         for k, t in items:
             if isinstance(t, torch.Tensor) and t.is_cuda:
                 h = handle_map[id(t)]
                 if id(t) in emitted:
                     extra_incref.append(h.store_key)
-                    handle = TensorHandle(
+                    handle = GPUTensorHandle(
                         store_key=h.store_key, source_id=h.source_id, shape=h.shape, dtype=h.dtype, device=h.device
                     )
                 else:
                     emitted.add(id(t))
                     handle = h
             elif isinstance(t, torch.Tensor):  # CPU tensor → Ray plasma
-                handle = TensorHandle(
+                handle = GPUTensorHandle(
                     store_key=None,
                     source_id=self.worker_id,
                     shape=tuple(t.shape),
@@ -153,7 +153,7 @@ class GPUStoreTransport(WorkerLocalTransport):
                 result[k] = t
                 continue
             bs = handle.shape[0] if handle.shape else 1
-            result[k] = TensorMeta(
+            result[k] = TensorRef(
                 refs=[handle], sizes=[bs], shape=tuple(handle.shape), dtype=handle.dtype, device=str(handle.device)
             )
         if extra_incref:
@@ -188,10 +188,10 @@ class GPUStoreTransport(WorkerLocalTransport):
         ray.get(self._tw.setup_global_pg.remote(global_rank, world_size))
 
     def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
-        # HandleView → send ONLY its [start:end) rows (exact-row routing);
+        # TensorSpan → send ONLY its [start:end) rows (exact-row routing);
         # whole handles send the full block (range None).
         items = [
-            (h.store_key, h.start, h.end) if isinstance(h, HandleView) else (h.store_key, None, None)
+            (h.store_key, h.start, h.end) if isinstance(h, TensorSpan) else (h.store_key, None, None)
             for h in handles
         ]
         ray.get(self._tw._nccl_send.remote(dst_rank, items))

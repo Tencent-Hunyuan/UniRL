@@ -271,7 +271,7 @@ class RolloutTrack(Batch):
             return self  # trivially nothing to do
 
         # The reward service runs on workers; its returned ``rewards`` arrives
-        # at the driver as a TensorMeta proxy (Worker._pack_output dehydrates
+        # at the driver as a TensorRef proxy (Worker._pack_output dehydrates
         # every Tensor leaf). Driver-side arithmetic below needs a real Tensor.
         rewards_local = _hydrate_tensor_meta(self.rewards)
 
@@ -362,24 +362,24 @@ def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
 
 
 def _hydrate_tensor_meta(value: Any) -> Any:
-    """Driver-side hydrate of a ``TensorMeta`` proxy back to a real ``torch.Tensor``.
+    """Driver-side hydrate of a ``TensorRef`` proxy back to a real ``torch.Tensor``.
 
     ``Worker._pack_output`` stores every ``torch.Tensor`` leaf in the return
     value into the TensorStore, so fields like ``track.rewards`` arrive at
-    the driver as ``TensorMeta`` proxies even though downstream driver-side
+    the driver as ``TensorRef`` proxies even though downstream driver-side
     code (advantage computation) does arithmetic on them as if they were
     tensors. This helper
     fetches the underlying tensor(s) via each handle's bound worker and cats
     them. Returns the value unchanged when it is already a ``torch.Tensor``
     or ``None``.
     """
-    from unirl.distributed.tensor.transport import TensorMeta
+    from unirl.distributed.tensor.transport import TensorRef
 
-    if not isinstance(value, TensorMeta):
+    if not isinstance(value, TensorRef):
         return value
     if not value.refs:
         return None
-    # materialize(None) = per-ref local() fetch + cat_rows (HandleView refs
+    # materialize(None) = per-ref local() fetch + cat_rows (TensorSpan refs
     # slice their base; ragged 2D parts follow the documented right-pad contract).
     return value.materialize(backend=None)
 
