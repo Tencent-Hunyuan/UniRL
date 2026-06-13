@@ -155,7 +155,10 @@ class GPUStoreTransport(WorkerLocalTransport):
                 continue
             bs = handle.shape[0] if handle.shape else 1
             result[k] = TensorRef(
-                spans=[TensorSpan(handle, 0, bs)], shape=tuple(handle.shape), dtype=handle.dtype, device=str(handle.device)
+                spans=[TensorSpan(handle, 0, bs)],
+                shape=tuple(handle.shape),
+                dtype=handle.dtype,
+                device=str(handle.device),
             )
         if extra_incref:
             self._tw.batch_incref.remote(extra_incref)

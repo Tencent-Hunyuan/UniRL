@@ -440,6 +440,7 @@ def hydrate_track(track: "RolloutTrack") -> "RolloutTrack":
 
     return walk(track)
 
+
 def balance_track_for_dp(track: "RolloutTrack", *, dp_size: int, min_spread: float = 0.05) -> "RolloutTrack":
     """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
 

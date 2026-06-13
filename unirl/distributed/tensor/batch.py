@@ -508,9 +508,7 @@ def _select_packed_data(
         return value[:0].clone()
     if hasattr(value, "select_segments"):
         # TensorRef: token-range gather as a lazy segment view (no data motion).
-        return value.select_segments(
-            [(int(cu[i].item()), int(cu[i + 1].item())) for i in indices]
-        )
+        return value.select_segments([(int(cu[i].item()), int(cu[i + 1].item())) for i in indices])
     chunks = [value[int(cu[i].item()) : int(cu[i + 1].item())] for i in indices]
     return torch.cat(chunks, dim=0)
 
