@@ -395,8 +395,21 @@ def _build_text_conditions(
         if pooled is not None:
             pooled_list.append(pooled.detach().cpu())
 
+        # Length-gate the attention mask (model-agnostic; see patch_conditions
+        # NOTE). Keep it only when its sequence length matches the fused embed
+        # sequence length: single-encoder models (Z-Image: Qwen3) satisfy this
+        # and NEED the mask so trainer-side replay can trim the zero-padded
+        # variable-length captions exactly as the rollout DiT did. Multi-encoder
+        # models (SD3) fuse embeds to a different length than the raw per-encoder
+        # mask concat, so the mask is dropped (the DiT ignores it there, and
+        # carrying it would pad embeds with spurious zero tokens).
         attn_mask = fuse_text_encoder_outputs(getattr(result, "encoder_attention_mask", None))
-        if attn_mask is not None:
+        if (
+            attn_mask is not None
+            and attn_mask.dim() >= 2
+            and embeds.dim() >= 2
+            and int(attn_mask.shape[-1]) == int(embeds.shape[-2])
+        ):
             mask_list.append(attn_mask.detach().cpu())
 
         neg_embeds = fuse_text_encoder_outputs(getattr(result, "negative_prompt_embeds", None))
@@ -408,11 +421,15 @@ def _build_text_conditions(
             neg_pooled_list.append(neg_pooled.detach().cpu())
 
     embeds_cat = torch.cat(prompt_embeds_list, dim=0) if prompt_embeds_list else None
+    # Only build a batched mask when EVERY result contributed one (the length
+    # gate is deterministic per model family, so this is all-or-nothing; the
+    # guard keeps a partial list from producing a wrong-batch-size mask).
+    attn_mask_cat = torch.cat(mask_list, dim=0) if mask_list and len(mask_list) == len(prompt_embeds_list) else None
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
             pooled=torch.cat(pooled_list, dim=0) if pooled_list else None,
-            attn_mask=torch.cat(mask_list, dim=0) if mask_list else None,
+            attn_mask=attn_mask_cat,
         )
         if embeds_cat is not None
         else None

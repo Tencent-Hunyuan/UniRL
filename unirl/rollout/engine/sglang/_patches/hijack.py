@@ -172,6 +172,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang._patches.patch_weights_updater import (
             patch_weights_updater,
         )
+        from unirl.rollout.engine.sglang._patches.patch_zimage_lora_pipeline import (
+            patch_zimage_lora_pipeline,
+        )
 
         # (A) Additive infra: srt is_available shim; SamplingParams/Req IO
         #     fields; GPUWorker RL methods + sleep/wake; weight-sync;
@@ -191,6 +194,7 @@ class SglangDiffusionHijack:
             patch_gpu_worker,
             patch_weights_updater,
             patch_sd3_lora_pipeline,
+            patch_zimage_lora_pipeline,
             patch_lora_tensors,
             patch_lora_slice_2d,
             patch_scheduler,
