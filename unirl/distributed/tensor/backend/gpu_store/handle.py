@@ -112,17 +112,6 @@ class GPUTensorHandle:
         memo[id(self)] = clone
         return clone
 
-    def routing_copy(self) -> GPUTensorHandle:
-        """A bare, unbound same-fields copy used as an id()-keyed transfer placeholder.
-
-        Unlike __copy__ this does NOT incref or rebind — it is a disposable token the
-        controller plants in a shard tree and matches by identity after NCCL recv, so
-        dropping it must not touch the source tensor's ref count.
-        """
-        return GPUTensorHandle(
-            self.store_key, self.source_id, self.shape, self.dtype, self.device, object_ref=self.object_ref
-        )
-
     # ── Pickle protocol (for Ray RPC) ──
 
     def __getstate__(self) -> dict:

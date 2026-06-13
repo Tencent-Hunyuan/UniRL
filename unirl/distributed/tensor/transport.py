@@ -48,6 +48,7 @@ import ray
 import torch
 
 from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
+from unirl.distributed.utils import collect_leaves
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,9 @@ class TensorHandle(Protocol):
 
     The worker-local store handle (``GPUTensorHandle`` / ``ColocateTensorHandle``)
     and the global ``TQTensorHandle`` both satisfy it structurally. The
-    worker-local-only surface (``store_key`` / ``source_id`` / ``object_ref`` /
-    ``routing_copy``) is reached via ``span.handle`` in the backends that need it,
-    never off the span — so it is intentionally absent from this protocol.
+    worker-local-only surface (``store_key`` / ``source_id`` / ``object_ref``) is
+    reached via ``span.handle`` in the backends that need it, never off the span —
+    so it is intentionally absent from this protocol.
     """
 
     def local(self) -> torch.Tensor: ...
@@ -128,15 +129,6 @@ class TensorSpan(Generic[T]):
 
     def local(self) -> torch.Tensor:
         return self.handle.local()[self.start : self.stop]
-
-    def routing_copy(self) -> "TensorSpan":
-        """Bare placeholder for localize's id()-keyed NCCL substitution.
-
-        Carries the handle's routing copy plus this span's range so the send
-        side can slice — dropping it must not touch the handle's ref count
-        (the handle's routing_copy is equally bare).
-        """
-        return TensorSpan(self.handle.routing_copy(), self.start, self.stop)
 
     def __getstate__(self) -> dict:
         return {"handle": self.handle, "start": self.start, "stop": self.stop}
@@ -748,73 +740,130 @@ class WorkerLocalTransport(TensorTransport):
         return ref.source_id == dst_worker_id
 
     @classmethod
-    def localize(cls, shards: list, pool: Any, device_ids: List[int], worker_ids: List[str]) -> list:
-        """Make every ref in each shard resolvable on its dst worker.
+    def _move_key(cls, span: Any, dst: Tuple[str, int], pool: Any) -> Optional[tuple]:
+        """Transfer identity of a span wrt a destination — or ``None`` if already resolvable there.
 
-        Shared skeleton for all worker-local backends; the only thing that varies is
-        ``_is_local`` (the locality predicate). A ref that is not already local and not
-        an object_ref (CPU/plasma resolves anywhere) is moved cross-device via one
-        batched NCCL hop between the two devices' slot0 workers, then substituted back
-        (id()-keyed). Names no backend type — works through ``ref.routing_copy`` /
-        ``ref.source_id`` / ``map_tree`` / the ``transport_op`` relay.
+        The single span classifier shared by ``localize``'s FIND and REPLACE passes. Pure
+        (no Ray): reads only the handle's identity fields, ``pool.device_id_of``, and the
+        per-backend ``_is_local``. Checked in short-circuit order so ``device_id_of`` is
+        never called on a resolvable ref:
+
+          1. ``object_ref`` present (CPU/plasma) → resolvable anywhere → ``None``
+          2. ``_is_local`` on the dst worker → ``None``
+          3. else → the value key ``(src_device, dst_device, store_key, start, stop)``
+
+        The key is by VALUE, not ``id()``: identical foreign slices headed to the same dst
+        device collapse to one transfer, and the received result is shared across every
+        tree position. ``store_key`` is unique per source device, and ``object_ref`` handles
+        (``store_key is None``) never reach branch 3, so the key cannot alias.
         """
-        foreign: Dict[Tuple[int, int], List[Any]] = {}  # (src_device_id, dst_device_id) → [routing_copy, ...]
+        dst_worker_id, dst_device_id = dst
+        h = span.handle
+        if getattr(h, "object_ref", None) is not None:
+            return None
+        if cls._is_local(h, dst_worker_id, dst_device_id, pool):
+            return None
+        return (pool.device_id_of(h.source_id), dst_device_id, h.store_key, span.start, span.stop)
 
-        def route(span: Any, dst_worker_id: str, dst_device_id: int) -> Any:
-            if getattr(span.handle, "object_ref", None) is not None:
-                return span  # CPU/plasma → resolvable anywhere
-            if cls._is_local(span.handle, dst_worker_id, dst_device_id, pool):
-                return span
-            src_device_id = pool.device_id_of(span.handle.source_id)
-            routing = span.routing_copy()
-            foreign.setdefault((src_device_id, dst_device_id), []).append(routing)
-            return routing
+    @classmethod
+    def _replace_leaf(cls, moved: Dict[tuple, Any], dst: Tuple[str, int], pool: Any) -> Callable[[Any], Any]:
+        """Build the ``map_tree`` leaf for REPLACE: swap each foreign span for its moved result.
 
-        def unwrap(obj: Any, dst_worker_id: str, dst_device_id: int) -> Any:
-            if isinstance(obj, TensorRef):
-                # A foreign span ships ONLY its [start:stop) rows — the send side
-                # slices by the routing copy's range (its .shape is sliced).
-                return obj.with_spans([route(s, dst_worker_id, dst_device_id) for s in obj.spans])
-            return obj
+        A factory (not an inline loop closure) so the per-shard ``dst`` is a real parameter —
+        no loop late-binding. A ref whose spans all stay put is returned UNCHANGED (same
+        object): this skips a needless rebuild and preserves the fields ``with_spans`` drops
+        (``grad`` / ``retain_grad_flag`` / ``_packed_cu_seqlens``). Keys are recomputed on the
+        original spans, so they match exactly what FIND recorded.
+        """
 
-        routed: list = []
-        for i, (s_args, s_kwargs) in enumerate(shards):
+        def leaf(o: Any) -> Any:
+            if isinstance(o, TensorRef):
+                new_spans = [moved.get(cls._move_key(s, dst, pool), s) for s in o.spans]
+                if all(ns is s for ns, s in zip(new_spans, o.spans)):
+                    return o
+                return o.with_spans(new_spans)
+            return o
 
-            def leaf(o, _w=worker_ids[i], _d=device_ids[i]):
-                return unwrap(o, _w, _d)
+        return leaf
 
-            routed.append((map_tree(s_args, leaf), map_tree(s_kwargs, leaf)))
+    @classmethod
+    def _move(cls, pool: Any, to_move: Dict[tuple, Any]) -> Dict[tuple, Any]:
+        """Run one batched NCCL hop per ``(src_device, dst_device)`` group; return key → received span.
 
-        if not foreign:
-            return routed
+        Ordering invariant: each group's ``keys`` list is built once and reused — in the
+        SAME order — for (a) the ``nccl_send`` items, (b) the ``nccl_recv`` shapes/dtypes,
+        and (c) the ``zip(keys, recv_handles)`` that fills ``moved``. ``dict`` preserves
+        insertion order, which is what makes this sound; do not reorder one without the
+        others. All sends AND recvs are posted before any ``ray.get`` so a send cannot block
+        on an unposted recv.
 
-        keys = list(foreign.keys())
+        Recv shapes/dtypes come off the representative span's ``.shape`` / ``.dtype`` — the
+        SLICED shape (exactly the rows the send ships), not the full handle block.
+        """
+        groups: Dict[Tuple[int, int], List[tuple]] = {}  # (src_dev, dst_dev) → [key, ...] (ordered)
+        for key in to_move:
+            groups.setdefault((key[0], key[1]), []).append(key)
+
         send_refs, recv_refs = [], []
-        for src_device_id, dst_device_id in keys:
-            handles = foreign[(src_device_id, dst_device_id)]
-            send_refs.append(pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, handles))
+        for (src_device_id, dst_device_id), keys in groups.items():
+            spans = [to_move[k] for k in keys]
+            send_refs.append(pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, spans))
             recv_refs.append(
                 pool.slot0_worker(dst_device_id).transport_op.remote(
-                    "nccl_recv", src_device_id, [h.shape for h in handles], [h.dtype for h in handles]
+                    "nccl_recv", src_device_id, [s.shape for s in spans], [s.dtype for s in spans]
                 )
             )
         ray.get(send_refs)
         recv_results = ray.get(recv_refs)
 
-        subs: Dict[int, Any] = {}
-        for (src_device_id, dst_device_id), new_handles in zip(keys, recv_results):
+        moved: Dict[tuple, Any] = {}
+        for ((src_device_id, dst_device_id), keys), new_handles in zip(groups.items(), recv_results):
             dst_worker = pool.slot0_worker(dst_device_id)
-            for old_span, new_h in zip(foreign[(src_device_id, dst_device_id)], new_handles):
+            for key, new_h in zip(keys, new_handles):
                 new_h.rebind(dst_worker)
                 # The recv handle holds exactly the sliced rows → full-range span.
-                subs[id(old_span)] = TensorSpan(new_h, 0, int(new_h.shape[0]))
+                moved[key] = TensorSpan(new_h, 0, int(new_h.shape[0]))
+        return moved
 
-        def substitute(obj: Any) -> Any:
-            if isinstance(obj, TensorRef):
-                return obj.with_spans([subs.get(id(s), s) for s in obj.spans])
-            return obj
+    @classmethod
+    def localize(cls, shards: list, pool: Any, device_ids: List[int], worker_ids: List[str]) -> list:
+        """Make every ref in each shard resolvable on its dst worker — find / move / replace.
 
-        return [(map_tree(a, substitute), map_tree(k, substitute)) for a, k in routed]
+        Shared skeleton for all worker-local backends; the only thing that varies is
+        ``_is_local`` (the locality predicate, reached via ``_move_key``). Three stages:
+
+          FIND     read-only walk → the unique foreign slices to move, keyed by transfer
+                   identity; identical slices to one dst device dedup (``_move_key``).
+          MOVE     one batched NCCL hop per ``(src_device, dst_device)`` group between the
+                   two devices' slot0 workers (``_move``).
+          REPLACE  rebuild each shard, swapping foreign spans for their received result and
+                   leaving local spans (and untouched refs) as-is (``_replace_leaf``).
+
+        Names no backend type — works through ``span.handle`` / ``pool`` / ``map_tree`` /
+        the ``transport_op`` relay. FIND and REPLACE are pure (no Ray); only MOVE does I/O,
+        so when nothing is foreign the shards are returned untouched.
+        """
+        dsts = list(zip(worker_ids, device_ids))
+
+        # FIND — the unique foreign slices, keyed by transfer identity (setdefault dedups).
+        to_move: Dict[tuple, Any] = {}  # key → representative span
+        for (s_args, s_kwargs), dst in zip(shards, dsts):
+            for ref in collect_leaves(s_args, TensorRef) + collect_leaves(s_kwargs, TensorRef):
+                for s in ref.spans:
+                    key = cls._move_key(s, dst, pool)
+                    if key is not None:
+                        to_move.setdefault(key, s)
+        if not to_move:
+            return shards
+
+        # MOVE — one batched NCCL hop per (src_device, dst_device) group.
+        moved = cls._move(pool, to_move)
+
+        # REPLACE — rebuild each shard, swapping foreign spans for their received result.
+        return [
+            (map_tree(s_args, cls._replace_leaf(moved, dst, pool)), map_tree(s_kwargs, cls._replace_leaf(moved, dst, pool)))
+            for (s_args, s_kwargs), dst in zip(shards, dsts)
+        ]
 
     # ---- remote compute (controller-triggered) ----------------------------
 
