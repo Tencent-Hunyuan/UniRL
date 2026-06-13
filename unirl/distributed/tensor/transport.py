@@ -504,9 +504,23 @@ class TensorTransport(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def get(self, refs: List[Any]) -> torch.Tensor:
-        """Fetch tensors for each ref and cat along dim 0."""
+    def _resolve_handles(self, handles: List[Any]) -> List[torch.Tensor]:
+        """Resolve each handle to its full dim-0 base tensor, aligned to *handles*.
+
+        The single backend-specific resolution primitive. Backends batch and dedup
+        internally (gpu: one ``batch_borrow`` + IPC-view cache; tq: one ``_fetch``
+        per put-group; colocate: per-tensor ``store.get``). ``get`` / ``get_batch``
+        below slice each span's ``[start:stop)`` rows off these bases — the slice is
+        universal, so it lives on the base, not in the backends.
+        """
         ...
+
+    def get(self, spans: List[Any]) -> torch.Tensor:
+        """Resolve each span (its handle, sliced to ``[start:stop)``) and cat along dim 0."""
+        if not spans:
+            raise ValueError("get: empty spans list")
+        bases = self._resolve_handles([s.handle for s in spans])
+        return cat_rows([b[s.start : s.stop] for s, b in zip(spans, bases)])
 
     @abc.abstractmethod
     def is_ref(self, value: Any) -> bool:
@@ -528,8 +542,23 @@ class TensorTransport(abc.ABC):
         return result
 
     def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
-        """Fetch multiple named tensors. Default: iterate per key."""
-        return {k: self.get(m.spans) for k, m in metas.items()}
+        """Fetch multiple named tensors, batching handle resolution across ALL keys.
+
+        Flatten every key's spans into one ``_resolve_handles`` call (one borrow /
+        fetch for the whole object), then slice + cat per key. An empty per-key span
+        list yields ``cat_rows([]) -> empty(0)``.
+        """
+        flat: List[Any] = []
+        owners: List[str] = []
+        for k, m in metas.items():
+            for s in m.spans:
+                flat.append(s)
+                owners.append(k)
+        bases = self._resolve_handles([s.handle for s in flat])
+        parts: Dict[str, List[torch.Tensor]] = {k: [] for k in metas}
+        for k, s, b in zip(owners, flat, bases):
+            parts[k].append(b[s.start : s.stop])
+        return {k: cat_rows(parts[k]) for k in metas}
 
     def transform(self, meta: TensorRef, fn: Callable[[torch.Tensor], torch.Tensor]) -> TensorRef:
         """Apply fn to the remote tensor, return new TensorRef.
@@ -548,13 +577,6 @@ class TensorTransport(abc.ABC):
             dtype=result.dtype,
             device=str(result.device),
         )
-
-    def end_call(self) -> None:
-        """Release any per-call resources (e.g. open IPC views). No-op default.
-
-        Called by the Worker after each call() completes; backends with per-call
-        state (gpu IPC views) override it.
-        """
 
     @classmethod
     def localize(cls, shards: list, pool: Any, device_ids: list, worker_ids: list) -> list:
@@ -682,7 +704,7 @@ class WorkerLocalTransport(TensorTransport):
     ref-count lifecycle (``incref``/``decref``), controller-orchestrated
     cross-worker transfer (``setup_transfer``/``nccl_send``/``nccl_recv``), and
     on-worker remote compute (``tensor_op``/``cat``/``get_cpu``). The universal
-    materialization surface (``get_batch``/``put_batch``/``end_call``) lives on
+    materialization surface (``get_batch``/``put_batch``) lives on
     the base. GLOBAL backends (e.g. the transfer queue) are plain
     :class:`TensorTransport` and implement none of this capability.
 
@@ -799,15 +821,15 @@ class WorkerLocalTransport(TensorTransport):
     def tensor_op(self, handle: Any, op: str, *op_args) -> Any:
         """Apply a named op (getitem/reshape/permute) to a stored tensor.
 
-        Default: round-trip get -> op -> put. Backends with on-worker compute
+        Default: round-trip resolve -> op -> put. Backends with on-worker compute
         override to avoid moving data.
         """
-        result = _apply_tensor_op(self.get([TensorSpan(handle, 0, int(handle.shape[0]))]), op, *op_args).contiguous()
+        result = _apply_tensor_op(self._resolve_handles([handle])[0], op, *op_args).contiguous()
         return self.put(result)
 
     def get_cpu(self, handle: Any) -> torch.Tensor:
         """Return the stored tensor as a CPU tensor."""
-        return self.get([TensorSpan(handle, 0, int(handle.shape[0]))]).cpu()
+        return self._resolve_handles([handle])[0].cpu()
 
 
 class TransportSession:

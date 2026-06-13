@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +18,6 @@ from unirl.distributed.tensor.transport import (
     TensorSpan,
     TensorTransport,
     TensorTransportRuntime,
-    cat_rows,
 )
 
 
@@ -58,7 +56,7 @@ class TQTensorHandle:
         backend = TensorTransportRuntime.current()
         if backend is None:
             raise RuntimeError("TQTensorHandle.local(): no TensorTransport installed to resolve the ref.")
-        return backend.get([self])
+        return backend._resolve_handles([self])[0]
 
 
 def _store_shape(t: torch.Tensor) -> torch.Tensor:
@@ -152,15 +150,10 @@ class TQTransport(TensorTransport):
 
         return _run_async_in_temp_loop(_put)
 
-    def get(self, spans: List[TensorSpan[TQTensorHandle]]) -> torch.Tensor:
-        async def _get() -> torch.Tensor:
-            # Each ref is a span: fetch its handle's row-block, then slice locally.
-            handles = [s.handle for s in spans]
-            tensors = await self._fetch(handles)
-            parts = [t[s.start : s.stop] for s, t in zip(spans, tensors)]
-            return cat_rows(parts)
-
-        return _run_async_in_temp_loop(_get)
+    def _resolve_handles(self, handles: List[TQTensorHandle]) -> List[torch.Tensor]:
+        # One async _fetch (column-unioned per put-group) returns the full base
+        # tensors aligned to *handles*; the base's get/get_batch slice the spans.
+        return _run_async_in_temp_loop(self._fetch, handles)
 
     def is_ref(self, value: Any) -> bool:
         return isinstance(value, TensorRef)
@@ -216,34 +209,6 @@ class TQTransport(TensorTransport):
             return result
 
         return _run_async_in_temp_loop(_put_batch)
-
-    def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
-        if not metas:
-            return {}
-
-        async def _get_batch() -> Dict[str, torch.Tensor]:
-            # Flatten every key's spans into one handle list (each handle carries
-            # its own producer field + original shape), fetch them grouped-by-put
-            # in _fetch, then regroup back per consumer key (cat a key's multiple
-            # spans). Extracting by handle.field — not by the consumer's positional
-            # key — is what lets a producer's output 'i' resolve under the
-            # consumer's input 'j'. Each span fetches its handle block and slices
-            # locally before the per-key cat.
-            handles: List[TQTensorHandle] = []
-            spans_list: List[Any] = []
-            owners: List[str] = []
-            for k, m in metas.items():
-                for s in m.spans:
-                    spans_list.append(s)
-                    handles.append(s.handle)
-                    owners.append(k)
-            tensors = await self._fetch(handles)
-            parts: Dict[str, list] = defaultdict(list)
-            for k, s, t in zip(owners, spans_list, tensors):
-                parts[k].append(t[s.start : s.stop])
-            return {k: cat_rows(lst) for k, lst in parts.items()}
-
-        return _run_async_in_temp_loop(_get_batch)
 
 
 __all__ = ["TQTransport", "TQTensorHandle"]

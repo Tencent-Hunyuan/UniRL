@@ -17,7 +17,7 @@ Put path (Worker → TW):
 Borrow path (TW → Worker):
   1. Worker calls batch_borrow([store_key, ...]) → [(ipc_h, shape, stride), ...]
   2. Worker opens IPC views (zero-copy read), offset always 0 (TW stores contiguous)
-  3. After role method + pack outputs, Worker clears all IPC view references
+  3. IPC views release by refcount when the resolved tensors aliasing them drop
 
 GC:
   controller weakref.finalize → tw.decref.remote(store_key)

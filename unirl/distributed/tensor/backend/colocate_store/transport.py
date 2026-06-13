@@ -11,7 +11,7 @@ colocate never needs CUDA-IPC: a ref is either local to this worker or on anothe
 device (→ NCCL). Multi-device (all slot0) is supported and leak-free.
 
 Only the store-specific methods are overridden. Batched resolve/pack (get_batch /
-put_batch), the per-call scope (end_call), and the remote-compute helpers (tensor_op /
+put_batch) and the remote-compute helpers (tensor_op /
 get_cpu) inherit the ABC defaults — those build on this class's get/put, so the defaults
 are already correct (and local).
 """
@@ -24,7 +24,7 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
-from unirl.distributed.tensor.transport import TensorRef, TensorSpan, WorkerLocalTransport, cat_rows
+from unirl.distributed.tensor.transport import TensorRef, WorkerLocalTransport
 
 
 class ColocateStoreTransport(WorkerLocalTransport):
@@ -37,26 +37,22 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def store(self) -> Any:
         return self._store
 
-    def _resolve_span(self, span: TensorSpan[ColocateTensorHandle]) -> torch.Tensor:
-        h = span.handle
-        if h.object_ref is not None:
-            base = ray.get(h.object_ref).detach()
-        elif h.source_id != self._store.worker_id:
-            raise RuntimeError(
-                f"ColocateStoreTransport: handle from '{h.source_id}' is not local to "
-                f"'{self._store.worker_id}'. localize should have transferred it."
-            )
-        else:
-            base = self._store.get(h)
-        return base[span.start : span.stop]
+    def _resolve_handles(self, handles: List[ColocateTensorHandle]) -> List[torch.Tensor]:
+        out: List[torch.Tensor] = []
+        for h in handles:
+            if h.object_ref is not None:
+                out.append(ray.get(h.object_ref).detach())
+            elif h.source_id != self._store.worker_id:
+                raise RuntimeError(
+                    f"ColocateStoreTransport: handle from '{h.source_id}' is not local to "
+                    f"'{self._store.worker_id}'. localize should have transferred it."
+                )
+            else:
+                out.append(self._store.get(h))
+        return out
 
     def put(self, tensor: torch.Tensor) -> Any:
         return self._store.put(tensor)
-
-    def get(self, spans: List[TensorSpan[ColocateTensorHandle]]) -> torch.Tensor:
-        if not spans:
-            raise ValueError("ColocateStoreTransport.get: empty spans list")
-        return cat_rows([self._resolve_span(s) for s in spans])
 
     def is_ref(self, value: Any) -> bool:
         return isinstance(value, TensorRef)
