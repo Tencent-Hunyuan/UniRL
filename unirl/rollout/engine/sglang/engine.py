@@ -409,12 +409,18 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         diffusion = get_diffusion_params(req.sampling_params)
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
-        # Normalize empty -> None: DiffusionNFT (num_sde_steps=0) resolves to ``[]``,
-        # which is ODE/forward-process (no SDE subset). ``None`` makes the response
-        # builder keep the FULL trajectory (no SDE-subset trim) and emit
-        # ``sde_indices = arange(num_steps)``, rather than treating ``[]`` as a
-        # zero-length subset and trimming the trajectory.
-        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw else None
+        # DiffusionNFT (num_sde_steps=0) resolves to ``[]``. The response builder
+        # reads an empty subset as "trim the SHIPPED trajectory to the terminal
+        # clean latent" (``compute_trajectory_positions`` always keeps position
+        # ``num_steps``). That is exactly what NFT needs: it consumes only
+        # ``segment.latents[:, -1]`` and ``segment.sigmas`` (``prepare_segment`` is
+        # a no-op for NFT — nothing reads the intermediate latents), so shipping
+        # all ``T+1`` latents over Ray IPC is ~T x wasted bandwidth. Keep ``[]`` as
+        # ``[]`` (do NOT normalize to ``None``) so the trim fires. The kernel still
+        # COLLECTS the full dit-trajectory (gated by ``rollout_return_dit_trajectory``
+        # in the request); this only bounds what crosses the wire. A genuine
+        # ``None`` (no diffusion sde params at all) keeps the full trajectory.
+        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
         # Best-effort emit: whenever the rollout ran SDE-gated steps, try to
         # land SGLang's native per-step log-probs on the segment. Whether they
         # are *used* (vs trainer-side replay) is decided downstream by the
