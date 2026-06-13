@@ -1,10 +1,9 @@
 """Runtime transformers-5.x compatibility shims for the HunyuanImage-3 checkpoint.
 
 The checkpoint's vendored ``trust_remote_code`` modeling was written for
-transformers 4.x. Instead of editing the checkpoint files on disk
-(``scripts/hi3_ckpt_transformers5_compat.py``), apply these idempotent
-monkeypatches once at bundle-load time — they need no on-disk state, survive
-re-downloads, and travel with the unirl code:
+transformers 4.x. Instead of editing the checkpoint files on disk, apply these
+idempotent monkeypatches once at bundle-load time — they need no on-disk state,
+survive re-downloads, and travel with the unirl code:
 
   A. transformers 5.x ``StaticLayer.lazy_initialization`` requires
      ``(key_states, value_states)``; the checkpoint's static cache calls it with
