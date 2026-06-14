@@ -37,6 +37,11 @@ adv_normalization_scope: group
 # false = mean-center-only advantage (reward - group_mean), no std division —
 # removes the GRPO difficulty bias (reference norm_adv_by_std_in_grpo=False).
 normalize_adv_by_std: false
+# Reorder the rollout batch driver-side so each DP shard gets a similar token
+# total (verl trainer.balance_batch parity). GRPO groups are dispatched as
+# consecutive siblings, so without this one rank draws a hard prompt's 8 long
+# answers and straggles the whole FSDP step. Measured: train 28.4s -> 15.3s.
+balance_shards: true
 
 logging:
   report_to_wandb: true
@@ -207,6 +212,13 @@ stack:
   # the increasingly off-policy steps 2-4 (π_old frozen per algorithm.
   # old_logp_source). dp=32 → per-worker shard 16 samples, 16%4==0 OK.
   num_updates_per_batch: 4
+  # verl ppo_max_token_len_per_gpu parity: pack each mini-batch into micro-batches
+  # under a token budget (length-sorted bin packing) instead of fixed-count
+  # slicing; with mbs=1 every sequence ran its own forward/backward. Omit
+  # micro_planner (→ default CountPlanner) for the legacy count-based behavior.
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

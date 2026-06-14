@@ -1,7 +1,7 @@
 """build_transport — construct the per-Worker TensorTransport for a backend kind.
 
 Called inside the Worker actor process (so the installed
-``TensorTransportRuntime`` singleton lives where ``TensorMeta.local()`` runs).
+``TensorTransportRuntime`` singleton lives where ``TensorRef.materialize()`` runs).
 Backend dependencies differ: colocate builds an in-process ``TensorStore``; gpu
 needs a ``TensorWorker`` handle (``tw``) injected by ``DevicePool``; transfer
 queue bootstraps its per-process TQ client here from the driver's ``tq_handoff``.

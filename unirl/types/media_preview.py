@@ -85,11 +85,11 @@ class MediaPreview(Batch):
 
 
 def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
-    """Smallest sample count >= ``min_items`` landing on a TensorMeta ref boundary.
+    """Smallest sample count >= ``min_items`` landing on a TensorRef ref boundary.
 
     ``decoded`` reaches the driver dehydrated: its tensor leaf (``Images.pixels``
-    / ``Videos.frames``) is a ``TensorMeta`` whose refs partition the batch by DP
-    shard, and ``TensorMeta`` only supports ref-boundary slicing. The cheapest
+    / ``Videos.frames``) is a ``TensorRef`` whose refs partition the batch by DP
+    shard, and ``TensorRef`` only supports ref-boundary slicing. The cheapest
     preview prefix is the first shard boundary covering ``min_items`` samples, so
     media logging hydrates one shard instead of the full decoded batch.
     ``Videos`` ref sizes count frames (PACKED), so shard frame boundaries are
@@ -97,13 +97,13 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     full batch size when the leaf is already a real tensor (nothing to save) or a
     boundary cannot be mapped.
     """
-    from unirl.distributed.tensor.transport import TensorMeta
+    from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
     want = max(1, min(int(min_items), total))
     if isinstance(decoded, Images):
         meta = decoded.pixels
-        if not isinstance(meta, TensorMeta):
+        if not isinstance(meta, TensorRef):
             return total
         rows = 0
         for size in meta.sizes:
@@ -113,7 +113,7 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
         return total
     meta = decoded.frames
     cu = decoded.cu_seqlens
-    if not isinstance(meta, TensorMeta) or cu is None:
+    if not isinstance(meta, TensorRef) or cu is None:
         return total
     sample_at_frame = {int(v): i for i, v in enumerate(cu.tolist())}
     frames = 0
@@ -166,17 +166,16 @@ def build_media_preview_for_track(
     limit = max(1, int(max_items))
 
     # ``decoded`` reaches the driver dehydrated (its tensor leaf is a
-    # ``TensorMeta`` proxy partitioned by DP shard). Slice to the smallest
+    # ``TensorRef`` proxy partitioned by DP shard). Slice to the smallest
     # ref-boundary prefix covering ``limit`` samples, then hydrate only that
     # shard so we pull one shard instead of the full decoded batch. Both steps
     # are no-ops when the leaf is already a real tensor (e.g. unit tests).
-    from unirl.distributed.tensor.transport import map_tree
-    from unirl.types.rollout_resp import _hydrate_tensor_meta
+    from unirl.distributed.tensor import hydrate, map_tree
 
     prefix = _ref_aligned_prefix_len(decoded, limit)
     if 0 < prefix < len(decoded):
         decoded = decoded.slice(0, prefix)
-    decoded = map_tree(decoded, _hydrate_tensor_meta)
+    decoded = map_tree(decoded, hydrate)
 
     if prompts is not None:
         prompt_texts: List[str] = [str(p) for p in prompts]

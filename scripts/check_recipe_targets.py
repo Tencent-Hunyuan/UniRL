@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # YAML trees that hold recipes / stage configs with ``_target_`` entries.
-SCAN_DIRS = ["examples", "DRPO", "FlowDPPO", "unirl"]
+SCAN_DIRS = ["examples", "CPPO", "DRPO", "FlowDPPO", "unirl"]
 # Vendored / sub-project trees kept byte-pristine (mirror .pre-commit-config exclude).
 SKIP_PARTS = {".git", "vendor"}
 

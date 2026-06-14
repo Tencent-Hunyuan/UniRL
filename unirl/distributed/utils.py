@@ -75,7 +75,7 @@ def collect_leaves(x, leaf_type: Type) -> list:
       - everything else -> skip
 
     Sorting dict/Batch keys ensures deterministic ordering across call sites,
-    which is critical for aligning controller-side collect_leaves(TensorMeta)
+    which is critical for aligning controller-side collect_leaves(TensorRef)
     with worker-side collect_leaves(torch.Tensor) by index.
     """
     result = []

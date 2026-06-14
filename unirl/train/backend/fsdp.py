@@ -182,6 +182,11 @@ class FSDPBackend(Remote):
             if active_lora is not None
             else None
         )
+        # Single source of truth for "which adapter the rollout samples under":
+        # the EMA shadow ("old") for DiffusionNFT adapter-EMA, else the trainable
+        # "default". The in-process eval-EMA swap and the weight sync to a
+        # SEPARATE engine both derive from this, so they cannot disagree.
+        self._rollout_adapter_name: str = str(ema_lora_cfg.shadow_adapter) if ema_lora_cfg is not None else "default"
         # No-sync gradient accumulation (see set_grad_sync). Only active under
         # ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the
         # per-micro reshard/re-gather interacts badly with deferred sync.
@@ -273,6 +278,18 @@ class FSDPBackend(Remote):
     # ------------------------------------------------------------------
     # Eval-EMA swap
     # ------------------------------------------------------------------
+
+    @property
+    def rollout_adapter_name(self) -> str:
+        """Adapter the rollout must sample under (single source of truth).
+
+        The EMA shadow (``"old"``) for DiffusionNFT-style adapter EMA, else the
+        trainable ``"default"``. The weight-sync handlers read this to decide
+        which adapter to push to a SEPARATE engine, mirroring the in-process
+        :meth:`apply_eval_ema` swap — so an off-policy algorithm rolls out under
+        the same weights whether the engine is colocated or separate.
+        """
+        return self._rollout_adapter_name
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def apply_eval_ema(self) -> None:

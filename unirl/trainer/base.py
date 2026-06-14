@@ -27,10 +27,10 @@ def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
         return None
+    from unirl.distributed.tensor import TensorTransportRuntime
     from unirl.distributed.tensor.backend.transfer_queue import TransferQueueRuntime
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
 
     rt = TransferQueueRuntime().install()
     handoffs = rt.init(cfg)
@@ -117,7 +117,7 @@ class BaseTrainer:
         its own ``train`` loop but they all drive one ``train_step`` per rollout, so this
         is the single seam that reclaims per-rollout TQ buffers without per-trainer edits.
         The reset fires once ``train_step`` returns — rewards/advantages materialized, no
-        live ``TensorMeta`` ref into the queue's RDMA buffers remaining.
+        live ``TensorRef`` ref into the queue's RDMA buffers remaining.
         """
         if self.pool.transport_kind not in ("transfer_queue", "tq"):
             return

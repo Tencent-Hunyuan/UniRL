@@ -14,6 +14,7 @@ LoRA the engine's in-process ``set_lora_from_tensors`` already owns the transfer
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.lora.base import LoraWeightSyncBase
@@ -35,7 +36,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         backend,
         rollout,
         param_prefix: str = "",
-        adapter_name: str = "default",
+        adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
     ) -> None:
