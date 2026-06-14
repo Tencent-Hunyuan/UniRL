@@ -451,12 +451,7 @@ def _build_text_conditions(
     # the pad tokens, and ``ZImageDiffusionStage.replay`` trims each caption back
     # to its real tokens. Every returned token is real, so synthesize an all-ones
     # ``[B, seq]`` mask from the fused embeds.
-    if (
-        model_family == "z_image"
-        and attn_mask_cat is None
-        and embeds_cat is not None
-        and embeds_cat.dim() == 3
-    ):
+    if model_family == "z_image" and attn_mask_cat is None and embeds_cat is not None and embeds_cat.dim() == 3:
         attn_mask_cat = torch.ones(
             (int(embeds_cat.shape[0]), int(embeds_cat.shape[1])),
             dtype=torch.long,
