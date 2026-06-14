@@ -15,7 +15,7 @@ Usage::
 
 The framework issues _auto_backward RPCs automatically on __exit__.
 Gradients are accumulated worker-side using PyTorch's native .grad += mechanism,
-supporting fan-out (same TensorMeta used as input to multiple RPCs).
+supporting fan-out (same TensorRef used as input to multiple RPCs).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-from unirl.distributed.tensor.transport import TensorMeta
+from unirl.distributed.tensor.ref import TensorRef
 
 if TYPE_CHECKING:
     from unirl.distributed.group.dispatch import Dispatch
@@ -54,14 +54,14 @@ class RPCBackwardNode:
     input_metas and output_metas are ordered lists — index i corresponds to
     _grad_inputs[call_id][i] and _grad_outputs[call_id][i] on the worker side.
     Both sides use the same depth-first sorted-key traversal via
-    collect_leaves(x, TensorMeta) / collect_leaves(x, Tensor) to guarantee alignment.
+    collect_leaves(x, TensorRef) / collect_leaves(x, Tensor) to guarantee alignment.
     """
 
     role_proxy: "Handle"
     call_id: str  # key prefix for worker _grad_inputs/_grad_outputs
     dispatch_mode: "Dispatch"  # backward dispatch mode (always DP_SCATTER currently)
-    input_metas: List["TensorMeta"]  # forward input TensorMetas, in traversal order
-    output_metas: List["TensorMeta"]  # forward output TensorMetas, in traversal order
+    input_metas: List["TensorRef"]  # forward input TensorMetas, in traversal order
+    output_metas: List["TensorRef"]  # forward output TensorMetas, in traversal order
 
 
 # ── GradContext ────────────────────────────────────────────────────────────────
@@ -140,8 +140,8 @@ def _run_backward(ctx: GradContext) -> None:
 def _run_auto_backward(node: RPCBackwardNode) -> None:
     """Call _auto_backward proxy on workers using node's dispatch_mode.
 
-    out_grads and in_grads are tuples of Optional[TensorMeta].  pytree_chunk
-    recurses into tuple elements, so each TensorMeta is chunked by dp_size
+    out_grads and in_grads are tuples of Optional[TensorRef].  pytree_chunk
+    recurses into tuple elements, so each TensorRef is chunked by dp_size
     giving worker_i its own grad shard.  pytree_cat does the inverse on
     return values.  No manual per-worker dispatch needed.
     """

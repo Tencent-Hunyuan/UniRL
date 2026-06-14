@@ -10,11 +10,11 @@ This exactly matches UniRL's train-side authority
 ``unirl/sde/kernels.py:DanceSDEStrategy`` (``.step`` / ``.compute_log_prob``)
 that ``logprob_source='replay'`` recomputes against -- keeping the rollout
 transition and the train-side log-prob consistent (iter-0 importance ratios ~1).
-Parity is pinned by ``tests/rollout/sglang/test_flow_sde_parity.py`` (dance case).
+Parity with that authority is verified by hand for now (no automated parity test yet).
 
 This is the ONLY REPLACE patch (all infra patches are additive). It re-vendors
-upstream ``flow_sde_sampling`` with one extra ``elif``; the parity test guards
-re-sync on upstream bumps.
+upstream ``flow_sde_sampling`` with one extra ``elif``, so it must be re-synced by
+hand against the pinned upstream source on any sglang bump.
 """
 
 from __future__ import annotations

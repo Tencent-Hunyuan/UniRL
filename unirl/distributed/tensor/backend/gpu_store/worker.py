@@ -7,7 +7,7 @@ Responsibilities:
   - Tensor storage with reference counting (_store, _ref_counts)
   - IPC handle management (_share_cuda_() only called here, never in Worker)
   - NCCL cross-GPU transfers (global ProcessGroup)
-  - tensor_op / get_tensor_cpu for TensorHandle remote operations
+  - tensor_op / get_tensor_cpu for GPUTensorHandle remote operations
 
 Put path (Worker → TW):
   1. Worker calls batch_allocate([(shape, dtype), ...]) → [(store_key, ipc_h, stride), ...]
@@ -17,7 +17,7 @@ Put path (Worker → TW):
 Borrow path (TW → Worker):
   1. Worker calls batch_borrow([store_key, ...]) → [(ipc_h, shape, stride), ...]
   2. Worker opens IPC views (zero-copy read), offset always 0 (TW stores contiguous)
-  3. After role method + pack outputs, Worker clears all IPC view references
+  3. IPC views release by refcount when the resolved tensors aliasing them drop
 
 GC:
   controller weakref.finalize → tw.decref.remote(store_key)
@@ -36,7 +36,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from unirl.distributed.tensor.backend.gpu_store.handle import TensorHandle
+from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 
 
 class TensorWorker:
@@ -116,7 +116,7 @@ class TensorWorker:
     def batch_write_done(self, store_keys: List[str]) -> None:
         """Move bufs from _pending into _store after Worker finishes writing.
 
-        Must be called synchronously (ray.get) before returning TensorHandle to
+        Must be called synchronously (ray.get) before returning GPUTensorHandle to
         controller — otherwise a concurrent borrow would KeyError on the key.
         """
         with self._lock:
@@ -146,7 +146,7 @@ class TensorWorker:
     # ── Reference counting ──
 
     def incref(self, key: str) -> None:
-        """Increment reference count. Called by TensorHandle __copy__ on controller."""
+        """Increment reference count. Called by GPUTensorHandle __copy__ on controller."""
         with self._lock:
             if key not in self._ref_counts:
                 raise KeyError(f"TensorWorker: cannot incref unknown key '{key}'")
@@ -167,7 +167,7 @@ class TensorWorker:
     def decref(self, key: str) -> None:
         """Decrement reference count. If zero, release the storage.
 
-        Called by TensorHandle._release (GC finalizer on controller side).
+        Called by GPUTensorHandle._release (GC finalizer on controller side).
 
         ipc_collect() is triggered lazily: only after _ipc_collect_count tensors
         freed OR _ipc_collect_bytes of cumulative VRAM freed, whichever comes first.
@@ -201,12 +201,12 @@ class TensorWorker:
                 raise KeyError(f"TensorWorker: unknown key '{key}'")
             return self._ref_counts[key]
 
-    # ── Tensor operations (called by TensorHandle.remote_op / TensorMeta.local) ──
+    # ── Tensor operations (called by GPUTensorHandle.remote_op / TensorRef.materialize) ──
 
-    def tensor_op(self, handle: TensorHandle, op: str, *op_args) -> TensorHandle:
+    def tensor_op(self, handle: GPUTensorHandle, op: str, *op_args) -> GPUTensorHandle:
         """Execute a tensor operation directly in _store (no IPC needed).
 
-        Returns a new unbound TensorHandle (caller must rebind).
+        Returns a new unbound GPUTensorHandle (caller must rebind).
         """
         if handle.object_ref is not None:
             t = ray.get(handle.object_ref)
@@ -229,12 +229,12 @@ class TensorWorker:
             self._counter += 1
             self._store[key] = result
             self._ref_counts[key] = 1
-        return TensorHandle(
+        return GPUTensorHandle(
             store_key=key, source_id=self.source_id, shape=tuple(result.shape), dtype=result.dtype, device=self.device
         )
 
-    def get_tensor_cpu(self, handle: TensorHandle) -> Tensor:
-        """Return tensor as CPU tensor (for TensorMeta.local())."""
+    def get_tensor_cpu(self, handle: GPUTensorHandle) -> Tensor:
+        """Return tensor as CPU tensor (for TensorRef.materialize())."""
         if handle.object_ref is not None:
             return ray.get(handle.object_ref)
         with self._lock:
@@ -283,15 +283,23 @@ class TensorWorker:
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
 
-    def _nccl_send(self, dst_rank: int, store_keys: List[str]) -> None:
-        """Send tensors identified by store_keys to dst_rank via NCCL."""
+    def _nccl_send(self, dst_rank: int, items: List) -> None:
+        """Send stored tensors (or row ranges of them) to dst_rank via NCCL.
+
+        Each item is ``(store_key, start, end)`` — a ``TensorSpan`` routing copy
+        ships only its ``[start:end)`` rows; ``(key, None, None)`` sends the whole
+        block. Bare ``str`` items are accepted for backward compatibility.
+        """
         assert self._global_pg is not None, "Global PG not initialized."
-        for key in store_keys:
+        for item in items:
+            key, start, end = (item, None, None) if isinstance(item, str) else item
             with self._lock:
                 tensor = self._store[key]
+            if start is not None:
+                tensor = tensor[start:end]
             self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
 
-    def _nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[TensorHandle]:
+    def _nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[GPUTensorHandle]:
         """Receive tensors from src_rank via NCCL, store in _store.
 
         Returns unbound TensorHandles (caller must rebind to this TW).
@@ -307,6 +315,6 @@ class TensorWorker:
                 self._store[key] = buf
                 self._ref_counts[key] = 1
             handles.append(
-                TensorHandle(store_key=key, source_id=self.source_id, shape=shape, dtype=dtype, device=self.device)
+                GPUTensorHandle(store_key=key, source_id=self.source_id, shape=shape, dtype=dtype, device=self.device)
             )
         return handles

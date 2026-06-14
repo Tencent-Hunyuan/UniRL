@@ -36,7 +36,7 @@ knows nothing about DTensor sharding or wrap topology.
   `optimizer_step` is the single chokepoint: clip → step → schedule → EMA, and it
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
-- **`TrainStack`** (`stack.py`) takes one backend + one `StageAlgorithm` and runs
+- **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
   `train_track`: move the segment onto device → `prepare_segment` (freeze π_old
   once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches, each a
   micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes from

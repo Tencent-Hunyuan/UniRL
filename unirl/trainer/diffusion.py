@@ -10,11 +10,11 @@ from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import _hydrate_tensor_meta
 from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -331,14 +331,20 @@ class DiffusionTrainer(BaseTrainer):
         )
         if _do_fsdp_offload:
             self.backend.offload()
-        # DiffusionNFT: sample under the EMA-smoothed ("old") adapter, then restore the
-        # trainable ("default") adapter before the loss. No-op for GRPO (gated).
-        # Only effective for colocate/trainside where rollout shares the train
-        # model; a separate sglang engine samples in its own process (see recipe).
-        if self._uses_ema:
+        # DiffusionNFT samples under the EMA-smoothed ("old") adapter. HOW "old"
+        # reaches the rollout depends on topology, so each mechanism fires only in
+        # its own regime (never both):
+        #   - trainside engine: it reuses THIS process's model, so swap the adapter
+        #     in place around generate and restore "default" before the loss.
+        #   - separate engine (sglang/vllm): runs in its own process and receives
+        #     "old" via the weight sync's merged push (backend.rollout_adapter_name);
+        #     the in-process swap cannot reach it, so skip the wasted swap + RPC.
+        # No-op for GRPO (gated on _uses_ema).
+        _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
+        if _inproc_ema_swap:
             self.backend.apply_eval_ema()
         resp = self.rollout.generate(req)
-        if self._uses_ema:
+        if _inproc_ema_swap:
             self.backend.restore_from_eval()
         self.rollout.sleep()
         if _do_fsdp_offload:
@@ -353,8 +359,8 @@ class DiffusionTrainer(BaseTrainer):
             if track.rewards is None:
                 continue
             # Hydrate in place so the wandb reward/advantage stats reuse this
-            # fetch instead of re-pulling the TensorMeta from the worker.
-            track.rewards = _hydrate_tensor_meta(track.rewards)
+            # fetch instead of re-pulling the TensorRef from the worker.
+            track.rewards = hydrate(track.rewards)
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands
 

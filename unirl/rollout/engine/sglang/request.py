@@ -37,7 +37,7 @@ from unirl.config.require import require
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import get_diffusion_params
+from unirl.types.sampling import get_diffusion_params, is_forward_process
 
 
 def _deexpand_prompts_from_groups(
@@ -233,22 +233,38 @@ def _to_sglang_kwargs(
     if req.sample_ids:
         kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
 
-    # Layer 4: SDE-kernel kwargs only apply when the algorithm requested
-    # per-step SDE noise (GRPO). ODE/non-SDE mode (eval, DiffusionNFT) omits them.
-    if sde_indices is not None:
+    # Layer 4: rollout mode. The response builder ALWAYS rebuilds the
+    # ``LatentSegment`` from ``rollout_trajectory_data.dit_trajectory.latents``
+    # (DiffusionNFT reads the clean final latent; GRPO replays the trajectory), so
+    # request rollout + the dit-trajectory unconditionally (collection is gated by
+    # ``rollout_return_dit_trajectory``, independently of the SDE kernel).
+    kwargs["rollout"] = True
+    kwargs["rollout_return_dit_trajectory"] = True
+    if is_forward_process(sde_indices):
+        # DiffusionNFT / forward-process: deterministic ODE rollout — no per-step
+        # SDE noise, so ``rollout_sde_step_indices`` is omitted (the kernel ignores
+        # it for ode and reads the field via ``getattr(..., None)``).
+        #
+        # ``rollout_log_prob_no_const=True`` is REQUIRED whenever
+        # ``rollout_sde_type="ode"``: an ODE step is deterministic, so its
+        # normalized log-prob is undefined and the kernel asserts this flag is set
+        # ("p_ode is always 0, true log_prob is meaningless"). It only makes the
+        # kernel emit a zero-log-prob placeholder, which this path never reads
+        # (``emit_native_logprob`` is False for a forward process). Keep it OFF the
+        # SDE branch below, where True would strip the normalization constants from
+        # GRPO's native log-prob.
+        kwargs["rollout_sde_type"] = "ode"
+        kwargs["rollout_noise_level"] = eta
+        kwargs["rollout_log_prob_no_const"] = True
+    else:
+        # SDE rollout (FlowGRPO et al.): per-step SDE noise on the resolved subset.
         require(
             sde_label is not None,
             "_to_sglang_kwargs: SDE mode requires sde_label (resolved by engine ctor)",
         )
-        kwargs["rollout"] = True
         kwargs["rollout_sde_type"] = sde_label
         kwargs["rollout_noise_level"] = eta
-        # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``)
-        # and gates dit-trajectory collection (latents + timesteps, returned in
-        # ``rollout_trajectory_data.dit_trajectory``) on
-        # ``rollout_return_dit_trajectory``.
         kwargs["rollout_sde_step_indices"] = sde_indices
-        kwargs["rollout_return_dit_trajectory"] = True
 
     if num_outputs_per_prompt is not None:
         kwargs["num_outputs_per_prompt"] = num_outputs_per_prompt
