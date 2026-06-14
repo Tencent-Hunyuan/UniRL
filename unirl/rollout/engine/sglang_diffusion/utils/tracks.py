@@ -298,6 +298,33 @@ def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(padded, dim=0)
 
 
+def _aligned_mask(
+    mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Fuse + mount an attention mask only when it aligns with the fused embeds.
+
+    The engine emits the model's embeds-aligned ``prompt_embeds_mask`` (the mask the
+    server's DiT itself attended under). Mount it only when its token axis (dim 1)
+    matches the fused embeds: Qwen-Image's single-encoder mask matches and flows to
+    replay; SD3's per-encoder mask fuses longer than the merged embeds, so it is
+    dropped (SD3's ``predict_noise`` ignores the mask — dropping a mismatched mask
+    is the safe, correct result and avoids padding the embeds up to a spurious
+    length, the historic ~68x LoRA-gradient dilution).
+    """
+    if not mask_list or embeds_cat is None:
+        return None
+    mask_cat = _cat_padded_rows(mask_list)
+    if int(mask_cat.shape[1]) != int(embeds_cat.shape[1]):
+        logger.debug(
+            "Dropping attention mask: fused seq-len %d != embeds seq-len %d "
+            "(mask not embeds-aligned for this family).",
+            int(mask_cat.shape[1]),
+            int(embeds_cat.shape[1]),
+        )
+        return None
+    return mask_cat
+
+
 def fuse_text_conditions(
     results: Sequence[RawResult],
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
@@ -352,7 +379,7 @@ def fuse_text_conditions(
         TextEmbedCondition(
             embeds=embeds_cat,
             pooled=torch.cat(pooled_list, dim=0) if pooled_list else None,
-            attn_mask=_cat_padded_rows(mask_list) if mask_list else None,
+            attn_mask=_aligned_mask(mask_list, embeds_cat),
         )
         if embeds_cat is not None
         else None
@@ -363,7 +390,7 @@ def fuse_text_conditions(
         TextEmbedCondition(
             embeds=neg_embeds_cat,
             pooled=torch.cat(neg_pooled_list, dim=0) if neg_pooled_list else None,
-            attn_mask=_cat_padded_rows(neg_mask_list) if neg_mask_list else None,
+            attn_mask=_aligned_mask(neg_mask_list, neg_embeds_cat),
         )
         if neg_embeds_cat is not None
         else None

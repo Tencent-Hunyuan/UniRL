@@ -21,13 +21,12 @@ same norm-preserving true-CFG blend as the trainside replay).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 
 # Qwen-Image patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
@@ -75,29 +74,12 @@ class QwenImageAdapter(ImageAdapter):
             segment_factory=self.segment_factory,
         )
 
-    def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        """Stage override: backfill the attention masks the serving stack drops.
-
-        The sglang qwen text-encode postprocess returns padded embeds WITHOUT
-        the parallel mask (``qwen_image_postprocess_text`` pads to the
-        request's batch max and discards the lengths), but the trainside
-        replay hard-requires ``attn_mask`` alongside ``embeds``
-        (``models/qwen_image/diffusion.py``). Within one request every sample
-        shares the prompt (the engine de-expands one group per forward), so
-        the embeds are unpadded and an all-ones mask is EXACT — and matches
-        what the server itself attended to. Cross-chunk length differences are
-        then handled by the padded fusions (mask rows extended with zeros).
-        """
-        out = super().build_condition(results)
-        for key in ("text", "negative_text"):
-            cond = out.get(key)
-            if cond is not None and cond.embeds is not None and cond.attn_mask is None:
-                out[key] = TextEmbedCondition(
-                    embeds=cond.embeds,
-                    pooled=cond.pooled,
-                    attn_mask=cond.embeds.new_ones(cond.embeds.shape[:2]),
-                )
-        return out
+    # build_condition: inherited from ImageAdapter. The engine emits Qwen-Image's
+    # embeds-aligned ``prompt_embeds_mask`` (the mask the server's DiT attends under)
+    # via ``_patches/patch_conditions``, and ``utils.tracks.fuse_text_conditions``
+    # mounts it whenever it aligns with the embeds — so no model-specific backfill is
+    # needed. If the mask is genuinely absent, trainside replay raises (fail loud)
+    # rather than fabricating an all-ones mask that is wrong for mixed-length batches.
 
 
 __all__ = ["QwenImageAdapter"]

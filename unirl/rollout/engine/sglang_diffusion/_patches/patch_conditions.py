@@ -38,16 +38,16 @@ WHAT THIS PATCH DOES (all setattr / dataclass-field-injection / AROUND-wrap):
 
        prompt_embeds          <- result.prompt_embeds
        pooled_prompt_embeds   <- result.pooled_embeds
-       encoder_attention_mask <- result.prompt_attention_mask
+       encoder_attention_mask <- result.prompt_embeds_mask
        negative_prompt_embeds <- result.negative_prompt_embeds
        neg_pooled_prompt_embeds <- result.neg_pooled_embeds
-       negative_attention_mask  <- result.negative_attention_mask
+       negative_attention_mask  <- result.negative_prompt_embeds_mask
 
    Upstream's ``TextEncodingStage.forward`` ALREADY populates the positive batch
-   fields (``prompt_embeds`` / ``pooled_embeds`` / ``prompt_attention_mask`` via
-   ``_append_positive_text_outputs``) and, when CFG is active, the negative ones
-   (``negative_prompt_embeds`` / ``neg_pooled_embeds`` / ``negative_attention_mask``
-   via ``_append_negative_text_outputs``) -- so we only COPY, never re-encode.
+   fields (``prompt_embeds`` / ``pooled_embeds`` / ``prompt_embeds_mask`` -- the
+   embeds-aligned mask the DiT actually attends under) and, when CFG is active, the
+   negative ones (``negative_prompt_embeds`` / ``neg_pooled_embeds`` /
+   ``negative_prompt_embeds_mask``) -- so we only COPY, never re-encode.
    That is why no text-encoding AROUND-wrap is needed here (see RISKS for why the
    fork's zeros-fallback / ``_expand`` re-capture is intentionally dropped).
 
@@ -90,24 +90,27 @@ _COND_FIELDS = (
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
 # Positives gate on return_prompt_embeds; negatives on return_negative_prompt_embeds.
 #
-# NOTE (LIN-365): ``encoder_attention_mask`` is deliberately NOT emitted. The SD3
-# pipeline's ``SD3ConditioningStage`` merges the prompt embeds (CLIP-L⊕CLIP-G along
-# hidden → 77, + T5 → 333) but leaves ``prompt_attention_mask`` as the raw
-# per-encoder list (77 + 77 + 256 → 410). Emitting that raw mask makes
-# ``TextEmbedCondition.concat`` pad the merged 333-token embeds up to the 410-token
-# mask (``target_seq_len = max(embeds_seq, mask_seq)``), injecting 77 spurious zero
-# tokens that the trainer's replay forwards through the DiT — diluting the LoRA
-# policy gradient ~68x (flat reward). SD3's ``predict_noise`` ignores the mask, so
-# dropping it is safe and matches the working vLLM-Omni / fork behavior. A model
-# that genuinely needs the mask must emit it merged to the embed sequence length.
+# NOTE (LIN-365): the emitted ``encoder_attention_mask`` carries the model's
+# EMBEDS-ALIGNED mask (``prompt_embeds_mask`` — the very mask the server's DiT
+# attends under, built by the text-encoding stage over the post-prefix-strip
+# embeds), NOT the raw ``prompt_attention_mask`` (which for prefix-stripped models
+# like Qwen-Image is longer than the embeds). The response translator mounts it
+# only when its fused length matches the fused embeds
+# (``utils.tracks.fuse_text_conditions``): Qwen-Image's single-encoder mask matches
+# and flows through to replay; SD3's per-encoder mask fuses to 410 vs the merged
+# 333-token embeds, so it is dropped there (SD3's ``predict_noise`` ignores the
+# mask anyway — see the historic ~68x LoRA-gradient dilution that motivated this
+# guard). This source-of-truth transmit + shape guard replaces both the old global
+# mask-drop and the adapter-side all-ones backfill.
 _POS_MAP = {
     "prompt_embeds": "prompt_embeds",
     "pooled_prompt_embeds": "pooled_embeds",
+    "encoder_attention_mask": "prompt_embeds_mask",
 }
 _NEG_MAP = {
     "negative_prompt_embeds": "negative_prompt_embeds",
     "neg_pooled_prompt_embeds": "neg_pooled_embeds",
-    "negative_attention_mask": "negative_attention_mask",
+    "negative_attention_mask": "negative_prompt_embeds_mask",
 }
 
 # Sentinels.
