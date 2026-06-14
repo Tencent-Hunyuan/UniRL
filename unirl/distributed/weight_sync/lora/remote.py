@@ -20,7 +20,7 @@ no contention. This handler does NO memory management — the trainer owns it.
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.distributed.weight_sync.lora.base import LoraWeightSyncBase
@@ -43,7 +43,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         *,
         backend,
         param_prefix: str = "",
-        adapter_name: str = "default",
+        adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
         copy: bool = False,

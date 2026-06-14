@@ -1,19 +1,14 @@
 # @package _global_
 # SD3.5 + DiffusionNFT, v2 trainer — SGLang SEPARATE-mode variant.
 #
-# ⚠️ KNOWN LIMITATION — NOT FULLY RUNNABLE AS A FAITHFUL DiffusionNFT RECIPE ⚠️
-# DiffusionNFT is meant to roll out under the EMA-smoothed "old" adapter
-# (requires_ema_rollout=True). In SEPARATE mode the rollout runs in a distinct
-# SGLang process, so the trainer's EMA swap (backend.apply_eval_ema, which
-# only touches the *train* process's model) does NOT reach the SGLang engine,
-# and the weight sync below pushes the trainable "default" adapter — not the
-# EMA "old" shadow. Making this faithful needs an extra path that syncs the
-# shadow adapter into SGLang (deeper change, not done here). This file is a
-# structure-aligned placeholder; the trainside family (sd3_nft.yaml,
-# sd3_nft_reward_service.yaml, qwen_image_nft*.yaml) is what runs cleanly.
-#
-# DiffusionNFT loss math (dual-adapter reference via algorithm.use_shadow) still works,
-# and the recipe constructs/loads — but rollout fidelity differs from v1.
+# DiffusionNFT rolls out under the EMA-smoothed "old" adapter
+# (requires_ema_rollout=True). In SEPARATE mode the in-process EMA swap
+# (backend.apply_eval_ema) cannot reach the distinct SGLang process, so the
+# weight sync instead folds the EMA shadow adapter into the pushed base. The
+# sync auto-derives WHICH adapter from the backend's single source of truth
+# (FSDPBackend.rollout_adapter_name, set from ema_lora_cfg.shadow_adapter), so
+# the SGLang engine samples under the EMA weights — faithful to v1. No per-recipe
+# wiring needed; set sync.adapter_name only to override.
 
 num_devices: 16               # 2 nodes x 8 GPUs (v1: 4 train + 4 rollout / node)
 
@@ -74,8 +69,9 @@ backend:
     type: constant
     warmup_steps: 0
     total_steps: 10000
-  # DiffusionNFT dual-adapter EMA. NOTE (see header): the weight sync pushes the
-  # "default" adapter, so SGLang rollout does not currently use "old".
+  # DiffusionNFT dual-adapter EMA. shadow_adapter ("old") becomes the backend's
+  # rollout_adapter_name, which the weight sync auto-folds into the pushed base
+  # (see header), so SGLang rollout samples under the EMA weights.
   ema_lora_cfg:
     _target_: unirl.train.configs.EmaLoraConfig
     rank: 32
@@ -180,8 +176,8 @@ sampling:
     num_sde_steps: 0
 
 # Merged full-weight sync → SGLang rollout (separate-slab NCCL broadcast).
-# ⚠️ Syncs the "default" adapter merged into base — NOT the EMA "old" shadow
-# (see header). Faithful DiffusionNFT-SGLang needs a shadow-adapter sync path.
+# Folds the EMA shadow adapter (backend.rollout_adapter_name, auto-derived) into
+# the pushed base; lora_merged: true is required for that fold (see header).
 sync:
   _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
   lora_merged: true

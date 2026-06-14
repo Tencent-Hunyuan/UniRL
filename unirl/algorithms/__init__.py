@@ -6,6 +6,7 @@ Public surface for the ``models`` training contract.
 from __future__ import annotations
 
 from .base import AlgorithmStepResult, StageAlgorithm
+from .cppo import CPPO, CPPOConfig
 from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
 from .drpo import DRPO, DRPOConfig
 from .flowdppo import FlowDPPO, FlowDPPOConfig
@@ -15,6 +16,8 @@ from .grpo import GRPO, GRPOConfig
 __all__ = [
     "GRPO",
     "GRPOConfig",
+    "CPPO",
+    "CPPOConfig",
     "DRPO",
     "DRPOConfig",
     "AlgorithmStepResult",

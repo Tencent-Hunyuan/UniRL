@@ -151,6 +151,42 @@ class SDEStrategy(StepStrategy, ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Implement StepStrategy.step by delegating to step_with_log_prob or Euler ODE."""
 
+    @abstractmethod
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        """Per-step diffusion coefficient ``std_dev_t`` for this SDE.
+
+        Pure function of the schedule + ``eta`` (independent of the model
+        output), so it is the single source shared by :meth:`step` (drift /
+        noise scaling) and :meth:`transition_std` (KL / log-prob std).
+        """
+
+    def transition_std(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        """Std of the per-step transition Gaussian ``N(mean, std**2)``.
+
+        Equals the ``std_var`` returned by :meth:`step` and used in
+        :meth:`compute_log_prob`, and is the correct normalizer for the FlowDPPO
+        KL ``(delta_mean)**2 / (2 * std**2)``. Default (Flow / Dance):
+        ``std_dev_t * sqrt(-dt)``. CPS overrides it (its noise carries no
+        ``sqrt(-dt)`` factor).
+        """
+        dt = sigma_next - sigma
+        std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
+        return std_dev_t * torch.sqrt(-dt)
+
     def _finalize_logp(
         self,
         *,
@@ -204,6 +240,16 @@ class FlowSDEStrategy(SDEStrategy):
         )
         return log_prob
 
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        return torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * eta
+
     def step(
         self,
         noise_pred: torch.Tensor,
@@ -220,7 +266,7 @@ class FlowSDEStrategy(SDEStrategy):
 
         device = noise_pred.device
         dt = sigma_next - sigma
-        std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * eta
+        std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
         prev_sample_mean = (
             sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
@@ -252,6 +298,28 @@ class CPSSDEStrategy(SDEStrategy):
     ) -> torch.Tensor:
         return -((prev_sample.detach() - prev_sample_mean) ** 2)
 
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        return sigma_next * math.sin(eta * math.pi / 2)
+
+    def transition_std(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        # CPS adds noise as std_dev_t * noise (no sqrt(-dt)), so the transition
+        # Gaussian std IS std_dev_t -- the KL must not multiply by sqrt(-dt).
+        return self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
+
     def step(
         self,
         noise_pred: torch.Tensor,
@@ -267,7 +335,7 @@ class CPSSDEStrategy(SDEStrategy):
         from diffusers.utils.torch_utils import randn_tensor
 
         device = noise_pred.device
-        std_dev_t = sigma_next * math.sin(eta * math.pi / 2)
+        std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
         pred_original = sample - sigma * noise_pred
         noise_estimate = sample + noise_pred * (1 - sigma)
         prev_sample_mean = pred_original * (1 - sigma_next) + noise_estimate * torch.sqrt(sigma_next**2 - std_dev_t**2)
@@ -301,6 +369,16 @@ class DanceSDEStrategy(SDEStrategy):
         )
         return log_prob
 
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        return torch.full_like(sigma, float(eta))
+
     def step(
         self,
         noise_pred: torch.Tensor,
@@ -317,7 +395,7 @@ class DanceSDEStrategy(SDEStrategy):
 
         device = noise_pred.device
         dt = sigma_next - sigma
-        std_dev_t = eta
+        std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
         prev_sample_mean = (
             sample * (1 + std_dev_t**2 / (2 * sigma) * dt)

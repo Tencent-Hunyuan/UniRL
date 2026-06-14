@@ -125,7 +125,7 @@ class DevicePool:
 
     def setup(self) -> None:
         """Create PlacementGroups, Worker actors, and (for worker-local backends) NCCL."""
-        from unirl.distributed.tensor.transport import WorkerLocalTransport
+        from unirl.distributed.tensor import WorkerLocalTransport
 
         self._create_placement_groups()
         self._create_workers()

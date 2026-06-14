@@ -48,6 +48,7 @@ runtime loop, deployment modes, and module map.
 |---|---|---|---|
 | **Flow-DPPO** | [*"Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models"*](https://arxiv.org/abs/2606.11025) | [FlowDPPO/](FlowDPPO/) | Diffusion/flow RL with an exact divergence-based trust-region mask. |
 | **DRPO** | [*"Rethinking the Divergence Regularization in LLM RL"*](https://arxiv.org/abs/2606.09821) | [DRPO/](DRPO/) | Token-level LLM RL with a smooth advantage-weighted quadratic regularizer. |
+| **CPPO** | [*"Beyond Uniform Token-Level Trust Region in LLM Reinforcement Learning"*](https://arxiv.org/abs/2606.10968) | [CPPO/](CPPO/) | Token-level LLM RL with a position-weighted, cumulative-prefix-budget Binary-TV mask. |
 
 UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **DiffusionNFT**,
 **DanceGRPO**, and **MixGRPO** — in [`unirl/algorithms/`](unirl/algorithms/README.md).
