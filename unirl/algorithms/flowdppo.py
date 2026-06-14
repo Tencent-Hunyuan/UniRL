@@ -345,10 +345,13 @@ class FlowDPPO(StageAlgorithm):
         target_steps: List[int],
         device: torch.device,
     ) -> torch.Tensor:
-        """Compute sigma_t = std_dev_t * sqrt(-dt) for KL normalization.
+        """Per-step KL-normalization sigma_t, delegated to the SDE strategy.
 
-        When ``add_kl_coefficient=False``, returns ones (unnormalized MSE).
-        Returns shape ``[1, S', 1, 1, 1]`` for broadcasting with means tensors.
+        Returns ``stage.strategy.transition_std(...)`` so the KL uses each
+        strategy's own transition std (Flow/Dance: ``std_dev_t * sqrt(-dt)``;
+        CPS: ``std_dev_t``, no ``sqrt(-dt)``). When ``add_kl_coefficient=False``,
+        returns ones (unnormalized MSE). Shape ``[1, S', 1, 1, 1]`` for
+        broadcasting with the means tensors.
         """
         if not self.add_kl_coefficient:
             return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
@@ -362,9 +365,11 @@ class FlowDPPO(StageAlgorithm):
         idx = torch.tensor(target_steps, dtype=torch.long, device=device)
         s = sigmas[idx]
         s_next = sigmas[idx + 1]
-        dt = s_next - s  # negative for denoising
-        std_dev_t = torch.sqrt(s / (1.0 - torch.clamp(s, max=0.99))) * eta
-        sigma_t = std_dev_t * torch.sqrt(-dt)
+        # Delegate to the SDE strategy so the KL normalizer matches each strategy's
+        # transition std (Flow/Dance: std_dev_t*sqrt(-dt); CPS: std_dev_t, no sqrt(-dt)).
+        # sigma_max=sigmas[1] mirrors the stage's sigma==1 handling (used by Flow only).
+        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
+        sigma_t = self.stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=eta, sigma_max=sigma_max)
         return sigma_t.reshape(1, -1, 1, 1, 1)
 
 
