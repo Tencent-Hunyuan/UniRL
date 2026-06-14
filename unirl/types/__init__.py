@@ -25,7 +25,6 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "BaseSamplingParams": ("unirl.types.sampling", "BaseSamplingParams"),
     "ComposedSamplingParams": ("unirl.types.sampling", "ComposedSamplingParams"),
     "DiffusionSamplingParams": ("unirl.types.sampling", "DiffusionSamplingParams"),
-    "SamplingRequirements": ("unirl.types.sampling", "SamplingRequirements"),
     "get_diffusion_params": ("unirl.types.sampling", "get_diffusion_params"),
     "TrajectoryStore": ("unirl.types.trajectory_store", "TrajectoryStore"),
 }
