@@ -133,7 +133,7 @@ algorithm:
   clip_schedule: constant
   # Bagel samples and trains at bs=1 (same micro-geometry), so the rollout's
   # stored sde_logp is a valid pi_old anchor → ratio=1 on update 1 without replay.
-  old_logp_source: native
+  old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.bagel.conditions.BagelDiffusionConditions
