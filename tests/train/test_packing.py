@@ -1,4 +1,4 @@
-"""Unit tests for micro-batch planning (unirl/train/stack/planning.py) + the
+"""Unit tests for micro-batch planning (unirl/train/stack/planner/) + the
 TokenBudgetPlanner seq-mean guard. Pure / CPU-only — no GPU, no FSDP backend.
 
 Run with ``pytest tests/train/test_packing.py`` or directly:
@@ -13,17 +13,18 @@ import pytest
 import torch
 
 from unirl.train.stack import TokenBudgetPlanner
-from unirl.train.stack.planning import (
+from unirl.train.stack.planner.count import _count_plan
+from unirl.train.stack.planner.packed import (
     _arrange_packed,
-    _build_micro_batch_slices,
-    _count_plan,
-    _pack_micros,
-    _pack_micros_2d,
-    _pack_micros_sum,
-    _partition_into_k,
+    _extract_samples,
+    _sample,
     _sync_micro_count,
-    _update_ranges,
+    balance_into_k,
+    dense,
+    first_fit_decreasing,
+    varlen_sum,
 )
+from unirl.train.stack.planner.types import _build_micro_batch_slices, _update_ranges
 
 
 def _range_indices(r):
@@ -44,10 +45,14 @@ def _covers(bins, indices):
     return sorted(flat) == sorted(indices) and len(flat) == len(indices)
 
 
-def _fake_track(lengths):
-    """Minimal RolloutTrack stand-in: just batch_size + segment.lengths."""
-    seg = types.SimpleNamespace(lengths=torch.tensor(lengths, dtype=torch.long))
-    return types.SimpleNamespace(batch_size=len(lengths), segment=seg, conditions={})
+def _samples(resp, prompt=None):
+    """Build the Sample list a packer consumes (idx = position, clamped sizes)."""
+    return [_sample(i, prompt=(0 if prompt is None else prompt[i]), resp=resp[i]) for i in range(len(resp))]
+
+
+def _idx_bins(micros):
+    """Micros (lists of Samples) -> lists of their original indices, for coverage checks."""
+    return [[s.idx for s in m] for m in micros]
 
 
 # --------------------------------------------------------------------------- #
@@ -77,69 +82,90 @@ def test_count_plan_structure():
 
 
 # --------------------------------------------------------------------------- #
-# token-budget packing — coverage + budget invariants
+# token-budget packing kernels — coverage + budget invariants
 # --------------------------------------------------------------------------- #
 DENSE_LENGTHS = [4000, 3500, 300, 250, 200, 180, 150, 120]
 
 
-def test_pack_micros_dense_covers_and_respects_budget():
-    bins = _pack_micros(indices=list(range(8)), lengths=DENSE_LENGTHS, token_budget=10240)
-    assert _covers(bins, list(range(8)))
-    for b in bins:
-        cost = max(DENSE_LENGTHS[i] for i in b) * len(b)
-        assert cost <= 10240 or len(b) == 1  # single oversize seq allowed its own bin
-    # the two long seqs cannot share with the shorts under 10240
-    assert all(b for b in bins)  # no empty bins
+def test_ffd_dense_covers_and_respects_budget():
+    micros = first_fit_decreasing(_samples(DENSE_LENGTHS), cost=dense, budget=10240)
+    assert _covers(_idx_bins(micros), list(range(8)))
+    for m in micros:
+        assert dense(m) <= 10240 or len(m) == 1  # single oversize seq allowed its own micro
+    assert all(m for m in micros)  # no empty micros
 
 
-def test_pack_micros_sum_covers_and_respects_budget():
-    bins = _pack_micros_sum(indices=list(range(8)), lengths=DENSE_LENGTHS, token_budget=8000)
-    assert _covers(bins, list(range(8)))
-    for b in bins:
-        cost = sum(DENSE_LENGTHS[i] for i in b)
-        assert cost <= 8000 or len(b) == 1
+def test_ffd_varlen_sum_covers_and_respects_budget():
+    micros = first_fit_decreasing(_samples(DENSE_LENGTHS), cost=varlen_sum, budget=8000)
+    assert _covers(_idx_bins(micros), list(range(8)))
+    for m in micros:
+        assert varlen_sum(m) <= 8000 or len(m) == 1
 
 
-def test_pack_micros_2d_covers_and_respects_budget():
-    prompt = [1000, 50, 900, 40, 30, 20, 10, 5]
-    resp = [50, 1000, 40, 900, 200, 180, 150, 120]
-    bins = _pack_micros_2d(indices=list(range(8)), prompt_lens=prompt, resp_lens=resp, token_budget=4096)
-    assert _covers(bins, list(range(8)))
-    for b in bins:
-        cost = (max(prompt[i] for i in b) + max(resp[i] for i in b)) * len(b)
-        assert cost <= 4096 or len(b) == 1
+def test_ffd_dense_2d_separates_anticorrelated_under_tight_budget():
+    # idx0 = big prompt / small resp, idx1 = small prompt / big resp. Together the 2D
+    # pad is (1000+1000)*2 = 4000, so a 2048 budget must keep them in separate micros
+    # even though each alone (1050) fits — this is exactly what the 2D dense cost buys.
+    prompt = [1000, 50]
+    resp = [50, 1000]
+    micros = first_fit_decreasing(_samples(resp, prompt), cost=dense, budget=2048)
+    bins = _idx_bins(micros)
+    assert _covers(bins, [0, 1])
+    for m in micros:
+        assert dense(m) <= 2048 or len(m) == 1
+    assert not any(0 in b and 1 in b for b in bins)
 
 
-def test_oversize_sequence_gets_its_own_bin():
+def test_oversize_sequence_gets_its_own_micro():
     # one seq longer than the whole budget must still be placed (never dropped)
-    bins = _pack_micros(indices=[0, 1, 2], lengths=[50, 99999, 60], token_budget=1024)
+    micros = first_fit_decreasing(_samples([50, 99999, 60]), cost=dense, budget=1024)
+    bins = _idx_bins(micros)
     assert _covers(bins, [0, 1, 2])
     big = next(b for b in bins if 1 in b)
     assert big == [1]
 
 
-def test_pack_micros_rejects_nonpositive_budget():
+def test_ffd_rejects_nonpositive_budget():
     with pytest.raises(ValueError):
-        _pack_micros(indices=[0, 1], lengths=[10, 20], token_budget=0)
+        first_fit_decreasing(_samples([10, 20]), cost=dense, budget=0)
+
+
+def test_ffd_tie_break_by_idx_is_deterministic():
+    # equal totals -> ordered by idx; budget fits exactly two per micro, so the first
+    # micro holds the lowest indices. Guards against a future sort-key change.
+    micros = first_fit_decreasing(_samples([100, 100, 100, 100]), cost=dense, budget=200)
+    assert _idx_bins(micros) == [[0, 1], [2, 3]]
+
+
+def test_sample_clamps_zero_resp():
+    # a zero response length is clamped to 1 so total >= 1: a zero-cost sample would
+    # otherwise pack unboundedly into one micro.
+    s = _sample(0, prompt=0, resp=0)
+    assert (s.prompt, s.resp, s.total) == (0, 1, 1)
+    micros = first_fit_decreasing(_samples([0, 0, 0, 0]), cost=dense, budget=2)
+    assert _covers(_idx_bins(micros), [0, 1, 2, 3])
+    for m in micros:
+        assert dense(m) <= 2  # clamp makes each row cost 1 -> at most 2 per micro
 
 
 # --------------------------------------------------------------------------- #
 # exact-K re-partition (NCCL micro-count parity)
 # --------------------------------------------------------------------------- #
-def test_partition_into_k_exact_and_covers():
-    idx = list(range(8))
+def test_balance_into_k_exact_and_covers():
+    samples = _samples(DENSE_LENGTHS)
     for k in (1, 2, 3, 5, 8):
-        bins = _partition_into_k(indices=idx, lengths=DENSE_LENGTHS, k=k)
-        assert len(bins) == k
-        assert all(len(b) >= 1 for b in bins)  # every bin non-empty
-        assert _covers(bins, idx)
+        micros = balance_into_k(samples, cost=dense, k=k)
+        assert len(micros) == k
+        assert all(len(m) >= 1 for m in micros)  # every micro non-empty
+        assert _covers(_idx_bins(micros), list(range(8)))
 
 
-def test_partition_into_k_out_of_range():
+def test_balance_into_k_out_of_range():
+    samples = _samples([1, 2, 3])
     with pytest.raises(ValueError):
-        _partition_into_k(indices=[0, 1, 2], lengths=[1, 2, 3], k=0)
+        balance_into_k(samples, cost=dense, k=0)
     with pytest.raises(ValueError):
-        _partition_into_k(indices=[0, 1, 2], lengths=[1, 2, 3], k=4)  # k > n
+        balance_into_k(samples, cost=dense, k=4)  # k > n
 
 
 def test_sync_micro_count_noop_without_dist():
@@ -155,10 +181,7 @@ def test_packed_arrange_preserves_update_membership():
     # must hold exactly its original [u*4, u*4+4) samples (membership unchanged), and
     # the plan's ranges must contiguously cover that permuted block.
     lengths = [4000, 3500, 300, 250, 200, 180, 150, 120]
-    track = _fake_track(lengths)
-    out = _arrange_packed(track, num_updates=2, token_budget=10240, cost_model="dense")
-    assert out is not None
-    perm, plan = out
+    perm, plan = _arrange_packed(_samples(lengths), num_updates=2, token_budget=10240, cost_model="dense")
     assert sorted(perm) == list(range(8))  # a full permutation, no sample lost
     assert len(plan) == 2
     for u, update in enumerate(plan):
@@ -172,8 +195,7 @@ def test_packed_arrange_preserves_update_membership():
 
 def test_sample_share_weights_sum_to_one_per_update():
     lengths = [4000, 3500, 300, 250, 200, 180, 150, 120]
-    track = _fake_track(lengths)
-    _, plan = _arrange_packed(track, num_updates=2, token_budget=10240, cost_model="dense")
+    _, plan = _arrange_packed(_samples(lengths), num_updates=2, token_budget=10240, cost_model="dense")
     for update in plan:
         update_total = sum(e - s for s, e in update)
         weights = [(e - s) / update_total for s, e in update]
@@ -181,9 +203,17 @@ def test_sample_share_weights_sum_to_one_per_update():
         assert abs(sum(weights) - 1.0) < 1e-12
 
 
-def test_arrange_packed_falls_back_when_no_lengths():
+def test_extract_samples_returns_none_without_lengths():
     track = types.SimpleNamespace(batch_size=4, segment=None, conditions={})
-    assert _arrange_packed(track, num_updates=2, token_budget=1024, cost_model="dense") is None
+    assert _extract_samples(track) is None
+
+
+def test_arrange_falls_back_to_count_plan_without_lengths():
+    # the fallback path returns a count plan and does NOT touch the track (no .select)
+    track = types.SimpleNamespace(batch_size=4, segment=None, conditions={})
+    out_track, plan = TokenBudgetPlanner(token_budget=1024).arrange(track, num_updates=2, micro_batch_size=1)
+    assert out_track is track
+    assert plan == _count_plan(total=4, num_updates=2, micro_batch_size=1)
 
 
 def test_arrange_packed_picks_up_prompt_from_conditions_dict():
@@ -194,9 +224,10 @@ def test_arrange_packed_picks_up_prompt_from_conditions_dict():
     seg = types.SimpleNamespace(lengths=torch.tensor([100, 100, 100, 100], dtype=torch.long))
     prompt = types.SimpleNamespace(attention_mask=torch.ones(4, 50, dtype=torch.long))
     track = types.SimpleNamespace(batch_size=4, segment=seg, conditions={"prompt": prompt})
-    out = _arrange_packed(track, num_updates=1, token_budget=300, cost_model="dense")
-    assert out is not None
-    perm, plan = out
+    samples = _extract_samples(track)
+    assert samples is not None
+    assert all(s.prompt == 50 for s in samples)  # prompt read via the dict accessor
+    perm, plan = _arrange_packed(samples, num_updates=1, token_budget=300, cost_model="dense")
     assert sorted(perm) == [0, 1, 2, 3]
     assert all((e - s) <= 2 for s, e in plan[0])  # prompt counted -> 2D cap
 

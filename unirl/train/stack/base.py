@@ -7,10 +7,10 @@ stack = one training track.
 
 It owns the entire family-agnostic pipeline — device alignment, the π_old anchor
 freeze, the per-update micro-accumulation loop, EMA, metrics — and defers exactly
-ONE decision to an injected :class:`~unirl.train.stack.planning.MicroPlanner`
+ONE decision to an injected :class:`~unirl.train.stack.planner.MicroPlanner`
 (composition, not inheritance): how each update's samples are grouped into
-micro-batches. :class:`~unirl.train.stack.planning.CountPlanner` (the default)
-groups by fixed count; :class:`~unirl.train.stack.planning.TokenBudgetPlanner`
+micro-batches. :class:`~unirl.train.stack.planner.CountPlanner` (the default)
+groups by fixed count; :class:`~unirl.train.stack.planner.TokenBudgetPlanner`
 packs by token budget. Swapping the strategy is a recipe-level ``micro_planner``
 block, no subclass.
 
@@ -25,11 +25,11 @@ Sequencing per :meth:`train_track` call (one rollout)::
 **Sort-then-slice.** Variable-length packing wants to group samples of similar
 length, which would normally force arbitrary index lists threaded through the
 whole pipeline. Instead the planner *reorders the track once up front* (length-sort
-within each update, see :meth:`~unirl.train.stack.planning.TokenBudgetPlanner.arrange`)
+within each update, see :meth:`~unirl.train.stack.planner.TokenBudgetPlanner.arrange`)
 so every micro is again a **contiguous** ``(start, end)`` range — exactly the
 count-based geometry. The stack therefore only ever slices, and the anchor
 reassembly is a plain ordered ``cat``; all packing-specific logic lives in the
-planner (a no-op for :class:`~unirl.train.stack.planning.CountPlanner`).
+planner (a no-op for :class:`~unirl.train.stack.planner.CountPlanner`).
 
 ``num_updates_per_batch`` partitions the rollout batch into that many disjoint
 updates and runs one optimizer step per update — the FlowGRPO / DanceGRPO
@@ -51,7 +51,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.planning import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
+from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
 from unirl.types.rollout_resp import RolloutTrack
 from unirl.utils.misc import aggregate_numeric_metrics
 
@@ -125,7 +125,7 @@ class TrainStack(Remote):
     on_rollout_end fan-out. The ONLY family-varying decision — micro-batch grouping —
     is delegated to an injected ``micro_planner`` (count-based vs token-budget);
     everything else is shared. Defaults to
-    :class:`~unirl.train.stack.planning.CountPlanner` (the historical diffusion
+    :class:`~unirl.train.stack.planner.CountPlanner` (the historical diffusion
     behaviour), so the 60+ count-based configs need no ``micro_planner`` block.
 
     Created as a sibling ``Remote`` inside a placement block; takes handles to its
@@ -177,7 +177,7 @@ class TrainStack(Remote):
         replay (replay GRPO; FlowDPPO always, for ``sde_means``), the recomputed
         ``anchor_fields`` are computed at the SAME micro geometry training will use —
         the contiguous ranges in ``plans`` (already aligned with the reordered track
-        from :meth:`~unirl.train.stack.planning.MicroPlanner.arrange`) — so the
+        from :meth:`~unirl.train.stack.planner.MicroPlanner.arrange`) — so the
         old/new forwards match bf16-element-for-element on those fields. Concretely,
         the on-policy PPO ratio is exactly 1 only where ``sde_logp`` is replayed
         (replay GRPO, or FlowDPPO under ``old_logp_source='replay'``), and the
@@ -223,7 +223,7 @@ class TrainStack(Remote):
         """Run one optimizer step over the contiguous micro ranges of a single update.
 
         ``micros`` is one update's worth of ``(start, end)`` ranges produced by
-        :meth:`~unirl.train.stack.planning.MicroPlanner.arrange` so the forward
+        :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
         geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
         """
         if resp_track.advantages is None:
@@ -360,7 +360,7 @@ class TrainStack(Remote):
         """Run ``num_updates_per_batch`` optimizer steps over disjoint updates.
 
         The update/micro grouping comes from
-        :meth:`~unirl.train.stack.planning.MicroPlanner.arrange` — the same source
+        :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` — the same source
         :meth:`prepare_segment` froze the π_old anchor at — so every update's
         ``new_logp`` is computed at exactly the anchor's geometry. ``prepare_segment``
         must already have frozen the anchor so all updates train against the same
