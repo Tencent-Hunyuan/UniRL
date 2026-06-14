@@ -321,6 +321,34 @@ class TensorRef(Batch):
 
 
 # ---------------------------------------------------------------------------
+# Driver-side hydration
+# ---------------------------------------------------------------------------
+
+
+def hydrate(value: Any) -> Any:
+    """Driver-side hydrate of a ``TensorRef`` proxy back to a real ``torch.Tensor``.
+
+    ``Worker.call`` packs every ``torch.Tensor`` leaf of a worker's return value
+    into the store (via ``transport.put_batch``), so fields like ``track.rewards``
+    arrive at the driver as ``TensorRef`` proxies even though downstream driver-side
+    code (advantage computation) does arithmetic on them as if they were tensors.
+    This fetches the underlying tensor(s) via each span's bound worker and cats
+    them. Returns the value unchanged when it is already a real tensor (or any
+    non-ref), and ``None`` for an empty-span ref.
+
+    Distinct from :meth:`TensorTransport.hydrate`, which resolves refs through an
+    explicit backend; this is the backend-less, per-ref path used off the driver.
+    """
+    if not isinstance(value, TensorRef):
+        return value
+    if not value.spans:
+        return None
+    # materialize(None) = per-span local() fetch + cat_rows (each span slices its
+    # handle; ragged 2D parts follow the documented right-pad contract).
+    return value.materialize(backend=None)
+
+
+# ---------------------------------------------------------------------------
 # Type-based tree walker
 # ---------------------------------------------------------------------------
 

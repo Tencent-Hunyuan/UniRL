@@ -17,6 +17,7 @@ from unirl.distributed.tensor.ref import (
     TensorRef,
     TensorSpan,
     cat_rows,
+    hydrate,
     map_tree,
 )
 from unirl.distributed.tensor.transport import (
@@ -39,6 +40,7 @@ __all__ = [
     "cat_rows",
     "concat_field",
     "field",
+    "hydrate",
     "map_tree",
     "max_field",
     "mean_field",

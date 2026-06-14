@@ -27,7 +27,7 @@ class TQTensorHandle:
     for free:
 
     * **Uniform ref interface.** Every ``TensorRef.spans`` element exposes
-      ``.local()``, so driver-side hydration (``_hydrate_tensor_meta``) resolves a
+      ``.local()``, so driver-side hydration (``hydrate``) resolves a
       worker-local ``TensorHandle`` and a global TQ ref the same way.
     * **Field identity travels with the ref.** ``Worker.call`` keys put/get by
       *positional* index, so a producer's output ``'0'`` is a consumer's input

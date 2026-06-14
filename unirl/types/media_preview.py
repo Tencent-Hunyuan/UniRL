@@ -170,13 +170,12 @@ def build_media_preview_for_track(
     # ref-boundary prefix covering ``limit`` samples, then hydrate only that
     # shard so we pull one shard instead of the full decoded batch. Both steps
     # are no-ops when the leaf is already a real tensor (e.g. unit tests).
-    from unirl.distributed.tensor import map_tree
-    from unirl.types.rollout_resp import _hydrate_tensor_meta
+    from unirl.distributed.tensor import hydrate, map_tree
 
     prefix = _ref_aligned_prefix_len(decoded, limit)
     if 0 < prefix < len(decoded):
         decoded = decoded.slice(0, prefix)
-    decoded = map_tree(decoded, _hydrate_tensor_meta)
+    decoded = map_tree(decoded, hydrate)
 
     if prompts is not None:
         prompt_texts: List[str] = [str(p) for p in prompts]
