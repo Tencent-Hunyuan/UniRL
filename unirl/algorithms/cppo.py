@@ -171,10 +171,11 @@ def _cppo_mask(
             continue
 
         # Decreasing position weight w_t in [w_min, 1] over this sequence's own
-        # length T (paper Eq. 9); t is 1-based. T == 1 -> w_t = 1 (frac = 0).
+        # length T (paper Eq. 9); t is 1-based, so w_1 = 1 and w_T = w_min. Use the
+        # paper's (t - 1) numerator so a single-token response (T == 1) keeps its
+        # lone first token at w_1 = 1; for T >= 2 this equals w_min + (1-w_min)(T-t)/(T-1).
         pos = torch.arange(1, T + 1, device=D_t.device, dtype=D_t.dtype)
-        frac = (T - pos) / max(T - 1, 1)
-        w_t = w_min + (1.0 - w_min) * frac
+        w_t = 1.0 - (1.0 - w_min) * (pos - 1) / max(T - 1, 1)
         Z_t = w_t * D_t
 
         # Prefix sums with a one-token right shift so the decision at t uses only
