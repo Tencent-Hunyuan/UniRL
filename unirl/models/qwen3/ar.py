@@ -39,7 +39,7 @@ from .conditions import Qwen3ARConditions
 
 logger = logging.getLogger(__name__)
 
-_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2")
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
 @functools.lru_cache(maxsize=None)

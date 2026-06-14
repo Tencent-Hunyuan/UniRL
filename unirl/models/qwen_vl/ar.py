@@ -18,7 +18,7 @@ from .conditions import QwenVLARConditions
 
 logger = logging.getLogger(__name__)
 
-_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2")
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
 @functools.lru_cache(maxsize=None)
@@ -131,9 +131,10 @@ def _merge_igt(per_sample_igt: Optional[List[Optional[torch.Tensor]]]) -> Option
 
 
 # Attention backends with a sparse packed kernel (skip cross-sequence blocks) →
-# packed replay always wins. Qwen2.5-VL has no flex support, but gets
-# flash_attention_2 once flash_attn is installed train-side; on plain sdpa,
-# packed is gated on length variance (see packed_replay).
+# packed replay always wins. Qwen2.5-VL has NO flex support, so packed replay needs
+# a FlashAttention backend (flash_attention_2/3/4, whichever flash-attn package is
+# installed; the repo pins flash-attn-4 → 'flash_attention_4'). On any other backend
+# (sdpa/eager) the gate falls back to the dense padded path (see packed_replay).
 class QwenVLARStage(ARStage[QwenVLARConditions]):
     def __init__(self, *, model: QwenVLBundle) -> None:
         self.model = model
@@ -414,15 +415,16 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
 
         Concatenate every sample's ``prompt + response`` into one zero-padded
         stream, with per-stream 4-D position ids ``[text_arange; get_rope_index
-        (t,h,w)]``. The text row restarts at 0 per stream, so transformers builds
-        the block-causal mask from it under sdpa (the same packed detection Qwen3
-        relies on; Qwen2.5-VL has no flex_attention support, so no monkey-patch);
-        per-stream M-RoPE positions equal the standalone layout (validated
-        bit-exact), so logp semantics match the dense :meth:`padding_replay`.
-        Returns ``None`` (→ padding fallback) when packing does not apply or
-        would not pay: single sample, missing prompt / lengths, or no
-        sparse-block attention kernel in use (only flex_attention /
-        flash_attention_2 make packed a win; see the gate below).
+        (t,h,w)]``. The text row restarts at 0 per stream; under a FlashAttention
+        backend transformers derives per-sequence ``cu_seqlens`` from that restarting
+        row (varlen FA — no cross-sequence attention, verl remove_padding parity).
+        sdpa/eager would instead build an explicit packed block-causal mask from the
+        same row (also correct), but the gate routes those to the dense path for
+        speed; Qwen2.5-VL has no flex_attention support, so a flash backend is the
+        reachable packed path. Per-stream M-RoPE positions equal the standalone
+        layout (validated bit-exact), so logp semantics match :meth:`padding_replay`.
+        Returns ``None`` (→ padding fallback) when packing does not apply: single
+        sample, or missing prompt / lengths / cu_seqlens.
         """
         if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
             return None
@@ -476,12 +478,20 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         packed_pos = torch.cat(pos_parts, dim=1).unsqueeze(1)  # [4, L] -> [4, 1, L]
         predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
 
+        if predict_index.numel() == 0:
+            return torch.zeros(0, dtype=torch.float32, device=device)
+
         forward_kwargs: Dict[str, Any] = {
             "input_ids": packed_ids,
             "attention_mask": None,  # packed block-causal mask inferred from restarting text positions
             "position_ids": packed_pos,
             "use_cache": False,
             "return_dict": True,
+            # Run the lm_head ONLY at the predict positions (transformers logits_to_keep
+            # accepts an index tensor) so we never materialize the full [1, L, vocab]
+            # logits — the packed analogue of Qwen3's chunked head. The returned logits
+            # come back in predict_index order, which equals flat_resp (segment) order.
+            "logits_to_keep": predict_index,
         }
         if pv is not None:
             forward_kwargs["pixel_values"] = pv
@@ -489,9 +499,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             forward_kwargs["image_grid_thw"] = igt
 
         out = self.model.transformer(**forward_kwargs)
-        if predict_index.numel() == 0:
-            return torch.zeros(0, dtype=torch.float32, device=device)
-        pred_logits = out.logits[0].index_select(0, predict_index).float()  # [T_total, V]
+        pred_logits = out.logits[0].float()  # [T_total, V] — logits at the predict positions
         T = float(temperature) if float(temperature) > 0.0 else 1.0
         log_probs = F.log_softmax(pred_logits / T, dim=-1)
         per_token = log_probs.gather(-1, flat_resp.unsqueeze(-1)).squeeze(-1)  # [T_total]

@@ -45,10 +45,14 @@ class QwenVLBundle(Bundle):
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
+        load_kwargs = {}
+        if getattr(config, "attn_implementation", None):
+            load_kwargs["attn_implementation"] = str(config.attn_implementation)
         transformer = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             path,
             torch_dtype=dtype,
             trust_remote_code=bool(config.trust_remote_code),
+            **load_kwargs,
         ).to(device)
 
         if config.freeze_vision_tower:
