@@ -22,8 +22,8 @@ import torch
 from torch import Tensor
 
 from unirl.distributed.group.remote import RankInfo, Remote
+from unirl.distributed.tensor import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
 from unirl.distributed.tensor.factory import build_transport
-from unirl.distributed.tensor.transport import TensorMeta, TensorTransport, TensorTransportRuntime, map_tree
 from unirl.distributed.utils import collect_leaves
 
 
@@ -139,7 +139,7 @@ class Worker:
         """Install the Worker's transport as the process backend.
 
         Any TensorTransport works — the Worker is backend-blind (it only uses
-        get_batch/put_batch/end_call). Worker-local capabilities (incref/decref,
+        get_batch/put_batch). Worker-local capabilities (incref/decref,
         NCCL, tensor_op/cat/get_cpu) are reached only by the controller, and only
         when the backend is a WorkerLocalTransport.
         """
@@ -275,8 +275,8 @@ class Worker:
     def call(self, role_name: str, method_name: str, args: tuple, kwargs: dict, grad_mode: bool = False, call_id=None):
         """Generic RPC entry point.
 
-        Resolves inputs (TensorMeta → Tensor via transport.get_batch) and packs
-        outputs (Tensor → TensorMeta via transport.put_batch). Non-tensor
+        Resolves inputs (TensorRef → Tensor via transport.get_batch) and packs
+        outputs (Tensor → TensorRef via transport.put_batch). Non-tensor
         args/kwargs/results pass through unchanged.
 
         grad_mode and call_id are dedicated parameters (not via kwargs) so
@@ -287,48 +287,42 @@ class Worker:
         """
         role = self._roles[role_name]
 
-        # Resolve: collect TensorMeta leaves (tree order), batch-fetch, substitute.
+        # Resolve: collect TensorRef leaves (tree order), batch-fetch, substitute.
         # Keys are positional indices so get_batch results align with the walk.
-        in_metas = self._collect(args, TensorMeta) + self._collect(kwargs, TensorMeta)
+        in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
         in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
 
         def resolve(o):
-            return next(in_iter) if isinstance(o, TensorMeta) else o
+            return next(in_iter) if isinstance(o, TensorRef) else o
 
         resolved_args = map_tree(args, resolve)
         resolved_kwargs = map_tree(kwargs, resolve)
 
-        try:
-            if grad_mode:
-                # get_batch returns detached views/copies, so resolved tensors are
-                # fresh objects that don't alias store contents — mark them directly.
-                tensors = collect_leaves(resolved_args, Tensor) + collect_leaves(
-                    tuple(resolved_kwargs.values()), Tensor
-                )
-                for t in tensors:
-                    t.requires_grad_(True)
-                    t.retain_grad()
-                role._grad_inputs[call_id] = tensors
+        if grad_mode:
+            # get_batch returns detached views/copies, so resolved tensors are
+            # fresh objects that don't alias store contents — mark them directly.
+            tensors = collect_leaves(resolved_args, Tensor) + collect_leaves(tuple(resolved_kwargs.values()), Tensor)
+            for t in tensors:
+                t.requires_grad_(True)
+                t.retain_grad()
+            role._grad_inputs[call_id] = tensors
 
-            result = getattr(role, method_name)(*resolved_args, **resolved_kwargs)
+        result = getattr(role, method_name)(*resolved_args, **resolved_kwargs)
 
-            if grad_mode:
-                # Save output tensors BEFORE pack so backward can use grad_fn.
-                role._grad_outputs[call_id] = collect_leaves(result, Tensor)
+        if grad_mode:
+            # Save output tensors BEFORE pack so backward can use grad_fn.
+            role._grad_outputs[call_id] = collect_leaves(result, Tensor)
 
-            # Pack: collect tensor leaves (tree order), batch-store, substitute metas.
-            out_tensors = self._collect(result, Tensor)
-            stored = self.transport.put_batch({str(i): t for i, t in enumerate(out_tensors)})
-            out_iter = iter(stored[str(i)] for i in range(len(out_tensors)))
+        # Pack: collect tensor leaves (tree order), batch-store, substitute metas.
+        out_tensors = self._collect(result, Tensor)
+        stored = self.transport.put_batch({str(i): t for i, t in enumerate(out_tensors)})
+        out_iter = iter(stored[str(i)] for i in range(len(out_tensors)))
 
-            def pack(o):
-                return next(out_iter) if isinstance(o, Tensor) else o
+        def pack(o):
+            return next(out_iter) if isinstance(o, Tensor) else o
 
-            return map_tree(result, pack)
-        finally:
-            # Release any per-call transport resources (gpu: close IPC views).
-            self.transport.end_call()
+        return map_tree(result, pack)
 
     # ── Leaf collection ──
 

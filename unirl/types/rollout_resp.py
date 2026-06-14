@@ -43,6 +43,7 @@ Pairs with ``RolloutReq`` (in ``unirl/types/rollout_req.py``).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Type, TypeVar, Union
@@ -57,10 +58,13 @@ from unirl.distributed.tensor.batch import (
     max_field,
     shared_field,
 )
+from unirl.distributed.tensor.ref import hydrate
 from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+
+logger = logging.getLogger(__name__)
 
 TR = TypeVar("TR", bound="RolloutTrack")
 TT = TypeVar("TT", bound="RolloutResp")
@@ -267,9 +271,9 @@ class RolloutTrack(Batch):
             return self  # trivially nothing to do
 
         # The reward service runs on workers; its returned ``rewards`` arrives
-        # at the driver as a TensorMeta proxy (Worker._pack_output dehydrates
+        # at the driver as a TensorRef proxy (Worker._pack_output dehydrates
         # every Tensor leaf). Driver-side arithmetic below needs a real Tensor.
-        rewards_local = _hydrate_tensor_meta(self.rewards)
+        rewards_local = hydrate(self.rewards)
 
         # Global scope: normalize across the whole batch, ignoring group
         # structure (reproduces v1 normalize_global). std() is unbiased (Bessel)
@@ -355,30 +359,6 @@ def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
     parent = resp.tracks[track.parent_track]
     parent_sid_to_idx = {sid: i for i, sid in enumerate(parent.sample_ids)}
     return [parent_root_groups[parent_sid_to_idx[pid]] for pid in track.parent_ids]
-
-
-def _hydrate_tensor_meta(value: Any) -> Any:
-    """Driver-side hydrate of a ``TensorMeta`` proxy back to a real ``torch.Tensor``.
-
-    ``Worker._pack_output`` stores every ``torch.Tensor`` leaf in the return
-    value into the TensorStore, so fields like ``track.rewards`` arrive at
-    the driver as ``TensorMeta`` proxies even though downstream driver-side
-    code (advantage computation) does arithmetic on them as if they were
-    tensors. This helper
-    fetches the underlying tensor(s) via each handle's bound worker and cats
-    them. Returns the value unchanged when it is already a ``torch.Tensor``
-    or ``None``.
-    """
-    from unirl.distributed.tensor.transport import TensorMeta
-
-    if not isinstance(value, TensorMeta):
-        return value
-    if not value.refs:
-        return None
-    tensors = [h.local() for h in value.refs]
-    if len(tensors) == 1:
-        return tensors[0]
-    return torch.cat(tensors, dim=0)
 
 
 def _track_with_field(track: TR, field_name: str, value: Any) -> TR:

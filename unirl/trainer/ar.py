@@ -8,11 +8,11 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import _hydrate_tensor_meta
 from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -147,8 +147,8 @@ class ARTrainer(BaseTrainer):
             if track.rewards is None:
                 continue
             # Hydrate in place so the wandb reward/advantage stats reuse this
-            # fetch instead of re-pulling the TensorMeta from the worker.
-            track.rewards = _hydrate_tensor_meta(track.rewards)
+            # fetch instead of re-pulling the TensorRef from the worker.
+            track.rewards = hydrate(track.rewards)
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands
 
@@ -207,7 +207,7 @@ class ARTrainer(BaseTrainer):
             if track.segment is not None:
                 track = self.reward.score_and_attach(req=req, track=track)
             if track.rewards is not None:
-                track.rewards = _hydrate_tensor_meta(track.rewards)
+                track.rewards = hydrate(track.rewards)
                 acc = float(track.rewards.to(torch.float32).mean().item())
                 break  # single-track for now; revisit if multi-track lands
         logger.info(

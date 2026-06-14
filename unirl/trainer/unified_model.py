@@ -63,14 +63,14 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
+from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
-from unirl.distributed.tensor.transport import TensorMeta
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.primitives import Texts
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack, _hydrate_tensor_meta, _track_with_field
+from unirl.types.rollout_resp import RolloutResp, RolloutTrack, _track_with_field
 from unirl.types.sampling import BaseSamplingParams, get_ar_params, get_diffusion_params
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -84,28 +84,28 @@ IMAGE_TRACK = "image"
 
 
 def deep_hydrate(obj: Any) -> Any:
-    """Materialize every ``TensorMeta`` leaf in ``obj`` to a real tensor, in place.
+    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place.
 
     The anchored single-actor engines return each track as ONE transport handle
     (a single ref spanning all samples), but the train side is num_devices-way DP and
     slices each track into per-rank shards — a single ref can't be intra-handle
     sliced. Hydrating on the driver fixes the mismatch (the DP dispatch then
     re-shards real tensors), but the driver has no ``TensorTransportRuntime``
-    installed, so ``TensorTransport.hydrate`` / ``TensorMeta.local`` are
-    unavailable here. ``_hydrate_tensor_meta`` instead pulls each leaf through
-    its ref's ``.local()`` (a plain ``ray.get`` from the owning worker's store),
+    installed, so the runtime-backed ``TensorTransport.hydrate`` is
+    unavailable here. ``hydrate`` instead pulls each leaf through
+    its ref's ``.materialize(backend=None)`` (a plain ``ray.get`` from the owning worker's store),
     which works from the driver — we walk the nested Batch/dict/list/TUPLE
-    structure and apply it to every ``TensorMeta``.
+    structure and apply it to every ``TensorRef``.
 
     NB: this walks TUPLES too (rebuilding them), unlike ``_collect_leaves``
     which skips them. HunyuanImage3's fused condition stores ``rope_cache`` as a
-    ``tuple`` of two TensorMeta; the DP scatter's driver-side
+    ``tuple`` of two TensorRef; the DP scatter's driver-side
     ``RolloutTrack.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
     → ``t.ndim``), so the rope MUST be real tensors here. (dp=1 never concats on
     the driver, so it never tripped on this.)
     """
-    if isinstance(obj, TensorMeta):
-        return _hydrate_tensor_meta(obj)
+    if isinstance(obj, TensorRef):
+        return hydrate(obj)
     if isinstance(obj, Batch):
         for f in dataclasses.fields(obj):
             v = getattr(obj, f.name)
@@ -563,7 +563,7 @@ class UnifiedModelTrainer(BaseTrainer):
         )
         scored = self.reward.score_and_attach(req=reward_req, track=img_track)
         if scored.rewards is not None:
-            scored.rewards = _hydrate_tensor_meta(scored.rewards)
+            scored.rewards = hydrate(scored.rewards)
         resp.tracks[IMAGE_TRACK] = scored
 
         # 2. Credit-assign image reward up the lineage → fills the "ar" track.
@@ -573,7 +573,7 @@ class UnifiedModelTrainer(BaseTrainer):
         mean_reward = 0.0
         di_rewards = resp.tracks[IMAGE_TRACK].rewards
         if di_rewards is not None:
-            mean_reward = float(_hydrate_tensor_meta(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
         # 3b. Intrusive debug dump (best-effort) — observe what AR generated and
         #     what DiT rendered before advantages/training mutate the tracks.
@@ -643,14 +643,14 @@ class UnifiedModelTrainer(BaseTrainer):
 
             rewards = None
             if image_track is not None and image_track.rewards is not None:
-                rewards = _hydrate_tensor_meta(image_track.rewards).to(torch.float32).tolist()
+                rewards = hydrate(image_track.rewards).to(torch.float32).tolist()
 
             # Save images (best-effort): hydrate pixels and write per-sample PNGs.
             n_imgs = 0
             if img_decoded is not None and getattr(img_decoded, "pixels", None) is not None:
                 from torchvision.utils import save_image
 
-                pixels = _hydrate_tensor_meta(img_decoded.pixels).detach().to(torch.float32).clamp(0, 1).cpu()
+                pixels = hydrate(img_decoded.pixels).detach().to(torch.float32).clamp(0, 1).cpu()
                 n_imgs = int(pixels.shape[0])
                 for k in range(n_imgs):
                     save_image(pixels[k], os.path.join(out_dir, f"img_{k}.png"))
