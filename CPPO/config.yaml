@@ -1,0 +1,89 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cppo — annotated config EXTRACT (for reading, not launching).
+#
+# Lifted from the full runnable recipe:
+#     examples/ar/qwen3_cppo_30b_a3b_base_dapo_sglang.yaml
+# Build the data once (unirl/utils/prepare_dapo_math.py), then launch (see README.md):
+#     DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#     python -m unirl.train_ar --config-name=ar/qwen3_cppo_30b_a3b_base_dapo_sglang num_devices=128
+#
+# Shown here: the algorithm + sampling blocks (what the loss does), the advantage
+# flag, and the SGLang rollout + full-weight-sync wiring. Omitted: bundle / pipeline /
+# backend(FSDP) / reward / stack / data_source — model & infra, not algorithm.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Advantage normalization (top-level _global_ keys):
+adv_normalization_scope: group   # per-prompt-group mean/std (critic-free GRPO)
+normalize_adv_by_std: false      # mean-center only (reward − group_mean), NO std
+                                 #   division — drops GRPO's difficulty bias
+                                 #   (reference norm_adv_by_std_in_grpo=False).
+
+# ── The algorithm. CPPO implements the paper's Binary-TV trust region: DPPO's
+# token-level ratio-advantage surrogate with a POSITION-WEIGHTED threshold and a
+# CUMULATIVE-PREFIX budget mask. Only the mask changes vs DPPO; the loss is the
+# same -A_t*r_t on kept tokens (NOT a smooth quadratic — that is the DRPO sibling). ──
+algorithm:
+  _target_: unirl.algorithms.cppo.CPPO
+  stage_attr: ar                 # resolve the AR stage from the trainer-injected pipeline (.ar)
+  cppo_delta: 0.20               # δ: token-level Binary-TV threshold (DPPO's clip_ratio
+                                 #   role). Paper Table 3: 0.15 dense, 0.20 for 30B-A3B.
+  cppo_w_min: 0.8                # w_min: position-weight floor. w_t = w_min + (1-w_min)*(T-t)/(T-1)
+                                 #   decreases from 1 (first token) to w_min (last), so late
+                                 #   tokens spend more of the trust-region budget.
+  cppo_delta_b: 0.02             # δ_b floor of the per-sequence dynamic prefix-average budget;
+                                 #   δ_b^seq = clamp(P90(D_{1:T}), δ_b, 2·δ_b) (paper Eq. 22).
+  loss_agg_mode: seq-mean-token-sum-norm  # per-seq Σ(token loss) / horizon, mean over seqs
+  horizon: 16384                 # fixed length normalizer for seq-mean-token-sum-norm
+  # 1.0 — MUST equal sampling.temperature below. Replay tempers logits
+  #   (log_softmax(logits / T)) so new_logp (π) and rollout logp (μ) live on the
+  #   same distribution ⇒ ratio_mean ≈ 1 on update 1.
+  sampling_temperature: 1.0
+  # rollout = anchor the ratio AND the Binary-TV divergence μ = |π − μ| on the
+  #   SGLang sampler's emitted logprobs for ALL mini-batch updates. This is the
+  #   behavior policy CPPO's trust region is defined against (paper Sec. 4); = the
+  #   released verl run's rollout_correction.bypass_mode=True.
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+# AR sampling — no SDE scheduler (token-level). Group size drives the critic-free
+# GRPO advantage; temperature must match sampling_temperature above.
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16         # group size G (n=16 × batch=256 = 4096 / rollout)
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0                       # 0 → SGLang -1 (off); peaked sampling collapses GRPO groups
+  max_new_tokens: 16384
+
+# ── SGLang rollout engine (colocate): time-shares each GPU with the FSDP train
+# shard via sleep()/wake_up(). 30B-A3B needs tensor parallelism — tp_size=8 is a
+# starting point to TUNE for your cluster. ──
+rollout:
+  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
+    tp_size: 8
+    max_new_tokens: 16384
+    temperature: 1.0             # keep == sampling.temperature / sampling_temperature
+    top_p: 1.0
+    samples_pre_expanded: true   # trainer pre-expands req by samples_per_prompt; engine emits n=1
+    chat_template_kwargs:
+      enable_thinking: true       # base model + emergent long CoT; MUST match pipeline.enable_thinking
+    engine_kwargs:
+      mem_fraction_static: 0.3
+      attention_backend: triton
+      enable_lora: false
+
+# ── Weight sync: push the full dense FSDP weights into the SGLang server each
+# rollout (full fine-tuning, no LoRA pool). This tracks the trained policy μ. ──
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+
+# Trust region is rollout-anchored: CPPO reuses the rollout logp as old_logp/μ
+# across all num_updates_per_batch mini-batch steps (frozen anchor; multi-update OK).
