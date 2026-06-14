@@ -27,10 +27,10 @@ def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
         return None
+    from unirl.distributed.tensor import TensorTransportRuntime
     from unirl.distributed.tensor.backend.transfer_queue import TransferQueueRuntime
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor import TensorTransportRuntime
 
     rt = TransferQueueRuntime().install()
     handoffs = rt.init(cfg)
