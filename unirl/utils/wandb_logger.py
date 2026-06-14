@@ -595,7 +595,15 @@ class UniRLWandBLogger:
                 if wandb_videos:
                     payload[video_key] = wandb_videos
 
-            wandb.log(payload)
+            # `rollout_id` here is ALREADY rollout_id+1 (the caller passes +1, see
+            # base.py `_drop_decoded`), i.e. the same step value this rollout's other
+            # metrics use — so payload["rollout/step"] above is correct, not off by one.
+            # Pass it explicitly so the media row merges into that rollout's _step
+            # instead of auto-incrementing, which would desync from the explicit-step
+            # path used everywhere else in this logger.
+            # INVARIANT: every wandb.log in this logger must pass an explicit step on
+            # the rollout_id+1 scale, or cross-call _step alignment breaks.
+            wandb.log(payload, step=int(rollout_id))
         except Exception as e:
             print(f"Warning: Failed to log generated media: {e}")
 
