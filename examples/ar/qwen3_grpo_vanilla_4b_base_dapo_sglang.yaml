@@ -1,6 +1,12 @@
 # @package _global_
 # AR GRPO vanilla baseline Qwen3-4B-Base on DAPO-Math — v2 trainer (ARTrainer), SGLang rollout, 32 GPU.
 #
+# NOTE: this is OUR "vanilla" baseline (Dr.GRPO no-std + token-sum-norm normalization
+# PLUS DAPO clip-higher 0.2/0.28), the GRPO reference used in the DRPO comparison —
+# NOT the official textbook GRPO. For textbook DeepSeekMath GRPO (÷group-std advantage,
+# ÷per-seq-length loss, symmetric clip) see qwen3_grpo_4b_base_dapo_sglang; for standard
+# Dr.GRPO (same normalization as here, symmetric clip) see qwen3_drgrpo_4b_base_dapo_sglang.
+#
 # GRPO baseline for the DRPO comparison: the SAME model / data / SGLang rollout /
 # full-weight TensorWeightSync / sampling / advantage normalization as
 # qwen3_drpo_4b_base_dapo_sglang, with the DRPO trust-region loss swapped for

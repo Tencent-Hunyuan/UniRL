@@ -166,10 +166,13 @@ algorithm:
   # old_logp_source: rollout).
   _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
-  # STANDARD GRPO (DeepSeekMath): SYMMETRIC PPO clip eps=0.2 (clip_range_high=null,
-  # NOT DAPO clip-higher 0.2/0.28) and per-seq token-MEAN loss aggregation
-  # (length-normalized). Together with normalize_adv_by_std=true above, these are
-  # the three axes that separate textbook GRPO from the Dr.GRPO recipes.
+  # STANDARD GRPO (DeepSeekMath): per-seq token-MEAN loss aggregation (÷ per-seq
+  # length |o_i|, length-normalized) and SYMMETRIC PPO clip eps=0.2 (clip_range_high=
+  # null, NOT DAPO clip-higher 0.2/0.28). With normalize_adv_by_std=true above, the TWO
+  # normalization DENOMINATORS — advantage ÷group-std and loss ÷per-seq-length — are
+  # what separate textbook GRPO from BOTH Dr.GRPO recipes (which use no-std + ÷fixed
+  # horizon). The symmetric clip is the SAME as qwen3_drgrpo and differs ONLY from the
+  # vanilla baseline qwen3_grpo_vanilla (which adds clip-higher).
   clip_range: 0.2
   clip_range_high: null # symmetric clip — standard GRPO (the vanilla baseline uses 0.28)
   clip_schedule: constant

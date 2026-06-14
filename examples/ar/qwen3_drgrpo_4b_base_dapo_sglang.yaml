@@ -165,8 +165,12 @@ algorithm:
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   # STANDARD Dr.GRPO (arXiv:2503.20783): no-std advantages + seq-mean-token-sum-norm
   # (the two Dr.GRPO fixes) with the ORIGINAL SYMMETRIC PPO clip eps=0.2
-  # (clip_range_high=null). Dr.GRPO does NOT touch the clipping — that symmetric clip
-  # is the ONLY difference from qwen3_grpo (the vanilla baseline = DAPO clip-higher 0.28).
+  # (clip_range_high=null). Dr.GRPO does NOT touch the clipping, so this symmetric clip
+  # is IDENTICAL to qwen3_grpo (textbook DeepSeekMath GRPO); the two recipes differ ONLY
+  # in the two Dr.GRPO normalization DENOMINATORS — advantage (no-std here vs ÷group-std
+  # in GRPO) and loss aggregation (÷fixed horizon here vs ÷per-seq-length in GRPO). The
+  # recipe that adds DAPO clip-higher 0.2/0.28 on TOP of this no-std + token-sum-norm
+  # normalization is the vanilla baseline qwen3_grpo_vanilla, NOT qwen3_grpo.
   clip_range: 0.2
   clip_range_high: null # symmetric clip — standard Dr.GRPO (the vanilla baseline uses 0.28)
   clip_schedule: constant
