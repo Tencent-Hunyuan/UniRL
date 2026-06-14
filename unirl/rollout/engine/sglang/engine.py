@@ -58,7 +58,7 @@ from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_req_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
+from unirl.types.sampling import get_diffusion_params, is_forward_process
 from unirl.utils.dtypes import parse_torch_dtype
 from unirl.utils.peft_merge import adapt_lora_for_sglang
 
@@ -424,11 +424,10 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         # Best-effort emit: whenever the rollout ran SDE-gated steps, try to
         # land SGLang's native per-step log-probs on the segment. Whether they
         # are *used* (vs trainer-side replay) is decided downstream by the
-        # algorithm's ``old_logp_source`` — not by the engine. An empty
-        # ``sde_indices`` (DiffusionNFT / forward-process, num_sde_steps=0 resolves to [])
-        # has no per-step log-probs to emit, so skip the block entirely —
-        # matching the prior behavior for that path.
-        emit_native_logprob = sde_indices is not None and len(sde_indices) > 0
+        # algorithm's ``old_logp_source`` — not by the engine. A forward process
+        # (DiffusionNFT; empty ``sde_indices``) has no per-step log-probs to emit,
+        # so skip the block entirely — matching the prior behavior for that path.
+        emit_native_logprob = not is_forward_process(sde_indices)
 
         return _to_rollout_resp(
             req,

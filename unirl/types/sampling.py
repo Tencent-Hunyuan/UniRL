@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from unirl.config.require import require
 
@@ -50,6 +50,23 @@ def get_ar_params(sampling: Any) -> Optional["ARSamplingParams"]:
     if isinstance(sampling, ARSamplingParams):
         return sampling
     return None
+
+
+def is_forward_process(sde_indices: Optional[Sequence[int]]) -> bool:
+    """True when the rollout records no SDE steps (deterministic ODE forward process).
+
+    ``sde_indices`` (from :meth:`DiffusionSamplingParams.resolve_sde_indices`) names
+    the denoising steps that draw per-step SDE noise. A non-empty list is an SDE
+    rollout (FlowGRPO et al.); an empty list -- or ``None`` when no SDE params were
+    set -- means every step is deterministic ODE, i.e. the DiffusionNFT-style forward
+    process whose only output of interest is the final clean latent.
+
+    This is the single source of truth for that interpretation: call sites read
+    ``is_forward_process(sde_indices)`` instead of re-deriving it ad hoc from
+    ``not x`` / ``x is None`` / ``len(x) == 0`` (those idioms had drifted apart and
+    caused a trajectory-bandwidth regression once).
+    """
+    return not sde_indices
 
 
 @dataclass
