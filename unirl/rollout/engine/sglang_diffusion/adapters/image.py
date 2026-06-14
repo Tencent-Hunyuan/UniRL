@@ -153,13 +153,22 @@ class ImageAdapter(ModelAdapter):
         # ``rollout_trajectory_data.dit_trajectory`` (gated on
         # ``rollout_return_dit_trajectory``); the flat ``trajectory_latents``
         # field is unsliced across outputs and lacks the x_T prepend, so it
-        # cannot back the RawResult contract. Non-SDE requests (eval / NFT /
-        # ODE) send an EMPTY step-index list: every step then takes the
-        # effective-ODE branch, which upstream keeps bit-exact with
-        # ``rollout=False`` stepping (scheduler_rl_mixin.flow_sde_sampling).
+        # cannot back the RawResult contract.
+        #
+        # SDE vs ODE gates on a NON-EMPTY step set. GRPO ships per-step SDE
+        # indices; DiffusionNFT / eval resolve ``num_sde_steps=0`` to ``[]``
+        # (and a paramless request to ``None``), both deterministic-ODE. Empty
+        # ``[]`` must NOT enter the SDE branch — that would ship the SDE kernel
+        # label with the recipe's ``eta`` (0.0 for NFT), tripping the upstream
+        # kernel's ``assert noise_level > 0``. The ODE branch instead pins
+        # ``rollout_sde_type="ode"`` + ``rollout_log_prob_no_const=True``: an ODE
+        # step's normalized log-prob is undefined, so upstream asserts the flag
+        # is set and emits a zero placeholder this path never reads
+        # (``emit_native_logprob`` is False when ``sde_indices`` is empty).
+        # Mirrors the legacy engine's ``request._to_sglang_kwargs`` ODE branch.
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
-        if sde_indices is not None:
+        if sde_indices:
             require(
                 self._sde_label is not None,
                 "build_inputs: SDE mode requires an sde_label (resolved from the strategy)",
@@ -169,6 +178,9 @@ class ImageAdapter(ModelAdapter):
             # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``).
             kwargs["rollout_sde_step_indices"] = sde_indices
         else:
+            kwargs["rollout_sde_type"] = "ode"
+            kwargs["rollout_noise_level"] = float(diffusion.eta)
+            kwargs["rollout_log_prob_no_const"] = True
             kwargs["rollout_sde_step_indices"] = []
 
         return kwargs
