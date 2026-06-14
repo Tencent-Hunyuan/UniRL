@@ -208,6 +208,13 @@ stack:
   # the increasingly off-policy steps 2-4 (π_old frozen per algorithm.
   # old_logp_source). dp=32 → per-worker shard 16 samples, 16%4==0 OK.
   num_updates_per_batch: 4
+  # verl ppo_max_token_len_per_gpu parity: pack each mini-batch into micro-batches
+  # under a token budget (length-sorted bin packing) instead of fixed-count
+  # slicing; with mbs=1 every sequence ran its own forward/backward. Omit
+  # micro_planner (→ default CountPlanner) for the legacy count-based behavior.
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
