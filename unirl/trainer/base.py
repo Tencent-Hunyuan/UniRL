@@ -95,6 +95,11 @@ class BaseTrainer:
         # consumed by _init_wandb. Empty for fresh runs.
         self._resume_state: Dict[str, Any] = {}
 
+        # DP seqlen balancing (verl trainer.balance_batch parity) — OFF by
+        # default; subclasses whose workloads have variable response lengths
+        # (currently ARTrainer) override this from their config.
+        self.balance_dp_batch = False
+
         # Reclaim per-rollout transport buffers after every train_step, centrally,
         # so each subclass train loop doesn't have to remember to.
         self._install_train_step_reset_hook()
@@ -136,6 +141,23 @@ class BaseTrainer:
     def _reset_transport_buffers(self) -> None:
         """Reclaim per-rollout mooncake zero-copy buffers (no-op for other backends)."""
         self.pool.reset_transfer_queue_buffers()
+
+    # ---- DP seqlen balancing (opt-in via balance_dp_batch) -----------------
+
+    def _balance_track(self, track):
+        """Opt-in DP seqlen balancing — thin policy wrapper over the mechanism.
+
+        The mechanism (hydrate + LPT reorder) lives with the data type:
+        :func:`unirl.types.rollout_resp.balance_track_for_dp`. This wrapper
+        only owns the POLICY: the ``balance_dp_batch`` flag (False by default; AR
+        workloads with variable response lengths opt in) and the dp size. Safe
+        to call unconditionally from any train_step.
+        """
+        if not self.balance_dp_batch:
+            return track
+        from unirl.types.rollout_resp import balance_track_for_dp
+
+        return balance_track_for_dp(track, dp_size=int(self.num_devices))
 
     # ---- wandb logging (shared by all v2 trainers) -------------------------
 

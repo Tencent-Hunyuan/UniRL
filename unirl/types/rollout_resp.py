@@ -361,6 +361,55 @@ def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
     return [parent_root_groups[parent_sid_to_idx[pid]] for pid in track.parent_ids]
 
 
+def balance_track_for_dp(track: "RolloutTrack", *, dp_size: int, min_spread: float = 0.05) -> "RolloutTrack":
+    """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
+
+    Greedy LPT under an equal-count constraint (DP_SCATTER splits the batch
+    into dp_size EQUAL contiguous chunks): longest sample first, into the
+    eligible bucket with the smallest running token sum. Advantages are
+    computed BEFORE this point (per-group stats already attached per
+    sample), so sample order is free to change — the same invariant verl
+    relies on. Buckets are laid out contiguously in worker order.
+    """
+    lengths = getattr(track.segment, "lengths", None) if track.segment is not None else None
+    if lengths is None:
+        logger.warning("balance_dp_batch: track has no segment lengths; skipping balance.")
+        return track
+    total = int(track.batch_size)
+    dp = int(dp_size)
+    if total % dp != 0 or dp <= 1:
+        return track
+    cap = total // dp
+    lens = [int(x) for x in lengths.tolist()]
+    if len(lens) != total:
+        logger.warning("balance_dp_batch: lengths (%d) != batch_size (%d); skipping.", len(lens), total)
+        return track
+    # Cheap skip guard: compute the CURRENT-order per-rank token sums in pure
+    # Python — when the spread is already tiny (uniform-length workloads, e.g.
+    # multiple-choice answers or fixed-step diffusion latents), the reorder +
+    # dispatch is pure overhead (measured +9.6s/step on VL geo3k).
+    current = [sum(lens[r * cap : (r + 1) * cap]) for r in range(dp)]
+    avg = sum(current) / dp
+    if avg <= 0 or (max(current) - min(current)) / avg < float(min_spread):
+        return track
+    order = sorted(range(total), key=lambda i: (-lens[i], i))
+    buckets = [[] for _ in range(dp)]
+    sums = [0] * dp
+    for i in order:
+        best = min((b for b in range(dp) if len(buckets[b]) < cap), key=lambda b: sums[b])
+        buckets[best].append(i)
+        sums[best] += lens[i]
+    perm = [i for bucket in buckets for i in bucket]
+    balanced = track.select(perm)
+    logger.info(
+        "balance_dp_batch: rank token sums min=%d max=%d (spread %.1f%%)",
+        min(sums),
+        max(sums),
+        100.0 * (max(sums) - min(sums)) / max(1, sum(sums) // dp),
+    )
+    return balanced
+
+
 def _track_with_field(track: TR, field_name: str, value: Any) -> TR:
     """Return a copy of ``track`` with one field replaced (other fields preserved)."""
     kwargs: Dict[str, Any] = {f.name: getattr(track, f.name) for f in dc_fields(track)}
