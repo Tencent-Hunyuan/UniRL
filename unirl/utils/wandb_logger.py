@@ -384,7 +384,15 @@ class UniRLWandBLogger:
                 if scalar is None:
                     continue
                 log_dict[metric_key] = scalar
-            wandb.log(log_dict)
+            # Pass the explicit logical step so the per-rollout rollout/train/perf
+            # calls (and the rollout-aligned eval, all at step == rollout_id+1) merge
+            # into ONE wandb history row at _step == rollout, instead of auto-
+            # incrementing _step ~3x/rollout. Gives one data point per step and lets
+            # the run overlay cleanly against per-step loggers (e.g. verl) on the
+            # default Step axis. Every step key shares the rollout_id+1 scale, so
+            # _step stays monotonic. (Builds on the per-update fold above: without it,
+            # the N same-step train calls would overwrite each other.)
+            wandb.log(log_dict, step=int(step))
         except Exception as e:
             print(f"Warning: Failed to log metrics ({step_key}): {e}")
 
