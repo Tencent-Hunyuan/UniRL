@@ -135,19 +135,6 @@ url = "https://download.pytorch.org/whl/cu129"
 name = "torch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-# Tier markers gate which tests run by available hardware (see
-# tests/transport/conftest.py:pytest_collection_modifyitems). A plain
-# `pytest tests/` on a laptop runs the cpu layer and skips the rest.
-markers = [
-  "cpu: pure-CPU, no GPU required (the always-on layer)",
-  "gpu: requires >=1 CUDA GPU",
-  "multigpu: requires >=2 CUDA GPUs (NCCL localize move, grad/backward)",
-  "mooncake: requires an external Mooncake master (env UNIRL_MOONCAKE_MASTER)",
-  "slow: sustained-churn / leak loops; opt-in via -m slow or RUN_SLOW=1",
-]
-
 [tool.setuptools]
 include-package-data = true
 
