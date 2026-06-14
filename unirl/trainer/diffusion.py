@@ -10,11 +10,11 @@ from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import _hydrate_tensor_meta
 from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -331,14 +331,20 @@ class DiffusionTrainer(BaseTrainer):
         )
         if _do_fsdp_offload:
             self.backend.offload()
-        # DiffusionNFT: sample under the EMA-smoothed ("old") adapter, then restore the
-        # trainable ("default") adapter before the loss. No-op for GRPO (gated).
-        # Only effective for colocate/trainside where rollout shares the train
-        # model; a separate sglang engine samples in its own process (see recipe).
-        if self._uses_ema:
+        # DiffusionNFT samples under the EMA-smoothed ("old") adapter. HOW "old"
+        # reaches the rollout depends on topology, so each mechanism fires only in
+        # its own regime (never both):
+        #   - trainside engine: it reuses THIS process's model, so swap the adapter
+        #     in place around generate and restore "default" before the loss.
+        #   - separate engine (sglang/vllm): runs in its own process and receives
+        #     "old" via the weight sync's merged push (backend.rollout_adapter_name);
+        #     the in-process swap cannot reach it, so skip the wasted swap + RPC.
+        # No-op for GRPO (gated on _uses_ema).
+        _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
+        if _inproc_ema_swap:
             self.backend.apply_eval_ema()
         resp = self.rollout.generate(req)
-        if self._uses_ema:
+        if _inproc_ema_swap:
             self.backend.restore_from_eval()
         self.rollout.sleep()
         if _do_fsdp_offload:
@@ -353,8 +359,8 @@ class DiffusionTrainer(BaseTrainer):
             if track.rewards is None:
                 continue
             # Hydrate in place so the wandb reward/advantage stats reuse this
-            # fetch instead of re-pulling the TensorMeta from the worker.
-            track.rewards = _hydrate_tensor_meta(track.rewards)
+            # fetch instead of re-pulling the TensorRef from the worker.
+            track.rewards = hydrate(track.rewards)
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands
 
@@ -368,25 +374,48 @@ class DiffusionTrainer(BaseTrainer):
         self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
-    def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+        save_mode: str = "full",
+    ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
         ``weight_sync_interval``: sync the adapter into the engine every N
         rollouts (fused into ``train_step``'s generate; no-op trainside).
 
-        Deferred (out of scope for the first runnable trainer):
-        ``num_updates_per_batch`` multi-epoch replay, checkpoint cadence,
-        evaluation cadence.
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
+        ``./checkpoints``); ``save_mode="adapter"`` keeps only the LoRA keys.
+        ``load_dir``: restore from a checkpoint directory and RESUME from its
+        saved step — ``num_rollouts`` is the TOTAL budget, so resuming
+        checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.
         """
         interval = max(1, weight_sync_interval)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
-            for rollout_id in range(num_rollouts):
+            for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet).
-                sync_weights = rollout_id > 0 and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate.
+                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                    resumed and rollout_id == start_rollout
+                )
                 result, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,
@@ -394,5 +423,8 @@ class DiffusionTrainer(BaseTrainer):
                     rollout_id=rollout_id,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                )
         finally:
             self._finish_wandb()

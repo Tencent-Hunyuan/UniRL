@@ -1,4 +1,5 @@
 import functools
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -26,10 +27,10 @@ def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
         return None
+    from unirl.distributed.tensor import TensorTransportRuntime
     from unirl.distributed.tensor.backend.transfer_queue import TransferQueueRuntime
     from unirl.distributed.tensor.backend.transfer_queue.runtime import _DEFAULT_PARTITION_ID
     from unirl.distributed.tensor.backend.transfer_queue.transport import TQTransport
-    from unirl.distributed.tensor.transport import TensorTransportRuntime
 
     rt = TransferQueueRuntime().install()
     handoffs = rt.init(cfg)
@@ -89,6 +90,10 @@ class BaseTrainer:
 
         self.logging_cfg = logging_cfg
         self.wandb_logger = UniRLWandBLogger(enabled=False)
+        # Driver-side state from a resumed checkpoint's trainer_state.json
+        # (wandb run id / step axis); populated by maybe_load_checkpoint,
+        # consumed by _init_wandb. Empty for fresh runs.
+        self._resume_state: Dict[str, Any] = {}
 
         # Reclaim per-rollout transport buffers after every train_step, centrally,
         # so each subclass train loop doesn't have to remember to.
@@ -112,7 +117,7 @@ class BaseTrainer:
         its own ``train`` loop but they all drive one ``train_step`` per rollout, so this
         is the single seam that reclaims per-rollout TQ buffers without per-trainer edits.
         The reset fires once ``train_step`` returns — rewards/advantages materialized, no
-        live ``TensorMeta`` ref into the queue's RDMA buffers remaining.
+        live ``TensorRef`` ref into the queue's RDMA buffers remaining.
         """
         if self.pool.transport_kind not in ("transfer_queue", "tq"):
             return
@@ -187,6 +192,8 @@ class BaseTrainer:
             media_max_items=int(cfg.get("media_max_items", 8)),
             media_log_interval=int(cfg.get("media_log_interval", 1)),
             enabled=report,
+            run_id=self._resume_state.get("wandb_run_id"),
+            optimizer_step=int(self._resume_state.get("optimizer_step") or 0),
         )
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
@@ -258,3 +265,67 @@ class BaseTrainer:
         """Close the wandb run if one is open."""
         if self.wandb_logger is not None:
             self.wandb_logger.finish()
+
+    # ---- checkpointing (shared by single-backend trainers) -----------------
+
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+        save_mode: str = "full",
+    ) -> None:
+        """Save every ``save_interval`` rollouts (and on the last one).
+
+        ``save_interval <= 0`` disables saving. Writes the backend state to
+        ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
+        to ``./checkpoints``; ``save_mode="adapter"`` keeps only the LoRA keys).
+        Paths resolve to absolute here, on the driver — the backend runs in
+        Ray workers whose CWD differs from the driver's.
+        """
+        if save_interval <= 0:
+            return
+        step = rollout_id + 1
+        # Save on the interval, and always on the final rollout.
+        if step % save_interval != 0 and step < num_rollouts:
+            return
+        base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
+        path = os.path.join(base_dir, f"checkpoint-{step}")
+        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        self.backend.save(path, step=step, mode=save_mode)
+        # Driver-owned state rides beside the worker-written checkpoint.pt:
+        # the wandb run id + train/ step axis let a resume append to the SAME
+        # wandb run instead of starting a fresh, misaligned one.
+        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+
+    def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
+        """Restore training state from ``load_dir``; return the rollout step to resume from.
+
+        Returns 0 for a fresh run (``load_dir`` empty) or a checkpoint that
+        predates step recording. Restores model/optimizer/scheduler plus the
+        optimizer-step counter; the trainer loop continues from the returned
+        step. Resolved to an absolute path on the driver (worker CWDs differ).
+        """
+        if not load_dir:
+            return 0
+        load_dir = os.path.abspath(load_dir)
+        logger.info("Loading checkpoint from %s", load_dir)
+        result = self.backend.load(load_dir)
+        if isinstance(result, list):  # BROADCAST dispatch collects one result per worker
+            result = result[0]
+        start = int(result or 0)
+        state_path = os.path.join(load_dir, "trainer_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                self._resume_state = json.load(f)
+        logger.info("Checkpoint restored; resuming at rollout %d", start)
+        if num_rollouts is not None and start >= num_rollouts:
+            logger.warning(
+                "Checkpoint step %d >= num_rollouts %d — nothing left to train (num_rollouts is the TOTAL budget).",
+                start,
+                num_rollouts,
+            )
+        return start

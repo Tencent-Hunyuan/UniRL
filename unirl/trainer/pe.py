@@ -31,12 +31,12 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import _hydrate_tensor_meta
 from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -209,9 +209,9 @@ class PETrainer(BaseTrainer):
         reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
         scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
         # propagate_rewards reshapes child.rewards directly (no hydration), so
-        # turn the worker-returned TensorMeta into a real tensor first.
+        # turn the worker-returned TensorRef into a real tensor first.
         if scored.rewards is not None:
-            scored.rewards = _hydrate_tensor_meta(scored.rewards)
+            scored.rewards = hydrate(scored.rewards)
         resp.tracks["diffusion"] = scored
 
         # 2. Credit-assign image reward up the lineage → fills the "ar" track
@@ -222,7 +222,7 @@ class PETrainer(BaseTrainer):
         mean_reward = 0.0
         di_rewards = resp.tracks["diffusion"].rewards
         if di_rewards is not None:
-            mean_reward = float(_hydrate_tensor_meta(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
         # 4. Per-track GRPO advantages — "ar" groups by prompt (N rewrites),
         #    "diffusion" groups by rewrite (M images).

@@ -15,7 +15,7 @@ import torch
 from unirl.distributed.group.dispatch import Dispatch, distributed
 
 if TYPE_CHECKING:
-    from unirl.distributed.tensor.transport import TensorTransport
+    from unirl.distributed.tensor import TensorTransport
 
 
 @dataclass

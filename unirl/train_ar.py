@@ -40,6 +40,7 @@ def main(cfg: DictConfig) -> None:
         logging_cfg=cfg.get("logging"),
         adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
         normalize_adv_by_std=bool(cfg.get("normalize_adv_by_std", True)),
+        balance_shards=bool(cfg.get("balance_shards", False)),
         eval_interval=int(cfg.get("eval_interval", 0)),
         eval_num_prompts=int(cfg.get("eval_num_prompts", 60)),
         eval_samples_per_prompt=int(cfg.get("eval_samples_per_prompt", 16)),
@@ -48,6 +49,10 @@ def main(cfg: DictConfig) -> None:
     trainer.train(
         num_rollouts=int(cfg.get("num_rollouts", 100)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
+        save_interval=int(cfg.get("save_interval", 0)),
+        save_dir=cfg.get("save_dir"),
+        load_dir=cfg.get("load_dir"),
+        save_mode=str(cfg.get("save_mode", "full")),
     )
 
 

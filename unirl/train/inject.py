@@ -122,8 +122,7 @@ def inject_nft(
     # mark the flag so downstream diffusers adapter ops stay consistent.
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
-    _activate(model, default)
-    _freeze_adapter(model, shadow)
+    _activate_keep_grad(model, default, trainable=default, frozen=shadow)
 
     if _current_rank() == 0:
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
@@ -142,8 +141,8 @@ def inject_nft(
 
     return Shadow(
         iter_pairs=lambda: _adapter_pairs(model, default, shadow),
-        swap_in=lambda: _activate(model, shadow),
-        swap_out=lambda: _activate(model, default),
+        swap_in=lambda: _activate_keep_grad(model, shadow, trainable=default, frozen=shadow),
+        swap_out=lambda: _activate_keep_grad(model, default, trainable=default, frozen=shadow),
     )
 
 
@@ -453,7 +452,7 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
 # ------------------------------------------------------------------
 
 
-def _freeze_adapter(model: nn.Module, name: str) -> None:
+def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
     from peft.tuners.lora import LoraLayer
 
     for m in model.modules():
@@ -462,7 +461,7 @@ def _freeze_adapter(model: nn.Module, name: str) -> None:
         for key in ("lora_A", "lora_B"):
             bank = getattr(m, key, {})
             if name in bank:
-                bank[name].weight.requires_grad = False
+                bank[name].weight.requires_grad = requires_grad
 
 
 def _reset_adapter(model: nn.Module, *, name: str) -> None:
@@ -519,6 +518,23 @@ def _activate(model: nn.Module, adapter_name: str) -> None:
     for m in model.modules():
         if isinstance(m, LoraLayer):
             m.set_adapter(adapter_name)
+
+
+def _activate_keep_grad(model: nn.Module, active: str, *, trainable: str, frozen: str) -> None:
+    """Switch the active adapter, then RESTORE the canonical requires_grad split.
+
+    peft's ``set_adapter`` couples the active adapter with ``requires_grad``
+    (active -> True, all others -> False). DiffusionNFT swaps to the frozen
+    ``old`` adapter for off-policy rollout, which flips the trainable ``default``
+    adapter to ``requires_grad=False``. Under FSDP2 with ``reshard_after_forward
+    =False`` the rollout's all-gather then caches the unsharded ``default`` param
+    grad-less, and the later training forward yields a loss with no ``grad_fn``
+    ("element 0 ... does not require grad"). Re-asserting the split keeps the
+    trainable adapter grad-enabled no matter which adapter is active, so the
+    cached compute param is always gathered with ``requires_grad=True``."""
+    _activate(model, active)
+    _set_adapter_requires_grad(model, trainable, True)
+    _set_adapter_requires_grad(model, frozen, False)
 
 
 # ------------------------------------------------------------------
