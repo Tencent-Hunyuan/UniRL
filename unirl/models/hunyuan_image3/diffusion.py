@@ -622,7 +622,11 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                 logger.warning(
                     "HunyuanImage3DiffusionStage.diffuse: requested %dx%d is not a supported HI3 preset; "
                     "snapped to %dx%d (nearest preset at ~%dpx base area).",
-                    int(params.height), int(params.width), snapped_hw[0], snapped_hw[1], int(self.vae_scale_factor) * latent_h,
+                    int(params.height),
+                    int(params.width),
+                    snapped_hw[0],
+                    snapped_hw[1],
+                    int(self.vae_scale_factor) * latent_h,
                 )
         else:
             latent_h = int(params.height) // int(self.vae_scale_factor)

@@ -24,6 +24,7 @@ backend loads with ``pre_tokenizer``/``decoder`` = ``None`` -> char-level). It
 needs the *loaded* tokenizer instance, so it is called from the text-embed stage
 after ``load_tokenizer``, not from :func:`apply_hi3_transformers5_compat`.
 """
+
 from __future__ import annotations
 
 from typing import Any
