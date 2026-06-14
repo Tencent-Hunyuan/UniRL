@@ -154,18 +154,19 @@ def _replay_aware_forward(
 _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2")
 
 
-def _packed_replay_supported() -> bool:
+def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     """Feature-detect the packed varlen replay prerequisites (review #43).
 
     The packed path relies on transformers building a block-causal mask from
     restarting position_ids (masking_utils.find_packed_sequence_indices,
     transformers >= 4.53). On older versions the forward would silently attend
     ACROSS sequence boundaries — wrong logps with no error — so fall back to the
-    dense path. ``UNIRL_DISABLE_PACKED_REPLAY=1`` is the explicit kill switch.
+    dense path. A sparse-block attention backend (flex_attention or
+    flash_attention_2) is also required — checked first so non-sparse backends
+    fall back before any packing work.
     """
-    import os as _os
-
-    if _os.environ.get("UNIRL_DISABLE_PACKED_REPLAY") == "1":
+    if attn_impl not in _SPARSE_PACKED_ATTN:
+        _warn_packed_disabled(str(attn_impl))
         return False
     try:
         from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
@@ -418,9 +419,11 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         grad / ``.train()`` scope. ``temperature`` divides logits before
         ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
         """
-        packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
-        if packed is not None:
-            return packed
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if _packed_replay_supported(attn_impl):
+            packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
+            if packed is not None:
+                return packed
         return self.padding_replay(conditions, segment=segment, temperature=temperature)
 
     def packed_replay(
@@ -451,23 +454,12 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         prompt_ids = conditions.prompt.input_ids.to(device)
         prompt_mask = conditions.prompt.attention_mask.to(device)
         batch_size = int(prompt_ids.shape[0])
-        if not (batch_size > 1 and _packed_replay_supported()):
+        if batch_size <= 1:
             return None
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         pad_id = self.model.tokenizer.pad_token_id or 0
         real_prompt_lens_p = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
-
-        # Packed replay only pays with a sparse-block attention kernel:
-        # flex_attention (BlockMask skips masked blocks) or flash_attention_2
-        # (flash_attn_varlen + cu_seqlens, within-sequence only). On plain sdpa
-        # the packed attention is the full O((ΣL)²) and can regress (measured: up
-        # to ~1.36x slower equal-length), so pack only when a sparse backend is in
-        # use; otherwise fall back to the dense padding path.
-        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
-        if attn_impl not in _SPARSE_PACKED_ATTN:
-            _warn_packed_disabled(str(attn_impl))
-            return None
 
         cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
         flat_resp = segment.tokens.to(device=device, dtype=torch.long)
