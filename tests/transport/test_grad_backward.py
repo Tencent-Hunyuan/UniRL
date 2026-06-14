@@ -56,5 +56,5 @@ def test_backward_flows_grad(multigpu_pool):
         out.grad = ones  # dL/dout = 1
     # dL/dinp = 3 * dL/dout = 3
     assert inp.grad is not None
-    g = inp.grad.local()
+    g = inp.grad.materialize()
     assert torch.allclose(g, torch.full((8, 8), 3.0)), g

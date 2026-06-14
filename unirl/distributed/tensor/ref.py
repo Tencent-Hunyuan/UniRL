@@ -3,7 +3,7 @@
 ``TensorRef`` is the universal tensor proxy: a ``Batch`` subclass holding an
 ordered list of :class:`TensorSpan`, each a contiguous row-window over one
 backend handle. Per-row ``select`` / ``slice`` / ``select_ranges`` build new
-spans (no data motion, no hydration); ``materialize`` / ``local`` hydrate
+spans (no data motion, no hydration); ``materialize`` hydrates
 through the active backend. ``cat_rows`` is the per-span assembly funnel and
 ``map_tree`` the structural walker shared by the transport rewrite passes.
 
@@ -282,9 +282,6 @@ class TensorRef(Batch):
 
     def permute(self, *dims: int) -> "TensorRef":
         return self.transform(lambda t: t.permute(*dims))
-
-    def local(self) -> torch.Tensor:
-        return self.materialize()
 
     def materialize(self, backend: "Optional[TensorTransport]" = None) -> torch.Tensor:
         """Fetch this meta into a real tensor (driver- or worker-side).

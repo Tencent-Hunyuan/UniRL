@@ -104,7 +104,7 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
       - ``Broadcast(x)`` → ``[x] * dp_size``  (explicit opt-out of splitting)
       - ``Tensor`` → chunk along dim 0 (must be divisible)
       - ``ndarray`` → split along axis 0 (must be divisible)
-      - ``TensorRef`` → chunk refs across ``dp_size`` (requires divisibility)
+      - ``TensorRef`` → row-chunked as a ``Batch`` (via its overridden ``slice``)
       - ``list`` → slice into equal parts (must be divisible)
       - ``tuple`` → recurse element-wise, reassemble per-shard tuples
       - ``dict`` → recurse into values, reassemble per-shard dicts
@@ -135,32 +135,6 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
         chunk_size = batch_size // dp_size
         return [value[i * chunk_size : (i + 1) * chunk_size] for i in range(dp_size)]
 
-    elif isinstance(value, TensorRef):
-        total = value.shape[0]
-        if total != batch_size:
-            return [value] * dp_size
-        if batch_size % dp_size != 0:
-            raise ValueError(f"batch_size={batch_size} not divisible by dp_size={dp_size}")
-        n_spans = len(value.spans)
-        if n_spans % dp_size != 0:
-            raise ValueError(f"TensorRef has {n_spans} spans, not divisible by dp_size={dp_size}")
-        spans_per_shard = n_spans // dp_size
-        parts = []
-        for i in range(dp_size):
-            start = i * spans_per_shard
-            end = start + spans_per_shard
-            shard_spans = value.spans[start:end]
-            shard_total = sum(s.stop - s.start for s in shard_spans)
-            parts.append(
-                TensorRef(
-                    spans=shard_spans,
-                    shape=(shard_total, *value.shape[1:]) if value.shape else None,
-                    dtype=value.dtype,
-                    device=value.device,
-                )
-            )
-        return parts
-
     elif isinstance(value, list):
         if len(value) != batch_size:
             return [value] * dp_size
@@ -183,6 +157,9 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
         # split, SHARED/reduction passed through) and recomputes cu_seqlens for
         # packed fields. A Batch whose own batch dim differs from the dispatch dim
         # doesn't participate in the split -> replicate it.
+        # TensorRef rides this path too (it IS a Batch): Batch.chunk -> its overridden
+        # slice/select_ranges chunks by ROW, so no TensorRef-specific branch is needed
+        # and single-span / non-uniform-span refs split into equal row shards.
         if value.batch_size != batch_size:
             return [value] * dp_size
         return value.chunk(dp_size)

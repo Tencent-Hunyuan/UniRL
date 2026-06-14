@@ -201,7 +201,7 @@ class TensorWorker:
                 raise KeyError(f"TensorWorker: unknown key '{key}'")
             return self._ref_counts[key]
 
-    # ── Tensor operations (called by GPUTensorHandle.remote_op / TensorRef.local) ──
+    # ── Tensor operations (called by GPUTensorHandle.remote_op / TensorRef.materialize) ──
 
     def tensor_op(self, handle: GPUTensorHandle, op: str, *op_args) -> GPUTensorHandle:
         """Execute a tensor operation directly in _store (no IPC needed).
@@ -234,7 +234,7 @@ class TensorWorker:
         )
 
     def get_tensor_cpu(self, handle: GPUTensorHandle) -> Tensor:
-        """Return tensor as CPU tensor (for TensorRef.local())."""
+        """Return tensor as CPU tensor (for TensorRef.materialize())."""
         if handle.object_ref is not None:
             return ray.get(handle.object_ref)
         with self._lock:

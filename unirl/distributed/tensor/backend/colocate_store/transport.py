@@ -24,7 +24,7 @@ import ray
 import torch
 
 from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTensorHandle
-from unirl.distributed.tensor.ref import TensorRef
+from unirl.distributed.tensor.ref import TensorRef, TensorSpan
 from unirl.distributed.tensor.worker_local import WorkerLocalTransport
 
 
@@ -75,9 +75,9 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         self._store.setup_global_pg(global_rank, world_size)
 
-    def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
+    def nccl_send(self, dst_rank: int, spans: List[TensorSpan]) -> None:
         # Each ref is a span → send ONLY its [start:stop) rows (exact-row routing).
-        items = [(s.handle.store_key, s.start, s.stop) for s in handles]
+        items = [(s.handle.store_key, s.start, s.stop) for s in spans]
         self._store._nccl_send(dst_rank, items)
 
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:

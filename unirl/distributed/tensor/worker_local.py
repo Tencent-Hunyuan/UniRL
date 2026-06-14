@@ -51,7 +51,7 @@ class WorkerLocalTransport(TensorTransport):
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         """Initialize the cross-worker transfer group."""
 
-    def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
+    def nccl_send(self, dst_rank: int, spans: List[TensorSpan]) -> None:
         raise NotImplementedError("transport does not support cross-worker send")
 
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:

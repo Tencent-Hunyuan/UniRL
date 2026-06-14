@@ -179,9 +179,9 @@ class GPUStoreTransport(WorkerLocalTransport):
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         ray.get(self._tw.setup_global_pg.remote(global_rank, world_size))
 
-    def nccl_send(self, dst_rank: int, handles: List[Any]) -> None:
+    def nccl_send(self, dst_rank: int, spans: List[TensorSpan]) -> None:
         # Each ref is a span → send ONLY its [start:stop) rows (exact-row routing).
-        items = [(s.handle.store_key, s.start, s.stop) for s in handles]
+        items = [(s.handle.store_key, s.start, s.stop) for s in spans]
         ray.get(self._tw._nccl_send.remote(dst_rank, items))
 
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:

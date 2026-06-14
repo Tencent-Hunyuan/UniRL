@@ -246,12 +246,28 @@ def test_chunk_tensorref_mismatched_size_replicated():
     assert all(s is ref for s in shards)
 
 
-def test_chunk_tensorref_span_indivisible_raises():
-    # batch_size divisible by dp_size, but span COUNT is not (1 span, dp_size 2).
-    ref = _meta(torch.zeros(4, 2))  # 1 span holding all 4 rows
+def test_chunk_tensorref_single_span_splits_by_row():
+    # A single-span ref (the shape put/dehydrate/from_handles produce) splits by
+    # ROW even though span COUNT (1) is not divisible by dp_size — chunking rides
+    # Batch.chunk -> TensorRef.slice -> select_ranges.
+    ref = _meta(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))  # 4 rows, 1 span
     assert len(ref.spans) == 1
-    with pytest.raises(ValueError):
-        pytree_chunk(ref, dp_size=2, batch_size=4)
+    shards = pytree_chunk(ref, dp_size=2, batch_size=4)
+    assert len(shards) == 2 and all(isinstance(s, TensorRef) for s in shards)
+    assert shards[0].batch_size == 2 and shards[1].batch_size == 2
+    assert torch.equal(shards[0].materialize(backend=None), torch.tensor([[0.0], [1.0]]))
+    assert torch.equal(shards[1].materialize(backend=None), torch.tensor([[2.0], [3.0]]))
+
+
+def test_chunk_tensorref_nonuniform_spans_split_into_equal_rows():
+    # Unequal span sizes still produce EQUAL row shards: by-span chunking would
+    # have given 3/1, by-row gives 2/2 (the first cut splits the 3-row span).
+    ref = _meta(torch.tensor([[0.0], [1.0], [2.0]]), torch.tensor([[3.0]]))  # spans [3, 1]
+    assert ref.sizes == [3, 1]
+    shards = pytree_chunk(ref, dp_size=2, batch_size=4)
+    assert shards[0].batch_size == 2 and shards[1].batch_size == 2
+    assert torch.equal(shards[0].materialize(backend=None), torch.tensor([[0.0], [1.0]]))
+    assert torch.equal(shards[1].materialize(backend=None), torch.tensor([[2.0], [3.0]]))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

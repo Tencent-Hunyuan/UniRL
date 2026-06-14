@@ -91,9 +91,9 @@ def deep_hydrate(obj: Any) -> Any:
     slices each track into per-rank shards — a single ref can't be intra-handle
     sliced. Hydrating on the driver fixes the mismatch (the DP dispatch then
     re-shards real tensors), but the driver has no ``TensorTransportRuntime``
-    installed, so ``TensorTransport.hydrate`` / ``TensorRef.local`` are
+    installed, so the runtime-backed ``TensorTransport.hydrate`` is
     unavailable here. ``_hydrate_tensor_meta`` instead pulls each leaf through
-    its ref's ``.local()`` (a plain ``ray.get`` from the owning worker's store),
+    its ref's ``.materialize(backend=None)`` (a plain ``ray.get`` from the owning worker's store),
     which works from the driver — we walk the nested Batch/dict/list/TUPLE
     structure and apply it to every ``TensorRef``.
 
