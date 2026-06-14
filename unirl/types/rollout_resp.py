@@ -63,6 +63,7 @@ from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,49 @@ class RolloutTrack(Batch):
             indices = torch.tensor(groups[gid], dtype=torch.long)
             results.append(self.select(indices))
         return results
+
+    def balance_shards(self, num_shards: int, *, min_spread: float = 0.05) -> "RolloutTrack":
+        """Reorder samples so ``num_shards`` equal contiguous shards carry ~equal tokens.
+
+        verl ``trainer.balance_batch`` parity. The consumer (``DP_SCATTER``) cuts
+        the batch into ``num_shards`` equal contiguous chunks, so every shard keeps
+        the same SAMPLE count — this only equalizes the per-shard TOKEN count, via
+        greedy LPT (:func:`unirl.utils.shard_balance.lpt_shard_permutation`).
+        Reordering is safe because advantages are already attached per sample.
+
+        Returns ``self`` unchanged when balancing cannot apply (no segment lengths,
+        ``num_shards <= 1``, batch size not divisible by ``num_shards``) or when the
+        shards are already within ``min_spread`` of balanced — permuting an
+        already-balanced batch only forces needless cross-shard row movement at
+        ``DP_SCATTER``. The reorder is applied via native zero-copy :meth:`select`,
+        so data stays worker-resident and materializes on the destination worker.
+
+        Args:
+            num_shards: Number of equal contiguous shards (the DP size).
+            min_spread: Skip balancing when the current per-shard token spread
+                (max-min over mean) is already below this fraction.
+
+        Returns:
+            A token-balanced copy of the track, or ``self`` if no reorder applies.
+        """
+        if self.segment is None or self.segment.lengths is None or num_shards <= 1:
+            return self
+        total = self.batch_size
+        if total % num_shards != 0:
+            return self
+        lengths = [int(x) for x in self.segment.lengths.tolist()]
+        if len(lengths) != total:
+            logger.warning("balance_shards: lengths (%d) != batch_size (%d); skipping.", len(lengths), total)
+            return self
+
+        before = shard_token_spread(lengths, num_shards)
+        if before < min_spread:
+            return self
+
+        perm = lpt_shard_permutation(lengths, num_shards)
+        after = shard_token_spread([lengths[i] for i in perm], num_shards)
+        logger.info("balance_shards: token spread %.1f%% -> %.1f%%", 100 * before, 100 * after)
+        return self.select(perm)
 
     # ---- track-to-track fan-out helper -------------------------------------
 
@@ -359,55 +403,6 @@ def _root_group_per_sample(resp: "RolloutResp", track_name: str) -> List[str]:
     parent = resp.tracks[track.parent_track]
     parent_sid_to_idx = {sid: i for i, sid in enumerate(parent.sample_ids)}
     return [parent_root_groups[parent_sid_to_idx[pid]] for pid in track.parent_ids]
-
-
-def balance_track_for_dp(track: "RolloutTrack", *, dp_size: int, min_spread: float = 0.05) -> "RolloutTrack":
-    """verl ``_balance_batch`` parity: reorder samples so DP ranks get equal token sums.
-
-    Greedy LPT under an equal-count constraint (DP_SCATTER splits the batch
-    into dp_size EQUAL contiguous chunks): longest sample first, into the
-    eligible bucket with the smallest running token sum. Advantages are
-    computed BEFORE this point (per-group stats already attached per
-    sample), so sample order is free to change — the same invariant verl
-    relies on. Buckets are laid out contiguously in worker order.
-    """
-    lengths = getattr(track.segment, "lengths", None) if track.segment is not None else None
-    if lengths is None:
-        logger.warning("balance_dp_batch: track has no segment lengths; skipping balance.")
-        return track
-    total = int(track.batch_size)
-    dp = int(dp_size)
-    if total % dp != 0 or dp <= 1:
-        return track
-    cap = total // dp
-    lens = [int(x) for x in lengths.tolist()]
-    if len(lens) != total:
-        logger.warning("balance_dp_batch: lengths (%d) != batch_size (%d); skipping.", len(lens), total)
-        return track
-    # Cheap skip guard: compute the CURRENT-order per-rank token sums in pure
-    # Python — when the spread is already tiny (uniform-length workloads, e.g.
-    # multiple-choice answers or fixed-step diffusion latents), the reorder +
-    # dispatch is pure overhead (measured +9.6s/step on VL geo3k).
-    current = [sum(lens[r * cap : (r + 1) * cap]) for r in range(dp)]
-    avg = sum(current) / dp
-    if avg <= 0 or (max(current) - min(current)) / avg < float(min_spread):
-        return track
-    order = sorted(range(total), key=lambda i: (-lens[i], i))
-    buckets = [[] for _ in range(dp)]
-    sums = [0] * dp
-    for i in order:
-        best = min((b for b in range(dp) if len(buckets[b]) < cap), key=lambda b: sums[b])
-        buckets[best].append(i)
-        sums[best] += lens[i]
-    perm = [i for bucket in buckets for i in bucket]
-    balanced = track.select(perm)
-    logger.info(
-        "balance_dp_batch: rank token sums min=%d max=%d (spread %.1f%%)",
-        min(sums),
-        max(sums),
-        100.0 * (max(sums) - min(sums)) / max(1, sum(sums) // dp),
-    )
-    return balanced
 
 
 def _track_with_field(track: TR, field_name: str, value: Any) -> TR:
