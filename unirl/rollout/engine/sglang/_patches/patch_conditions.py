@@ -101,12 +101,15 @@ _COND_FIELDS = (
 #     ``predict_noise`` ignores the mask, and carrying the 410-len mask would
 #     make ``TextEmbedCondition.concat`` pad the 333-token embeds up to 410,
 #     injecting spurious zero tokens that dilute the LoRA gradient ~68x.)
-#   * Single-encoder models (Z-Image: one Qwen3 encoder, mask_seq == embed_seq)
-#     PASS the check and KEEP the mask — which Z-Image genuinely needs, because
-#     its ``predict_noise`` rebuilds the per-prompt variable-length caption list
-#     by trimming the zero-padded embeds with this mask (see
-#     ``models/z_image/diffusion.py:_caption_list``). Without it, replay would
-#     forward the zero-pad positions through the DiT and diverge from rollout.
+#   * Single-encoder models (Z-Image: one Qwen3 encoder) source this from the raw
+#     fixed-length tokenizer mask (512), whose length never matches the trimmed
+#     caption embeds, so it ALSO fails the gate and is dropped. Z-Image genuinely
+#     needs a real validity mask — ``predict_noise`` rebuilds the per-prompt
+#     variable-length caption list by trimming the zero-padded embeds (see
+#     ``models/z_image/diffusion.py:_caption_list``) — so the response translator
+#     recovers it directly from the embeds' zero-pad rows rather than from this
+#     emitted field. Without that mask, replay would forward the zero-pad positions
+#     through the DiT and diverge from rollout.
 _POS_MAP = {
     "prompt_embeds": "prompt_embeds",
     "pooled_prompt_embeds": "pooled_embeds",

@@ -442,20 +442,21 @@ def _build_text_conditions(
     # guard keeps a partial list from producing a wrong-batch-size mask).
     attn_mask_cat = torch.cat(mask_list, dim=0) if mask_list and len(mask_list) == len(prompt_embeds_list) else None
 
-    # Z-Image: SGLang emits per-sample token-level captions ``[seq, hidden]`` with
-    # NO padding (the returned seq is the real token count; different prompts come
-    # back at different lengths). Its ``encoder_attention_mask`` is an unusable
-    # ``[seq, hidden]`` all-ones blob that the length gate above drops. The trainer
-    # DOES need a real ``[B, seq]`` mask so that cross-prompt batching
-    # (``TextEmbedCondition.concat`` pads variable lengths to the batch max) marks
-    # the pad tokens, and ``ZImageDiffusionStage.replay`` trims each caption back
-    # to its real tokens. Every returned token is real, so synthesize an all-ones
-    # ``[B, seq]`` mask from the fused embeds.
+    # Z-Image: SGLang returns the Qwen3 caption embeds zero-padded to the
+    # encode-batch's max caption length (the fork's ``pad_text_embeddings_with_mask``
+    # uses exact ``new_zeros``); a single-prompt encode comes back unpadded. The raw
+    # ``encoder_attention_mask`` is the fixed 512-token tokenizer mask, whose length
+    # never matches the trimmed embed sequence, so the length gate above already
+    # dropped it. Recover the real per-token validity mask straight from the embeds:
+    # a position is valid iff its embedding row is not all-zero. The trainer needs
+    # this so ``ZImageDiffusionStage.replay`` (via ``_caption_list``) trims each
+    # caption back to the exact tokens the rollout DiT attended to; an all-ones mask
+    # would instead forward the zero-pad rows and make replay diverge from rollout.
+    # Unpadded (single-prompt) embeds have no zero rows, so this is all-ones too —
+    # also correct. Cross-chunk merges (``TextEmbedCondition.concat``) zero-pad both
+    # embeds and this mask consistently.
     if model_family == "z_image" and attn_mask_cat is None and embeds_cat is not None and embeds_cat.dim() == 3:
-        attn_mask_cat = torch.ones(
-            (int(embeds_cat.shape[0]), int(embeds_cat.shape[1])),
-            dtype=torch.long,
-        )
+        attn_mask_cat = (embeds_cat != 0).any(dim=-1).to(torch.long)
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
