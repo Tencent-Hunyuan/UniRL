@@ -122,6 +122,12 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"remote mode (local_mode=False) requires host and scheduler_port; "
             f"got host={self.host!r}, scheduler_port={self.scheduler_port!r}",
         )
+        require(
+            not self.local_mode or (self.port is None and self.scheduler_port is None),
+            f"local mode self-reserves its ports; remove port / scheduler_port from the "
+            f"config — they are silently ignored (the reserved set overrides them). "
+            f"got port={self.port!r}, scheduler_port={self.scheduler_port!r}",
+        )
 
     # ------------------------------------------------------------------
     # SGLang ServerArgs intent (successor of the legacy ``build_server_kwargs``)

@@ -15,11 +15,13 @@ three schedule-mutation code paths inside set_timesteps and we neutralize all:
    temporarily set to ``1.0``.
 
 2. **Dynamic mu shift** (used by FLUX-family / Klein,
-   ``use_dynamic_shifting=True``): ``sigmas = time_shift(mu, 1.0, sigmas)``,
-   where ``time_shift(mu, t, x) = exp(mu) / (exp(mu) + (1/x - 1)**t)``. With
-   ``mu == 0`` this collapses to ``1/(1/x) == x`` -- also the identity. So we
-   force ``mu = 0.0`` for the call (the scheduler still requires a non-None mu
-   here, which is why we pass 0.0 instead of None).
+   ``use_dynamic_shifting=True``): ``sigmas = time_shift(mu, 1.0, sigmas)``.
+   Neutralized by binding ``time_shift`` to identity for the delegated call
+   (instance attribute shadows the class method; ``del`` restores), exactly like
+   the terminal-stretch path below. This is correct for BOTH
+   ``time_shift_type="exponential"`` and ``"linear"``; the older ``mu = 0.0``
+   trick was the identity only for the exponential form and would zero the whole
+   schedule under ``linear``. The driver already baked μ into the sigmas.
 
 3. **Terminal stretch** (used by Qwen-Image, ``shift_terminal: 0.02``;
    SD3/Flux ship ``null``): ``stretch_shift_to_terminal`` rescales the whole
@@ -82,20 +84,26 @@ def patch_set_timesteps() -> None:
                 # Identity instance-binding shadows the class method for this
                 # call only; the driver already baked the terminal stretch in.
                 self.stretch_shift_to_terminal = lambda t: t
-            # time_shift(mu=0, sigma=1.0, t=x) == x; neutralizes dynamic path.
-            effective_mu = 0.0 if dynamic else mu
+            if dynamic:
+                # Same identity-shadow trick for the mu-shift: correct for BOTH
+                # exponential and linear time_shift_type (mu=0.0 was the identity
+                # only for exponential and would zero the schedule under linear).
+                # The driver already baked μ into the sigmas.
+                self.time_shift = lambda mu, sigma, t: t
             return orig(
                 self,
                 num_inference_steps=num_inference_steps,
                 device=device,
                 sigmas=sigmas,
-                mu=effective_mu,
+                mu=mu,
                 timesteps=timesteps,
             )
         finally:
             self.set_shift(saved_shift)
             if stretches:
                 del self.stretch_shift_to_terminal
+            if dynamic:
+                del self.time_shift
 
     set_timesteps._unirl_external_sigmas = True  # type: ignore[attr-defined]
     FlowMatchEulerDiscreteScheduler.set_timesteps = set_timesteps

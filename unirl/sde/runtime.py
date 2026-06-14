@@ -305,7 +305,9 @@ class FlowMatchSchedulePolicy:
         :func:`get_sigma_schedule` / :func:`calculate_dynamic_mu`.
         """
         if not self.use_dynamic_shifting:
-            return get_sigma_schedule(num_inference_steps, self.shift, device)
+            return get_sigma_schedule(
+                num_inference_steps, self.shift, device, shift_terminal=self.shift_terminal
+            )
         latent_h = int(height) // int(self.vae_scale_factor)
         latent_w = int(width) // int(self.vae_scale_factor)
         image_seq_len = (latent_h // int(self.patch_size)) * (latent_w // int(self.patch_size))
