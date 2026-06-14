@@ -37,6 +37,11 @@ adv_normalization_scope: group
 # false = mean-center-only advantage (reward - group_mean), no std division —
 # removes the GRPO difficulty bias (reference norm_adv_by_std_in_grpo=False).
 normalize_adv_by_std: false
+# Reorder the rollout batch driver-side so each DP shard gets a similar token
+# total (verl trainer.balance_batch parity). GRPO groups are dispatched as
+# consecutive siblings, so without this one rank draws a hard prompt's 8 long
+# answers and straggles the whole FSDP step. Measured: train 28.4s -> 15.3s.
+balance_shards: true
 
 logging:
   report_to_wandb: true
