@@ -27,7 +27,7 @@ from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_diffusion_params
+from unirl.types.sampling import get_diffusion_params, is_forward_process
 from unirl.types.segments.latent import make_image_segment
 
 
@@ -155,20 +155,24 @@ class ImageAdapter(ModelAdapter):
         # field is unsliced across outputs and lacks the x_T prepend, so it
         # cannot back the RawResult contract.
         #
-        # SDE vs ODE gates on a NON-EMPTY step set. GRPO ships per-step SDE
-        # indices; DiffusionNFT / eval resolve ``num_sde_steps=0`` to ``[]``
-        # (and a paramless request to ``None``), both deterministic-ODE. Empty
-        # ``[]`` must NOT enter the SDE branch — that would ship the SDE kernel
-        # label with the recipe's ``eta`` (0.0 for NFT), tripping the upstream
-        # kernel's ``assert noise_level > 0``. The ODE branch instead pins
-        # ``rollout_sde_type="ode"`` + ``rollout_log_prob_no_const=True``: an ODE
-        # step's normalized log-prob is undefined, so upstream asserts the flag
-        # is set and emits a zero placeholder this path never reads
-        # (``emit_native_logprob`` is False when ``sde_indices`` is empty).
-        # Mirrors the legacy engine's ``request._to_sglang_kwargs`` ODE branch.
+        # SDE vs ODE gates on ``is_forward_process`` (the single source of truth
+        # for "no SDE steps" — empty ``[]`` from num_sde_steps=0, or ``None`` when
+        # no SDE params were set). A forward process (DiffusionNFT / eval) must NOT
+        # enter the SDE branch: that would ship the SDE kernel label with the
+        # recipe's ``eta`` (0.0 for NFT), tripping the upstream kernel's
+        # ``assert noise_level > 0``. The ODE branch pins ``rollout_sde_type="ode"``
+        # + ``rollout_log_prob_no_const=True``: an ODE step's normalized log-prob is
+        # undefined, so upstream asserts the flag is set and emits a zero
+        # placeholder this path never reads (``emit_native_logprob`` is False for a
+        # forward process). Mirrors the legacy engine's ``_to_sglang_kwargs``.
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
-        if sde_indices:
+        if is_forward_process(sde_indices):
+            kwargs["rollout_sde_type"] = "ode"
+            kwargs["rollout_noise_level"] = float(diffusion.eta)
+            kwargs["rollout_log_prob_no_const"] = True
+            kwargs["rollout_sde_step_indices"] = []
+        else:
             require(
                 self._sde_label is not None,
                 "build_inputs: SDE mode requires an sde_label (resolved from the strategy)",
@@ -177,11 +181,6 @@ class ImageAdapter(ModelAdapter):
             kwargs["rollout_noise_level"] = float(diffusion.eta)
             # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``).
             kwargs["rollout_sde_step_indices"] = sde_indices
-        else:
-            kwargs["rollout_sde_type"] = "ode"
-            kwargs["rollout_noise_level"] = float(diffusion.eta)
-            kwargs["rollout_log_prob_no_const"] = True
-            kwargs["rollout_sde_step_indices"] = []
 
         return kwargs
 
@@ -238,10 +237,10 @@ class ImageAdapter(ModelAdapter):
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
         # Best-effort native log-prob emission: only meaningful when the algorithm
-        # requested SDE steps (NFT / forward-process resolves sde_indices to []).
-        # Whether the emitted anchor is *used* or recomputed is the training
-        # layer's call (``algorithm.old_logp_source``), not an engine flag.
-        emit_native_logprob = sde_indices is not None and len(sde_indices) > 0
+        # requested SDE steps (a forward process — NFT / eval — has none). Whether
+        # the emitted anchor is *used* or recomputed is the training layer's call
+        # (``algorithm.old_logp_source``), not an engine flag.
+        emit_native_logprob = not is_forward_process(sde_indices)
 
         segment = self.build_segment(
             req,
