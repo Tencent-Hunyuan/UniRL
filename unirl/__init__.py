@@ -12,7 +12,6 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "RewardRequest": ("unirl.types", "RewardRequest"),
     "RewardResponse": ("unirl.types", "RewardResponse"),
     "RewardType": ("unirl.types", "RewardType"),
-    "SamplingRequirements": ("unirl.types.sampling", "SamplingRequirements"),
     # sde
     "get_sigma_schedule": ("unirl.sde", "get_sigma_schedule"),
     # reward

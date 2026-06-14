@@ -175,26 +175,3 @@ class ComposedSamplingParams(BaseSamplingParams):
         # Each prompt → ar.samples_per_prompt AR outputs, each AR output →
         # diffusion.samples_per_prompt diffusion samples.
         self.samples_per_prompt = int(self.diffusion.samples_per_prompt) * int(self.ar.samples_per_prompt)
-
-
-@dataclass(frozen=True)
-class SamplingRequirements:
-    """Algorithm-declared sampling contract shared with runtime."""
-
-    requires_trajectory: bool = True
-    requires_log_prob: bool = True
-    requires_embeddings: bool = True
-    requires_clean_latents: bool = False
-
-    @property
-    def is_forward_process(self) -> bool:
-        """Whether this is a forward process algorithm (DiffusionNFT)."""
-        return self.requires_clean_latents and not self.requires_trajectory
-
-    def to_dict(self) -> Dict[str, bool]:
-        """Convert core boolean requirements to a plain dictionary."""
-        return {
-            "requires_trajectory": bool(self.requires_trajectory),
-            "requires_log_prob": bool(self.requires_log_prob),
-            "requires_embeddings": bool(self.requires_embeddings),
-        }
