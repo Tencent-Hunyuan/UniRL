@@ -41,13 +41,13 @@ from unirl.distributed.group.dispatch import (
     resolve_backward_dispatch_mode,
 )
 from unirl.distributed.group.remote import RankInfo, Remote
-from unirl.distributed.tensor.backend.colocate_store.handle import TensorHandle
+from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
+from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 from unirl.distributed.tensor.grad_context import (
     RPCBackwardNode,
     current_grad_context,
 )
 from unirl.distributed.tensor.pytree import infer_batch_size
-from unirl.distributed.tensor.transport import TensorMeta, WorkerLocalTransport, map_tree
 from unirl.distributed.utils import collect_leaves
 
 if TYPE_CHECKING:
@@ -266,7 +266,7 @@ class Handle:
             if ctx is not None:
                 bwd_dispatch_mode = resolve_backward_dispatch_mode(method_name, dispatch_mode, self.rank_infos)
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
-                input_metas = collect_leaves(args, TensorMeta) + collect_leaves(tuple(kwargs.values()), TensorMeta)
+                input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
             batch_size = infer_batch_size(args, kwargs)
             # Only DP_SCATTER/DP_SCATTER_HEAD split the per-sample batch by dp_size, so only
@@ -300,7 +300,7 @@ class Handle:
             collected = collect_fn(self, results)
 
             if ctx is not None:
-                output_metas = collect_leaves(collected, TensorMeta)
+                output_metas = collect_leaves(collected, TensorRef)
                 ctx.nodes.append(
                     RPCBackwardNode(
                         role_proxy=self,
@@ -335,7 +335,7 @@ class Handle:
     # ── TensorHandle rebinding ──
 
     def _rebind_tree(self, obj, worker_handle, *, worker_local: bool = True):
-        """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorMeta.
+        """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorRef.
 
         For worker-local backends, ``rebind`` attaches the worker actor handle and
         registers the decref GC finalizer. For GLOBAL backends the refs resolve
@@ -346,13 +346,13 @@ class Handle:
         """
 
         def rebind_leaf(o):
-            if isinstance(o, TensorHandle):
+            if isinstance(o, GPUTensorHandle):
                 if worker_local:
                     o.rebind(worker_handle)
-                return TensorMeta.from_handles([o])
-            if isinstance(o, TensorMeta) and worker_local:
-                for h in o.refs:
-                    h.rebind(worker_handle)
+                return TensorRef.from_handles([o])
+            if isinstance(o, TensorRef) and worker_local:
+                for s in o.spans:
+                    s.handle.rebind(worker_handle)
             return o
 
         return map_tree(obj, rebind_leaf)
