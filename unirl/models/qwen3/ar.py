@@ -39,20 +39,44 @@ from .conditions import Qwen3ARConditions
 
 logger = logging.getLogger(__name__)
 
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2")
+
 
 @functools.lru_cache(maxsize=None)
 def _warn_packed_disabled(attn_impl: str) -> None:
     """One-time warning (per distinct backend) when packed replay is skipped.
 
-    Fires only when packing WOULD apply (B>1, mask support) but the attention
-    backend is not a sparse-block kernel, so replay uses the slower padded path.
+    Fires when packing WOULD apply (B > 1) but the attention backend is not a
+    sparse-block kernel, so replay uses the slower padded path instead.
     """
     logger.warning(
-        "Qwen3ARStage: packed-varlen replay disabled — attn_implementation=%r is not a sparse-block "
-        "kernel; using the padded replay path. Set attn_implementation='flex_attention' (or "
-        "'flash_attention_2' with flash_attn installed) to enable packed replay.",
+        "packed-varlen replay disabled: attn_implementation=%r is not a "
+        "sparse-block kernel; using the padded replay path. Set "
+        "attn_implementation='flex_attention' (or 'flash_attention_2' with "
+        "flash_attn installed) to enable packed replay.",
         attn_impl,
     )
+
+
+def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
+    """Feature-detect the packed varlen replay prerequisites (review #43).
+
+    1. A sparse-block attention backend (flex_attention or flash_attention_2);
+       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
+       require a sparse backend (checked first; warns once on fallback).
+    2. transformers building a block-causal mask from restarting position_ids
+       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
+       older versions the forward would silently attend ACROSS sequence
+       boundaries (wrong logps, no error), so fall back to the dense path.
+    """
+    if attn_impl not in _SPARSE_PACKED_ATTN:
+        _warn_packed_disabled(str(attn_impl))
+        return False
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def _replay_aware_forward(
@@ -151,30 +175,6 @@ def _replay_aware_forward(
 # flex via BlockMask, flash_attention_2 via flash_attn_varlen + cu_seqlens. Under
 # either, packed replay is always a win; on any other backend (sdpa/eager) it is
 # gated on length variance (see packed_replay).
-_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2")
-
-
-def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
-    """Feature-detect the packed varlen replay prerequisites (review #43).
-
-    The packed path relies on transformers building a block-causal mask from
-    restarting position_ids (masking_utils.find_packed_sequence_indices,
-    transformers >= 4.53). On older versions the forward would silently attend
-    ACROSS sequence boundaries — wrong logps with no error — so fall back to the
-    dense path. A sparse-block attention backend (flex_attention or
-    flash_attention_2) is also required — checked first so non-sparse backends
-    fall back before any packing work.
-    """
-    if attn_impl not in _SPARSE_PACKED_ATTN:
-        _warn_packed_disabled(str(attn_impl))
-        return False
-    try:
-        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 @dataclass
 class Qwen3ARParams:
     """Per-request AR-mode knobs for Qwen3.
@@ -487,6 +487,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         bucket = 1024
         L = int(packed_ids.shape[1])
         target = ((L + bucket - 1) // bucket) * bucket
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if attn_impl != "flex_attention":
             target = L
         if target > L:
