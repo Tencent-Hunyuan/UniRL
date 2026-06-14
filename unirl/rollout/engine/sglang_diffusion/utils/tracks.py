@@ -298,9 +298,7 @@ def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(padded, dim=0)
 
 
-def _aligned_mask(
-    mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tensor]
-) -> Optional[torch.Tensor]:
+def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """Fuse + mount an attention mask only when it aligns with the fused embeds.
 
     The engine emits the model's embeds-aligned ``prompt_embeds_mask`` (the mask the
@@ -316,8 +314,7 @@ def _aligned_mask(
     mask_cat = _cat_padded_rows(mask_list)
     if int(mask_cat.shape[1]) != int(embeds_cat.shape[1]):
         logger.debug(
-            "Dropping attention mask: fused seq-len %d != embeds seq-len %d "
-            "(mask not embeds-aligned for this family).",
+            "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
             int(mask_cat.shape[1]),
             int(embeds_cat.shape[1]),
         )
