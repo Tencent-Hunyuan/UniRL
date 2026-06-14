@@ -403,6 +403,13 @@ def _merge_conditions(merged, output_batches) -> None:
             tensors = [v[enc_idx] for v in per_batch]
             if any(t is None for t in tensors):
                 merged_list.append(None)
+            elif tensors[0].dim() <= 2:
+                # Token-level un-batched caption [seq, hidden] (Z-Image): dim 0 is
+                # the SEQUENCE, not the output axis, so cat-dim-0 would corrupt it.
+                # A de-expanded group's outputs share one prompt → identical
+                # captions, so keep one; _slice_embed_list re-adds the batch dim
+                # per output.
+                merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
@@ -447,10 +454,26 @@ def _wrap_result_common(DiffGenerator) -> None:
 def _slice_embed_list(embed_list, idx: int):
     """Slice the idx-th sample out of a per-encoder ``list[Tensor]`` field.
 
-    Returns a new list with each tensor sliced ``t[idx:idx+1]`` (keeps the batch
-    dim), or ``None`` when the field is absent. Mirrors the fork's
-    ``_slice_embed_list`` in ``diffusion_generator.py``.
+    Two layouts occur:
+
+    * **Batched** ``[B, seq, hidden]`` (SD3 etc.): dim 0 is the sample/output
+      axis, so slice ``t[idx:idx+1]`` (keep-dim) to pick this output. Mirrors the
+      fork's ``_slice_embed_list`` in ``diffusion_generator.py``.
+    * **Token-level, un-batched** ``[seq, hidden]`` (Z-Image: Qwen3 emits a
+      per-sample variable-length caption with NO batch dim). Here dim 0 is the
+      SEQUENCE, so ``t[idx:idx+1]`` would wrongly grab a single token. The
+      per-output OutputBatch already holds THIS output's full caption (within a
+      de-expanded group every output shares the same prompt → same caption), so
+      add a batch dim instead: ``t.unsqueeze(0)`` → ``[1, seq, hidden]``.
     """
     if embed_list is None:
         return None
-    return [t[idx : idx + 1] if t is not None else None for t in embed_list]
+    out = []
+    for t in embed_list:
+        if t is None:
+            out.append(None)
+        elif t.dim() <= 2:
+            out.append(t.unsqueeze(0))
+        else:
+            out.append(t[idx : idx + 1])
+    return out

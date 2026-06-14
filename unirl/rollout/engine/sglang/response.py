@@ -164,7 +164,21 @@ def _maybe_unpack_packed_trajectory(
     untouched. The 4-D → 5-D unpack only fires when the rollout-side fork
     actually emits packed tokens AND the model family is one we know wants
     image-form latents on the trainer side.
+
+    Z-Image is the inverse case: SGLang's S3-DiT runs the denoise loop in 5-D
+    image form ``[B, C, F=1, H, W]`` (its ``_as_image_list`` requires the frame
+    axis), so the captured trajectory arrives 6-D ``[B, T, C, 1, H, W]``. The
+    trainer-side segment and ``ZImageDiffusionStage.replay`` use image-form
+    ``[B, T, C, H, W]``, so the singleton frame axis is dropped here.
     """
+    if model_family == "z_image" and trajectories.ndim == 6:
+        if int(trajectories.shape[3]) != 1:
+            raise ValueError(
+                f"_maybe_unpack_packed_trajectory: Z-Image trajectory has a non-singleton "
+                f"frame axis (shape={tuple(trajectories.shape)}); expected "
+                f"[B, T, C, 1, H, W] for t2i."
+            )
+        trajectories = trajectories.squeeze(3)
     if trajectories.ndim == 5:
         return trajectories
     if trajectories.ndim != 4:
@@ -369,6 +383,8 @@ def _build_decoded_images(
 
 def _build_text_conditions(
     results: Sequence["GenerationResult"],
+    *,
+    model_family: str = "",
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
     """Fuse per-result encoder outputs into ``text`` + optional ``negative_text``.
 
@@ -425,6 +441,26 @@ def _build_text_conditions(
     # gate is deterministic per model family, so this is all-or-nothing; the
     # guard keeps a partial list from producing a wrong-batch-size mask).
     attn_mask_cat = torch.cat(mask_list, dim=0) if mask_list and len(mask_list) == len(prompt_embeds_list) else None
+
+    # Z-Image: SGLang emits per-sample token-level captions ``[seq, hidden]`` with
+    # NO padding (the returned seq is the real token count; different prompts come
+    # back at different lengths). Its ``encoder_attention_mask`` is an unusable
+    # ``[seq, hidden]`` all-ones blob that the length gate above drops. The trainer
+    # DOES need a real ``[B, seq]`` mask so that cross-prompt batching
+    # (``TextEmbedCondition.concat`` pads variable lengths to the batch max) marks
+    # the pad tokens, and ``ZImageDiffusionStage.replay`` trims each caption back
+    # to its real tokens. Every returned token is real, so synthesize an all-ones
+    # ``[B, seq]`` mask from the fused embeds.
+    if (
+        model_family == "z_image"
+        and attn_mask_cat is None
+        and embeds_cat is not None
+        and embeds_cat.dim() == 3
+    ):
+        attn_mask_cat = torch.ones(
+            (int(embeds_cat.shape[0]), int(embeds_cat.shape[1])),
+            dtype=torch.long,
+        )
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
@@ -494,7 +530,7 @@ def _to_rollout_resp(
 
     conditions: dict = {}
     if cfg.populate_conditions:
-        text_cond, neg_text_cond = _build_text_conditions(results)
+        text_cond, neg_text_cond = _build_text_conditions(results, model_family=str(cfg.model_family))
         if text_cond is not None:
             conditions["text"] = text_cond
         if neg_text_cond is not None:

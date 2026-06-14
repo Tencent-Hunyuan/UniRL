@@ -29,6 +29,7 @@ rollout-with-initial_noise on both the single and grouped paths.
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -82,12 +83,35 @@ def patch_latent_prep() -> None:
         device = get_local_torch_device()
         batch_size = int(batch.batch_size)
         nopp = int(getattr(batch, "num_outputs_per_prompt", 1) or 1)
+        pcfg = server_args.pipeline_config
 
         # 1) Expand driver-shipped noise to batch_size (fork's rule).
         latents = _expand_initial_noise(latents, batch_size, nopp).to(device=device)
 
+        # 1b) Reconcile dims with the canonical randn shape. The randn branch
+        # builds ``randn_tensor(prepare_latent_shape(...))`` (then packs), so the
+        # provided-latents branch must hand the ``maybe_*`` calls the SAME shape.
+        # The driver ships frame-less image-form noise ``[B, C, H, W]`` (from the
+        # model's ``latent_shape``); models whose ``prepare_latent_shape`` adds a
+        # frame axis need ``[B, C, F=1, H, W]``. Z-Image's S3-DiT is the case that
+        # forced this: its ``_as_image_list`` treats a 4-D tensor as a SINGLE
+        # ``[C, F, H, W]`` image (dim==4 branch), so a frame-less ``[B, C, H, W]``
+        # gets C read as 1 and the 16 channels folded into the token count —
+        # patchify then yields feature dim ``pH*pW*pF*1`` instead of ``*C`` and the
+        # x_embedder matmul fails. Reshaping to ``prepare_latent_shape`` is a no-op
+        # when the driver shape already matches (e.g. SD3) and only inserts the
+        # size-1 frame axis when the model expects it. numel-guarded: a genuine
+        # mismatch falls through unchanged rather than silently reshaping wrong.
+        try:
+            num_frames = int(getattr(batch, "num_frames", 1) or 1)
+            expected = tuple(int(d) for d in pcfg.prepare_latent_shape(batch, batch_size, num_frames))
+            if tuple(latents.shape) != expected and latents.numel() == math.prod(expected):
+                latents = latents.reshape(expected)
+        except Exception as exc:  # pragma: no cover - defensive; preserve prior behavior on any failure
+            if _DEBUG:
+                print(f"[UNIRL latent_prep] shape reconcile skipped: {type(exc).__name__}: {exc}", flush=True)
+
         # 2) Compute latent_ids on the UNPACKED shape (mirror randn branch order).
-        pcfg = server_args.pipeline_config
         latent_ids = pcfg.maybe_prepare_latent_ids(latents)
         if latent_ids is not None:
             batch.latent_ids = latent_ids.to(device=device)
