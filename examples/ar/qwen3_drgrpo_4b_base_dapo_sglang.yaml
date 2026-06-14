@@ -1,18 +1,16 @@
 # @package _global_
-# AR standard GRPO (textbook DeepSeekMath) Qwen3-4B-Base on DAPO-Math — v2 trainer
+# AR standard Dr.GRPO (symmetric-clip) Qwen3-4B-Base on DAPO-Math — v2 trainer
 # (ARTrainer), SGLang rollout, 32 GPU.
 #
-# TEXTBOOK / standard GRPO (DeepSeekMath) — the "GRPO" reference point. Sibling of
-# qwen3_drgrpo_4b_base_dapo_sglang (standard Dr.GRPO) and the DRPO-paper vanilla
-# baseline qwen3_grpo_vanilla_4b_base_dapo_sglang. SAME model / data / SGLang rollout /
-# full-weight TensorWeightSync / sampling / 4 rollout-anchored updates; differs in
-# exactly the three normalization choices that define standard GRPO:
-#   - normalize_adv_by_std=true          — advantage divided by the group std
-#   - loss_agg_mode=seq-mean-token-mean  — per-seq token-MEAN (length-normalized)
-#   - symmetric PPO clip eps=0.2 (clip_range_high=null) — NOT DAPO clip-higher 0.2/0.28
-# vs qwen3_drgrpo (standard Dr.GRPO): no-std + token-sum-norm, SAME symmetric clip —
-# so GRPO <-> Dr.GRPO isolates the two Dr.GRPO normalization fixes. vs the vanilla
-# baseline qwen3_grpo_vanilla: that one adds DAPO clip-higher on top of Dr.GRPO normalization.
+# STANDARD Dr.GRPO (Dr.GRPO, arXiv:2503.20783) — the two Dr.GRPO fixes applied to
+# GRPO, with the ORIGINAL symmetric PPO clip RETAINED (Dr.GRPO does not modify the
+# clipping). Sibling of qwen3_grpo_4b_base_dapo_sglang (textbook GRPO):
+#   - normalize_adv_by_std=false            — Dr.GRPO, removes the difficulty bias
+#   - loss_agg_mode=seq-mean-token-sum-norm — Dr.GRPO, removes the length bias
+#   - symmetric PPO clip eps=0.2 (clip_range_high=null) — unmodified PPO clipping
+# NOTE vs qwen3_grpo_vanilla_4b_base_dapo_sglang: that file is the DRPO-paper "vanilla"
+# baseline = the SAME Dr.GRPO normalization but with DAPO clip-higher (0.2/0.28)
+# added on top; THIS file is textbook Dr.GRPO with the unmodified symmetric clip.
 #
 # Data prep (one-time) — build the local jsonl from the raw DAPO-Math-17k dataset:
 #   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
@@ -21,7 +19,7 @@
 # Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_drgrpo_4b_base_dapo_sglang num_devices=32
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -35,17 +33,16 @@ eval_interval: 10
 
 # ARTrainer advantage scope (per-group mean/std).
 adv_normalization_scope: group
-# true = STANDARD GRPO: advantage = (reward - group_mean) / group_std. The std
-# division is the GRPO difficulty weighting (Dr.GRPO removes it; the drgrpo and
-# vanilla recipes set this false). This is one of the three textbook-GRPO axes.
-normalize_adv_by_std: true
+# false = mean-center-only advantage (reward - group_mean), no std division —
+# removes the GRPO difficulty bias (reference norm_adv_by_std_in_grpo=False).
+normalize_adv_by_std: false
 
 logging:
   report_to_wandb: true
   project_name: unirl-grpo
-  run_name: grpo_qwen3-4b-base_dapo_sglang
+  run_name: drgrpo_qwen3-4b-base_dapo_sglang
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [grpo, standard, textbook, qwen3, 4b-base, dapo, sglang, v2]
+  tags: [drgrpo, standard, qwen3, 4b-base, dapo, sglang, v2]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -166,18 +163,19 @@ algorithm:
   # old_logp_source: rollout).
   _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
-  # STANDARD GRPO (DeepSeekMath): per-seq token-MEAN loss aggregation (÷ per-seq
-  # length |o_i|, length-normalized) and SYMMETRIC PPO clip eps=0.2 (clip_range_high=
-  # null, NOT DAPO clip-higher 0.2/0.28). With normalize_adv_by_std=true above, the TWO
-  # normalization DENOMINATORS — advantage ÷group-std and loss ÷per-seq-length — are
-  # what separate textbook GRPO from BOTH Dr.GRPO recipes (which use no-std + ÷fixed
-  # horizon). The symmetric clip is the SAME as qwen3_drgrpo and differs ONLY from the
-  # vanilla baseline qwen3_grpo_vanilla (which adds clip-higher).
+  # STANDARD Dr.GRPO (arXiv:2503.20783): no-std advantages + seq-mean-token-sum-norm
+  # (the two Dr.GRPO fixes) with the ORIGINAL SYMMETRIC PPO clip eps=0.2
+  # (clip_range_high=null). Dr.GRPO does NOT touch the clipping, so this symmetric clip
+  # is IDENTICAL to qwen3_grpo (textbook DeepSeekMath GRPO); the two recipes differ ONLY
+  # in the two Dr.GRPO normalization DENOMINATORS — advantage (no-std here vs ÷group-std
+  # in GRPO) and loss aggregation (÷fixed horizon here vs ÷per-seq-length in GRPO). The
+  # recipe that adds DAPO clip-higher 0.2/0.28 on TOP of this no-std + token-sum-norm
+  # normalization is the vanilla baseline qwen3_grpo_vanilla, NOT qwen3_grpo.
   clip_range: 0.2
-  clip_range_high: null # symmetric clip — standard GRPO (the vanilla baseline uses 0.28)
+  clip_range_high: null # symmetric clip — standard Dr.GRPO (the vanilla baseline uses 0.28)
   clip_schedule: constant
-  loss_agg_mode: seq-mean-token-mean # per-seq token-MEAN, mean over seqs (length-normalized)
-  horizon: 8192 # unused by seq-mean-token-mean; kept for parity with the sibling recipes
+  loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
+  horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
   # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1).
   sampling_temperature: 1.0
