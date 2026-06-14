@@ -52,6 +52,7 @@ class ARTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
+        balance_shards: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = 60,
         eval_samples_per_prompt: int = 16,
@@ -65,6 +66,12 @@ class ARTrainer(BaseTrainer):
         # group std. False = mean-center only (reward - group_mean), NO std division —
         # removes the difficulty bias that over-amplifies low-std (hard) prompts.
         self.normalize_adv_by_std = normalize_adv_by_std
+        # verl trainer.balance_batch parity: driver-side reorder of the rollout
+        # batch so each DP shard receives a similar total-token workload. FSDP
+        # collectives sync all ranks every micro, so a step runs at the SLOWEST
+        # rank's pace — without balancing, the rank that drew the longest
+        # sequences straggles (~+/-11%% rank-total variance at heavy lengths).
+        self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
         # AIME-style periodic eval — avg@k accuracy on the eval prompt set
         # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
         self.eval_interval = int(eval_interval)
@@ -160,6 +167,10 @@ class ARTrainer(BaseTrainer):
 
         self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
+        # verl balance_batch parity: reorder so each DP shard gets a near-equal
+        # token load before DP_SCATTER (no-op when already balanced).
+        if self.balance_shards:
+            track = track.balance_shards(int(self.num_devices))
         result = self.stack.train_track(track, training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(
             rollout_id,

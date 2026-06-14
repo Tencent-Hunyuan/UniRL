@@ -63,6 +63,7 @@ from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.segments import Segment
+from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,49 @@ class RolloutTrack(Batch):
             indices = torch.tensor(groups[gid], dtype=torch.long)
             results.append(self.select(indices))
         return results
+
+    def balance_shards(self, num_shards: int, *, min_spread: float = 0.05) -> "RolloutTrack":
+        """Reorder samples so ``num_shards`` equal contiguous shards carry ~equal tokens.
+
+        verl ``trainer.balance_batch`` parity. The consumer (``DP_SCATTER``) cuts
+        the batch into ``num_shards`` equal contiguous chunks, so every shard keeps
+        the same SAMPLE count — this only equalizes the per-shard TOKEN count, via
+        greedy LPT (:func:`unirl.utils.shard_balance.lpt_shard_permutation`).
+        Reordering is safe because advantages are already attached per sample.
+
+        Returns ``self`` unchanged when balancing cannot apply (no segment lengths,
+        ``num_shards <= 1``, batch size not divisible by ``num_shards``) or when the
+        shards are already within ``min_spread`` of balanced — permuting an
+        already-balanced batch only forces needless cross-shard row movement at
+        ``DP_SCATTER``. The reorder is applied via native zero-copy :meth:`select`,
+        so data stays worker-resident and materializes on the destination worker.
+
+        Args:
+            num_shards: Number of equal contiguous shards (the DP size).
+            min_spread: Skip balancing when the current per-shard token spread
+                (max-min over mean) is already below this fraction.
+
+        Returns:
+            A token-balanced copy of the track, or ``self`` if no reorder applies.
+        """
+        if self.segment is None or self.segment.lengths is None or num_shards <= 1:
+            return self
+        total = self.batch_size
+        if total % num_shards != 0:
+            return self
+        lengths = [int(x) for x in self.segment.lengths.tolist()]
+        if len(lengths) != total:
+            logger.warning("balance_shards: lengths (%d) != batch_size (%d); skipping.", len(lengths), total)
+            return self
+
+        before = shard_token_spread(lengths, num_shards)
+        if before < min_spread:
+            return self
+
+        perm = lpt_shard_permutation(lengths, num_shards)
+        after = shard_token_spread([lengths[i] for i in perm], num_shards)
+        logger.info("balance_shards: token spread %.1f%% -> %.1f%%", 100 * before, 100 * after)
+        return self.select(perm)
 
     # ---- track-to-track fan-out helper -------------------------------------
 
