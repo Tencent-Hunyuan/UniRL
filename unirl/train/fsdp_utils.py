@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import torch
 from torch import Tensor, nn

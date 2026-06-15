@@ -52,7 +52,7 @@ def main(cfg: DictConfig) -> None:
         save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),
-        save_mode=cfg.get("save_mode", "auto")
+        save_mode=cfg.get("save_mode", "auto"),
     )
 
 
