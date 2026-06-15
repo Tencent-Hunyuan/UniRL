@@ -470,6 +470,10 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         for b in range(batch_size):
             n_p = int(real_prompt_lens_p[b].item())
             n_r = lengths[b]
+            # The predict-index math below (offset + n_p - 1) assumes each stream has
+            # >=1 real prompt token; n_p == 0 would gather the PRIOR stream's last
+            # hidden state (silent cross-sequence logp corruption), so fail loud.
+            assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
             seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
             streams.append(seq)
             pos_parts.append(torch.arange(seq.numel(), device=device))

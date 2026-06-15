@@ -36,7 +36,11 @@ class Qwen3PipelineConfig:
     trust_remote_code: bool = True
 
     model_precision: Any = "bf16"
-    # HF attention backend for the TRAIN-side model (replay teacher-forcing).
+    # HF attention backend for the TRAIN-side model, set on from_pretrained — so it
+    # is the model's GLOBAL backend and governs EVERY forward: replay teacher-forcing
+    # AND the HF autoregress() decode loop (the *_sglang recipes roll out in SGLang,
+    # so only replay is exercised there; flex targets full-sequence forwards and may
+    # recompile per step under HF incremental decode).
     # 'flex_attention' makes the packed varlen replay fast: transformers builds a
     # BlockMask from the restarting position_ids and the flex kernel skips the
     # fully-masked cross-sequence blocks (sdpa falls back to the math kernel on
