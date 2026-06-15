@@ -1,40 +1,28 @@
-"""ReFLPolicy — self-contained ReFL policy Remote.
+"""ReFLPolicy — family-agnostic ReFL policy Remote.
 
-Composes an :class:`FSDPBackend` (FSDP-wrap of ``bundle.transformer`` + LoRA +
-optimizer + checkpoint) with the SD3 sampling/decode stages over the SAME bundle,
-so:
+Builds a **config-chosen** ``Pipeline`` (no per-family imports), FSDP-wraps its
+bundle's transformer via ``FSDPBackend``, and drives grad DRaFT-K sampling + grad
+VAE decode through the shared :func:`unirl.models.draft.draft_generate`. The family
+is selected entirely by ``pipeline_target`` + ``model_config``; the
+``loss_backward`` seed and ``optimizer_step`` are family-agnostic.
 
-  - ``sample_and_decode`` runs grad-enabled DRaFT-K sampling + VAE decode on the
-    FSDP-wrapped *trainable* transformer (returns the only cross-role tensor, the
-    image);
-  - ``loss_backward`` is the ``-reward.mean()`` seed node (local backward to
-    populate ``rewards.grad``; the distributed ``enable_grad()`` context chains it
-    back through the reward role → image → transformer params);
-  - ``optimizer_step`` consumes those grads on the same params.
-
-Construction follows the Phase-0-validated pattern: the FSDP process group is
+Construction follows the Phase-0/e2e-validated order: the FSDP process group is
 initialized in ``initialize()`` (after ``Remote.setup`` populated the dist env),
-then ``FSDPBackend`` (which calls ``fully_shard``) is built over it.
+then the pipeline + ``FSDPBackend`` (which calls ``fully_shard``) are built over it.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from hydra.utils import get_class
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.models.sd3.bundle import SD3Bundle
-from unirl.models.sd3.conditions import SD3Conditions
-from unirl.models.sd3.config import SD3PipelineConfig
-from unirl.models.sd3.diffusion import SD3DiffusionStage, SD3DiffusionStep
-from unirl.models.sd3.text_embed import SD3TextEmbedStage
-from unirl.models.sd3.vae import SD3VAEDecodeStage
-from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
-from unirl.sde.runtime import get_sigma_schedule
+from unirl.models.draft import draft_generate
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.configs import FSDPConfig, LoraConfig
@@ -45,19 +33,19 @@ logger = logging.getLogger(__name__)
 
 
 class ReFLPolicy(Remote):
-    """SD3 ReFL policy: FSDP transformer + grad DRaFT-K sampling + optimizer."""
+    """Family-agnostic ReFL policy: config-chosen Pipeline + FSDP + grad DRaFT-K."""
 
     def __init__(
         self,
         *,
-        model_config: SD3PipelineConfig,
+        pipeline_target: str,
+        model_config: Any,
         fsdp_cfg: FSDPConfig,
         optimizer_cfg: OptimizerConfig,
         scheduler_cfg: LrSchedulerConfig,
         lora_cfg: Optional[LoraConfig] = None,
+        strategy: Optional[Any] = None,
         block_class_names: Tuple[str, ...] = ("JointTransformerBlock",),
-        strategy: Optional[StepStrategy] = None,
-        shift: float = 3.0,
         draft_num_steps: int = 1,
         reward_loss_scale: float = 1.0,
         guidance_scale: float = 1.0,
@@ -68,14 +56,14 @@ class ReFLPolicy(Remote):
         activation_checkpoint_vae: bool = True,
     ) -> None:
         super().__init__()
+        self._pipeline_target = str(pipeline_target)
         self._model_config = model_config
         self._fsdp_cfg = fsdp_cfg
         self._optimizer_cfg = optimizer_cfg
         self._scheduler_cfg = scheduler_cfg
         self._lora_cfg = lora_cfg
+        self._strategy = strategy
         self._block_class_names = tuple(block_class_names)
-        self._strategy = strategy if strategy is not None else FlowSDEStrategy()
-        self._shift = float(shift)
         self.draft_num_steps = int(draft_num_steps)
         self.reward_loss_scale = float(reward_loss_scale)
         self.guidance_scale = float(guidance_scale)
@@ -96,13 +84,19 @@ class ReFLPolicy(Remote):
         ):
             dist.init_process_group(backend="nccl")
 
-        self._model_config.device = self.device
-        bundle = SD3Bundle.from_config(self._model_config)
-        self.bundle = bundle
+        try:
+            self._model_config.device = self.device  # runtime device injection
+        except Exception:
+            pass
 
-        # FSDP-wrap bundle.transformer in place + inject LoRA + build optimizer.
+        pipeline_cls = get_class(self._pipeline_target)
+        self.pipeline = pipeline_cls.from_config(self._model_config, strategy=self._strategy)
+
+        # FSDP-wrap pipeline.bundle.transformer in place + inject LoRA + optimizer.
+        # The pipeline's stages reference the same bundle, so sampling uses the
+        # wrapped trainable transformer.
         self.backend = FSDPBackend(
-            bundle=bundle,
+            bundle=self.pipeline.bundle,
             block_class_names=self._block_class_names,
             trainable_attr="transformer",
             fsdp_cfg=self._fsdp_cfg,
@@ -112,21 +106,10 @@ class ReFLPolicy(Remote):
             rank=int(self.rank_info.rank) if self.rank_info is not None else 0,
             lora_cfg=self._lora_cfg,
         )
-
-        # Sampling/decode stages over the SAME (now FSDP-wrapped) bundle.
-        self.diffusion = SD3DiffusionStage(
-            model=bundle,
-            step=SD3DiffusionStep(),
-            strategy=self._strategy,
-            autocast_precision=self._model_config.autocast_precision,
-            trajectory_precision=self._model_config.trajectory_precision,
-            logprob_precision=self._model_config.logprob_precision,
-        )
-        self.text_embed = SD3TextEmbedStage(bundle)
-        self.vae_decode = SD3VAEDecodeStage(bundle)
         logger.info(
-            "ReFLPolicy initialized: draft_num_steps=%d nfe=%d guidance=%.2f res=%dx%d",
-            self.draft_num_steps, self.num_inference_steps, self.guidance_scale, self.height, self.width,
+            "ReFLPolicy initialized: pipeline=%s draft_num_steps=%d nfe=%d guidance=%.2f res=%dx%d",
+            self._pipeline_target, self.draft_num_steps, self.num_inference_steps,
+            self.guidance_scale, self.height, self.width,
         )
 
     # ------------------------------------------------------------------
@@ -135,17 +118,10 @@ class ReFLPolicy(Remote):
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def sample_and_decode(self, *, prompts: Texts, rollout_id: int = 0) -> Images:
-        """Grad-enabled DRaFT-K sample + in-graph VAE decode. Returns ``Images``
-        whose pixels carry grad_fn into the FSDP transformer params — the single
-        tensor that crosses to the reward role."""
+        """Grad-enabled DRaFT-K sample + in-graph VAE decode via the shared,
+        family-agnostic ``draft_generate``. Returns ``Images`` whose pixels carry
+        grad_fn into the FSDP transformer params — the single cross-role tensor."""
         self.backend.model.train()
-        device = torch.device(self.device)
-        # Text encoders are frozen — keep their (large, e.g. T5-XXL) forward graph
-        # out of the DRaFT backward; the transformer still gets grad via the latents.
-        with torch.no_grad():
-            cond = self.text_embed.embed(prompts)
-        conditions = SD3Conditions(text=cond)
-        schedule = get_sigma_schedule(self.num_inference_steps, shift=self._shift, device=device)
         dp_rank = int(self.rank_info.dp_rank) if self.rank_info is not None else 0
         params = DiffusionSamplingParams(
             num_inference_steps=self.num_inference_steps,
@@ -157,10 +133,14 @@ class ReFLPolicy(Remote):
             seed=self.base_seed + 1000 * int(rollout_id) + dp_rank,
             init_same_noise=False,
         )
-        clean = self.diffusion.diffuse_draft_k(
-            conditions, schedule=schedule, params=params, draft_num_steps=self.draft_num_steps
+        return draft_generate(
+            self.pipeline,
+            model_config=self._model_config,
+            texts=prompts,
+            params=params,
+            draft_num_steps=self.draft_num_steps,
+            activation_checkpoint=self.activation_checkpoint_vae,
         )
-        return self.vae_decode.decode_grad(clean, activation_checkpoint=self.activation_checkpoint_vae)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def loss_backward(self, *, rewards: torch.Tensor) -> None:
@@ -185,8 +165,7 @@ class ReFLPolicy(Remote):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.ALL)
     def param_checksum(self) -> float:
-        """L1 sum of local trainable-param shards — a cheap weight-change probe
-        (changes after a real optimizer step)."""
+        """L1 sum of local trainable-param shards — a cheap weight-change probe."""
         total = 0.0
         for p in self.backend.model.parameters():
             if not p.requires_grad:

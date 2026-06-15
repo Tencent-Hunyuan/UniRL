@@ -20,6 +20,7 @@ save_mode: adapter
 
 policy:
   _target_: unirl.train.refl.policy.ReFLPolicy
+  pipeline_target: unirl.models.sd3.pipeline.SD3Pipeline   # family selector — swap this + model_config for another family, no code
   draft_num_steps: 1           # grad through the final step only (DRaFT-1)
   reward_loss_scale: 1.0
   guidance_scale: 1.0
@@ -27,7 +28,6 @@ policy:
   height: 512
   width: 512
   seed: 42
-  shift: 3.0
   activation_checkpoint_vae: true
   block_class_names: ["JointTransformerBlock"]
   strategy:

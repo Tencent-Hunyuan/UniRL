@@ -1,15 +1,14 @@
 #!/usr/bin/env python
-"""Phase 1 ReFL oracle — single-process gate for the grad-enabled SD3 sampling +
-differentiable PickScore reward, BEFORE wiring the distributed two-role trainer.
+"""Phase 1 ReFL oracle — single-process gate for the shared grad sampler +
+differentiable reward, BEFORE wiring the distributed two-role trainer.
 
 Runs the REAL components in one process with plain ``torch.autograd``:
-  SD3 bundle → inject LoRA → ``diffuse_draft_k`` → ``decode_grad`` →
-  PickScore ``compute_rewards_differentiable`` → ``-reward.mean()`` → ``backward()``.
+  SD3 pipeline → inject LoRA → ``draft_generate`` (shared `draft_k_sample` +
+  grad `decode`) → PickScore ``compute_rewards_differentiable`` →
+  ``-reward.mean()`` → ``backward()``.
 
 Gate checks (all must pass before Phase 2):
-  1. connectivity — every LoRA param gets a finite, non-None, non-zero grad
-     (catches a stray detach / leaked no_grad / non-differentiable preprocessing,
-     and the fp32-LoRA-under-autocast-cache footgun).
+  1. connectivity — every LoRA param gets a finite, non-None, non-zero grad.
   2. DRaFT-K isolation — grad norm differs between K=1 and K=T (the mask works).
   3. preprocessing fidelity — differentiable PickScore ≈ the PIL processor path.
 
@@ -27,12 +26,11 @@ import traceback
 
 import torch
 
-from unirl.models.sd3.conditions import SD3Conditions
+from unirl.models.draft import draft_generate
 from unirl.models.sd3.config import SD3PipelineConfig
 from unirl.models.sd3.pipeline import SD3Pipeline
 from unirl.reward.local.pickscore import PickScoreRewardScorer, PickScoreSpec
 from unirl.sde.kernels import FlowSDEStrategy
-from unirl.sde.runtime import get_sigma_schedule
 from unirl.train.inject import inject_lora
 from unirl.types.primitives import Texts
 from unirl.types.reward import RewardRequest
@@ -51,15 +49,12 @@ PROMPTS = [
 ]
 
 
-def build_pipeline(model_path: str, device: torch.device) -> SD3Pipeline:
+def build(model_path: str, device: torch.device):
     cfg = SD3PipelineConfig(
         pretrained_model_ckpt_path=model_path,
-        model_precision="bf16",
-        autocast_precision="bf16",
-        trajectory_precision="bf16",
-        logprob_precision="fp32",
-        shift=3.0,
-        device=device,
+        model_precision="bf16", autocast_precision="bf16",
+        trajectory_precision="bf16", logprob_precision="fp32",
+        shift=3.0, device=device,
     )
     pipeline = SD3Pipeline.from_config(cfg, strategy=FlowSDEStrategy())
     inject_lora(
@@ -67,27 +62,22 @@ def build_pipeline(model_path: str, device: torch.device) -> SD3Pipeline:
         rank=32, alpha=64, target_modules=LORA_TARGETS,
         dropout=0.0, bias="none", task_type="FEATURE_EXTRACTION",
     )
-    # fp32 LoRA adapters (master weights); base stays bf16.
     for _, p in pipeline.bundle.transformer.named_parameters():
         if p.requires_grad:
-            p.data = p.data.float()
+            p.data = p.data.float()  # fp32 LoRA master
     pipeline.bundle.transformer.train()
-    return pipeline
+    return pipeline, cfg
 
 
-def sample_decode_reward(pipeline, reward, prompts, *, device, steps, guidance, hw, draft_k, seed):
-    cond = pipeline.text_embed.embed(Texts(texts=list(prompts)))
-    conditions = SD3Conditions(text=cond)
-    schedule = get_sigma_schedule(steps, shift=float(pipeline.shift), device=device)
+def sample_reward(pipeline, cfg, reward, prompts, *, steps, guidance, hw, draft_k, seed):
     params = DiffusionSamplingParams(
-        num_inference_steps=steps, guidance_scale=guidance,
-        height=hw, width=hw, eta=0.0, samples_per_prompt=1,
-        seed=seed, init_same_noise=False,
+        num_inference_steps=steps, guidance_scale=guidance, height=hw, width=hw,
+        eta=0.0, samples_per_prompt=1, seed=seed, init_same_noise=False,
     )
-    clean = pipeline.diffusion.diffuse_draft_k(
-        conditions, schedule=schedule, params=params, draft_num_steps=draft_k
+    images = draft_generate(
+        pipeline, model_config=cfg, texts=Texts(texts=list(prompts)),
+        params=params, draft_num_steps=draft_k, activation_checkpoint=False,
     )
-    images = pipeline.vae_decode.decode_grad(clean, activation_checkpoint=False)
     rewards = reward.compute_rewards_differentiable(images.pixels, list(prompts))
     return images, rewards
 
@@ -104,14 +94,14 @@ def main() -> int:
     ap.add_argument("--guidance", type=float, default=1.0)
     ap.add_argument("--hw", type=int, default=512)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--tol", type=float, default=2e-2, help="check-3 max abs reward diff")
+    ap.add_argument("--tol", type=float, default=2e-2)
     args = ap.parse_args()
 
     device = torch.device("cuda")
     torch.manual_seed(args.seed)
     print(f"model={args.model_path} steps={args.steps} guidance={args.guidance} hw={args.hw}", flush=True)
 
-    pipeline = build_pipeline(args.model_path, device)
+    pipeline, cfg = build(args.model_path, device)
     reward = PickScoreRewardScorer(config=PickScoreSpec(batch_size=8, device="auto"), base_device="cuda")
     model = pipeline.bundle.transformer
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -121,9 +111,9 @@ def main() -> int:
 
     # ---- Check 1: connectivity (grad through ALL steps, K=T) ----
     model.zero_grad(set_to_none=True)
-    images, rewards = sample_decode_reward(
-        pipeline, reward, PROMPTS, device=device, steps=args.steps,
-        guidance=args.guidance, hw=args.hw, draft_k=args.steps, seed=args.seed,
+    images, rewards = sample_reward(
+        pipeline, cfg, reward, PROMPTS, steps=args.steps, guidance=args.guidance,
+        hw=args.hw, draft_k=args.steps, seed=args.seed,
     )
     print(
         f"[c1] images {tuple(images.pixels.shape)} finite={bool(torch.isfinite(images.pixels).all())} "
@@ -141,9 +131,9 @@ def main() -> int:
 
     # ---- Check 2: DRaFT-K isolation (K=1 vs K=T) ----
     model.zero_grad(set_to_none=True)
-    _, rewards1 = sample_decode_reward(
-        pipeline, reward, PROMPTS, device=device, steps=args.steps,
-        guidance=args.guidance, hw=args.hw, draft_k=1, seed=args.seed,
+    _, rewards1 = sample_reward(
+        pipeline, cfg, reward, PROMPTS, steps=args.steps, guidance=args.guidance,
+        hw=args.hw, draft_k=1, seed=args.seed,
     )
     (-rewards1.mean()).backward()
     norm_k1 = _grad_norm(named)
@@ -155,9 +145,9 @@ def main() -> int:
 
     # ---- Check 3: preprocessing fidelity (differentiable vs PIL path) ----
     with torch.no_grad():
-        images_d, rewards_diff = sample_decode_reward(
-            pipeline, reward, PROMPTS, device=device, steps=args.steps,
-            guidance=args.guidance, hw=args.hw, draft_k=0, seed=args.seed,
+        images_d, rewards_diff = sample_reward(
+            pipeline, cfg, reward, PROMPTS, steps=args.steps, guidance=args.guidance,
+            hw=args.hw, draft_k=0, seed=args.seed,
         )
         req = RewardRequest(primitives={"text": Texts(texts=list(PROMPTS))}, generated={"image": images_d})
         rewards_pil = torch.tensor(reward._compute_model_rewards(req), device=device, dtype=torch.float32)

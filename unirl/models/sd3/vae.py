@@ -16,6 +16,8 @@ Decode math copied from ``models/sd3.py:533-550`` and
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -31,12 +33,18 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
     def __init__(self, bundle: SD3Bundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Images:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
         """Decode the final-step latents in *s* into pixel images.
 
-        Reads ``s.latents[:, -1]`` (the final stored position, which is
-        ``T`` — the clean latent ``x_0``). VAE forward runs in fp32; output
-        is clamped to ``[0, 1]`` before being wrapped in ``Images``.
+        Reads ``s.latents[:, -1]`` (the final stored position, which is ``T`` —
+        the clean latent ``x_0``). VAE forward runs in fp32; output is clamped to
+        ``[0, 1]`` before being wrapped in ``Images``.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("SD3VAEDecodeStage.decode: segment.latents is None")
@@ -47,31 +55,6 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         clean = s.latents[:, -1]
         scaling_factor = self.bundle.vae.config.scaling_factor
         shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32) / scaling_factor
-            if shift_factor is not None:
-                latents_f32 = latents_f32 + float(shift_factor)
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
-        pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
-
-    def decode_grad(self, clean: torch.Tensor, *, activation_checkpoint: bool = False) -> Images:
-        """Differentiable VAE decode of a clean latent ``x_0`` (``[B, C, H, W]``)
-        for ReFL direct-reward backprop.
-
-        Unlike :meth:`decode` this takes the raw latent tensor (not a
-        ``LatentSegment``) and runs WITHOUT ``torch.no_grad()`` so gradients flow
-        from the reward back through the (frozen) VAE into ``clean``. The VAE
-        carries no trainable params, so only ``clean``'s graph is extended. Set
-        ``activation_checkpoint`` to recompute the decode in backward (the
-        dominant in-graph activation) and trade compute for memory.
-        """
-        if clean.ndim != 4:
-            raise ValueError(
-                f"SD3VAEDecodeStage.decode_grad: expected clean latent [B, C, H, W], got {tuple(clean.shape)}"
-            )
-        scaling_factor = self.bundle.vae.config.scaling_factor
-        shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
         vae = self.bundle.vae.to(torch.float32)
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
@@ -80,12 +63,13 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 latents_f32 = latents_f32 + float(shift_factor)
             return vae.decode(latents_f32).sample
 
-        if activation_checkpoint and clean.requires_grad:
-            from torch.utils.checkpoint import checkpoint
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
 
-            decoded = checkpoint(_decode, clean, use_reentrant=False)
-        else:
-            decoded = _decode(clean)
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)
 
