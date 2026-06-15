@@ -5,7 +5,7 @@ engine-emitted text-encoder embeddings: the response translator
 (``rollout/engine/sglang/response.py:_build_text_conditions``) reads, per
 ``GenerationResult``::
 
-    result.prompt_embeds, result.pooled_prompt_embeds, result.encoder_attention_mask,
+    result.prompt_embeds, result.pooled_prompt_embeds,
     result.negative_prompt_embeds, result.neg_pooled_prompt_embeds
 
 Stock upstream ``GenerationResult`` / ``OutputBatch`` do NOT carry these
@@ -23,12 +23,12 @@ delegates the read to ``sampling_params``, so the worker sees them as
 
 WHAT THIS PATCH DOES (all setattr / dataclass-field-injection / AROUND-wrap):
 
-1. **OutputBatch + GenerationResult field injection.** Add the 6 embed fields to
+1. **OutputBatch + GenerationResult field injection.** Add the 5 embed fields to
    each dataclass (mirrors the fork's schedule_batch.py / entrypoints/utils.py
    diffs) so they round-trip through ``dataclasses.fields`` / ``replace`` and the
    scheduler<->driver IPC.
 
-2. **Copy the 6 fields off the ``Req`` onto the OutputBatch, gated on the flags**,
+2. **Copy the 5 fields off the ``Req`` onto the OutputBatch, gated on the flags**,
    at the seam where the OutputBatch is actually built. In the MONOLITHIC path the
    terminal ``DecodingStage.forward(batch) -> OutputBatch`` constructs it directly,
    so ``GPUWorker._req_to_output_batch`` is bypassed (it fires only on the disagg
@@ -38,7 +38,6 @@ WHAT THIS PATCH DOES (all setattr / dataclass-field-injection / AROUND-wrap):
 
        prompt_embeds          <- result.prompt_embeds
        pooled_prompt_embeds   <- result.pooled_embeds
-       encoder_attention_mask <- result.prompt_attention_mask
        negative_prompt_embeds <- result.negative_prompt_embeds
        neg_pooled_prompt_embeds <- result.neg_pooled_embeds
        negative_attention_mask  <- result.negative_attention_mask
@@ -75,13 +74,12 @@ from dataclasses import field
 
 logger = logging.getLogger(__name__)
 
-# The 6 conditions fields, in the fork's order. All default to None and are
+# The 5 conditions fields, in the fork's order. All default to None and are
 # typed ``list[torch.Tensor] | None`` (one entry per text encoder) on
 # OutputBatch; ``Any``-typed on GenerationResult to match its existing style.
 _COND_FIELDS = (
     "prompt_embeds",
     "pooled_prompt_embeds",
-    "encoder_attention_mask",
     "negative_prompt_embeds",
     "neg_pooled_prompt_embeds",
     "negative_attention_mask",
@@ -135,7 +133,7 @@ def patch_conditions() -> None:
     #
     # Both are registered in ``__dataclass_fields__`` (so they round-trip through
     # ``fields`` / ``replace`` / ``asdict`` / pickle) AND have their generated
-    # ``__init__`` wrapped to strip-then-reapply the 6 keys -- because once a field
+    # ``__init__`` wrapped to strip-then-reapply the 5 keys -- because once a field
     # lives in ``__dataclass_fields__``, ``dataclasses.replace`` passes EVERY field
     # as a kwarg to ``__init__``, and the frozen generated ``__init__`` would reject
     # the post-hoc ones. GenerationResult is additionally built directly with these
@@ -188,7 +186,7 @@ def _make_dataclass_field(name: str, default, type_str: str):
 
 
 def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
-    """Register the 6 conditions fields onto a plain ``@dataclass`` ``cls``.
+    """Register the 5 conditions fields onto a plain ``@dataclass`` ``cls``.
 
     Registration (``__dataclass_fields__`` entry + class-level ``None`` default)
     makes the fields visible to ``dataclasses.fields`` / ``replace`` / ``asdict``,
@@ -199,7 +197,7 @@ def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
     not know the post-hoc fields; yet once a field is in ``__dataclass_fields__``,
     ``dataclasses.replace`` passes EVERY field as a kwarg, and
     ``GenerationResult`` is built directly as ``GenerationResult(**common, ...)``
-    with our keys. So we wrap ``__init__`` to strip the 6 keys before the strict
+    with our keys. So we wrap ``__init__`` to strip the 5 keys before the strict
     generated ``__init__`` runs, then re-apply via ``object.__setattr__`` -- the
     same strip-then-reapply pattern ``patch_sampling_io`` uses for SamplingParams.
     """
@@ -426,7 +424,7 @@ def _wrap_result_common(DiffGenerator) -> None:
 
     ``_result_common(req, output_batch, generation_time, output_index)`` returns
     the kwargs dict shared by every ``GenerationResult(**common, ...)`` call. We
-    add the 6 conditions fields, slicing each per-encoder tensor ``t[idx:idx+1]``
+    add the 5 conditions fields, slicing each per-encoder tensor ``t[idx:idx+1]``
     by ``output_index`` so each result carries its own single-sample embeds.
 
     Single path: ``output_batch`` is the per-Req batch (batch dim 1), idx=0 ->

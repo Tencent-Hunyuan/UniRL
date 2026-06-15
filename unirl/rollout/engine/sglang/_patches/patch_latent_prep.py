@@ -29,10 +29,13 @@ rollout-with-initial_noise on both the single and grouped paths.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
@@ -108,8 +111,9 @@ def patch_latent_prep() -> None:
             if tuple(latents.shape) != expected and latents.numel() == math.prod(expected):
                 latents = latents.reshape(expected)
         except Exception as exc:  # pragma: no cover - defensive; preserve prior behavior on any failure
-            if _DEBUG:
-                print(f"[UNIRL latent_prep] shape reconcile skipped: {type(exc).__name__}: {exc}", flush=True)
+            # Surface at normal log level (not _DEBUG-gated): a swallowed reconcile
+            # leaves un-reshaped latents that fail later inside the DiT, far from here.
+            logger.warning("latent_prep shape reconcile skipped: %s: %s", type(exc).__name__, exc)
 
         # 2) Compute latent_ids on the UNPACKED shape (mirror randn branch order).
         latent_ids = pcfg.maybe_prepare_latent_ids(latents)

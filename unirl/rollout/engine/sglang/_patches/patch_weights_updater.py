@@ -74,9 +74,16 @@ def _resolve_param_names_mapping(module) -> dict:
 
 
 def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int, num_shards: int) -> None:
-    """Write ``tensor`` into the ``shard_id``-th equal slice (dim 0) of a fused
-    param. Prefers the param's SGLang ``weight_loader`` (TP-correct) and falls
-    back to a manual equal-shard copy (correct for tp_size=1, the recipe's case).
+    """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param.
+
+    Prefers the param's SGLang ``weight_loader``, which derives each shard's
+    offset/size from the layer's ``output_sizes`` and is therefore TP- and
+    GQA-correct (handles unequal q/k/v). The manual fallback splits dim 0 into
+    ``num_shards`` EQUAL slices, so it is correct ONLY for equal-sized shards
+    (q==k==v, w1==w3) — which holds for Z-Image base (MHA: num_heads==n_kv_heads)
+    at tp_size=1, the only model reaching it here. A future fused GQA model must go
+    through the ``weight_loader`` path (or derive offsets from ``output_sizes``);
+    the equal-split fallback would silently corrupt unequal shards.
     """
     wl = getattr(param, "weight_loader", None)
     if wl is not None:
