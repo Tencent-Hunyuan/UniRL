@@ -60,6 +60,10 @@ bundle:
     autocast_precision: bf16
     logprob_precision: fp32
     use_gradient_checkpointing: true
+    # flex_attention: packed varlen replay gets a fused block-causal kernel
+    # (BlockMask skips cross-sequence blocks; sdpa falls back to the math kernel
+    # on packed masks). Train-side only — rollout runs in SGLang.
+    attn_implementation: flex_attention
 
 pipeline:
   # from_bundle shares the trainer-injected bundle. NO system_instruction +
