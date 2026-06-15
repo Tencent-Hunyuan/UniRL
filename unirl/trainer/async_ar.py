@@ -272,8 +272,13 @@ class AsyncARTrainer(ARTrainer):
         req = self._build_req(self.data_source.get_samples(self.batch_size), gen_id)
         refs, worker_local = self._generate_async(req)
         self._inflight.append(
-            {"refs": refs, "worker_local": worker_local, "req": req,
-             "gen_id": gen_id, "weight_version": self._weight_version}
+            {
+                "refs": refs,
+                "worker_local": worker_local,
+                "req": req,
+                "gen_id": gen_id,
+                "weight_version": self._weight_version,
+            }
         )
 
     def _score_into_buffer(self, rec: Dict[str, Any], resp: RolloutResp) -> None:
