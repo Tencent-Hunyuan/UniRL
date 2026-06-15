@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import logging
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,6 +15,47 @@ from unirl.types.segments import TextSegment
 
 from .bundle import QwenVLBundle
 from .conditions import QwenVLARConditions
+
+logger = logging.getLogger(__name__)
+
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_packed_disabled(attn_impl: str) -> None:
+    """One-time warning (per distinct backend) when packed replay is skipped.
+
+    Fires when packing WOULD apply (B > 1) but the attention backend is not a
+    sparse-block kernel, so replay uses the slower padded path instead.
+    """
+    logger.warning(
+        "packed-varlen replay disabled: attn_implementation=%r is not a "
+        "sparse-block kernel; using the padded replay path. Set "
+        "attn_implementation='flex_attention' (or 'flash_attention_2' with "
+        "flash_attn installed) to enable packed replay.",
+        attn_impl,
+    )
+
+
+def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
+    """Feature-detect the packed varlen replay prerequisites (review #43).
+
+    1. A sparse-block attention backend (flex_attention or flash_attention_2);
+       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
+       require a sparse backend (checked first; warns once on fallback).
+    2. transformers building a block-causal mask from restarting position_ids
+       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
+       older versions the forward would silently attend ACROSS sequence
+       boundaries (wrong logps, no error), so fall back to the dense path.
+    """
+    if attn_impl not in _SPARSE_PACKED_ATTN:
+        _warn_packed_disabled(str(attn_impl))
+        return False
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 @dataclass
@@ -87,6 +130,11 @@ def _merge_igt(per_sample_igt: Optional[List[Optional[torch.Tensor]]]) -> Option
     return torch.cat(parts, dim=0) if parts else None
 
 
+# Attention backends with a sparse packed kernel (skip cross-sequence blocks) →
+# packed replay always wins. Qwen2.5-VL has NO flex support, so packed replay needs
+# a FlashAttention backend (flash_attention_2/3/4, whichever flash-attn package is
+# installed; the repo pins flash-attn-4 → 'flash_attention_4'). On any other backend
+# (sdpa/eager) the gate falls back to the dense padded path (see packed_replay).
 class QwenVLARStage(ARStage[QwenVLARConditions]):
     def __init__(self, *, model: QwenVLBundle) -> None:
         self.model = model
@@ -219,6 +267,24 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> torch.Tensor:
+        """Branch: prefer :meth:`packed_replay` (packed-varlen, B > 1), else
+        :meth:`padding_replay` (dense padded default). Returns packed varlen
+        ``[total_tokens]`` aligned with ``segment.log_probs``."""
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if _packed_replay_supported(attn_impl):
+            packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
+            if packed is not None:
+                return packed
+        return self.padding_replay(conditions, segment=segment, temperature=temperature)
+
+    def padding_replay(
+        self,
+        conditions: QwenVLARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Dense padded ``[B, max_real + T_max]`` replay — the default / fallback path."""
         if conditions.prompt is None or conditions.prompt.input_ids is None:
             raise ValueError("QwenVLARStage.replay: conditions.prompt.input_ids is None")
         if conditions.prompt.attention_mask is None:
@@ -337,6 +403,107 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if not flat:
             return torch.zeros(0, dtype=torch.float32, device=device)
         return torch.cat(flat, dim=0)
+
+    def packed_replay(
+        self,
+        conditions: QwenVLARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> Optional[torch.Tensor]:
+        """Packed-varlen replay for VL (M-RoPE) — verl remove_padding parity.
+
+        Concatenate every sample's ``prompt + response`` into one zero-padded
+        stream, with per-stream 4-D position ids ``[text_arange; get_rope_index
+        (t,h,w)]``. The text row restarts at 0 per stream; under a FlashAttention
+        backend transformers derives per-sequence ``cu_seqlens`` from that restarting
+        row (varlen FA — no cross-sequence attention, verl remove_padding parity).
+        sdpa/eager would instead build an explicit packed block-causal mask from the
+        same row (also correct), but the gate routes those to the dense path for
+        speed; Qwen2.5-VL has no flex_attention support, so a flash backend is the
+        reachable packed path. Per-stream M-RoPE positions equal the standalone
+        layout (validated bit-exact), so logp semantics match :meth:`padding_replay`.
+        Returns ``None`` (→ padding fallback) when packing does not apply: single
+        sample, or missing prompt / lengths / cu_seqlens.
+        """
+        if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
+            return None
+        if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
+            return None
+        device = next(self.model.transformer.parameters()).device
+        prompt_ids = conditions.prompt.input_ids.to(device)
+        prompt_mask = conditions.prompt.attention_mask.to(device)
+        batch_size = int(prompt_ids.shape[0])
+        if batch_size <= 1:
+            return None
+        pv = _merge_pv(conditions.pixel_values)
+        igt = _merge_igt(conditions.image_grid_thw)
+        if pv is not None:
+            pv = pv.to(device)
+        if igt is not None:
+            igt = igt.to(device)
+
+        flat_resp = segment.tokens.to(device=device, dtype=torch.long)
+        lengths = [int(n) for n in segment.lengths.tolist()]
+        igt_list = conditions.image_grid_thw  # per-sample list (a sample may have 0/≥1 images)
+        get_rope_index = self.model.transformer.model.get_rope_index
+        self.model.transformer.model.rope_deltas = None  # avoid stale M-RoPE cache
+
+        real_prompt_lens = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
+
+        cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
+        streams: List[torch.Tensor] = []
+        pos_parts: List[torch.Tensor] = []
+        pred_parts: List[torch.Tensor] = []
+        offset = 0
+        for b in range(batch_size):
+            n_p = int(real_prompt_lens[b].item())
+            n_r = lengths[b]
+            seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
+            streams.append(seq)
+            # Per-stream 4-D M-RoPE position [text; t; h; w]; text row restarts at
+            # 0 per stream so transformers builds the packed block-causal mask
+            # from it (sdpa). Per-stream get_rope_index == dense per-row (bit-exact).
+            one = seq.unsqueeze(0)
+            grid = igt_list[b] if (igt_list is not None and igt_list[b] is not None) else None
+            if grid is not None:
+                grid = grid.to(device)
+            vision_pos, _ = get_rope_index(one, image_grid_thw=grid, attention_mask=torch.ones_like(one))  # [3,1,n]
+            text_pos = torch.arange(seq.numel(), device=device).unsqueeze(0)  # [1, n]
+            pos_parts.append(torch.cat([text_pos, vision_pos[:, 0, :]], dim=0))  # [4, n]
+            if n_r > 0:
+                pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
+            offset += int(seq.numel())
+        packed_ids = torch.cat(streams).unsqueeze(0)  # [1, L]
+        packed_pos = torch.cat(pos_parts, dim=1).unsqueeze(1)  # [4, L] -> [4, 1, L]
+        predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
+
+        if predict_index.numel() == 0:
+            return torch.zeros(0, dtype=torch.float32, device=device)
+
+        forward_kwargs: Dict[str, Any] = {
+            "input_ids": packed_ids,
+            "attention_mask": None,  # packed block-causal mask inferred from restarting text positions
+            "position_ids": packed_pos,
+            "use_cache": False,
+            "return_dict": True,
+            # Run the lm_head ONLY at the predict positions (transformers logits_to_keep
+            # accepts an index tensor) so we never materialize the full [1, L, vocab]
+            # logits — the packed analogue of Qwen3's chunked head. The returned logits
+            # come back in predict_index order, which equals flat_resp (segment) order.
+            "logits_to_keep": predict_index,
+        }
+        if pv is not None:
+            forward_kwargs["pixel_values"] = pv
+        if igt is not None:
+            forward_kwargs["image_grid_thw"] = igt
+
+        out = self.model.transformer(**forward_kwargs)
+        pred_logits = out.logits[0].float()  # [T_total, V] — logits at the predict positions
+        T = float(temperature) if float(temperature) > 0.0 else 1.0
+        log_probs = F.log_softmax(pred_logits / T, dim=-1)
+        per_token = log_probs.gather(-1, flat_resp.unsqueeze(-1)).squeeze(-1)  # [T_total]
+        return per_token.to(dtype=torch.float32)
 
     def _resolve_stop_ids(
         self,
