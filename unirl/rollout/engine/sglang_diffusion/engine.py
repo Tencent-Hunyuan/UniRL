@@ -189,6 +189,10 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
+        # Idempotent, symmetric with ``wake_up``: a second ``sleep()`` while already
+        # offloaded would issue ``release_memory_occupation`` to the scheduler twice.
+        if self._is_offloaded:
+            return
         self._backend.release_memory(tags=_OFFLOAD_TAGS, cpu_backup_tags=_CPU_BACKUP_TAGS)
         self._is_offloaded = True
         # The released tags include the transformer weights → the loaded LoRA pool
