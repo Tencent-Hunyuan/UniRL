@@ -42,6 +42,7 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--guidance", type=float, default=1.0)
     ap.add_argument("--hw", type=int, default=512)
+    ap.add_argument("--frames", type=int, default=16, help="video families only; WAN needs (frames-1)%4==0")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tol", type=float, default=1e-3, help="max rel-diff on the final latent")
     args = ap.parse_args()
@@ -60,8 +61,8 @@ def main() -> int:
 
     params = DiffusionSamplingParams(
         num_inference_steps=args.steps, guidance_scale=args.guidance,
-        height=args.hw, width=args.hw, eta=0.0, sde_indices=[], samples_per_prompt=1,
-        seed=args.seed, init_same_noise=False,
+        height=args.hw, width=args.hw, num_frames=args.frames, eta=0.0, sde_indices=[],
+        samples_per_prompt=1, seed=args.seed, init_same_noise=False,
     )
     with torch.no_grad():
         conds = pipeline.build_conditions(Texts(texts=PROMPTS), guidance_scale=args.guidance)
