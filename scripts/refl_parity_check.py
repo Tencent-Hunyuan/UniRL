@@ -50,6 +50,11 @@ def main() -> int:
     pipeline_cls = get_class(args.pipeline_target)
     config_cls = get_class(args.config_target)
     cfg = config_cls(pretrained_model_ckpt_path=args.model_path, device=device)
+    # Compare both paths in fp32 so the per-step dtype policy is identical (diffuse
+    # casts latents to trajectory_dtype; draft_k_sample keeps the kernel's fp32).
+    # This isolates the LOOP logic — the thing the refactor must preserve.
+    if hasattr(cfg, "trajectory_precision"):
+        cfg.trajectory_precision = "fp32"
     pipeline = pipeline_cls.from_config(cfg, strategy=FlowSDEStrategy())
     print(f"family={args.pipeline_target.split('.')[-1]} steps={args.steps} guidance={args.guidance}", flush=True)
 
