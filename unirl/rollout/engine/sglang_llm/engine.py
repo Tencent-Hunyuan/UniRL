@@ -1081,6 +1081,18 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
                 **(self.cfg.chat_template_kwargs or {}),
             )
 
+        # transformers 5.x apply_chat_template(tokenize=True) returns a
+        # BatchEncoding (older versions a tokenizers.Encoding or list[int]);
+        # normalize to a flat list[int] so the sglang prompt_token_ids and the
+        # decode preview below both receive integers.
+        if hasattr(input_ids, "input_ids"):  # BatchEncoding
+            input_ids = input_ids["input_ids"]
+        elif hasattr(input_ids, "ids"):  # tokenizers.Encoding
+            input_ids = list(input_ids.ids)
+        if input_ids and isinstance(input_ids[0], (list, tuple)):
+            input_ids = input_ids[0]  # de-nest a single-sequence batch
+        input_ids = [int(t) for t in input_ids]
+
         if not self._chat_template_logged:
             self._chat_template_logged = True
             decoded_preview = self._tokenizer.decode(input_ids[:30], skip_special_tokens=False)
