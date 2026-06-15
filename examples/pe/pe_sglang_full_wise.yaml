@@ -3,7 +3,7 @@
 #
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
-#   - ar:        SGLangLLMRolloutEngine (Qwen3 SRT)   → P*N rewrites
+#   - ar:        SGLangRolloutEngine (Qwen3 SRT)   → P*N rewrites
 #   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # Trained weights reach each engine via a per-track sync bridge, routed to the
 # matching child of the composed engine by ``track_prefix``:
@@ -199,7 +199,7 @@ ar:
     micro_batch_size: 1
     max_grad_norm: 1.0
 
-# ── Composed dual-engine rollout: sglang_llm (ar) + sglang (diffusion) ──────
+# ── Composed dual-engine rollout: sglang (ar) + sglang (diffusion) ──────
 rollout:
   _target_: unirl.rollout.engine.composed.engine.ComposedRolloutEngine
   # The diffusion child needs the SD3 model_config (path + shift + LoRA hints);
@@ -227,7 +227,8 @@ rollout:
     # / empty outputs fall back to the original user prompt.
     pe_marker: "Revised Prompt:"
     ar:
-      _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
       max_new_tokens: 1024          # headroom for Qwen3 <think> + the revised prompt
@@ -347,7 +348,7 @@ sync:
     _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
     track_prefix: ar            # route to the AR child of the ComposedRolloutEngine
     lora_merged: true           # fold base+(α/r)·B·A → push the merged FULL weights
-    # sglang_llm wants bare HF-native keys (model.layers.*) → leave name_remap unset
+    # sglang wants bare HF-native keys (model.layers.*) → leave name_remap unset
     # (identity), so keys pass through bare. A "transformer." nesting would mis-key
     # the LLM update (suspected cause of the ar_spo TensorWeightSync ~0.2 plateau).
     flush_cache: true

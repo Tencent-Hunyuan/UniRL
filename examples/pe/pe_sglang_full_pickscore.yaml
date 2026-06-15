@@ -1,9 +1,14 @@
 # @package _global_
 # PE (Prompt Enhancement) joint trainer — composed_pe DUAL-ENGINE (sglang), v2.
+# Opt-in clone of pe_sglang_full_pickscore.yaml with the composed engine's AR
+# child on the role-decomposed `sglang` engine. The ONLY difference is the
+# ar child config `_target_` (the composed engine builds the child via
+# config.ar.make_engine); the diffusion child and every field are identical.
+# Parity-gate the composed path, then retire the legacy recipe.
 #
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
-#   - ar:        SGLangLLMRolloutEngine (Qwen3 SRT)   → P*N rewrites
+#   - ar:        SGLangRolloutEngine (Qwen3 SRT)   → P*N rewrites
 #   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # ===========================================================================
 #  AR weight-sync MODE = FULL-MERGE  (full-weight-sync, lora_merged)
@@ -20,7 +25,7 @@
 # Sync runs every ``weight_sync_interval`` rollouts (skip step 0).
 #
 # Pairs with unirl/train_pe.py:
-#   python -m unirl.train_pe --config-name pe/pe_sglang_full_pickscore
+#   python -m unirl.train_pe --config-name pe_sglang_full_pickscore
 #
 # Format mirrors examples/pe/pe_trainside_pickscore.yaml (v2). Set checkpoint paths via
 # the PRETRAINED_MODEL / LLM_MODEL env vars (see ${oc.env:...} defaults below).
@@ -30,7 +35,7 @@
 # resps). Default P=8 on 8 GPUs → 1 prompt/worker × N=2 × M=2.
 # 1-GPU wiring smoke (bypasses the multi-GPU DP merge entirely — dp_size=1 returns
 # the single worker's resp with no cross-worker concat):
-#   python -m unirl.train_pe --config-name pe/pe_sglang_full_pickscore num_devices=1 ++devices_per_node=1 batch_size=2 num_rollouts=3
+#   python -m unirl.train_pe --config-name pe_sglang_full_pickscore num_devices=1 ++devices_per_node=1 batch_size=2 num_rollouts=3
 # Scale toward the v1 e2e (P=8 N=4 M=4) once green.
 #
 # VERIFY at smoke (engine-specific, can't be unit-checked):
@@ -51,6 +56,14 @@ num_rollouts: 300
 # Offload both tracks' FSDP train state to CPU during generate (separate-engine
 # recipe only; trainside leaves it off — it samples the live FSDP modules).
 enable_fsdp_offload: true
+
+# W&B logging (rank-0/driver only); inert unless REPORT_TO_WANDB=true is exported.
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-pe}
+  run_name: ${oc.env:WANDB_RUN_NAME,pe_sglang_full_pickscore}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["pe", "pickscore", "sglang", "full"]
 
 # ── Diffusion side (SD3) — copied from pe_trainside_pickscore.yaml ───────────────────
 diffusion:
@@ -144,7 +157,7 @@ diffusion:
     _target_: unirl.train.stack.TrainStack
     micro_batch_size: 1
     max_grad_norm: 1.0
-    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (GRPO is single-update only)
+    num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (ARGRPO is single-update only)
 
 # ── AR side (Qwen3) — copied from pe_trainside_pickscore.yaml ────────────────────────
 ar:
@@ -175,7 +188,7 @@ ar:
       use_torch_compile: false
     optimizer_cfg:
       _target_: unirl.train.backend.base.OptimizerConfig
-      learning_rate: 5.0e-6      # v1 e2e value (GRPO ratio is update-sensitive)
+      learning_rate: 5.0e-6      # v1 e2e value (ARGRPO ratio is update-sensitive)
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_epsilon: 1.0e-8
@@ -206,7 +219,7 @@ ar:
     micro_batch_size: 1
     max_grad_norm: 1.0
 
-# ── Composed dual-engine rollout: sglang_llm (ar) + sglang (diffusion) ──────
+# ── Composed dual-engine rollout: sglang (ar) + sglang (diffusion) ──────
 rollout:
   _target_: unirl.rollout.engine.composed.engine.ComposedRolloutEngine
   # The diffusion child needs the SD3 model_config (path + shift + LoRA hints);
@@ -219,7 +232,7 @@ rollout:
     _target_: unirl.rollout.engine.composed.config.ComposedRolloutEngineConfig
     sleep_diffusion_on_start: false
     # PE instruction (Siqi recipe). ComposedRolloutEngine
-    # injects this as system_instruction into BOTH the "ar" stage (sglang_llm
+    # injects this as system_instruction into BOTH the "ar" stage (sglang
     # generation) AND the "chat" stage (trainside Qwen3Pipeline replay), so
     # generation and replay see the same prompt (engine.py:206-208).
     pe_instruction: |
@@ -239,12 +252,15 @@ rollout:
     # PE text to diffusion; off-format / empty outputs fall back to the original prompt.
     pe_marker: "Revised Prompt:"
     ar:
-      _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
       max_new_tokens: 512
       temperature: 0.7
       top_p: 0.9
+      # Transport: in-process sglang.Engine (native). Use "http" (separate SRT
+      # server subprocess) only if a native issue needs the HTTP fallback.
+      backend: native
       concurrency: 4
       engine_kwargs:
         mem_fraction_static: 0.25
@@ -273,8 +289,6 @@ rollout:
       # so sglang bounds its DiT-forward / VAE-decode peak memory.
       forward_batch_size: 8
       engine_kwargs:
-        # multimodal_gen sglang has torch_memory_saver on by default → its sleep
-        # already frees; no knob needed here.
         mem_fraction_static: 0
         skip_server_warmup: true
         disable_cuda_graph: true
@@ -346,7 +360,7 @@ sync:
     _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
     track_prefix: ar            # route to the AR child of the ComposedRolloutEngine
     lora_merged: true           # fold base+(α/r)·B·A → push the merged FULL weights
-    # sglang_llm wants bare HF-native keys (model.layers.*) → leave name_remap unset
+    # sglang wants bare HF-native keys (model.layers.*) → leave name_remap unset
     # (identity), so keys pass through bare. A "transformer." nesting would mis-key
     # the LLM update (suspected cause of the ar_spo TensorWeightSync ~0.2 plateau).
     flush_cache: true

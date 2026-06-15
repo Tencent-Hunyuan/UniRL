@@ -3,7 +3,7 @@
 #
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
-#   - ar:        SGLangLLMRolloutEngine (Qwen3 SRT)   → P*N rewrites
+#   - ar:        SGLangRolloutEngine (Qwen3 SRT)   → P*N rewrites
 #   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # ===========================================================================
 #  AR weight-sync MODE = lora-POOL   (set_lora_from_tensors → SGLang LLM pool)
@@ -204,7 +204,7 @@ ar:
     micro_batch_size: 1
     max_grad_norm: 1.0
 
-# ── Composed dual-engine rollout: sglang_llm (ar) + sglang (diffusion) ──────
+# ── Composed dual-engine rollout: sglang (ar) + sglang (diffusion) ──────
 rollout:
   _target_: unirl.rollout.engine.composed.engine.ComposedRolloutEngine
   # The diffusion child needs the SD3 model_config (path + shift + LoRA hints);
@@ -217,7 +217,7 @@ rollout:
     _target_: unirl.rollout.engine.composed.config.ComposedRolloutEngineConfig
     sleep_diffusion_on_start: false
     # PE instruction (Siqi recipe). ComposedRolloutEngine
-    # injects this as system_instruction into BOTH the "ar" stage (sglang_llm
+    # injects this as system_instruction into BOTH the "ar" stage (sglang
     # generation) AND the "chat" stage (trainside Qwen3Pipeline replay), so
     # generation and replay see the same prompt (engine.py:206-208).
     pe_instruction: |
@@ -237,7 +237,8 @@ rollout:
     # PE text to diffusion; off-format / empty outputs fall back to the original prompt.
     pe_marker: "Revised Prompt:"
     ar:
-      _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
       max_new_tokens: 512
