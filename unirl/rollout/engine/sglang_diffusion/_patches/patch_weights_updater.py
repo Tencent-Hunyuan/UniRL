@@ -44,6 +44,8 @@ Idempotent via sentinel guards. Import-safe (sglang imported inside the fn).
 from __future__ import annotations
 
 import gc
+import logging
+import re
 from collections import defaultdict
 from collections.abc import Iterable
 
@@ -51,6 +53,92 @@ import torch
 
 _METHODS_SENTINEL = "_unirl_named_tensor_methods"
 _LWIM_SENTINEL = "_unirl_lora_name_remap"
+
+_log = logging.getLogger(__name__)
+
+
+def _resolve_param_names_mapping(module) -> dict:
+    """Return the model's ``param_names_mapping`` dict, or ``{}``.
+
+    SGLang models that FUSE projections (Z-Image's ``ZImageTransformer2DModel``
+    maps ``to_q/to_k/to_v`` -> ``to_qkv`` and ``feed_forward.w1/w3`` -> ``w13``)
+    carry a class-level ``param_names_mapping`` of
+    ``{regex: (replacement, shard_id, num_shards)}`` (the same dict the checkpoint
+    loader applies). The in-memory named-tensor update path does NOT apply it, so
+    without this the trainer's separate-projection tensors match no fused param and
+    are silently dropped — the bug behind a flat reward curve on fused-attention
+    models like Z-Image.
+    """
+    mapping = getattr(type(module), "param_names_mapping", None)
+    if not isinstance(mapping, dict):
+        mapping = getattr(module, "param_names_mapping", None)
+    return mapping if isinstance(mapping, dict) else {}
+
+
+def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int, num_shards: int) -> None:
+    """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param.
+
+    Prefers the param's SGLang ``weight_loader`` when it accepts a shard id (it
+    derives each shard's offset/size from the layer's ``output_sizes`` and is thus
+    TP- and GQA-correct). The manual fallback splits dim 0 into ``num_shards`` EQUAL
+    slices, so it is correct ONLY for equal-sized shards (q==k==v, w1==w3) — which
+    holds for Z-Image base (MHA: ``num_attention_heads == n_kv_heads``) at
+    ``tp_size=1``, the only fused model reaching it here. A future fused GQA model
+    must go through the ``weight_loader`` path (the equal-split fallback would
+    silently corrupt unequal shards).
+    """
+    wl = getattr(param, "weight_loader", None)
+    if wl is not None:
+        try:
+            wl(param, tensor.to(param.dtype), shard_id)
+            return
+        except Exception:  # pragma: no cover - signature varies; manual fallback below
+            pass
+    data = param.data
+    total = int(data.shape[0])
+    if total % num_shards != 0:
+        raise ValueError(f"fused param dim0={total} not divisible by num_shards={num_shards}")
+    s = total // num_shards
+    data[shard_id * s : (shard_id + 1) * s].copy_(tensor.to(param.dtype))
+
+
+def _apply_fused_param_mapping(module, named_tensors):
+    """Consume separate-projection tensors into their fused params via the model's
+    ``param_names_mapping``; return the leftover ``(name, tensor)`` list for the
+    exact-match loader. No-op when the module declares no mapping.
+    """
+    mapping = _resolve_param_names_mapping(module)
+    if not mapping:
+        return list(named_tensors)
+
+    model_params = dict(module.named_parameters())
+    leftover: list = []
+    fused = 0
+    for name, tensor in named_tensors:
+        if name in model_params:
+            leftover.append((name, tensor))
+            continue
+        handled = False
+        for pat, val in mapping.items():
+            if not isinstance(val, (tuple, list)) or len(val) != 3:
+                continue
+            m = re.match(pat, name)
+            if m is None:
+                continue
+            replacement, shard_id, num_shards = val
+            target = m.expand(replacement)
+            param = model_params.get(target)
+            if param is None:
+                continue
+            _write_fused_shard(param, tensor, int(shard_id), int(num_shards))
+            fused += 1
+            handled = True
+            break
+        if not handled:
+            leftover.append((name, tensor))
+    if fused:
+        _log.info("weight-sync: loaded %d fused shard(s) (e.g. qkv/w13) via param_names_mapping", fused)
+    return leftover
 
 
 def patch_weights_updater() -> None:
@@ -100,11 +188,15 @@ def patch_weights_updater() -> None:
             """Copy weights from weights_iter into model_params in-place."""
             lora_remap = _build_lora_name_remap(model_params)
 
+            _matched = 0
+            _skipped: list[str] = []
             for name, loaded_weight in weights_iter:
                 if name not in model_params:
                     name = lora_remap.get(name, name)
                 if name not in model_params:
+                    _skipped.append(name)
                     continue
+                _matched += 1
                 param = model_params[name]
                 if param.shape != loaded_weight.shape:
                     raise ValueError(f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}")
@@ -117,6 +209,23 @@ def patch_weights_updater() -> None:
                     param._local_tensor.copy_(distributed_weight._local_tensor)
                 else:
                     param.data.copy_(loaded_weight.to(param.dtype))
+
+            # Silent weight-drop is dangerous: a name matching no model param is
+            # skipped above (``continue``), so a sender/receiver naming or fusion
+            # mismatch (diffusers separate ``to_q/to_k/to_v`` vs SGLang's fused
+            # ``to_qkv``) leaves those weights at their loaded base value with NO
+            # error — the rollout silently never sees the trained update. Fused
+            # projections are consumed upstream by ``_apply_fused_param_mapping``;
+            # anything still unmatched here is a real mismatch, surfaced loudly.
+            if _skipped:
+                logger.warning(
+                    "load_weights_into_model: matched=%d SKIPPED=%d unmatched name(s) "
+                    "(not in target module params — naming/fusion mismatch; those "
+                    "weights were NOT updated). Sample: %s",
+                    _matched,
+                    len(_skipped),
+                    _skipped[:10],
+                )
 
         load_weights_into_model._unirl_lora_name_remap = True  # type: ignore[attr-defined]
         wu._build_lora_name_remap = _build_lora_name_remap
@@ -317,6 +426,12 @@ def patch_weights_updater() -> None:
             if not module_tensors:
                 continue
             try:
+                # Fused-projection models (Z-Image: to_q/k/v -> to_qkv,
+                # feed_forward.w1/w3 -> w13) need the model's param_names_mapping
+                # applied so the trainer's separate-projection tensors land in the
+                # right fused shard. Consume those here; the rest fall through to
+                # the exact-match loader below.
+                module_tensors = _apply_fused_param_mapping(module, module_tensors)
                 _load_weights_into_module(module, module_tensors)
                 updated_modules.append(module_name)
             except Exception as e:
