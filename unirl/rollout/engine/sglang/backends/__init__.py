@@ -8,8 +8,8 @@ included. Consumers import from this package, so adding an impl touches no
 engine/adapter/weight-sync code.
 """
 
-from unirl.rollout.engine.sglang_v2.backends.base import Backend, RawResult
-from unirl.rollout.engine.sglang_v2.backends.http import HTTPBackend
-from unirl.rollout.engine.sglang_v2.backends.native import NativeBackend
+from unirl.rollout.engine.sglang.backends.base import Backend, RawResult
+from unirl.rollout.engine.sglang.backends.http import HTTPBackend
+from unirl.rollout.engine.sglang.backends.native import NativeBackend
 
 __all__ = ["Backend", "HTTPBackend", "NativeBackend", "RawResult"]

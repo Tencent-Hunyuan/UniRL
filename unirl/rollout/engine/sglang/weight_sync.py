@@ -31,7 +31,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from unirl.rollout.engine.sglang_v2.backends import Backend
+from unirl.rollout.engine.sglang.backends import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +145,7 @@ class WeightSync:
         self._active_adapter = nickname
         self._lora_loaded = True
         logger.info(
-            "sglang_v2: LoRA adapter %r loaded as %r (%d tensor keys)",
+            "sglang: LoRA adapter %r loaded as %r (%d tensor keys)",
             adapter_name,
             nickname,
             len(lora_tensors),

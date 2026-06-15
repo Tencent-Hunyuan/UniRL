@@ -1,6 +1,6 @@
 """Boot dispatch — ``config.backend`` picks the seam impl, intent flows whole.
 
-A real ``SGLangV2RolloutEngine.__init__`` run with both boots faked (recorder
+A real ``SGLangRolloutEngine.__init__`` run with both boots faked (recorder
 classmethod stand-ins on the engine module's names) and the tokenizer I/O
 stubbed: the default routes to HTTP with its client-side knobs
 (``advertise_host`` / ``health_timeout_s``), ``backend="native"`` routes to the
@@ -17,11 +17,11 @@ import pytest
 import torch
 from conftest import RecordingBackend, StubTokenizer
 
-import unirl.rollout.engine.sglang_v2.engine as engine_mod
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig, SGLangV2Ports
-from unirl.rollout.engine.sglang_v2.engine import SGLangV2RolloutEngine
+import unirl.rollout.engine.sglang.engine as engine_mod
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
+from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
-PORTS = SGLangV2Ports(server_port=30001, nccl_port=30002)
+PORTS = SGLangPorts(server_port=30001, nccl_port=30002)
 
 
 class RecordingBoot:
@@ -54,9 +54,9 @@ def boots(monkeypatch):
 
 def test_default_backend_boots_http(boots):
     http, native = boots
-    config = SGLangV2EngineConfig(pretrained_model_ckpt_path="stub/model")
+    config = SGLangEngineConfig(pretrained_model_ckpt_path="stub/model")
 
-    engine = SGLangV2RolloutEngine(config, device=torch.device("cpu"), ports=PORTS)
+    engine = SGLangRolloutEngine(config, device=torch.device("cpu"), ports=PORTS)
 
     assert len(http.calls) == 1 and native.calls == []
     intent, kwargs = http.calls[0]
@@ -70,13 +70,13 @@ def test_default_backend_boots_http(boots):
 
 def test_native_backend_boots_in_process_engine(boots):
     http, native = boots
-    config = SGLangV2EngineConfig(
+    config = SGLangEngineConfig(
         pretrained_model_ckpt_path="stub/model",
         backend="native",
         engine_kwargs={"concurrency": 3},
     )
 
-    engine = SGLangV2RolloutEngine(config, device=torch.device("cpu"), ports=PORTS)
+    engine = SGLangRolloutEngine(config, device=torch.device("cpu"), ports=PORTS)
 
     assert len(native.calls) == 1 and http.calls == []
     intent, kwargs = native.calls[0]

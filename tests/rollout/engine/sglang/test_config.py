@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig, SGLangV2Ports
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 
 
 def make_config(**kwargs):
     kwargs.setdefault("pretrained_model_ckpt_path", "stub/model")
-    return SGLangV2EngineConfig(**kwargs)
+    return SGLangEngineConfig(**kwargs)
 
 
-PORTS = SGLangV2Ports(server_port=31000, nccl_port=31001)
+PORTS = SGLangPorts(server_port=31000, nccl_port=31001)
 
 
 # ---------------------------------------------------------------------------
@@ -71,20 +71,20 @@ def test_server_intent_host_typed_field():
 
 
 def test_ports_reserve_distinct_in_range():
-    ports = SGLangV2Ports.reserve()
+    ports = SGLangPorts.reserve()
     assert ports.server_port != ports.nccl_port
     assert 1 <= ports.server_port <= 65535
     assert 1 <= ports.nccl_port <= 65535
 
 
 def test_ports_from_ports_round_trip():
-    ports = SGLangV2Ports.from_ports([30001, 30002])
+    ports = SGLangPorts.from_ports([30001, 30002])
     assert (ports.server_port, ports.nccl_port) == (30001, 30002)
 
 
 def test_ports_reject_duplicates():
     with pytest.raises(ValueError, match="distinct"):
-        SGLangV2Ports(server_port=30001, nccl_port=30001)
+        SGLangPorts(server_port=30001, nccl_port=30001)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ def test_ports_reject_duplicates():
 
 def test_validation_errors():
     with pytest.raises(ValueError, match="pretrained_model_ckpt_path"):
-        SGLangV2EngineConfig()
+        SGLangEngineConfig()
     with pytest.raises(ValueError, match="tp_size"):
         make_config(tp_size=0)
     with pytest.raises(ValueError, match="concurrency"):
@@ -132,7 +132,7 @@ def test_model_family_validated_against_registry():
 
 def test_v1_recipe_shaped_config_constructs():
     """The parity-recipe promise: a v1-shaped field set needs no new keys."""
-    cfg = SGLangV2EngineConfig(
+    cfg = SGLangEngineConfig(
         pretrained_model_ckpt_path="Qwen/Qwen3-4B-Base",
         tp_size=1,
         max_new_tokens=8192,

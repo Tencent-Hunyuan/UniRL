@@ -41,7 +41,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from unirl.rollout.engine.sglang_v2.backends.http import parse_generate_response
+from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def payload_to_generate_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     unknown = set(payload) - set(_GENERATE_PASSTHROUGH) - {"text"}
     if unknown:
-        raise ValueError(f"sglang_v2 native backend: unmapped /generate payload keys: {sorted(unknown)}")
+        raise ValueError(f"sglang native backend: unmapped /generate payload keys: {sorted(unknown)}")
     kwargs = {k: payload[k] for k in _GENERATE_PASSTHROUGH if k in payload}
     if "text" in payload:
         kwargs["prompt"] = payload["text"]
@@ -219,7 +219,7 @@ class NativeBackend:
         results = self._run(self._generate_async(requests))
         elapsed = time.perf_counter() - t0
         logger.info(
-            "sglang_v2 NativeBackend.generate: %d requests -> %d results in %.2fs",
+            "sglang NativeBackend.generate: %d requests -> %d results in %.2fs",
             len(requests),
             len(results),
             elapsed,
@@ -235,13 +235,13 @@ class NativeBackend:
                 try:
                     response = await self._engine.async_generate(**kwargs)
                 except Exception as exc:
-                    raise RuntimeError(f"sglang_v2 NativeBackend.generate failed: {exc}") from exc
+                    raise RuntimeError(f"sglang NativeBackend.generate failed: {exc}") from exc
             parsed = parse_generate_response(response)
             if not self._logged_first_response and parsed:
                 self._logged_first_response = True
                 first = parsed[0]
                 logger.info(
-                    "sglang_v2 first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
                     len(first.token_ids),
                     len(first.logprobs),
                     first.text[:200],
@@ -273,7 +273,7 @@ class NativeBackend:
             success = bool(result.success)
             detail = getattr(result, "error_message", None) or getattr(result, "message", "unknown")
         if not success:
-            raise RuntimeError(f"sglang_v2 NativeBackend.{operation} failed: {detail}")
+            raise RuntimeError(f"sglang NativeBackend.{operation} failed: {detail}")
 
     def _require_alive(self, operation: str) -> None:
         if self._engine is None:
@@ -299,7 +299,7 @@ class NativeBackend:
                 return
             time.sleep(1.0)
         raise TimeoutError(
-            f"sglang_v2 NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})"
+            f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})"
         )
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
@@ -392,7 +392,7 @@ class NativeBackend:
         )
         self._check_result(result, "init_weights_group")
         logger.info(
-            "sglang_v2 NativeBackend: NCCL group %r initialized (rank_offset=%d, world_size=%d)",
+            "sglang NativeBackend: NCCL group %r initialized (rank_offset=%d, world_size=%d)",
             group_name,
             rank_offset,
             world_size,
@@ -408,7 +408,7 @@ class NativeBackend:
         flush_cache: bool,
     ) -> None:
         logger.info(
-            "sglang_v2 NativeBackend: update_weights_from_distributed group=%s, %d params, first=%s last=%s, flush=%s",
+            "sglang NativeBackend: update_weights_from_distributed group=%s, %d params, first=%s last=%s, flush=%s",
             group_name,
             len(names),
             names[0] if names else "<empty>",

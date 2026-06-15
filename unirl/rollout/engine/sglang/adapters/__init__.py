@@ -5,7 +5,7 @@ fire the ``@register_adapter`` side-effects); ``config.__post_init__`` validates
 ``model_family`` against :func:`registered_adapters`.
 """
 
-from unirl.rollout.engine.sglang_v2.adapters.base import (
+from unirl.rollout.engine.sglang.adapters.base import (
     MMEncoding,
     ModelAdapter,
     PreparedInputs,
@@ -13,8 +13,8 @@ from unirl.rollout.engine.sglang_v2.adapters.base import (
     register_adapter,
     registered_adapters,
 )
-from unirl.rollout.engine.sglang_v2.adapters.text import TextLMAdapter
-from unirl.rollout.engine.sglang_v2.adapters.vlm import VLMAdapter
+from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
+from unirl.rollout.engine.sglang.adapters.vlm import VLMAdapter
 
 __all__ = [
     "MMEncoding",

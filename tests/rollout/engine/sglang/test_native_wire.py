@@ -21,10 +21,10 @@ def test_native_module_imports_without_sglang():
     assert importlib.util.find_spec("sglang") is None, (
         "this CPU suite assumes sglang is NOT installed — the import-hygiene assertion below would be vacuous otherwise"
     )
-    import unirl.rollout.engine.sglang_v2.backends.native  # noqa: F401
+    import unirl.rollout.engine.sglang.backends.native  # noqa: F401
 
 
-from unirl.rollout.engine.sglang_v2.backends.native import (  # noqa: E402
+from unirl.rollout.engine.sglang.backends.native import (  # noqa: E402
     NativeBackend,
     payload_to_generate_kwargs,
 )

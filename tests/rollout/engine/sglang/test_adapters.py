@@ -13,9 +13,9 @@ import pytest
 import torch
 from conftest import StubProcessor, StubTokenizer, make_raw
 
-from unirl.rollout.engine.sglang_v2.adapters import TextLMAdapter, VLMAdapter
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig
-from unirl.rollout.engine.sglang_v2.utils import resolve_sampling, split_thinking_tags
+from unirl.rollout.engine.sglang.adapters import TextLMAdapter, VLMAdapter
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig
+from unirl.rollout.engine.sglang.utils import resolve_sampling, split_thinking_tags
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import ARSamplingParams
@@ -35,7 +35,7 @@ def make_req(prompts, *, sampling_params=None, stage_config=None, images=None):
 
 
 def make_text_adapter(config=None, tokenizer=None) -> TextLMAdapter:
-    config = config or SGLangV2EngineConfig(pretrained_model_ckpt_path="stub/model")
+    config = config or SGLangEngineConfig(pretrained_model_ckpt_path="stub/model")
     return TextLMAdapter(config, None, tokenizer=tokenizer or StubTokenizer())
 
 
@@ -45,7 +45,7 @@ def make_text_adapter(config=None, tokenizer=None) -> TextLMAdapter:
 
 
 def test_resolve_sampling_typed_ar_wins_over_config_defaults():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", temperature=0.7, top_p=0.9, max_new_tokens=512)
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", temperature=0.7, top_p=0.9, max_new_tokens=512)
     ar = ARSamplingParams(temperature=1.0, top_p=0.95, top_k=20, max_new_tokens=8192)
     sampling = resolve_sampling(cfg, make_req(["a"], sampling_params=ar))
     assert sampling.block["temperature"] == 1.0
@@ -54,7 +54,7 @@ def test_resolve_sampling_typed_ar_wins_over_config_defaults():
 
 
 def test_resolve_sampling_config_defaults_without_ar_params():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", temperature=0.3, top_p=0.8, max_new_tokens=64)
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", temperature=0.3, top_p=0.8, max_new_tokens=64)
     sampling = resolve_sampling(cfg, make_req(["a"]))
     assert sampling.block["temperature"] == 0.3
     assert sampling.block["top_p"] == 0.8
@@ -62,7 +62,7 @@ def test_resolve_sampling_config_defaults_without_ar_params():
 
 
 def test_resolve_sampling_top_k_translation():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m")
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m")
     # Positive top_k passes through.
     ar = ARSamplingParams(top_k=20)
     assert resolve_sampling(cfg, make_req(["a"], sampling_params=ar)).block["top_k"] == 20
@@ -76,10 +76,10 @@ def test_resolve_sampling_top_k_translation():
 def test_resolve_sampling_n_logic():
     ar = ARSamplingParams(samples_per_prompt=8)
     # Pre-expanded: the caller already fanned P -> P*N; emit one per entry.
-    pre = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", samples_pre_expanded=True)
+    pre = SGLangEngineConfig(pretrained_model_ckpt_path="m", samples_pre_expanded=True)
     assert resolve_sampling(pre, make_req(["a"], sampling_params=ar)).n == 1
     # Unexpanded: the engine fans out samples_per_prompt itself.
-    raw = SGLangV2EngineConfig(pretrained_model_ckpt_path="m")
+    raw = SGLangEngineConfig(pretrained_model_ckpt_path="m")
     assert resolve_sampling(raw, make_req(["a"], sampling_params=ar)).n == 8
     # No typed params: stage_config['ar']['n'] then 1.
     assert resolve_sampling(raw, make_req(["a"], stage_config={"ar": {"n": 3}})).n == 3
@@ -87,7 +87,7 @@ def test_resolve_sampling_n_logic():
 
 
 def test_resolve_sampling_stage_config_extras():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", system_instruction="/cfg")
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", system_instruction="/cfg")
     stage = {
         "ar": {
             "return_logprob": False,
@@ -117,7 +117,7 @@ def test_resolve_sampling_stage_config_extras():
 
 def test_build_inputs_chat_template_path():
     tok = StubTokenizer()
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", chat_template_kwargs={"enable_thinking": False})
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", chat_template_kwargs={"enable_thinking": False})
     adapter = make_text_adapter(cfg, tok)
     sampling = resolve_sampling(cfg, make_req(["hi"], stage_config={"ar": {"system_instruction": "/sys"}}))
     prepared = adapter.build_inputs(make_req(["hi"]), sampling=sampling)
@@ -286,7 +286,7 @@ def test_split_thinking_tags_forms():
 
 
 def make_vlm_adapter():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", image_token="<img>")
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", image_token="<img>")
     return VLMAdapter(cfg, None, tokenizer=StubTokenizer(), processor=StubProcessor())
 
 
@@ -295,10 +295,10 @@ def make_vlm_req(prompts):
 
 
 def test_vlm_validate_requires_processor_and_image_token():
-    cfg = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", image_token="<img>")
+    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="m", image_token="<img>")
     with pytest.raises(ValueError, match="AutoProcessor"):
         VLMAdapter(cfg, None, tokenizer=StubTokenizer(), processor=None)
-    cfg_text = SGLangV2EngineConfig(pretrained_model_ckpt_path="m", model_family="vlm")
+    cfg_text = SGLangEngineConfig(pretrained_model_ckpt_path="m", model_family="vlm")
     with pytest.raises(ValueError, match="image_token"):
         VLMAdapter(cfg_text, None, tokenizer=StubTokenizer(), processor=StubProcessor())
 

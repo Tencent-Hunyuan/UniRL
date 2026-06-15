@@ -4,7 +4,7 @@
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
 #   - ar:        SGLangLLMRolloutEngine (Qwen3 SRT)   → P*N rewrites
-#   - diffusion: SGLangRolloutEngine    (SD3 sglang)  → P*N*M images
+#   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # ===========================================================================
 #  AR weight-sync MODE = FULL-MERGE  (full-weight-sync, lora_merged)
 #  Folds base+(α/r)·B·A and pushes the merged FULL weights via TensorWeightSync

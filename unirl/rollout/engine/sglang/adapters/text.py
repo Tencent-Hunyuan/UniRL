@@ -16,13 +16,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
-from unirl.rollout.engine.sglang_v2.adapters.base import (
+from unirl.rollout.engine.sglang.adapters.base import (
     ModelAdapter,
     PreparedInputs,
     register_adapter,
 )
-from unirl.rollout.engine.sglang_v2.backends import RawResult
-from unirl.rollout.engine.sglang_v2.utils import (
+from unirl.rollout.engine.sglang.backends import RawResult
+from unirl.rollout.engine.sglang.utils import (
     ResolvedSampling,
     pack_prompt_condition,
 )

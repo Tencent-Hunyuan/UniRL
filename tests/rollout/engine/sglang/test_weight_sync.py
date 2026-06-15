@@ -12,7 +12,7 @@ import pytest
 import torch
 from conftest import RecordingBackend
 
-from unirl.rollout.engine.sglang_v2.weight_sync import WeightSync
+from unirl.rollout.engine.sglang.weight_sync import WeightSync
 
 
 def make_sync(uses_lora: bool = True):

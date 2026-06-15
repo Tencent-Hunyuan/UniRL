@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from unirl.distributed.group.dispatch import DISTRIBUTED_CONFIG_ATTR, Dispatch
-from unirl.rollout.engine.sglang_v2.engine import SGLangV2RolloutEngine
+from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
 
 @pytest.mark.parametrize(
@@ -24,7 +24,7 @@ from unirl.rollout.engine.sglang_v2.engine import SGLangV2RolloutEngine
     ],
 )
 def test_dispatched_methods_carry_marker_with_mode(method, mode):
-    attr = SGLangV2RolloutEngine.__dict__[method]  # most-derived, not inherited
+    attr = SGLangRolloutEngine.__dict__[method]  # most-derived, not inherited
     config = getattr(attr, DISTRIBUTED_CONFIG_ATTR)
     assert config["dispatch_mode"] is mode
 
@@ -43,7 +43,7 @@ def test_dispatched_methods_carry_marker_with_mode(method, mode):
     ],
 )
 def test_raw_rpc_methods_are_undecorated(method):
-    attr = getattr(SGLangV2RolloutEngine, method)
+    attr = getattr(SGLangRolloutEngine, method)
     assert not hasattr(attr, DISTRIBUTED_CONFIG_ATTR)
 
 
@@ -63,7 +63,7 @@ def test_surface_methods_are_real_class_attributes():
         "destroy_weights_update_group",
         "set_lora_from_tensors",
     ):
-        assert method in dir(SGLangV2RolloutEngine)
+        assert method in dir(SGLangRolloutEngine)
     # update_weights_from_ipc stays the base's NotImplementedError stub —
     # deliberately not overridden (SGLang has no IPC receiver).
-    assert "update_weights_from_ipc" not in SGLangV2RolloutEngine.__dict__
+    assert "update_weights_from_ipc" not in SGLangRolloutEngine.__dict__

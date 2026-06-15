@@ -19,10 +19,10 @@ def test_http_module_imports_without_sglang():
     assert importlib.util.find_spec("sglang") is None, (
         "this CPU suite assumes sglang is NOT installed — the import-hygiene assertion below would be vacuous otherwise"
     )
-    import unirl.rollout.engine.sglang_v2.backends.http  # noqa: F401
+    import unirl.rollout.engine.sglang.backends.http  # noqa: F401
 
 
-from unirl.rollout.engine.sglang_v2.backends.http import (  # noqa: E402
+from unirl.rollout.engine.sglang.backends.http import (  # noqa: E402
     asdict_drop_none,
     parse_generate_response,
 )

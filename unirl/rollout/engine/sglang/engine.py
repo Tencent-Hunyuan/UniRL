@@ -1,4 +1,4 @@
-"""``sglang_v2`` engine core — wiring + delegation only.
+"""``sglang`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete model (the adapter,
 picked from the registry by ``config.model_family``, owns the
@@ -29,42 +29,42 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
-from unirl.rollout.engine.sglang_v2.adapters import get_adapter
-from unirl.rollout.engine.sglang_v2.backends import HTTPBackend, NativeBackend
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig, SGLangV2Ports
-from unirl.rollout.engine.sglang_v2.utils import resolve_sampling
-from unirl.rollout.engine.sglang_v2.weight_sync import WeightSync
+from unirl.rollout.engine.sglang.adapters import get_adapter
+from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
+from unirl.rollout.engine.sglang.utils import resolve_sampling
+from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangV2RolloutEngine(BaseRolloutEngine):
+class SGLangRolloutEngine(BaseRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
-    _component_name = "sglang_v2"
+    _component_name = "sglang"
 
     def __init__(
         self,
-        config: SGLangV2EngineConfig,
+        config: SGLangEngineConfig,
         *,
         device: Optional[torch.device] = None,
         strategy: Any = None,
         rank: Optional[int] = None,
         model_config: Optional[Any] = None,
-        ports: Optional[SGLangV2Ports] = None,
+        ports: Optional[SGLangPorts] = None,
     ) -> None:
         require(
-            isinstance(config, SGLangV2EngineConfig),
-            f"SGLangV2RolloutEngine requires SGLangV2EngineConfig; got {type(config).__name__}",
+            isinstance(config, SGLangEngineConfig),
+            f"SGLangRolloutEngine requires SGLangEngineConfig; got {type(config).__name__}",
         )
         # LLM engine carries its own model path on the config; the diffusion
         # engine takes it from model_config. Log if a caller supplied one so
         # the divergence is visible.
         if model_config is not None:
             logger.debug(
-                "SGLangV2RolloutEngine: model_config provided but ignored — "
+                "SGLangRolloutEngine: model_config provided but ignored — "
                 "LLM engine uses config.pretrained_model_ckpt_path",
             )
         del strategy  # LLM rollout has no SDE strategy
@@ -96,7 +96,7 @@ class SGLangV2RolloutEngine(BaseRolloutEngine):
         self.adapter = get_adapter(config.model_family)(config, model_config, tokenizer=tokenizer, processor=processor)
 
         logger.info(
-            "Initializing sglang_v2 engine (rank=%s, model_family=%s, model=%s, tp=%s)",
+            "Initializing sglang engine (rank=%s, model_family=%s, model=%s, tp=%s)",
             rank,
             config.model_family,
             config.pretrained_model_ckpt_path,
@@ -107,7 +107,7 @@ class SGLangV2RolloutEngine(BaseRolloutEngine):
         # spawn (both backends: nccl_port de-syncs colocated engines). Tests
         # inject a fixed set.
         if ports is None:
-            ports = SGLangV2Ports.reserve()
+            ports = SGLangPorts.reserve()
 
         # Backend (the seam) — booted from the config-spelled intent.
         intent = config.server_intent(ports=ports, extra=self.adapter.boot_kwargs())
@@ -150,7 +150,7 @@ class SGLangV2RolloutEngine(BaseRolloutEngine):
         """Run text generation against the engine and return a typed response."""
         require(
             int(req.batch_size) > 0,
-            "SGLangV2RolloutEngine.generate requires non-empty req (batch_size > 0)",
+            "SGLangRolloutEngine.generate requires non-empty req (batch_size > 0)",
         )
         sampling = resolve_sampling(self.cfg, req)
         prepared = self.adapter.build_inputs(req, sampling=sampling)
@@ -347,4 +347,4 @@ class SGLangV2RolloutEngine(BaseRolloutEngine):
     # NotImplementedError (SGLang has no bucketed-IPC receiver).
 
 
-__all__ = ["SGLangV2RolloutEngine"]
+__all__ = ["SGLangRolloutEngine"]

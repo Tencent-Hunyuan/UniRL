@@ -1,7 +1,7 @@
 # @package _global_
 # SD3 v2 trainer — LoRA training, MERGED full-weight sync via tensor-payload (COLOCATE).
 # SGLang twin of sd3_vllmomni_full_tensor.yaml: identical train side + sync, the
-# only swap is the rollout engine (SGLangRolloutEngine instead of vLLM-Omni).
+# only swap is the rollout engine (SGLangDiffusionRolloutEngine instead of vLLM-Omni).
 #   - LoRA training (lora_cfg kept), pushed as a MERGED full model each sync —
 #     sync.lora_merged: true folds the LoRA delta into the base weights, so the
 #     rollout engine runs the merged model with no separate adapter.

@@ -4,7 +4,7 @@
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
 #   - ar:        SGLangLLMRolloutEngine (Qwen3 SRT)   → P*N rewrites
-#   - diffusion: SGLangRolloutEngine    (SD3 sglang)  → P*N*M images
+#   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # Trained weights reach each engine via a per-track sync bridge, routed to the
 # matching child of the composed engine by ``track_prefix``:
 #   - diffusion: LocalLoraWeightSync           → set_lora_from_tensors (SD3 sglang LoRA pool)

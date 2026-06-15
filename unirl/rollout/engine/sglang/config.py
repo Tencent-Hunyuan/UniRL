@@ -1,8 +1,8 @@
-"""``sglang_v2`` engine config — wired by ``_target_`` (like every engine config).
+"""``sglang`` engine config — wired by ``_target_`` (like every engine config).
 
 Ported from ``SGLangLLMEngineConfig`` field-for-field (parity recipes are pure
 clones — only the two rollout ``_target_`` lines change) minus all port math:
-the engine reserves its own :class:`SGLangV2Ports` at boot, so there is no
+the engine reserves its own :class:`SGLangPorts` at boot, so there is no
 ``find_free_port`` here and the ``port`` field survives only for config-shape
 parity. ``model_family`` selects the adapter and defaults from the predecessor's
 own VLM switch (``image_token``), so v1-shaped recipes need no new key.
@@ -23,7 +23,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 
 
 @dataclass(frozen=True)
-class SGLangV2Ports(ReservedPorts):
+class SGLangPorts(ReservedPorts):
     """The ports one SRT server spawn consumes.
 
     - ``server_port`` — the HTTP bind (``ServerArgs.port``).
@@ -41,13 +41,13 @@ class SGLangV2Ports(ReservedPorts):
 
 
 @dataclass
-class SGLangV2EngineConfig(BaseEngineConfig):
-    """Configuration for the ``sglang_v2`` rollout engine."""
+class SGLangEngineConfig(BaseEngineConfig):
+    """Configuration for the ``sglang`` rollout engine."""
 
     def make_engine(self, **deps: Any):
-        from unirl.rollout.engine.sglang_v2.engine import SGLangV2RolloutEngine
+        from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
-        return SGLangV2RolloutEngine(config=self, **deps)
+        return SGLangRolloutEngine(config=self, **deps)
 
     # --- Model ---
     pretrained_model_ckpt_path: str = ""
@@ -62,7 +62,7 @@ class SGLangV2EngineConfig(BaseEngineConfig):
     # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
     # cross-node connections). ``port`` is kept for config-shape parity with
     # the predecessor; the engine self-reserves its ports — inject a typed
-    # ``SGLangV2Ports`` (tests) instead of pinning this field.
+    # ``SGLangPorts`` (tests) instead of pinning this field.
     host: Optional[str] = None
     port: Optional[int] = None
 
@@ -115,33 +115,33 @@ class SGLangV2EngineConfig(BaseEngineConfig):
             self.engine_kwargs = {}
         require(
             bool(self.pretrained_model_ckpt_path),
-            "SGLangV2EngineConfig.pretrained_model_ckpt_path must be set",
+            "SGLangEngineConfig.pretrained_model_ckpt_path must be set",
         )
         require(
             self.tp_size is None or self.tp_size >= 1,
-            f"SGLangV2EngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
+            f"SGLangEngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
         )
         require(
             self.concurrency >= 1,
-            f"SGLangV2EngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
+            f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
         require(
             self.max_new_tokens >= 1,
-            f"SGLangV2EngineConfig.max_new_tokens must be >= 1; got {self.max_new_tokens!r}",
+            f"SGLangEngineConfig.max_new_tokens must be >= 1; got {self.max_new_tokens!r}",
         )
         require(
             self.temperature > 0,
-            f"SGLangV2EngineConfig.temperature must be > 0; got {self.temperature!r}",
+            f"SGLangEngineConfig.temperature must be > 0; got {self.temperature!r}",
         )
         require(
             0.0 < self.top_p <= 1.0,
-            f"SGLangV2EngineConfig.top_p must be in (0, 1]; got {self.top_p!r}",
+            f"SGLangEngineConfig.top_p must be in (0, 1]; got {self.top_p!r}",
         )
 
         self.backend = str(self.backend).strip().lower()
         require(
             self.backend in ("http", "native"),
-            f"SGLangV2EngineConfig.backend must be 'http' or 'native'; got {self.backend!r}",
+            f"SGLangEngineConfig.backend must be 'http' or 'native'; got {self.backend!r}",
         )
 
         # Adapter selection: derive from the predecessor's VLM switch when not
@@ -150,12 +150,12 @@ class SGLangV2EngineConfig(BaseEngineConfig):
         if self.model_family is None:
             self.model_family = "vlm" if self.image_token is not None else "text"
         self.model_family = str(self.model_family).strip().lower()
-        from unirl.rollout.engine.sglang_v2.adapters import registered_adapters
+        from unirl.rollout.engine.sglang.adapters import registered_adapters
 
         valid_families = registered_adapters()
         require(
             self.model_family in valid_families,
-            f"SGLangV2EngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
+            f"SGLangEngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
         )
 
     # ------------------------------------------------------------------
@@ -165,7 +165,7 @@ class SGLangV2EngineConfig(BaseEngineConfig):
     def server_intent(
         self,
         *,
-        ports: SGLangV2Ports,
+        ports: SGLangPorts,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Spell this config (+ the reserved ports) as ServerArgs intent.
@@ -205,4 +205,4 @@ class SGLangV2EngineConfig(BaseEngineConfig):
         return intent
 
 
-__all__ = ["SGLangV2EngineConfig", "SGLangV2Ports"]
+__all__ = ["SGLangEngineConfig", "SGLangPorts"]

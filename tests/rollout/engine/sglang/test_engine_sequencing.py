@@ -1,6 +1,6 @@
 """Bare-engine sequencing — the logic the core actually owns.
 
-A real ``SGLangV2RolloutEngine`` instance built without ``__init__`` (no server
+A real ``SGLangRolloutEngine`` instance built without ``__init__`` (no server
 spawn), seam + components wired by hand: the staged sleep/wake two-flag
 machine (flush ordering, the weights-released event, the post-sync re-offload
 path), ``onload_weights`` idempotence, and generate's ``lora_path`` stamping +
@@ -12,18 +12,18 @@ from __future__ import annotations
 import torch
 from conftest import RecordingBackend, StubTokenizer, make_raw
 
-from unirl.rollout.engine.sglang_v2.adapters import TextLMAdapter
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig
-from unirl.rollout.engine.sglang_v2.engine import SGLangV2RolloutEngine
-from unirl.rollout.engine.sglang_v2.weight_sync import WeightSync
+from unirl.rollout.engine.sglang.adapters import TextLMAdapter
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig
+from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
+from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 
 
 def make_bare_engine(*, generate_results=None, uses_lora=True):
     """A real engine instance with the seam faked — no ctor, no server."""
-    engine = object.__new__(SGLangV2RolloutEngine)
-    config = SGLangV2EngineConfig(pretrained_model_ckpt_path="stub/model")
+    engine = object.__new__(SGLangRolloutEngine)
+    config = SGLangEngineConfig(pretrained_model_ckpt_path="stub/model")
     backend = RecordingBackend(generate_results=generate_results)
     engine.cfg = config
     engine.rank = 0

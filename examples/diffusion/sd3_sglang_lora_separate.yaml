@@ -1,7 +1,7 @@
 # @package _global_
 # SD3 v2 trainer — LoRA training, LoRA-ADAPTER sync via Ray RPC (SEPARATE slabs).
 # SGLang twin of sd3_vllmomni_lora_separate.yaml: identical train side + sync,
-# the only swap is the rollout engine (SGLangRolloutEngine instead of vLLM-Omni).
+# the only swap is the rollout engine (SGLangDiffusionRolloutEngine instead of vLLM-Omni).
 #   - layout: separate — train on `train_fraction` of the pool, rollout on the rest.
 #   - LoRA training (lora_cfg kept), pushed as the bare ADAPTER each sync
 #     (RemoteLoraWeightSync ships lora_A/lora_B to set_lora_from_tensors).

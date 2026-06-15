@@ -322,7 +322,7 @@ class HTTPBackend:
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
         if self._client is None:
-            raise RuntimeError("httpx is required for sglang_v2 generate. Install httpx: pip install httpx")
+            raise RuntimeError("httpx is required for sglang generate. Install httpx: pip install httpx")
         t0 = time.perf_counter()
         loop = asyncio.new_event_loop()
         try:
@@ -331,7 +331,7 @@ class HTTPBackend:
             loop.close()
         elapsed = time.perf_counter() - t0
         logger.info(
-            "sglang_v2 HTTPBackend.generate: %d requests -> %d results in %.2fs",
+            "sglang HTTPBackend.generate: %d requests -> %d results in %.2fs",
             len(requests),
             len(results),
             elapsed,
@@ -349,7 +349,7 @@ class HTTPBackend:
                 self._logged_first_response = True
                 first = parsed[0]
                 logger.info(
-                    "sglang_v2 first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
                     len(first.token_ids),
                     len(first.logprobs),
                     first.text[:200],
@@ -439,7 +439,7 @@ class HTTPBackend:
         if isinstance(response, dict):
             if not response.get("success", True):
                 detail = response.get("error_message") or response.get("message", "unknown")
-                raise RuntimeError(f"sglang_v2 HTTPBackend.{operation} failed: {detail}")
+                raise RuntimeError(f"sglang HTTPBackend.{operation} failed: {detail}")
 
     def _require_alive(self, operation: str) -> None:
         if self._server_process is None or not self._server_process.is_alive():
@@ -469,7 +469,7 @@ class HTTPBackend:
                 last_err = exc
             time.sleep(1.0)
         raise TimeoutError(
-            f"sglang_v2 HTTPBackend: /flush_cache did not return 200 after 60 attempts (last error: {last_err})"
+            f"sglang HTTPBackend: /flush_cache did not return 200 after 60 attempts (last error: {last_err})"
         )
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
@@ -559,7 +559,7 @@ class HTTPBackend:
             "init_weights_group",
         )
         logger.info(
-            "sglang_v2 HTTPBackend: NCCL group %r initialized (rank_offset=%d, world_size=%d)",
+            "sglang HTTPBackend: NCCL group %r initialized (rank_offset=%d, world_size=%d)",
             group_name,
             rank_offset,
             world_size,
@@ -575,7 +575,7 @@ class HTTPBackend:
         flush_cache: bool,
     ) -> None:
         logger.info(
-            "sglang_v2 HTTPBackend: update_weights_from_distributed group=%s, %d params, first=%s last=%s, flush=%s",
+            "sglang HTTPBackend: update_weights_from_distributed group=%s, %d params, first=%s last=%s, flush=%s",
             group_name,
             len(names),
             names[0] if names else "<empty>",

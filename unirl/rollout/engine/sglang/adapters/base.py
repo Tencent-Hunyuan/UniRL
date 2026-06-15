@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from unirl.config.require import require
-from unirl.rollout.engine.sglang_v2.backends import RawResult
-from unirl.rollout.engine.sglang_v2.utils import ResolvedSampling
+from unirl.rollout.engine.sglang.backends import RawResult
+from unirl.rollout.engine.sglang.utils import ResolvedSampling
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
 

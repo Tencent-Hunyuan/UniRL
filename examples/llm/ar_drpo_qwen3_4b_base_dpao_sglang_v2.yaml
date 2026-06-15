@@ -1,7 +1,7 @@
 # @package _global_
 # AR DRPO Qwen3-4B-Base on DAPO-Math — v2 trainer (VLMTrainer), SGLang rollout, 64 GPU.
 # Opt-in clone of ar_drpo_qwen3_4b_base_dpao_sglang.yaml onto the role-decomposed
-# `sglang_v2` engine. The ONLY differences are the two rollout `_target_`s
+# `sglang` engine. The ONLY differences are the two rollout `_target_`s
 # (engine + config class); every config field is identical because the v2 config
 # preserves the same field names. Ports are engine-reserved (no port fields).
 # Use this to parity-gate v2 against the legacy `sglang_llm` engine, then
@@ -26,7 +26,7 @@
 # Run (64 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
 # to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_vlm --config-name=llm/ar_drpo_qwen3_4b_base_dpao_sglang_v2 num_devices=64
+#   python -m unirl.train_vlm --config-name=llm/ar_drpo_qwen3_4b_base_dpao_sglang num_devices=64
 
 num_devices: 64
 batch_size: 64 # prompts_per_rollout
@@ -105,9 +105,9 @@ backend:
 rollout:
   # SGLang LLM engine, colocate (time-shares each GPU with the FSDP train shard
   # via sleep()/wake_up()). tp_size=1 → one single-GPU engine per rank.
-  _target_: unirl.rollout.engine.sglang_v2.engine.SGLangV2RolloutEngine
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang_v2.config.SGLangV2EngineConfig
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
     max_new_tokens: 8192

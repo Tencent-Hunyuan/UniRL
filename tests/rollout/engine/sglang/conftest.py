@@ -1,4 +1,4 @@
-"""Shared CPU fakes for the ``sglang_v2`` suite — no sglang, no GPU, no network.
+"""Shared CPU fakes for the ``sglang`` suite — no sglang, no GPU, no network.
 
 ``RawResult`` is a structural protocol, so canned results are
 ``SimpleNamespace``s; the tokenizer/processor are injected at adapter
@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from unirl.rollout.engine.sglang_v2.config import SGLangV2EngineConfig
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig
 
 
 def make_raw(
@@ -134,8 +134,8 @@ class RecordingBackend:
 
 
 @pytest.fixture
-def text_config() -> SGLangV2EngineConfig:
-    return SGLangV2EngineConfig(pretrained_model_ckpt_path="stub/model")
+def text_config() -> SGLangEngineConfig:
+    return SGLangEngineConfig(pretrained_model_ckpt_path="stub/model")
 
 
 @pytest.fixture

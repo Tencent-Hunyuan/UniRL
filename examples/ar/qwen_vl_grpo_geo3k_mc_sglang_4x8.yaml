@@ -33,7 +33,7 @@ adv_normalization_scope: global
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac
-  run_name: qwen_vl_grpo_sglang_v2_4x8
+  run_name: qwen_vl_grpo_sglang_4x8
   entity: ${oc.env:WANDB_ENTITY,null}
   tags: [grpo, qwen-vl, geo3k-mc, sglang, rollout, colocate, 4x8]
 

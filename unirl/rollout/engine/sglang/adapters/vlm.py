@@ -14,14 +14,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
-from unirl.rollout.engine.sglang_v2.adapters.base import (
+from unirl.rollout.engine.sglang.adapters.base import (
     MMEncoding,
     PreparedInputs,
     register_adapter,
 )
-from unirl.rollout.engine.sglang_v2.adapters.text import TextLMAdapter
-from unirl.rollout.engine.sglang_v2.backends import RawResult
-from unirl.rollout.engine.sglang_v2.utils import ResolvedSampling, pil_to_base64
+from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
+from unirl.rollout.engine.sglang.backends import RawResult
+from unirl.rollout.engine.sglang.utils import ResolvedSampling, pil_to_base64
 from unirl.types.primitives import Image, Images
 from unirl.types.rollout_req import RolloutReq
 

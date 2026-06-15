@@ -1,15 +1,15 @@
 # @package _global_
 # PE (Prompt Enhancement) joint trainer — composed_pe DUAL-ENGINE (sglang), v2.
 # Opt-in clone of pe_sglang_full_pickscore.yaml with the composed engine's AR
-# child on the role-decomposed `sglang_v2` engine. The ONLY difference is the
+# child on the role-decomposed `sglang` engine. The ONLY difference is the
 # ar child config `_target_` (the composed engine builds the child via
 # config.ar.make_engine); the diffusion child and every field are identical.
 # Parity-gate the composed path, then retire the legacy recipe.
 #
 # Same two-track PE recipe as pe_trainside_pickscore.yaml, but the rollout is a
 # ComposedRolloutEngine driving TWO separate-process SGLang engines:
-#   - ar:        SGLangV2RolloutEngine (Qwen3 SRT)   → P*N rewrites
-#   - diffusion: SGLangRolloutEngine    (SD3 sglang)  → P*N*M images
+#   - ar:        SGLangRolloutEngine (Qwen3 SRT)   → P*N rewrites
+#   - diffusion: SGLangDiffusionRolloutEngine    (SD3 sglang)  → P*N*M images
 # ===========================================================================
 #  AR weight-sync MODE = FULL-MERGE  (full-weight-sync, lora_merged)
 #  Folds base+(α/r)·B·A and pushes the merged FULL weights via TensorWeightSync
@@ -61,9 +61,9 @@ enable_fsdp_offload: true
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
   project_name: ${oc.env:WANDB_PROJECT,unirl-pe}
-  run_name: ${oc.env:WANDB_RUN_NAME,pe_sglang_v2_full_pickscore}
+  run_name: ${oc.env:WANDB_RUN_NAME,pe_sglang_full_pickscore}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: ["pe", "pickscore", "sglang_v2", "full"]
+  tags: ["pe", "pickscore", "sglang", "full"]
 
 # ── Diffusion side (SD3) — copied from pe_trainside_pickscore.yaml ───────────────────
 diffusion:
@@ -219,7 +219,7 @@ ar:
     micro_batch_size: 1
     max_grad_norm: 1.0
 
-# ── Composed dual-engine rollout: sglang_v2 (ar) + sglang (diffusion) ──────
+# ── Composed dual-engine rollout: sglang (ar) + sglang (diffusion) ──────
 rollout:
   _target_: unirl.rollout.engine.composed.engine.ComposedRolloutEngine
   # The diffusion child needs the SD3 model_config (path + shift + LoRA hints);
@@ -232,7 +232,7 @@ rollout:
     _target_: unirl.rollout.engine.composed.config.ComposedRolloutEngineConfig
     sleep_diffusion_on_start: false
     # PE instruction (Siqi recipe). ComposedRolloutEngine
-    # injects this as system_instruction into BOTH the "ar" stage (sglang_v2
+    # injects this as system_instruction into BOTH the "ar" stage (sglang
     # generation) AND the "chat" stage (trainside Qwen3Pipeline replay), so
     # generation and replay see the same prompt (engine.py:206-208).
     pe_instruction: |
@@ -252,7 +252,7 @@ rollout:
     # PE text to diffusion; off-format / empty outputs fall back to the original prompt.
     pe_marker: "Revised Prompt:"
     ar:
-      _target_: unirl.rollout.engine.sglang_v2.config.SGLangV2EngineConfig
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
       max_new_tokens: 512
@@ -260,7 +260,7 @@ rollout:
       top_p: 0.9
       # Transport: "http" (SRT server subprocess, default) or "native"
       # (in-process sglang.Engine). Env-driven so one recipe serves both.
-      backend: ${oc.env:SGLANG_V2_BACKEND,http}
+      backend: ${oc.env:SGLANG_BACKEND,http}
       concurrency: 4
       engine_kwargs:
         mem_fraction_static: 0.25
@@ -279,7 +279,7 @@ rollout:
         # max_lora_rank: 16
         # lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     diffusion:
-      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
       model_family: sd3
       tp_size: 1
       local_mode: true
@@ -360,7 +360,7 @@ sync:
     _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
     track_prefix: ar            # route to the AR child of the ComposedRolloutEngine
     lora_merged: true           # fold base+(α/r)·B·A → push the merged FULL weights
-    # sglang_v2 wants bare HF-native keys (model.layers.*) → leave name_remap unset
+    # sglang wants bare HF-native keys (model.layers.*) → leave name_remap unset
     # (identity), so keys pass through bare. A "transformer." nesting would mis-key
     # the LLM update (suspected cause of the ar_spo TensorWeightSync ~0.2 plateau).
     flush_cache: true

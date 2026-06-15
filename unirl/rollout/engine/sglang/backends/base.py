@@ -1,6 +1,6 @@
 """The backend seam contract — the ``Backend`` protocol + the wire types.
 
-Every ``sglang_v2`` collaborator reaches the SGLang SRT runtime through this
+Every ``sglang`` collaborator reaches the SGLang SRT runtime through this
 protocol; the real implementation lives beside it (``http.py`` — SRT server
 subprocess + HTTP). This module holds no runtime code at all, so it is trivially
 CPU-importable.
@@ -63,7 +63,7 @@ class RawResult(Protocol):
 
 @runtime_checkable
 class Backend(Protocol):
-    """The seam every ``sglang_v2`` collaborator reaches the runtime through."""
+    """The seam every ``sglang`` collaborator reaches the runtime through."""
 
     # generation
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
