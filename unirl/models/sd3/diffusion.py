@@ -407,6 +407,118 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         )
 
     # ------------------------------------------------------------------
+    # DRaFT-K grad sampling (ReFL / direct reward backprop)
+    # ------------------------------------------------------------------
+
+    def diffuse_draft_k(
+        self,
+        conditions: SD3Conditions,
+        *,
+        schedule: torch.Tensor,
+        params: DiffusionSamplingParams,
+        draft_num_steps: int = 0,
+        initial_latents: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Deterministic (ODE, eta=0) sampling with gradients through only the
+        final ``draft_num_steps`` steps (DRaFT-K); returns the live clean latent
+        ``x_0`` (``[B, C, H, W]``) carrying grad_fn into the transformer params.
+
+        ``draft_num_steps <= 0`` keeps gradients through ALL steps; ``K>0`` runs
+        the first ``T-K`` steps under ``torch.no_grad()`` (detached) and only the
+        last ``K`` carry grad. Unlike :meth:`diffuse`, no trajectory is stored and
+        no log-probs are computed — the reward backprops straight through ``x_0``.
+        Caller owns ``.train()`` mode + the outer grad scope (mirrors ``replay``).
+        """
+        from unirl.sde.noise import generate_latents
+
+        if conditions.text is None or conditions.text.embeds is None:
+            raise ValueError("SD3DiffusionStage.diffuse_draft_k: conditions.text.embeds is None")
+        prompt_embeds = conditions.text.embeds
+        device = prompt_embeds.device
+        batch_size = int(prompt_embeds.shape[0])
+        T = int(params.num_inference_steps)
+        if int(schedule.shape[0]) != T + 1:
+            raise ValueError(
+                f"SD3DiffusionStage.diffuse_draft_k: schedule length {schedule.shape[0]} != T+1={T + 1}"
+            )
+        schedule = schedule.to(device)
+        self.strategy.init_schedule(schedule)
+
+        latent_h = int(params.height) // int(self.vae_scale_factor)
+        latent_w = int(params.width) // int(self.vae_scale_factor)
+        expected_latent_shape = (int(self.latent_channels), latent_h, latent_w)
+        if initial_latents is not None:
+            if tuple(initial_latents.shape) != (batch_size, *expected_latent_shape):
+                raise ValueError(
+                    f"SD3DiffusionStage.diffuse_draft_k: initial_latents.shape={tuple(initial_latents.shape)} "
+                    f"!= {(batch_size, *expected_latent_shape)}"
+                )
+            latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
+        else:
+            latents = generate_latents(
+                batch_size=batch_size,
+                latent_shape=expected_latent_shape,
+                device=device,
+                dtype=self.trajectory_dtype,
+                init_same_noise=bool(params.init_same_noise),
+                samples_per_prompt=int(params.samples_per_prompt),
+                noise_group_ids=params.noise_group_ids,
+                base_seed=int(params.seed),
+            )
+
+        # cache_enabled=False: PEFT fp32 LoRA adapters lose parameter grads under
+        # autocast's weight cache on the differentiable pass (see train_reward_dpgo.py).
+        autocast_ctx = (
+            torch.autocast("cuda", self.autocast_dtype, cache_enabled=False)
+            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
+
+        # K<=0 → grad through all steps; K>0 → grad only through the final K.
+        grad_start_index = max(0, T - draft_num_steps) if draft_num_steps > 0 else 0
+
+        for i in range(T):
+            sigma = schedule[i].to(device)
+            sigma_next = schedule[i + 1].to(device)
+            if i < grad_start_index:
+                # Frozen prefix: deterministic, no autograd graph retained.
+                with torch.no_grad(), autocast_ctx:
+                    new_latents, _, _ = self.step.step_with_logp(
+                        self.model,
+                        conditions,
+                        strategy=self.strategy,
+                        sample=latents,
+                        sigma=sigma,
+                        sigma_next=sigma_next,
+                        guidance_scale=float(params.guidance_scale),
+                        eta=0.0,
+                        sigma_max=sigma_max,
+                        step_index=i,
+                    )
+                latents = new_latents.detach()
+            else:
+                # Grad window: backprop flows through these transformer forwards.
+                if draft_num_steps > 0 and i == grad_start_index:
+                    latents = latents.detach().requires_grad_(True)
+                with autocast_ctx:
+                    new_latents, _, _ = self.step.step_with_logp(
+                        self.model,
+                        conditions,
+                        strategy=self.strategy,
+                        sample=latents,
+                        sigma=sigma,
+                        sigma_next=sigma_next,
+                        guidance_scale=float(params.guidance_scale),
+                        eta=0.0,
+                        sigma_max=sigma_max,
+                        step_index=i,
+                    )
+                latents = new_latents
+
+        return latents
+
+    # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
 
