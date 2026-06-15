@@ -11,12 +11,14 @@ Launch (single node):
   DATA_PATH=/path/to/train.jsonl \
   python -m unirl.train_async_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang_async num_devices=4
 
-Two extra config knobs vs the colocate recipe:
+Extra config knobs vs the colocate recipe:
   * ``train_fraction`` — share of GPUs for the train slab (rollout gets the rest).
     Constraint: ``train_fraction * num_devices`` and ``(1-train_fraction) * num_devices``
     must both be integers, AND ``batch_size * samples_per_prompt`` must be divisible
     by each slab size (DP_SCATTER divisibility).
-  * ``rollout_mode`` — ``"pipeline"`` (one-step overlap) or ``"buffer"`` (continuous).
+  * ``max_inflight`` — concurrent generations (overlap depth). ``1`` ≈ one-step pipeline.
+  * ``buffer_max_staleness`` — weight-syncs a buffered group may cross. ``0``/unset =
+    on-policy (``ratio≈1``); ``>0`` = off-policy continuous buffer.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ def main(cfg: DictConfig) -> None:
         eval_samples_per_prompt=int(cfg.get("eval_samples_per_prompt", 16)),
         eval_temperature=float(cfg.get("eval_temperature", 1.0)),
         train_fraction=float(cfg.get("train_fraction", 0.5)),
-        rollout_mode=str(cfg.get("rollout_mode", "pipeline")),
+        max_inflight=int(cfg.get("max_inflight", 1)),
         buffer_max_staleness=cfg.get("buffer_max_staleness"),
     )
     trainer.train(
