@@ -36,17 +36,17 @@ def main(cfg: DictConfig) -> None:
         sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
         layout=cfg.get("layout", "colocate"),
-        train_fraction=float(cfg.get("train_fraction", 0.5)),
+        train_fraction=cfg.get("train_fraction", 0.5),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
     )
     trainer.train(
-        num_rollouts=int(cfg.get("num_rollouts", 100)),
-        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
-        save_interval=int(cfg.get("save_interval", 0)),
+        num_rollouts=cfg.get("num_rollouts", 100),
+        weight_sync_interval=cfg.get("weight_sync_interval", 1),
+        save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),
-        save_mode=str(cfg.get("save_mode", "full")),
+        save_mode=cfg.get("save_mode", "auto"),
     )
 
 

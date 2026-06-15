@@ -18,13 +18,13 @@ the record).
 
 Examples:
     # SD3.5 LoRA run, diffusers transformer subfolder
-    python -m unirl.tools.export_hf \\
+    python -m unirl.tools.export_full \\
         --checkpoint /ckpts/sd3_trainside/checkpoint-500 \\
         --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \\
         --output /ckpts/sd3_trainside/hf-500
 
     # AR (transformers CausalLM)
-    python -m unirl.tools.export_hf \\
+    python -m unirl.tools.export_full \\
         --checkpoint /ckpts/qwen3/checkpoint-300 --library transformers \\
         --base Qwen/Qwen3-4B-Base --output /ckpts/qwen3/hf-300
 

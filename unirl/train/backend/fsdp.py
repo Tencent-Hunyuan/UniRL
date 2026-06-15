@@ -36,6 +36,7 @@ from unirl.train.fsdp_utils import (
     clip_grad_norm,
     fsdp_offload,
     fsdp_onload,
+    gather_lora_state_dict,
     gather_optimizer_state_dict,
     gather_state_dict,
     load_model_state_dict,
@@ -175,9 +176,12 @@ class FSDPBackend(Remote):
         active_lora = lora_cfg or ema_lora_cfg
         self._lora_meta: Optional[Dict[str, object]] = (
             {
-                "rank": int(active_lora.rank),
-                "alpha": int(active_lora.alpha),
-                "target_modules": list(active_lora.target_modules),
+                "rank": active_lora.rank,
+                "alpha": active_lora.alpha,
+                "target_modules": active_lora.target_modules,
+                "dropout": active_lora.dropout,
+                "bias": active_lora.bias,
+                "task_type": active_lora.task_type,
             }
             if active_lora is not None
             else None
@@ -320,20 +324,21 @@ class FSDPBackend(Remote):
         """Gather state (collective on every rank); write ``path/checkpoint.pt`` on dist rank 0.
 
         ``step`` is the trainer's rollout step — :meth:`load` returns it so
-        the loop resumes where it stopped. ``mode="adapter"`` keeps only the
-        LoRA keys in the model state (MBs instead of GBs; the frozen base
-        reloads from the pretrained snapshot on resume). The optimizer state
-        is identical under both modes — it only ever covers the trainable
-        (LoRA) params.
+        the loop resumes where it stopped. ``mode="adapter"`` gathers only the
+        LoRA keys in the model state (MBs instead of GBs; the frozen base reloads
+        from the pretrained snapshot on resume). ``mode="auto"`` selects
+        adapter mode when LoRA is present, otherwise full. The optimizer state is
+        identical under all modes — it only ever covers trainable params.
         """
-        if mode not in ("full", "adapter"):
-            raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'full' or 'adapter')")
+        mode = self._resolve_save_mode(mode)
         if mode == "adapter" and not any("lora_" in name for name, _ in self.model.named_parameters()):
             raise RuntimeError("FSDPBackend.save: mode='adapter' but the model has no LoRA params")
-        self._reject_meta_params("save")
-        policy_state = gather_state_dict(self.model)
         if mode == "adapter":
-            policy_state = {k: v for k, v in policy_state.items() if "lora_A" in k or "lora_B" in k}
+            self._reject_lora_meta_params("save")
+            policy_state = gather_lora_state_dict(self.model)
+        else:
+            self._reject_meta_params("save")
+            policy_state = gather_state_dict(self.model)
         state: Dict[str, object] = {
             "policy_state_dict": policy_state,
             "optimizer_state_dict": gather_optimizer_state_dict(self.model, self.optimizer),
@@ -362,7 +367,6 @@ class FSDPBackend(Remote):
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
-        self._reject_meta_params("load")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
         # Agree on visibility BEFORE the collectives: on multi-node, a rank
         # whose node does not mount the checkpoint path would raise alone and
@@ -382,6 +386,10 @@ class FSDPBackend(Remote):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
         strict = checkpoint.get("save_mode", "full") == "full"
+        if strict:
+            self._reject_meta_params("load")
+        else:
+            self._reject_lora_meta_params("load")
         load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
         load_optimizer_state_dict(self.model, self.optimizer, checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
@@ -389,6 +397,13 @@ class FSDPBackend(Remote):
         if checkpoint.get("optimizer_step_count") is not None:
             self._optimizer_step_count = int(checkpoint["optimizer_step_count"])
         return int(checkpoint.get("step") or 0)
+
+    def _resolve_save_mode(self, mode: str) -> str:
+        if mode == "auto":
+            return "adapter" if self._lora_meta is not None else "full"
+        if mode not in ("full", "adapter"):
+            raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'auto', 'full' or 'adapter')")
+        return mode
 
     def _reject_meta_params(self, op: str) -> None:
         """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).
@@ -402,6 +417,18 @@ class FSDPBackend(Remote):
             raise RuntimeError(
                 f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
                 "full-state-dict checkpointing of meta-init bundles is not supported yet."
+            )
+
+    def _reject_lora_meta_params(self, op: str) -> None:
+        meta = [
+            name
+            for name, param in self.model.named_parameters()
+            if param.is_meta and ("lora_A" in name or "lora_B" in name)
+        ]
+        if meta:
+            raise RuntimeError(
+                f"FSDPBackend.{op}: {len(meta)} LoRA params are on meta (e.g. {meta[:3]}); "
+                "adapter checkpointing requires materialized LoRA params."
             )
 
     # ------------------------------------------------------------------
