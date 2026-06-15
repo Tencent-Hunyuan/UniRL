@@ -21,7 +21,7 @@ from unirl.types.rollout_resp import RolloutTrack, _track_with_field
 from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import total_samples_per_prompt
 
-from .base import RewardBackend
+from .base import DifferentiableReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -162,9 +162,15 @@ class RewardService(Remote):
         Deliberately bypasses :meth:`score_and_attach` / ``RewardRequest.images``
         (those go through ``tensor_frame_to_pil`` + ``torch.tensor(...)``, which
         detach). Under ``enable_grad()`` the framework marks ``images.pixels`` as a
-        grad leaf and chains the returned reward's grad back to it. Requires a
-        backend implementing ``compute_rewards_differentiable``.
+        grad leaf and chains the returned reward's grad back to it. The backend must
+        satisfy the :class:`~unirl.reward.base.DifferentiableReward` Protocol.
         """
+        if not isinstance(self.backend, DifferentiableReward):
+            raise TypeError(
+                f"RewardService.score_differentiable: backend "
+                f"{type(self.backend).__name__} is not a DifferentiableReward — ReFL "
+                f"needs a differentiable in-process reward (e.g. pickscore/clip/hpsv2)."
+            )
         return self.backend.compute_rewards_differentiable(images.pixels, list(prompts.texts))
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)

@@ -75,24 +75,10 @@ class LocalRewardBackend(RewardBackend):
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         """Compute per-sample rewards."""
 
-    def compute_rewards_differentiable(
-        self,
-        images_tensor: torch.Tensor,
-        prompts: List[str],
-        records: Optional[List[dict]] = None,
-    ) -> torch.Tensor:
-        """Differentiable scoring for ReFL / direct-reward backprop.
-
-        Takes a grad-carrying image tensor ``[B, C, H, W]`` in ``[0, 1]`` (not
-        PIL) and returns a ``[B]`` reward tensor with ``grad_fn`` intact — no
-        ``torch.no_grad()``, no ``.item()``. Only scorers that wrap a
-        differentiable ``nn.Module`` (pickscore/clip/hpsv2/...) override this;
-        the rest inherit this raise.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support differentiable scoring; use a "
-            f"differentiable reward (e.g. pickscore) for ReFL."
-        )
+    # Differentiable scoring (ReFL) is an OPTIONAL capability, not part of this
+    # base: scorers that wrap a differentiable nn.Module define
+    # ``compute_rewards_differentiable`` and thereby satisfy the
+    # ``unirl.reward.base.DifferentiableReward`` Protocol (e.g. PickScore).
 
     def is_available(self) -> bool:
         return self._is_loaded
