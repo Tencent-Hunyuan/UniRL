@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -128,6 +129,38 @@ def _merge_igt(per_sample_igt: Optional[List[Optional[torch.Tensor]]]) -> Option
         return None
     parts = [igt for igt in per_sample_igt if igt is not None]
     return torch.cat(parts, dim=0) if parts else None
+
+
+def _vision_rope_positions(
+    transformer: Any,
+    input_ids: torch.Tensor,
+    *,
+    image_grid_thw: Optional[torch.Tensor],
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Call Qwen2.5-VL ``get_rope_index`` across transformers versions → ``[3, bs, seq]``.
+
+    transformers >= 5.x made ``mm_token_type_ids`` (text=0 / image=1 / video=2) a
+    REQUIRED positional arg of ``get_rope_index``; <= 4.57 has no such parameter.
+    Build it from the config token ids and pass it only when the installed
+    signature accepts it, so both version lines work (mirrors transformers' own
+    ``ProcessorMixin.create_mm_token_type_ids``).
+    """
+    get_rope_index = transformer.model.get_rope_index
+    kwargs = {"image_grid_thw": image_grid_thw, "attention_mask": attention_mask}
+    if "mm_token_type_ids" in inspect.signature(get_rope_index).parameters:
+        cfg = transformer.config
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        image_token_id = getattr(cfg, "image_token_id", None)
+        video_token_id = getattr(cfg, "video_token_id", None)
+        if image_token_id is not None:
+            mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
+        position_ids, _ = get_rope_index(input_ids, mm_token_type_ids, **kwargs)
+    else:
+        position_ids, _ = get_rope_index(input_ids, **kwargs)
+    return position_ids
 
 
 # Attention backends with a sparse packed kernel (skip cross-sequence blocks) →
@@ -362,7 +395,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         # Direct forward with position_ids=None only produces [3, bs, seq] (no text_position_ids),
         # causing incorrect causal mask for multimodal inputs.
         # Fix: call get_rope_index ourselves and prepend text_positions.
-        vision_pos, _ = self.model.transformer.model.get_rope_index(
+        vision_pos = _vision_rope_positions(
+            self.model.transformer,
             full_ids,
             image_grid_thw=igt,
             attention_mask=full_mask,
@@ -422,7 +456,9 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         same row (also correct), but the gate routes those to the dense path for
         speed; Qwen2.5-VL has no flex_attention support, so a flash backend is the
         reachable packed path. Per-stream M-RoPE positions equal the standalone
-        layout (validated bit-exact), so logp semantics match :meth:`padding_replay`.
+        layout (validated bit-exact on transformers 4.57; the packed VL path needs a
+        flash backend and re-validation on the 5.x stack — see PR notes / #54), so
+        logp semantics match :meth:`padding_replay`.
         Returns ``None`` (→ padding fallback) when packing does not apply: single
         sample, or missing prompt / lengths / cu_seqlens.
         """
@@ -446,7 +482,6 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         flat_resp = segment.tokens.to(device=device, dtype=torch.long)
         lengths = [int(n) for n in segment.lengths.tolist()]
         igt_list = conditions.image_grid_thw  # per-sample list (a sample may have 0/≥1 images)
-        get_rope_index = self.model.transformer.model.get_rope_index
         self.model.transformer.model.rope_deltas = None  # avoid stale M-RoPE cache
 
         real_prompt_lens = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
@@ -468,7 +503,9 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             grid = igt_list[b] if (igt_list is not None and igt_list[b] is not None) else None
             if grid is not None:
                 grid = grid.to(device)
-            vision_pos, _ = get_rope_index(one, image_grid_thw=grid, attention_mask=torch.ones_like(one))  # [3,1,n]
+            vision_pos = _vision_rope_positions(
+                self.model.transformer, one, image_grid_thw=grid, attention_mask=torch.ones_like(one)
+            )  # [3, 1, n]
             text_pos = torch.arange(seq.numel(), device=device).unsqueeze(0)  # [1, n]
             pos_parts.append(torch.cat([text_pos, vision_pos[:, 0, :]], dim=0))  # [4, n]
             if n_r > 0:
