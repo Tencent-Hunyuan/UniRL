@@ -1,11 +1,10 @@
 """``sglang`` engine config — wired by ``_target_`` (like every engine config).
 
-Ported from ``SGLangLLMEngineConfig`` field-for-field (parity recipes are pure
-clones — only the two rollout ``_target_`` lines change) minus all port math:
-the engine reserves its own :class:`SGLangPorts` at boot, so there is no
-``find_free_port`` here and the ``port`` field survives only for config-shape
-parity. ``model_family`` selects the adapter and defaults from the predecessor's
-own VLM switch (``image_token``), so v1-shaped recipes need no new key.
+No port math: the engine reserves its own :class:`SGLangPorts` at boot, so
+there is no ``find_free_port`` here and the ``port`` field is accepted but
+ignored (kept for recipe-shape stability). ``model_family`` selects the adapter
+and defaults from the ``image_token`` VLM switch, so text/VLM recipes need no
+extra key.
 
 ``server_intent`` (the successor of the hand-maintained ServerArgs allowlist)
 spells this config + the reserved ports as the SGLang ServerArgs intent dict;

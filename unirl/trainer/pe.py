@@ -101,7 +101,7 @@ class PETrainer(BaseTrainer):
 
             # Pass the (composed) pipeline only to engines whose role_cls
             # declares it (trainside). For a separate-process engine
-            # (``composed_pe``: sglang_llm + sglang) there is no shared
+            # (``composed_pe``: sglang + sglang_diffusion) there is no shared
             # pipeline — trained weights reach the engine via the sync bridges.
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
             takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters

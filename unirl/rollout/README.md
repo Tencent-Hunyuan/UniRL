@@ -5,7 +5,7 @@
 > trainer. Out: a `RolloutResp`. Full map: [`../README.md`](../README.md).
 
 <div align="center">
-  <img src="../../assets/rollout-engines-new.png" alt="UniRL rollout: one generate(req) to RolloutResp ABC, five interchangeable engines (trainside, sglang, sglang_llm, vllm_omni, composed) picked by _target_, and three deployment modes (direct, separate, colocate)" width="100%">
+  <img src="../../assets/rollout-engines-new.png" alt="UniRL rollout: one generate(req) to RolloutResp ABC, five interchangeable engines (trainside, sglang, sglang_diffusion, vllm_omni, composed) picked by _target_, and three deployment modes (direct, separate, colocate)" width="100%">
 </div>
 
 *One contract — `generate(req) → RolloutResp`, dispatched `DP_SCATTER`. Five engines sit behind it (picked by `_target_`); the one you choose fixes the GPU layout and whether weight-sync runs.*
@@ -46,7 +46,7 @@ on a wrong objective.
   lineage. Single-modality flows return one track; the composed PE flow returns two
   (`ar` + `diffusion`).
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
-  sampler), `sglang_diffusion` (dedicated diffusion), `sglang_llm` (dedicated AR), `vllm_omni`
+  sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
   (dedicated; HI3 / SD3 / HunyuanVideo), and `composed` (chains an AR child + a
   diffusion child for prompt enhancement). Each diffusion engine consumes
   `req.sigmas` verbatim, and the dedicated engines regenerate `x_T` from the recipe,

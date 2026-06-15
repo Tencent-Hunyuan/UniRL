@@ -156,7 +156,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         """Run PE serial flow: AR expansion → diffusion sampling → 2-track resp.
 
         Dispatched ``DP_SCATTER`` (like vllm-omni / trainside): the Handle shards the
-        req across DP workers (each owns its own sglang_llm + sglang subprocess),
+        req across DP workers (each owns its own sglang + sglang_diffusion subprocess),
         every worker runs the serial flow on its prompt-shard, and ``_collect_dp_merge``
         merges the per-worker 2-track resps. (``BROADCAST`` would return a list
         of per-worker resps via ``_collect_passthrough`` and break the trainer.)
@@ -187,7 +187,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         )
 
         # AR sub-req stage_config: forward parent's "chat" + "ar" subsets
-        # and inject pe_instruction on both — ``sglang_llm`` reads "ar" while
+        # and inject pe_instruction on both — ``sglang`` reads "ar" while
         # ``Qwen3Pipeline`` reads "chat".
         ar_stage_config: Dict[str, Any] = {
             key: dict(req.stage_config[key]) for key in ("chat", "ar") if key in req.stage_config

@@ -12,8 +12,7 @@ of one parsed ``/generate`` candidate); the adapters do the
 asymmetries (async fan-out, retries, SGLang's dict-vs-list response shape for
 ``n``) behind these signatures.
 
-Deliberate divergences from the ``sglang_diffusion`` seam, inherited from the
-``sglang_llm`` predecessor:
+Deliberate divergences from the ``sglang_diffusion`` seam:
 
 - No ``target_modules`` on the update verbs — the diffusion-side default
   ``["transformer"]`` doesn't match LLM module naming; omitting the field lets

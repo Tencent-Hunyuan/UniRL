@@ -5,8 +5,8 @@ spawn. :meth:`HTTPBackend.boot` filters the config-spelled intent against the
 real ``ServerArgs`` fields (the only place that knows them), quarantines the env
 the SRT subprocess needs at the spawn boundary, launches the server, and polls
 ``/health_generate``. Generation fans the per-prompt payloads out concurrently
-(fresh event loop + semaphore + retry — the ``slime``-style HTTP plumbing the
-``sglang_llm`` predecessor used); weight/memory verbs are synchronous POSTs with
+(fresh event loop + semaphore + retry — ``slime``-style HTTP plumbing); weight/memory
+verbs are synchronous POSTs with
 the long weight-op timeout tier.
 
 Control-plane payloads (weight sync, memory, LoRA) are constructed from the
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Process / health helpers (ported from the sglang_llm ``_server.py``)
+# Process / health helpers (SRT subprocess lifecycle + health polling)
 # ---------------------------------------------------------------------------
 
 

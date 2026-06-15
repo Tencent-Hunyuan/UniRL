@@ -37,7 +37,7 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 | `trainer/` | Per-domain training lifecycle (`base.py` + `diffusion`/`ar`/`pe`/`unified_model`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
 | `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
-| `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_llm, vllm_omni, composed) |
+| `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, composed) |
 | `train/` | Train stack: `TrainStack`, FSDP backend, LoRA/DiffusionNFT/mirror injection, EMA shadow, optimizer/lr |
 | `algorithms/` | Per-track loss algorithms (GRPO, DiffusionNFT, FlowDPPO, DRPO) |
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
