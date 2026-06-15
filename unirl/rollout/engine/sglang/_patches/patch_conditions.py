@@ -90,36 +90,24 @@ _COND_FIELDS = (
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
 # Positives gate on return_prompt_embeds; negatives on return_negative_prompt_embeds.
 #
-# NOTE (LIN-365): ``encoder_attention_mask`` IS emitted, but the response
-# translator (``response.py:_build_text_conditions``) **length-gates** it: it
-# attaches the mask to ``TextEmbedCondition`` only when the fused mask sequence
-# length equals the fused embed sequence length, and drops it otherwise. This
-# makes the mask model-agnostic and correct for both shapes:
-#   * Multi-encoder models (SD3: CLIP-L⊕CLIP-G→77 + T5→333 = 333 fused embeds,
-#     but raw per-encoder mask concat = 77+77+256 = 410) FAIL the length check,
-#     so the mask is dropped — exactly the prior SD3 behavior. (SD3's
-#     ``predict_noise`` ignores the mask, and carrying the 410-len mask would
-#     make ``TextEmbedCondition.concat`` pad the 333-token embeds up to 410,
-#     injecting spurious zero tokens that dilute the LoRA gradient ~68x.)
-#   * Single-encoder models (Z-Image: one Qwen3 encoder) source this from the raw
-#     fixed-length tokenizer mask (512), whose length never matches the trimmed
-#     caption embeds, so it ALSO fails the gate and is dropped. Z-Image genuinely
-#     needs a real validity mask — ``predict_noise`` rebuilds the per-prompt
-#     variable-length caption list by trimming the zero-padded embeds (see
-#     ``models/z_image/diffusion.py:_caption_list``) — so the response translator
-#     recovers it directly from the embeds' zero-pad rows rather than from this
-#     emitted field. Without that mask, replay would forward the zero-pad positions
-#     through the DiT and diverge from rollout.
+# NOTE (LIN-365): ``encoder_attention_mask`` is intentionally NOT emitted. SD3's
+# ``predict_noise`` ignores it, and Z-Image recovers the caption validity mask from
+# the embeds' zero-pad rows in ``response.py:_build_text_conditions``.
 _POS_MAP = {
     "prompt_embeds": "prompt_embeds",
     "pooled_prompt_embeds": "pooled_embeds",
-    "encoder_attention_mask": "prompt_attention_mask",
 }
 _NEG_MAP = {
     "negative_prompt_embeds": "negative_prompt_embeds",
     "neg_pooled_prompt_embeds": "neg_pooled_embeds",
     "negative_attention_mask": "negative_attention_mask",
 }
+
+# Dest fields whose per-encoder tensor may arrive un-batched ``[seq, hidden]``
+# (single-encoder token-level models, e.g. Z-Image/Qwen3). Only these get a batch
+# dim added at ingestion; pooled (``[B, hidden]``) and masks (``[B, seq]``) are
+# already batched and must be sliced/merged as-is.
+_TOKEN_EMBED_DESTS = frozenset({"prompt_embeds", "negative_prompt_embeds"})
 
 # Sentinels.
 _OUTPUT_BATCH_FIELDS_SENTINEL = "_unirl_conditions_output_batch_fields"
@@ -286,11 +274,28 @@ def _copy_conditions(src, output_batch) -> None:
     ``return_negative_prompt_embeds`` (delegated to ``sampling_params``).
     """
     if getattr(src, "return_prompt_embeds", False):
-        for dst, srcattr in _POS_MAP.items():
-            setattr(output_batch, dst, _to_cpu_embed_list(getattr(src, srcattr, None)))
+        _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
-        for dst, srcattr in _NEG_MAP.items():
-            setattr(output_batch, dst, _to_cpu_embed_list(getattr(src, srcattr, None)))
+        _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+
+
+def _copy_mapped_conditions(src, output_batch, mapping) -> None:
+    """Copy each ``dst <- srcattr`` field, normalizing un-batched token embeds so
+    every per-encoder field reaches the slice/merge transforms as ``[B, ...]``."""
+    for dst, srcattr in mapping.items():
+        val = _to_cpu_embed_list(getattr(src, srcattr, None))
+        if dst in _TOKEN_EMBED_DESTS:
+            val = _ensure_batched_embed_list(val)
+        setattr(output_batch, dst, val)
+
+
+def _ensure_batched_embed_list(value):
+    """Add a leading batch dim to any un-batched ``[seq, hidden]`` per-encoder
+    tensor; no-op for already-batched ``[B, seq, hidden]`` (multi-encoder models)."""
+    if not isinstance(value, (list, tuple)):
+        return value
+    out = [t if (t is None or t.dim() >= 3) else t.unsqueeze(0) for t in value]
+    return out if isinstance(value, list) else type(value)(out)
 
 
 def _wrap_decoding_stage(DecodingStage) -> None:
@@ -406,13 +411,6 @@ def _merge_conditions(merged, output_batches) -> None:
             tensors = [v[enc_idx] for v in per_batch]
             if any(t is None for t in tensors):
                 merged_list.append(None)
-            elif tensors[0].dim() <= 2:
-                # Token-level un-batched caption [seq, hidden] (Z-Image): dim 0 is
-                # the SEQUENCE, not the output axis, so cat-dim-0 would corrupt it.
-                # A de-expanded group's outputs share one prompt → identical
-                # captions, so keep one; _slice_embed_list re-adds the batch dim
-                # per output.
-                merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
@@ -457,26 +455,11 @@ def _wrap_result_common(DiffGenerator) -> None:
 def _slice_embed_list(embed_list, idx: int):
     """Slice the idx-th sample out of a per-encoder ``list[Tensor]`` field.
 
-    Two layouts occur:
-
-    * **Batched** ``[B, seq, hidden]`` (SD3 etc.): dim 0 is the sample/output
-      axis, so slice ``t[idx:idx+1]`` (keep-dim) to pick this output. Mirrors the
-      fork's ``_slice_embed_list`` in ``diffusion_generator.py``.
-    * **Token-level, un-batched** ``[seq, hidden]`` (Z-Image: Qwen3 emits a
-      per-sample variable-length caption with NO batch dim). Here dim 0 is the
-      SEQUENCE, so ``t[idx:idx+1]`` would wrongly grab a single token. The
-      per-output OutputBatch already holds THIS output's full caption (within a
-      de-expanded group every output shares the same prompt → same caption), so
-      add a batch dim instead: ``t.unsqueeze(0)`` → ``[1, seq, hidden]``.
+    Returns a new list with each tensor sliced ``t[idx:idx+1]`` (keeps the batch
+    dim), or ``None`` when the field is absent. Un-batched token embeds are
+    normalized to ``[1, seq, hidden]`` upstream (see ``_ensure_batched_embed_list``),
+    so every field is ``[B, ...]`` here. Mirrors the fork's ``_slice_embed_list``.
     """
     if embed_list is None:
         return None
-    out = []
-    for t in embed_list:
-        if t is None:
-            out.append(None)
-        elif t.dim() <= 2:
-            out.append(t.unsqueeze(0))
-        else:
-            out.append(t[idx : idx + 1])
-    return out
+    return [t[idx : idx + 1] if t is not None else None for t in embed_list]

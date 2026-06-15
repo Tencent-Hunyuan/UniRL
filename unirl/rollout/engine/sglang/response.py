@@ -394,7 +394,6 @@ def _build_text_conditions(
     """
     prompt_embeds_list: List[torch.Tensor] = []
     pooled_list: List[torch.Tensor] = []
-    mask_list: List[torch.Tensor] = []
     neg_embeds_list: List[torch.Tensor] = []
     neg_pooled_list: List[torch.Tensor] = []
 
@@ -411,23 +410,6 @@ def _build_text_conditions(
         if pooled is not None:
             pooled_list.append(pooled.detach().cpu())
 
-        # Length-gate the attention mask (model-agnostic; see patch_conditions
-        # NOTE). Keep it only when its sequence length matches the fused embed
-        # sequence length: single-encoder models (Z-Image: Qwen3) satisfy this
-        # and NEED the mask so trainer-side replay can trim the zero-padded
-        # variable-length captions exactly as the rollout DiT did. Multi-encoder
-        # models (SD3) fuse embeds to a different length than the raw per-encoder
-        # mask concat, so the mask is dropped (the DiT ignores it there, and
-        # carrying it would pad embeds with spurious zero tokens).
-        attn_mask = fuse_text_encoder_outputs(getattr(result, "encoder_attention_mask", None))
-        if (
-            attn_mask is not None
-            and attn_mask.dim() >= 2
-            and embeds.dim() >= 2
-            and int(attn_mask.shape[-1]) == int(embeds.shape[-2])
-        ):
-            mask_list.append(attn_mask.detach().cpu())
-
         neg_embeds = fuse_text_encoder_outputs(getattr(result, "negative_prompt_embeds", None))
         if neg_embeds is not None:
             neg_embeds_list.append(neg_embeds.detach().cpu())
@@ -437,25 +419,14 @@ def _build_text_conditions(
             neg_pooled_list.append(neg_pooled.detach().cpu())
 
     embeds_cat = torch.cat(prompt_embeds_list, dim=0) if prompt_embeds_list else None
-    # Only build a batched mask when EVERY result contributed one (the length
-    # gate is deterministic per model family, so this is all-or-nothing; the
-    # guard keeps a partial list from producing a wrong-batch-size mask).
-    attn_mask_cat = torch.cat(mask_list, dim=0) if mask_list and len(mask_list) == len(prompt_embeds_list) else None
 
-    # Z-Image: SGLang returns the Qwen3 caption embeds zero-padded to the
-    # encode-batch's max caption length (the fork's ``pad_text_embeddings_with_mask``
-    # uses exact ``new_zeros``); a single-prompt encode comes back unpadded. The raw
-    # ``encoder_attention_mask`` is the fixed 512-token tokenizer mask, whose length
-    # never matches the trimmed embed sequence, so the length gate above already
-    # dropped it. Recover the real per-token validity mask straight from the embeds:
-    # a position is valid iff its embedding row is not all-zero. The trainer needs
-    # this so ``ZImageDiffusionStage.replay`` (via ``_caption_list``) trims each
-    # caption back to the exact tokens the rollout DiT attended to; an all-ones mask
-    # would instead forward the zero-pad rows and make replay diverge from rollout.
-    # Unpadded (single-prompt) embeds have no zero rows, so this is all-ones too —
-    # also correct. Cross-chunk merges (``TextEmbedCondition.concat``) zero-pad both
-    # embeds and this mask consistently.
-    if model_family == "z_image" and attn_mask_cat is None and embeds_cat is not None and embeds_cat.dim() == 3:
+    # Z-Image (single Qwen3 encoder) ships captions zero-padded to the batch-max
+    # length; recover the per-token validity mask from the non-zero rows so replay's
+    # ``_caption_list`` trims each caption to exactly the tokens the rollout DiT
+    # attended to. Other families don't need a mask here (SD3's predict_noise ignores
+    # it); unpadded single-prompt embeds have no zero rows → all-ones, also correct.
+    attn_mask_cat = None
+    if model_family == "z_image" and embeds_cat is not None and embeds_cat.dim() == 3:
         attn_mask_cat = (embeds_cat != 0).any(dim=-1).to(torch.long)
     text_cond = (
         TextEmbedCondition(
