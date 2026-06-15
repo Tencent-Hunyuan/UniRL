@@ -67,6 +67,7 @@ logs/
 local/
 !unirl/reward/local/
 !unirl/reward/local/**
+unirl/reward/local/**/__pycache__/   # the broad un-ignore above must not re-track bytecode
 **/rollout_data/
 **/buffer_stats/
 *.out
