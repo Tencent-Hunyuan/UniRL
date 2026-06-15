@@ -140,7 +140,11 @@ class ReFLPolicy(Remote):
         tensor that crosses to the reward role."""
         self.backend.model.train()
         device = torch.device(self.device)
-        conditions = SD3Conditions(text=self.text_embed.embed(prompts))
+        # Text encoders are frozen — keep their (large, e.g. T5-XXL) forward graph
+        # out of the DRaFT backward; the transformer still gets grad via the latents.
+        with torch.no_grad():
+            cond = self.text_embed.embed(prompts)
+        conditions = SD3Conditions(text=cond)
         schedule = get_sigma_schedule(self.num_inference_steps, shift=self._shift, device=device)
         dp_rank = int(self.rank_info.dp_rank) if self.rank_info is not None else 0
         params = DiffusionSamplingParams(
