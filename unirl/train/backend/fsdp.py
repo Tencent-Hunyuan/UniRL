@@ -396,6 +396,11 @@ class FSDPBackend(Remote):
         """
         import torch.distributed.checkpoint as dcp
 
+        # Frozen aux (vae / vit) on meta is expected and dropped below; a
+        # *trainable* param on meta means materialize missed it, and dropping it
+        # would write a checkpoint missing weights with no error. is_meta alone
+        # can't tell the two apart, but requires_grad can — so fail fast here.
+        self._reject_trainable_meta_params("save")
         os.makedirs(path, exist_ok=True)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
@@ -472,7 +477,6 @@ class FSDPBackend(Remote):
 
     def _load_torch(self, checkpoint_path: str) -> int:
         """Legacy single-file load: read full state, broadcast from rank 0, reshard."""
-        self._reject_meta_params("load")
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
         strict = checkpoint.get("save_mode", "full") == "full"
@@ -542,6 +546,23 @@ class FSDPBackend(Remote):
                 f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
                 "full-state-dict checkpointing of meta-init bundles is not supported under "
                 "checkpoint_format='torch' (use 'dcp')."
+            )
+
+    def _reject_trainable_meta_params(self, op: str) -> None:
+        """Fail fast on *trainable* params left on meta (the sharded "dcp" path).
+
+        The DCP save drops every meta entry, which is correct for the frozen aux
+        (vae / vit) that meta-init bundles never materialize. But a param that is
+        ``requires_grad`` AND on meta is a materialize bug, not aux — dropping it
+        would silently produce a checkpoint missing trained weights. ``requires_grad``
+        is what tells the two apart, so this guard rejects only the former and
+        leaves the frozen aux to ``drop_meta_entries``. Same verdict on every rank.
+        """
+        meta = [name for name, param in self.model.named_parameters() if param.requires_grad and param.is_meta]
+        if meta:
+            raise RuntimeError(
+                f"FSDPBackend.{op}: {len(meta)} trainable params are on meta (e.g. {meta[:3]}); "
+                "they would be silently dropped from the DCP checkpoint (materialize missed them)."
             )
 
     def _reject_lora_meta_params(self, op: str) -> None:
