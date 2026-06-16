@@ -24,9 +24,6 @@ bundle:
     _target_: unirl.models.wan22.config.WAN22PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-T2V-A14B-Diffusers}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: fp16
-    logprob_precision: fp32
     shift: 5.0
     max_sequence_length: 512
     boundary_ratio: 0.875
@@ -139,9 +136,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: fp16
-  logprob_precision: fp32
   # SDE step schedule inherited verbatim from wan22_t2v_14b (DanceGRPO swaps
   # only the kernel, not the schedule).
   scheduler:

@@ -29,9 +29,6 @@ bundle:
     _target_: unirl.models.sd3.config.SD3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     shift: 3.0
 
 pipeline:
@@ -156,9 +153,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   # SDE step schedule: which denoising steps record SDE log-probs.
   # num_sde_steps: null = all steps; int = sparse subset; 0 = none (DiffusionNFT).
   # A static `sde_indices: [...]` overrides this. (WindowScheduler also available.)
@@ -176,7 +170,7 @@ sampling:
 # file): every N rollouts it calls sync() to push the freshly-trained
 # LoRA (set_lora_from_tensors) into the engine just before that rollout's
 # generate — fused into the generate wake/sleep, so a synced step costs one
-# wake+sleep, not two. Absent on examples/diffusion/sd3_trainside.yaml (trainside shares
+# wake+sleep, not two. Absent on examples/diffusion/sd3/sd3_trainside.yaml (trainside shares
 # the trained module — no sync).
 sync:
   _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync

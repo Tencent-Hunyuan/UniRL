@@ -33,9 +33,6 @@ diffusion:
       _target_: unirl.models.sd3.config.SD3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
       model_precision: bf16
-      autocast_precision: bf16
-      trajectory_precision: bf16
-      logprob_precision: fp32
       shift: 3.0
   pipeline:
     _target_: unirl.models.sd3.pipeline.SD3Pipeline
@@ -116,8 +113,6 @@ ar:
       _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       model_precision: bf16
-      autocast_precision: bf16
-      logprob_precision: fp32
   pipeline:
     # Qwen3Pipeline builds chat_template + ar stages from the (shared) bundle
     # the trainer injects, so the rollout samples the SAME module the backend trains.
@@ -218,9 +213,6 @@ sampling:
     eta: 0.7
     seed: 42
     init_same_noise: false
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     # Sparse SDE-index schedule (FlowDPPO-style, mirrors sd3_flowdppo.yaml):
     # num_sde_steps random steps drawn from the first half of the denoising
     # schedule, resolved PER ROLLOUT (seeded by rollout_id) by

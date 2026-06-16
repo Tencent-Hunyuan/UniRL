@@ -38,7 +38,7 @@
 #
 # Launch (1 node x 8 GPUs):
 #   PRETRAINED_MODEL=<local> DATA_PATH=<prompts> \
-#     bash examples/run_experiment_single_node.sh diffusion/hunyuan_video15_t2v_vllmomni_colocate_v2
+#     bash examples/run_experiment_single_node.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_colocate
 
 num_devices: 8                     # 1 node × 8 GPUs (colocate: all 8 train + rollout)
 batch_size: 16                     # prompts_per_rollout
@@ -59,9 +59,6 @@ bundle:
     _target_: unirl.models.hunyuan_video15.config.HunyuanVideo15PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     shift: 5.0
 
 pipeline:
@@ -200,9 +197,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

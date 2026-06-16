@@ -11,7 +11,7 @@
 # keeps the small PUT_TENSOR buffer from exhausting across rollouts, so the
 # default (small) buffer sizes below are sufficient.
 #
-# Run: python -m unirl.train_diffusion --config-name diffusion/sd3_trainside_tq_mooncake
+# Run: python -m unirl.train_diffusion --config-name diffusion/sd3/sd3_trainside_tq_mooncake
 
 num_devices: 8
 batch_size: 48 # prompts_per_rollout
@@ -68,9 +68,6 @@ bundle:
     _target_: unirl.models.sd3.config.SD3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     shift: 3.0
 
 pipeline:
@@ -189,9 +186,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   # SDE step schedule: which denoising steps record SDE log-probs.
   # num_sde_steps: null = all steps; int = sparse subset; 0 = none (DiffusionNFT).
   # A static `sde_indices: [...]` overrides this. (WindowScheduler also available.)

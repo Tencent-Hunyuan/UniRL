@@ -37,9 +37,6 @@ bundle:
     _target_: unirl.models.z_image.config.ZImagePipelineConfig
     pretrained_model_ckpt_path: ${oc.env:Z_IMAGE_PATH,Tongyi-MAI/Z-Image}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     max_sequence_length: 512
     # Static FlowMatch shift; base Z-Image's scheduler_config.json declares
     # use_dynamic_shifting=false + shift=6.0 (read by build_schedule_policy).
@@ -160,9 +157,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

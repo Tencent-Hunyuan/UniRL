@@ -32,9 +32,6 @@ bundle:
     _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     max_sequence_length: 512
     # Trainer-side TE is dead weight on the separate-engine path (the
     # engine encodes; the trainer replays captured conditions) and its
@@ -168,9 +165,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   # SDE step schedule inherited verbatim from qwen_image_trainside (DanceGRPO
   # swaps only the kernel, not the schedule).
   scheduler:

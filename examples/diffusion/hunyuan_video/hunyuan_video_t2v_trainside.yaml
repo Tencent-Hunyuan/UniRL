@@ -9,7 +9,7 @@
 # Layout: 1 node × 8 GPUs, all colocated; no weight sync section.
 #
 # Launch (1 node x 8 GPUs):
-#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video_t2v_trainside
+#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video/hunyuan_video_t2v_trainside
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout (v1: 48)
@@ -28,9 +28,6 @@ bundle:
     _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     shift: 5.0
 
 pipeline:
@@ -172,9 +169,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

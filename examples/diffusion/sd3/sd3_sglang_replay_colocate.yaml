@@ -1,12 +1,12 @@
 # @package _global_
 # SD3 + SGLang colocate, REPLAY logprob, v2 trainer, 2x8 H20 (matches v1 reference geometry).
 #
-# Same as sd3_sglang_rollout_colocate.yaml except:
+# Same as sd3/sd3_sglang_rollout_colocate.yaml except:
 #   - algorithm.old_logp_source: replay
 #       Trainer recomputes the π_old anchor via stage.replay at update time
 #       (the engine's best-effort native log-probs, if any, are ignored).
 #
-#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_replay_colocate
+#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_replay_colocate
 
 num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
 batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
@@ -19,9 +19,6 @@ model_config:
   _target_: unirl.models.sd3.config.SD3PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
   model_precision: bf16
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   shift: 3.0
   # SGLang builds its LoRA ServerArgs from these two fields.
   use_lora: true
@@ -177,8 +174,6 @@ sampling:
   seed: 42
   init_same_noise: false
   autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

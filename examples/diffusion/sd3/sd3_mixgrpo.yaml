@@ -22,9 +22,6 @@ bundle:
     _target_: unirl.models.sd3.config.SD3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     shift: 3.0
 
 pipeline:
@@ -132,9 +129,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: true            # v1 mixgrpo sets init_same_noise true
-  autocast_precision: bf16
-  trajectory_precision: bf16
-  logprob_precision: fp32
   # Progressive sliding-window SDE-index schedule (MixGRPO). The window of
   # SDE-recorded steps advances with the rollout id; rolls back to the start
   # once it sweeps the schedule.

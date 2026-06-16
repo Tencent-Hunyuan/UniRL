@@ -1,6 +1,6 @@
 # @package _global_
 # FLUX.2-klein-9B GRPO — trainside (in-process FSDP) colocate.
-# Mirrors examples/diffusion/sd3_trainside.yaml and qwen_image_trainside.yaml
+# Mirrors examples/diffusion/sd3/sd3_trainside.yaml and qwen_image/qwen_image_trainside.yaml
 # in structure, with Klein knobs (DanceSDE + empirical-mu schedule, klein LoRA).
 #
 # Trainside = rollout runs in-process on the FSDP-wrapped training pipeline
@@ -25,7 +25,7 @@
 #   trajectory_precision = fp16        (rollout cache fits per actor)
 #
 # Launch (4 nodes x 8 GPUs, taiji SPMD):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein_trainside
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_trainside
 
 num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
 batch_size: 64                # prompts_per_rollout (64 x 16 samples = 1024 global)
@@ -44,9 +44,6 @@ bundle:
     _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-9B}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: fp16
-    logprob_precision: fp32
     max_sequence_length: 512
     # Static-shift fallback only; Klein's checkpoint enables empirical-mu
     # dynamic shifting (build_schedule_policy) and this value is ignored at runtime.
@@ -199,9 +196,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: true
-  autocast_precision: bf16
-  trajectory_precision: fp16
-  logprob_precision: fp32
   # SDE step schedule: which denoising steps record SDE log-probs.
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
