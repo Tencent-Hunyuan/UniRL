@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import torch
 from torch import Tensor, nn
@@ -68,6 +68,33 @@ def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimiz
     return full
 
 
+def gather_lora_state_dict(model: nn.Module) -> StateDict:
+    """Gather every adapter's LoRA tensors, preserving the model state-dict key format.
+
+    Unlike :func:`gather_state_dict`, this never asks DCP for the full model
+    state. Each LoRA DTensor is materialized directly, so adapter-only
+    checkpoints avoid full-model CPU memory and wire traffic. CPU-offloaded
+    DTensor shards are moved to CUDA one tensor at a time before the collective,
+    because this stack initializes the train mesh with NCCL, not a CPU backend.
+    All ranks must call this because DTensor materialization is collective; only
+    rank 0 returns the gathered CPU tensors.
+    """
+    gathered: StateDict = {}
+    for key, value in model.state_dict().items():
+        if "lora_A" not in key and "lora_B" not in key:
+            continue
+        if isinstance(value, torch.Tensor) and value.is_meta:
+            raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")
+        materialized = _materialize_checkpoint_tensor(value)
+        if isinstance(materialized, torch.Tensor):
+            materialized = materialized.detach().cpu()
+        if _current_rank() == 0:
+            gathered[key] = materialized
+    if _current_rank() != 0:
+        return {}
+    return gathered
+
+
 def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
     """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
 
@@ -101,40 +128,6 @@ def is_materialized(model: nn.Module) -> bool:
 
 def trainable_params(model: nn.Module) -> Iterator[Parameter]:
     return (p for p in model.parameters() if p.requires_grad)
-
-
-def lora_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-) -> StateDict:
-    """Adapter-only state for inference export.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    return {k: v for k, v in full_sd.items() if _is_lora_key(k)}
-
-
-def nft_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-    shadow_adapter: str = "old",
-) -> StateDict:
-    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    token = f".{shadow_adapter}."
-    return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
 
 
 def clip_grad_norm(
@@ -232,11 +225,6 @@ def _current_rank() -> int:
     return 0
 
 
-def _is_lora_key(key: str) -> bool:
-    """True for default-adapter LoRA keys (excludes shadow/old adapter)."""
-    return ("lora_A" in key or "lora_B" in key) and ".old." not in key
-
-
 def _build_state_dict_options(**kwargs: object) -> object:
     from torch.distributed.checkpoint.state_dict import StateDictOptions
 
@@ -258,6 +246,19 @@ def _maybe_dtensor_to_tensor(value: object) -> object:
     if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
         return value.full_tensor()
     return value
+
+
+def _materialize_checkpoint_tensor(value: object) -> object:
+    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
+        device = getattr(value, "device", None)
+        if (
+            getattr(device, "type", None) == "cpu"
+            and torch.cuda.is_available()
+            and hasattr(value, "cuda")
+            and callable(getattr(value, "cuda"))
+        ):
+            value = value.cuda()
+    return _maybe_dtensor_to_tensor(value)
 
 
 def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
@@ -329,8 +330,6 @@ __all__ = [
     "local_view",
     "is_materialized",
     "trainable_params",
-    "lora_state_dict",
-    "nft_state_dict",
     "fsdp_offload",
     "fsdp_onload",
     "infer_device",

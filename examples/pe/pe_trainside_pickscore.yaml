@@ -221,6 +221,15 @@ sampling:
     autocast_precision: bf16
     trajectory_precision: bf16
     logprob_precision: fp32
-    sde_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # Sparse SDE-index schedule (FlowDPPO-style, mirrors sd3_flowdppo.yaml):
+    # num_sde_steps random steps drawn from the first half of the denoising
+    # schedule, resolved PER ROLLOUT (seeded by rollout_id) by
+    # PETrainer._build_req via resolve_sde_indices. Replaces the static all-SDE
+    # list with selective stochastic steps.
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      timestep_fraction: [0.0, 0.5]   # SDE steps drawn from the first half
+      num_sde_steps: 3
 
 num_rollouts: 300

@@ -1,14 +1,15 @@
-"""vLLM-Omni rollout engine for unirl.
+"""vLLM-Omni rollout engine.
 
-Modality-keyed wrapper around vllm-omni's ``Omni`` orchestrator for
-HunyuanImage 3.0. Supports all four upstream modalities: t2i, it2i,
-i2t, t2t.
+A thin engine core over one backend seam (``backends/`` — the only code that
+imports the vllm-omni runtime, boot included), with per-modality adapters
+(``adapters/`` — registry keyed on ``config.modality``, per-output-shape base
+adapters holding the conversion), a pure ``utils/`` bag, a ``WeightSync``
+component, typed self-reserved ports, and the worker-side role packages
+(``worker/`` / ``pipelines/`` / ``patches/``). Recipes select it by pointing
+their rollout ``_target_`` lines here.
 
-Imports are lazy to avoid a circular dependency: the trainer-side IPC
-weight-sync handler needs ``weight_sync.bucketed_transfer`` which lives
-under this package. Eager-importing ``engine`` here would pull
-``rollout.engine.base`` which is still initializing when the import
-chain starts from ``base → types → distributed → weight_sync → full.ipc``.
+Imports are lazy: engine modules pull ``rollout.engine.base`` whose import
+chain is still initializing when reached from ``base → types → distributed``.
 """
 
 
@@ -17,6 +18,10 @@ def __getattr__(name: str):
         from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig
 
         return VLLMOmniEngineConfig
+    if name == "VLLMOmniPorts":
+        from unirl.rollout.engine.vllm_omni.config import VLLMOmniPorts
+
+        return VLLMOmniPorts
     if name == "VLLMOmniRolloutEngine":
         from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
 
@@ -24,4 +29,4 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["VLLMOmniEngineConfig", "VLLMOmniRolloutEngine"]
+__all__ = ["VLLMOmniPorts", "VLLMOmniEngineConfig", "VLLMOmniRolloutEngine"]

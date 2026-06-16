@@ -19,6 +19,13 @@ num_devices: 8
 batch_size: 64
 num_rollouts: 10000
 
+# Checkpointing (LoRA adapter only — MBs, not GBs). Set SAVE_DIR to a persistent
+# location (e.g. CephFS) so checkpoints survive pod teardown; the default is a
+# repo-relative path. save_interval=0 disables saving (the framework default).
+save_interval: ${oc.env:SAVE_INTERVAL,100}
+save_mode: ${oc.env:SAVE_MODE,adapter}
+save_dir: ${oc.env:SAVE_DIR,checkpoints/flux2klein_4b_editreward}
+
 logging:
   report_to_wandb: true
   project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein-editreward}

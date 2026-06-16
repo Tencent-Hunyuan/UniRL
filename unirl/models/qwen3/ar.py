@@ -17,6 +17,8 @@ Three classes:
 
 from __future__ import annotations
 
+import functools
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -35,6 +37,47 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
+logger = logging.getLogger(__name__)
+
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_packed_disabled(attn_impl: str) -> None:
+    """One-time warning (per distinct backend) when packed replay is skipped.
+
+    Fires when packing WOULD apply (B > 1) but the attention backend is not a
+    sparse-block kernel, so replay uses the slower padded path instead.
+    """
+    logger.warning(
+        "packed-varlen replay disabled: attn_implementation=%r is not a "
+        "sparse-block kernel; using the padded replay path. Set "
+        "attn_implementation='flex_attention' (or 'flash_attention_2' with "
+        "flash_attn installed) to enable packed replay.",
+        attn_impl,
+    )
+
+
+def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
+    """Feature-detect the packed varlen replay prerequisites (review #43).
+
+    1. A sparse-block attention backend (flex_attention or flash_attention_2);
+       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
+       require a sparse backend (checked first; warns once on fallback).
+    2. transformers building a block-causal mask from restarting position_ids
+       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
+       older versions the forward would silently attend ACROSS sequence
+       boundaries (wrong logps, no error), so fall back to the dense path.
+    """
+    if attn_impl not in _SPARSE_PACKED_ATTN:
+        _warn_packed_disabled(str(attn_impl))
+        return False
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
+        return False
+    return True
+
 
 def _replay_aware_forward(
     self: Any,
@@ -43,6 +86,7 @@ def _replay_aware_forward(
     prompt_len: Optional[int] = None,
     temperature: float = 1.0,
     autocast_dtype: Optional[torch.dtype] = None,
+    packed_predict_index: Optional[torch.Tensor] = None,
     **kw: Any,
 ) -> Any:
     """Dual-mode ``forward`` installed on the Qwen3 CausalLM instance.
@@ -76,6 +120,34 @@ def _replay_aware_forward(
     # [B, chunk, vocab] FP32 transient stays ~1.2 GiB, and each chunk is
     # gradient-checkpointed (recomputed in backward rather than held).
     T = float(temperature) if float(temperature) > 0.0 else 1.0
+
+    if packed_predict_index is not None:
+        # Packed varlen replay: ``hidden`` is one packed row [1, L_total, H]
+        # holding every sequence back-to-back (block-causal mask built by
+        # transformers from the restarting position_ids). Predictions for the
+        # FLAT response stream (``response_tokens`` = segment-order targets,
+        # [T_total]) live at ``packed_predict_index`` — gather those hidden
+        # states and run the same chunked fp32 ``x[tok] - logsumexp(x)`` over
+        # the flat stream. No pad tokens exist anywhere on this path.
+        h_pred = hidden[0].index_select(0, packed_predict_index)  # [T_total, H]
+        targets = response_tokens
+
+        def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+            lf = self.lm_head(h).float() / T  # [chunk, vocab] FP32
+            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+
+        flat_parts: List[torch.Tensor] = []
+        flat_chunk = 2048
+        for s in range(0, int(h_pred.size(0)), flat_chunk):
+            h = h_pred[s : s + flat_chunk]
+            tok = targets[s : s + flat_chunk]
+            if torch.is_grad_enabled() and h.requires_grad:
+                flat_parts.append(checkpoint(_flat_logp_chunk, h, tok, use_reentrant=False))
+            else:
+                flat_parts.append(_flat_logp_chunk(h, tok))
+        if not flat_parts:
+            return hidden.new_zeros((0,), dtype=torch.float32)
+        return torch.cat(flat_parts, dim=0)
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
@@ -99,6 +171,10 @@ def _replay_aware_forward(
     return torch.cat(parts, dim=1)
 
 
+# Attention backends with a sparse packed kernel (skip cross-sequence blocks):
+# flex via BlockMask, flash_attention_2 via flash_attn_varlen + cu_seqlens. Under
+# either, packed replay is always a win; on any other backend (sdpa/eager) it is
+# gated on length variance (see packed_replay).
 @dataclass
 class Qwen3ARParams:
     """Per-request AR-mode knobs for Qwen3.
@@ -336,16 +412,119 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
     ) -> torch.Tensor:
         """Per-token log-prob replay over a stored rollout segment.
 
-        One teacher-forced forward over ``prompt + response`` (no KV
-        cache), gather log-probs at the predicting positions for each
-        response token, return packed varlen ``[total_tokens]`` aligned
-        with ``segment.log_probs``. Caller controls grad / no_grad scope
-        and ``.train()`` mode. Empty-response samples contribute zero
-        tokens to the output.
+        Branch: prefer :meth:`packed_replay` (packed-varlen, zero padding, B > 1)
+        and fall back to :meth:`padding_replay` (the dense ``[B, P_max + T_max]``
+        padded path) when packing does not apply. Returns packed varlen
+        ``[total_tokens]`` aligned with ``segment.log_probs``; caller controls
+        grad / ``.train()`` scope. ``temperature`` divides logits before
+        ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
+        """
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if _packed_replay_supported(attn_impl):
+            packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
+            if packed is not None:
+                return packed
+        return self.padding_replay(conditions, segment=segment, temperature=temperature)
 
-        ``temperature`` divides ``pred_logits`` before ``log_softmax`` so
-        it matches SGLang's sampler (``log_softmax(logits/T)``). Default
-        ``1.0`` is a no-op.
+    def packed_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> Optional[torch.Tensor]:
+        """Packed-varlen replay (B > 1): zero padding anywhere.
+
+        Concatenate every sample's REAL prompt tokens + its flat response tokens
+        into ONE row; position_ids restart at 0 per sequence, and with
+        ``attention_mask=None`` transformers' masking_utils detects the packed
+        layout from the restarting positions and builds the block-causal mask
+        (verl remove_padding equivalence). Per-sequence RoPE positions equal the
+        standalone layout, so logp semantics match :meth:`padding_replay`.
+        Returns ``None`` (→ padding fallback) when packing does not apply or
+        would not pay: single sample, no per-sample lengths, no packed-mask
+        support (:func:`_packed_replay_supported`), or no sparse-block attention
+        kernel in use (only flex_attention / flash_attention_2 make packed a win).
+        """
+        if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
+            return None
+        if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
+            return None
+        device = next(self.model.transformer.parameters()).device
+        prompt_ids = conditions.prompt.input_ids.to(device)
+        prompt_mask = conditions.prompt.attention_mask.to(device)
+        batch_size = int(prompt_ids.shape[0])
+        if batch_size <= 1:
+            return None
+
+        lengths = [int(n) for n in segment.lengths.tolist()]
+        pad_id = self.model.tokenizer.pad_token_id or 0
+        real_prompt_lens_p = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
+
+        cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
+        flat_resp = segment.tokens.to(device=device, dtype=torch.long)
+        streams: List[torch.Tensor] = []
+        pos_parts: List[torch.Tensor] = []
+        pred_parts: List[torch.Tensor] = []
+        offset = 0
+        for b in range(batch_size):
+            n_p = int(real_prompt_lens_p[b].item())
+            n_r = lengths[b]
+            # The predict-index math below (offset + n_p - 1) assumes each stream has
+            # >=1 real prompt token; n_p == 0 would gather the PRIOR stream's last
+            # hidden state (silent cross-sequence logp corruption), so fail loud.
+            assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
+            seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
+            streams.append(seq)
+            pos_parts.append(torch.arange(seq.numel(), device=device))
+            if n_r > 0:
+                pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
+            offset += int(seq.numel())
+        packed_ids = torch.cat(streams).unsqueeze(0)
+        packed_pos = torch.cat(pos_parts).unsqueeze(0)
+        predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
+        # Bucket the packed length to a multiple of 1024 so flex_attention compiles
+        # O(10) shapes instead of one per distinct L (a ~40s first-compile per
+        # shape). Filler tokens carry restarting position_ids, forming their own
+        # isolated "sequence" under the packed block-causal mask (no prediction
+        # gathered from them). sdpa/eager only pay filler FLOPs, so skip bucketing.
+        bucket = 1024
+        L = int(packed_ids.shape[1])
+        target = ((L + bucket - 1) // bucket) * bucket
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if attn_impl != "flex_attention":
+            target = L
+        if target > L:
+            n_fill = target - L
+            fill_ids = torch.full((1, n_fill), pad_id, dtype=packed_ids.dtype, device=device)
+            fill_pos = torch.arange(n_fill, device=device).unsqueeze(0)
+            packed_ids = torch.cat([packed_ids, fill_ids], dim=1)
+            packed_pos = torch.cat([packed_pos, fill_pos], dim=1)
+        per_token_flat = self.model.transformer(
+            input_ids=packed_ids,
+            attention_mask=None,
+            position_ids=packed_pos,
+            response_tokens=flat_resp,
+            packed_predict_index=predict_index,
+            prompt_len=0,
+            temperature=temperature,
+            autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
+        )
+        return per_token_flat.to(dtype=self.logprob_dtype)
+
+    def padding_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path.
+
+        One teacher-forced forward over padded ``prompt + response``; gather
+        log-probs at the predicting positions per response token; return packed
+        varlen ``[total_tokens]``. ``temperature`` divides logits before
+        ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
         """
         if conditions.prompt is None or conditions.prompt.input_ids is None:
             raise ValueError("Qwen3ARStage.replay: conditions.prompt.input_ids is None")
@@ -374,6 +553,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
         pad_id = self.model.tokenizer.pad_token_id or 0
+
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -404,6 +584,20 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 left_padded_mask[b, prompt_len - n_real :] = 1
             prompt_ids = left_padded_ids
             prompt_mask = left_padded_mask
+
+        # Trim the prompt block to THIS batch's true max length. The track-level
+        # concat right-pads prompts to the global (worker-shard) max, so every
+        # replay micro otherwise forwards at the widest prompt in the shard —
+        # pure dense-pad waste (with token-budget packing the micro members are
+        # length-sorted, making the waste systematic). After the LEFT re-pad all
+        # real tokens sit at the right end, so dropping the leading all-pad
+        # columns preserves prompt-end position (= new prompt_len - 1) and the
+        # cumsum position_ids below are pad-invariant.
+        max_real_prompt = int(real_prompt_lens.max().item())
+        if 0 < max_real_prompt < prompt_len:
+            prompt_ids = prompt_ids[:, prompt_len - max_real_prompt :]
+            prompt_mask = prompt_mask[:, prompt_len - max_real_prompt :]
+            prompt_len = max_real_prompt
 
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)

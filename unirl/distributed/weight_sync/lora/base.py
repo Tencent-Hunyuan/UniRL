@@ -100,7 +100,7 @@ class LoraWeightSyncBase(Remote):
         read-back. Returns sorted lists (multisets) compared against the engine's
         ``loaded_lora_checksums`` in :meth:`_assert_loaded`.
         """
-        from unirl.rollout.engine.vllm_omni.weight_sync.checksum import (
+        from unirl.distributed.weight_sync.transfer.checksum import (
             compute_lora_checksums_post_optimize,
         )
 

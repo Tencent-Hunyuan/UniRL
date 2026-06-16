@@ -466,13 +466,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sde_logp = torch.stack(sde_logp_list, dim=0).unsqueeze(0) if sde_logp_list else None  # [1, S]
         sde_indices = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
-        sample_indices = torch.zeros(1, dtype=torch.long, device=device)
-        positions = torch.zeros(1, dtype=torch.long, device=device)
         indices = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
         return LatentSegment(
-            sample_indices=sample_indices,
-            positions=positions,
             latents=latents_stacked,
             sigmas=schedule,
             indices=indices,

@@ -4,7 +4,7 @@
 # generates <think>...</think><recaption>...</recaption><answer><boi><img_size>...
 # and stops at EOS. The full AR text is the recaption the DiT engine consumes as
 # cot_text (extra["ar_generated_text"]); per-token logp (logprobs=1) feeds
-# ar_capture.extract_ar_segment for GRPO replay.
+# ar_capture.extract_ar_segment for ARGRPO replay.
 #
 # Differs from upstream i2t/t2t (which are is_comprehension:true comprehension
 # answers, NOT think/recaption) — see hi3_v2_IMPL_spec.md plan-correction #1.
@@ -31,7 +31,7 @@ stage_args:
       # Side-effect import installs the Base-ckpt tokenizer fix AND composes
       # the bucketed CUDA-IPC weight-sync mixin (LoRA sync target). See
       # t2i_rl.yaml for the full rationale.
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.ar_extension.HI3ARWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.ar_extension.HI3ARWeightSyncExtension
       enable_lora: true
       # Colocate-memory trim: the AR stage only needs prompt + max_new_tokens
       # (~4096), not the model's full 22800 ctx. Capping max_model_len shrinks
