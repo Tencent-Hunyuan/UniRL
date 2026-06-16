@@ -5,12 +5,17 @@
 # (no separate rollout actor, no weight sync). Strongest colocate form.
 #
 # This recipe targets the BASE checkpoint Tongyi-MAI/Z-Image (not the distilled
-# Turbo): multi-step sampling WITH classifier-free guidance (guidance_scale>0,
-# empty-string negatives auto-added by the pipeline) and static shift=6.0. The
-# S3-DiT single-stream transformer + Qwen3 text encoder are loaded by the
-# bundle; the VAE is the flux-style 16-channel AutoencoderKL. (To run Turbo
-# instead: set Z_IMAGE_PATH=.../Z-Image-Turbo and override shift=3.0,
-# sampling.guidance_scale=0.0, sampling.num_inference_steps=8.)
+# Turbo): multi-step sampling and static shift=6.0. The S3-DiT single-stream
+# transformer + Qwen3 text encoder are loaded by the bundle; the VAE is the
+# flux-style 16-channel AutoencoderKL.
+#
+# CFG is intentionally OFF here (guidance_scale=0 -> single forward, no negative
+# prompt). Empirically CFG slows the reward curve: it sharpens the per-prompt
+# distribution (less in-group diversity -> weaker GRPO advantage) AND doubles
+# the per-step forward cost. Off = more exploration + ~2x faster rollouts.
+# (To re-enable CFG: set sampling.guidance_scale>0; the pipeline then auto-adds
+# empty-string negatives. To run Turbo: set Z_IMAGE_PATH=.../Z-Image-Turbo and
+# override shift=3.0, sampling.num_inference_steps=8.)
 #
 # Scale is set by the launcher (num_devices = cluster GPU count); this same
 # recipe runs on 2 (H20 smoke), 8 (1-node) and 32 (4x8) GPUs. batch_size=64
@@ -124,8 +129,10 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
-  # forward_batch_size (8) != micro_batch_size (1); recompute pi_old at the
-  # train micro-geometry so the on-policy ratio is exactly 1 (see SD3 recipe).
+  # Recompute pi_old at the exact train micro-geometry so the on-policy ratio is
+  # exactly 1 (bf16 forwards are batch-shape sensitive). Correct & safe to keep
+  # even now that micro_batch_size happens to equal forward_batch_size, and
+  # required again the moment they diverge (see SD3 recipe).
   old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
@@ -134,7 +141,15 @@ algorithm:
 
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 1
+  # Train-side micro-batch (pure speed/memory knob — it only sets grad-accum
+  # granularity, NOT the effective batch, so it never changes the optimization
+  # math). Observed: mbs 1->4 barely moved HBM (~42 -> ~40 GB) because resident
+  # frozen weights (transformer + Qwen3 encoder + VAE) dominate and activations
+  # don't persist under AC. So push it hard. On the 4x8 run the per-GPU
+  # mini-batch is 16 (batch_size*spp/num_devices/num_updates_per_batch =
+  # 64*16/32/2), so mbs=16 means zero accumulation (max SM feed); 8 = 2 accum
+  # steps. Start at 8, bump to 16 via `stack.micro_batch_size=16` if HBM allows.
+  micro_batch_size: 8
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
 
@@ -150,10 +165,12 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 16       # base Z-Image: multi-step (RL-reduced from ~30-50)
-  guidance_scale: 4.0           # base needs CFG; empty-string negatives auto-added.
-                                # diffusers default is 5.0 — lower => more in-group
-                                # diversity for GRPO. Set 0.0 only for Turbo.
+  num_inference_steps: 12       # base Z-Image: multi-step (RL-reduced from ~30-50;
+                                # 12 ≈ Qwen-Image recipe — trims rollout cost, which
+                                # CFG already doubles per step). Set 8 only for Turbo.
+  guidance_scale: 0.0           # CFG OFF (single forward, no negative). Faster
+                                # reward curve: more in-group diversity for GRPO +
+                                # ~2x cheaper rollouts. Set >0 to re-enable CFG.
   height: 512
   width: 512
   eta: 0.7

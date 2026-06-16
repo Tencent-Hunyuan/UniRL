@@ -29,9 +29,13 @@ rollout-with-initial_noise on both the single and grouped paths.
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
@@ -82,12 +86,39 @@ def patch_latent_prep() -> None:
         device = get_local_torch_device()
         batch_size = int(batch.batch_size)
         nopp = int(getattr(batch, "num_outputs_per_prompt", 1) or 1)
+        pcfg = server_args.pipeline_config
 
         # 1) Expand driver-shipped noise to batch_size (fork's rule).
         latents = _expand_initial_noise(latents, batch_size, nopp).to(device=device)
 
+        # 1b) Insert the singleton frame axis for image-form 5-D DiTs (Z-Image).
+        # The driver ships frame-less image-form noise [B, C, H, W] (from the model's
+        # latent_shape), but Z-Image's S3-DiT denoises in 5-D [B, C, 1, H, W]:
+        # ``ZImageTransformer2DModel._as_image_list`` treats a 4-D tensor as a SINGLE
+        # [C, F, H, W] image, folding the 16 channels into the token count so the
+        # x_embedder matmul fails. The randn branch already gets 5-D via
+        # ``prepare_latent_shape``; mirror that for provided latents. Gated TIGHTLY to
+        # the Z-Image signature (4-D driver -> 5-D expected with channels preserved at
+        # dim 1 and a size-1 frame at dim 2) so it is a strict no-op for every other
+        # family: SD3/Flux/ernie (4-D expected), Qwen-Image ([B, 1, C, H, W] — dim 1 is
+        # the frame, not channels, so expected[1] != C), and video (frame > 1).
+        try:
+            num_frames = int(getattr(batch, "num_frames", 1) or 1)
+            expected = tuple(int(d) for d in pcfg.prepare_latent_shape(batch, batch_size, num_frames))
+            if (
+                latents.ndim == 4
+                and len(expected) == 5
+                and expected[1] == int(latents.shape[1])
+                and expected[2] == 1
+                and latents.numel() == math.prod(expected)
+            ):
+                latents = latents.reshape(expected)
+        except Exception as exc:  # pragma: no cover - defensive; preserve prior behavior on any failure
+            # Surface at normal log level (not _DEBUG-gated): a swallowed reconcile
+            # leaves un-reshaped latents that fail later inside the DiT, far from here.
+            logger.warning("latent_prep frame-axis reconcile skipped: %s: %s", type(exc).__name__, exc)
+
         # 2) Compute latent_ids on the UNPACKED shape (mirror randn branch order).
-        pcfg = server_args.pipeline_config
         latent_ids = pcfg.maybe_prepare_latent_ids(latents)
         if latent_ids is not None:
             batch.latent_ids = latent_ids.to(device=device)

@@ -23,6 +23,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.video import (
     HunyuanVideoAdapter,
     MochiAdapter,
 )
+from unirl.rollout.engine.sglang_diffusion.adapters.z_image import ZImageAdapter
 
 __all__ = [
     "ModelAdapter",
@@ -36,4 +37,5 @@ __all__ = [
     "QwenImageAdapter",
     "MochiAdapter",
     "HunyuanVideoAdapter",
+    "ZImageAdapter",
 ]
