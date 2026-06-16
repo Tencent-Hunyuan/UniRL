@@ -15,7 +15,7 @@ built-in `config_name` — a safe place to start.
 
 | Domain | Entrypoint | Default recipe (start here) | Models |
 |---|---|---|---|
-| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
+| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
 | [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
@@ -30,18 +30,18 @@ entrypoint (`train_ar` / `train_pe` / `train_unified_model`); the default is
 
 ```bash
 # 0. Compose-check first — verifies the config composes and every ${oc.env:...} resolves
-python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job --resolve
+python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg job --resolve
 
 # 1. Single node
-bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 
 # 2. Multi-node (taiji)
-bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_rollout_colocate
+bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
 
 # 3. Or invoke an entrypoint directly, without the launchers
-python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside num_devices=8
+python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside num_devices=8
 ```
 
 Pass cluster-local paths and W&B identity through env vars (`PRETRAINED_MODEL`,

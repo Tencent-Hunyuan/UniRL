@@ -6,9 +6,9 @@ The trainer owns the placement scope, sibling Remote wiring, and the
 ``train_step → train`` loop; this module just maps the loaded Hydra
 config blocks to constructor kwargs.
 
-Pairs with ``examples/diffusion/sd3_trainside.yaml`` (default) and
-``examples/diffusion/sd3_vllmomni.yaml``. Switch with
-``--config-name diffusion/sd3_vllmomni`` on the CLI.
+Pairs with ``examples/diffusion/sd3/sd3_trainside.yaml`` (default) and
+``examples/diffusion/sd3/sd3_vllmomni.yaml``. Switch with
+``--config-name diffusion/sd3/sd3_vllmomni`` on the CLI.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from omegaconf import DictConfig
 from unirl.trainer.diffusion import DiffusionTrainer
 
 
-@hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3_trainside")
+@hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3/sd3_trainside")
 def main(cfg: DictConfig) -> None:
     trainer = DiffusionTrainer(
         cfg=cfg,
