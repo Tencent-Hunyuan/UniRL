@@ -200,6 +200,8 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             if neg is not None and neg.embeds is not None:
                 negative_prompt_embeds = neg.embeds
                 negative_prompt_embeds_mask = neg.attn_mask
+                if negative_prompt_embeds_mask is None:
+                    raise ValueError("QwenImageDiffusionStep.predict_noise: conditions.negative_text.attn_mask is None")
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,

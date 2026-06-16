@@ -26,21 +26,25 @@ from unirl.config.validation import validate_precision_type
 def _qwen_image_dynamic_overrides() -> Dict[str, Any]:
     """Canonical dynamic-shift params for Qwen-Image.
 
-    Mirrors upstream ``diffusers.pipelines.qwen_image.QwenImagePipeline``
-    scheduler defaults. Used by vllm_omni / sglang engines that read
+    Mirrors ``Qwen/Qwen-Image``'s ``scheduler/scheduler_config.json``
+    (max_shift 0.9, max_image_seq_len 8192, shift_terminal 0.02 — NOT the
+    Flux-flavored ``calculate_shift`` defaults this dict previously carried).
+    Used by vllm_omni / sglang engines that read
     ``model_config.dynamic_shift_overrides`` when constructing
     :class:`FlowMatchSchedulePolicy` for an HF-repo-id path where
-    ``scheduler/scheduler_config.json`` can't be read directly.
+    ``scheduler/scheduler_config.json`` can't be read directly; a local
+    checkpoint dir reads the real JSON and must produce the same values.
 
     Trainside engine reads these via ``QwenImagePipeline.build_schedule_policy``.
     Keep the two paths in sync if anything here changes.
     """
     return {
         "base_shift": 0.5,
-        "max_shift": 1.15,
+        "max_shift": 0.9,
         "base_image_seq_len": 256,
-        "max_image_seq_len": 4096,
+        "max_image_seq_len": 8192,
         "time_shift_type": "exponential",
+        "shift_terminal": 0.02,
         "vae_scale_factor": 8,
         "patch_size": 2,
     }

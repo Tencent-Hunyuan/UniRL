@@ -33,7 +33,7 @@ batch.
 The dual-adapter mechanics (install / EMA / switch) live in the EMA
 policy owned by the FSDP backend. The algorithm receives the policy
 via constructor injection (``nft_lora_policy=...``, resolved off
-``backend.ema`` by the v2 trainer) and calls its ``with_old_adapter()``
+``backend.ema`` by the v2 trainer) and calls its ``use_shadow()``
 context manager to obtain :math:`old_pred`.
 """
 
@@ -328,7 +328,7 @@ class DiffusionNFT(StageAlgorithm):
             sigma=t_batch,
             params=self.params,
         )
-        # Reference adapter forward, detached. ``with_old_adapter``
+        # Reference adapter forward, detached. ``use_shadow``
         # temporarily activates the EMA-tracked adapter; the surrounding
         # ``no_grad`` keeps autograd off this branch.
         with torch.no_grad(), self.nft_lora_policy.use_shadow():

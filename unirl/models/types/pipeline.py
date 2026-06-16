@@ -21,7 +21,7 @@ docstring so multiple bundles don't drift on the same key names.
 σ schedule contract
 -------------------
 Diffusion pipelines no longer own σ construction. The engine adapter that
-hosts the pipeline (``TrainsideRolloutEngine``, ``SGLangRolloutEngine``,
+hosts the pipeline (``TrainsideRolloutEngine``, ``SGLangDiffusionRolloutEngine``,
 ``VLLMOmniRolloutEngine``) pins ``RolloutReq.sigmas`` via
 :func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
 ``pipeline.generate(req)``; the pipeline reads ``req.sigmas`` and uses it

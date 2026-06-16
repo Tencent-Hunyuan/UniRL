@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
-# (unirl/rollout/engine/sglang/_patches/, LIN-365) is verified against
+# (unirl/rollout/engine/sglang_diffusion/_patches/, LIN-365) is verified against
 # (sde/cps parity + SD3 GRPO e2e). sglang >=0.5.11 is CUDA-13-native: its
 # kernel stack (sglang-kernel, sgl-deep-gemm, cuda-python>=13) ships cu13
 # binaries only, so this extra pins the matching torch +cu130 family and the

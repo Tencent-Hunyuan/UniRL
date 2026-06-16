@@ -1,4 +1,4 @@
-"""TensorHandle — tensor reference for the Single Controller.
+"""GPUTensorHandle — tensor reference for the Single Controller.
 
 A reference-counted handle to a single tensor stored in a worker. It manages its
 own GC via weakref.finalize and flows between worker and controller via Ray RPC
@@ -19,7 +19,7 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 
-class TensorHandle:
+class GPUTensorHandle:
     """Handle to a single tensor stored in a worker.
 
     Two phases of life:
@@ -66,23 +66,23 @@ class TensorHandle:
         no decref RPC needed.
         """
         assert not self._finalized, (
-            f"TensorHandle {self.store_key!r} is already bound. rebind() must only be called once."
+            f"GPUTensorHandle {self.store_key!r} is already bound. rebind() must only be called once."
         )
         self._finalized = True
         self.worker_handle = worker_handle
         if self.object_ref is None:
             # CUDA tensor: register finalizer for decref RPC
-            weakref.finalize(self, TensorHandle._release, worker_handle, self.store_key)
+            weakref.finalize(self, GPUTensorHandle._release, worker_handle, self.store_key)
 
     # ── Remote operations ──
 
     def remote_op_async(self, op: str, *args) -> Any:
         """Fire remote tensor_op on the worker, return ObjectRef (does not wait)."""
-        assert self.worker_handle is not None, "TensorHandle not bound"
+        assert self.worker_handle is not None, "GPUTensorHandle not bound"
         return self.worker_handle.transport_op.remote("tensor_op", self, op, *args)
 
-    def remote_op(self, op: str, *args) -> TensorHandle:
-        """Execute remote tensor_op synchronously, return new bound TensorHandle."""
+    def remote_op(self, op: str, *args) -> GPUTensorHandle:
+        """Execute remote tensor_op synchronously, return new bound GPUTensorHandle."""
         new_h = ray.get(self.remote_op_async(op, *args))
         new_h.rebind(self.worker_handle)
         return new_h
@@ -91,37 +91,26 @@ class TensorHandle:
         """Fetch the actual tensor to controller CPU."""
         if self.object_ref is not None:
             return ray.get(self.object_ref)
-        assert self.worker_handle is not None, "TensorHandle not bound to worker"
+        assert self.worker_handle is not None, "GPUTensorHandle not bound to worker"
         return ray.get(self.worker_handle.transport_op.remote("get_cpu", self))
 
     # ── Copy protocols ──
 
-    def __copy__(self) -> TensorHandle:
+    def __copy__(self) -> GPUTensorHandle:
         if self.worker_handle is not None and self.object_ref is None:
             # CUDA tensor: explicit incref to keep tensor alive in the worker
             self.worker_handle.transport_op.remote("incref", self.store_key)
-        clone = TensorHandle(
+        clone = GPUTensorHandle(
             self.store_key, self.source_id, self.shape, self.dtype, self.device, object_ref=self.object_ref
         )
         if self.worker_handle is not None:
             clone.rebind(self.worker_handle)
         return clone
 
-    def __deepcopy__(self, memo) -> TensorHandle:
+    def __deepcopy__(self, memo) -> GPUTensorHandle:
         clone = self.__copy__()
         memo[id(self)] = clone
         return clone
-
-    def routing_copy(self) -> TensorHandle:
-        """A bare, unbound same-fields copy used as an id()-keyed transfer placeholder.
-
-        Unlike __copy__ this does NOT incref or rebind — it is a disposable token the
-        controller plants in a shard tree and matches by identity after NCCL recv, so
-        dropping it must not touch the source tensor's ref count.
-        """
-        return TensorHandle(
-            self.store_key, self.source_id, self.shape, self.dtype, self.device, object_ref=self.object_ref
-        )
 
     # ── Pickle protocol (for Ray RPC) ──
 
@@ -163,4 +152,4 @@ class TensorHandle:
 
     def __repr__(self) -> str:
         bound = "bound" if self.worker_handle else "unbound"
-        return f"TensorHandle({self.shape}, {self.dtype}, source_id={self.source_id}, {bound})"
+        return f"GPUTensorHandle({self.shape}, {self.dtype}, source_id={self.source_id}, {bound})"

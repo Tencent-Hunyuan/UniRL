@@ -53,7 +53,7 @@ def validate_precision_type(value: Any, *, field: str) -> str:
     return _CANONICAL_BY_DTYPE[dtype].value
 
 
-_SGLANG_ENGINE_TARGET_SUFFIX = "SGLangRolloutEngine"
+_SGLANG_ENGINE_TARGET_SUFFIX = "SGLangDiffusionRolloutEngine"
 _VLLM_OMNI_ENGINE_TARGET_SUFFIX = "VLLMOmniRolloutEngine"
 _TRAINSIDE_ENGINE_TARGET_SUFFIX = "TrainsideRolloutEngine"
 _DIRECT_SAMPLING_ENGINE_SUFFIXES: tuple = (_TRAINSIDE_ENGINE_TARGET_SUFFIX,)
@@ -144,7 +144,7 @@ def validate_rollout_layout(cfg: DictConfig) -> None:
         engine_target = str(cfg.rollout.engine.get("_target_") or "")
         require(
             engine_target.endswith(_SGLANG_ENGINE_TARGET_SUFFIX),
-            f"multi-GPU colocated rollout (num_rollout_gpus_per_actor={num_gpus_per_actor}, colocate=True) requires the sglang engine; got rollout.engine._target_={engine_target!r}",
+            f"multi-GPU colocated rollout (num_rollout_gpus_per_actor={num_gpus_per_actor}, colocate=True) requires the sglang_diffusion engine; got rollout.engine._target_={engine_target!r}",
         )
 
 

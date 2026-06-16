@@ -157,9 +157,9 @@ backend:
       - to_qkv_mlp_proj
 
 rollout:
-  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: flux2_klein
     # SGLang's Klein pipeline emits the Qwen3-layer-concat prompt_embeds;
     # populate_conditions packs them into TextEmbedCondition so trainer-side
