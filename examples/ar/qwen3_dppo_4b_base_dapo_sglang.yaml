@@ -1,0 +1,233 @@
+# @package _global_
+# AR DPPO Qwen3-4B-Base on DAPO-Math — v2 trainer (ARTrainer), SGLang rollout, 32 GPU.
+#
+# Faithful port of the reference recipe (MaxwellJryao/SPO-DPPO run_qwen3_4b.sh +
+# verl core_algos.py) to reproduce the DPPO AIME curve:
+#   - DPPO (paper §3, Qi et al. arXiv:2602.04879): the UNIFORM Binary-TV trust
+#     region. Keep token t iff A_t*(r_t-1) <= 0 OR |pi - mu| <= dppo_delta;
+#     loss L = E[sum_t keep_t * (-A_t*r_t)] — a hard 0/1 mask with the SAME
+#     threshold for every token (CPPO/DRPO are the position-weighted / smoothed
+#     siblings of this exact trust region).
+#   - loss_agg_mode=seq-mean-token-sum-norm (per-seq token-sum / horizon)
+#   - normalize_adv_by_std=false (mean-center-only advantage)
+#   - n=8 samples/prompt x batch=64 prompts = 512 samples/rollout
+#   - base model + temperature=1.0 (high-entropy exploration; the instruct model
+#     freezes — grad_norm ~0.0008 — because hard DAPO prompts give zero-std GRPO
+#     groups, while the base model yields mixed right/wrong groups → real gradient).
+#
+# Data prep (one-time) — build the local jsonl from the raw DAPO-Math-17k dataset:
+#   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+#   → data/dapo_math/{train.jsonl, aime_eval.jsonl}
+#
+# Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
+# to a local checkpoint dir to use a cache. DATA_PATH is required (local jsonl):
+#   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen3_dppo_4b_base_dapo_sglang num_devices=32
+
+num_devices: 32
+batch_size: 64 # prompts_per_rollout
+num_rollouts: 800
+weight_sync_interval: 1 # push the full dense weights into SGLang every rollout
+# AIME eval every 10 rollouts + a pre-train baseline (rollout -1) — mirrors the verl
+# run's test_freq=10 + val_before_train=True. The eval_* defaults already match verl
+# val: 60 prompts (AIME24+25), 16 samples/prompt, temperature 1.0 (train top_k/top_p
+# are inherited). Requires EVAL_DATA_PATH (data/dapo_math/aime_eval.jsonl).
+eval_interval: 10
+
+# ARTrainer advantage scope (per-group mean/std).
+adv_normalization_scope: group
+# false = mean-center-only advantage (reward - group_mean), no std division —
+# removes the GRPO difficulty bias (reference norm_adv_by_std_in_grpo=False).
+normalize_adv_by_std: false
+# Reorder the rollout batch driver-side so each DP shard gets a similar token
+# total (verl trainer.balance_batch parity). GRPO groups are dispatched as
+# consecutive siblings, so without this one rank draws a hard prompt's 8 long
+# answers and straggles the whole FSDP step. Measured: train 28.4s -> 15.3s.
+balance_shards: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-dppo
+  run_name: dppo_qwen3-4b-base_dapo_sglang
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [dppo, qwen3, 4b-base, dapo, sglang, v2]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    # fp32 STORAGE = Megatron-parity master weights (verl's FSDP actor also
+    # loads fp32). FSDP2's mp_policy still computes/communicates bf16; AdamW
+    # steps land exactly in fp32 instead of rounding away below the bf16 ULP
+    # (lr 1e-6 vs ULP ~7.8e-5 at |w|~0.02 → most updates silently vanished).
+    model_precision: fp32
+    autocast_precision: bf16
+    logprob_precision: fp32
+    use_gradient_checkpointing: true
+
+pipeline:
+  # from_bundle shares the trainer-injected bundle. NO system_instruction +
+  # thinking ON: the paper trains Qwen3-4B-Base with emergent long CoT (8192
+  # response budget; response length grows to 3-5k tokens). MUST match the
+  # rollout chat_template (enable_thinking: true) so train/rollout prompts agree.
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  # fp32: keep the per-token logp un-rounded. The Binary-TV divergence |pi - mu|
+  # is a subtraction of two near-equal probabilities, so a bf16 logp CAST adds
+  # ±0.002-0.008 nat/token noise that leaks straight into the mask decision near
+  # the dppo_delta boundary. verl stores fp32 (flash-attn xentropy) — parity.
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false  # true overlaps each block's all-gather with compute (multi-node win; uses the default root wrap)
+    defer_grad_sync: false  # true = one reduce-scatter per optimizer step (ZeRO-2 only — needs reshard_after_forward: false; parity-check before enabling)
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    # 0.01 = the released verl run's AdamW default (verl OptimizerConfig.weight_decay,
+    # constant-wd schedule on its Megatron path; the script overrides only lr).
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  # FULL fine-tuning (no lora_cfg) — the paper trains full parameters (Megatron).
+  # FSDP shards the 4B; full dense weights are pushed into SGLang each rollout via
+  # the TensorWeightSync below (requires rollout enable_lora: false).
+
+rollout:
+  # SGLang LLM engine, colocate (time-shares each GPU with the FSDP train shard
+  # via sleep()/wake_up()). tp_size=1 → one single-GPU engine per rank.
+  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
+    # one completion per entry (n=1); else samples double-count.
+    samples_pre_expanded: true
+    # thinking ON (paper) — no /no_think system message; MUST match the
+    # pipeline chat_template (enable_thinking) or train/rollout prompts diverge.
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
+      # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
+      # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
+      # cuda_graph_max_bs=16 so its captured buffers stay small (the default 256
+      # would balloon server memory + compete with the weight push).
+      mem_fraction_static: 0.3
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  # math-verify (the paper's grader). 1.0 if the parsed answer matches the ground
+  # truth else 0.0. Unlike MathBoxed it extracts the final answer even without
+  # \boxed{} (Qwen3-Base + thinking often reasons to the answer unboxed), so it
+  # does not under-count correct generations / inflate zero-advantage groups.
+  _target_: unirl.reward.service.RewardService
+  # keep = score the partial text of truncated (length-capped) traces instead of
+  # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  # DPPO implements the paper's UNIFORM Binary-TV trust region: GRPO's token-level
+  # ratio-advantage surrogate with a hard keep/reject mask under a single threshold
+  # delta for every token (NO position weight / prefix budget — that is CPPO; NOT a
+  # smooth quadratic — that is DRPO). keep_t = (A_t*(r_t-1) <= 0) OR (|pi-mu| <= delta).
+  _target_: unirl.algorithms.dppo.DPPO
+  stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
+  dppo_delta: 0.15 # δ: uniform token-level Binary-TV threshold (0.15 dense; paper §4)
+  loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
+  horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
+  # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
+  # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1,
+  # and the Binary-TV divergence |pi-mu| reflects only policy drift).
+  sampling_temperature: 1.0
+  # rollout = anchor the ratio AND the Binary-TV divergence μ on the SGLang
+  # sampler's emitted logprobs for ALL 4 mini-batch updates below — exact parity
+  # with the released verl run (rollout_correction.bypass_mode=True). This is the
+  # behavior policy DPPO's trust region is defined against. 'replay' instead
+  # freezes a train-side π_old at pre-update weights (mb1 ratio≡1, pure drift).
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  # FULL-weight colocate sync: push the full dense FSDP weights into the SGLang
+  # server each rollout via update_weights_from_tensor. Qwen3's HF param names
+  # (model.layers.*, lm_head.weight) match SGLang's Qwen3 weight map (qkv/gate_up
+  # fused server-side), so NO name_remap is needed. tensor.py frees each bucket's
+  # gathered tensors (empty_cache) so the all-gather doesn't OOM the colocated server.
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # 4 disjoint mini-batch optimizer steps per rollout, 128 trajectories each —
+  # matches the RELEASED verl run script (run_qwen3_4b.sh: ppo_mini_batch_size=16
+  # prompts × n=8 = 128; 512/128 = 4 steps). Engages DPPO's trust region on the
+  # increasingly off-policy steps 2-4 (π_old frozen per algorithm.old_logp_source;
+  # DPPO.supports_multi_update=True). dp=32 → per-worker shard 16 samples, 16%4==0 OK.
+  num_updates_per_batch: 4
+  # verl ppo_max_token_len_per_gpu parity: pack each mini-batch into micro-batches
+  # under a token budget (length-sorted bin packing) instead of fixed-count slicing.
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # local jsonl; build with unirl/utils/prepare_dapo_math.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 64 # 64 prompts x 8 samples = 512 / rollout
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  # paper lists only temperature=1.0 → unrestricted sampling. top_k=0 (engine maps
+  # to SGLang -1 = off) is REQUIRED: top_k=20 (Qwen3 generation_config default)
+  # peaks sampling → low intra-group diversity → GRPO advantages collapse → frozen.
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192
