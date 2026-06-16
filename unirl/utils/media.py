@@ -48,4 +48,19 @@ def tensor_to_pil(images: torch.Tensor) -> List[Any]:
     return pil_images
 
 
-__all__ = ["tensor_frame_to_pil", "tensor_to_pil"]
+def hstack_pils(left: Any, right: Any) -> Any:
+    """Stack two PIL images side by side ("input | output"), matching heights."""
+    try:
+        from PIL import Image
+    except Exception:
+        return right
+    if right.height != left.height:
+        new_w = max(1, int(round(right.width * left.height / right.height)))
+        right = right.resize((new_w, left.height))
+    canvas = Image.new("RGB", (left.width + right.width, left.height))
+    canvas.paste(left.convert("RGB"), (0, 0))
+    canvas.paste(right.convert("RGB"), (left.width, 0))
+    return canvas
+
+
+__all__ = ["tensor_frame_to_pil", "tensor_to_pil", "hstack_pils"]
