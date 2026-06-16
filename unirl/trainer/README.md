@@ -59,9 +59,10 @@ matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 
 Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
 `UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the
-model state (`save_mode=full`: frozen base + LoRA adapters; `save_mode=adapter`:
-LoRA keys only — MBs instead of GBs), the optimizer state (gathered full via
-DCP — not per-rank shards; it only ever covers the trainable params, so it is
+model state (`save_mode=auto`: LoRA-only when LoRA is active, otherwise full;
+`save_mode=full`: frozen base + LoRA adapters; `save_mode=adapter`: LoRA keys
+only — MBs instead of GBs), the optimizer state (gathered full via DCP — not
+per-rank shards; it only ever covers the trainable params, so it is
 adapter-sized either way), the scheduler state, the step counters (`step`,
 `optimizer_step_count`), and the LoRA config (rank / alpha / target_modules —
 export tooling reads its scaling from it) — enough to resume training. Each one is written to
@@ -86,7 +87,7 @@ Driven by top-level config keys, read by the entrypoints and forwarded to
 | --- | --- | --- |
 | `save_interval` | `0` | Save every N rollouts (and on the last); `0` disables saving. |
 | `save_dir` | `./checkpoints` | Output folder for `checkpoint-<step>/`, resolved on the driver (with Hydra's legacy chdir the default lands in the run output dir). |
-| `save_mode` | `full` | `full` = whole model state; `adapter` = LoRA keys only (the frozen base reloads from the pretrained snapshot on resume). |
+| `save_mode` | `auto` | `auto` = LoRA-only when LoRA is active, otherwise full; `full` = whole model state; `adapter` = LoRA keys only (the frozen base reloads from the pretrained snapshot on resume). |
 | `load_dir` | unset | A checkpoint dir to restore and resume from; unset trains fresh. |
 
 These keys are not in the recipe YAMLs, so append them with Hydra's `+` syntax.
@@ -107,14 +108,21 @@ bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
     +load_dir=/ckpts/sd3_run/checkpoint-400 \
     +save_interval=200 +save_dir=/ckpts/sd3_run +save_mode=adapter
 
-# 3. Export: fold the LoRA into the base weights (scaling from the checkpoint's
-#    recorded lora_config) and write a standard save_pretrained folder
-python -m unirl.tools.export_hf \
+# 3a. Export a merged model: fold the LoRA into the base weights (scaling from
+#     the checkpoint's recorded lora_config) and write a standard save_pretrained folder
+python -m unirl.tools.export_full \
     --checkpoint /ckpts/sd3_run/checkpoint-1000 \
     --base stabilityai/stable-diffusion-3.5-medium --subfolder transformer \
     --output /ckpts/sd3_run/hf-1000
 
-# 4. Share / use
+# 3b. Or export a PEFT adapter artifact (adapter_model.safetensors +
+#     adapter_config.json) for LoRA-aware loaders
+python -m unirl.tools.export_adapter \
+    --checkpoint /ckpts/sd3_run/checkpoint-1000 \
+    --base stabilityai/stable-diffusion-3.5-medium \
+    --output /ckpts/sd3_run/adapter-1000
+
+# 4. Share / use the merged model or adapter folder
 hf upload <user>/<repo> /ckpts/sd3_run/hf-1000
 #   transformer = AutoModel.from_pretrained("<user>/<repo>", torch_dtype=torch.bfloat16)
 #   pipe = StableDiffusion3Pipeline.from_pretrained(base, transformer=transformer)
@@ -135,15 +143,17 @@ The wandb run also continues: `trainer_state.json` (driver-written, beside
 `checkpoint.pt` is a raw training checkpoint (PEFT-injected names, optimizer
 state), not a release artifact. The offline checkpoint toolset lives in
 `unirl/tools/` (the runtime counterpart for engine weight sync is
-`unirl/utils/peft_merge.py`): `export_hf` folds the LoRA delta into the base
-weights and writes a standard `save_pretrained` folder — step 3 above.
+`unirl/utils/peft_merge.py`): `export_full` folds the LoRA delta into the base
+weights and writes a standard `save_pretrained` folder; `export_adapter`
+extracts a single adapter into a PEFT adapter folder.
 
 Works with both checkpoint flavors: `save_mode=full` merges self-contained;
 `save_mode=adapter` folds the LoRA keys onto the freshly loaded base weights.
 The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
 `--lora-alpha` overrides it (needed only for checkpoints predating the record).
-AR models: `--library transformers`, no `--subfolder`. NFT runs can export the
-EMA shadow adapter with `--adapter old`.
+AR models: `--library transformers`, no `--subfolder`. For adapter artifacts,
+use `python -m unirl.tools.export_adapter --checkpoint ... --base ... --output ...`.
+NFT runs can export the EMA shadow adapter with `--adapter old`.
 
 ## Gotchas
 
