@@ -370,7 +370,6 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
     if not found_any_stage0:
         return None
 
-    n = len(rows_tokens)
     tokens_list: List[torch.Tensor] = [torch.tensor(toks, dtype=torch.long) for toks in rows_tokens]
     have_logp = all(lp is not None for toks, lp in zip(rows_tokens, rows_logps) if toks)
     log_probs_list: Optional[List[torch.Tensor]] = None
@@ -378,8 +377,6 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
         log_probs_list = [lp if lp is not None else torch.zeros(0, dtype=torch.float32) for lp in rows_logps]
 
     return TextSegment.pack(
-        sample_indices=torch.arange(n, dtype=torch.long),
-        positions=torch.zeros(n, dtype=torch.long),
         tokens=tokens_list,
         log_probs=log_probs_list,
     )
