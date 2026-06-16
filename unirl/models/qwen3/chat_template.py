@@ -62,10 +62,15 @@ class Qwen3ChatTemplateStage(EmbedStage[Texts, Qwen3ARConditions]):
                 enable_thinking=self.enable_thinking,
                 tokenize=True,
                 return_tensors="pt",
+                return_dict=False,
                 truncation=True,
                 max_length=self.max_prompt_length,
             )
-            # apply_chat_template returns [1, L]; squeeze the leading dim.
+            # transformers v5 flipped apply_chat_template's `return_dict` default
+            # from False to True: it now returns a BatchEncoding, and integer-
+            # indexing a fast-tokenizer BatchEncoding yields a tokenizers.Encoding
+            # (no `.to`), not a tensor. Pin return_dict=False so we keep the bare
+            # input_ids [1, L] tensor identically across v4/v5; squeeze leading dim.
             per_sample_ids.append(ids[0].to(device=device, dtype=torch.long))
 
         # Right-pad to the in-batch max so the AR loop can use a single tensor.
