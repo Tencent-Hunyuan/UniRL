@@ -511,6 +511,12 @@ class FSDPBackend(Remote):
         meta_path = os.path.join(path, "metadata.pt")
         meta: Dict[str, object] = torch.load(meta_path, map_location="cpu")
         mode = str(meta.get("save_mode", "full"))
+        # Symmetric with _save_dcp: a trainable param on meta would be dropped by
+        # drop_meta_entries below and then left unresolved by the non-strict load
+        # (has_meta_params relaxes strict), silently keeping its pre-load weights.
+        # Reject it here; the remaining meta is the frozen aux that legitimately
+        # relaxes strict.
+        self._reject_trainable_meta_params("load")
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
@@ -551,8 +557,8 @@ class FSDPBackend(Remote):
     def _reject_trainable_meta_params(self, op: str) -> None:
         """Fail fast on *trainable* params left on meta (the sharded "dcp" path).
 
-        The DCP save drops every meta entry, which is correct for the frozen aux
-        (vae / vit) that meta-init bundles never materialize. But a param that is
+        Both DCP save and load drop every meta entry, which is correct for the
+        frozen aux (vae / vit) that meta-init bundles never materialize. But a param that is
         ``requires_grad`` AND on meta is a materialize bug, not aux — dropping it
         would silently produce a checkpoint missing trained weights. ``requires_grad``
         is what tells the two apart, so this guard rejects only the former and
