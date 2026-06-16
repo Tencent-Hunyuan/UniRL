@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import torch
 from torch import Tensor, nn
@@ -27,9 +27,82 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     return _to_cpu_state_dict(full)
 
 
-def load_model_state_dict(model: nn.Module, state_dict: StateDict) -> None:
-    """Load a full state dict, broadcasting from rank 0 across ranks."""
+def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
+    """Load a full state dict, broadcasting from rank 0 across ranks.
+
+    ``strict=False`` loads a partial dict (adapter-only checkpoints): keys
+    absent from ``state_dict`` keep the model's current weights.
+    """
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+    options = _build_state_dict_options(
+        full_state_dict=True,
+        broadcast_from_rank0=True,
+        cpu_offload=False,
+        strict=strict,
+    )
+    try:
+        set_model_state_dict(model, state_dict, options=options)
+    except TypeError:
+        set_model_state_dict(model, state_dict)
+
+
+def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
+    """Rank-0 DCP gather of optimizer state.  Full state on rank 0, empty on others.
+
+    All ranks must call this (the gather is a collective).  Values are full
+    (unsharded) CPU tensors keyed by parameter FQN — symmetric with
+    :func:`gather_state_dict`.  ``optimizer.state_dict()`` is NOT a substitute:
+    under FSDP2 its values are this rank's local DTensor shards.
+    """
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
+    try:
+        full = dict(get_optimizer_state_dict(model, optimizer, options=options))
+    except TypeError:
+        full = dict(get_optimizer_state_dict(model, optimizer))
+
+    if _current_rank() != 0:
+        return {}
+    return full
+
+
+def gather_lora_state_dict(model: nn.Module) -> StateDict:
+    """Gather every adapter's LoRA tensors, preserving the model state-dict key format.
+
+    Unlike :func:`gather_state_dict`, this never asks DCP for the full model
+    state. Each LoRA DTensor is materialized directly, so adapter-only
+    checkpoints avoid full-model CPU memory and wire traffic. CPU-offloaded
+    DTensor shards are moved to CUDA one tensor at a time before the collective,
+    because this stack initializes the train mesh with NCCL, not a CPU backend.
+    All ranks must call this because DTensor materialization is collective; only
+    rank 0 returns the gathered CPU tensors.
+    """
+    gathered: StateDict = {}
+    for key, value in model.state_dict().items():
+        if "lora_A" not in key and "lora_B" not in key:
+            continue
+        if isinstance(value, torch.Tensor) and value.is_meta:
+            raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")
+        materialized = _materialize_checkpoint_tensor(value)
+        if isinstance(materialized, torch.Tensor):
+            materialized = materialized.detach().cpu()
+        if _current_rank() == 0:
+            gathered[key] = materialized
+    if _current_rank() != 0:
+        return {}
+    return gathered
+
+
+def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
+    """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
+
+    Pass the rank-0 dict from :func:`gather_optimizer_state_dict`; other ranks
+    pass ``{}`` (their input is ignored — tensors broadcast from rank 0 and
+    re-shard into each rank's local state).
+    """
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(
         full_state_dict=True,
@@ -37,9 +110,9 @@ def load_model_state_dict(model: nn.Module, state_dict: StateDict) -> None:
         cpu_offload=False,
     )
     try:
-        set_model_state_dict(model, state_dict, options=options)
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
     except TypeError:
-        set_model_state_dict(model, state_dict)
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
 def local_view(tensor: Tensor) -> Tensor:
@@ -55,40 +128,6 @@ def is_materialized(model: nn.Module) -> bool:
 
 def trainable_params(model: nn.Module) -> Iterator[Parameter]:
     return (p for p in model.parameters() if p.requires_grad)
-
-
-def lora_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-) -> StateDict:
-    """Adapter-only state for inference export.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    return {k: v for k, v in full_sd.items() if _is_lora_key(k)}
-
-
-def nft_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-    shadow_adapter: str = "old",
-) -> StateDict:
-    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    token = f".{shadow_adapter}."
-    return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
 
 
 def clip_grad_norm(
@@ -186,11 +225,6 @@ def _current_rank() -> int:
     return 0
 
 
-def _is_lora_key(key: str) -> bool:
-    """True for default-adapter LoRA keys (excludes shadow/old adapter)."""
-    return ("lora_A" in key or "lora_B" in key) and ".old." not in key
-
-
 def _build_state_dict_options(**kwargs: object) -> object:
     from torch.distributed.checkpoint.state_dict import StateDictOptions
 
@@ -214,6 +248,19 @@ def _maybe_dtensor_to_tensor(value: object) -> object:
     return value
 
 
+def _materialize_checkpoint_tensor(value: object) -> object:
+    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
+        device = getattr(value, "device", None)
+        if (
+            getattr(device, "type", None) == "cpu"
+            and torch.cuda.is_available()
+            and hasattr(value, "cuda")
+            and callable(getattr(value, "cuda"))
+        ):
+            value = value.cuda()
+    return _maybe_dtensor_to_tensor(value)
+
+
 def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     converted: StateDict = {}
     for key, value in state_dict.items():
@@ -225,68 +272,34 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
-def sync_unsharded_grads(params: List[Parameter]) -> int:
-    """All-reduce-AVG the grads of plain (non-DTensor) params across ranks.
-
-    Per-block ``fully_shard`` leaves the params outside the wrapped blocks
-    (embed / final norm / lm_head — for Qwen3-4B the tied embed/head matrix
-    is ~10% of the model) as plain replicated tensors. FSDP never reduces
-    their grads, so without this every rank steps its own copy with its
-    local-batch gradient and the replicas silently drift apart. Average
-    them like DDP would, once per optimizer step (after accumulation,
-    before clipping). Returns the number of params synced.
-    """
-    import torch.distributed as dist
-
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
-        return 0
-    n = 0
-    for param in params:
-        grad = getattr(param, "grad", None)
-        if grad is None:
-            continue
-        if hasattr(grad, "to_local") and callable(getattr(grad, "to_local")):
-            continue  # sharded DTensor grad: FSDP reduce-scatter owns it
-        if not isinstance(grad, Tensor):
-            continue
-        dist.all_reduce(grad, op=dist.ReduceOp.AVG)
-        n += 1
-    return n
-
-
 def _global_clip_for_sharded_grads(
     params: List[Parameter],
     max_grad_norm: float,
 ) -> Tensor:
-    """Explicit global-norm gradient clipping for mixed Tensor/DTensor params.
+    """Explicit global-norm gradient clipping for FSDP DTensor grads.
 
     Ported from the deleted FSDPPolicy._global_clip_for_sharded_grads.
-    Handles two FSDP corner cases that the standard clip_grad_norm_ path
-    can't: (1) mixed regular Tensor + DTensor params from per-block
-    fully_shard without root wrap, and (2) CPU DTensor collectives
-    missing under cpu_offload.
+    Handles the FSDP corner case the standard clip_grad_norm_ path can't:
+    CPU DTensor collectives missing under cpu_offload. Every grad here is a
+    sharded DTensor: the root wrap claims all leftover params, and
+    ``fsdp_wrap`` fails fast on trainable params outside every group when
+    ``root_wrap`` is disabled — so per-shard square sums SUM-reduce to the
+    exact global norm with no replicated double counting.
     """
     import torch.distributed as dist
 
-    world_size = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
     grads: list[Tensor] = []
     local_sq_sum = 0.0
     for param in params:
         grad = getattr(param, "grad", None)
         if grad is None:
             continue
-        is_sharded = hasattr(grad, "to_local") and callable(getattr(grad, "to_local"))
         local_grad = grad
-        if is_sharded:
-            local_grad = grad.to_local()
+        if hasattr(local_grad, "to_local") and callable(getattr(local_grad, "to_local")):
+            local_grad = local_grad.to_local()
         if not isinstance(local_grad, Tensor):
             continue
-        sq = float(torch.sum(local_grad.detach().float() ** 2).item())
-        if not is_sharded and world_size > 1:
-            # Replicated grad (identical on every rank after sync_unsharded_grads):
-            # count it once globally, not world_size times under the SUM all-reduce.
-            sq /= world_size
-        local_sq_sum += sq
+        local_sq_sum += float(torch.sum(local_grad.detach().float() ** 2).item())
         grads.append(grad)
 
     if not grads:
@@ -310,14 +323,13 @@ def _global_clip_for_sharded_grads(
 __all__ = [
     "StateDict",
     "clip_grad_norm",
-    "sync_unsharded_grads",
+    "gather_optimizer_state_dict",
     "gather_state_dict",
     "load_model_state_dict",
+    "load_optimizer_state_dict",
     "local_view",
     "is_materialized",
     "trainable_params",
-    "lora_state_dict",
-    "nft_state_dict",
     "fsdp_offload",
     "fsdp_onload",
     "infer_device",

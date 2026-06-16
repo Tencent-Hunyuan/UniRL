@@ -75,6 +75,10 @@ backend:
     reshard_after_forward: true        # 7B base: reshard to keep resident memory low
     activation_checkpointing: true     # 7B + 15-step replay: required
     use_torch_compile: false
+    # Vendored BAGEL code calls language_model.model.embed_tokens / lm_head /
+    # forward_inference directly outside a root forward (bagel.py), which is
+    # incompatible with a root fully_shard group owning those params.
+    root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-4

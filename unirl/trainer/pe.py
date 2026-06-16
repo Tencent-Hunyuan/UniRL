@@ -31,12 +31,12 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import _hydrate_tensor_meta
 from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -177,7 +177,7 @@ class PETrainer(BaseTrainer):
         ``sync_weights`` pushes each track's freshly-trained adapter into the
         engine between ``wake_up`` and ``generate`` — no-op trainside (the
         rollout shares the live FSDP modules, so the bridges are ``None``).
-        ``rollout_id`` only keys the wandb panels (see :meth:`_log_rollout`).
+        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
         self.rollout.wake_up()
@@ -209,9 +209,9 @@ class PETrainer(BaseTrainer):
         reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
         scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
         # propagate_rewards reshapes child.rewards directly (no hydration), so
-        # turn the worker-returned TensorMeta into a real tensor first.
+        # turn the worker-returned TensorRef into a real tensor first.
         if scored.rewards is not None:
-            scored.rewards = _hydrate_tensor_meta(scored.rewards)
+            scored.rewards = hydrate(scored.rewards)
         resp.tracks["diffusion"] = scored
 
         # 2. Credit-assign image reward up the lineage → fills the "ar" track
@@ -222,20 +222,28 @@ class PETrainer(BaseTrainer):
         mean_reward = 0.0
         di_rewards = resp.tracks["diffusion"].rewards
         if di_rewards is not None:
-            mean_reward = float(_hydrate_tensor_meta(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
         # 4. Per-track GRPO advantages — "ar" groups by prompt (N rewrites),
         #    "diffusion" groups by rewrite (M images).
         for name in TRACK_NAMES:
             resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
-        self._drop_decoded(resp)
+        # ``reward_req`` text is repeat_interleaved to the diffusion track size
+        # (one prompt per sample), so it captions the image previews correctly —
+        # unlike ``req`` (one prompt per group).
+        self._drop_decoded(
+            req,
+            resp,
+            rollout_id=rollout_id,
+            media_prompts={"diffusion": list(reward_req.primitives["text"].texts)},
+        )
         # 5. Route each track to its own stack (each DP_SCATTER-sharded on dispatch).
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(resp.tracks[name], training_progress=float(training_progress))
             for name in TRACK_NAMES
         }
-        self._log_rollout(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
+        self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
         return results, mean_reward
 
     def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
@@ -259,18 +267,6 @@ class PETrainer(BaseTrainer):
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
-                ar, di = results["ar"], results["diffusion"]
-                logger.info(
-                    "rollout %d/%d  reward=%.4f  ar[loss=%.4f gn=%.4f lr=%.2e]  diff[loss=%.4f gn=%.4f lr=%.2e]",
-                    rollout_id + 1,
-                    num_rollouts,
-                    mean_reward,
-                    ar.loss,
-                    ar.grad_norm,
-                    ar.lr,
-                    di.loss,
-                    di.grad_norm,
-                    di.lr,
-                )
+                self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
         finally:
             self._finish_wandb()

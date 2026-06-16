@@ -92,9 +92,9 @@ backend:
       - attn.to_v
 
 rollout:
-  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: sd3
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}

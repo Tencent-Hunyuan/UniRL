@@ -6,9 +6,9 @@ and image samples. Designed to match the logging behavior of DanceGRPO,
 FlowGRPO, DiffusionNFT, and MixGRPO for comparison and reproducibility.
 
 Usage:
-    from unirl.utils.wandb_logger import init_logger, get_logger
+    from unirl.utils.wandb_logger import init_logger
 
-    # Initialize (typically in train.py)
+    # Initialize (typically via BaseTrainer._init_wandb)
     logger = init_logger(project="unirl", run_name="exp1", config=args)
 
     # Log training metrics
@@ -18,8 +18,12 @@ Usage:
     logger.log_rollout(rollout_id=10, metrics={"reward_mean": 0.8})
 """
 
+import functools
+import logging
 import os
-from typing import Any, Dict, List, Optional
+import time
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import torch
 
@@ -29,6 +33,146 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+if TYPE_CHECKING:
+    from unirl.train.stack import TrainStepResult
+
+module_logger = logging.getLogger(__name__)
+
+
+class PhaseTimer:
+    """Per-phase wall-clock timer for one train step.
+
+    Construction starts the step total; each ``phase(name)`` block accumulates
+    into :attr:`phases` (re-entering a name adds to it, so a phase split across
+    code paths still reports one number). Feed the results straight to
+    :meth:`UniRLWandBLogger.log_rollout_step`::
+
+        timer = PhaseTimer()
+        with timer.phase("generate"):
+            resp = self.rollout.generate(req)
+        ...
+        logger.log_rollout_step(
+            rollout_id, result, resp,
+            step_time_s=timer.total(), phase_times=timer.phases,
+        )
+
+    Phases sum to ~``total()``; the residual is whatever ran outside any
+    ``phase`` block (cheap glue like logging).
+    """
+
+    def __init__(self) -> None:
+        self._t0 = time.perf_counter()
+        self.phases: Dict[str, float] = {}
+
+    @contextmanager
+    def phase(self, name: str) -> Iterator[None]:
+        """Time the enclosed block and accumulate it under ``name``."""
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t)
+
+    def total(self) -> float:
+        """Wall-clock seconds since construction (the whole step)."""
+        return time.perf_counter() - self._t0
+
+
+#: (handle attr, method, phase name) — the standard per-step collaborator
+#: handles every v2 trainer drives; missing ones (e.g. trainside has no
+#: ``weight_sync``) are skipped by :func:`install_phase_timing`.
+_STEP_PHASE_SPECS = (
+    ("rollout", "wake_up", "wake_up"),
+    ("rollout", "generate", "generate"),
+    ("rollout", "sleep", "sleep"),
+    ("weight_sync", "sync", "weight_sync"),
+    ("reward", "score_and_attach", "reward"),
+    ("stack", "train_track", "train"),
+)
+
+
+def install_phase_timing(trainer: Any) -> None:
+    """Attribute every train step into ``perf/<phase>_time_s`` — no trainer edits.
+
+    Wraps ``trainer.train_step`` to arm a fresh :class:`PhaseTimer` per step and,
+    lazily on the first step (the collaborators are created by the subclass
+    ``__init__`` after this installs, and ``_init_wandb`` replaces the logger
+    before stepping), wraps the standard collaborators from
+    ``_STEP_PHASE_SPECS`` to accumulate their wall-clocks, plus the live
+    logger's :meth:`UniRLWandBLogger.log_rollout_step` to inject the collected
+    ``phase_times`` unless the caller already passed them. The trainers' own
+    ``log_rollout_step(step_time_s=...)`` call sites stay the boundary —
+    untouched.
+
+    Handle methods are instance attributes (``handle.py`` binds them via
+    ``setattr``), so instance-level re-``setattr`` wrapping is the framework's
+    own extension mechanism. ``evaluate`` between steps also hits the wrapped
+    collaborators, but it accumulates into the stale timer of the
+    already-logged step and is discarded at the next re-arm.
+
+    Timing semantics: handle dispatch is a blocking barrier (``handle_fn``
+    does ``ray.get`` on all workers before returning), so each phase is the
+    step's true critical-path wall-clock and phases sum to ~the step total.
+    If a collaborator ever becomes async-submit (returns before the work
+    finishes), its phase collapses to submission time and the wait leaks into
+    the residual — a sudden near-zero phase plus a large
+    ``rollout_time_s - sum(phases)`` residual is the tell.
+    """
+    inner = getattr(trainer, "train_step", None)
+    if not callable(inner):
+        return
+
+    @functools.wraps(inner)
+    def _steady_step(*args, **kwargs):
+        trainer._step_timer = PhaseTimer()  # re-arm: fresh phases for this step
+        return inner(*args, **kwargs)
+
+    @functools.wraps(inner)
+    def _first_step(*args, **kwargs):
+        # First step is the earliest point the collaborators and the live logger
+        # are all constructed; wrap them once, then rebind to the lean steady
+        # wrapper so later steps just re-arm (no per-step branch, no latch flag).
+        trainer._step_timer = PhaseTimer()
+        _wrap_step_collaborators(trainer)
+        trainer.train_step = _steady_step
+        return inner(*args, **kwargs)
+
+    trainer._step_timer = PhaseTimer()  # target for any pre-step evaluate()
+    trainer.train_step = _first_step
+
+
+def _timed_call(trainer: Any, fn, phase: str):
+    """Return ``fn`` wrapped to accumulate its wall-clock under ``phase``."""
+
+    @functools.wraps(fn)
+    def _timed(*args, **kwargs):
+        with trainer._step_timer.phase(phase):
+            return fn(*args, **kwargs)
+
+    return _timed
+
+
+def _wrap_step_collaborators(trainer: Any) -> None:
+    """Time each present collaborator method, and teach the logger to emit phases."""
+    for handle_attr, method, phase in _STEP_PHASE_SPECS:
+        handle = getattr(trainer, handle_attr, None)
+        fn = getattr(handle, method, None)
+        if not callable(fn):
+            continue
+        setattr(handle, method, _timed_call(trainer, fn, phase))
+
+    # Inject the phases we collected into the logger boundary, unless the
+    # trainer already passed its own.
+    log_inner = trainer.wandb_logger.log_rollout_step
+
+    @functools.wraps(log_inner)
+    def _log_with_phases(*args, **kwargs):
+        if kwargs.get("phase_times") is None and trainer._step_timer.phases:
+            kwargs["phase_times"] = dict(trainer._step_timer.phases)
+        return log_inner(*args, **kwargs)
+
+    trainer.wandb_logger.log_rollout_step = _log_with_phases
 
 
 class UniRLWandBLogger:
@@ -42,7 +186,7 @@ class UniRLWandBLogger:
         project: WandB project name
         run_name: WandB run name
         config: Training configuration
-        image_log_interval: How often to log images (in rollouts)
+        media_log_interval: How often to log generated media (in rollouts)
     """
 
     def __init__(
@@ -52,13 +196,21 @@ class UniRLWandBLogger:
         config: Optional[Any] = None,
         log_dir: Optional[str] = None,
         rank: int = 0,
-        image_log_interval: int = 10,
+        media_log_interval: int = 1,
+        media_max_items: int = 8,
+        log_media: bool = False,
         enabled: bool = True,
         tags: Optional[List[str]] = None,
         entity: Optional[str] = None,
-        require_success: bool = False,
+        run_id: Optional[str] = None,
+        optimizer_step: int = 0,
     ):
         """Initialize WandB logger.
+
+        Enabling reporting inherently requires a successful init: when
+        ``enabled`` and a ``project`` are given, a failed/unavailable wandb
+        init raises (you asked for wandb and it could not start) rather than
+        silently training without logging.
 
         Args:
             project: WandB project name
@@ -66,21 +218,30 @@ class UniRLWandBLogger:
             config: Training configuration (dict or object with __dict__)
             log_dir: WandB run directory (if provided)
             rank: Process rank (only rank 0 logs)
-            image_log_interval: How often to log images (in rollouts)
-            enabled: Whether to enable logging
+            media_log_interval: How often to log generated media (in rollouts)
+            media_max_items: Max per-track media samples to log per logged rollout
+            log_media: Master switch for generated-media logging
+            enabled: Whether to enable logging (disabled => no-op null-object)
             tags: List of tags for the WandB run. Defaults to ['unirl'] if not provided.
             entity: WandB entity (team or username). If None, uses the default entity.
-            require_success: Raise immediately if WandB is unavailable or init fails.
+            run_id: Resume this wandb run id (from a checkpoint's
+                trainer_state.json) instead of starting a fresh run.
+            optimizer_step: Seed for the ``train/`` step axis on resume.
         """
         self.project = project
         self.run_name = run_name
         self.entity = entity
         self.log_dir = str(log_dir) if log_dir else None
-        self.image_log_interval = image_log_interval
+        self.media_log_interval = max(1, int(media_log_interval))
+        self.media_max_items = max(1, int(media_max_items))
+        self.log_media = bool(log_media)
         self.rank = rank
         self.tags = tags if tags is not None else ["unirl"]
-        self.require_success = bool(require_success)
+        self.run_id = run_id
         self._initialized = False
+        # Optimizer-step counter for the ``train/`` panel (moved here from
+        # BaseTrainer so all step-axis bookkeeping lives in the logger).
+        self._optimizer_step = int(optimizer_step)
 
         # Only enable on rank 0
         self.enabled = enabled and rank == 0
@@ -96,17 +257,24 @@ class UniRLWandBLogger:
         """Whether wandb.init completed successfully."""
         return bool(self._initialized)
 
+    @property
+    def optimizer_step(self) -> int:
+        """Current ``train/`` step-axis value — checkpointed for resume."""
+        return self._optimizer_step
+
     def _handle_init_failure(
         self,
         message: str,
         exc: Optional[BaseException] = None,
     ) -> None:
-        """Disable the logger or raise immediately when strict mode is enabled."""
-        self.enabled = False
+        """Raise when an *enabled* wandb run fails to initialize.
+
+        Reached only from the ctor's ``enabled and project`` branch, so a failure
+        here means reporting was explicitly requested and could not start —
+        surface it loudly instead of silently degrading to no logging.
+        """
         full_message = f"{message}: {exc}" if exc is not None else message
-        if self.require_success:
-            raise RuntimeError(full_message) from exc
-        print(f"Warning: {full_message}")
+        raise RuntimeError(full_message) from exc
 
     def _init_wandb(self, config: Optional[Any] = None):
         """Initialize wandb run."""
@@ -135,7 +303,13 @@ class UniRLWandBLogger:
             )
             if self.entity:
                 init_kwargs["entity"] = self.entity
+            if self.run_id:
+                # Resume the checkpoint's run ("allow": append if the id
+                # exists, else create it) so curves continue in one run.
+                init_kwargs["id"] = self.run_id
+                init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
+            self.run_id = wandb.run.id
             self._init_metric_axes()
             self._initialized = True
         except Exception as e:
@@ -431,6 +605,182 @@ class UniRLWandBLogger:
             prefix="eval/",
         )
 
+    def should_log_media(self, rollout_id: int) -> bool:
+        """Whether generated media should be captured/logged for this rollout.
+
+        Gated so trainers don't build (CPU/PIL-heavy) previews when media
+        logging is off, disabled, or this rollout isn't on the cadence.
+        """
+        return self.enabled and self.log_media and (int(rollout_id) % self.media_log_interval == 0)
+
+    def log_rollout_step(
+        self,
+        rollout_id: int,
+        results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+        resp: Any,
+        *,
+        step_time_s: Optional[float] = None,
+        phase_times: Optional[Dict[str, float]] = None,
+        trunc_len: Optional[int] = None,
+        extra_metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log one rollout's metrics to wandb. No-op when disabled.
+
+        The single per-step entry point shared by every trainer. It consumes
+        only framework-universal objects: a :class:`RolloutResp` (``resp``)
+        and a :class:`TrainStepResult` (single-track) or a ``{track:
+        TrainStepResult}`` dict (multi-track). All wandb/metric/step logic
+        lives here so trainers stay logging-free.
+
+        - ``rollout/*``: reward/advantage (and AR response-length) distribution
+          stats from ``resp.tracks`` via ``compute_rollout_resp_metrics``, plus
+          any ``extra_metrics`` (e.g. ``sync_weights``) merged in.
+        - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
+          (see :meth:`_log_train`).
+        - ``perf/rollout_time_s``: optional wall-clock for the step.
+        - ``perf/<phase>_time_s``: optional per-phase wall-clocks from
+          ``phase_times`` (e.g. ``generate``/``weight_sync``/``reward``/
+          ``train``), so the step total can be attributed without log
+          archaeology.
+
+        Generated media is NOT logged here: this runs after ``train_track``,
+        so a preview still attached to the track would have ridden into the
+        DP_SCATTER training dispatch. ``BaseTrainer._drop_decoded`` uploads
+        previews via :meth:`log_generated_media` at this same step value and
+        frees them before dispatch.
+        """
+        if not self.enabled or not self._initialized:
+            return
+        # Lazy import keeps wandb_logger importable without the training stack.
+        from unirl.utils.wandb_metrics import compute_rollout_resp_metrics
+
+        step = rollout_id + 1
+        rollout_metrics = compute_rollout_resp_metrics(resp=resp, trunc_len=trunc_len)
+        if extra_metrics:
+            rollout_metrics.update(extra_metrics)
+        self.log_rollout(step, rollout_metrics)
+
+        self._log_train(results)
+
+        perf: Dict[str, float] = {}
+        if step_time_s is not None:
+            perf["rollout_time_s"] = float(step_time_s)
+        if phase_times:
+            perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
+        if perf:
+            self.log_perf(step, perf)
+
+    def _log_train(
+        self,
+        results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+    ) -> None:
+        """Emit ``train/*`` points, per optimizer step, single- and multi-track.
+
+        Step-axis matrix (``train/step`` == ``self._optimizer_step``):
+
+        - single result, ``per_update`` empty → one aggregate point per backward.
+        - single result, ``per_update`` len N>1 → N points (one per optimizer
+          update), metrics unprefixed (the on-policy update0 then off-policy drift).
+        - dict results → metrics namespaced ``<track>/<key>``. Cross-track
+          per-update merge ONLY when every track's ``per_update`` shares the same
+          length L>1 (one optimizer driving all tracks, e.g. unified_model);
+          otherwise one aggregate point per rollout. This never interleaves the
+          independent optimizers of a per-track recipe (e.g. PE), and is
+          byte-identical to the legacy path for every single-update recipe.
+        """
+        if not self.enabled or not self._initialized:
+            return
+
+        if isinstance(results, dict):
+            per_update_lens = [len(getattr(r, "per_update", ()) or ()) for r in results.values()]
+            mergeable = bool(per_update_lens) and len(set(per_update_lens)) == 1 and per_update_lens[0] > 1
+            if mergeable:
+                length = per_update_lens[0]
+                for i in range(length):
+                    merged: Dict[str, Any] = {
+                        f"{name}/{key}": value
+                        for name, result in results.items()
+                        for key, value in dict(result.per_update[i]).items()
+                    }
+                    self._optimizer_step += 1
+                    self.log_step(self._optimizer_step, merged)
+                return
+            train_metrics: Dict[str, Any] = {
+                f"{name}/{key}": value
+                for name, result in results.items()
+                for key, value in aggregate_stage_results([result]).items()
+            }
+            if any(bool(getattr(r, "has_backward", False)) for r in results.values()):
+                self._optimizer_step += 1
+                self.log_step(self._optimizer_step, train_metrics)
+            return
+
+        # Single-track result.
+        per_update = getattr(results, "per_update", ()) or ()
+        if len(per_update) > 1:
+            for metrics in per_update:
+                self._optimizer_step += 1
+                self.log_step(self._optimizer_step, dict(metrics))
+        elif getattr(results, "has_backward", False):
+            self._optimizer_step += 1
+            self.log_step(self._optimizer_step, dict(aggregate_stage_results([results])))
+
+    def log_progress(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+        mean_reward: float,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        """Emit the one-line stdout progress summary for a rollout.
+
+        NOT gated by ``enabled`` — console progress prints even when wandb
+        reporting is off. Generic over single- and multi-track ``results``:
+        a single result renders ``loss/grad_norm/lr`` (+ ``ratio``/``clip``
+        when the algorithm reported them); a dict renders one ``name[...]``
+        group per track, preserving the richer per-track line trainers used
+        to hand-format.
+        """
+        log = logger if logger is not None else module_logger
+
+        def _metric(metrics: Any, key: str) -> Optional[float]:
+            value = (metrics or {}).get(key) if metrics is not None else None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _fmt(result: Any) -> str:
+            parts = f"loss={result.loss:.4f} gn={result.grad_norm:.4f} lr={result.lr:.2e}"
+            metrics = getattr(result, "metrics", None)
+            ratio_mean = _metric(metrics, "ratio_mean")
+            ratio_std = _metric(metrics, "ratio_std")
+            clip_fraction = _metric(metrics, "clip_fraction")
+            if ratio_mean is not None:
+                parts += f" ratio={ratio_mean:.4f}"
+                if ratio_std is not None:
+                    parts += f"±{ratio_std:.4f}"
+            if clip_fraction is not None:
+                parts += f" clip={clip_fraction:.2f}"
+            return parts
+
+        if isinstance(results, dict):
+            body = "  ".join(f"{name}[{_fmt(result)}]" for name, result in results.items())
+        else:
+            body = _fmt(results)
+        suffix = ("  " + " ".join(f"{k}={v}" for k, v in extra.items())) if extra else ""
+        log.info(
+            "rollout %d/%d  reward=%.4f  %s%s",
+            rollout_id + 1,
+            num_rollouts,
+            mean_reward,
+            body,
+            suffix,
+        )
+
     def finish(self):
         """Finish wandb run."""
         if self.enabled and self._initialized:
@@ -438,21 +788,6 @@ class UniRLWandBLogger:
                 wandb.finish()
             except Exception as e:
                 print(f"Warning: Failed to finish wandb run: {e}")
-
-
-# Global logger instance
-_global_logger: Optional[UniRLWandBLogger] = None
-
-
-def get_logger() -> Optional[UniRLWandBLogger]:
-    """Get the global wandb logger instance."""
-    return _global_logger
-
-
-def set_logger(logger: UniRLWandBLogger):
-    """Set the global wandb logger instance."""
-    global _global_logger
-    _global_logger = logger
 
 
 def init_logger(
@@ -463,10 +798,18 @@ def init_logger(
     rank: int = 0,
     tags: Optional[List[str]] = None,
     entity: Optional[str] = None,
-    require_success: bool = False,
+    log_media: bool = False,
+    media_max_items: int = 8,
+    media_log_interval: int = 1,
+    enabled: bool = True,
     **kwargs,
 ) -> UniRLWandBLogger:
-    """Initialize and set the global wandb logger.
+    """Construct a :class:`UniRLWandBLogger`.
+
+    Always returns a logger instance. Pass ``enabled=False`` (the BaseTrainer
+    factory does this when reporting is off) for a no-op null-object whose wandb
+    methods short-circuit while ``log_progress`` still prints. An *enabled* run
+    that fails to init raises (success is inherent to enabling — no opt-out flag).
 
     Args:
         project: WandB project name
@@ -475,14 +818,16 @@ def init_logger(
         rank: Process rank
         tags: List of tags for the WandB run. Defaults to ['unirl'] if not provided.
         entity: WandB entity (team or username). If None, uses the default entity.
-        require_success: Raise immediately if WandB init fails.
+        log_media: Master switch for generated-media logging.
+        media_max_items: Max per-track media samples per logged rollout.
+        media_log_interval: How often (in rollouts) to log media.
+        enabled: Whether logging is enabled at all.
         **kwargs: Additional arguments for UniRLWandBLogger
 
     Returns:
-        The initialized logger
+        The constructed logger
     """
-    global _global_logger
-    _global_logger = UniRLWandBLogger(
+    return UniRLWandBLogger(
         project=project,
         run_name=run_name,
         config=config,
@@ -490,10 +835,12 @@ def init_logger(
         rank=rank,
         tags=tags,
         entity=entity,
-        require_success=require_success,
+        log_media=log_media,
+        media_max_items=media_max_items,
+        media_log_interval=media_log_interval,
+        enabled=enabled,
         **kwargs,
     )
-    return _global_logger
 
 
 def aggregate_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:

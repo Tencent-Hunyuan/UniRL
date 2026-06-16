@@ -196,6 +196,25 @@ rewards:
       dtype: bfloat16
       device: cuda
 
+  # ─────────────── EditReward (image editing quality) ───────────────
+  # EditReward — Qwen2.5-VL-7B multi-head reward model for instruction-guided
+  # image editing. Evaluates instruction following (dim1, 1-4) and visual
+  # quality (dim2, 1-4). Expects 2-turn history: source → edited.
+  # ~14GB VRAM at bfloat16. Keep max_concurrency=1 (7B model, sequential).
+  - name: editreward
+    scorer: editreward
+    runtime_env: envs/editreward.txt
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      checkpoint_path: /path/to/EditReward/checkpoint
+      config_path: null  # null = use default config bundled in EditReward package
+      device: cuda
+      dtype: bfloat16
+      rm_head_type: ranknet_multi_head
+
   # ─────────────── GenEval (compositional) — DISABLED ───────────────
   # Classic GenEval: Mask2Former (mmdet) object detection + CLIP color
   # classification, scoring object count / color / position constraints

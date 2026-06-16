@@ -85,7 +85,7 @@ backend:
       - attn.to_v
 
 rollout:
-  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   # model_config carries the σ-schedule `shift` + checkpoint path; share the
   # bundle's config (the worker materializes the nested _target_).
   model_config: ${bundle.config}
@@ -94,7 +94,7 @@ rollout:
   # the pipeline's strategy explicitly (vLLM-Omni doesn't need it; SGLang does).
   strategy: ${pipeline.strategy}
   config:
-    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     # Explicit family for trainer-side typed-condition reconstruction.
     model_family: sd3
     tp_size: 1

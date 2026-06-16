@@ -20,7 +20,7 @@ setup(
         "torch>=2.1",
         "ray[default]>=2.9,<3",
         "sglang[diffusion]==0.5.12.post1",
-        "diffusers>=0.30",
+        "diffusers>=0.37.0",
         "hydra-core>=1.3",
         "omegaconf>=2.3",
         "transformers>=4.41",

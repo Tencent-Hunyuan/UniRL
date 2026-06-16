@@ -75,6 +75,7 @@ def get_sigma_schedule(
     *,
     mu: Optional[float] = None,
     time_shift_type: str = "exponential",
+    shift_terminal: Optional[float] = None,
 ) -> torch.Tensor:
     """Compute the FlowMatch σ schedule of length ``num_steps + 1``.
 
@@ -88,10 +89,23 @@ def get_sigma_schedule(
       ``linspace(1, 1/T)`` base grid every real FlowMatch pipeline uses
       (omitting ``sigmas=`` degenerates diffusers' small-σ tail to
       ``≈ 1/num_train_timesteps``). ``shift`` is unused.
+
+    ``shift_terminal`` (dynamic branch only; Qwen-Image ships ``0.02``,
+    SD3/Flux ship ``null``): forwarded into the diffusers scheduler, whose
+    ``set_timesteps`` applies the canonical ``stretch_shift_to_terminal``
+    after the mu shift — exactly the official inference order. No current
+    static-shift model uses it, so the static branch fails fast rather than
+    growing an untested hand-rolled stretch.
     """
     if mu is None:
         # DELETE-WHEN: diffusers #13243 fixed → drop this branch and route
         # static through diffusers too (symmetric with the dynamic branch).
+        if shift_terminal is not None:
+            raise ValueError(
+                f"get_sigma_schedule: shift_terminal={shift_terminal!r} is only "
+                f"supported on the dynamic branch (mu is not None); no static-"
+                f"shift model declares it. Pass mu= or drop shift_terminal."
+            )
         t = torch.linspace(1.0, 0.0, num_steps + 1)
         sigmas = (shift * t) / (1 + (shift - 1) * t)
     else:
@@ -101,6 +115,7 @@ def get_sigma_schedule(
             num_train_timesteps=1000,
             use_dynamic_shifting=True,
             time_shift_type=time_shift_type,
+            shift_terminal=shift_terminal,
         )
         base_sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         scheduler.set_timesteps(num_inference_steps=num_steps, sigmas=base_sigmas, mu=mu)
@@ -189,6 +204,20 @@ def _normalize_patch_size(value: Any, default: int) -> int:
     return int(value)
 
 
+def _normalize_shift_terminal(value: Any) -> Optional[float]:
+    """Coerce a raw ``shift_terminal`` config value to ``Optional[float]``.
+
+    ``scheduler_config.json`` ships JSON ``null`` for models without the
+    terminal stretch (SD3/Flux) and a float for those with it (Qwen-Image:
+    ``0.02``). Diffusers gates the stretch on truthiness, so ``0``/``0.0``
+    means disabled — normalize falsy to ``None`` to keep one disabled
+    spelling throughout the policy.
+    """
+    if not value:
+        return None
+    return float(value)
+
+
 @dataclass
 class FlowMatchSchedulePolicy:
     """The model-owned σ schedule policy. Loaded once per actor.
@@ -214,6 +243,11 @@ class FlowMatchSchedulePolicy:
     image_seq_len (via :meth:`compute_mu`) and delegates to diffusers'
     dynamic branch; otherwise these fields are ignored.
 
+    ``shift_terminal``: terminal-stretch target (Qwen-Image: ``0.02``;
+    SD3/Flux: ``null``). Also sourced from ``scheduler_config.json``;
+    applied by diffusers after the dynamic shift. ``None`` disables it —
+    byte-identical schedules for every model that doesn't declare it.
+
     ``vae_scale_factor``, ``patch_size``: latent-grid divisors used in
     image_seq_len = ``(H // vae_scale_factor // patch_size) * (W // ...)``.
     Sourced from ``<pretrained>/vae/config.json`` and
@@ -228,6 +262,7 @@ class FlowMatchSchedulePolicy:
     base_image_seq_len: int = 256
     max_image_seq_len: int = 4096
     time_shift_type: str = "exponential"
+    shift_terminal: Optional[float] = None
     vae_scale_factor: int = 8
     patch_size: int = 2
 
@@ -270,7 +305,7 @@ class FlowMatchSchedulePolicy:
         :func:`get_sigma_schedule` / :func:`calculate_dynamic_mu`.
         """
         if not self.use_dynamic_shifting:
-            return get_sigma_schedule(num_inference_steps, self.shift, device)
+            return get_sigma_schedule(num_inference_steps, self.shift, device, shift_terminal=self.shift_terminal)
         latent_h = int(height) // int(self.vae_scale_factor)
         latent_w = int(width) // int(self.vae_scale_factor)
         image_seq_len = (latent_h // int(self.patch_size)) * (latent_w // int(self.patch_size))
@@ -281,6 +316,7 @@ class FlowMatchSchedulePolicy:
             device,
             mu=mu,
             time_shift_type=self.time_shift_type,
+            shift_terminal=self.shift_terminal,
         )
 
     @classmethod
@@ -317,7 +353,7 @@ class FlowMatchSchedulePolicy:
                 f"from HF Hub OR have the model's Pipeline.build_schedule_policy "
                 f"pass dynamic_overrides with use_dynamic_shifting=True + "
                 f"base_shift / max_shift / base_image_seq_len / max_image_seq_len / "
-                f"time_shift_type fields."
+                f"time_shift_type (+ shift_terminal where the model declares it) fields."
             )
         defaults = cls()
         return cls(
@@ -328,6 +364,7 @@ class FlowMatchSchedulePolicy:
             base_image_seq_len=int(overrides.get("base_image_seq_len", defaults.base_image_seq_len)),
             max_image_seq_len=int(overrides.get("max_image_seq_len", defaults.max_image_seq_len)),
             time_shift_type=str(overrides.get("time_shift_type", defaults.time_shift_type)),
+            shift_terminal=_normalize_shift_terminal(overrides.get("shift_terminal", defaults.shift_terminal)),
             vae_scale_factor=int(overrides.get("vae_scale_factor", defaults.vae_scale_factor)),
             patch_size=_normalize_patch_size(overrides.get("patch_size"), defaults.patch_size),
         )
@@ -423,6 +460,7 @@ class FlowMatchSchedulePolicy:
             base_image_seq_len=int(sched.get("base_image_seq_len", defaults.base_image_seq_len)),
             max_image_seq_len=int(sched.get("max_image_seq_len", defaults.max_image_seq_len)),
             time_shift_type=str(sched.get("time_shift_type", defaults.time_shift_type)),
+            shift_terminal=_normalize_shift_terminal(sched.get("shift_terminal", defaults.shift_terminal)),
             vae_scale_factor=int(vae_scale_factor or defaults.vae_scale_factor),
             patch_size=_normalize_patch_size(trans.get("patch_size"), defaults.patch_size),
         )

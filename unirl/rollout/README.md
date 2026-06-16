@@ -46,7 +46,7 @@ on a wrong objective.
   lineage. Single-modality flows return one track; the composed PE flow returns two
   (`ar` + `diffusion`).
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
-  sampler), `sglang` (dedicated diffusion), `sglang_llm` (dedicated AR), `vllm_omni`
+  sampler), `sglang_diffusion` (dedicated diffusion), `sglang_llm` (dedicated AR), `vllm_omni`
   (dedicated; HI3 / SD3 / HunyuanVideo), and `composed` (chains an AR child + a
   diffusion child for prompt enhancement). Each diffusion engine consumes
   `req.sigmas` verbatim, and the dedicated engines regenerate `x_T` from the recipe,

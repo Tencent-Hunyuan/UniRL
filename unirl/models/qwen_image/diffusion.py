@@ -217,14 +217,14 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
             if neg is not None and neg.embeds is not None:
                 negative_prompt_embeds = neg.embeds
                 negative_prompt_embeds_mask = neg.attn_mask
-                negative_txt_seq_lens = None
-                if negative_prompt_embeds_mask is not None:
-                    neg_true = negative_prompt_embeds_mask.sum(dim=1).to(torch.long)
-                    neg_max = int(neg_true.max().item())
-                    if negative_prompt_embeds.shape[1] > neg_max:
-                        negative_prompt_embeds = negative_prompt_embeds[:, :neg_max]
-                        negative_prompt_embeds_mask = negative_prompt_embeds_mask[:, :neg_max]
-                    negative_txt_seq_lens = neg_true.tolist()
+                if negative_prompt_embeds_mask is None:
+                    raise ValueError("QwenImageDiffusionStep.predict_noise: conditions.negative_text.attn_mask is None")
+                neg_true = negative_prompt_embeds_mask.sum(dim=1).to(torch.long)
+                neg_max = int(neg_true.max().item())
+                if negative_prompt_embeds.shape[1] > neg_max:
+                    negative_prompt_embeds = negative_prompt_embeds[:, :neg_max]
+                    negative_prompt_embeds_mask = negative_prompt_embeds_mask[:, :neg_max]
+                negative_txt_seq_lens = neg_true.tolist()
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,

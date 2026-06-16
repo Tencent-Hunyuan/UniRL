@@ -15,9 +15,7 @@ from .scheduler_utils import (
 from .wandb_logger import (
     UniRLWandBLogger,
     aggregate_metrics,
-    get_logger,
     init_logger,
-    set_logger,
 )
 
 __all__ = [
@@ -32,8 +30,6 @@ __all__ = [
     # wandb_logger
     "UniRLWandBLogger",
     "init_logger",
-    "get_logger",
-    "set_logger",
     "aggregate_metrics",
     "tensor_frame_to_pil",
     "tensor_to_pil",

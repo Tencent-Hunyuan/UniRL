@@ -17,9 +17,12 @@ Three classes:
 
 from __future__ import annotations
 
+import functools
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from types import MethodType
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -34,7 +37,144 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
+logger = logging.getLogger(__name__)
 
+_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_packed_disabled(attn_impl: str) -> None:
+    """One-time warning (per distinct backend) when packed replay is skipped.
+
+    Fires when packing WOULD apply (B > 1) but the attention backend is not a
+    sparse-block kernel, so replay uses the slower padded path instead.
+    """
+    logger.warning(
+        "packed-varlen replay disabled: attn_implementation=%r is not a "
+        "sparse-block kernel; using the padded replay path. Set "
+        "attn_implementation='flex_attention' (or 'flash_attention_2' with "
+        "flash_attn installed) to enable packed replay.",
+        attn_impl,
+    )
+
+
+def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
+    """Feature-detect the packed varlen replay prerequisites (review #43).
+
+    1. A sparse-block attention backend (flex_attention or flash_attention_2);
+       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
+       require a sparse backend (checked first; warns once on fallback).
+    2. transformers building a block-causal mask from restarting position_ids
+       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
+       older versions the forward would silently attend ACROSS sequence
+       boundaries (wrong logps, no error), so fall back to the dense path.
+    """
+    if attn_impl not in _SPARSE_PACKED_ATTN:
+        _warn_packed_disabled(str(attn_impl))
+        return False
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _replay_aware_forward(
+    self: Any,
+    *,
+    response_tokens: Optional[torch.Tensor] = None,
+    prompt_len: Optional[int] = None,
+    temperature: float = 1.0,
+    autocast_dtype: Optional[torch.dtype] = None,
+    packed_predict_index: Optional[torch.Tensor] = None,
+    **kw: Any,
+) -> Any:
+    """Dual-mode ``forward`` installed on the Qwen3 CausalLM instance.
+
+    Without ``response_tokens``: delegate to the stock class forward (decode /
+    generate). With it: run the decoder body only and return the padded
+    ``[B, T_max]`` FP32 per-token log-probs via a chunked
+    ``x[tok] - logsumexp(x)`` over ``lm_head`` — the full ``[B, L, vocab]``
+    logits are never materialized. Running inside ``forward`` keeps replay
+    valid under FSDP2 root wrap: the root pre-forward gathers the leftover
+    embed/norm/lm_head group and does not reshard it after forward.
+    """
+    if response_tokens is None:
+        # Resolve the real class forward through the MRO (skips this instance
+        # override; FSDPModule defines no forward).
+        for klass in type(self).__mro__:
+            f = klass.__dict__.get("forward")
+            if f is not None and f is not _replay_aware_forward:
+                return f(self, **kw)
+        raise RuntimeError("_replay_aware_forward: no class-level forward found in the MRO")
+
+    # Body in autocast (matmul bf16, norms fp32); the caller passes None off-CUDA.
+    autocast_ctx = (
+        torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
+    )
+    with autocast_ctx:
+        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state  # [B, L, H]
+
+    # Chunked lm_head outside autocast: FP32 logp matching SGLang's
+    # log_softmax(logits/T). The chunk scales inversely with batch so the
+    # [B, chunk, vocab] FP32 transient stays ~1.2 GiB, and each chunk is
+    # gradient-checkpointed (recomputed in backward rather than held).
+    T = float(temperature) if float(temperature) > 0.0 else 1.0
+
+    if packed_predict_index is not None:
+        # Packed varlen replay: ``hidden`` is one packed row [1, L_total, H]
+        # holding every sequence back-to-back (block-causal mask built by
+        # transformers from the restarting position_ids). Predictions for the
+        # FLAT response stream (``response_tokens`` = segment-order targets,
+        # [T_total]) live at ``packed_predict_index`` — gather those hidden
+        # states and run the same chunked fp32 ``x[tok] - logsumexp(x)`` over
+        # the flat stream. No pad tokens exist anywhere on this path.
+        h_pred = hidden[0].index_select(0, packed_predict_index)  # [T_total, H]
+        targets = response_tokens
+
+        def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+            lf = self.lm_head(h).float() / T  # [chunk, vocab] FP32
+            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+
+        flat_parts: List[torch.Tensor] = []
+        flat_chunk = 2048
+        for s in range(0, int(h_pred.size(0)), flat_chunk):
+            h = h_pred[s : s + flat_chunk]
+            tok = targets[s : s + flat_chunk]
+            if torch.is_grad_enabled() and h.requires_grad:
+                flat_parts.append(checkpoint(_flat_logp_chunk, h, tok, use_reentrant=False))
+            else:
+                flat_parts.append(_flat_logp_chunk(h, tok))
+        if not flat_parts:
+            return hidden.new_zeros((0,), dtype=torch.float32)
+        return torch.cat(flat_parts, dim=0)
+    T_max = int(response_tokens.size(1))
+    resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
+
+    def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        lf = self.lm_head(h).float() / T  # [B, chunk, vocab] FP32
+        chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
+        return chosen - torch.logsumexp(lf, dim=-1)
+
+    bsz = resp_hidden.size(0)
+    chunk = max(64, 2048 // max(1, bsz))
+    parts: List[torch.Tensor] = []
+    for s in range(0, T_max, chunk):
+        h = resp_hidden[:, s : s + chunk, :]
+        tok = response_tokens[:, s : s + chunk]
+        if torch.is_grad_enabled() and h.requires_grad:
+            parts.append(checkpoint(_logp_chunk, h, tok, use_reentrant=False))
+        else:
+            parts.append(_logp_chunk(h, tok))
+    if not parts:
+        return resp_hidden.new_zeros((bsz, 0), dtype=torch.float32)  # T_max == 0
+    return torch.cat(parts, dim=1)
+
+
+# Attention backends with a sparse packed kernel (skip cross-sequence blocks):
+# flex via BlockMask, flash_attention_2 via flash_attn_varlen + cu_seqlens. Under
+# either, packed replay is always a win; on any other backend (sdpa/eager) it is
+# gated on length variance (see packed_replay).
 @dataclass
 class Qwen3ARParams:
     """Per-request AR-mode knobs for Qwen3.
@@ -134,6 +274,13 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # the GRPO ratio / clip math starts from FP32.
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
+        # Install the dual-mode forward (see ``_replay_aware_forward``) as an
+        # INSTANCE attribute: it wins over the class forward, survives the
+        # FSDP2 class swap (only ``__class__`` changes) and LoRA injection,
+        # and is idempotent via the ``__func__`` identity check.
+        transformer = model.transformer
+        if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
+            transformer.forward = MethodType(_replay_aware_forward, transformer)
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the HF causal LM module — the FSDP/LoRA wrap target.
@@ -205,11 +352,15 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
-        # NOTE: this decode loop runs plain forwards; it does not unshard FSDP
-        # itself. The recipe sets ``reshard_after_forward=false`` on the
-        # FSDPBackend so parameters stay gathered after the first forward — the
-        # remaining decode steps then reuse the gathered params instead of
-        # re-AllGathering each token, which is what makes AR rollout fast.
+        # NOTE: this decode loop calls the ROOT module every token, so FSDP
+        # hooks fire normally in both wrap modes. Per-block groups re-gather
+        # per step according to ``reshard_after_forward``; under the default
+        # root wrap the leftover group (embed / final norm / lm_head) stays
+        # gathered after the first step — the root group never reshards after
+        # forward — so only the blocks pay per-token gather traffic. The
+        # transformer's ``forward`` is the patched dual-mode function
+        # (``_replay_aware_forward``); without ``response_tokens`` it delegates
+        # to the stock class forward, so this loop is unchanged.
         for _ in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
@@ -261,16 +412,119 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
     ) -> torch.Tensor:
         """Per-token log-prob replay over a stored rollout segment.
 
-        One teacher-forced forward over ``prompt + response`` (no KV
-        cache), gather log-probs at the predicting positions for each
-        response token, return packed varlen ``[total_tokens]`` aligned
-        with ``segment.log_probs``. Caller controls grad / no_grad scope
-        and ``.train()`` mode. Empty-response samples contribute zero
-        tokens to the output.
+        Branch: prefer :meth:`packed_replay` (packed-varlen, zero padding, B > 1)
+        and fall back to :meth:`padding_replay` (the dense ``[B, P_max + T_max]``
+        padded path) when packing does not apply. Returns packed varlen
+        ``[total_tokens]`` aligned with ``segment.log_probs``; caller controls
+        grad / ``.train()`` scope. ``temperature`` divides logits before
+        ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
+        """
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if _packed_replay_supported(attn_impl):
+            packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
+            if packed is not None:
+                return packed
+        return self.padding_replay(conditions, segment=segment, temperature=temperature)
 
-        ``temperature`` divides ``pred_logits`` before ``log_softmax`` so
-        it matches SGLang's sampler (``log_softmax(logits/T)``). Default
-        ``1.0`` is a no-op.
+    def packed_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> Optional[torch.Tensor]:
+        """Packed-varlen replay (B > 1): zero padding anywhere.
+
+        Concatenate every sample's REAL prompt tokens + its flat response tokens
+        into ONE row; position_ids restart at 0 per sequence, and with
+        ``attention_mask=None`` transformers' masking_utils detects the packed
+        layout from the restarting positions and builds the block-causal mask
+        (verl remove_padding equivalence). Per-sequence RoPE positions equal the
+        standalone layout, so logp semantics match :meth:`padding_replay`.
+        Returns ``None`` (→ padding fallback) when packing does not apply or
+        would not pay: single sample, no per-sample lengths, no packed-mask
+        support (:func:`_packed_replay_supported`), or no sparse-block attention
+        kernel in use (only flex_attention / flash_attention_2 make packed a win).
+        """
+        if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
+            return None
+        if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
+            return None
+        device = next(self.model.transformer.parameters()).device
+        prompt_ids = conditions.prompt.input_ids.to(device)
+        prompt_mask = conditions.prompt.attention_mask.to(device)
+        batch_size = int(prompt_ids.shape[0])
+        if batch_size <= 1:
+            return None
+
+        lengths = [int(n) for n in segment.lengths.tolist()]
+        pad_id = self.model.tokenizer.pad_token_id or 0
+        real_prompt_lens_p = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
+
+        cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
+        flat_resp = segment.tokens.to(device=device, dtype=torch.long)
+        streams: List[torch.Tensor] = []
+        pos_parts: List[torch.Tensor] = []
+        pred_parts: List[torch.Tensor] = []
+        offset = 0
+        for b in range(batch_size):
+            n_p = int(real_prompt_lens_p[b].item())
+            n_r = lengths[b]
+            # The predict-index math below (offset + n_p - 1) assumes each stream has
+            # >=1 real prompt token; n_p == 0 would gather the PRIOR stream's last
+            # hidden state (silent cross-sequence logp corruption), so fail loud.
+            assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
+            seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
+            streams.append(seq)
+            pos_parts.append(torch.arange(seq.numel(), device=device))
+            if n_r > 0:
+                pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
+            offset += int(seq.numel())
+        packed_ids = torch.cat(streams).unsqueeze(0)
+        packed_pos = torch.cat(pos_parts).unsqueeze(0)
+        predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
+        # Bucket the packed length to a multiple of 1024 so flex_attention compiles
+        # O(10) shapes instead of one per distinct L (a ~40s first-compile per
+        # shape). Filler tokens carry restarting position_ids, forming their own
+        # isolated "sequence" under the packed block-causal mask (no prediction
+        # gathered from them). sdpa/eager only pay filler FLOPs, so skip bucketing.
+        bucket = 1024
+        L = int(packed_ids.shape[1])
+        target = ((L + bucket - 1) // bucket) * bucket
+        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        if attn_impl != "flex_attention":
+            target = L
+        if target > L:
+            n_fill = target - L
+            fill_ids = torch.full((1, n_fill), pad_id, dtype=packed_ids.dtype, device=device)
+            fill_pos = torch.arange(n_fill, device=device).unsqueeze(0)
+            packed_ids = torch.cat([packed_ids, fill_ids], dim=1)
+            packed_pos = torch.cat([packed_pos, fill_pos], dim=1)
+        per_token_flat = self.model.transformer(
+            input_ids=packed_ids,
+            attention_mask=None,
+            position_ids=packed_pos,
+            response_tokens=flat_resp,
+            packed_predict_index=predict_index,
+            prompt_len=0,
+            temperature=temperature,
+            autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
+        )
+        return per_token_flat.to(dtype=self.logprob_dtype)
+
+    def padding_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path.
+
+        One teacher-forced forward over padded ``prompt + response``; gather
+        log-probs at the predicting positions per response token; return packed
+        varlen ``[total_tokens]``. ``temperature`` divides logits before
+        ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
         """
         if conditions.prompt is None or conditions.prompt.input_ids is None:
             raise ValueError("Qwen3ARStage.replay: conditions.prompt.input_ids is None")
@@ -299,6 +553,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
         pad_id = self.model.tokenizer.pad_token_id or 0
+
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -330,6 +585,20 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             prompt_ids = left_padded_ids
             prompt_mask = left_padded_mask
 
+        # Trim the prompt block to THIS batch's true max length. The track-level
+        # concat right-pads prompts to the global (worker-shard) max, so every
+        # replay micro otherwise forwards at the widest prompt in the shard —
+        # pure dense-pad waste (with token-budget packing the micro members are
+        # length-sorted, making the waste systematic). After the LEFT re-pad all
+        # real tokens sit at the right end, so dropping the leading all-pad
+        # columns preserves prompt-end position (= new prompt_len - 1) and the
+        # cumsum position_ids below are pad-invariant.
+        max_real_prompt = int(real_prompt_lens.max().item())
+        if 0 < max_real_prompt < prompt_len:
+            prompt_ids = prompt_ids[:, prompt_len - max_real_prompt :]
+            prompt_mask = prompt_mask[:, prompt_len - max_real_prompt :]
+            prompt_len = max_real_prompt
+
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
             full_mask = torch.cat([prompt_mask, response_mask], dim=1)
@@ -342,72 +611,24 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         # to ``arange(0, L)`` and ignores ``attention_mask``.
         position_ids = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
 
-        # autocast scope mirrors SD3DiffusionStage.replay: matmul/linear stay
-        # in BF16 but softmax / layer_norm / log_softmax auto-promote to FP32
-        # in both forward and backward.  Without it, FSDP's ``param_dtype=bf16``
-        # forces every op to BF16 and backward NaNs after long LoRA drift.
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-        # Run the model BODY only (no lm_head) so we never materialize the full
-        # [B, L, vocab] logits. At 32k that tensor is ~10 GiB (forward) + ~10 GiB
-        # (grad) and is the dominant replay-memory term; last_hidden_state is
-        # [B, L, H] (H=2048, ~75x smaller). Safe under this FSDP setup: only the
-        # Qwen3DecoderLayers are sharded (they gather via their own hooks when the
-        # body runs); embed/norm/lm_head are full params, so .model(...) and
-        # .lm_head(...) work called directly.
-        with autocast_ctx:
-            body_out = self.model.transformer.model(
-                input_ids=full_ids,
-                attention_mask=full_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                return_dict=True,
-            )
-            hidden = body_out.last_hidden_state  # [B, L, H]
+        # Replay goes through the patched dual-mode ``forward`` (see
+        # ``_replay_aware_forward``): the decoder body + chunked lm_head run
+        # INSIDE the root forward, so this is topology-independent (FSDP2
+        # root-wrapped or plain) and never materializes [B, L, vocab] logits.
+        # The cuda-vs-cpu autocast decision lives here; dtype validity and the
+        # autocast scope live in the patched forward.
+        per_token = self.model.transformer(
+            input_ids=full_ids,
+            attention_mask=full_mask,
+            position_ids=position_ids,
+            response_tokens=response_tokens,
+            prompt_len=prompt_len,
+            temperature=temperature,
+            autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
+        )  # [B, T_max] FP32
 
         if T_max == 0:
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
-
-        # Apply lm_head only to response positions, chunked over the time dim, with
-        # the identity  log_softmax(x)[tok] = x[tok] - logsumexp(x)  so we never
-        # materialize a full [B, T_max, vocab] tensor (FP32 that is ~18.5 GiB at
-        # 32k). Gradient-checkpoint each chunk so the per-chunk lm_head + FP32
-        # upcast is recomputed in backward rather than held. log_softmax stays FP32
-        # (outside the autocast scope) so the GRPO ratio / clip math starts from
-        # FP32, matching SD3. Divide by T so the returned logp matches SGLang's
-        # sampler (log_softmax(logits/T)); old_logp uses the same scaling.
-        # Numerically identical (value + gradient) to dense lm_head + log_softmax
-        # + gather, since logits == lm_head(last_hidden_state).
-        T = float(temperature) if float(temperature) > 0.0 else 1.0
-        lm_head = self.model.transformer.lm_head
-        resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]  # [B, T_max, H]
-
-        def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-            lf = lm_head(h).float() / T  # [B, chunk, vocab] FP32
-            chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
-            return chosen - torch.logsumexp(lf, dim=-1)
-
-        # ~1.2 GiB FP32 transient per chunk at B=1 (chunk x vocab x 4B). Scale
-        # the time-chunk down with batch so the [B, chunk, vocab] FP32 transient
-        # stays ~1.2 GiB regardless of per-rank shard size: replay() runs the
-        # whole shard in one call (B = samples/num_devices, i.e. 16 at dp=32),
-        # where a fixed chunk=2048 is an 18.5 GiB alloc that OOMs next to the
-        # colocated engine (which pins expandable_segments:False for CUDA-IPC
-        # weight sync, so the allocator cannot grow segments to absorb it).
-        bsz = resp_hidden.size(0)
-        chunk = max(64, 2048 // max(1, bsz))
-        parts: List[torch.Tensor] = []
-        for s in range(0, T_max, chunk):
-            h = resp_hidden[:, s : s + chunk, :]
-            tok = response_tokens[:, s : s + chunk]
-            if torch.is_grad_enabled() and h.requires_grad:
-                parts.append(checkpoint(_logp_chunk, h, tok, use_reentrant=False))
-            else:
-                parts.append(_logp_chunk(h, tok))
-        per_token = torch.cat(parts, dim=1)
 
         flat: List[torch.Tensor] = []
         for b in range(batch_size):
