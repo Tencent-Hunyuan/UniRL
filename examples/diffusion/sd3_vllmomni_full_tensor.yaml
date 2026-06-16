@@ -84,12 +84,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
-    modality: sd35_t2i
-    default_height: 512
-    default_width: 512
-    default_num_inference_steps: 10
-    default_guidance_scale: 1.0
-    default_eta: 0.7
+    modality: sd3_t2i
     enable_sleep_mode: true # colocate: train + rollout time-share the GPU
 
 reward:

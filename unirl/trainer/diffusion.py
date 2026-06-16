@@ -382,7 +382,7 @@ class DiffusionTrainer(BaseTrainer):
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
-        save_mode: str = "full",
+        save_mode: str = "auto",
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
@@ -391,7 +391,8 @@ class DiffusionTrainer(BaseTrainer):
 
         ``save_interval``: write a checkpoint every N rollouts (and on the last
         one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
-        ``./checkpoints``); ``save_mode="adapter"`` keeps only the LoRA keys.
+        ``./checkpoints``); ``save_mode="auto"`` writes LoRA-only checkpoints
+        when LoRA is active and full checkpoints otherwise.
         ``load_dir``: restore from a checkpoint directory and RESUME from its
         saved step — ``num_rollouts`` is the TOTAL budget, so resuming
         checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.

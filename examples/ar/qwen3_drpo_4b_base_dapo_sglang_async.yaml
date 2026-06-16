@@ -1,0 +1,178 @@
+# @package _global_
+# ASYNC AR DRPO Qwen3-4B-Base on DAPO-Math — AsyncARTrainer, SGLang rollout.
+#
+# Disaggregated sibling of ar/qwen3_drpo_4b_base_dapo_sglang.yaml: identical
+# DRPO algorithm / model / data / sampling / advantage, but training and the
+# SGLang rollout engine run on DISJOINT GPU slabs (train_fraction) instead of
+# time-sharing each GPU, generation overlaps training, and full dense weights
+# cross the slab boundary via NCCLWeightSync (not the colocate TensorWeightSync).
+#
+# Run (1x8 pod -> 4 train / 4 rollout):
+#   QWEN3_PATH=/root/unirl/models/local/Qwen3-4B-Base \
+#   DATA_PATH=/root/unirl/data/dapo_math/train.jsonl \
+#   EVAL_DATA_PATH=/root/unirl/data/dapo_math/aime_eval.jsonl \
+#   python -m unirl.train_async_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang_async num_devices=8
+#
+# DIVISIBILITY (DP_SCATTER): batch_size * samples_per_prompt (512) must be
+# divisible by BOTH slabs. num_devices=8 / train_fraction=0.5 -> 4/4, 512%4==0.
+# num_devices=32 -> 16/16, 512%16==0. train_fraction*num_devices must be integer.
+
+num_devices: 32
+batch_size: 64 # prompts_per_rollout
+num_rollouts: 800
+
+# Train slab share (rollout gets the rest). 0.5 -> equal split.
+train_fraction: 0.5
+# Async knobs (one unified loop): max_inflight = concurrent generations (overlap
+# depth; 1 ≈ one-step pipeline). buffer_max_staleness = weight-syncs a buffered
+# group may cross: 0 = on-policy (ratio≈1), >0 = off-policy continuous buffer.
+max_inflight: 1
+buffer_max_staleness: 0
+
+# =1 is the on-policy reward-parity baseline vs the colocate ARTrainer (a sync
+# sits between every gen/train pair -> NO overlap). Set >1 to overlap
+# generate(N+1) with train(N): data is then off-policy by <= interval weight
+# versions, absorbed by DRPO's rollout-anchored ratio (old_logp_source: rollout).
+weight_sync_interval: 1
+
+eval_interval: 10
+adv_normalization_scope: group
+normalize_adv_by_std: false
+balance_shards: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-drpo
+  run_name: drpo_qwen3-4b-base_dapo_sglang_async
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [drpo, qwen3, 4b-base, dapo, sglang, v2, async]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    model_precision: fp32
+    autocast_precision: bf16
+    logprob_precision: fp32
+    use_gradient_checkpointing: true
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+
+rollout:
+  # SGLang LLM engine, DISAGGREGATED: owns its own GPU slab and stays RESIDENT
+  # (no sleep()/wake_up()). tp_size=1 -> one single-GPU engine per rollout GPU.
+  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    samples_pre_expanded: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      # Disaggregated: the engine owns the GPU (no colocated FSDP shard), so it
+      # can reserve more KV than the colocate recipe's 0.3. Leave headroom for
+      # the NCCL weight-receive buffers during the broadcast.
+      mem_fraction_static: 0.8
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.drpo.DRPO
+  stage_attr: ar
+  drpo_epsilon: 12.5
+  penalty_mu_weighted: true
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 8192
+  sampling_temperature: 1.0
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  # Cross-slab full-weight sync: train rank 0 NCCL-broadcasts the full dense
+  # FSDP weights into the SGLang engines (init_weights_update_group +
+  # update_weights_from_distributed). flush_cache resets SRT KV/prefix on the
+  # last bucket. Qwen3 HF param names match SGLang's weight map -> no name_remap.
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  group_name: weight_sync
+  lora_merged: false
+  bucket_size_mb: 512
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 64 # 64 prompts x 8 samples = 512 / rollout
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

@@ -71,10 +71,10 @@ class IPCWeightSync(FullWeightSync):
         Runs on every train rank. Spawns the engine receiver in a thread (so it
         overlaps the sender pump), pumps each stage's socket, then joins.
         """
-        from unirl.rollout.engine.vllm_omni.weight_sync.bucketed_transfer import (
+        from unirl.distributed.weight_sync.transfer.bucketed_transfer import (
             BucketedWeightSender,
         )
-        from unirl.rollout.engine.vllm_omni.weight_sync.ipc_dispatch import zmq_handle
+        from unirl.distributed.weight_sync.transfer.ipc_dispatch import zmq_handle
 
         replica_rank = self._my_rank  # distinct per colocate engine → unique socket
 

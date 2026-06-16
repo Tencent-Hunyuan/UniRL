@@ -73,7 +73,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
 
     def _verify_loaded(self, lora_tensors, peft_config) -> None:
         """Assert the sibling engine's loaded LoRA matches what we just pushed."""
-        from unirl.rollout.engine.vllm_omni.weight_sync.ipc_dispatch import (
+        from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
             DIFFRL_LORA_INT_ID,
         )
 

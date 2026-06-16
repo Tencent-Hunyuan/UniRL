@@ -246,20 +246,14 @@ class BagelPipeline(Pipeline):
         across the group), every sample's ``sde_indices`` / ``indices`` / ``sigmas`` is
         identical, so the shared fields are taken from ``segments[0]`` and only the
         per-sample ``latents`` / ``sde_logp`` stack along the batch axis.
-        ``sample_indices`` resets to ``arange(N)`` (the driver's ``RolloutTrack.concat``
-        shifts it per shard).
         """
         if len(segments) == 1:
             return segments[0]
-        device = segments[0].latents.device
-        n = len(segments)
         latents = torch.cat([s.latents for s in segments], dim=0)  # [N, K, seq, C]
         sde_logp = (
             torch.cat([s.sde_logp for s in segments], dim=0) if segments[0].sde_logp is not None else None
         )  # [N, S]
         return LatentSegment(
-            sample_indices=torch.arange(n, dtype=torch.long, device=device),
-            positions=torch.zeros(n, dtype=torch.long, device=device),
             latents=latents,
             sigmas=segments[0].sigmas,
             indices=segments[0].indices,

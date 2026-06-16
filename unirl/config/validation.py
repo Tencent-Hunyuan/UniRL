@@ -61,7 +61,7 @@ _DIRECT_SAMPLING_ENGINE_SUFFIXES: tuple = (_TRAINSIDE_ENGINE_TARGET_SUFFIX,)
 # can fail fast on a mismatched pairing. UpdateWeightFromTensor /
 # UpdateWeightFromDistributed work on BOTH sglang and vllm-omni — they're
 # transport-shape contracts, not engine-specific (vllm-omni's receivers live
-# in unirl.rollout.engine.vllm_omni.weight_sync.{ipc,nccl}_receive_mixin).
+# in unirl.rollout.engine.vllm_omni.worker.{ipc,nccl}_receive_mixin).
 _IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})  # vllm-omni only
 
 
@@ -133,7 +133,7 @@ def validate_weight_sync_contract(cfg: DictConfig) -> None:
             require(
                 engine_target.endswith(_VLLM_OMNI_ENGINE_TARGET_SUFFIX),
                 f"sync={sync_name} (bucketed CUDA-IPC) is only implemented by the "
-                f"vllm-omni rollout engine; got rollout.engine._target_={engine_target!r}",
+                f"vllm-omni rollout engines; got rollout.engine._target_={engine_target!r}",
             )
 
 

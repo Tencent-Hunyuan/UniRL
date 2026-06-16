@@ -91,12 +91,7 @@ rollout:
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     # sd35_t2i stage config enables LoRA (enable_lora: true, max_lora_rank: 32),
     # so the engine accepts the adapter pushed by RemoteLoraWeightSync.
-    modality: sd35_t2i
-    default_height: 512
-    default_width: 512
-    default_num_inference_steps: 10
-    default_guidance_scale: 1.0
-    default_eta: 0.7
+    modality: sd3_t2i
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
     enable_sleep_mode: false
 

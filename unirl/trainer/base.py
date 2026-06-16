@@ -275,13 +275,14 @@ class BaseTrainer:
         *,
         save_interval: int,
         save_dir: Optional[str],
-        save_mode: str = "full",
+        save_mode: str = "auto",
     ) -> None:
         """Save every ``save_interval`` rollouts (and on the last one).
 
         ``save_interval <= 0`` disables saving. Writes the backend state to
         ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
-        to ``./checkpoints``; ``save_mode="adapter"`` keeps only the LoRA keys).
+        to ``./checkpoints``; ``save_mode="auto"`` keeps only LoRA keys when
+        LoRA is active and writes full checkpoints otherwise).
         Paths resolve to absolute here, on the driver — the backend runs in
         Ray workers whose CWD differs from the driver's.
         """
