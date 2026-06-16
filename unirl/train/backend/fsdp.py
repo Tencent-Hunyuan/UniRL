@@ -34,6 +34,7 @@ from unirl.train.factories import build_lr_scheduler, build_optimizer
 from unirl.train.fsdp_utils import (
     _current_rank,
     clip_grad_norm,
+    drop_meta_entries,
     fsdp_offload,
     fsdp_onload,
     gather_lora_state_dict,
@@ -41,6 +42,10 @@ from unirl.train.fsdp_utils import (
     gather_state_dict,
     load_model_state_dict,
     load_optimizer_state_dict,
+    load_sharded_model_state_dict,
+    load_sharded_optimizer_state_dict,
+    sharded_model_state_dict,
+    sharded_optimizer_state_dict,
     trainable_params,
 )
 from unirl.train.inject import (
@@ -171,6 +176,16 @@ class FSDPBackend(Remote):
         self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
+        # Checkpoint storage backend ("torch" legacy single-file vs "dcp"
+        # sharded). save honors this; load auto-detects the on-disk format.
+        checkpoint_format = str(getattr(fsdp_cfg, "checkpoint_format", "torch"))
+        if checkpoint_format not in ("torch", "dcp"):
+            raise ValueError(
+                "FSDPBackend: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', "
+                f"got {checkpoint_format!r}"
+            )
+        self._checkpoint_format: str = checkpoint_format
+        self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
         # Checkpointed for export tooling: the LoRA fold needs scaling =
         # alpha / rank, and alpha is not derivable from the weights.
         active_lora = lora_cfg or ema_lora_cfg
@@ -321,7 +336,7 @@ class FSDPBackend(Remote):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def save(self, path: str, step: Optional[int] = None, mode: str = "full") -> None:
-        """Gather state (collective on every rank); write ``path/checkpoint.pt`` on dist rank 0.
+        """Save training state; dispatch on ``checkpoint_format`` ("torch" | "dcp").
 
         ``step`` is the trainer's rollout step — :meth:`load` returns it so
         the loop resumes where it stopped. ``mode="adapter"`` gathers only the
@@ -329,10 +344,23 @@ class FSDPBackend(Remote):
         from the pretrained snapshot on resume). ``mode="auto"`` selects
         adapter mode when LoRA is present, otherwise full. The optimizer state is
         identical under all modes — it only ever covers trainable params.
+
+        "torch" gathers a full state dict to dist rank 0 and writes a single
+        ``checkpoint.pt``. "dcp" writes per-rank shards directly under
+        ``path`` via DCP's ``checkpoint_id`` (including its ``.metadata``) plus
+        a light app-level ``metadata.pt`` on rank 0 —
+        this is the path that supports 80B meta-init bundles and reshard.
         """
         mode = self._resolve_save_mode(mode)
         if mode == "adapter" and not any("lora_" in name for name, _ in self.model.named_parameters()):
             raise RuntimeError("FSDPBackend.save: mode='adapter' but the model has no LoRA params")
+        if self._checkpoint_format == "dcp":
+            self._save_dcp(path, step, mode)
+        else:
+            self._save_torch(path, step, mode)
+
+    def _save_torch(self, path: str, step: Optional[int], mode: str) -> None:
+        """Legacy single-file save: gather full state to rank 0, torch.save."""
         if mode == "adapter":
             self._reject_lora_meta_params("save")
             policy_state = gather_lora_state_dict(self.model)
@@ -357,32 +385,94 @@ class FSDPBackend(Remote):
         os.makedirs(path, exist_ok=True)
         torch.save(state, os.path.join(path, "checkpoint.pt"))
 
+    def _save_dcp(self, path: str, step: Optional[int], mode: str) -> None:
+        """Sharded save: every rank writes its own shard under ``path``.
+
+        Never gathers a full tensor on any single rank, so meta-init bundles
+        (whose frozen aux stays on meta) are supported — those keys carry no
+        data and are dropped here. Non-tensor metadata (step / save_mode /
+        lora_config / scheduler / optimizer_step_count) is light and rides in a
+        rank-0 ``metadata.pt`` beside DCP's own ``.metadata``.
+        """
+        import torch.distributed.checkpoint as dcp
+
+        os.makedirs(path, exist_ok=True)
+        model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
+        if mode == "adapter":
+            model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
+        sharded_state: Dict[str, object] = {
+            "model": model_sd,
+            "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
+        }
+        dcp.save(sharded_state, checkpoint_id=path)
+
+        if _current_rank() != 0:
+            return
+        meta: Dict[str, object] = {
+            "optimizer_step_count": self._optimizer_step_count,
+            "step": step,
+            "save_mode": mode,
+            "lora_config": self._lora_meta,
+        }
+        if self.scheduler is not None:
+            meta["scheduler_state_dict"] = self.scheduler.state_dict()
+        torch.save(meta, os.path.join(path, "metadata.pt"))
+
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> int:
-        """Restore the state written by :meth:`save`; return the saved rollout step (0 if absent).
+        """Restore state written by :meth:`save`; return the saved rollout step (0 if absent).
 
-        Every rank runs this (the DCP set is a collective): each reads the
-        checkpoint from shared storage to CPU, then tensors broadcast from
-        dist rank 0 and re-shard into the local model/optimizer state.
+        Auto-detects the on-disk format: DCP's root ``path/.metadata`` loads
+        via DCP (each rank reads only its own shard, reshard-aware); otherwise
+        the legacy ``path/checkpoint.pt`` loads via torch. So checkpoints
+        written before this change still resume regardless of
+        ``checkpoint_format``.
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
+        dcp_metadata_path = os.path.join(path, ".metadata")
+        metadata_path = os.path.join(path, "metadata.pt")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
         # Agree on visibility BEFORE the collectives: on multi-node, a rank
         # whose node does not mount the checkpoint path would raise alone and
-        # strand the others in the DCP broadcast until the NCCL timeout.
-        exists = os.path.exists(checkpoint_path)
+        # strand the others in the load collective until the NCCL timeout.
+        local_visible = {
+            "dcp": os.path.exists(dcp_metadata_path),
+            "metadata": os.path.exists(metadata_path),
+            "torch": os.path.exists(checkpoint_path),
+        }
         if dist.is_available() and dist.is_initialized():
-            verdicts: List[Optional[bool]] = [None] * dist.get_world_size()
-            dist.all_gather_object(verdicts, exists)
-            missing_on = [rank for rank, ok in enumerate(verdicts) if not ok]
+            verdicts: List[Optional[Dict[str, bool]]] = [None] * dist.get_world_size()
+            dist.all_gather_object(verdicts, local_visible)
         else:
-            missing_on = [] if exists else [0]
+            verdicts = [local_visible]
+
+        saw_dcp = [rank for rank, ok in enumerate(verdicts) if ok and ok["dcp"]]
+        if saw_dcp:
+            missing_dcp = [rank for rank, ok in enumerate(verdicts) if not (ok and ok["dcp"])]
+            if missing_dcp:
+                raise FileNotFoundError(
+                    f"FSDPBackend.load: DCP metadata not visible on rank(s) {missing_dcp}: {dcp_metadata_path} "
+                    "(save_dir/load_dir must live on storage mounted on every node)"
+                )
+            missing_meta = [rank for rank, ok in enumerate(verdicts) if not (ok and ok["metadata"])]
+            if missing_meta:
+                raise FileNotFoundError(
+                    f"FSDPBackend.load: app metadata not visible on rank(s) {missing_meta}: {metadata_path}"
+                )
+            return self._load_dcp(path)
+
+        missing_on = [rank for rank, ok in enumerate(verdicts) if not (ok and ok["torch"])]
         if missing_on:
             raise FileNotFoundError(
                 f"FSDPBackend.load: checkpoint not visible on rank(s) {missing_on}: {checkpoint_path} "
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
+        return self._load_torch(checkpoint_path)
+
+    def _load_torch(self, checkpoint_path: str) -> int:
+        """Legacy single-file load: read full state, broadcast from rank 0, reshard."""
+        self._reject_meta_params("load")
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
         strict = checkpoint.get("save_mode", "full") == "full"
@@ -405,18 +495,53 @@ class FSDPBackend(Remote):
             raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'auto', 'full' or 'adapter')")
         return mode
 
+    def _load_dcp(self, path: str) -> int:
+        """Sharded load: each rank reads its own shard from DCP ``path``.
+
+        Reshard-aware — the same shard dir loads under a different world size.
+        The current model/optimizer sharded state dicts seed the layout, DCP
+        fills them in place, then we set them back (the canonical DCP recipe).
+        """
+        import torch.distributed.checkpoint as dcp
+
+        meta_path = os.path.join(path, "metadata.pt")
+        meta: Dict[str, object] = torch.load(meta_path, map_location="cpu")
+        mode = str(meta.get("save_mode", "full"))
+        has_meta_params = any(p.is_meta for p in self.model.parameters())
+        strict = mode == "full" and not has_meta_params
+
+        model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
+        if mode == "adapter":
+            model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
+        sharded_state: Dict[str, object] = {
+            "model": model_sd,
+            "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
+        }
+        dcp.load(sharded_state, checkpoint_id=path)
+
+        load_sharded_model_state_dict(self.model, sharded_state["model"], strict=strict)
+        load_sharded_optimizer_state_dict(self.model, self.optimizer, sharded_state["optim"])
+        if self.scheduler is not None and "scheduler_state_dict" in meta:
+            self.scheduler.load_state_dict(meta["scheduler_state_dict"])
+        if meta.get("optimizer_step_count") is not None:
+            self._optimizer_step_count = int(meta["optimizer_step_count"])
+        return int(meta.get("step") or 0)
+
     def _reject_meta_params(self, op: str) -> None:
         """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).
 
         Their frozen aux (vae / vit) stays on meta and a full-state-dict gather
         would die deep inside DCP ("Cannot copy out of meta tensor"). Same
-        verdict on every rank, so raising here is collective-safe.
+        verdict on every rank, so raising here is collective-safe. Only the
+        legacy "torch" path needs this — the sharded "dcp" path drops meta keys
+        (they carry no data) instead of gathering them.
         """
         meta = [name for name, p in self.model.named_parameters() if p.is_meta]
         if meta:
             raise RuntimeError(
                 f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
-                "full-state-dict checkpointing of meta-init bundles is not supported yet."
+                "full-state-dict checkpointing of meta-init bundles is not supported under "
+                "checkpoint_format='torch' (use 'dcp')."
             )
 
     def _reject_lora_meta_params(self, op: str) -> None:
