@@ -181,8 +181,7 @@ class FSDPBackend(Remote):
         checkpoint_format = str(getattr(fsdp_cfg, "checkpoint_format", "torch"))
         if checkpoint_format not in ("torch", "dcp"):
             raise ValueError(
-                "FSDPBackend: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', "
-                f"got {checkpoint_format!r}"
+                f"FSDPBackend: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', got {checkpoint_format!r}"
             )
         self._checkpoint_format: str = checkpoint_format
         self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
