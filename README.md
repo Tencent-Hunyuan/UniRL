@@ -69,6 +69,7 @@ dimension; all listed models are supported (✅).
 | Stable Diffusion 3 / 3.5 | Image diffusion | Text → Image | ✅ |
 | Qwen-Image | Image diffusion | Text → Image | ✅ |
 | FLUX.2-Klein | Image diffusion | Text → Image | ✅ |
+| Z-Image | Image diffusion | Text → Image | ✅ |
 | WAN 2.1 | Video diffusion | Text / Image → Video | ✅ |
 | WAN 2.2 | Video diffusion | Text / Image → Video | ✅ |
 | HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
