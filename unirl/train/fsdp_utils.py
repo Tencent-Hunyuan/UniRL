@@ -115,6 +115,82 @@ def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer
         set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
+def sharded_model_state_dict(model: nn.Module) -> StateDict:
+    """Per-rank sharded model state for DCP.
+
+    Unlike :func:`gather_state_dict`, this keeps each rank's local DTensor
+    shard (``full_state_dict=False``, no rank-0 gather, no cpu_offload) so
+    every rank writes only its own slice via ``dcp.save``. Never materializes
+    a full tensor on any single rank — the basis for checkpointing models too
+    large to gather (80B meta-init bundles).
+    """
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        return dict(get_model_state_dict(model, options=options))
+    except TypeError:
+        return dict(get_model_state_dict(model))
+
+
+def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
+    """Per-rank sharded optimizer state for DCP (symmetric with
+    :func:`sharded_model_state_dict`)."""
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        return dict(get_optimizer_state_dict(model, optimizer, options=options))
+    except TypeError:
+        return dict(get_optimizer_state_dict(model, optimizer))
+
+
+def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
+    """Load a per-rank sharded model state read by ``dcp.load`` in place.
+
+    ``strict=False`` loads adapter-only checkpoints: keys absent from
+    ``state_dict`` keep the model's current weights.
+    """
+    from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False, strict=strict)
+    try:
+        set_model_state_dict(model, state_dict, options=options)
+    except TypeError:
+        set_model_state_dict(model, state_dict)
+
+
+def load_sharded_optimizer_state_dict(
+    model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
+) -> None:
+    """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+
+
+def drop_meta_entries(state_dict: StateDict) -> StateDict:
+    """Drop never-materialized (meta) entries from a sharded state dict.
+
+    Meta-init bundles (e.g. hi3 80B) keep frozen aux (vae / vit) on meta —
+    those tensors carry no data and DCP cannot read/write them. The trained
+    decoder + heads are materialized and remain. A plain ``.is_meta`` check on
+    the (possibly DTensor) value's local view is enough: a DTensor over meta
+    shards reports ``is_meta`` on its local tensor.
+    """
+    kept: StateDict = {}
+    for key, value in state_dict.items():
+        local = getattr(value, "_local_tensor", value)
+        if isinstance(local, torch.Tensor) and local.is_meta:
+            continue
+        kept[key] = value
+    return kept
+
+
 def local_view(tensor: Tensor) -> Tensor:
     """DTensor -> local shard.  Identity for non-DTensors."""
     if hasattr(tensor, "_local_tensor"):
@@ -327,6 +403,11 @@ __all__ = [
     "gather_state_dict",
     "load_model_state_dict",
     "load_optimizer_state_dict",
+    "sharded_model_state_dict",
+    "sharded_optimizer_state_dict",
+    "load_sharded_model_state_dict",
+    "load_sharded_optimizer_state_dict",
+    "drop_meta_entries",
     "local_view",
     "is_materialized",
     "trainable_params",

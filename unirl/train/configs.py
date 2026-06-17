@@ -79,6 +79,17 @@ class FSDPConfig:
     # code) or whose wrapped object carries frozen mixed-dtype sibling
     # sub-models that must not be sharded (hunyuan_image3's VAE/ViT).
     root_wrap: bool = True
+    # Checkpoint storage backend. "torch" (default) keeps the legacy path:
+    # gather a full state dict to rank 0 and torch.save a single checkpoint.pt.
+    # "dcp" uses torch.distributed.checkpoint sharded save/load — each rank
+    # reads/writes only its own shard (no rank-0 full-tensor gather), which
+    # enables meta-init bundles (80B) to checkpoint, parallelizes I/O across
+    # ranks, and resumes under a different world size. load auto-detects the
+    # on-disk format, so legacy checkpoint.pt dirs still resume regardless.
+    checkpoint_format: str = "torch"
+    # dcp only: background (async) save so the train loop is not blocked on the
+    # I/O. Ignored under checkpoint_format="torch". (Wired in a later phase.)
+    checkpoint_async: bool = False
 
 
 __all__ = [
