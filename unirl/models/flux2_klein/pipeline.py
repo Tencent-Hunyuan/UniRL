@@ -41,7 +41,7 @@ from typing import Any, Optional, Tuple
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import get_diffusion_params
@@ -56,7 +56,7 @@ from .diffusion import (
 )
 from .schedule import Flux2KleinSchedulePolicy, build_flux2_klein_schedule_policy
 from .text_embed import Flux2KleinTextEmbedStage
-from .vae import Flux2KleinVAEDecodeStage
+from .vae import Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
 
 
 class Flux2KleinPipeline(Pipeline):
@@ -126,6 +126,10 @@ class Flux2KleinPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else Flux2KleinVAEDecodeStage(bundle)
+        # Image-edit conditioning: encodes the source image into condition
+        # tokens. Built unconditionally (cheap); only used when a request
+        # carries primitives["image"].
+        self.vae_encode = Flux2KleinVAEEncodeStage(bundle)
         # ``shift`` is retained as an attribute for the hosting engine
         # to read when constructing the σ policy. For Klein, the
         # empirical-μ schedule fully replaces static shifting at
@@ -263,6 +267,23 @@ class Flux2KleinPipeline(Pipeline):
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         klein_conds = Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
+
+        # Image-edit conditioning: when the request carries a source image
+        # (primitives["image"], role="condition" in the data), VAE-encode it
+        # into packed condition tokens + RoPE ids and attach to the conditions.
+        # Flux2KleinDiffusionStep concatenates these onto the noise sequence so
+        # the transformer actually sees the source. Without this the edit is
+        # text-only (the bug this fixes: edited images ignored the source).
+        images = req.primitives.get("image")
+        if isinstance(images, Images):
+            if int(images.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"Flux2KleinPipeline.generate: image count {int(images.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_tokens, image_ids = self.vae_encode.encode(images, height=int(params.height), width=int(params.width))
+            klein_conds.image_latent = image_tokens
+            klein_conds.image_latent_ids = image_ids
 
         schedule = req.sigmas.to(self.bundle.device)
 

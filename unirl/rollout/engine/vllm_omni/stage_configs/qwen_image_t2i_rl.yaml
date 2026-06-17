@@ -1,0 +1,84 @@
+# Single-stage Qwen-Image text-to-image config for RL rollout.
+#
+# Diff vs the (non-existent) upstream Qwen-Image stage config (upstream boots
+# it through the default single-diffusion-stage factory):
+#   - custom_pipeline_args installs our RLQwenImagePipeline subclass so
+#     SDE-mode rollouts get a swappable scheduler + per-step trajectory
+#     capture (latents, sigmas, log_probs). The subclass also owns the
+#     packed-latent boundary: x_T injection packs the driver's spatial
+#     [B, C, H, W] noise; trajectory harvest unpacks back from the
+#     transformer's [B, S, C*4] patch layout.
+#   - worker_extension_cls installs DiTWeightSyncExtension so the worker
+#     exposes update_weights_from_ipc (bucketed CUDA-IPC) and the NCCL
+#     update_weights paths the trainer needs.
+#
+# Contract notes:
+#   - CFG is off by default (recipes run guidance_scale 1.0 = true_cfg 1.0);
+#     the driver-side adapter omits negative_prompt entirely when CFG is off
+#     so upstream's "" -> has_neg_prompt + true_cfg 4.0 default never fires.
+#   - height/width must be multiples of 16 (vae_scale_factor * packing);
+#     otherwise upstream normalizes them and the driver-pinned dynamic-shift
+#     sigma schedule desyncs — the response layer's sigma-echo verify then
+#     fails loudly.
+#
+# Sized for Qwen-Image (20B MMDiT + co-resident Qwen2.5-VL text encoder) on
+# TP=1. Single-GPU rollout matches the trainer's full-forward math more
+# closely than tensor-parallel rollout and avoids the systematic bf16 drift
+# seen in replay log-prob parity checks.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 4
+    engine_args:
+      model_stage: diffusion
+      enforce_eager: true
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      # Required for vLLM to wrap DiT Linear modules in LoRA-aware variants.
+      # Without ``enable_lora``, ``add_lora`` still registers the adapter in
+      # ``DiffusionLoRAManager._registered_adapters`` (so checksum probes
+      # pass), but no Linear consults it and the forward silently runs base
+      # weights. ``max_lora_rank`` must be >= the recipe's LoRAPolicy rank
+      # (64 in qwen_image_dancegrpo); the vllm.config.lora default of 16
+      # silently rejects larger adapters at add time.
+      enable_lora: true
+      max_lora_rank: 64
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 1
+        enable_expert_parallel: false
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+      # unirl-specific: install RLQwenImagePipeline so SDE-mode rollouts get
+      # a swappable scheduler + per-step trajectory capture.
+      custom_pipeline_args:
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.qwen_image.pipeline.RLQwenImagePipeline
+      # unirl-specific: install the weight-sync extension so the DiT
+      # worker exposes update_weights_from_ipc (bucketed CUDA-IPC) and
+      # later init_weight_transfer_engine / update_weights (NCCL).
+      # Must coexist with the custom pipeline above; vllm-omni's worker
+      # composes these via multiple inheritance at instantiation time.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
+    final_output: true
+    final_output_type: image
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1

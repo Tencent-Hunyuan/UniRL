@@ -24,7 +24,7 @@ from unirl.models.flux2_klein.schedule import (
     build_flux2_klein_schedule_policy,
 )
 from unirl.models.flux2_klein.text_embed import Flux2KleinTextEmbedStage
-from unirl.models.flux2_klein.vae import Flux2KleinVAEDecodeStage
+from unirl.models.flux2_klein.vae import Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
 
 __all__ = [
     "Flux2KleinBundle",
@@ -37,5 +37,6 @@ __all__ = [
     "Flux2KleinSchedulePolicy",
     "Flux2KleinTextEmbedStage",
     "Flux2KleinVAEDecodeStage",
+    "Flux2KleinVAEEncodeStage",
     "build_flux2_klein_schedule_policy",
 ]

@@ -22,7 +22,7 @@ stage_args:
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       # See t2i YAML for rationale; same tokenizer patch + weight-sync mixin.
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.ar_extension.HI3ARWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.ar_extension.HI3ARWeightSyncExtension
       # Enable LoRA on the AR stage; mirrors the t2i YAML.
       enable_lora: true
       gpu_memory_utilization: 0.95
@@ -68,10 +68,10 @@ stage_args:
         enable_expert_parallel: true
       # unirl-specific: install RLHunyuanImage3Pipeline.
       custom_pipeline_args:
-        pipeline_class: unirl.rollout.engine.vllm_omni.hi3.pipeline.RLHunyuanImage3Pipeline
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.hi3.pipeline.RLHunyuanImage3Pipeline
       # unirl-specific: install the weight-sync extension on the DiT
       # worker (mirrors t2i YAML — see that file for rationale).
-      worker_extension_cls: unirl.rollout.engine.vllm_omni.weight_sync.dit_extension.DiTWeightSyncExtension
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion
     final_output: true

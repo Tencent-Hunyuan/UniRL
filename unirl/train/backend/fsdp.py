@@ -479,7 +479,7 @@ class FSDPBackend(Remote):
         names: List[str],
         prefix: str = "",
     ) -> Dict[str, str]:
-        from unirl.rollout.engine.vllm_omni.weight_sync.checksum import (
+        from unirl.distributed.weight_sync.transfer.checksum import (
             fingerprint_tensor,
         )
         from unirl.utils.peft_merge import raw_state_dict

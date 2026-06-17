@@ -88,11 +88,11 @@ class QwenImagePipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
-        )
+        # No default text-embed stage without a loaded text encoder
+        # (load_text_encoder=False — the vllm-omni recipes' trainer side).
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = QwenImageDiffusionStage(
                 model=bundle,
@@ -184,7 +184,13 @@ class QwenImagePipeline(Pipeline):
         from ``cfg.sampling.sde_strategy``.
         """
         bundle = QwenImageBundle.from_config(config)
-        text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+        # load_text_encoder=False (vllm-omni recipes): no trainer-side TE —
+        # prompts are encoded engine-side and conditions arrive captured.
+        text_embed = (
+            QwenImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+            if bundle.text_encoder is not None
+            else None
+        )
         step = QwenImageDiffusionStep()
         diffusion = QwenImageDiffusionStage(
             model=bundle,
@@ -230,6 +236,14 @@ class QwenImagePipeline(Pipeline):
 
         params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
 
+        if self.text_embed is None:
+            raise RuntimeError(
+                "QwenImagePipeline.generate: no text_embed stage "
+                "(load_text_encoder=False). The trainer-side pipeline cannot "
+                "encode prompts in this configuration — separate-engine "
+                "recipes encode in the rollout engine; trainside rollout "
+                "requires load_text_encoder=True."
+            )
         text_cond = self.text_embed.embed(texts)
         # CFG empty negative: Qwen-Image upstream (diffusers v0.37.1
         # ``QwenImagePipeline`` docstring at ``pipeline_qwenimage.py:509``)

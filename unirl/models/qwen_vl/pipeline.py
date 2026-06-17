@@ -74,7 +74,7 @@ class QwenVLPipeline(Pipeline):
         pil_images = None
         images_prim = req.primitives.get("image")
         if images_prim is not None and isinstance(images_prim, Images):
-            pil_images = [img.to_pil() for img in images_prim.to_list()]
+            pil_images = images_prim.to_pils()
 
         chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
         if "system_instruction" in chat_overrides:
