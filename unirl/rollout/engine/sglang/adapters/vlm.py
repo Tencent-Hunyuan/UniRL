@@ -22,7 +22,7 @@ from unirl.rollout.engine.sglang.adapters.base import (
 from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
 from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import ResolvedSampling, pil_to_base64
-from unirl.types.primitives import Image
+from unirl.types.primitives import Images
 from unirl.types.rollout_req import RolloutReq
 
 
@@ -72,9 +72,17 @@ class VLMAdapter(TextLMAdapter):
             mm=mm_encs,
         )
 
-    def extract_images(self, req: RolloutReq, *, n_prompts: int) -> List[Image]:
-        image_prim = req.primitives["image"]
-        return [Image(pixels=image_prim.pixels[i]).to_pil() for i in range(len(image_prim))]
+    def extract_images(self, req: RolloutReq, *, n_prompts: int) -> List[Any]:
+        image_prim = req.primitives.get("image")
+        require(
+            image_prim is not None and isinstance(image_prim, Images),
+            f"{type(self).__name__} requires req.primitives['image']: Images",
+        )
+        require(
+            len(image_prim) == n_prompts,
+            f"{type(self).__name__}: image batch {len(image_prim)} != prompt count {n_prompts}",
+        )
+        return image_prim.to_pils()
 
     def encode_mm(
         self,
