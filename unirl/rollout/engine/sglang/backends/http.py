@@ -5,7 +5,7 @@ spawn. :meth:`HTTPBackend.boot` filters the config-spelled intent against the
 real ``ServerArgs`` fields (the only place that knows them), quarantines the env
 the SRT subprocess needs at the spawn boundary, launches the server, and polls
 ``/health_generate``. Generation fans the per-prompt payloads out concurrently
-(fresh event loop + semaphore + retry — ``slime``-style HTTP plumbing); weight/memory
+(persistent event loop + semaphore + retry — ``slime``-style HTTP plumbing); weight/memory
 verbs are synchronous POSTs with
 the long weight-op timeout tier.
 
@@ -218,12 +218,11 @@ class HTTPBackend:
         self._base_url = base_url
         self._concurrency = int(concurrency)
         self._rt = runtime
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._client: Any = None
         if httpx is not None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(None),
-                trust_env=False,
-            )
+            self._async_loop = asyncio.new_event_loop()
+            self._client = self._run_async(self._make_client())
         self._logged_first_response = False
 
     # ------------------------------------------------------------------ #
@@ -319,16 +318,26 @@ class HTTPBackend:
     # Generation — async fan-out owned here (event loop, semaphore, retry)
     # ------------------------------------------------------------------ #
 
+    async def _make_client(self) -> Any:
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(None),
+            trust_env=False,
+        )
+
+    def _run_async(self, awaitable: Any) -> Any:
+        if self._async_loop is None or self._async_loop.is_closed():
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise RuntimeError("sglang HTTPBackend async event loop is not available.")
+        return self._async_loop.run_until_complete(awaitable)
+
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
         if self._client is None:
             raise RuntimeError("httpx is required for sglang generate. Install httpx: pip install httpx")
         t0 = time.perf_counter()
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(self._generate_async(requests))
-        finally:
-            loop.close()
+        results = self._run_async(self._generate_async(requests))
         elapsed = time.perf_counter() - t0
         logger.info(
             "sglang HTTPBackend.generate: %d requests -> %d results in %.2fs",
@@ -501,14 +510,17 @@ class HTTPBackend:
         """Kill the SRT server and close the HTTP client."""
         if self._client is not None:
             try:
-                loop = asyncio.new_event_loop()
-                try:
-                    loop.run_until_complete(self._client.aclose())
-                finally:
-                    loop.close()
+                self._run_async(self._client.aclose())
             except Exception:
                 pass
             self._client = None
+        if self._async_loop is not None:
+            try:
+                if not self._async_loop.is_closed():
+                    self._async_loop.close()
+            except Exception:
+                pass
+            self._async_loop = None
         if self._server_process is not None:
             logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
             kill_process_tree(self._server_process.pid)

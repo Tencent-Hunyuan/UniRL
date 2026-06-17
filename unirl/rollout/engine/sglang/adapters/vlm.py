@@ -22,7 +22,7 @@ from unirl.rollout.engine.sglang.adapters.base import (
 from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
 from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import ResolvedSampling, pil_to_base64
-from unirl.types.primitives import Image, Images
+from unirl.types.primitives import Image
 from unirl.types.rollout_req import RolloutReq
 
 

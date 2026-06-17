@@ -50,9 +50,7 @@ class TextLMAdapter(ModelAdapter):
             )
 
     def _has_chat_template(self) -> bool:
-        return hasattr(self._tokenizer, "apply_chat_template") and bool(
-            getattr(self._tokenizer, "chat_template", None)
-        )
+        return hasattr(self._tokenizer, "apply_chat_template") and bool(getattr(self._tokenizer, "chat_template", None))
 
     # ------------------------------------------------------------------ #
     # build_inputs — RolloutReq → per-prompt /generate payloads
@@ -187,9 +185,7 @@ class TextLMAdapter(ModelAdapter):
             }
         )
 
-    def build_ids(
-        self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]
-    ) -> Tuple[List[str], List[str]]:
+    def build_ids(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> Tuple[List[str], List[str]]:
         """The per-row ``(sample_ids, group_ids)``, prompt-major.
 
         For ``n > 1`` the sample-id is mangled as ``f"{sid}#{k}"`` to keep

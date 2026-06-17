@@ -298,9 +298,7 @@ class NativeBackend:
             if getattr(last, "success", True):
                 return
             time.sleep(1.0)
-        raise TimeoutError(
-            f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})"
-        )
+        raise TimeoutError(f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})")
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("release memory")
