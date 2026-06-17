@@ -49,6 +49,12 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         enable_fsdp_offload: bool = False,
         adv_use_global_std: bool = False,
+        eval_interval: int = 0,
+        eval_num_prompts: int = 64,
+        eval_samples_per_prompt: int = 4,
+        eval_chunk_prompts: int = 16,
+        eval_cfg_text_scale: float = 4.0,
+        eval_eta: float = 0.0,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -64,6 +70,18 @@ class DiffusionTrainer(BaseTrainer):
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.
         self._adv_use_global_std = bool(adv_use_global_std)
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
+        # eval_interval=0 disables it (zero-impact for runs that don't set it).
+        # Diffusion eval generates at the deterministic best-quality setting
+        # (cfg_text=eval_cfg_text_scale, eta=eval_eta) and CHUNKS the eval prompts
+        # (eval_chunk_prompts): one generate over the whole eval set would hold N x
+        # the KV/decoded on the driver (the it2i memory bottleneck).
+        self.eval_interval = int(eval_interval)
+        self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
+        self.eval_chunk_prompts = int(eval_chunk_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
+        self.eval_eta = float(eval_eta)
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -244,7 +262,9 @@ class DiffusionTrainer(BaseTrainer):
             return None
         return [int(x) for x in shape]
 
-    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
+    def _build_req(
+        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
+    ) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
 
         Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
@@ -255,12 +275,16 @@ class DiffusionTrainer(BaseTrainer):
         resolved indices are stamped onto a per-request copy of the diffusion
         sampling params, and the schedule config itself is nulled so only the
         resolved ``sde_indices`` ride to the engine.
+
+        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
+        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
-        inputs = inputs.expand(total_samples_per_prompt(self.sampling_params))
-        diffusion = self.sampling_params.get("diffusion")
+        base = base_sampling if base_sampling is not None else self.sampling_params
+        inputs = inputs.expand(total_samples_per_prompt(base))
+        diffusion = base.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**self.sampling_params, "diffusion": diffusion}
+        sampling_params = {**base, "diffusion": diffusion}
         # Driver-authoritative x_T, shipped as a deterministic RECIPE. The driver
         # is the single source of initial noise: it authors per-sample noise group
         # ids keyed on (rollout_id, STABLE sample/group id); base_seed rides on
@@ -284,7 +308,7 @@ class DiffusionTrainer(BaseTrainer):
         init_noise_group_ids: list = []
         init_noise_latent_shape = self._noise_latent_shape
         if init_noise_latent_shape is not None:
-            if bool(getattr(self.sampling_params.get("diffusion"), "init_same_noise", False)):
+            if bool(getattr(base.get("diffusion"), "init_same_noise", False)):
                 init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
             else:
                 init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]
@@ -382,6 +406,60 @@ class DiffusionTrainer(BaseTrainer):
         self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
+    def evaluate(self, step: int) -> float:
+        """Periodic eval on the eval set (no training); returns the mean reward.
+
+        Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
+        Generates at the deterministic best-quality setting (``cfg_text_scale=
+        eval_cfg_text_scale``, ``eta=eval_eta``; ``eval_samples_per_prompt`` x_T per
+        prompt) over ``eval_num_prompts`` eval prompts (``run.eval_data_path``),
+        scores, logs the mean reward under ``eval/*``, and returns it. The eval
+        prompts are CHUNKED (``eval_chunk_prompts``) so one generate never holds N x
+        the KV/decoded on the driver.
+        """
+        # Override only the "diffusion" entry of the modality-keyed sampling dict
+        # (mirrors the AR trainer's evaluate()).
+        eval_diffusion = dataclasses.replace(
+            self.sampling_params.get("diffusion"),
+            samples_per_prompt=self.eval_samples_per_prompt,
+            cfg_text_scale=self.eval_cfg_text_scale,
+            eta=self.eval_eta,
+        )
+        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.eval_chunk_prompts)
+        reward_sum, reward_n = 0.0, 0
+        self.rollout.wake_up()
+        if self.weight_sync is not None:
+            self.weight_sync.sync()
+        for start in range(0, n_prompts, chunk):
+            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            req = self._build_req(sub, step, base_sampling=eval_sp)
+            resp = self.rollout.generate(req)
+            for name, track in list(resp.tracks.items()):
+                if track.segment is not None:
+                    resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+            for track in resp.tracks.values():
+                if track.rewards is not None:
+                    rewards = hydrate(track.rewards).to(torch.float32)
+                    reward_sum += float(rewards.sum().item())
+                    reward_n += int(rewards.numel())
+                    break  # single-track for now; revisit if multi-track lands
+        self.rollout.sleep()
+        mean_reward = reward_sum / max(1, reward_n)
+        logger.info(
+            "EVAL step %d  eval_reward(%d prompts x %d samples, cfg=%.1f eta=%.1f)=%.4f",
+            step,
+            self.eval_num_prompts,
+            self.eval_samples_per_prompt,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            mean_reward,
+        )
+        self.wandb_logger.log_eval(step, {"reward": mean_reward})
+        return mean_reward
+
     def train(
         self,
         *,
@@ -415,6 +493,8 @@ class DiffusionTrainer(BaseTrainer):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
+            if self.eval_interval > 0:
+                self.evaluate(start_rollout)  # baseline eval before any training
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
@@ -432,6 +512,8 @@ class DiffusionTrainer(BaseTrainer):
                     rollout_id=rollout_id,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )

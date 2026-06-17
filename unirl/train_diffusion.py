@@ -39,6 +39,12 @@ def main(cfg: DictConfig) -> None:
         train_fraction=cfg.get("train_fraction", 0.5),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
+        eval_interval=cfg.get("eval_interval", 0),
+        eval_num_prompts=cfg.get("eval_num_prompts", 64),
+        eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
+        eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
+        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
+        eval_eta=cfg.get("eval_eta", 0.0),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),
