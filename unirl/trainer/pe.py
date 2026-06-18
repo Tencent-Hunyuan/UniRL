@@ -35,10 +35,10 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams, get_diffusion_params
+from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -110,8 +110,9 @@ class PETrainer(BaseTrainer):
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        # ComposedSamplingParams(ar=N, diffusion=M) — drives PEPipeline's fan-out.
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        # {"ar": ARSamplingParams(N), "diffusion": DiffusionSamplingParams(M)} —
+        # the modality-keyed sampling dict driving PEPipeline's two-level fan-out.
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Per-track weight-sync bridges; None trainside (shares the modules).
         self.diffusion_sync = None
@@ -191,7 +192,7 @@ class PETrainer(BaseTrainer):
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
-        from ``ComposedSamplingParams`` (``ar.samples_per_prompt`` rewrites,
+        from the sampling dict (``ar.samples_per_prompt`` rewrites,
         ``diffusion.samples_per_prompt`` images each). The single-track trainer
         pre-expands here; PE must not, or it would double-count.
 
@@ -202,10 +203,10 @@ class PETrainer(BaseTrainer):
         :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
         The AR sub-block has no SDE machinery and is left untouched.
         """
-        diff_params = get_diffusion_params(self.sampling_params)
+        diff_params = self.sampling_params.get("diffusion")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = dataclasses.replace(self.sampling_params, diffusion=diffusion)
+        sampling_params = {**self.sampling_params, "diffusion": diffusion}
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),

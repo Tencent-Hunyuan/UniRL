@@ -177,7 +177,7 @@ algorithm:
       _target_: hydra.utils.get_class
       path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
     # FlowGRPO.replay needs the same guidance_scale / eta the rollout
-    # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
+    # sampled with — bind to the "diffusion" entry of the sampling dict.
     params: ${sampling.diffusion}
 
 # One stack: single backend + both algorithms → one optimizer step.
@@ -196,7 +196,7 @@ data_source:
     algorithm:
       prompts_per_rollout: ${batch_size}
 
-# ComposedSamplingParams: intended hierarchy is
+# Modality-keyed sampling dict: intended hierarchy is
 #   original prompt → ar.samples_per_prompt AR trajectories (temperature-sampled
 #   think/recaption) → each trajectory → diffusion.samples_per_prompt images.
 #   AR GRPO groups by original prompt; image GRPO groups by AR trajectory.
@@ -210,7 +210,6 @@ data_source:
 # num_images_per_prompt fan-out + response.py lineage for n images/AR (follow-up).
 # These small values are for the dump-first observe run.
 sampling:
-  _target_: unirl.types.sampling.ComposedSamplingParams
   ar:
     _target_: unirl.types.sampling.ARSamplingParams
     samples_per_prompt: 2       # N AR trajectories per prompt (temperature-driven)

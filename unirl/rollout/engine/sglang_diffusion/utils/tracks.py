@@ -26,7 +26,6 @@ from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import get_diffusion_params
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
 
@@ -70,7 +69,7 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    diffusion = get_diffusion_params(req.sampling_params)
+    diffusion = req.sampling_params.get("diffusion")
     height = int(diffusion.height) if diffusion.height is not None else None
     width = int(diffusion.width) if diffusion.width is not None else None
     require(

@@ -56,7 +56,6 @@ from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, s
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_ar_params, get_diffusion_params
 
 # --------------------------------------------------------------------------- #
 # Chat-template prompt construction
@@ -310,7 +309,7 @@ class Hi3InputAdapter:
         if not self.image_input and req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
 
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
         return _build_prompt_entries(
             texts,
             task=task,
@@ -322,8 +321,8 @@ class Hi3InputAdapter:
 
     def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
         """AR always; a DiT stage rides along iff ``"dit" in self.stages``."""
-        diff_params = get_diffusion_params(req.sampling_params)
-        ar_params = get_ar_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
+        ar_params = req.sampling_params.get("ar")
         sampling = [self._ar_sampling(ar_params)]
         if "dit" in self.stages:
             sampling.append(self._dit_sampling(req, diff_params))
@@ -440,7 +439,7 @@ class Hi3DitRecaptionInputAdapter:
             raise ValueError(f"{self.modality}: cot_text count {len(cot.texts)} != prompt count {len(texts.texts)}.")
 
         sys_type = (req.stage_config or {}).get("sys_type") or self.sys_type
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
 
         base_kwargs = core_diff_kwargs(req, diff_params)
         height = int(base_kwargs["height"])

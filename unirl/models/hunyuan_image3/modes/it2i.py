@@ -25,7 +25,7 @@ from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
 
@@ -56,7 +56,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
     )
 
-    params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
     if req.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "

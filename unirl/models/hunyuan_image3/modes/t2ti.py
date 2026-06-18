@@ -37,7 +37,7 @@ from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_ar_params, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions, HunyuanImage3DiffusionConditions
@@ -113,17 +113,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
     )
 
-    ar_sp = get_ar_params(req.sampling_params)
+    ar_sp = req.sampling_params.get("ar")
     require(
         ar_sp is not None,
         "HunyuanImage3Pipeline.generate (t2ti): AR sampling params missing — t2ti needs "
-        "ComposedSamplingParams(ar=ARSamplingParams(...), diffusion=DiffusionSamplingParams(...)).",
+        "a sampling dict with both 'ar' (ARSamplingParams) and 'diffusion' (DiffusionSamplingParams) entries.",
     )
-    diff_sp = get_diffusion_params(req.sampling_params)
+    diff_sp = req.sampling_params.get("diffusion")
     require(
         isinstance(diff_sp, DiffusionSamplingParams),
         "HunyuanImage3Pipeline.generate (t2ti): diffusion sampling params missing or mistyped — t2ti needs "
-        "ComposedSamplingParams(ar=ARSamplingParams(...), diffusion=DiffusionSamplingParams(...)).",
+        "a sampling dict with both 'ar' (ARSamplingParams) and 'diffusion' (DiffusionSamplingParams) entries.",
     )
 
     ar_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})

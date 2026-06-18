@@ -20,11 +20,10 @@ from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, grouped_pi
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
 
 
 def _num_frames(req: RolloutReq) -> int:
-    return int(getattr(get_diffusion_params(req.sampling_params), "num_frames", 5))
+    return int(getattr(req.sampling_params.get("diffusion"), "num_frames", 5))
 
 
 class Hv15InputAdapter(DitInputAdapter):

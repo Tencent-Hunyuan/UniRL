@@ -68,7 +68,6 @@ from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_ar_params
 from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
@@ -736,7 +735,7 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
             )
             pil_images = image_prim.to_pils()
 
-        ar = get_ar_params(req.sampling_params)
+        ar = req.sampling_params.get("ar")
         stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
         if self.cfg.samples_pre_expanded:
             # The caller (ARTrainer) already expanded the req to P*N entries,

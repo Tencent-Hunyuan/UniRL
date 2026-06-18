@@ -13,12 +13,13 @@ Pairs with ``RolloutResp`` (in ``unirl/types/rollout_resp.py``). Carries:
   for engines that accept a precomputed start-of-denoising tensor (SGLang's
   ``Req.latents``, vllm-omni's per-stage init-latents). Future keys: other
   typed engine-bound inputs land under their own slot.
-- ``sampling_params: Optional[BaseSamplingParams]`` — typed sampling config.
-  Holds ``DiffusionSamplingParams`` for pure diffusion pipelines,
-  ``ARSamplingParams`` for pure AR pipelines, or
-  ``ComposedSamplingParams`` for composed (PE) pipelines.
-  Use ``get_diffusion_params()`` / ``get_ar_params()`` to extract the
-  relevant sub-config.
+- ``sampling_params: Dict[str, BaseSamplingParams]`` — typed sampling config
+  keyed by modality slot: ``"diffusion"`` → ``DiffusionSamplingParams`` and/or
+  ``"ar"`` → ``ARSamplingParams``. Pure pipelines carry a single key; composed
+  (PE / unified-model) pipelines carry both. Read a modality's sub-config with
+  ``sampling_params.get("diffusion")`` / ``.get("ar")`` (``None`` when that
+  modality is absent) and use ``total_samples_per_prompt()`` for the per-prompt
+  fanout (product across modalities).
 - ``stage_config: Dict[str, Any]`` — model-specific routing metadata
   (``"task"``, ``"bot_task"``, ``"sys_type"``, ``"chat"``).
 - ``sigmas: Optional[torch.Tensor]`` — the σ schedule for this rollout,
@@ -68,7 +69,7 @@ class RolloutReq(Batch):
     group_ids: List[str] = concat_field(default_factory=list)
     primitives: Dict[str, PrimitiveValue] = field(kind=FieldKind.CONCAT, default_factory=dict)
     request_conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
-    sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
+    sampling_params: Dict[str, BaseSamplingParams] = shared_field(default_factory=dict)
     stage_config: Dict[str, Any] = shared_field(default_factory=dict)
     # σ schedule is shared across all samples in the request — every
     # sample runs the same num_inference_steps / shift / dynamic-shift μ

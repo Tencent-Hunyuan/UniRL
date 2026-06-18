@@ -39,7 +39,7 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import HunyuanVideoBundle
 from .conditions import HunyuanVideoConditions
@@ -58,9 +58,9 @@ class HunyuanVideoPipeline(Pipeline):
     Reads from ``RolloutReq``:
 
     - ``primitives["text"]: Texts`` -- required prompts.
-    - ``sampling_params: DiffusionSamplingParams`` -- per-rollout sampling
+    - ``sampling_params: Dict[str, BaseSamplingParams]`` -- per-rollout sampling
       knobs (steps / guidance / size / num_frames / eta / sde_indices /
-      ...). Read via :func:`get_diffusion_params`.
+      ...). Read via ``sampling_params.get("diffusion")``.
     - ``sigmas: Tensor[T+1]`` -- pinned by the engine adapter (required).
 
     Writes to ``RolloutResp``:
@@ -201,7 +201,7 @@ class HunyuanVideoPipeline(Pipeline):
                 f"Texts, got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         # Encode texts via LLaMA + CLIP (no negative branch needed).
         text_llama = self.text_embed.embed_llama(texts)

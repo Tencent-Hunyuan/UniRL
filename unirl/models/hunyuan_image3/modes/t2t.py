@@ -23,7 +23,6 @@ from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_ar_params
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
@@ -56,7 +55,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         )
 
     # Build HunyuanImage3ARParams from typed sampling params + model-specific stage_config.
-    ar = get_ar_params(req.sampling_params)
+    ar = req.sampling_params.get("ar")
     model_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),

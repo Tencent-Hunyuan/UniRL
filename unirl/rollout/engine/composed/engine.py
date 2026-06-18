@@ -31,7 +31,6 @@ from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, _track_with_field
-from unirl.types.sampling import get_ar_params, get_diffusion_params
 
 logger = logging.getLogger(__name__)
 
@@ -169,8 +168,8 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         )
         P = int(req.batch_size)
 
-        ar_params = get_ar_params(req.sampling_params)
-        diff_params = get_diffusion_params(req.sampling_params)
+        ar_params = req.sampling_params.get("ar")
+        diff_params = req.sampling_params.get("diffusion")
         N = int(ar_params.samples_per_prompt) if ar_params is not None else 1
         M = int(diff_params.samples_per_prompt) if diff_params is not None else 1
         require(N >= 1, f"ComposedRolloutEngine.generate: ar.n={N} must be >= 1")
