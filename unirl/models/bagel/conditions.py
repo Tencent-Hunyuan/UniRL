@@ -24,6 +24,15 @@ context is one list element).
 
 ``Condition`` subclass so it is a valid ``RolloutTrack.conditions`` dict value;
 ``to_dict`` emits it under a single ``"bagel"`` key, ``from_dict`` reads it back.
+
+Replay approximation (frozen contexts): the contexts are prefilled under
+``no_grad`` at rollout and reused verbatim by ``replay``. For T2I this is exact
+w.r.t. training — the text prefill routes through the frozen und experts. For
+it2i (editing) the input-image VAE prefill routes through the GEN experts
+(``mode="gen"``, vendor bagel.py:528-534) — the LoRA-trained surface — so the
+stored contexts carry no gradient and go stale across optimizer updates. Ratio
+consistency still holds because old and new log-probs replay against the SAME
+stored contexts; this matches the standard frozen-context treatment.
 """
 
 from __future__ import annotations
@@ -34,6 +43,67 @@ from typing import Any, ClassVar, Dict, List, Optional, Tuple
 from unirl.config.require import require
 from unirl.distributed.tensor.batch import concat_field
 from unirl.types.conditions.base import Condition, Modality
+
+
+@dataclass
+class BagelARConditions(Condition):
+    """Per-sample RAW prompt material for the Bagel AR (text-out) stage.
+
+    Unlike :class:`BagelDiffusionConditions` (opaque prefilled KV contexts —
+    valid because the diffusion path trains only the gen experts while the
+    prompt prefill rides the frozen und path), the AR stage trains the und path
+    itself: replay needs gradients THROUGH the prompt prefill, so an opaque
+    no-grad cache cannot be the source of truth. Both ``autoregress`` and
+    ``replay`` re-derive the context from the same stored splits via the same
+    ``rl_ops`` prefill functions — prefix K/V parity by construction.
+
+    ``prompt_splits[i]`` is the ordered list of split descriptors for sample i:
+
+    - ``{"kind": "text", "ids": LongTensor[k]}`` — final token ids INCLUDING the
+      ``bos``/``eos`` (``<|im_start|>``/``<|im_end|>``) wrap that the vendored
+      ``prepare_prompts`` applies, so replay is tokenizer-independent.
+    - ``{"kind": "vit", "image": FloatTensor[3, H, W]}`` — the ``vit_transform``
+      output (final preprocessed pixels), ingested ViT-only (understanding path).
+
+    Covers t2t ``[text]``, i2t ``[vit]``, it2t ``[vit, text]`` and arbitrary
+    future interleaves. ``concat_field`` lists so ``RolloutTrack.slice`` /
+    ``concat`` / ``select`` re-index per sample, exactly like the diffusion
+    conditions.
+    """
+
+    modality: ClassVar[Modality] = Modality.TEXT
+
+    prompt_splits: List[List[Dict[str, Any]]] = concat_field(default_factory=list)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.prompt_splits)
+
+    @classmethod
+    def for_sample(cls, *, splits: List[Dict[str, Any]]) -> "BagelARConditions":
+        """Build a single-sample conditions (1-element list) from ordered splits."""
+        require(bool(splits), "BagelARConditions.for_sample: splits must be non-empty.")
+        for sp in splits:
+            require(
+                isinstance(sp, dict) and sp.get("kind") in ("text", "vit"),
+                f"BagelARConditions.for_sample: each split must be a dict with kind in ('text', 'vit'); got {sp!r}.",
+            )
+        return cls(prompt_splits=[list(splits)])
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "BagelARConditions":
+        """Read the conditions back from a ``RolloutTrack.conditions`` dict."""
+        bagel_ar = d.get("bagel_ar")
+        if isinstance(bagel_ar, cls):
+            return bagel_ar
+        raise ValueError(
+            "BagelARConditions.from_dict: expected a 'bagel_ar' key holding a "
+            f"BagelARConditions instance; got keys {sorted(d.keys())}."
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Emit as a single ``"bagel_ar"`` entry for ``RolloutTrack.conditions``."""
+        return {"bagel_ar": self}
 
 
 @dataclass
@@ -124,4 +194,4 @@ class BagelDiffusionConditions(Condition):
         return {"bagel": self}
 
 
-__all__ = ["BagelDiffusionConditions"]
+__all__ = ["BagelARConditions", "BagelDiffusionConditions"]

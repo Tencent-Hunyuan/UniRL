@@ -96,14 +96,14 @@ export to Hugging Face, share:
 
 ```bash
 # 1. Train, saving LoRA-only checkpoints every 200 rollouts
-bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside \
     num_rollouts=500 \
     +save_interval=200 +save_dir=/ckpts/sd3_run +save_mode=adapter
 
 # 2. Resume (after a preemption, or to extend the budget). num_rollouts is the
 #    TOTAL budget (here: rollouts 400..999); the same save_dir is fine —
 #    checkpoint numbering continues, and the wandb run reattaches.
-bash examples/run_experiment_single_node.sh diffusion/sd3_trainside \
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside \
     num_rollouts=1000 \
     +load_dir=/ckpts/sd3_run/checkpoint-400 \
     +save_interval=200 +save_dir=/ckpts/sd3_run +save_mode=adapter

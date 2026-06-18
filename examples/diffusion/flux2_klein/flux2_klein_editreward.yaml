@@ -41,9 +41,6 @@ bundle:
     _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-9B}
     model_precision: bf16
-    autocast_precision: bf16
-    trajectory_precision: fp16
-    logprob_precision: fp32
     max_sequence_length: 512
     shift: 1.0
 
@@ -165,9 +162,6 @@ sampling:
   samples_per_prompt: 16
   seed: 42
   init_same_noise: true
-  autocast_precision: bf16
-  trajectory_precision: fp16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

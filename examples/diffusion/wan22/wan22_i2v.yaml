@@ -1,0 +1,153 @@
+# @package _global_
+# GRPO WAN 2.2 I2V 14B trainside (FSDP) colocate, v2 trainer, 1x8.
+#
+# WAN 2.2 14B I2V (expand_timesteps=False path): image_dim == 0, so there is NO
+# CLIP vision tower — image conditioning flows through the VAE-latent + mask
+# channel-concat (transformer in_channels=36), not image cross-attention. Hence
+# the LoRA target set is the same attn1/attn2 set as T2V (no attn2.add_* adders,
+# unlike WAN 2.1 I2V). Dual-transformer routing (high/low noise) is unchanged.
+#
+# ⚠️ DATA: I2V needs input images via MultimodalRLDataSource + a DATA_PATH
+# dataset with (image, condition) refs; the run cannot start without it.
+# LoRA targets: WAN attn names (v1 generic q_proj default matched nothing).
+# num_updates_per_batch=2 restored (v2 TrainStack multi-update).
+
+num_devices: 8                # 1 node x 8 GPUs
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 1000
+
+bundle:
+  _target_: unirl.models.wan22.bundle.WAN22Bundle.from_config
+  config:
+    _target_: unirl.models.wan22.config.WAN22PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-I2V-A14B-Diffusers}
+    model_precision: bf16
+    shift: 5.0
+    max_sequence_length: 512
+    boundary_ratio: 0.875
+    num_train_timesteps: 1000
+
+pipeline:
+  _target_: unirl.models.wan22.pipeline.WAN22Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # T2V attn set only — WAN 2.2 14B I2V conditions via channel-concat
+    # (image_dim==0), so there are no attn2.add_* image-cross-KV adders.
+    target_modules:
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.wan21.conditions.WAN21Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 480
+  width: 640
+  num_frames: 9                   # 3 latent frames
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.2]
+    num_sde_steps: null
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-i2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_i2v}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["wan22", "i2v", "grpo", "video", "pickscore", "dual-transformer", "v2"]
+  log_media: false
+  media_max_items: 8
+  media_log_interval: 1

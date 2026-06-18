@@ -115,14 +115,9 @@ class BagelDiffusionParams(DiffusionSamplingParams):
         )
 
 
-def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    """Move every tensor value in a ``prepare_vae_latent*`` dict onto ``device``.
-
-    The vendored ``prepare_vae_latent`` / ``prepare_vae_latent_cfg`` build their
-    packed index tensors on CPU; the MoT forward needs them on the model device.
-    Non-tensor values pass through untouched.
-    """
-    return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
+# The vendored ``prepare_*`` helpers build their packed index tensors on CPU;
+# the MoT forward needs them on the model device. Shared with the AR adapters.
+_to_device = rl_ops._to_device
 
 
 class BagelDiffusionStep:
