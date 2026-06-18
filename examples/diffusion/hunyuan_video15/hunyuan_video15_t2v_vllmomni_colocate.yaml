@@ -1,0 +1,223 @@
+# @package _global_
+# HunyuanVideo-1.5 T2V GRPO — v2 trainer, vllm-omni rollout, COLOCATE (single pod).
+#
+# Single-node 1x8 port of hunyuan_video15_t2v_vllmomni_nccl_separate_v2.yaml.
+# All 8 GPUs time-share train + rollout (colocate, the default layout), so this
+# runs on ONE pod instead of the separate recipe's 2 nodes x 8 GPUs.
+#
+# Numerically faithful to the separate recipe: with all 8 GPUs training,
+# per-train-worker batch = samples_per_prompt(16) * prompts_per_rollout(16) /
+# train_gpus(8) = 32 — identical to the separate recipe's 8-train-GPU split.
+# Only the GPU *allocation* changes (time-shared vs disjoint slabs); the
+# hyperparameters, model, reward, algorithm, sampling and LoRA are unchanged.
+#
+# Changes vs the separate recipe (everything else identical):
+#   - num_devices 16 -> 8; drop layout/train_fraction (colocate is the default).
+#   - rollout enable_sleep_mode false -> true: colocate time-shares the GPU, so
+#     the engine must sleep (release GPU memory) while the trainer runs and wake
+#     to generate.
+#   - sync NCCLWeightSync -> LocalLoraWeightSync: the proven colocate weight
+#     sync (sd3/qwen v2 use it). Pushes the trained LoRA adapter into the
+#     co-located sibling engine in-process; the engine runs base + adapter,
+#     which is mathematically the merged model the separate recipe pushed.
+#     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
+#     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
+#     which the vllm-omni-only venv (two-venv image) does not provide.
+#   - algorithm.old_logp_source: replay — the separate-ENGINE anchor (the
+#     vllm-omni engine is a separate process even when colocated; without replay
+#     the cross-process rollout<->replay logp gap dilutes the first-epoch ratio
+#     -> flat reward). Every other vllm-omni v2 engine recipe sets this; the
+#     separate recipe predates the fix and omits it.
+#
+# Boot note: colocate 1x8 lands all 8 hv15 engine replicas on ONE node — the
+# worst-case parallel-boot memcg burst (each loads ~30GB DiT + Qwen2.5-VL TE +
+# ByT5 + fp32 VAE). The engine's flock boot-serializer
+# (DIFFRL_OMNI_BOOT_SERIALIZE=1, default) single-files the loads, and the ckpt
+# MUST be pod-local (point PRETRAINED_MODEL at a local path) — serialized cephfs
+# loads would be 8x28min and blow init_timeout.
+#
+# Launch (1 node x 8 GPUs):
+#   PRETRAINED_MODEL=<local> DATA_PATH=<prompts> \
+#     bash examples/run_experiment_single_node.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_colocate
+
+num_devices: 8                     # 1 node × 8 GPUs (colocate: all 8 train + rollout)
+batch_size: 16                     # prompts_per_rollout
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+
+weight_sync_interval: 1            # sync every rollout
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
+  run_name: hunyuan_video15_t2v_vllmomni_colocate
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [hunyuan_video15, t2v, grpo, vllm-omni, colocate, ipc, lora-r64, v2]
+
+bundle:
+  _target_: unirl.models.hunyuan_video15.bundle.HunyuanVideo15Bundle.from_config
+  config:
+    _target_: unirl.models.hunyuan_video15.config.HunyuanVideo15PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
+    model_precision: bf16
+    shift: 5.0
+
+pipeline:
+  _target_: unirl.models.hunyuan_video15.pipeline.HunyuanVideo15Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["HunyuanVideo15TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - attn.add_q_proj
+      - attn.add_k_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - ff.net.0.proj
+      - ff.net.2
+      - ff_context.net.0.proj
+      - ff_context.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
+    modality: hv15_t2v
+    # Colocate time-shares the GPU: the engine sleeps (releases GPU memory)
+    # while the trainer runs and wakes to generate.
+    enable_sleep_mode: true
+    # HV1.5 has ~30GB DiT shards; with a pod-local ckpt + flock-serialized boots
+    # each load is fast, but keep generous timeouts as headroom.
+    omni_extra:
+      init_timeout: 3600
+      stage_init_timeout: 1800
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Separate-ENGINE anchor: the vllm-omni engine is a separate process even when
+  # colocated, so old_logp must be trainer-side replay (not the engine's rollout
+  # logp). Omitting it bakes the cross-process logp gap into the first-epoch
+  # ratio -> diluted GRPO signal / flat reward. (Matches qwen_image_*_vllmomni_v2.)
+  old_logp_source: replay
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.hunyuan_video15.conditions.HunyuanVideo15Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # v1 vllm_omni separate ran num_updates_per_batch=2 (2 PPO mini-batch
+  # optimizer steps per rollout, π_old frozen once). Omitting it defaulted
+  # to 1 → a single on-policy update where new_logp==old_logp → ratio_mean≡1
+  # and a diluted GRPO signal.
+  # per-worker batch = samples_per_prompt(16) * prompts_per_rollout(16) /
+  # train_gpus(8) = 32; 32 % 2 == 0 → mini-batch 16 (matches v1).
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  # MultimodalRLDataSource.__init__(args) expects a v1-shape cfg with
+  # args.run.{data_path,eval_data_path,seed} and
+  # args.algorithm.prompts_per_rollout. Wrap these in nested dicts so
+  # OmegaConf packs them as a DictConfig that supports attribute access.
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: ${sampling.seed}
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# DanceGRPO-aligned for HV1.5 T2V: 16 steps, eta=0.25, shift=5.0, cfg=0.
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 16
+  guidance_scale: 0.0
+  height: 480
+  width: 480
+  num_frames: 5
+  eta: 0.25
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    # feat-branch v1 vllm_omni separate recipe: SDE candidate pool = first 60%
+    # of the schedule (steps 0..8 at T=16), then 8 of those are drawn as the
+    # stochastic / trainable steps. Dropping timestep_fraction + num_sde_steps
+    # defaulted to SDE-on-all-16-steps, which diluted the GRPO signal (root
+    # cause of the flat-reward curves).
+    timestep_fraction: [0.0, 0.6]
+    num_sde_steps: 8
+
+# LoRA-adapter sync → colocated vLLM-Omni rollout (same bridge as
+# sd3_flowdppo_vllmomni_v2 / qwen_image_dancegrpo_vllmomni_v2). Extracts the
+# trained FSDP LoRA adapter and loads it into the co-located sibling engine
+# in-process via set_lora_from_tensors; the engine then runs base + adapter,
+# i.e. the merged model the separate recipe pushed over NCCL. Chosen over the
+# full-weight IPC/tensor handlers because those require SGLang's CUDA-IPC
+# serializer, which is absent from the vllm-omni-only venv on the two-venv
+# image; the LoRA path is in-process and SGLang-free.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.local.LocalLoraWeightSync
+  verify: true
+  param_prefix: "transformer."
+  adapter_name: default

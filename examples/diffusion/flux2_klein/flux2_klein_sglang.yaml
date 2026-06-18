@@ -1,0 +1,296 @@
+# @package _global_
+# FLUX.2-klein-9B GRPO — SGLang colocate, REPLAY logprob.
+# Mirrors examples/diffusion/sd3/sd3_sglang_replay_colocate.yaml in structure,
+# with Klein knobs (DanceSDE, empirical-mu, klein LoRA).
+#
+# SGLang = rollout runs in a separate per-actor worker process (DiffGenerator),
+# weight-synced from the trainer via LoRA. algorithm.old_logp_source=replay: the
+# trainer recomputes the π_old anchor via Flux2KleinDiffusionStage.replay at
+# update time (so the SGLang fork does NOT need to emit trajectory_log_probs).
+#
+# Upstream SGLang fork prerequisites (engine fails fast otherwise):
+#   1. FLUX.2-klein pipeline registered so DiffGenerator.from_pretrained can
+#      load it (Qwen3 text encoder + 9B Flux2Transformer2DModel + 32-ch VAE).
+#   2. Dance SDE kernel registered under the string "dance" (the engine's
+#      _resolve_sde_label maps DanceSDEStrategy -> "dance").
+#
+# Uses bf16 FSDP so the synced LoRA tensors stay wire-dtype compatible with the
+# rollout kernels.
+#
+# Launch (4 nodes x 8 GPUs, taiji SPMD):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_sglang
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 x 16 samples = 1024 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (SGLang needs both at init).
+model_config:
+  _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-9B}
+  model_precision: bf16
+  max_sequence_length: 512
+  # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
+  # shifting (build_schedule_policy) and this value is ignored at runtime.
+  shift: 1.0
+  # SGLang builds its LoRA ServerArgs from these fields. This list MUST stay in
+  # lockstep with backend.lora_cfg.target_modules and rollout.config.target_modules
+  # below — three independent consumers (PEFT injection, weight-sync bucket
+  # layout, SGLang ServerArgs.lora_target_modules) each read the names from their
+  # own field. See backend.lora_cfg.target_modules below for the full rationale.
+  use_lora: true
+  lora_target_modules:
+    # DUAL block (Flux2TransformerBlock × 8) — full attention + FFN coverage:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - add_q_proj
+    - add_k_proj
+    - add_v_proj
+    - to_add_out
+    - ff.linear_in
+    - ff.linear_out
+    - ff_context.linear_in
+    - ff_context.linear_out
+    # SINGLE block (Flux2SingleTransformerBlock × 48): fused QKV+MLP only.
+    # `attn.to_out` (single-block bare Linear) is excluded: bare "to_out"
+    # would also endswith-match the dual block's `attn.to_out` ModuleList
+    # (Linear + Dropout), which PEFT refuses to wrap (crashes get_peft_model
+    # on the training side).
+    - to_qkv_mlp_proj
+
+# Shared SDE strategy; SGLang resolves its sde_label ("dance") from it.
+strategy:
+  _target_: unirl.sde.kernels.DanceSDEStrategy
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FLUX.2-klein transformer block classes (dual-stream + single-stream); these
+  # match the installed diffusers Flux2Transformer2DModel._no_split_modules
+  # (['Flux2TransformerBlock', 'Flux2SingleTransformerBlock']).
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # bf16 master — keeps the synced LoRA wire dtype compatible with the SGLang
+    # rollout kernels (no separate cast path).
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # FLUX.2-klein-9B transformer LoRA targets, matched against the diffusers
+    # Flux2Transformer2DModel nn.Linear module names (verified with PEFT on a
+    # tiny dummy build). Lists every dual-block linear plus the dominant
+    # single-block linear so both block families learn; see the trainside recipe
+    # for the per-module coverage breakdown and the to_out exclusion rationale.
+    target_modules:
+      # DUAL block (Flux2TransformerBlock × 8): image-stream attention
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      # DUAL block: text-stream attention (klein is dual-stream)
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      # DUAL block: image FFN + text FFN (qualified prefix avoids bare
+      # "linear_in" also catching time/guidance/modulation projections)
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      # SINGLE block (Flux2SingleTransformerBlock × 48): fused QKV+MLP only.
+      # `attn.to_out` (single-block bare Linear) is excluded: bare "to_out"
+      # would also endswith-match the dual block's `attn.to_out` ModuleList
+      # ([Linear, Dropout]) which PEFT refuses to wrap (crashes get_peft_model).
+      # Recovering that ~30% of single-block params would require regex
+      # target_modules — left as a follow-up.
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: flux2_klein
+    # SGLang's Klein pipeline emits the Qwen3-layer-concat prompt_embeds;
+    # populate_conditions packs them into TextEmbedCondition so trainer-side
+    # replay sees the same conditions as rollout (no fallback path).
+    populate_conditions: true
+    # Mirrors sampling.init_same_noise (false for SGLang — see the note there;
+    # the fork's flux2 pre-shipped-noise geometry isn't ready). When false the
+    # engine ships no initial_noise and SGLang draws its own.
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory (FLUX.2-klein-9B runs the whole batch in one
+    # forward otherwise). Mirrors flux2_klein_trainside. NOTE: this recipe draws
+    # SGLang-side noise (init_same_noise=false, no x_T recipe), so chunking
+    # changes which samples are drawn vs unchunked — fine for RL (each chunk is a
+    # valid rollout), just not byte-reproducible.
+    forward_batch_size: 16
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    # MUST stay in sync with model_config.lora_target_modules and
+    # backend.lora_cfg.target_modules above. SGLang reads these for its
+    # ServerArgs.lora_target_modules (controls which modules SGLang pre-allocates
+    # LoRA buffers for); PEFT/backend reads its own copy for the trainside
+    # injection. Drift between the three causes silent LoRA-key drops at sync.
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      - to_qkv_mlp_proj
+    engine_kwargs:
+      model_type: flux2_klein
+  # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via
+  # Flux2KleinDiffusionStage.replay (the SGLang fork need not emit log-probs).
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  # NOTE (differs from the trainside recipe, which uses init_same_noise=true):
+  # SGLang draws its own per-sample initial noise here. The engine's
+  # init_same_noise=true path pre-ships an engine-built noise tensor sized via
+  # the SGLang fork's flux2 pipeline_config.prepare_latent_shape, but that fork
+  # path mis-sizes the FLUX.2 latent channels (the DiT img_in linear then sees
+  # 128 vs the expected 64 and the denoising matmul fails). Until the fork's
+  # FLUX.2 pre-shipped-noise geometry is fixed, keep this false so the rollout
+  # uses SGLang's own (correct) internal noise. GRPO correctness is unaffected —
+  # per-prompt-group advantages don't require shared init noise; it's only a
+  # variance-reduction nicety.
+  init_same_noise: false
+  autocast_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train).
+# Every N rollouts the loop pushes the freshly-trained adapter into SGLang.
+weight_sync_interval: 1
+
+# LoRA weight sync -> SGLang rollout. The trainer's weight_sync_interval drives
+# cadence; bridge.sync() pushes the freshly-trained LoRA adapter into the engine
+# (fused into the generate wake/sleep).
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  # MUST be false on the actual SGLang engine (only vLLM-Omni implements the
+  # checksum read-back API). LocalLoraWeightSync._verify_loaded calls
+  # self._rollout.loaded_lora_checksums(adapter_id=...), and that method only
+  # exists on VLLMOmniRolloutEngine — SGLangRolloutEngine only exposes
+  # loaded_param_checksums (different signature, full-weight path), so verify=true
+  # crashes with AttributeError on the first weight-sync (rollout 1; rollout 0
+  # skips sync via DiffusionTrainer.train's `rollout_id > 0` gate, which is why
+  # single-node num_rollouts=1 smokes don't catch it). Matches every other working
+  # actual-SGLang + LoRA config in the repo (pe_sglang_lora_pool / pe_sglang_full_merge /
+  # qwen_vl_grpo_geo3k_mc_sglang_4x8_lora / qwen3_drpo_4b_base_dapo_sglang). Flip
+  # back to true once SGLangRolloutEngine implements loaded_lora_checksums.
+  verify: false
+  # Mirrors Flux2KleinPipelineConfig.weight_sync_param_name_prefix; must match
+  # the engine-side LoRA key naming.
+  param_prefix: "transformer."
+  adapter_name: default

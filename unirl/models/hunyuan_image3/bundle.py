@@ -24,17 +24,15 @@ the real 80B ``tencent/HunyuanImage-3.0`` weights this path will OOM —
 the training stack constructs the bundle manually with
 ``device_map="auto"``.
 
-:meth:`build_t2i_inputs` wraps the upstream tokenizer-wrapper +
-rope helpers to produce the unified-MM tensors that
-``HunyuanImage3DiffusionStep.predict_noise`` feeds into the real
-``HunyuanImage3ForCausalMM.forward(mode="gen_image")`` call.
+Chat-template input prep (tokenizer wrapper + rope helpers) lives on
+``HunyuanImage3TextEmbedStage`` (``embed_for_ar`` / ``embed_for_gen_image``),
+not here.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -43,7 +41,6 @@ import torch.nn as nn
 from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
-from .conditions import HunyuanImage3FusedMultimodalCondition
 from .config import HunyuanImage3PipelineConfig
 
 logger = logging.getLogger(__name__)
@@ -111,6 +108,9 @@ class HunyuanImage3Bundle(Bundle):
         """
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        from .compat import apply_hi3_transformers5_compat
+
+        apply_hi3_transformers5_compat()
         path = config.pretrained_model_ckpt_path
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
@@ -195,231 +195,6 @@ class HunyuanImage3Bundle(Bundle):
         )
 
     # ------------------------------------------------------------------
-    # T2I input prep — wraps the upstream tokenizer-wrapper + rope helpers.
-    # ------------------------------------------------------------------
-
-    def build_t2i_inputs(
-        self,
-        prompts: List[str],
-        negative_prompts: Optional[List[str]],
-        *,
-        height: int,
-        width: int,
-        bot_task: str = "image",
-        batch_cond_image_info: Optional[List[List[Any]]] = None,
-    ) -> Dict[str, Any]:
-        """Build the upstream MM input tensors for a t2i diffusion step.
-
-        Mirrors the input-prep half of ``HunyuanImage3ForCausalMM._generate``
-        (upstream ``hunyuan.py`` ~lines 2200–2380): runs the tokenizer
-        wrapper to splice prompt + ``<boi>`` + ``<img_ratio_X>`` + ``<img>``
-        block + ``<timestep>`` + ``<eoi>`` into ``input_ids``, builds the
-        4D causal+image-bidirectional ``attention_mask``, the per-token
-        ``position_ids``, and the per-position rope tables ``(cos, sin)``.
-
-        KV cache is intentionally NOT built — the unirl per-step
-        kernel calls ``transformer(..., past_key_values=None,
-        use_cache=False, first_step=True)`` every diffusion step.
-
-        Args:
-            prompts:
-                List of B prompt strings.
-            negative_prompts:
-                Optional list of B negative-prompt strings for CFG. If
-                provided, all returned tensors are batched
-                ``[cond, uncond]`` along axis 0 (cond first, matching
-                upstream ``HunyuanImage3Text2ImagePipeline.__call__`` at
-                ``hunyuan_image_3_pipeline.py:830``).
-            height, width:
-                Target image size in pixels. Snapped to the closest
-                preset ratio by the upstream ``image_processor``.
-            bot_task:
-                Chat-template flag selecting the AR-prefix preset baked
-                into ``input_ids``. One of ``{"image", "auto", "think",
-                "recaption", "think_recaption", "img_ratio"}``. Default
-                ``"image"`` matches vllm-omni's ``t2i_vanilla`` preset
-                (no prefix marker). ``"think"`` / ``"recaption"`` insert
-                a static ``<think>`` / ``<recaption>`` marker after the
-                ``Assistant:`` system prompt — the model treats this as
-                a reasoning-mode signal during the diffusion forward.
-                Per vllm-omni ``prompt_utils.py:23-31``.
-
-        Returns:
-            Dict with the following keys:
-                fused           : HunyuanImage3FusedMultimodalCondition
-                                  carries input_ids ``[B*cfg, L] long``,
-                                  attention_mask ``[B*cfg, 1, L, L] bool``,
-                                  position_ids ``[B*cfg, L] long``,
-                                  rope_cache ``(cos, sin)`` ``([B*cfg, L, D], [B*cfg, L, D]) float``,
-                                  gen_image_mask ``[B*cfg, L] bool``,
-                                  gen_timestep_scatter_index ``[B*cfg, K] long``,
-                                  cond_vae_image_mask / cond_vit_image_mask /
-                                  cond_timestep_scatter_index (``None`` for vanilla t2i;
-                                  set when ``batch_cond_image_info`` is passed).
-                tokenizer_output: opaque upstream apply_chat_template output (used by
-                                  the KV-cache path's first ``_update_model_kwargs``
-                                  call to gather down).
-
-            where:
-                B   = len(prompts)
-                cfg = 2 if negative_prompts else 1
-                L   = output.tokens.shape[1]  (sequence length, depends on prompt + image-token block)
-
-        All tensors live on the embedding-layer device of ``self.transformer``
-        (under ``device_map="auto"`` this is typically cuda:0).
-        """
-        transformer = self.transformer
-        config = transformer.config
-        gen_config = transformer.generation_config
-
-        if not prompts:
-            raise ValueError("HunyuanImage3Bundle.build_t2i_inputs: prompts is empty")
-        if negative_prompts is not None and len(negative_prompts) != len(prompts):
-            raise ValueError(
-                "HunyuanImage3Bundle.build_t2i_inputs: "
-                f"len(negative_prompts)={len(negative_prompts)} != "
-                f"len(prompts)={len(prompts)}"
-            )
-
-        batch_size: int = len(prompts)
-        cfg_factor: int = 2 if negative_prompts is not None else 1
-        # Effective batch axis size for all returned tensors.
-        N = batch_size * cfg_factor  # noqa: N806 — matches upstream variable naming
-
-        # Image info from explicit (h, w). Upstream's image_processor
-        # snaps to the closest preset ratio. The method name differs
-        # across HI3 checkpoints: Base ships ``build_image_info``,
-        # Instruct ships ``build_gen_image_info`` (same semantics, two
-        # default kwargs we don't need).
-        ip = transformer.image_processor
-        if hasattr(ip, "build_image_info"):
-            image_info = ip.build_image_info(f"{int(height)}x{int(width)}")
-        elif hasattr(ip, "build_gen_image_info"):
-            image_info = ip.build_gen_image_info(f"{int(height)}x{int(width)}")
-        else:
-            raise AttributeError(
-                "HunyuanImage3 image_processor missing both 'build_image_info' and 'build_gen_image_info'."
-            )
-        batch_gen_image_info = [image_info] * batch_size
-
-        # The wrapper around the HF tokenizer (which knows how to splice in
-        # <boi>, <eoi>, <img>, <timestep>, <img_ratio_*> markers) is lazily
-        # populated upstream — ``load_tokenizer`` must be called explicitly
-        # after ``from_pretrained``. Do it here so callers (the smoke script
-        # and ``from_config``) don't need to remember.
-        if getattr(transformer, "_tkwrapper", None) is None:
-            transformer.load_tokenizer(self.tokenizer)
-
-        # Tokenize + splice in special markers (<boi>, <img>, <timestep>,
-        # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
-        # cfg_factor=2, the wrapper internally duplicates the prompt slot
-        # for the unconditional branch.
-        out = transformer._tkwrapper.apply_chat_template(
-            batch_prompt=list(prompts),
-            batch_message_list=None,
-            mode="gen_image",
-            batch_gen_image_info=batch_gen_image_info,
-            batch_cond_image_info=batch_cond_image_info,
-            batch_system_prompt=None,
-            batch_cot_text=None,
-            max_length=None,
-            bot_task=bot_task,
-            image_base_size=config.image_base_size,
-            sequence_template=gen_config.sequence_template,
-            cfg_factor=cfg_factor,
-            drop_think=gen_config.drop_think,
-        )
-        output, sections = out["output"], out["sections"]
-
-        # Pick a single device. When ``device_map="auto"`` is in effect, the
-        # word-token embedding (``transformer.model.wte``) typically lives on
-        # cuda:0 — and HuggingFace's hooks transparently move tensors between
-        # shards downstream. We anchor everything to that one device.
-        device = transformer.model.wte.weight.device
-
-        # input_ids: [N, L] long
-        input_ids: torch.Tensor = output.tokens.to(device)
-        seq_len: int = int(input_ids.shape[1])
-
-        # Rope (cos, sin) for the unified MM sequence.
-        # Each tensor: [N, L, head_dim] float.
-        rope_image_info = transformer.build_batch_rope_image_info(output, sections)
-        # FSDP2's ``fully_shard`` rebinds ``type(transformer).__module__`` to
-        # ``torch.distributed.fsdp._fully_shard._fully_shard``, so we can't
-        # index ``sys.modules`` by that key. Walk ``sys.modules`` for the
-        # original trust_remote_code module that owns ``build_batch_2d_rope``.
-        build_batch_2d_rope = None
-        for _name, _mod in sys.modules.items():
-            if _name.startswith("transformers_modules.") and hasattr(_mod, "build_batch_2d_rope"):
-                build_batch_2d_rope = _mod.build_batch_2d_rope
-                break
-        if build_batch_2d_rope is None:
-            raise RuntimeError(
-                "HunyuanImage3Bundle.build_t2i_inputs: could not locate "
-                "build_batch_2d_rope in any transformers_modules.* — was "
-                "AutoModelForCausalLM.from_pretrained called with "
-                "trust_remote_code=True before bundle construction?"
-            )
-        cos, sin = build_batch_2d_rope(
-            image_infos=rope_image_info,
-            seq_len=seq_len,
-            n_elem=config.attention_head_dim,
-            device=device,
-            base=config.rope_theta,
-        )
-        # cos / sin: [N, L, head_dim]
-
-        # Position ids share across batch via expand to save memory.
-        # Shape: [N, L] long.
-        position_ids: torch.Tensor = torch.arange(0, seq_len, dtype=torch.long, device=device)[None].expand(N, -1)
-
-        # Build 4D causal+image-bidirectional attention mask.
-        # Shape: [N, 1, L, L] bool.
-        attention_mask: torch.Tensor = transformer._prepare_attention_mask_for_generation(
-            input_ids,
-            gen_config,
-            model_kwargs={"tokenizer_output": output},
-        ).to(device)
-
-        # Move auxiliary tensors to the same device.
-        # gen_image_mask: [N, L] bool — positions of generated-image patches.
-        gen_image_mask: torch.Tensor = output.gen_image_mask.to(device)
-        # gen_timestep_scatter_index: [N, K] long (K is small, index of <timestep> tokens)
-        gen_timestep_scatter_index: torch.Tensor = output.gen_timestep_scatter_index.to(device)
-
-        # When ``batch_cond_image_info`` was passed, the wrapper emits
-        # cond-image position pin-points (cond_vae_image_mask /
-        # cond_vit_image_mask) and the cond-timestep scatter index.
-        # ``None`` for vanilla t2i.
-        cond_vae_image_mask = getattr(output, "cond_vae_image_mask", None)
-        if cond_vae_image_mask is not None:
-            cond_vae_image_mask = cond_vae_image_mask.to(device)
-        cond_vit_image_mask = getattr(output, "cond_vit_image_mask", None)
-        if cond_vit_image_mask is not None:
-            cond_vit_image_mask = cond_vit_image_mask.to(device)
-        cond_timestep_scatter_index = getattr(output, "cond_timestep_scatter_index", None)
-        if cond_timestep_scatter_index is not None:
-            cond_timestep_scatter_index = cond_timestep_scatter_index.to(device)
-
-        fused = HunyuanImage3FusedMultimodalCondition(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            rope_cache=(cos, sin),
-            gen_image_mask=gen_image_mask,
-            gen_timestep_scatter_index=gen_timestep_scatter_index,
-            cond_vae_image_mask=cond_vae_image_mask,
-            cond_vit_image_mask=cond_vit_image_mask,
-            cond_timestep_scatter_index=cond_timestep_scatter_index,
-        )
-        # Opaque tokenizer wrapper output. Carries the slice info the
-        # KV-cache path's first ``_update_model_kwargs_for_generation``
-        # call needs to gather position_ids / attention_mask /
-        # gen_timestep_scatter_index down from full-L to the L' changed
-        # slice (timestep + image tokens) for steps 1..T-1.
-        return {"fused": fused, "tokenizer_output": output}
-
-    # ------------------------------------------------------------------
     # Meta-init constructor for large models (80B+).
     # ------------------------------------------------------------------
 
@@ -445,6 +220,9 @@ class HunyuanImage3Bundle(Bundle):
             GenerationConfig,
         )
 
+        from .compat import apply_hi3_transformers5_compat
+
+        apply_hi3_transformers5_compat()
         path = config.pretrained_model_ckpt_path
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):

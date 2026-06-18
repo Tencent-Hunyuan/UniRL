@@ -1,0 +1,169 @@
+# @package _global_
+# Qwen-Image + DiffusionNFT trainside (FSDP) colocate, v2 trainer, 1x8.
+#
+# DiffusionNFT = forward-process diffusion RL with a dual-adapter EMA reference:
+#   - backend.ema_lora_cfg installs the "default" (trainable) + "old" (EMA)
+#     LoRA pair via inject_nft; the trainer rolls out under "old" and trains
+#     "default", then EMA-updates "old" at each rollout boundary.
+#   - algorithm._target_ = DiffusionNFT (vs FlowGRPO in the GRPO recipe);
+#     it pulls the EMA handle off backend.ema (trainer injects backend=...).
+#   - sampling.scheduler.num_sde_steps: 0 — KEY: DiffusionNFT forward-process path,
+#     no per-step SDE log_prob recorded.
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 10000
+
+bundle:
+  _target_: unirl.models.qwen_image.bundle.QwenImageBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image.config.QwenImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image.pipeline.QwenImagePipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # DiffusionNFT dual-adapter EMA (replaces the GRPO recipe's lora_cfg). Fields mirror
+  # the v1 training.ema_lora block. target_modules keep the v1 DiffusionNFT set: bare
+  # (un-prefixed) names that also cover the img/txt MLP projections — broader
+  # than the GRPO recipe's attn-only `attn.*` set.
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # Mirrors v1 rollout.plan.forward_batch_size: 1 (Qwen-Image VAE + text
+  # encoder are heavy; chunk forward to 1 sample at a time).
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+  # DiffusionNFT loss hyperparameters (v1 algorithm.algorithms.diffusion block).
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.99
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.0                      # DiffusionNFT: forward-process, no SDE noise injection
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-diffusionNFT}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_nft}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["qwen-image", "t2i", "nft", "trainside", "v2"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1

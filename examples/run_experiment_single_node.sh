@@ -21,8 +21,8 @@
 # Export any of them before running to override a conf's own default.
 #
 # Examples:
-#   bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
-#   REPORT_TO_WANDB=true bash examples/run_experiment_single_node.sh diffusion/qwen_image_trainside
+#   bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
+#   REPORT_TO_WANDB=true bash examples/run_experiment_single_node.sh diffusion/qwen_image/qwen_image_trainside
 #   ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #   ENTRY=train_pe bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 #

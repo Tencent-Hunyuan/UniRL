@@ -12,6 +12,12 @@ integration mirrors ``unirl.models.hunyuan_image3`` — the diffusion "transform
 is the LLM backbone itself and text conditioning flows through a KV cache rather
 than a separate text encoder.
 
+Five task modes, two stages (rollout + replay each): image-out ``t2i`` / ``it2i``
+(editing) ride :class:`BagelDiffusionStage`; text-out ``t2t`` / ``i2t`` / ``it2t``
+ride :class:`BagelARStage` (the und path, ``ar.py`` + the AR adapters in
+``rl_ops.py``). ``BagelPipeline.generate`` routes via ``stage_config["task"]``
+or infers from the sampling-params type + image-input presence.
+
 Kept flash-attn-free at import time: ``import unirl.models.bagel`` must not pull
 the vendored modeling (which hard-imports ``flash_attn``). The adapter wrappers
 (config / conditions / diffusion / vae / pipeline) are flash-free; ``BagelBundle``
@@ -21,14 +27,20 @@ BagelBundle`` only where a GPU model is constructed. ``rl_ops`` (the RL primitiv
 is flash-free too (torch + diffusers only).
 """
 
-from .conditions import BagelDiffusionConditions
-from .config import BAGEL_MOE_GEN_LORA_TARGETS, BagelPipelineConfig
+from .ar import BagelARParams, BagelARStage, BagelARStep
+from .conditions import BagelARConditions, BagelDiffusionConditions
+from .config import BAGEL_MOE_GEN_LORA_TARGETS, BAGEL_UND_LORA_TARGETS, BagelPipelineConfig
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage, BagelDiffusionStep
 from .pipeline import BagelPipeline
 from .vae import BagelVAEDecodeStage, bagel_latent_geometry, bagel_latent_shape, unpatchify_latent
 
 __all__ = [
     "BAGEL_MOE_GEN_LORA_TARGETS",
+    "BAGEL_UND_LORA_TARGETS",
+    "BagelARConditions",
+    "BagelARParams",
+    "BagelARStage",
+    "BagelARStep",
     "BagelDiffusionConditions",
     "BagelDiffusionParams",
     "BagelDiffusionStage",

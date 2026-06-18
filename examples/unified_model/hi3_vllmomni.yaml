@@ -230,9 +230,6 @@ sampling:
     # surfaces whether images within a prompt actually differ (seed check).
     seed: 42
     init_same_noise: false
-    autocast_precision: bf16
-    trajectory_precision: fp16
-    logprob_precision: fp32
     scheduler:
       # Sparse SDE (mirrors sd3_vllmomni / sd3_dancegrpo): record SDE log-probs at
       # only a few steps, ODE elsewhere -> lower-variance GRPO gradient. null = all-SDE.
