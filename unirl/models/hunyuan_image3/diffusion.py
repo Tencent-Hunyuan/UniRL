@@ -24,7 +24,7 @@ It reads the prepared multimodal tensors from
 ``HunyuanImage3FusedMultimodalCondition`` carrying ``input_ids``,
 ``attention_mask``, ``position_ids``, ``rope_cache``, plus the 5
 scatter-layout masks/indices), all built by
-:meth:`HunyuanImage3Bundle.build_t2i_inputs`. It calls
+:meth:`HunyuanImage3TextEmbedStage.embed_for_gen_image`. It calls
 ``transformer.prepare_inputs_for_generation(...)`` followed by the
 forward with ``first_step=True, use_cache=False`` — KV-cache reuse
 across diffusion steps is intentionally out of scope and tracked as a
@@ -33,6 +33,7 @@ follow-up.
 
 from __future__ import annotations
 
+import logging
 import sys
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -51,6 +52,8 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import HunyuanImage3Bundle
 from .conditions import HunyuanImage3DiffusionConditions
 from .diffusion_state import HunyuanImage3DiffusionState
+
+logger = logging.getLogger(__name__)
 
 
 class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
@@ -73,29 +76,9 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         state: Optional[HunyuanImage3DiffusionState] = None,
         step_index: int = 0,
     ) -> torch.Tensor:
-        """Run the unified MM transformer in ``mode="gen_image"`` and return
+        """
+        Run the unified MM transformer in ``mode="gen_image"`` and return
         the CFG-combined noise prediction.
-
-        Two paths:
-
-        1. **Stateless** (``state is None``): every call uses
-           ``past_key_values=None, use_cache=False, first_step=True``.
-           Pays the full O(L²) cost per step but is correct and matches
-           ``replay``'s call shape (each replay step is independent).
-
-        2. **KV-cached** (``state is not None``): on ``step_index == 0``
-           runs forward with ``first_step=True, use_cache=True`` and
-           captures ``past_key_values`` into ``state`` via
-           ``transformer._update_model_kwargs_for_generation``. On
-           ``step_index > 0`` reuses ``state.past_key_values`` /
-           ``state.position_ids`` / ``state.attention_mask`` /
-           ``state.gen_timestep_scatter_index`` and runs forward with
-           ``first_step=False, use_cache=True`` — the model only
-           processes the changed slice (image+timestep tokens).
-
-        Output ``pred`` is split into ``[cond, uncond]`` along axis 0 to
-        match the upstream pipeline ordering
-        (``hunyuan_image_3_pipeline.py:830``).
         """
         fused = conditions.fused
         if fused is None or fused.input_ids is None:
@@ -103,13 +86,13 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 "HunyuanImage3DiffusionStep.predict_noise: "
                 "conditions.fused.input_ids is None. The smoke t2i path expects the "
                 "pipeline to populate conditions via "
-                "HunyuanImage3Bundle.build_t2i_inputs(...)."
+                "HunyuanImage3TextEmbedStage.embed_for_gen_image(...)."
             )
         if fused.gen_image_mask is None or fused.gen_timestep_scatter_index is None:
             raise ValueError(
                 "HunyuanImage3DiffusionStep.predict_noise: "
                 "conditions.fused.gen_image_mask / gen_timestep_scatter_index missing — "
-                "did you call HunyuanImage3Bundle.build_t2i_inputs(...)?"
+                "did you call HunyuanImage3TextEmbedStage.embed_for_gen_image(...)?"
             )
 
         transformer = model.transformer
@@ -187,9 +170,16 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # method dispatch can strip **kwargs. Building the dict here is
         # equivalent and robust to FSDP wrapping.
         input_ids_in = fused.input_ids
+        # On decode steps (is_first=False) the checkpoint's _update shrinks
+        # position_ids to the changed slice (timestep + image tokens); gather
+        # input_ids AND gen_image_mask to that slice so they match the forward's
+        # hidden length (else masked_select sees full-L mask vs slice-L hidden).
+        image_mask_in = fused.gen_image_mask
         if input_ids_in is not None and position_ids_in is not None:
             if input_ids_in.shape[1] != position_ids_in.shape[1]:
                 input_ids_in = torch.gather(input_ids_in, dim=1, index=position_ids_in)
+                if image_mask_in is not None:
+                    image_mask_in = torch.gather(image_mask_in, dim=1, index=position_ids_in)
         # [ROPE-FIX] config.rope_type=="2d" needs a 2-D
         # RoPE for image tokens, built from per-image (slice,(token_h,token_w)).
         # The original replay passed EMPTY rope_image_info, so build_2d_rope gives
@@ -226,6 +216,12 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 _th = _n // _tw if _tw > 0 else 0
                 if _tw > 0 and _th * _tw == _n:
                     rope_image_info_val[_b] = [(slice(_start, _start + _n), (_th, _tw))]
+        # Forward-scatter index for the timestep continuous embedding: on is_first
+        # the model scatters into the full sequence; on decode steps it scatters
+        # into the [timestep, image] slice where the timestep is the first token
+        # (index 0). The full-sequence gen_timestep_scatter_index overflows the
+        # slice for long cond-image sequences (it2i) -> scatter index OOB.
+        timesteps_index_in = scatter_idx_in if is_first else torch.zeros_like(scatter_idx_in)
         model_inputs = {
             "input_ids": input_ids_in,
             "attention_mask": attention_mask_in,
@@ -234,13 +230,13 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             "rope_image_info": rope_image_info_val,
             "mode": "gen_image",
             "images": sample_2,
-            "image_mask": fused.gen_image_mask,
+            "image_mask": image_mask_in,
             "timesteps": t_expand,
             # native sets timesteps_index = gen_timestep_scatter_index
             # (modeling:2836) so instantiate_continuous_tokens injects the
             # timestep token's continuous embedding (required for gen_image;
             # passing None silently skips it and corrupts the noise_pred).
-            "timesteps_index": scatter_idx_in,
+            "timesteps_index": timesteps_index_in,
             "gen_timestep_scatter_index": scatter_idx_in,
             "cond_vae_images": cond_vae_images,
             "cond_vae_image_mask": cond_vae_image_mask,
@@ -264,7 +260,10 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         transformer.post_token_len = None
         n_img = int(fused.gen_image_mask.sum(dim=-1).max().item()) if fused.gen_image_mask is not None else 0
         transformer.num_image_tokens = n_img
-        transformer.num_special_tokens = None
+        # ragged_final_layer at decode steps slices hidden_states[:, num_special_tokens:]
+        # to drop the leading timestep/special tokens before the image region; on
+        # is_first it uses image_mask instead (None is correct there).
+        transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
         output = transformer(**model_inputs, first_step=is_first)
 
@@ -376,6 +375,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 "position_ids": fused.position_ids,
                 "image_mask": fused.gen_image_mask,
                 "gen_timestep_scatter_index": fused.gen_timestep_scatter_index,
+                "timesteps_index": fused.gen_timestep_scatter_index,
                 "custom_pos_emb": fused.rope_cache,
                 "rope_image_info": _rope_info,
             }
@@ -388,6 +388,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 "position_ids": state.position_ids,
                 "image_mask": fused.gen_image_mask,
                 "gen_timestep_scatter_index": state.gen_timestep_scatter_index,
+                "timesteps_index": state.gen_timestep_scatter_index,
                 "custom_pos_emb": fused.rope_cache,
                 "rope_image_info": _rope_info,
             }
@@ -596,8 +597,40 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        latent_h = int(params.height) // int(self.vae_scale_factor)
-        latent_w = int(params.width) // int(self.vae_scale_factor)
+        # HI3 snaps any requested H×W to the nearest preset at base_size² area
+        # (image_base_size=1024 → ~1MP) — the text-embed stage's
+        # build_gen_image_info does this, so the <img> placeholder span it
+        # splices is sized from the SNAPPED token grid. Size the latent from that
+        # SAME snapped grid, else a non-preset request (e.g. 512²) yields a
+        # latent (raw H//vae_scale) shorter than the placeholder span → the
+        # image-token scatter mismatches (index N vs src M). At a preset size
+        # (e.g. 1024²) get_target_size is a no-op, so this is identical to before.
+        ip = getattr(self.model.transformer, "image_processor", None)
+        info = None
+        if ip is not None:
+            if hasattr(ip, "build_image_info"):
+                info = ip.build_image_info(f"{int(params.height)}x{int(params.width)}")
+            elif hasattr(ip, "build_gen_image_info"):
+                info = ip.build_gen_image_info(f"{int(params.height)}x{int(params.width)}")
+        if info is not None:
+            # token_{height,width} are computed from the snapped image dims; the
+            # DiT treats each latent spatial position as one image token, so the
+            # latent grid == the placeholder grid.
+            latent_h, latent_w = int(info.token_height), int(info.token_width)
+            snapped_hw = (latent_h * int(self.vae_scale_factor), latent_w * int(self.vae_scale_factor))
+            if snapped_hw != (int(params.height), int(params.width)):
+                logger.warning(
+                    "HunyuanImage3DiffusionStage.diffuse: requested %dx%d is not a supported HI3 preset; "
+                    "snapped to %dx%d (nearest preset at ~%dpx base area).",
+                    int(params.height),
+                    int(params.width),
+                    snapped_hw[0],
+                    snapped_hw[1],
+                    int(self.vae_scale_factor) * latent_h,
+                )
+        else:
+            latent_h = int(params.height) // int(self.vae_scale_factor)
+            latent_w = int(params.width) // int(self.vae_scale_factor)
         per_sample_shape = (int(self.latent_channels), latent_h, latent_w)
         # latents: [B, C, H, W]. Driver-authoritative x_T via the shared
         # ``NoiseRecipe`` — the SAME ``for_batch(...).resolve(...)`` path the

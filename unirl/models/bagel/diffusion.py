@@ -115,14 +115,9 @@ class BagelDiffusionParams(DiffusionSamplingParams):
         )
 
 
-def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    """Move every tensor value in a ``prepare_vae_latent*`` dict onto ``device``.
-
-    The vendored ``prepare_vae_latent`` / ``prepare_vae_latent_cfg`` build their
-    packed index tensors on CPU; the MoT forward needs them on the model device.
-    Non-tensor values pass through untouched.
-    """
-    return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
+# The vendored ``prepare_*`` helpers build their packed index tensors on CPU;
+# the MoT forward needs them on the model device. Shared with the AR adapters.
+_to_device = rl_ops._to_device
 
 
 class BagelDiffusionStep:
@@ -466,13 +461,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sde_logp = torch.stack(sde_logp_list, dim=0).unsqueeze(0) if sde_logp_list else None  # [1, S]
         sde_indices = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
-        sample_indices = torch.zeros(1, dtype=torch.long, device=device)
-        positions = torch.zeros(1, dtype=torch.long, device=device)
         indices = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
         return LatentSegment(
-            sample_indices=sample_indices,
-            positions=positions,
             latents=latents_stacked,
             sigmas=schedule,
             indices=indices,

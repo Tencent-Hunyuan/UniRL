@@ -1,0 +1,204 @@
+# @package _global_
+# SD3 v2 trainer — LoRA training, LoRA-ADAPTER sync via Ray RPC (SEPARATE slabs).
+# SGLang twin of sd3_vllmomni_lora_separate.yaml: identical train side + sync,
+# the only swap is the rollout engine (SGLangRolloutEngine instead of vLLM-Omni).
+#   - layout: separate — train on `train_fraction` of the pool, rollout on the rest.
+#   - LoRA training (lora_cfg kept), pushed as the bare ADAPTER each sync
+#     (RemoteLoraWeightSync ships lora_A/lora_B to set_lora_from_tensors).
+#   - No NCCL group / merged-model broadcast: rank 0 ships the few-MB adapter over a
+#     plain Ray RPC to each rollout Worker. SGLang accepts the adapter because the
+#     shared model_config sets use_lora: true + lora_target_modules.
+
+num_devices: 8
+# prompts_per_rollout. Reduced from 48 (the vLLM-Omni configs' value) for SGLang:
+# the separate layout runs the whole batch on just 4 rollout GPUs (192 imgs/GPU at
+# 48), and SGLang's memory-saver pool (~59 GB) leaves little room for the DiT-
+# forward activation. 16 prompts × 16 samples / 4 rollout GPUs = 64 imgs/GPU.
+batch_size: 16
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+
+# Layout: two sibling device slabs.
+layout: separate
+train_fraction: 0.5 # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool.
+
+weight_sync_interval: 1
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+    # rollout.model_config points here (${bundle.config}); SGLang builds its LoRA
+    # ServerArgs from these two fields so the engine accepts the synced adapter.
+    use_lora: true
+    lora_target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # LoRA training — synced as the bare adapter (RemoteLoraWeightSync), so the
+  # rollout engine keeps the frozen base and only its adapter changes each sync.
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  # model_config carries the σ-schedule `shift` + checkpoint path + LoRA flags;
+  # share the bundle's config (the worker materializes the nested _target_).
+  model_config: ${bundle.config}
+  # SDE strategy → engine resolves the SGLang kernel label (sde_label) needed by
+  # _to_sglang_kwargs. Colocate doesn't inject `strategy` via setup(), so pass
+  # the pipeline's strategy explicitly (vLLM-Omni doesn't need it; SGLang does).
+  strategy: ${pipeline.strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    # Explicit family for trainer-side typed-condition reconstruction.
+    model_family: sd3
+    tp_size: 1
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory (it runs the whole batch in one forward otherwise),
+    # without shrinking the logical batch. Mirrors sd3_trainside.
+    forward_batch_size: 16
+    # LoRA target modules for the adapter sync (matches the colocate recipe).
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+    engine_kwargs:
+      model_type: sd3
+    # Separate slabs do not time-share GPUs, so no sleep/wake is issued.
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # Trainer-side replay recomputes the π_old anchor (matches prior behaviour).
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps
+    # (the validated reproduce setting); [0,1] spreads it across all steps.
+    timestep_fraction: [0, 0.5]
+
+# LoRA adapter sync → SGLang rollout (separate-slab Ray RPC). Wired to the rollout
+# slab by DiffusionTrainer's one-time handshake (set_rollout_targets only — no NCCL
+# pick_master/connect). RemoteLoraWeightSync takes the backend sibling only
+# (rollout is cross-slab); rank 0 ships the adapter to each rollout Worker.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  # SGLang exposes no loaded_lora_checksums (the read-back is vLLM-Omni-only), so
+  # the checksum verify path is unavailable here — keep verify: false.
+  verify: false
+  # Mirrors SD3PipelineConfig.weight_sync_param_name_prefix; must match the
+  # engine-side LoRA key naming.
+  param_prefix: "transformer."
+  adapter_name: default

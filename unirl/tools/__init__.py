@@ -2,5 +2,6 @@
 
 File-to-file counterparts of the runtime LoRA merging in
 ``unirl.utils.peft_merge`` (which engines and weight sync use on live
-modules). Entry point: ``python -m unirl.tools.export_hf``.
+modules). Entry points: ``python -m unirl.tools.export_full`` for a merged
+model and ``python -m unirl.tools.export_adapter`` for a PEFT adapter.
 """

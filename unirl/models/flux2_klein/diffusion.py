@@ -138,6 +138,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         dtype = prompt_embeds.dtype
 
         packed = pack_latents(sample).to(dtype=dtype)
+        noise_seq_len = packed.shape[1]
 
         if sigma.dim() == 0:
             timestep = sigma.float().expand(batch_size).to(device)
@@ -150,6 +151,24 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         txt_ids = prepare_text_ids(prompt_embeds).to(device=device)
         img_ids = prepare_latent_ids(sample).to(device=device)
 
+        # Image-edit conditioning: append the source-image condition tokens to
+        # the noise token sequence (and their RoPE ids to img_ids), mirroring
+        # diffusers' Flux2KleinPipeline reference path
+        # (latent_model_input = cat([latents, image_latents], dim=1)). The
+        # transformer attends jointly; we slice the prediction back to the
+        # noise tokens afterwards. Pure T2I leaves these None → no-op.
+        cond_tokens = conditions.image_latent
+        if cond_tokens is not None:
+            cond_tokens = cond_tokens.to(device=device, dtype=dtype)
+            packed = torch.cat([packed, cond_tokens], dim=1)
+            cond_ids = conditions.image_latent_ids
+            if cond_ids is None:
+                raise ValueError(
+                    "Flux2KleinDiffusionStep.predict_noise: conditions.image_latent set "
+                    "but image_latent_ids is None; both are required for the edit path."
+                )
+            img_ids = torch.cat([img_ids, cond_ids.to(device=device)], dim=1)
+
         noise_pred_packed = model.transformer(
             hidden_states=packed,
             encoder_hidden_states=prompt_embeds,
@@ -160,6 +179,8 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
+        # Drop the condition-token predictions; keep only the noise tokens.
+        noise_pred_packed = noise_pred_packed[:, :noise_seq_len]
 
         if guidance_scale > 1.0:
             neg = conditions.negative_text
@@ -175,7 +196,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
                     img_ids=img_ids,
                     joint_attention_kwargs=None,
                     return_dict=False,
-                )[0]
+                )[0][:, :noise_seq_len]
                 noise_pred_packed = negative_noise_pred_packed + guidance_scale * (
                     noise_pred_packed - negative_noise_pred_packed
                 )

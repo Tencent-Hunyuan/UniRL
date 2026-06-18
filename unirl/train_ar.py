@@ -39,20 +39,20 @@ def main(cfg: DictConfig) -> None:
         sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
         adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
-        normalize_adv_by_std=bool(cfg.get("normalize_adv_by_std", True)),
-        balance_shards=bool(cfg.get("balance_shards", False)),
-        eval_interval=int(cfg.get("eval_interval", 0)),
-        eval_num_prompts=int(cfg.get("eval_num_prompts", 60)),
-        eval_samples_per_prompt=int(cfg.get("eval_samples_per_prompt", 16)),
-        eval_temperature=float(cfg.get("eval_temperature", 1.0)),
+        normalize_adv_by_std=cfg.get("normalize_adv_by_std", True),
+        balance_shards=cfg.get("balance_shards", False),
+        eval_interval=cfg.get("eval_interval", 0),
+        eval_num_prompts=cfg.get("eval_num_prompts", 60),
+        eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 16),
+        eval_temperature=cfg.get("eval_temperature", 1.0),
     )
     trainer.train(
-        num_rollouts=int(cfg.get("num_rollouts", 100)),
-        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
-        save_interval=int(cfg.get("save_interval", 0)),
+        num_rollouts=cfg.get("num_rollouts", 100),
+        weight_sync_interval=cfg.get("weight_sync_interval", 1),
+        save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),
-        save_mode=str(cfg.get("save_mode", "full")),
+        save_mode=cfg.get("save_mode", "auto"),
     )
 
 

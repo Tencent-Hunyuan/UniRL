@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List
 
 import torch
 from torch import Tensor, nn
@@ -68,6 +68,33 @@ def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimiz
     return full
 
 
+def gather_lora_state_dict(model: nn.Module) -> StateDict:
+    """Gather every adapter's LoRA tensors, preserving the model state-dict key format.
+
+    Unlike :func:`gather_state_dict`, this never asks DCP for the full model
+    state. Each LoRA DTensor is materialized directly, so adapter-only
+    checkpoints avoid full-model CPU memory and wire traffic. CPU-offloaded
+    DTensor shards are moved to CUDA one tensor at a time before the collective,
+    because this stack initializes the train mesh with NCCL, not a CPU backend.
+    All ranks must call this because DTensor materialization is collective; only
+    rank 0 returns the gathered CPU tensors.
+    """
+    gathered: StateDict = {}
+    for key, value in model.state_dict().items():
+        if "lora_A" not in key and "lora_B" not in key:
+            continue
+        if isinstance(value, torch.Tensor) and value.is_meta:
+            raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")
+        materialized = _materialize_checkpoint_tensor(value)
+        if isinstance(materialized, torch.Tensor):
+            materialized = materialized.detach().cpu()
+        if _current_rank() == 0:
+            gathered[key] = materialized
+    if _current_rank() != 0:
+        return {}
+    return gathered
+
+
 def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
     """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
 
@@ -88,6 +115,82 @@ def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer
         set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
+def sharded_model_state_dict(model: nn.Module) -> StateDict:
+    """Per-rank sharded model state for DCP.
+
+    Unlike :func:`gather_state_dict`, this keeps each rank's local DTensor
+    shard (``full_state_dict=False``, no rank-0 gather, no cpu_offload) so
+    every rank writes only its own slice via ``dcp.save``. Never materializes
+    a full tensor on any single rank — the basis for checkpointing models too
+    large to gather (80B meta-init bundles).
+    """
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        return dict(get_model_state_dict(model, options=options))
+    except TypeError:
+        return dict(get_model_state_dict(model))
+
+
+def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
+    """Per-rank sharded optimizer state for DCP (symmetric with
+    :func:`sharded_model_state_dict`)."""
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        return dict(get_optimizer_state_dict(model, optimizer, options=options))
+    except TypeError:
+        return dict(get_optimizer_state_dict(model, optimizer))
+
+
+def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
+    """Load a per-rank sharded model state read by ``dcp.load`` in place.
+
+    ``strict=False`` loads adapter-only checkpoints: keys absent from
+    ``state_dict`` keep the model's current weights.
+    """
+    from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False, strict=strict)
+    try:
+        set_model_state_dict(model, state_dict, options=options)
+    except TypeError:
+        set_model_state_dict(model, state_dict)
+
+
+def load_sharded_optimizer_state_dict(
+    model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
+) -> None:
+    """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
+    options = _build_state_dict_options(full_state_dict=False)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+
+
+def drop_meta_entries(state_dict: StateDict) -> StateDict:
+    """Drop never-materialized (meta) entries from a sharded state dict.
+
+    Meta-init bundles (e.g. hi3 80B) keep frozen aux (vae / vit) on meta —
+    those tensors carry no data and DCP cannot read/write them. The trained
+    decoder + heads are materialized and remain. A plain ``.is_meta`` check on
+    the (possibly DTensor) value's local view is enough: a DTensor over meta
+    shards reports ``is_meta`` on its local tensor.
+    """
+    kept: StateDict = {}
+    for key, value in state_dict.items():
+        local = getattr(value, "_local_tensor", value)
+        if isinstance(local, torch.Tensor) and local.is_meta:
+            continue
+        kept[key] = value
+    return kept
+
+
 def local_view(tensor: Tensor) -> Tensor:
     """DTensor -> local shard.  Identity for non-DTensors."""
     if hasattr(tensor, "_local_tensor"):
@@ -101,40 +204,6 @@ def is_materialized(model: nn.Module) -> bool:
 
 def trainable_params(model: nn.Module) -> Iterator[Parameter]:
     return (p for p in model.parameters() if p.requires_grad)
-
-
-def lora_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-) -> StateDict:
-    """Adapter-only state for inference export.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    return {k: v for k, v in full_sd.items() if _is_lora_key(k)}
-
-
-def nft_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-    shadow_adapter: str = "old",
-) -> StateDict:
-    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    token = f".{shadow_adapter}."
-    return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
 
 
 def clip_grad_norm(
@@ -232,11 +301,6 @@ def _current_rank() -> int:
     return 0
 
 
-def _is_lora_key(key: str) -> bool:
-    """True for default-adapter LoRA keys (excludes shadow/old adapter)."""
-    return ("lora_A" in key or "lora_B" in key) and ".old." not in key
-
-
 def _build_state_dict_options(**kwargs: object) -> object:
     from torch.distributed.checkpoint.state_dict import StateDictOptions
 
@@ -258,6 +322,19 @@ def _maybe_dtensor_to_tensor(value: object) -> object:
     if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
         return value.full_tensor()
     return value
+
+
+def _materialize_checkpoint_tensor(value: object) -> object:
+    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
+        device = getattr(value, "device", None)
+        if (
+            getattr(device, "type", None) == "cpu"
+            and torch.cuda.is_available()
+            and hasattr(value, "cuda")
+            and callable(getattr(value, "cuda"))
+        ):
+            value = value.cuda()
+    return _maybe_dtensor_to_tensor(value)
 
 
 def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
@@ -326,11 +403,14 @@ __all__ = [
     "gather_state_dict",
     "load_model_state_dict",
     "load_optimizer_state_dict",
+    "sharded_model_state_dict",
+    "sharded_optimizer_state_dict",
+    "load_sharded_model_state_dict",
+    "load_sharded_optimizer_state_dict",
+    "drop_meta_entries",
     "local_view",
     "is_materialized",
     "trainable_params",
-    "lora_state_dict",
-    "nft_state_dict",
     "fsdp_offload",
     "fsdp_onload",
     "infer_device",

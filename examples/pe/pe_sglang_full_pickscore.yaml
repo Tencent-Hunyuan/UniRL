@@ -60,9 +60,6 @@ diffusion:
       _target_: unirl.models.sd3.config.SD3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
       model_precision: bf16
-      autocast_precision: bf16
-      trajectory_precision: bf16
-      logprob_precision: fp32
       shift: 3.0
       # SGLang diffusion rollout boots in (online) LoRA mode and wraps these
       # modules. Trainside ignores these hints (FSDPBackend.lora_cfg injects
@@ -154,8 +151,6 @@ ar:
       _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       model_precision: bf16
-      autocast_precision: bf16
-      logprob_precision: fp32
   pipeline:
     _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline
     autocast_precision: bf16
@@ -323,8 +318,6 @@ sampling:
     seed: 42
     init_same_noise: false
     autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     sde_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 # ── Per-track LoRA weight-sync bridges (PETrainer builds one each) ──────────

@@ -5,7 +5,9 @@ token-by-token. Parameterized on the conditions container type ``C`` for
 parity with ``DiffusionStage[C]`` so each bundle declares its own typed
 container.
 
-Step-level kernel: ``ARStep`` — per-token sampling kernel (tensor I/O).
+Step-level kernel: ``ARStep`` — per-token transition kernel: ``sample`` is
+the logits→token math kernel; ``init_state`` / ``step`` own the per-token
+model forward (mirroring ``DiffusionStep.forward`` vs ``.step``).
 
 The legacy ``ARTrajectory`` type is deleted — ``TextSegment`` (in
 ``unirl/types/segments/text.py``) replaces it.
@@ -20,7 +22,9 @@ import torch
 from unirl.types.sampling import ARSamplingParams
 from unirl.types.segments import TextSegment
 
+B = TypeVar("B")
 C = TypeVar("C")
+S = TypeVar("S")
 
 
 @runtime_checkable
@@ -57,14 +61,38 @@ class ARStage(Protocol[C]):
 
 
 @runtime_checkable
-class ARStep(Protocol):
-    """Per-step AR token sampling kernel.
+class ARStep(Protocol[B, C, S]):
+    """Per-token AR transition kernel — two levels, mirroring ``DiffusionStep``.
 
-    Given the model's logits over the vocabulary at the current position,
-    sample the next token and return its log-probability.
+    - ``sample(logits)`` — the math kernel: given ``[B, vocab]`` logits at
+      the current position, sample the next token and return
+      ``(token_id [B], log_prob [B])``.
+    - ``init_state`` / ``step`` — the full transition. ``init_state`` builds
+      the model-facing decode state (KV cache, initial model_kwargs) without
+      running a forward; ``step`` runs one token's model forward, ``sample``,
+      and the state advance, returning ``(token_id, log_prob, state)``.
+
+    Unlike ``DiffusionStep`` (whose per-model state is default-constructed
+    by the stage and lazily filled on step 0), AR gets an explicit
+    ``init_state`` because the KV cache must be pre-sized with
+    ``prompt_len + max_new_tokens`` — a loop-level quantity the per-step
+    kernel otherwise never sees.
+
+    The state type ``S`` is per-bundle (e.g. ``HunyuanImage3ARState``):
+    growing ``input_ids``, the HF-style ``model_kwargs`` threaded across
+    steps, and the step index.
+
+    MIGRATION NOTE: ``Qwen3ARStep`` / ``QwenVLARStep`` still implement the
+    legacy logits-only shape (``step(logits) -> (token, logp)``) and are
+    invoked only by their own stages' loops; migrating them to this
+    protocol is a follow-up.
     """
 
-    def step(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: ...
+    def sample(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    def init_state(self, model: B, conditions: C, *, max_new_tokens: int) -> S: ...
+
+    def step(self, model: B, conditions: C, state: S) -> Tuple[torch.Tensor, torch.Tensor, S]: ...
 
 
 def left_pad_prompt(

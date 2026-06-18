@@ -65,7 +65,7 @@ from unirl.rollout.engine.sglang_llm._server import (
 )
 from unirl.rollout.engine.sglang_llm.config import SGLangLLMEngineConfig
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Image, Images, Texts
+from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import get_ar_params
@@ -734,7 +734,7 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
                 len(image_prim) == len(prompts),
                 f"SGLangLLMRolloutEngine.generate: image batch {len(image_prim)} != prompt count {len(prompts)}",
             )
-            pil_images = [Image(pixels=image_prim.pixels[i]).to_pil() for i in range(len(image_prim))]
+            pil_images = image_prim.to_pils()
 
         ar = get_ar_params(req.sampling_params)
         stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
@@ -1080,6 +1080,18 @@ class SGLangLLMRolloutEngine(BaseRolloutEngine):
                 tokenize=True,
                 **(self.cfg.chat_template_kwargs or {}),
             )
+
+        # transformers 5.x apply_chat_template(tokenize=True) returns a
+        # BatchEncoding (older versions a tokenizers.Encoding or list[int]);
+        # normalize to a flat list[int] so the sglang prompt_token_ids and the
+        # decode preview below both receive integers.
+        if hasattr(input_ids, "input_ids"):  # BatchEncoding
+            input_ids = input_ids["input_ids"]
+        elif hasattr(input_ids, "ids"):  # tokenizers.Encoding
+            input_ids = list(input_ids.ids)
+        if input_ids and isinstance(input_ids[0], (list, tuple)):
+            input_ids = input_ids[0]  # de-nest a single-sequence batch
+        input_ids = [int(t) for t in input_ids]
 
         if not self._chat_template_logged:
             self._chat_template_logged = True

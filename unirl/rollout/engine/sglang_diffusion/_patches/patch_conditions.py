@@ -113,6 +113,14 @@ _NEG_MAP = {
     "negative_attention_mask": "negative_prompt_embeds_mask",
 }
 
+# Dest fields whose per-encoder tensor may arrive un-batched ``[seq, hidden]``.
+# Single-encoder token-level models (Z-Image / Qwen3) emit a bare ``[seq, hidden]``
+# caption when a chunk encodes a single prompt (``zimage_postprocess_text`` returns
+# ``hidden_states[0][mask]`` for batch-size 1). Only these dests get a batch dim
+# added at ingestion; pooled (``[B, hidden]``) and masks (``[B, seq]``) are already
+# batched and must be sliced/merged as-is.
+_TOKEN_EMBED_DESTS = frozenset({"prompt_embeds", "negative_prompt_embeds"})
+
 # Sentinels.
 _OUTPUT_BATCH_FIELDS_SENTINEL = "_unirl_conditions_output_batch_fields"
 _GEN_RESULT_FIELDS_SENTINEL = "_unirl_conditions_gen_result_fields"
@@ -278,11 +286,38 @@ def _copy_conditions(src, output_batch) -> None:
     ``return_negative_prompt_embeds`` (delegated to ``sampling_params``).
     """
     if getattr(src, "return_prompt_embeds", False):
-        for dst, srcattr in _POS_MAP.items():
-            setattr(output_batch, dst, _to_cpu_embed_list(getattr(src, srcattr, None)))
+        _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
-        for dst, srcattr in _NEG_MAP.items():
-            setattr(output_batch, dst, _to_cpu_embed_list(getattr(src, srcattr, None)))
+        _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+
+
+def _copy_mapped_conditions(src, output_batch, mapping) -> None:
+    """Copy each ``dst <- srcattr`` field, normalizing un-batched token embeds so
+    every per-encoder field reaches the slice/merge transforms as ``[B, ...]``.
+
+    Single-encoder token-level models (Z-Image) emit a bare ``[seq, hidden]``
+    caption for a single-prompt encode; per-output ``_slice_embed_list`` would then
+    slice the SEQ axis and corrupt it. Adding the missing batch dim here (gated to
+    ``_TOKEN_EMBED_DESTS``) keeps every downstream transform batch-first; a no-op
+    for already-batched multi-encoder embeds (SD3/Qwen) and for pooled/masks.
+    """
+    for dst, srcattr in mapping.items():
+        val = _to_cpu_embed_list(getattr(src, srcattr, None))
+        if dst in _TOKEN_EMBED_DESTS:
+            val = _ensure_batched_embed_list(val)
+        setattr(output_batch, dst, val)
+
+
+def _ensure_batched_embed_list(value):
+    """Add a leading batch dim to any un-batched ``[seq, hidden]`` per-encoder tensor.
+
+    No-op for already-batched ``[B, seq, hidden]`` (``dim() >= 3``, multi-encoder
+    models) and for ``None`` holes; preserves the container type.
+    """
+    if not isinstance(value, (list, tuple)):
+        return value
+    out = [t if (t is None or t.dim() >= 3) else t.unsqueeze(0) for t in value]
+    return out if isinstance(value, list) else type(value)(out)
 
 
 def _wrap_decoding_stage(DecodingStage) -> None:

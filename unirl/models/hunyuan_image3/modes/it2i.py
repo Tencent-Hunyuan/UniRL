@@ -18,8 +18,9 @@ those slots via the ``HunyuanStaticCache``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
+from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
@@ -35,26 +36,25 @@ if TYPE_CHECKING:
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
     texts = req.primitives.get("text")
-    if not isinstance(texts, Texts):
-        raise TypeError(
-            f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
-            f"must be Texts, "
-            f"got {type(texts).__name__ if texts is not None else 'None'}"
-        )
+    require(
+        isinstance(texts, Texts),
+        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
+        f"must be Texts, "
+        f"got {type(texts).__name__ if texts is not None else 'None'}",
+    )
     images = req.primitives.get("image")
-    if not isinstance(images, Images):
-        raise TypeError(
-            f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
-            f"must be Images, "
-            f"got {type(images).__name__ if images is not None else 'None'}"
-        )
-    negatives_raw = req.primitives.get("negative_text")
-    negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-    if negatives is not None and len(negatives.texts) != len(texts.texts):
-        raise ValueError(
-            f"HunyuanImage3Pipeline.generate (it2i): negative_text length "
-            f"{len(negatives.texts)} != text length {len(texts.texts)}"
-        )
+    require(
+        isinstance(images, Images),
+        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
+        f"must be Images, "
+        f"got {type(images).__name__ if images is not None else 'None'}",
+    )
+    require(
+        req.primitives.get("negative_text") is None,
+        "HunyuanImage3Pipeline.generate (it2i): negative_text is not supported — "
+        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
+        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
+    )
 
     params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
     if req.sigmas is None:
@@ -63,7 +63,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
             "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
         )
     schedule = req.sigmas.to(pipeline.bundle.device)
-    cfg_factor = 2 if float(params.guidance_scale) > 1.0 else 1
+    # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
+    # and the vit_kwargs duplication below — they must agree on the batch axis.
+    cfg = float(params.guidance_scale) > 1.0
+    cfg_factor = 2 if cfg else 1
 
     # 1. ViT cond features. Returns joint_image_info (forwarded to chat
     #    template), cond_vit_images, vit_kwargs.
@@ -86,16 +89,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         }
 
     # 4. Build the unified-MM tensors with cond-image markers spliced in.
-    if negatives is not None:
-        neg_strs: Optional[List[str]] = list(negatives.texts)
-    elif cfg_factor > 1:
-        neg_strs = ["" for _ in texts.texts]
-    else:
-        neg_strs = None
     bot_task = str(req.stage_config.get("bot_task", "image"))
-    mm = pipeline.bundle.build_t2i_inputs(
-        list(texts.texts),
-        neg_strs,
+    mm = pipeline.text_embed.embed_for_gen_image(
+        texts,
+        cfg=cfg,
         height=int(params.height),
         width=int(params.width),
         bot_task=bot_task,

@@ -66,7 +66,7 @@ class WAN21CLIPVisionEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
         if not isinstance(p, Images):
             raise TypeError(f"WAN21CLIPVisionEncodeStage.encode: expected Images, got {type(p).__name__}")
 
-        pils = [img.to_pil() for img in p.to_list()]
+        pils = p.to_pils()
         processed = self.bundle.image_processor(images=pils, return_tensors="pt").pixel_values
         processed = processed.to(device=self.bundle.device, dtype=self.bundle.dtype)
 

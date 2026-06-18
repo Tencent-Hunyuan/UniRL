@@ -20,6 +20,7 @@ multi-epoch replay, checkpoint / eval cadence, structured logging.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import time
@@ -37,7 +38,7 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sampling import BaseSamplingParams, get_diffusion_params
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -144,20 +145,31 @@ class PETrainer(BaseTrainer):
         stack = remote_hydra(cfg.stack, fsdp_backend=backend, algorithm=algorithm)
         return _Side(bundle=bundle, pipeline=pipeline, backend=backend, algorithm=algorithm, stack=stack)
 
-    def _build_req(self, inputs: RolloutInputs) -> RolloutReq:
+    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
         from ``ComposedSamplingParams`` (``ar.samples_per_prompt`` rewrites,
         ``diffusion.samples_per_prompt`` images each). The single-track trainer
         pre-expands here; PE must not, or it would double-count.
+
+        ``rollout_id`` keys the diffusion SDE-step schedule: the indices are
+        resolved off the diffusion sub-block (``resolve_sde_indices``), stamped
+        onto a per-request copy, and the ``scheduler`` is nulled so only the
+        concrete ``sde_indices`` ride to the engine (mirrors
+        :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
+        The AR sub-block has no SDE machinery and is left untouched.
         """
+        diff_params = get_diffusion_params(self.sampling_params)
+        sde_indices = diff_params.resolve_sde_indices(rollout_id)
+        diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
+        sampling_params = dataclasses.replace(self.sampling_params, diffusion=diffusion)
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
-            sampling_params=self.sampling_params,
+            sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
         )
 
@@ -258,7 +270,7 @@ class PETrainer(BaseTrainer):
             for rollout_id in range(num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs)
+                req = self._build_req(inputs, rollout_id)
                 # Sync before generate; skip step 0 (nothing trained yet).
                 sync_weights = rollout_id > 0 and rollout_id % interval == 0
                 results, mean_reward = self.train_step(

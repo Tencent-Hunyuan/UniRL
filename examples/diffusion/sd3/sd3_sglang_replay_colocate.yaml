@@ -1,0 +1,202 @@
+# @package _global_
+# SD3 + SGLang colocate, REPLAY logprob, v2 trainer, 2x8 H20 (matches v1 reference geometry).
+#
+# Same as sd3/sd3_sglang_rollout_colocate.yaml except:
+#   - algorithm.old_logp_source: replay
+#       Trainer recomputes the π_old anchor via stage.replay at update time
+#       (the engine's best-effort native log-probs, if any, are ignored).
+#
+#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_replay_colocate
+
+num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
+batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 10000
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (SGLang needs both at init).
+model_config:
+  _target_: unirl.models.sd3.config.SD3PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+  model_precision: bf16
+  shift: 3.0
+  # SGLang builds its LoRA ServerArgs from these two fields.
+  use_lora: true
+  lora_target_modules:
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+
+# Shared SDE strategy; SGLang resolves its sde_label from it.
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: sd3
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory (it runs the whole batch in one forward otherwise),
+    # without shrinking the logical batch. Mirrors sd3_trainside.
+    forward_batch_size: 16
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+    engine_kwargs:
+      model_type: sd3
+  # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # REPLAY mode: trainer recomputes the π_old anchor via stage.replay at update
+  # time (engine emits trajectories; its native log-probs, if any, are ignored).
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+
+data_source:
+  # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
+  # via data_path and exposes get_samples(bs). (DefaultDataSource returns only
+  # 8 hardcoded prompts — smoke-test use; training on it over-optimizes/collapses.)
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps
+    # (the validated reproduce setting); [0,1] spreads it across all steps.
+    timestep_fraction: [0, 0.5]
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train).
+# Every N rollouts the loop pushes the freshly-trained adapter into SGLang.
+# 1 = on-policy; >1 lags rollout weights (off-policy drift).
+weight_sync_interval: 1
+
+# LoRA weight sync → SGLang rollout. Same bridge that vllm-omni uses; the
+# trainer's `weight_sync_interval` drives cadence — every N rollouts it calls
+# bridge.sync() to push the freshly-trained LoRA adapter into the engine
+# (fused into the generate wake/sleep, so a synced step costs one wake instead
+# of two).
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false  # SGLang engine lacks loaded_lora_checksums (only loaded_param_checksums); skip read-back
+  # Mirrors SD3PipelineConfig.weight_sync_param_name_prefix; must match the
+  # engine-side LoRA key naming (a wrong prefix yields wrong/zero loaded layers,
+  # which `verify` catches).
+  param_prefix: "transformer."
+  adapter_name: default

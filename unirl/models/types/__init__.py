@@ -11,7 +11,7 @@ Pipeline stages (each ``X → Y`` between tiers):
 Step kernels (per-step math, tensor I/O):
 
 - ``DiffusionStep`` — single denoising transition.
-- ``ARStep`` — single token sample.
+- ``ARStep`` — single-token transition (model forward + sample).
 
 All schedule / sampling parameters are passed at call time on the rollout-
 level stages (``diffuse(...)`` / ``autoregress(...)``) — Stages are stateless
