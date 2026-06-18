@@ -135,14 +135,31 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
             pil_image = to_pil_image(pixels[b].clamp(0.0, 1.0).float().cpu())
             if pil_image.mode != "RGB":
                 pil_image = pil_image.convert("RGB")
-            info = image_processor.preprocess(pil_image)
-            joint_image_info.append([info])
+            if hasattr(image_processor, "preprocess"):
+                # Older checkpoint API: preprocess -> JointImageInfo with
+                # vision_image_info.image_tensor + vision_encoder_kwargs.
+                info = image_processor.preprocess(pil_image)
+                cond_item = info
+                vit_tensor = info.vision_image_info.image_tensor  # [1, S, D]
+                ve_kwargs = info.vision_encoder_kwargs
+            else:
+                # Newer (Instruct) API: get_image_with_size -> CondImage. The ViT
+                # ImageTensor (cond_image.vit_image) IS the [S, D] patch tensor and
+                # carries .vision_encoder_kwargs; CondImage flows to
+                # apply_chat_template (batch_cond_images) + _encode_cond_image.
+                cond_image = image_processor.get_image_with_size(
+                    pil_image, return_type=image_processor.cond_image_type
+                )[0]
+                cond_item = cond_image
+                vit_t = cond_image.vit_image
+                vit_tensor = vit_t.unsqueeze(0) if vit_t.dim() == 2 else vit_t  # [1, S, D]
+                ve_kwargs = vit_t.vision_encoder_kwargs
+            joint_image_info.append([cond_item])
 
-            # vision_image_info.image_tensor: [1, S, D] -- keep the leading
-            # 1-dim so the per-sample tensor is [n_cond=1, S, D].
-            cond_vit_images.append(info.vision_image_info.image_tensor)
+            # [1, S, D] -- keep the leading 1-dim so the per-sample tensor is
+            # [n_cond=1, S, D].
+            cond_vit_images.append(vit_tensor)
 
-            ve_kwargs = info.vision_encoder_kwargs
             # Stack across the per-sample cond-image list (length 1 here)
             # to produce [n_cond, ...] tensors per sample.
             spatial_shapes_list.append(torch.stack([ve_kwargs["spatial_shapes"]], dim=0))  # [1, 2]

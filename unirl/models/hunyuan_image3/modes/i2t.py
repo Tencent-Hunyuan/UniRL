@@ -18,8 +18,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List
 
+import torch
+
 from unirl.models.types.ar import ARSamplingParams
-from unirl.types.conditions import ImageEmbedCondition
+from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
@@ -27,7 +29,7 @@ from unirl.types.sampling import get_ar_params
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
-from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task
+from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
@@ -67,9 +69,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         taylor_cache_order=model_cfg.get("taylor_cache_order"),
     )
     bot_task = str(ar_params.bot_task)
+    tok_bot_task = _tokenizer_bot_task(bot_task)
 
     system_prompt = _resolve_system_prompt(
-        pipeline.bundle, bot_task, ar_params.use_system_prompt, ar_params.system_prompt
+        pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
     )
     system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
 
@@ -78,26 +81,54 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #       "attention_mask"}}
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # Chat template path: pass batch_cond_image_info so the wrapper
-    # splices in <img> markers; the resulting ``cond_vit_image_mask``
-    # (now on ``fused``) pins which ``input_ids`` positions hold the
-    # ViT scatter target.
+    # HI3-Instruct represents a cond image as a DUAL VAE + ViT block (the
+    # chat template splices VAE <img> slots + a cond <timestep> alongside the
+    # ViT <img> slots). ``_encode_cond_image`` VAE-encodes the cond image and
+    # returns the per-sample VAE latents + timestep + the (re-shaped) ViT
+    # features the unified-MM forward scatters — same call it2i uses.
+    # ``cfg_factor=1``: the AR/comprehension forward has no CFG batching.
+    # Without the VAE half, the 4096 VAE <img> slots stay bare <img>
+    # embeddings → the model sees garbage and can't comprehend the image.
+    cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
+        vit["joint_image_info"], cfg_factor=1
+    )
+
+    # ``cond_vae_images`` is the raw VAE-input image (float). The AR forward runs
+    # the bf16 VAE encoder WITHOUT autocast (the diffusion path wraps its forward
+    # in torch.autocast; the autoregress loop does not), so a float input hits
+    # bf16 conv weights → dtype mismatch. Cast float tensors to the model dtype.
+    def _cast_floats(x: Any) -> Any:
+        if isinstance(x, torch.Tensor):
+            return x.to(dtype=pipeline.bundle.dtype) if x.is_floating_point() else x
+        if isinstance(x, (list, tuple)):
+            return type(x)(_cast_floats(e) for e in x)
+        return x
+
+    cond_vae_images = _cast_floats(cond_vae_images)
+
+    # Chat template path: pass batch_cond_image_info so the wrapper splices in
+    # the cond-image markers; the resulting cond_vae_image_mask /
+    # cond_vit_image_mask / cond_timestep_scatter_index (now on ``fused``) pin
+    # which ``input_ids`` positions hold the VAE / ViT / timestep scatter targets.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
-        bot_task=bot_task,
+        bot_task=tok_bot_task,
         system_prompt=system_prompt_list,
         cot_text=([ar_params.cot_text] * len(texts.texts) if ar_params.cot_text else None),
         batch_cond_image_info=vit["joint_image_info"],
     )
 
+    cond_vae = ImageLatentCondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
-        embeds=vit["cond_vit_images"],
+        embeds=cond_vit_images,
         attn_mask=vit["vit_kwargs"]["attention_mask"],
         spatial_shapes=vit["vit_kwargs"]["spatial_shapes"],
     )
     ar_conds = HunyuanImage3ARConditions(
         fused=mm["fused"],
+        cond_vae=cond_vae,
         cond_vit=cond_vit,
+        cond_timestep=cond_timestep,
         tokenizer_output=mm["tokenizer_output"],
     )
 

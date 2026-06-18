@@ -1,7 +1,8 @@
 """HunyuanImage3Pipeline — RolloutReq → RolloutResp dispatcher.
 
 Per-task generate logic lives in ``modes/<task>.py`` (one file each for
-``t2t``, ``i2t``, ``t2i``, ``it2i``). This module is a thin dispatcher:
+``t2t``, ``i2t``, ``t2i``, ``it2i``, ``t2ti``). This module is a thin
+dispatcher:
 it instantiates / composes the shared stages (``Bundle``,
 ``TextEmbedStage``, ``DiffusionStage``, ``ARStage``, ``VAEEncodeStage``,
 ``VAEDecodeStage``, ``VitEncodeStage``) and routes ``generate(req)`` to
@@ -47,15 +48,25 @@ class HunyuanImage3Pipeline(Pipeline):
     Reads from ``RolloutReq``:
 
     - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
+    - ``primitives["negative_text"]`` — rejected for t2i / it2i: the HI3
+      tokenizer never consumes negative-prompt text; CFG derives from
+      ``guidance_scale > 1.0``.
     - ``primitives["image"]: Images`` — required for i2t / it2i.
-    - ``stage_params["task"]: str`` — one of ``{"t2t", "i2t", "t2i", "it2i"}``.
-      Defaults to ``"t2i"`` if absent.
+    - ``stage_params["task"]: str`` — one of ``{"t2t", "i2t", "t2i",
+      "it2i", "t2ti"}``. Defaults to ``"t2i"`` if absent.
     - ``stage_params["bot_task"]: str`` — chat-template flag forwarded to
-      ``Bundle.build_t2i_inputs`` (t2i / it2i).
+      ``HunyuanImage3TextEmbedStage.embed_for_gen_image`` (t2i / it2i),
+      or the CoT-chain preset for t2ti (default ``"think_recaption"``).
     - ``stage_params["diffusion"]: dict`` — kwargs for
       :class:`HunyuanImage3DiffusionParams` (t2i / it2i).
-    - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t).
+    - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t / t2ti).
+
+    t2ti (text → CoT text + image) requires
+    ``ComposedSamplingParams(ar=..., diffusion=...)`` and returns TWO
+    tracks: ``"ar"`` (root, the CoT TextSegment) and ``"image"``
+    (``parent_track="ar"``, the LatentSegment). Fan-out
+    (``samples_per_prompt``) is NOT honored by t2ti — replication
+    belongs to the engine adapter, as with the other HI3 modes.
 
     Writes to ``RolloutResp``:
 
@@ -188,7 +199,7 @@ class HunyuanImage3Pipeline(Pipeline):
         modes package to avoid the circular ``modes -> pipeline`` ref
         (mode files type-annotate ``pipeline: "HunyuanImage3Pipeline"``).
         """
-        from .modes import i2t, it2i, t2i, t2t
+        from .modes import i2t, it2i, t2i, t2t, t2ti
 
         task = req.stage_config.get("task", "t2i")
         if task == "t2t":
@@ -199,21 +210,28 @@ class HunyuanImage3Pipeline(Pipeline):
             return t2i.generate(self, req)
         if task == "it2i":
             return it2i.generate(self, req)
+        if task == "t2ti":
+            return t2ti.generate(self, req)
         raise ValueError(
-            f"HunyuanImage3Pipeline.generate: unknown task={task!r}; expected one of 't2t', 'i2t', 't2i', 'it2i'."
+            f"HunyuanImage3Pipeline.generate: unknown task={task!r}; "
+            f"expected one of 't2t', 'i2t', 't2i', 'it2i', 't2ti'."
         )
 
     # ------------------------------------------------------------------
     # Helpers shared by multiple modes.
     # ------------------------------------------------------------------
 
-    def _detokenize_text_segment(self, text_seg) -> Texts:
+    def _detokenize_text_segment(self, text_seg, *, skip_special_tokens: bool = True) -> Texts:
         """Detokenize a varlen ``TextSegment`` back into a ``Texts`` primitive.
 
         Reads ``text_seg.tokens`` + ``text_seg.cu_seqlens`` to slice each
         sample's tokens, runs ``self.bundle.tokenizer.decode`` per sample,
         and packages the results into ``Texts``. Returns empty strings
         when the bundle has no tokenizer (used by fake-bundle tests).
+
+        ``skip_special_tokens=False`` keeps control markers like
+        ``</think>`` / ``</recaption>`` in the decoded text — t2ti's
+        bridge needs them to truncate and re-feed the CoT.
 
         Shape contract:
             text_seg.tokens     : packed varlen [sum_lengths] long
@@ -231,7 +249,12 @@ class HunyuanImage3Pipeline(Pipeline):
             a = int(text_seg.cu_seqlens[k].item())
             b = int(text_seg.cu_seqlens[k + 1].item())
             ids = text_seg.tokens[a:b].tolist()
-            out.append(tokenizer.decode(ids, skip_special_tokens=True))
+            # clean_up_tokenization_spaces=False: the HunyuanImage3 BPE tokenizer
+            # warns that the WordPiece-oriented cleanup is destructive for BPE
+            # (inserts spaces between characters) — disable it for coherent text.
+            out.append(
+                tokenizer.decode(ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
+            )
         return Texts(texts=out)
 
 
