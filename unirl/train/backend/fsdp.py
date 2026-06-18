@@ -171,6 +171,17 @@ class FSDPBackend(Remote):
         self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
+        # The FSDP compute dtype (MixedPrecisionPolicy.param_dtype). This is the
+        # wire dtype for weight sync: with master_dtype=fp32 the trainable LoRA
+        # params live in fp32 (the reward-collapse fix), but the rollout engine's
+        # vLLM punica kernel hard-asserts bf16/fp16 — so LoRA extraction casts to
+        # this dtype at the all-gather (also halves the sync bandwidth). Exposed
+        # via the ``wire_dtype`` property the LoRA sync reads.
+        from unirl.utils.dtypes import parse_torch_dtype
+
+        self._wire_dtype: torch.dtype = parse_torch_dtype(
+            fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
+        )
         # Checkpointed for export tooling: the LoRA fold needs scaling =
         # alpha / rank, and alpha is not derivable from the weights.
         active_lora = lora_cfg or ema_lora_cfg
@@ -294,6 +305,16 @@ class FSDPBackend(Remote):
         the same weights whether the engine is colocated or separate.
         """
         return self._rollout_adapter_name
+
+    @property
+    def wire_dtype(self) -> torch.dtype:
+        """The dtype LoRA / full-weight sync ships in (FSDP compute ``param_dtype``).
+
+        Decoupled from the trainable params' own dtype: under ``master_dtype=fp32``
+        the LoRA params are fp32, but the rollout engine's vLLM punica kernel
+        requires bf16/fp16, so the sync casts to this at extraction.
+        """
+        return self._wire_dtype
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def apply_eval_ema(self) -> None:

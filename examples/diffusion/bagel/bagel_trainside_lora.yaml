@@ -44,9 +44,6 @@ bundle:
     # v3-equivalent: bf16 heads + bf16 transformer compute under autocast bf16 (no
     # fp32-heads → vendor stays byte-pristine). fp32 LoRA master (below) is the only
     # precision lever — it is THE reward-collapse fix.
-    autocast_precision: bf16
-    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
-    logprob_precision: fp32
     shift: 3.0
     use_lora: true
 
@@ -165,15 +162,12 @@ sampling:
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0
   cfg_renorm_type: global
-  eta: 1.0                             # SDE noise scale (= flow_grpo noise_level); consumed by FlowSDEStrategy
+  eta: 0.7                            # SDE noise scale (= flow_grpo noise_level); consumed by FlowSDEStrategy
   samples_per_prompt: 16
   height: 512
   width: 512
   seed: 42
   init_same_noise: false               # per-sample x_T (NoiseRecipe r{rollout}:{sample}); diverse GRPO groups
-  autocast_precision: bf16
-  trajectory_precision: fp32
-  logprob_precision: fp32
   # SDE steps: 2 random steps drawn from the early half [0, 7) of the 14-step schedule,
   # resolved PER ROLLOUT via AllSDEScheduler → resolve_sde_indices (shared across the
   # GRPO group, seeded by rollout_id). Uses UniRL's NATIVE timestep_fraction (early-half

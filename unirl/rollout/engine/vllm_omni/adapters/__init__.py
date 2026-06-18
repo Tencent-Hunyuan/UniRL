@@ -8,6 +8,7 @@ two conversion verbs):
 - ``sd3``  — sd3_t2i
 - ``hv15`` — hv15_t2v
 - ``qwen_image`` — qwen_image_t2i
+- ``bagel`` — bagel_t2i
 
 ``dit`` holds the universal single-stage DiT skeletons
 (:class:`DitInputAdapter` / :class:`DitOutputAdapter`) the families derive
@@ -20,6 +21,11 @@ from unirl.rollout.engine.vllm_omni.adapters.base import (
     get_adapter,
     register_adapter,
     registered_adapters,
+)
+from unirl.rollout.engine.vllm_omni.adapters.bagel import (
+    BagelInputAdapter,
+    BagelOutputAdapter,
+    BagelT2iAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import (
@@ -51,6 +57,9 @@ from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3OutputAdapter, Sd3T2i
 __all__ = [
     "DitInputAdapter",
     "DitOutputAdapter",
+    "BagelInputAdapter",
+    "BagelOutputAdapter",
+    "BagelT2iAdapter",
     "Hi3ArRecaptionAdapter",
     "Hi3ArRecaptionOutputAdapter",
     "Hi3DitRecaptionAdapter",

@@ -208,6 +208,7 @@ class BagelPipeline(Pipeline):
                 cfg_text_context=cfg_text_ctx,
                 cfg_img_context=cfg_img_ctx,
                 image_shape=image_shape,
+                prompt=prompt,
             )
             x0_i = initial[i] if initial is not None else None
             seg_i = self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=x0_i)
@@ -222,6 +223,7 @@ class BagelPipeline(Pipeline):
             gen_contexts=gen_list,
             cfg_text_contexts=cfg_text_list,
             cfg_img_contexts=cfg_img_list,
+            prompts=list(prompts),
             image_shapes=shapes,
         )
         images = self.vae_decode.decode(segment, image_shape=image_shape)
