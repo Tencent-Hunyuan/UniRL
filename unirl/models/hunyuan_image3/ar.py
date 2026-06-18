@@ -440,6 +440,15 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         Stop-token policy: any token in ``params.stop_token_ids`` (if
         provided) terminates that sample's generation. Falls back to
         ``sampling_params.stop_token_id`` otherwise.
+
+        Padding note: unlike the qwen AR stages (which ``left_pad_prompt``),
+        HI3 keeps the upstream right-padding and reads the prefill prediction
+        at ``real_pos - 1``; decode-step ``position_ids`` are then advanced by
+        the checkpoint's own ``_update_model_kwargs_for_generation`` (not
+        vendored here). Mixed-length in-process batches therefore depend on
+        that upstream position handling and have been validated only via the
+        equal-length / two-engine (per-request, un-padded) rollout path. The
+        matching ``replay`` recovers true positions from ``fused.prompt_lengths``.
         """
         fused = conditions.fused
         if fused is None or fused.input_ids is None:
@@ -512,10 +521,13 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         varlen ``[total_tokens]`` aligned with ``segment.log_probs``.
 
         Builds ``inputs_embeds`` for the forward by looking up the chat-
-        template ``input_ids`` in the model's shared embedding table —
-        for t2t this is exact; for i2t / it2i replay with cond-image
-        conditioning the cond_vit scatter is *not* re-applied here (a
-        future training-side enhancement).
+        template ``input_ids`` in the model's shared embedding table — exact
+        for the text-only AR path (t2t / think_recaption). i2t / it2i replay
+        with cond-image conditioning is **rejected** below: the cond VAE+ViT
+        scatter is not re-applied here, so replaying those without it would
+        compute logp on un-conditioned hidden states (a future training-side
+        enhancement). The shipped two-engine recaption RL is text-only
+        (``is_comprehension: false``), so this never triggers there.
 
         Caller controls grad / no_grad scope and ``.train()`` mode.
         Empty-response samples contribute zero tokens to the output.
@@ -528,6 +540,19 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                 "HunyuanImage3ARStage.replay: segment requires tokens with "
                 "framework-managed cu_seqlens (construct via TextSegment.pack)"
             )
+        # Fail closed on cond-image replay: the rollout conditioned the response
+        # on scattered VAE+ViT cond-image embeds, but this teacher-forced replay
+        # rebuilds inputs_embeds from input_ids only (no cond scatter). Replaying
+        # i2t/it2i this way would silently drop the image → wrong logp. Reject
+        # until the scatter is ported here.
+        if conditions.cond_vit is not None or conditions.cond_vae is not None:
+            raise NotImplementedError(
+                "HunyuanImage3ARStage.replay: cond-image (i2t / it2i) replay is not "
+                "supported — the VAE+ViT cond scatter is not re-applied in the "
+                "teacher-forced forward, so per-token logp would omit the image "
+                "conditioning the rollout used. In-process comprehension/edit AR RL "
+                "needs the cond-image scatter ported into replay first."
+            )
 
         prompt_ids_padded = fused.input_ids  # [B, max_prompt_len], right-padded
         # Drive the forward on the MODEL's device, not the conditions' device:
@@ -538,19 +563,27 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         device = self.model.transformer.model.wte.weight.device
         batch_size = int(prompt_ids_padded.shape[0])
 
-        # Per-sample TRUE prompt lengths. The two-engine AR rollout sends each
-        # prompt as its own vLLM request (no batch padding), so prompts differ
-        # in length; ``response._build_ar_fused_condition`` right-pads them and
-        # carries the per-sample TRUE length in ``fused.prompt_lengths`` [B].
-        # Using the real length per sample is REQUIRED — a single padded
-        # ``prompt_len`` would (1) let the response attend prompt-region pad,
-        # (2) shift rope/positions (forward derives them from arange over the
-        # padded length), and (3) slice the prediction logits at the wrong
-        # column. We therefore replay ONE sample at a time with no padding.
-        if fused.prompt_lengths is not None:
-            prompt_lengths = [int(n) for n in fused.prompt_lengths.tolist()]
-        else:
-            prompt_lengths = [int(prompt_ids_padded.shape[1])] * batch_size
+        # Per-sample TRUE prompt lengths. The rollout sends each prompt without
+        # batch padding (its own vLLM request in the two-engine adapter, or the
+        # tokenizer's ``real_pos`` in the in-process ``embed_for_ar``); both
+        # right-pad to ``[B, max_len]`` and carry the per-sample TRUE length in
+        # ``fused.prompt_lengths`` [B]. Using the real length per sample is
+        # REQUIRED — a single padded ``prompt_len`` would (1) let the response
+        # attend prompt-region pad, (2) shift rope/positions (forward derives
+        # them from arange over the padded length), and (3) slice the prediction
+        # logits at the wrong column. We therefore replay ONE sample at a time
+        # with no padding. Fail closed rather than silently fall back to the
+        # padded length, which would corrupt per-token logp for short samples.
+        if fused.prompt_lengths is None:
+            raise ValueError(
+                "HunyuanImage3ARStage.replay: fused.prompt_lengths is None. The "
+                "per-sample TRUE prompt length is required to slice off the right-pad "
+                "in a mixed-length batch; without it, replay would teacher-force on "
+                "pad-shifted positions and silently corrupt the GRPO ratio. Populate "
+                "it at rollout time — both the vLLM adapter (adapters/hi3.py) and the "
+                "in-process embed_for_ar derive it from the tokenizer's real_pos."
+            )
+        prompt_lengths = [int(n) for n in fused.prompt_lengths.tolist()]
 
         resp_lengths = [int(n) for n in segment.lengths.tolist()]
         cu = [int(c) for c in segment.cu_seqlens.tolist()]

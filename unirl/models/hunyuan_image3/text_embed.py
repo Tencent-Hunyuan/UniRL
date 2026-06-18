@@ -300,6 +300,23 @@ class HunyuanImage3TextEmbedStage:
         cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), _device)
         cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), _device)
 
+        # Per-sample TRUE prompt length for the right-padded batch. The upstream
+        # tokenizer right-pads a mixed-length batch to ``max_len`` and records the
+        # real end in ``real_pos`` (one-past-last-valid → == prompt length, the
+        # same quantity the rollout prefill reads at ``real_pos - 1``). Carry it on
+        # ``fused`` so trainside ``replay`` slices off the right-pad — the same
+        # ``prompt_lengths`` contract the two-engine adapter (adapters/hi3.py)
+        # fills. Without it, ``replay`` would fall back to the padded length and
+        # compute per-token logp at pad-shifted positions for short samples →
+        # silent GRPO ratio error.
+        prompt_lengths: Optional[torch.Tensor] = None
+        real_pos = getattr(output, "real_pos", None)
+        if real_pos is not None:
+            rp = real_pos.to(device=_device, dtype=torch.long)
+            if rp.dim() == 2:
+                rp = rp[:, -1]
+            prompt_lengths = rp.reshape(-1)  # [B]
+
         fused = HunyuanImage3FusedMultimodalCondition(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -308,6 +325,7 @@ class HunyuanImage3TextEmbedStage:
             cond_vae_image_mask=cond_vae_image_mask,
             cond_vit_image_mask=cond_vit_image_mask,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
+            prompt_lengths=prompt_lengths,
         )
         return {"fused": fused, "tokenizer_output": output}
 
