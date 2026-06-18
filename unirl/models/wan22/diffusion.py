@@ -617,7 +617,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         unwrapped, exactly like SD3 / HI3.
 
         **LoRA-on-composite assumption** (worth a GPU smoke):
-        LoRA injection (``unirl.train.inject``) calls
+        LoRA injection (``unirl.train.lora``) calls
         :func:`peft.inject_adapter_in_model` on whatever
         ``trainable_module()`` returns, with a ``target_modules`` list of
         suffix strings (e.g. ``["attn1.to_q", "attn1.to_k", ...]``).

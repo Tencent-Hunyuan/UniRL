@@ -35,13 +35,16 @@ Use :meth:`Flux2KleinBundle.from_config` to load a checkpoint.
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
 from typing import Any, List, Tuple
 
 import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.meta_init import finalize_meta_init
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Flux2KleinPipelineConfig
@@ -93,6 +96,48 @@ def _materialize_meta_tensors(module: nn.Module) -> List[str]:
             materialized.append(name + " (buffer)")
 
     return materialized
+
+
+def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: str) -> None:
+    """Zero-init (post-load, deferred) transformer params the checkpoint omits.
+
+    Klein's ``time_guidance_embed.guidance_embedder`` (built by older diffusers
+    even when ``guidance_embeds=false``) is absent from the checkpoint. On the
+    eager path :func:`_materialize_meta_tensors` zero-inits it. Under meta-init
+    the backend's ``to_empty`` materializes every param to garbage and the
+    ``strict=False`` load fills only those present in the checkpoint, so the
+    absent ones must be zeroed *after* the load — stamped as a deferred op
+    (drained by ``apply_deferred_ops`` once weights are loaded). Names are
+    captured pre-LoRA, but the absent params (guidance embedder) are never LoRA
+    targets, so their names are stable through injection."""
+    from safetensors import safe_open
+
+    from unirl.train.deferred import _stamp
+
+    ckpt_keys: set = set()
+    if os.path.isdir(weights_dir):
+        for shard in sorted(glob.glob(os.path.join(weights_dir, "*.safetensors"))):
+            with safe_open(shard, framework="pt") as handle:
+                ckpt_keys.update(handle.keys())
+    absent = frozenset(name for name, _ in transformer.named_parameters() if name not in ckpt_keys)
+    if not absent:
+        return
+
+    def _zero_absent(model: nn.Module) -> None:
+        zeroed: List[str] = []
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in absent:
+                    param.zero_()
+                    zeroed.append(name)
+        if zeroed:
+            logger.info(
+                "FLUX.2-klein meta-init: zero-initialized %d checkpoint-absent param(s): %s",
+                len(zeroed),
+                zeroed[:8],
+            )
+
+    _stamp(transformer, _zero_absent)
 
 
 class Flux2KleinBundle(Bundle):
@@ -147,22 +192,35 @@ class Flux2KleinBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        # --- Transformer (9B, with meta-tensor materialization) ---
-        transformer = Flux2Transformer2DModel.from_pretrained(
-            path,
-            subfolder="transformer",
-            torch_dtype=dtype,
-        )
-        materialized = _materialize_meta_tensors(transformer)
-        if materialized:
-            preview = materialized[:5] + (["..."] if len(materialized) > 5 else [])
-            logger.warning(
-                "FLUX.2-klein transformer: zero-initialized %d parameter(s)/buffer(s) "
-                "missing from the checkpoint (e.g. klein-9B guidance embedder): %s",
-                len(materialized),
-                preview,
+        # --- Transformer (9B) ---
+        if config.meta_init_transformer:
+            # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
+            # no per-rank weight allocation; the backend materializes + loads
+            # from the stashed dir after sharding. The guidance-embedder quirk
+            # (see module docstring) is handled by a deferred zero-init of the
+            # checkpoint-absent params, since to_empty leaves them as garbage
+            # (not meta) — _materialize_meta_tensors wouldn't catch them.
+            transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
+            with torch.device("meta"):
+                transformer = Flux2Transformer2DModel.from_config(transformer_config)
+            transformer = finalize_meta_init(transformer, dtype=dtype)
+            _stamp_zero_checkpoint_absent_params(transformer, os.path.join(path, "transformer"))
+        else:
+            transformer = Flux2Transformer2DModel.from_pretrained(
+                path,
+                subfolder="transformer",
+                torch_dtype=dtype,
             )
-        transformer = transformer.to(device)
+            materialized = _materialize_meta_tensors(transformer)
+            if materialized:
+                preview = materialized[:5] + (["..."] if len(materialized) > 5 else [])
+                logger.warning(
+                    "FLUX.2-klein transformer: zero-initialized %d parameter(s)/buffer(s) "
+                    "missing from the checkpoint (e.g. klein-9B guidance embedder): %s",
+                    len(materialized),
+                    preview,
+                )
+            transformer = transformer.to(device)
 
         # --- VAE (frozen, eval) ---
         vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
@@ -183,7 +241,7 @@ class Flux2KleinBundle(Bundle):
         # --- Scheduler (FlowMatchEulerDiscreteScheduler with empirical mu) ---
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
@@ -193,6 +251,10 @@ class Flux2KleinBundle(Bundle):
             device=device,
             pretrained_path=path,
         )
+        if config.meta_init_transformer:
+            # Consumed by the backend's post-shard weight load.
+            bundle._transformer_weights_path = os.path.join(path, "transformer")
+        return bundle
 
 
 __all__ = ["Flux2KleinBundle"]

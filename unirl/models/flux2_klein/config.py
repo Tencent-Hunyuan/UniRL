@@ -61,6 +61,13 @@ class Flux2KleinPipelineConfig:
     # load it under the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
+    # Meta-init the transformer (build on the meta device; the backend loads
+    # weights after sharding) instead of eager ``from_pretrained``. Avoids the
+    # per-rank full-model GPU spike. Consumed by FSDPBackend / VeOmniBackend via
+    # the stashed ``_transformer_weights_path``. The Klein guidance-embedder
+    # quirk is handled by a deferred zero-init of checkpoint-absent params.
+    meta_init_transformer: bool = False
+
     # FLUX.2-klein Qwen3 text encoder budget (tokens including chat
     # template). The legacy bundle defaults to 512.
     max_sequence_length: int = 512

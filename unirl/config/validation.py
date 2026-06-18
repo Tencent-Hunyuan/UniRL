@@ -94,9 +94,9 @@ def validate_dynamic_dotpaths(cfg: DictConfig) -> None:
 def validate_training_batch_geometry(cfg: DictConfig) -> None:
     """Cross-section: training plan's global batch size must divide by DP sizes.
 
-    ``dp_size`` is ``Optional[int]`` on ``TrainTopology``; ``None`` means
-    "derive from ``dist.get_world_size()`` at runtime" and is not checkable
-    at cfg time.
+    ``cfg.training.topology.dp_size`` is optional; ``null`` means "derive
+    from ``dist.get_world_size()`` at runtime" and is not checkable at cfg
+    time.
     """
     global_batch = int(cfg.training.plan.global_batch_size)
     raw_dp_size = cfg.training.topology.dp_size

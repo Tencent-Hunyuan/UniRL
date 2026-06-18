@@ -1,11 +1,22 @@
-"""FSDPBackend — single-track training-state Remote.
+"""BaseFSDP2Backend — the shared training-state Remote for FSDP2 backends.
 
-Owns structural injection (LoRA / DiffusionNFT / mirror EMA / FSDP wrap) on the
-trainable module exposed by a :class:`Bundle`, plus the ongoing training
-state (optimizer, scheduler, EMA, eval-EMA swap, checkpoint, onload/
-offload).  Does NOT hold a ``Stage`` or an algorithm — the algorithm
-sibling Remote owns the stage and runs forward/backward against the
-same shared bundle.
+Holds everything identical across the torch-native and VeOmni FSDP2 backends:
+the training step, the EMA eval-swap, the hardened checkpoint envelope, the
+memory lifecycle, and the construction scaffolding (structural injection +
+EMA/optimizer/scheduler build). The two concrete backends
+(:class:`~unirl.train.backend.fsdp.FSDPBackend` and
+:class:`~unirl.train.backend.veomni.VeOmniBackend`) subclass this and supply only
+their engine-specific behavior:
+
+* the constructor *lifecycle* (wrap strategy, distributed bring-up, sequence
+  parallelism, eager-vs-meta weight load) stays in each leaf, written as a linear
+  named sequence that calls the shared construction helpers here; and
+* five small *hooks* — grad clip, optimizer-state gather/load, model on/offload —
+  that the methods below dispatch through.
+
+This module imports torch (and ema / lora / optim / deferred) at module level and
+MUST NOT be imported from ``veomni/__init__`` — only from inside the two
+``backend.py`` files. It imports neither ``veomni`` nor either leaf backend.
 """
 
 from __future__ import annotations
@@ -13,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -21,86 +32,84 @@ from torch import nn
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.models.types.bundle import Bundle
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
-from unirl.train.configs import (
-    EmaFullConfig,
-    EmaLoraConfig,
-    FSDPConfig,
-    LoraConfig,
-)
-from unirl.train.ema import EMA, make_decay_fn
-from unirl.train.factories import build_lr_scheduler, build_optimizer
-from unirl.train.fsdp_utils import (
+from unirl.train.backend.sharded_state import (
+    StateDict,
     _current_rank,
-    clip_grad_norm,
     drop_meta_entries,
-    fsdp_offload,
-    fsdp_onload,
     gather_lora_state_dict,
-    gather_optimizer_state_dict,
     gather_state_dict,
     load_model_state_dict,
-    load_optimizer_state_dict,
     load_sharded_model_state_dict,
     load_sharded_optimizer_state_dict,
+    move_optimizer_state,
     sharded_model_state_dict,
     sharded_optimizer_state_dict,
     trainable_params,
 )
-from unirl.train.inject import (
-    apply_deferred_ops,
-    fsdp_wrap,
-    inject_lora,
-    inject_mirror,
-    inject_nft,
-)
-from unirl.train.shadow import Shadow
+from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
+from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
+from unirl.train.lora import inject_lora
+from unirl.train.optim import build_lr_scheduler, build_optimizer
 
 logger = logging.getLogger(__name__)
 
 
-class FSDPBackend(Remote):
-    """Single-track FSDP training backend.
+class BaseFSDP2Backend(Remote):
+    """Shared base for the single-track FSDP2 training backends.
 
-    One-shot construction: after ``__init__`` returns the backend is
-    fully usable (model wrapped, optimizer/scheduler/EMA built).
-    Caller is responsible for passing ``device`` and ``rank`` —
-    matches :class:`BaseRolloutEngine` subclasses' contract.
+    Subclasses own ``__init__`` (the engine-specific lifecycle) and the five
+    hooks at the bottom of this class; everything else is shared. After a leaf
+    ``__init__`` returns the backend is fully usable (model wrapped, weights
+    loaded, optimizer/scheduler/EMA built).
     """
 
-    def __init__(
+    # --- attribute contract (set by the leaf ctor + _finalize_construction) ---
+    _bundle: object
+    _rank: int
+    _device: torch.device
+    model: nn.Module
+    ema: Optional[EMA]
+    optimizer: torch.optim.Optimizer
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
+    _optimizer_step_count: int
+    _eval_ema_active: bool
+    _lora_meta: Optional[Dict[str, object]]
+    _rollout_adapter_name: str
+    _defer_grad_sync: bool
+    _grad_sync_enabled: bool
+
+    # ------------------------------------------------------------------
+    # Construction helpers (called in sequence from each leaf __init__)
+    # ------------------------------------------------------------------
+
+    def _check_lora_exclusivity(
         self,
-        *,
-        bundle: Bundle,
-        block_class_names: Tuple[str, ...],
-        fsdp_cfg: FSDPConfig,
-        optimizer_cfg: OptimizerConfig,
-        scheduler_cfg: LrSchedulerConfig,
-        device: Optional[torch.device] = None,
-        rank: int = 0,
-        trainable_attr: str = "transformer",
-        lora_cfg: Optional[LoraConfig] = None,
-        ema_lora_cfg: Optional[EmaLoraConfig] = None,
-        ema_cfg: Optional[EmaFullConfig] = None,
-        with_aux: Tuple[str, ...] = (),
+        lora_cfg: Optional[LoraConfig],
+        ema_lora_cfg: Optional[EmaLoraConfig],
     ) -> None:
-        super().__init__()
         if lora_cfg is not None and ema_lora_cfg is not None:
             raise ValueError(
-                "FSDPBackend: lora_cfg and ema_lora_cfg are mutually exclusive "
-                "(both inject LoRA adapters). Use ema_lora_cfg for DiffusionNFT-style "
-                "adapter EMA, or lora_cfg for plain LoRA."
+                f"{type(self).__name__}: lora_cfg and ema_lora_cfg are mutually "
+                "exclusive (both inject LoRA adapters). Use ema_lora_cfg for "
+                "NFT-style adapter EMA, or lora_cfg for plain LoRA."
             )
 
-        self._bundle = bundle
-        self._rank = int(rank)
-        self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def _inject_structural(
+        self,
+        model: nn.Module,
+        lora_cfg: Optional[LoraConfig],
+        ema_lora_cfg: Optional[EmaLoraConfig],
+        ema_cfg: Optional[EmaFullConfig],
+    ) -> Optional[Shadow]:
+        """Structural injection on the (possibly meta) trainable module.
 
-        model = getattr(bundle, trainable_attr)
-
+        LoRA / NFT-adapter-EMA / mirror-EMA injection — exactly the
+        ``unirl.train.deferred`` contract (mutate now; the post-materialize
+        resets are drained by ``apply_deferred_ops`` after the weight load).
+        Returns the EMA :class:`Shadow` (or ``None``).
+        """
         shadow: Optional[Shadow] = None
-
         if ema_lora_cfg is not None:
             shadow = inject_nft(
                 model,
@@ -123,39 +132,31 @@ class FSDPBackend(Remote):
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
             )
-
         if ema_cfg is not None:
             shadow = inject_mirror(model, prefix=ema_cfg.shadow_prefix)
+        return shadow
 
-        fsdp_wrap(
-            model,
-            block_class_names=tuple(block_class_names),
-            param_dtype=fsdp_cfg.param_dtype,
-            cpu_offload=fsdp_cfg.cpu_offload,
-            mixed_precision=fsdp_cfg.mixed_precision,
-            fsdp_mode=fsdp_cfg.fsdp_mode,
-            reshard_after_forward=fsdp_cfg.reshard_after_forward,
-            forward_prefetch=fsdp_cfg.forward_prefetch,
-            activation_checkpointing=fsdp_cfg.activation_checkpointing,
-            use_torch_compile=fsdp_cfg.use_torch_compile,
-            master_dtype=getattr(fsdp_cfg, "master_dtype", None),
-            root_wrap=getattr(fsdp_cfg, "root_wrap", True),
-        )
+    def _finalize_construction(
+        self,
+        model: nn.Module,
+        shadow: Optional[Shadow],
+        *,
+        optimizer_cfg: OptimizerConfig,
+        scheduler_cfg: LrSchedulerConfig,
+        lora_cfg: Optional[LoraConfig],
+        ema_lora_cfg: Optional[EmaLoraConfig],
+        ema_cfg: Optional[EmaFullConfig],
+        fsdp_cfg: FSDPConfig,
+    ) -> None:
+        """Build EMA / optimizer / scheduler and set the shared train state.
 
-        bundle_materialize = getattr(bundle, "materialize", None)
-        if callable(bundle_materialize):
-            bundle_materialize(device=self._device, with_aux=tuple(with_aux))
-        elif with_aux:
-            logger.info(
-                "Rank %s: bundle %s loads eagerly; ignoring with_aux=%s",
-                self._rank,
-                type(bundle).__name__,
-                tuple(with_aux),
-            )
+        Called at the end of each leaf constructor — after the model is wrapped,
+        weight-loaded, and its deferred ops drained — so the backend is fully
+        usable once the leaf ``__init__`` returns.
+        """
+        self.model = model
 
-        apply_deferred_ops(model)
-
-        self.ema: Optional[EMA] = None
+        self.ema = None
         if shadow is not None:
             active_cfg = ema_lora_cfg or ema_cfg
             self.ema = EMA(
@@ -164,16 +165,15 @@ class FSDPBackend(Remote):
                 timing=active_cfg.timing,
             )
 
-        self.optimizer: torch.optim.Optimizer = build_optimizer(
+        self.optimizer = build_optimizer(
             optimizer_cfg,
             params=list(trainable_params(model)),
         )
-        self.scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = build_lr_scheduler(
+        self.scheduler = build_lr_scheduler(
             scheduler_cfg,
             optimizer=self.optimizer,
         )
 
-        self.model: nn.Module = model
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
         # Checkpoint storage backend ("torch" legacy single-file vs "dcp"
@@ -181,14 +181,14 @@ class FSDPBackend(Remote):
         checkpoint_format = str(getattr(fsdp_cfg, "checkpoint_format", "torch"))
         if checkpoint_format not in ("torch", "dcp"):
             raise ValueError(
-                f"FSDPBackend: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', got {checkpoint_format!r}"
+                f"{type(self).__name__}: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', got {checkpoint_format!r}"
             )
         self._checkpoint_format: str = checkpoint_format
         self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
         # Checkpointed for export tooling: the LoRA fold needs scaling =
         # alpha / rank, and alpha is not derivable from the weights.
         active_lora = lora_cfg or ema_lora_cfg
-        self._lora_meta: Optional[Dict[str, object]] = (
+        self._lora_meta = (
             {
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
@@ -204,12 +204,12 @@ class FSDPBackend(Remote):
         # the EMA shadow ("old") for DiffusionNFT adapter-EMA, else the trainable
         # "default". The in-process eval-EMA swap and the weight sync to a
         # SEPARATE engine both derive from this, so they cannot disagree.
-        self._rollout_adapter_name: str = str(ema_lora_cfg.shadow_adapter) if ema_lora_cfg is not None else "default"
+        self._rollout_adapter_name = str(ema_lora_cfg.shadow_adapter) if ema_lora_cfg is not None else "default"
         # No-sync gradient accumulation (see set_grad_sync). Only active under
         # ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the
         # per-micro reshard/re-gather interacts badly with deferred sync.
-        self._defer_grad_sync: bool = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
-        self._grad_sync_enabled: bool = True
+        self._defer_grad_sync = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
+        self._grad_sync_enabled = True
 
     # ------------------------------------------------------------------
     # Training step
@@ -222,14 +222,9 @@ class FSDPBackend(Remote):
         """Toggle the FSDP2 gradient reduce-scatter for no-sync accumulation.
 
         With ``defer_grad_sync`` on, the train loop disables sync on every
-        micro-batch except the last, so every FSDP group accumulates gradients
-        in its unsharded buffers and a single reduce-scatter runs per optimizer
-        step instead of one per micro-batch. Under the default root wrap the
-        whole model is sharded — the per-block groups AND the leftover root
-        group (embed / final norm / lm_head) — and the loop below toggles all of
-        them, so this defers one reduce-scatter per step for the *entire* model
-        on a multi-node fabric.
-
+        micro-batch except the last, so every FSDP group accumulates gradients in
+        its unsharded buffers and a single reduce-scatter runs per optimizer step
+        instead of one per micro-batch (a multi-node win; ~no-op over NVLink).
         No-op when deferral is off (the common case) or the flag is already in
         the wanted state. ``set_is_last_backward`` does not recurse, so every
         FSDP module is toggled; ``set_requires_gradient_sync`` is idempotent
@@ -251,30 +246,25 @@ class FSDPBackend(Remote):
         return self._defer_grad_sync
 
     def optimizer_step(self, *, max_grad_norm: float) -> float:
-        """Clip, optimizer step, scheduler step, EMA step.
+        """Clip (via the engine hook), optimizer step, scheduler step, EMA step.
 
-        The algorithm sibling Remote is responsible for populating grads
-        on this backend's model (they share the bundle).  Caller must
-        only invoke this when ``has_backward`` was True for the
-        accumulated micro-batches.
+        The algorithm sibling Remote populates grads on this backend's model
+        (they share the bundle); caller invokes this only when ``has_backward``
+        was True for the accumulated micro-batches.
 
         Skips the whole step on a non-finite (NaN/Inf) clipped grad norm:
         stepping would scale every parameter by the bad norm and poison the
         weights, crashing the next rollout's sampling. The clipped norm is an
         all-rank scalar so the skip is identical on every rank. This is the one
-        optimizer-step chokepoint every v2 trainer (PE / VLM / diffusion via
-        ``TrainStack``) routes through, so the guard covers all of them.
+        optimizer-step chokepoint every v2 trainer routes through.
         """
-        params = list(trainable_params(self.model))
-        # Every trainable grad is a sharded DTensor that FSDP reduce-scatters:
-        # the root wrap claims the leftover params, and fsdp_wrap fails fast on
-        # trainable params outside every group when root_wrap is disabled.
-        clipped = clip_grad_norm(params, float(max_grad_norm))
+        clipped = self._clip_grad_norm(float(max_grad_norm))
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 
         if not math.isfinite(grad_norm):
             logger.warning(
-                "FSDPBackend.optimizer_step: non-finite grad norm (%s) at step %d; skipping step.",
+                "%s.optimizer_step: non-finite grad norm (%s) at step %d; skipping step.",
+                type(self).__name__,
                 grad_norm,
                 self._optimizer_step_count,
             )
@@ -313,9 +303,9 @@ class FSDPBackend(Remote):
     def apply_eval_ema(self) -> None:
         """Swap the EMA shadow ("old") adapter into live position for rollout.
 
-        Driver-callable (each worker swaps its own model); the DiffusionNFT trainer
-        wraps ``rollout.generate`` with this + :meth:`restore_from_eval`.
-        No-op when ``ema is None`` (GRPO) or already swapped in.
+        Driver-callable (each worker swaps its own model); the NFT trainer wraps
+        ``rollout.generate`` with this + :meth:`restore_from_eval`. No-op when
+        ``ema is None`` (GRPO) or already swapped in.
         """
         if self.ema is None or self._eval_ema_active:
             return
@@ -330,7 +320,7 @@ class FSDPBackend(Remote):
         self._eval_ema_active = False
 
     # ------------------------------------------------------------------
-    # Checkpoint
+    # Checkpoint (one hardened envelope; optimizer mechanism is per-backend)
     # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -352,23 +342,28 @@ class FSDPBackend(Remote):
         """
         mode = self._resolve_save_mode(mode)
         if mode == "adapter" and not any("lora_" in name for name, _ in self.model.named_parameters()):
-            raise RuntimeError("FSDPBackend.save: mode='adapter' but the model has no LoRA params")
+            raise RuntimeError(f"{type(self).__name__}.save: mode='adapter' but the model has no LoRA params")
         if self._checkpoint_format == "dcp":
             self._save_dcp(path, step, mode)
         else:
             self._save_torch(path, step, mode)
 
     def _save_torch(self, path: str, step: Optional[int], mode: str) -> None:
-        """Legacy single-file save: gather full state to rank 0, torch.save."""
+        """Legacy single-file save: gather full state to rank 0, torch.save.
+
+        The optimizer gather is per-backend (DCP get-state for torch-native
+        FSDP, plain ``state_dict()`` for VeOmni) via :meth:`_gather_optimizer_state`.
+        """
         if mode == "adapter":
             self._reject_lora_meta_params("save")
             policy_state = gather_lora_state_dict(self.model)
         else:
             self._reject_meta_params("save")
             policy_state = gather_state_dict(self.model)
+        optimizer_state = self._gather_optimizer_state()
         state: Dict[str, object] = {
             "policy_state_dict": policy_state,
-            "optimizer_state_dict": gather_optimizer_state_dict(self.model, self.optimizer),
+            "optimizer_state_dict": optimizer_state,
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
             "save_mode": mode,
@@ -377,8 +372,8 @@ class FSDPBackend(Remote):
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        # The DCP gathers above populate dist rank 0 only — that rank writes.
-        # (NOT self._rank: that is a constructor kwarg, identical on every worker.)
+        # The gathers above populate dist rank 0 only — that rank writes. (NOT
+        # self._rank: that is a constructor kwarg, identical on every worker.)
         if _current_rank() != 0:
             return
         os.makedirs(path, exist_ok=True)
@@ -430,7 +425,8 @@ class FSDPBackend(Remote):
         via DCP (each rank reads only its own shard, reshard-aware); otherwise
         the legacy ``path/checkpoint.pt`` loads via torch. So checkpoints
         written before this change still resume regardless of
-        ``checkpoint_format``.
+        ``checkpoint_format``. The optimizer restore is per-backend via the
+        :meth:`_load_optimizer_state` hook.
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
@@ -469,13 +465,18 @@ class FSDPBackend(Remote):
         missing_on = [rank for rank, ok in enumerate(verdicts) if not (ok and ok["torch"])]
         if missing_on:
             raise FileNotFoundError(
-                f"FSDPBackend.load: checkpoint not visible on rank(s) {missing_on}: {checkpoint_path} "
+                f"{type(self).__name__}.load: checkpoint not visible on rank(s) {missing_on}: {checkpoint_path} "
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
         return self._load_torch(checkpoint_path)
 
     def _load_torch(self, checkpoint_path: str) -> int:
-        """Legacy single-file load: read full state, broadcast from rank 0, reshard."""
+        """Legacy single-file load: read full state, broadcast from rank 0, reshard.
+
+        Every rank loads the file: the model broadcast tolerates {} on non-zero
+        ranks, but a plain-``state_dict`` optimizer restore (VeOmni) needs the
+        real dict locally on every rank — restored via :meth:`_load_optimizer_state`.
+        """
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
         strict = checkpoint.get("save_mode", "full") == "full"
@@ -484,7 +485,7 @@ class FSDPBackend(Remote):
         else:
             self._reject_lora_meta_params("load")
         load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
-        load_optimizer_state_dict(self.model, self.optimizer, checkpoint["optimizer_state_dict"])
+        self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if checkpoint.get("optimizer_step_count") is not None:
@@ -548,7 +549,7 @@ class FSDPBackend(Remote):
         meta = [name for name, p in self.model.named_parameters() if p.is_meta]
         if meta:
             raise RuntimeError(
-                f"FSDPBackend.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
+                f"{type(self).__name__}.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
                 "full-state-dict checkpointing of meta-init bundles is not supported under "
                 "checkpoint_format='torch' (use 'dcp')."
             )
@@ -566,7 +567,7 @@ class FSDPBackend(Remote):
         meta = [name for name, param in self.model.named_parameters() if param.requires_grad and param.is_meta]
         if meta:
             raise RuntimeError(
-                f"FSDPBackend.{op}: {len(meta)} trainable params are on meta (e.g. {meta[:3]}); "
+                f"{type(self).__name__}.{op}: {len(meta)} trainable params are on meta (e.g. {meta[:3]}); "
                 "they would be silently dropped from the DCP checkpoint (materialize missed them)."
             )
 
@@ -578,7 +579,7 @@ class FSDPBackend(Remote):
         ]
         if meta:
             raise RuntimeError(
-                f"FSDPBackend.{op}: {len(meta)} LoRA params are on meta (e.g. {meta[:3]}); "
+                f"{type(self).__name__}.{op}: {len(meta)} LoRA params are on meta (e.g. {meta[:3]}); "
                 "adapter checkpointing requires materialized LoRA params."
             )
 
@@ -588,29 +589,23 @@ class FSDPBackend(Remote):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload(self) -> None:
-        """Move the FSDP train state (params + grads + optimizer) back to GPU.
+        """Move the train state (params + grads + optimizer) back to GPU.
 
         Driver-callable across all DP workers (each onloads its own FSDP shard).
         Inverse of :meth:`offload`; the colocate trainers call this before the
         train backward (gated by ``enable_fsdp_offload``)."""
-        fsdp_onload(self.model, self._device)
-        for state in self.optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(self._device)
+        self._onload_model()
+        move_optimizer_state(self.optimizer, self._device)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def offload(self) -> None:
-        """Move the FSDP train state (params + grads + optimizer) to CPU.
+        """Move the train state (params + grads + optimizer) to CPU.
 
         Frees GPU memory during the rollout phase so a colocate vLLM/SGLang
-        engine fits. Driver-callable across all DP workers (each offloads its
-        own FSDP shard). Gated by the trainer's ``enable_fsdp_offload``."""
-        fsdp_offload(self.model)
-        for state in self.optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.cpu()
+        engine fits. Driver-callable across all DP workers (each offloads its own
+        FSDP shard). Gated by the trainer's ``enable_fsdp_offload``."""
+        self._offload_model()
+        move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
@@ -676,5 +671,29 @@ class FSDPBackend(Remote):
             seed,
         )
 
+    # ------------------------------------------------------------------
+    # Engine-specific hooks (overridden by each leaf backend)
+    # ------------------------------------------------------------------
 
-__all__ = ["FSDPBackend"]
+    def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:
+        """Clip gradients and return the (pre-clip) global grad norm."""
+        raise NotImplementedError
+
+    def _gather_optimizer_state(self) -> StateDict:
+        """Rank-0 optimizer state for the checkpoint (collective for DCP backends)."""
+        raise NotImplementedError
+
+    def _load_optimizer_state(self, optimizer_state: StateDict) -> None:
+        """Restore optimizer state from a checkpoint dict (real dict on every rank)."""
+        raise NotImplementedError
+
+    def _onload_model(self) -> None:
+        """Move the wrapped model's params + grads back to the live device."""
+        raise NotImplementedError
+
+    def _offload_model(self) -> None:
+        """Move the wrapped model's params + grads to CPU."""
+        raise NotImplementedError
+
+
+__all__ = ["BaseFSDP2Backend"]

@@ -25,6 +25,7 @@ Use :meth:`QwenImageBundle.from_config` to load a checkpoint.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Optional
 
@@ -35,6 +36,38 @@ from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenImagePipelineConfig
+
+logger = logging.getLogger(__name__)
+
+
+def _rebuild_meta_rope_modules(transformer: nn.Module) -> int:
+    """Rebuild rope-embed modules whose tables were built on meta.
+
+    diffusers' ``QwenEmbedRope`` keeps its complex rope tables
+    (``pos_freqs`` / ``neg_freqs``) as PLAIN tensor attributes —
+    deliberately not buffers (upstream comment: registering complex
+    buffers drops the imaginary part) — so ``to_empty`` never
+    materializes them and they stay on meta. The module holds no
+    parameters, so re-instantiating it on CPU from its own ctor attrs
+    and swapping it in is shard-exempt; ``forward`` moves the tables to
+    the live device on use."""
+    count = 0
+    for name, mod in list(transformer.named_modules()):
+        pos_freqs = getattr(mod, "pos_freqs", None)
+        if not (isinstance(pos_freqs, torch.Tensor) and pos_freqs.is_meta):
+            continue
+        fresh = type(mod)(
+            theta=mod.theta,
+            axes_dim=list(mod.axes_dim),
+            scale_rope=getattr(mod, "scale_rope", False),
+        )
+        if "." in name:
+            parent_name, attr = name.rsplit(".", 1)
+            setattr(transformer.get_submodule(parent_name), attr, fresh)
+        else:
+            setattr(transformer, name, fresh)
+        count += 1
+    return count
 
 
 class QwenImageBundle(Bundle):
@@ -117,9 +150,37 @@ class QwenImageBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        transformer = QwenImageTransformer2DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype).to(
-            device
-        )
+        if config.meta_init_transformer:
+            # VeOmniBackend lifecycle: architecture only, on the meta device
+            # (no weight allocation). VeOmni's parallelize asserts meta init,
+            # materializes storage via ``to_empty``, and calls the model's
+            # ``init_weights()`` unconditionally — stamped to a no-op here so
+            # it cannot clobber anything; the backend loads the real weights
+            # from the stashed path after sharding (rank0 read + broadcast).
+            transformer_config = QwenImageTransformer2DModel.load_config(path, subfolder="transformer")
+            with torch.device("meta"):
+                transformer = QwenImageTransformer2DModel.from_config(transformer_config)
+            rebuilt = _rebuild_meta_rope_modules(transformer)
+            if rebuilt:
+                logger.info("meta_init_transformer: rebuilt %d rope module(s) on CPU", rebuilt)
+            transformer = transformer.to(dtype)
+            transformer.init_weights = lambda: None
+            non_persistent = sorted(set(n for n, _ in transformer.named_buffers()) - set(transformer.state_dict()))
+            if non_persistent:
+                # Non-persistent buffers are absent from checkpoints, so
+                # ``to_empty`` leaves them uninitialized — if any module
+                # relies on init-time buffer values, the parity gates will
+                # surface it; this log names the suspects.
+                logger.warning(
+                    "meta_init_transformer: %d non-persistent buffer(s) will not be "
+                    "restored by the checkpoint load: %s",
+                    len(non_persistent),
+                    non_persistent[:8],
+                )
+        else:
+            transformer = QwenImageTransformer2DModel.from_pretrained(
+                path, subfolder="transformer", torch_dtype=dtype
+            ).to(device)
 
         vae = AutoencoderKLQwenImage.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
         vae.requires_grad_(False)
@@ -143,7 +204,7 @@ class QwenImageBundle(Bundle):
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
@@ -153,6 +214,12 @@ class QwenImageBundle(Bundle):
             device=device,
             pretrained_path=path,
         )
+        if config.meta_init_transformer:
+            # Consumed by VeOmniBackend's post-parallelize weight load.
+            # Kept as the raw join — the backend validates local-dir-ness
+            # at load time (HF repo IDs need a local download first).
+            bundle._transformer_weights_path = os.path.join(path, "transformer")
+        return bundle
 
 
 __all__ = ["QwenImageBundle"]

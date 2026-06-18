@@ -185,7 +185,13 @@ class DiffusionTrainer(BaseTrainer):
                     "separate slab."
                 )
             self._rollout_is_trainside = True
-            return remote(**rollout_parsed, pipeline=self.pipeline)  # direct sampling
+            # The trainside engine samples through the SAME SP-parallelized model
+            # the backend wraps, so its DP_SCATTER must shard over the model's
+            # dp_size (not all world ranks) — else the two ranks of an SP pair get
+            # different prompts and the sampling Ulysses all-to-all hangs. Inherit
+            # the backend's SP degree (sp_size is a handle-layout hint, stripped
+            # before the engine __init__; the pipeline sibling alone is flat).
+            return remote(**rollout_parsed, pipeline=self.pipeline, sp_size=self.backend.sp_size)  # direct sampling
         return remote(**rollout_parsed)  # vllm / sglang
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:

@@ -77,6 +77,14 @@ eval = [
   "torchvision>=0.16",
   "easyocr>=1.7",
 ]
+# VeOmni's torch-native distributed layer (FSDP2/EP parallelize), consumed
+# exclusively through unirl.train.backend.veomni._compat — a selective import
+# that never executes veomni/__init__.py or veomni/models/__init__.py, so the
+# transformers-locked model zoo inside the wheel stays dormant. The shim's
+# import closure is audited per release (tests/test_compat_import.py).
+veomni = [
+  "veomni==0.1.11 ; sys_platform == 'linux'",
+]
 dev = [
   "pytest>=7.4",
   "pytest-cov>=4.1",

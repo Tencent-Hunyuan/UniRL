@@ -63,6 +63,12 @@ class WAN21PipelineConfig:
     # the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
+    # Meta-init the transformer (build on the meta device; the backend loads
+    # weights after sharding) instead of eager ``from_pretrained``. Avoids the
+    # per-rank full-model GPU spike. Consumed by FSDPBackend / VeOmniBackend via
+    # the stashed ``_transformer_weights_path``.
+    meta_init_transformer: bool = False
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="WAN21PipelineConfig.model_precision")
 

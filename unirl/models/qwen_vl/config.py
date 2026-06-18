@@ -30,6 +30,12 @@ class QwenVLPipelineConfig:
     min_pixels: int = 256 * 28 * 28
     max_pixels: int = 1280 * 28 * 28
 
+    # Meta-init the transformer (build on the meta device; the backend loads
+    # weights after sharding from the checkpoint root) instead of eager
+    # ``from_pretrained``. Avoids the per-rank full-model GPU spike. Consumed by
+    # FSDPBackend / VeOmniBackend via the stashed ``_transformer_weights_path``.
+    meta_init_transformer: bool = False
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="QwenVLPipelineConfig.model_precision")
 
