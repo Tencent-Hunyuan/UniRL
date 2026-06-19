@@ -32,7 +32,6 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_ar_params
 
 from .ar import Qwen3ARParams, Qwen3ARStage
 from .bundle import Qwen3Bundle
@@ -161,7 +160,7 @@ class Qwen3Pipeline(Pipeline):
         conds: Qwen3ARConditions = chat_stage.embed(texts)
 
         # Extract typed AR sampling params from the request.
-        ar = get_ar_params(req.sampling_params)
+        ar = req.sampling_params.get("ar")
         if ar is not None:
             params = Qwen3ARParams(
                 max_tokens=ar.max_new_tokens,

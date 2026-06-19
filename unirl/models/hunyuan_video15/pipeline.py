@@ -44,7 +44,7 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import HunyuanVideo15Bundle
 from .conditions import HunyuanVideo15Conditions
@@ -247,7 +247,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         else:
             negatives = None
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         # CFG empty negative: when CFG is on (``guidance_scale > 1``) and
         # caller didn't supply a negative, default to ``[""] * B``. When

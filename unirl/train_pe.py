@@ -31,7 +31,9 @@ def main(cfg: DictConfig) -> None:
         sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
+        pe_cfg=cfg.get("pe"),
         freeze_llm=cfg.get("freeze_llm", False),
+        diffusion_group_scope=cfg.get("diffusion_group_scope", "rewrite"),
     )
     trainer.train(
         num_rollouts=int(cfg.get("num_rollouts", 100)),

@@ -271,6 +271,7 @@ class RolloutTrack(Batch):
         eps: float = 1e-8,
         scope: str = "group",
         use_global_std: bool = False,
+        group_ids: Optional[List[str]] = None,
     ) -> "RolloutTrack":
         """GRPO-style per-group advantage: ``(reward - group_mean) / (group_std + eps)``.
 
@@ -302,6 +303,18 @@ class RolloutTrack(Batch):
             The two share an expectation (both estimate the population reward std),
             but the full-batch scope is intentional — topology-independent and
             lower-variance. Used by the FlowDPPO recipe; left ``False`` elsewhere.
+        :param group_ids: Optional per-sample grouping labels (length =
+            ``batch_size``) that OVERRIDE the track's own ``parent_ids`` for the
+            ``scope="group"`` computation. Used to group at a different lineage
+            level than the immediate parent — e.g. PE's prompt-level grouping
+            groups the diffusion track by its ROOT prompt id (all N×M images of a
+            prompt) instead of by rewrite (M images), so a rewrite that
+            systematically beats the prompt-wide mean gets non-zero advantage.
+            Resolve these via :meth:`RolloutResp.compute_track_advantages` rather
+            than by hand. Must already be in group-by-parent contiguous order (the
+            same invariant ``parent_ids`` satisfies — PE's lineage keeps a
+            prompt's images consecutive). ``None`` (default) ⇒ use ``parent_ids``,
+            exactly today's behavior. Ignored when ``scope="global"``.
         :return: A new :class:`RolloutTrack` with ``advantages`` set.
 
         Population std (``unbiased=False``) is used so the math degenerates
@@ -330,10 +343,22 @@ class RolloutTrack(Batch):
                 adv_g = rewards_g - rewards_g.mean()
             return _track_with_field(self, "advantages", adv_g)
 
-        # Root track (parent_ids is None) — each sample is its own group, so
+        # Grouping labels: an explicit ``group_ids`` override (e.g. root-prompt
+        # ids resolved by RolloutResp.compute_track_advantages) wins; otherwise
+        # the track's own ``parent_ids`` (today's default). The override must
+        # align 1:1 with samples and obey the same group-by-parent contiguity
+        # invariant checked below.
+        if group_ids is not None and len(group_ids) != n:
+            raise ValueError(
+                f"compute_advantages: group_ids length {len(group_ids)} != "
+                f"sample count {n}; the override must be one label per sample."
+            )
+        group_labels = self.parent_ids if group_ids is None else list(group_ids)
+
+        # Root track (no grouping labels) — each sample is its own group, so
         # advantage = 0 for every sample (a single-sample group's mean equals
         # itself; centered = 0).
-        if self.parent_ids is None:
+        if group_labels is None:
             return _track_with_field(
                 self,
                 "advantages",
@@ -341,7 +366,7 @@ class RolloutTrack(Batch):
             )
 
         # Detect uniform group sizes via group-by-parent contiguous ordering.
-        unique_pids = list(dict.fromkeys(self.parent_ids))
+        unique_pids = list(dict.fromkeys(group_labels))
         n_groups = len(unique_pids)
         if n_groups == 0 or n % n_groups != 0:
             raise ValueError(
@@ -352,9 +377,9 @@ class RolloutTrack(Batch):
             )
         branch = n // n_groups
         expected_parent_ids = [pid for pid in unique_pids for _ in range(branch)]
-        if list(self.parent_ids) != expected_parent_ids:
+        if list(group_labels) != expected_parent_ids:
             raise ValueError(
-                "compute_advantages: parent_ids not in group-by-parent contiguous "
+                "compute_advantages: grouping labels not in group-by-parent contiguous "
                 "order. Siblings must be consecutive (use fork_track / "
                 "make_root_track), got interleaved ordering."
             )
@@ -653,6 +678,44 @@ class RolloutResp(Batch):
         # parents-first / by use-case order; preserve self's order).
         ordered = {name: new_tracks[name] for name in self.tracks.keys()}
         return type(self)(tracks=ordered, reward_compute_s=self.reward_compute_s)
+
+    # ---- lineage-aware advantage computation -------------------------------
+
+    def compute_track_advantages(
+        self,
+        track_name: str,
+        *,
+        group_key: str = "parent",
+        **adv_kwargs: Any,
+    ) -> "RolloutTrack":
+        """Compute one track's GRPO advantages, optionally grouping by an ancestor.
+
+        ``group_key`` selects which lineage level defines a GRPO group:
+
+        - ``"parent"`` (default): group by the track's own ``parent_ids`` —
+          identical to calling ``track.compute_advantages(**adv_kwargs)`` directly
+          (e.g. the diffusion track groups by rewrite, M images per group).
+        - ``"root"``: group by the ROOT-track group id of each sample, resolved by
+          walking ``parent_track`` + ``parent_ids`` up to the root via
+          :func:`_root_group_per_sample`. For the PE diffusion track this groups
+          all ``N*M`` images descended from one original prompt into a single
+          group, so a rewrite that systematically beats the prompt-wide mean earns
+          non-zero advantage (instead of being differenced out per-rewrite). The
+          resolved labels stay group-by-parent contiguous because the lineage keeps
+          a prompt's samples consecutive (``make_root_track`` / ``fork_track``).
+
+        Returns the new track (advantages set); does NOT mutate ``self.tracks`` —
+        the caller assigns it back, mirroring the ``track.compute_advantages``
+        call sites. Lineage is never mutated — only the grouping used for the
+        advantage reduction changes.
+        """
+        track = self.tracks[track_name]
+        if group_key == "parent":
+            return track.compute_advantages(**adv_kwargs)
+        if group_key == "root":
+            root_labels = _root_group_per_sample(self, track_name)
+            return track.compute_advantages(group_ids=root_labels, **adv_kwargs)
+        raise ValueError(f"compute_track_advantages: group_key must be 'parent' or 'root'; got {group_key!r}")
 
 
 __all__ = ["RolloutResp", "RolloutTrack", "Decoded"]

@@ -125,7 +125,7 @@ The practical consequence:
 ## From rollout to update
 
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
-2. `SGLangLLMRolloutEngine` samples completions and returns an `"ar"` track with packed
+2. `SGLangRolloutEngine` samples completions and returns an `"ar"` track with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
 3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
 4. `RolloutTrack.compute_advantages(normalize=False, scope="group")` mean-centers rewards

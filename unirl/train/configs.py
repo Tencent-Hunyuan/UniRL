@@ -90,6 +90,14 @@ class FSDPConfig:
     # dcp only: background (async) save so the train loop is not blocked on the
     # I/O. Ignored under checkpoint_format="torch". (Wired in a later phase.)
     checkpoint_async: bool = False
+    # Ulysses sequence-parallel degree (default 1 = disabled, a true no-op).
+    # When >1 the VeOmni backend builds a folded dp_shard x ulysses FSDP mesh
+    # (init_parallel_state(ulysses_size=sp_size, dp_size=world//sp_size)) and
+    # installs the per-architecture SP patch (slice the sequence across sp_size
+    # ranks, all-to-all in attention) — see unirl.train.backend.veomni.sp.
+    # Must divide the world size and the model's attention head count. Only the
+    # VeOmni backend honors it; FSDPBackend ignores it.
+    sp_size: int = 1
 
 
 __all__ = [

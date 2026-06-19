@@ -1,7 +1,7 @@
 # @package _global_
 # SD3 + SGLang colocate, v2 trainer, 2x8 H20 (matches v1 reference geometry).
 # Diverges:
-#   - rollout engine target points at SGLangRolloutEngine via v2 builder
+#   - rollout engine target points at SGLangDiffusionRolloutEngine via v2 builder
 #   - LoRA reuses the existing sglang weight-sync bridge (set_lora_from_tensors)
 #
 #   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate

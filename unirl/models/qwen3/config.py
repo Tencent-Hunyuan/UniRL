@@ -55,6 +55,12 @@ class Qwen3PipelineConfig:
 
     weight_sync_param_name_prefix: str = "transformer."
 
+    # Meta-init the transformer (build on the meta device; the backend loads
+    # weights after sharding from the checkpoint root) instead of eager
+    # ``from_pretrained``. Avoids the per-rank full-model GPU spike. Consumed by
+    # FSDPBackend / VeOmniBackend via the stashed ``_transformer_weights_path``.
+    meta_init_transformer: bool = False
+
     # ``merged_dense`` is the only LoRA-materialization path that survives
     # the SGLang LLM LoRA-pool deadlock under composed (PE) rollouts, so it
     # is the default for Qwen3.

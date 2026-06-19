@@ -35,10 +35,10 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams, get_diffusion_params
+from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,13 @@ class PETrainer(BaseTrainer):
     :class:`PEPipeline` samples its live module under ``torch.no_grad``), but it
     has no backend / algorithm / stack and never trains — only the diffusion
     track updates. Use it to learn diffusion against a fixed prompt-enhancer.
+
+    ``diffusion_group_scope`` selects the diffusion track's GRPO grouping (the
+    advantage baseline): ``"rewrite"`` (default) compares the M images of one
+    rewrite; ``"prompt"`` compares all N*M images of one original prompt across
+    every rewrite, so diffusion learns to render well for the original intent
+    regardless of how the (frozen) rewriter phrased it. The objective recipe
+    pairs ``freeze_llm=True`` with ``diffusion_group_scope="prompt"``.
     """
 
     def __init__(
@@ -90,7 +97,9 @@ class PETrainer(BaseTrainer):
         sync_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = False,
+        pe_cfg: Optional[DictConfig] = None,
         freeze_llm: bool = False,
+        diffusion_group_scope: str = "rewrite",
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -106,12 +115,37 @@ class PETrainer(BaseTrainer):
         # ``stack.train_track``; with a frozen LLM that's diffusion alone.
         self._freeze_llm = bool(freeze_llm)
         self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
+        # Diffusion-track GRPO grouping level (the advantage baseline):
+        #   "rewrite" (default): group = the M images of one rewrite (group by
+        #       the rewrite's sample id) — images compared only to siblings with
+        #       identical conditioning text. Byte-identical to the prior behavior.
+        #   "prompt": group = all N*M images descended from one original prompt
+        #       (group by the ROOT prompt id) — a rewrite that systematically
+        #       beats the prompt-wide mean earns non-zero advantage, so diffusion
+        #       learns to render well for the original intent across the rewriter's
+        #       rephrasings. Pairs with ``freeze_llm`` (fixed rewriter) for the
+        #       "same semantics, different wordings → better images" objective.
+        self._diffusion_group_scope = str(diffusion_group_scope)
+        if self._diffusion_group_scope not in ("rewrite", "prompt"):
+            raise ValueError(
+                f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
+            )
+
+        # PE prompt-rewrite knobs forwarded to the composed PEPipeline (trainside
+        # only — they shape the LLM rewrite + the text the diffusion child sees,
+        # mirroring the sglang ComposedRolloutEngine's pe_instruction / pe_marker).
+        # ``None`` everywhere preserves the prior bare-prompt behavior.
+        pe = pe_cfg if pe_cfg is not None else {}
+        self._pe_instruction = pe.get("pe_instruction", None)
+        self._pe_marker = pe.get("pe_marker", None)
+        self._pe_max_chars = pe.get("pe_max_chars", None)
 
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        # ComposedSamplingParams(ar=N, diffusion=M) — drives PEPipeline's fan-out.
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        # {"ar": ARSamplingParams(N), "diffusion": DiffusionSamplingParams(M)} —
+        # the modality-keyed sampling dict driving PEPipeline's two-level fan-out.
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Per-track weight-sync bridges; None trainside (shares the modules).
         self.diffusion_sync = None
@@ -124,7 +158,7 @@ class PETrainer(BaseTrainer):
 
             # Pass the (composed) pipeline only to engines whose role_cls
             # declares it (trainside). For a separate-process engine
-            # (``composed_pe``: sglang_llm + sglang) there is no shared
+            # (``composed_pe``: sglang + sglang_diffusion) there is no shared
             # pipeline — trained weights reach the engine via the sync bridges.
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
             takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
@@ -139,6 +173,9 @@ class PETrainer(BaseTrainer):
                     PEPipeline,
                     diffusion_pipeline=self.diffusion.pipeline,
                     llm_pipeline=self.ar.pipeline,
+                    pe_instruction=self._pe_instruction,
+                    pe_marker=self._pe_marker,
+                    pe_max_chars=self._pe_max_chars,
                 )
                 self.rollout = remote(**rollout_parsed, pipeline=self.pe_pipeline)
             else:
@@ -191,7 +228,7 @@ class PETrainer(BaseTrainer):
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
-        from ``ComposedSamplingParams`` (``ar.samples_per_prompt`` rewrites,
+        from the sampling dict (``ar.samples_per_prompt`` rewrites,
         ``diffusion.samples_per_prompt`` images each). The single-track trainer
         pre-expands here; PE must not, or it would double-count.
 
@@ -202,10 +239,10 @@ class PETrainer(BaseTrainer):
         :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
         The AR sub-block has no SDE machinery and is left untouched.
         """
-        diff_params = get_diffusion_params(self.sampling_params)
+        diff_params = self.sampling_params.get("diffusion")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = dataclasses.replace(self.sampling_params, diffusion=diffusion)
+        sampling_params = {**self.sampling_params, "diffusion": diffusion}
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -284,11 +321,16 @@ class PETrainer(BaseTrainer):
         if di_rewards is not None:
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
-        # 4. Per-track GRPO advantages — "ar" groups by prompt (N rewrites),
-        #    "diffusion" groups by rewrite (M images). Only the trained tracks
-        #    need advantages; a frozen LLM skips the AR advantage entirely.
+        # 4. Per-track GRPO advantages. "ar" groups by prompt (its N rewrites).
+        #    "diffusion" groups by rewrite (M images) by default, or — when
+        #    ``diffusion_group_scope="prompt"`` — by the ROOT prompt (all N*M
+        #    images of a prompt) so cross-rewrite quality becomes signal. Only
+        #    the trained tracks need advantages; a frozen LLM skips the AR one.
         for name in self._train_tracks:
-            resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
+            if name == "diffusion" and self._diffusion_group_scope == "prompt":
+                resp.tracks[name] = resp.compute_track_advantages(name, group_key="root", normalize=True)
+            else:
+                resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
         # ``reward_req`` text is repeat_interleaved to the diffusion track size
         # (one prompt per sample), so it captions the image previews correctly —

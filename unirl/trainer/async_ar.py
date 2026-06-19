@@ -46,10 +46,10 @@ from unirl.distributed.tensor import WorkerLocalTransport, hydrate
 from unirl.distributed.tensor.pytree import infer_batch_size
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -142,7 +142,7 @@ class AsyncARTrainer(ARTrainer):
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
         self.data_source = instantiate(data_source_cfg)
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         self.weight_sync = None
 
         # ---- async state ----
@@ -163,7 +163,7 @@ class AsyncARTrainer(ARTrainer):
         # BOTH slabs (training over the train slab, generation over the rollout
         # slab). Fail early with a clear message rather than mid-run in dispatch.
         self._rollout_devices = self.num_devices - self._train_devices
-        total = int(self.batch_size) * int(self.sampling_params.samples_per_prompt)
+        total = int(self.batch_size) * total_samples_per_prompt(self.sampling_params)
         for slab_name, slab in (("train", self._train_devices), ("rollout", self._rollout_devices)):
             if total % slab != 0:
                 raise ValueError(
@@ -348,7 +348,7 @@ class AsyncARTrainer(ARTrainer):
             result,
             resp,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params, "max_new_tokens", None),
+            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
         # train_step is bypassed, so BaseTrainer's per-step reset hook never
         # fires; reclaim transport buffers here (no-op for colocate_store/gpu).

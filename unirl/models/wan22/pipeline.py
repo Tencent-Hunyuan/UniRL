@@ -33,7 +33,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import WAN22Bundle
 from .config import WAN22PipelineConfig
@@ -172,7 +172,7 @@ class WAN22Pipeline(Pipeline):
                 f"WAN22Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         text_cond = self.text_embed.embed(texts)
         # CFG empty negative: same rationale as WAN21Pipeline (see that

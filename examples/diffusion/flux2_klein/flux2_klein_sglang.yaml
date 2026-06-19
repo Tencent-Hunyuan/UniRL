@@ -281,14 +281,14 @@ sync:
   # MUST be false on the actual SGLang engine (only vLLM-Omni implements the
   # checksum read-back API). LocalLoraWeightSync._verify_loaded calls
   # self._rollout.loaded_lora_checksums(adapter_id=...), and that method only
-  # exists on VLLMOmniRolloutEngine — SGLangRolloutEngine only exposes
+  # exists on VLLMOmniRolloutEngine — SGLangDiffusionRolloutEngine only exposes
   # loaded_param_checksums (different signature, full-weight path), so verify=true
   # crashes with AttributeError on the first weight-sync (rollout 1; rollout 0
   # skips sync via DiffusionTrainer.train's `rollout_id > 0` gate, which is why
   # single-node num_rollouts=1 smokes don't catch it). Matches every other working
   # actual-SGLang + LoRA config in the repo (pe_sglang_lora_pool / pe_sglang_full_merge /
   # qwen_vl_grpo_geo3k_mc_sglang_4x8_lora / qwen3_drpo_4b_base_dapo_sglang). Flip
-  # back to true once SGLangRolloutEngine implements loaded_lora_checksums.
+  # back to true once SGLangDiffusionRolloutEngine implements loaded_lora_checksums.
   verify: false
   # Mirrors Flux2KleinPipelineConfig.weight_sync_param_name_prefix; must match
   # the engine-side LoRA key naming.

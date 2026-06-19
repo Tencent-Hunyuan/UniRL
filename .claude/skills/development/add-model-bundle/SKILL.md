@@ -52,6 +52,45 @@ Model packages are wired into recipes by `_target_` dotpath (no ConfigStore):
 
 Keep package-specific logic under `unirl/models/<model_name>/`. Put only cross-model protocols or reusable condition abstractions under `unirl/models/types/` or `unirl/types/conditions/`.
 
+## Meta-Init (avoid the per-rank full-model load)
+
+A bundle can build its trainable transformer on the **meta** device instead of eager `from_pretrained`, so the backend materializes + loads weights *after* sharding — avoiding the per-rank full-model GPU/host spike that OOMs large models. Both `FSDPBackend` and `VeOmniBackend` honor a single contract; opt in per recipe with `meta_init_transformer: true` on the bundle config (default `false` → unchanged eager path).
+
+Single-transformer bundles (the common case) branch in `from_config`:
+
+```python
+if config.meta_init_transformer:
+    transformer_config = <Class>.load_config(path, subfolder="transformer")   # diffusers
+    with torch.device("meta"):
+        transformer = <Class>.from_config(transformer_config)
+    transformer = finalize_meta_init(transformer, dtype=dtype)                # unirl.models.types.meta_init
+else:
+    transformer = <Class>.from_pretrained(path, subfolder="transformer", torch_dtype=dtype).to(device, dtype=dtype)
+...
+bundle = cls(...)
+if config.meta_init_transformer:
+    bundle._transformer_weights_path = os.path.join(path, "transformer")      # diffusion layout
+return bundle
+```
+
+- `finalize_meta_init` dtype-casts (on meta this is metadata-only), stamps `init_weights` to a no-op (VeOmni's `parallelize` calls it after `to_empty`), and warns about non-persistent buffers the checkpoint load won't restore.
+- Stash `_transformer_weights_path` = the safetensors dir the backend reads via `load_sharded` (`unirl/train/backend/sharded_load.py`): `<ckpt>/transformer` for diffusers-layout models; the **checkpoint root** (`path`) for AR/VL models loaded through `AutoModelForCausalLM` (no subfolder).
+- AR/VL bundles build on meta via `accelerate.init_empty_weights()` + `AutoModelForCausalLM.from_config(cfg, trust_remote_code=...)` (qwen3) or `ModelClass(cfg)` (qwen_vl). Structural setup that does not touch weights (`gradient_checkpointing_enable`, `requires_grad_(False)` for a frozen vision tower) runs on both builds and persists through `to_empty` + load.
+
+Per-architecture init-computed state that `to_empty` destroys must be restored — the `finalize_meta_init` non-persistent-buffer warning is the signal to look for a new model's quirk. A bundle that recovers such state builds under `accelerate.init_empty_weights(include_buffers=False)` (parameters on meta, buffers/`__dict__` tensors real on CPU) instead of `with torch.device("meta")` (which forces buffers to meta too); `stamp_init_state_restore` then captures from the model itself and raises if it finds meta tensors (the tell-tale of the wrong context).
+- plain-tensor rope tables (Qwen-Image `QwenEmbedRope.pos_freqs`): rebuild the module on CPU *before* `finalize_meta_init` (see `_rebuild_meta_rope_modules`).
+- non-persistent sincos buffers (SD3 `PatchEmbed.pos_embed`): build under `init_empty_weights(include_buffers=False)` and capture from the model itself via `stamp_init_state_restore(transformer)` (deferred restore after the load).
+- params the checkpoint omits (FLUX.2-klein guidance embedder): zero-init them post-load via a deferred op keyed on checkpoint-absent names — `to_empty` leaves them as garbage (not meta), so an `is_meta`-gated fix won't catch them.
+
+Always confirm parity on a GPU pod: the meta build must load weights byte-identical to the eager path, on both backends.
+
+Composite trainables with *embedded* frozen aux (only `hunyuan_image3` today — `transformer.vae` / `transformer.vision_model` live inside the meta-built wrapper) are the exception, and add two hooks on top of the contract:
+
+- `trainable_module()` returns the bare decoder (`transformer.model`). The backend resolves the module to wrap/optimize/checkpoint via `resolve_trainable_module(bundle, trainable_attr)` (`unirl/train/backend/base.py`), which prefers this method and otherwise falls back to the named attr. Handing the backend the single decoder — not the heterogeneous composite — keeps the frozen aux *outside* the wrap (on meta until materialized, off the optimizer/checkpoint), which is what lets the composite run under VeOmni (its `parallelize` root-shards + whole-root-`to_empty`s its input) and makes the `weight_sync_param_name_prefix` (`"model."`) resolve correctly.
+- a self-contained `materialize(device, with_aux=())` allocates + DCP-loads the decoder, the always-resident diffusion heads, and the opt-in vae/vit in one collective (mixed DTensor decoder + plain heads/aux); the backend calls it when no `_transformer_weights_path` is stashed.
+
+Single-transformer bundles whose aux are separate eager modules need none of that.
+
 ## Conditions And Field Kinds
 
 `<Model>Conditions(Batch)` is the typed container passed to diffusion or AR stages and serialized through `RolloutResp.tracks[<slot>].conditions`. It owns conditioning slots only. Latents live in `LatentSegment`; sigma schedules live in `RolloutReq.sigmas` and segment metadata.

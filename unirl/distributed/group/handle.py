@@ -27,6 +27,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
@@ -52,6 +53,9 @@ from unirl.distributed.utils import collect_leaves
 
 if TYPE_CHECKING:
     from unirl.distributed.group.device_pool import DevicePool
+
+
+logger = logging.getLogger(__name__)
 
 
 # ── Module-level counter for unique role_name generation ─────────────────────
@@ -91,6 +95,72 @@ def reset_role_name_counter() -> None:
     _role_name_counter.clear()
 
 
+def _sp_size_from_init_kwargs(init_kwargs: Optional[Dict[str, Any]], world_size: int) -> int:
+    """Ulysses ``sp_size`` for the rank layout.
+
+    A role takes the SP layout if either (a) it is itself the VeOmni training
+    backend, created with an ``fsdp_cfg`` carrying ``sp_size`` (or a bare
+    ``sp_size`` kwarg), or (b) it holds a sibling ``HandleRef`` to an SP-enabled
+    role — e.g. the train stack (``fsdp_backend=<SP backend>``) or a trainside
+    rollout (which samples through the same SP model). Case (b) is essential:
+    such a role's ``DP_SCATTER`` must shard over the SAME ``dp_size`` as the
+    model's mesh, else the two ranks of an SP pair get different shards and the
+    Ulysses all-to-all desyncs (mismatched shapes -> NCCL hang). Layout-agnostic
+    siblings (``BROADCAST``-only weight sync) inherit it too but are unaffected.
+
+    Returns 1 unless the resolved ``sp_size > 1`` and evenly divides
+    ``world_size``.
+    """
+    if not init_kwargs:
+        return 1
+
+    def _cfg_get(cfg: Any, key: str, default: int) -> int:
+        # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
+        # (e.g. fsdp_cfg) arrive here as PLAIN DICTS, not instantiated configs —
+        # getattr(dict, "sp_size") would silently return the default. Read the
+        # key for dicts and the attr for instantiated configs alike.
+        if isinstance(cfg, dict):
+            val = cfg.get(key, default)
+        else:
+            val = getattr(cfg, key, default)
+        return int(val or default)
+
+    sp = 1
+    fsdp_cfg = init_kwargs.get("fsdp_cfg")
+    if fsdp_cfg is not None:
+        sp = _cfg_get(fsdp_cfg, "sp_size", 1)
+    elif "sp_size" in init_kwargs:
+        sp = int(init_kwargs.get("sp_size") or 1)
+    # Inherit from the largest SP-enabled sibling handle (case (b) above).
+    for value in init_kwargs.values():
+        if isinstance(value, HandleRef):
+            sp = max(sp, int(getattr(value, "sp_size", 1) or 1))
+    return sp if (sp > 1 and world_size % sp == 0) else 1
+
+
+def _build_rank_infos(world_size: int, sp_size: int = 1) -> List[RankInfo]:
+    """Contiguous (dp, sp) rank layout: rank ``i`` -> ``dp_rank i//sp``, ``sp_rank i%sp``.
+
+    Matches VeOmni's ``init_sequence_parallel`` SP grouping
+    (``range(j*sp, (j+1)*sp)``) so the controller's data dispatch and VeOmni's
+    sequence-parallel groups agree: ranks in one SP group share a ``dp_rank``
+    (DP_SCATTER feeds them the same shard) and only ``sp_rank==0`` is collected.
+    ``sp_size=1`` reproduces the flat one-rank-per-dp layout exactly.
+    """
+    dp_size = world_size // sp_size
+    return [
+        RankInfo(
+            rank=i,
+            world_size=world_size,
+            dp_rank=i // sp_size,
+            dp_size=dp_size,
+            sp_rank=i % sp_size,
+            sp_size=sp_size,
+        )
+        for i in range(world_size)
+    ]
+
+
 @dataclass(frozen=True)
 class HandleRef:
     """Serializable marker for a Handle.
@@ -102,9 +172,17 @@ class HandleRef:
 
     Only resolves on the same Worker as the referenced role — i.e. when the
     sibling lives on the same device slab and slot.
+
+    ``sp_size`` carries the referenced handle's Ulysses degree so a dependent
+    role (e.g. the train stack, which takes ``fsdp_backend=<SP backend>``)
+    inherits the SAME (dp, sp) rank layout. Without this, the dependent stays
+    flat (sp=1) and its ``DP_SCATTER`` splits a batch across all ``world_size``
+    ranks — feeding the two ranks of an SP pair *different* shards, which
+    desyncs the model's Ulysses all-to-all (mismatched shapes -> NCCL hang).
     """
 
     role_name: str
+    sp_size: int = 1
 
 
 class Handle:
@@ -163,10 +241,25 @@ class Handle:
         }
 
         # Register role on each Worker with dist_env
-        self.rank_infos = [
-            RankInfo(rank=i, world_size=self.world_size, dp_rank=i, dp_size=self.world_size)
-            for i in range(self.world_size)
-        ]
+        # Sequence parallelism (Ulysses): a VeOmni backend created with
+        # fsdp_cfg.sp_size>1 lays out ranks as contiguous SP blocks matching
+        # VeOmni's mesh; roles that hold an SP sibling (or get an explicit
+        # ``sp_size=`` layout hint) inherit it; everything else stays flat
+        # (sp=1). See _build_rank_infos / _sp_size_from_init_kwargs.
+        sp_size = _sp_size_from_init_kwargs(init_kwargs, self.world_size)
+        self.rank_infos = _build_rank_infos(self.world_size, sp_size)
+        logger.info(
+            "Handle layout: role=%s world=%d dp_size=%d sp_size=%d",
+            self.role_name,
+            self.world_size,
+            self.rank_infos[0].dp_size,
+            self.rank_infos[0].sp_size,
+        )
+        # ``sp_size`` is a reserved handle-layout hint, not a role constructor
+        # arg (e.g. the trainside rollout, whose model is SP-parallelized but
+        # whose __init__ takes no sp_size) — consume it before forwarding.
+        if init_kwargs:
+            init_kwargs.pop("sp_size", None)
         ray.get(
             [
                 w.add_remote.remote(
@@ -191,6 +284,14 @@ class Handle:
     def dp_size(self) -> int:
         """Number of data-parallel groups."""
         return self.rank_infos[0].dp_size if self.rank_infos else self.world_size
+
+    @property
+    def sp_size(self) -> int:
+        """Ulysses sequence-parallel degree of this handle's rank layout (1 = flat).
+
+        Read by ``_to_marker`` when this handle is passed as a sibling so the
+        dependent role inherits the same (dp, sp) layout (see ``HandleRef``)."""
+        return self.rank_infos[0].sp_size if self.rank_infos else 1
 
     # ── User-facing initialize ──
 
