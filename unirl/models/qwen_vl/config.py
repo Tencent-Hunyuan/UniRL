@@ -13,6 +13,16 @@ class QwenVLPipelineConfig:
     trust_remote_code: bool = True
 
     model_precision: Any = "bf16"
+    # HF attention backend for the TRAIN-side model, set on from_pretrained — so it
+    # is the model's GLOBAL backend and governs EVERY forward: replay teacher-forcing
+    # AND the HF autoregress() decode loop (the *_sglang recipes roll out in SGLang,
+    # so only replay is exercised there).
+    # Qwen2.5-VL has NO flex_attention support, so packed-varlen replay needs a
+    # FlashAttention backend ('flash_attention_4' for the pinned flash-attn-4, or
+    # 'flash_attention_2'/'flash_attention_3' if those packages are installed):
+    # transformers derives per-sequence cu_seqlens from the restarting position_ids
+    # so cross-sequence blocks are skipped. None = HF default (sdpa) -> dense replay.
+    attn_implementation: Optional[str] = None
     device: Any = None
 
     autocast_precision: str = "bf16"

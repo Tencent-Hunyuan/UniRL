@@ -46,6 +46,10 @@ class QwenVLBundle(Bundle):
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
+        load_kwargs = {}
+        if getattr(config, "attn_implementation", None):
+            load_kwargs["attn_implementation"] = str(config.attn_implementation)
+
         if config.meta_init_transformer:
             # Meta-init (FSDP / VeOmni load_sharded path): parameters on the meta
             # device, materialized + loaded by the backend from the checkpoint
@@ -69,6 +73,7 @@ class QwenVLBundle(Bundle):
                 path,
                 torch_dtype=dtype,
                 trust_remote_code=bool(config.trust_remote_code),
+                **load_kwargs,
             ).to(device)
 
         # Structural (sets requires_grad / checkpointing flags, no weight
