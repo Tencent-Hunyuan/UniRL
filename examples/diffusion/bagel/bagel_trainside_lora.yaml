@@ -29,11 +29,11 @@ transport_kind: colocate_store
 workers_per_device: 1
 
 logging:
-  report_to_wandb: true
-  project_name: bagel-pickscore-lora
-  run_name: unirl_main_bagel_pickscore_lora_bs16_g16_cfg1_u2_v3eq_reuse
-  entity: gxhe-rl
-  tags: [bagel, pickscore, lora, trainside, cfg1, migration, official-bagel, rl_ops, reuse, v3eq, fp32master]
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
 
 bundle:
   _target_: unirl.models.bagel.bundle.BagelBundle.from_config
