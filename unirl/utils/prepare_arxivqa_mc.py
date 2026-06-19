@@ -112,9 +112,7 @@ def shard_paths(repo: str, config: str, split: str) -> list:
     want = sorted(
         f
         for f in files
-        if f.startswith(f"{config}/")
-        and os.path.basename(f).startswith(f"{split}-")
-        and f.endswith(".parquet")
+        if f.startswith(f"{config}/") and os.path.basename(f).startswith(f"{split}-") and f.endswith(".parquet")
     )
     if not want:
         raise SystemExit(f"prepare_arxivqa_mc: no {split}-*.parquet found under {repo}/{config}")
@@ -178,9 +176,9 @@ def main() -> None:
     args = ap.parse_args()
 
     try:
-        import pyarrow.parquet  # noqa: F401
         import huggingface_hub  # noqa: F401
         import PIL  # noqa: F401
+        import pyarrow.parquet  # noqa: F401
     except ImportError:
         raise SystemExit(
             "This tool needs pyarrow + huggingface_hub + pillow: pip install pyarrow huggingface_hub pillow"

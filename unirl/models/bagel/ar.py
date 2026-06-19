@@ -303,18 +303,39 @@ class BagelARStage(ARStage[BagelARConditions]):
         start_id = int(self.model.new_token_ids["bos_token_id"])
 
         if self.replay_mode == "train":
-            parts = self._replay_train(conditions, segment=segment, cu=cu, lengths=lengths,
-                                       start_id=start_id, temperature=temperature, device=device)
+            parts = self._replay_train(
+                conditions,
+                segment=segment,
+                cu=cu,
+                lengths=lengths,
+                start_id=start_id,
+                temperature=temperature,
+                device=device,
+            )
         else:
-            parts = self._replay_inference(conditions, segment=segment, cu=cu, lengths=lengths,
-                                           start_id=start_id, temperature=temperature, device=device)
+            parts = self._replay_inference(
+                conditions,
+                segment=segment,
+                cu=cu,
+                lengths=lengths,
+                start_id=start_id,
+                temperature=temperature,
+                device=device,
+            )
         if not parts:
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
         return torch.cat(parts, dim=0).to(dtype=self.logprob_dtype)
 
     def _replay_train(
-        self, conditions: BagelARConditions, *, segment: TextSegment, cu: List[int], lengths: List[int],
-        start_id: int, temperature: float, device: torch.device,
+        self,
+        conditions: BagelARConditions,
+        *,
+        segment: TextSegment,
+        cu: List[int],
+        lengths: List[int],
+        start_id: int,
+        temperature: float,
+        device: torch.device,
     ) -> List[torch.Tensor]:
         """Train-mode replay: one grad ``forward_train`` per sample over ``[image | prompt |
         response_input]`` with the image-full/text-causal nested mask. Trains the und
@@ -349,8 +370,15 @@ class BagelARStage(ARStage[BagelARConditions]):
         return parts
 
     def _replay_inference(
-        self, conditions: BagelARConditions, *, segment: TextSegment, cu: List[int], lengths: List[int],
-        start_id: int, temperature: float, device: torch.device,
+        self,
+        conditions: BagelARConditions,
+        *,
+        segment: TextSegment,
+        cu: List[int],
+        lengths: List[int],
+        start_id: int,
+        temperature: float,
+        device: torch.device,
     ) -> List[torch.Tensor]:
         """Inference-mode replay: image prefilled under no_grad (frozen), then one grad
         ``forward_inference`` over ``[prompt+response]``. Kernel-matched to rollout

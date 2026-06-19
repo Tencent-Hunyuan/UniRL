@@ -568,9 +568,7 @@ def und_replay_logits(model: Any, packed: Dict[str, Any]) -> torch.Tensor:
         vit_embed = model.connector(vit_embed)
         vit_embed = vit_embed + model.vit_pos_embed(packed["packed_vit_position_ids"])
         packed_sequence[packed["packed_vit_token_indexes"]] = vit_embed
-        packed_und_token_indexes = torch.cat(
-            [packed["packed_text_indexes"], packed["packed_vit_token_indexes"]], dim=0
-        )
+        packed_und_token_indexes = torch.cat([packed["packed_text_indexes"], packed["packed_vit_token_indexes"]], dim=0)
 
     last_hidden_state = lm(
         packed_sequence=packed_sequence,
