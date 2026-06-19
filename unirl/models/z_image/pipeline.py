@@ -45,7 +45,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import ZImageBundle
 from .conditions import ZImageConditions
@@ -198,7 +198,7 @@ class ZImagePipeline(Pipeline):
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
 

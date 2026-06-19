@@ -57,6 +57,13 @@ class SD3PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # VeOmniBackend lifecycle: build the transformer on the meta device
+    # (architecture only, no weight allocation). VeOmni's parallelize
+    # asserts meta init, materializes storage via ``to_empty``, and the
+    # backend loads real weights from ``<pretrained>/transformer`` after
+    # sharding. FSDPBackend recipes leave this False (eager load).
+    meta_init_transformer: bool = False
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="SD3PipelineConfig.model_precision")
 

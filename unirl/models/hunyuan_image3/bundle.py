@@ -91,6 +91,21 @@ class HunyuanImage3Bundle(Bundle):
     def vit(self) -> Optional[nn.Module]:
         return self._vit
 
+    def trainable_module(self) -> nn.Module:
+        """The sharded trainable subtree the backend wraps: the bare decoder
+        (``HunyuanImage3Model`` at ``transformer.model``).
+
+        Its diffusion heads + frozen VAE/ViT are wrapper-level *siblings* that
+        stay OUTSIDE the FSDP/VeOmni wrap — loaded by :meth:`materialize`, kept
+        off the optimizer/checkpoint, and (under ``with_aux=()``) left on meta.
+        Handing the backend this single module (not the composite wrapper) is
+        what lets HI3 run under VeOmni. All LoRA adapters (``qkv_proj``/
+        ``o_proj``) live in the decoder, so optimizer / EMA / checkpoint /
+        weight-sync scope is the decoder — which also makes the ``"model."``
+        sync prefix in ``config.py`` resolve correctly (the wrapper handoff
+        double-prefixed it)."""
+        return self.transformer.model
+
     @classmethod
     def from_config(cls, config: HunyuanImage3PipelineConfig) -> "HunyuanImage3Bundle":
         """Load all HunyuanImage3 components from a HuggingFace checkpoint.
@@ -255,6 +270,13 @@ class HunyuanImage3Bundle(Bundle):
             pass
 
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+        # VeOmni's ``parallelize`` calls ``init_weights()`` on the module it
+        # wraps (the decoder, via :meth:`trainable_module`) right after
+        # ``to_empty``; stamp it to a no-op so it cannot clobber the real weights
+        # that :meth:`materialize` installs post-shard. Mirrors the qwen_image /
+        # sd3 meta-init bundles. Harmless on the FSDP path (never called there).
+        transformer.model.init_weights = lambda: None  # type: ignore[method-assign]
 
         # Scheduler — same as ``from_config``; tiny, no meta concerns.
         scheduler: Any = None

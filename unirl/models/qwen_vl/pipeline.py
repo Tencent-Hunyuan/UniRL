@@ -7,7 +7,6 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_ar_params
 
 from .ar import QwenVLARParams, QwenVLARStage
 from .bundle import QwenVLBundle
@@ -88,7 +87,7 @@ class QwenVLPipeline(Pipeline):
 
         conds: QwenVLARConditions = chat_stage.embed(texts, images=pil_images)
 
-        ar = get_ar_params(req.sampling_params)
+        ar = req.sampling_params.get("ar")
         if ar is not None:
             params = QwenVLARParams(
                 max_tokens=ar.max_new_tokens,

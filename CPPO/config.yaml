@@ -61,9 +61,10 @@ sampling:
 # shard via sleep()/wake_up(). 30B-A3B needs tensor parallelism — tp_size=8 is a
 # starting point to TUNE for your cluster. ──
 rollout:
-  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     tp_size: 8
     max_new_tokens: 16384

@@ -26,12 +26,14 @@ indirection.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.meta_init import finalize_meta_init
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import HunyuanVideoPipelineConfig
@@ -94,8 +96,19 @@ class HunyuanVideoBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        transformer = HunyuanVideoTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
-        transformer = transformer.to(device=device, dtype=dtype)
+        if config.meta_init_transformer:
+            # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
+            # no per-rank weight allocation; the backend materializes + loads
+            # from the stashed dir after sharding.
+            transformer_config = HunyuanVideoTransformer3DModel.load_config(path, subfolder="transformer")
+            with torch.device("meta"):
+                transformer = HunyuanVideoTransformer3DModel.from_config(transformer_config)
+            transformer = finalize_meta_init(transformer, dtype=dtype)
+        else:
+            transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+                path, subfolder="transformer", torch_dtype=dtype
+            )
+            transformer = transformer.to(device=device, dtype=dtype)
 
         vae = (
             AutoencoderKLHunyuanVideo.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
@@ -118,7 +131,7 @@ class HunyuanVideoBundle(Bundle):
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
@@ -130,6 +143,10 @@ class HunyuanVideoBundle(Bundle):
             device=device,
             pretrained_path=path,
         )
+        if config.meta_init_transformer:
+            # Consumed by the backend's post-shard weight load.
+            bundle._transformer_weights_path = os.path.join(path, "transformer")
+        return bundle
 
 
 __all__ = ["HunyuanVideoBundle"]

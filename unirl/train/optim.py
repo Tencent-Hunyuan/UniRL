@@ -1,21 +1,39 @@
-"""Factory functions that turn typed training sub-configs into runtime torch objects.
+"""Optimizer / LR-scheduler factories and their duck-typed protocols.
 
-Kept separate from ``unirl/config/training_sections.py`` so the config layer
-stays torch-free — launcher scripts, linters, and schema tools can import the
-typed dataclasses without pulling ``torch``.
+Kept separate from the config dataclasses (``unirl/train/backend/base.py``)
+so the config layer stays torch-free — launcher scripts, linters, and schema
+tools can import the typed dataclasses without pulling ``torch``.
+
+The protocols capture the method surface the unirl training code actually
+uses; the standard ``torch.optim.AdamW`` /
+``torch.optim.lr_scheduler.LRScheduler`` instances satisfy them structurally.
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Protocol, runtime_checkable
 
 import torch
 
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
-from unirl.train.backend.protocols import (
-    LRSchedulerProtocol,
-    OptimizerProtocol,
-)
+
+
+@runtime_checkable
+class OptimizerProtocol(Protocol):
+    state: Dict[Any, Dict[str, Any]]
+
+    def step(self) -> None: ...
+    def zero_grad(self) -> None: ...
+    def state_dict(self) -> Dict[str, Any]: ...
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None: ...
+
+
+@runtime_checkable
+class LRSchedulerProtocol(Protocol):
+    def step(self) -> None: ...
+    def state_dict(self) -> Dict[str, Any]: ...
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None: ...
+    def get_last_lr(self) -> List[float]: ...
 
 
 def build_optimizer(
@@ -104,4 +122,4 @@ def build_lr_scheduler(
     return None
 
 
-__all__ = ["build_lr_scheduler", "build_optimizer"]
+__all__ = ["build_lr_scheduler", "build_optimizer", "OptimizerProtocol", "LRSchedulerProtocol"]

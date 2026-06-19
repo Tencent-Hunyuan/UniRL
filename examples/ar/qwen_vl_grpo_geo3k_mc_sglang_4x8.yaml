@@ -3,7 +3,7 @@
 # with the SGLang LLM rollout engine (rollout-anchored, colocate).
 #
 # Differs from the trainside config (qwen_vl_grpo_geo3k_mc_4x8.yaml) only in:
-#   - rollout: SGLangLLMRolloutEngine (separate in-process SRT server) instead of
+#   - rollout: SGLangRolloutEngine (separate in-process SRT server) instead of
 #     TrainsideRolloutEngine.
 #   - sync: full-weight TensorWeightSync pushes the trained weights into the
 #     sglang server each rollout (trainside shares the module; sglang needs an
@@ -33,7 +33,7 @@ adv_normalization_scope: global
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac
-  run_name: qwen_vl_grpo_sglang_v2_4x8
+  run_name: qwen_vl_grpo_sglang_4x8
   entity: ${oc.env:WANDB_ENTITY,null}
   tags: [grpo, qwen-vl, geo3k-mc, sglang, rollout, colocate, 4x8]
 
@@ -83,11 +83,12 @@ backend:
 
 # SGLang LLM rollout engine (separate in-process SRT server). The top-level
 # _target_ resolves to the engine class for remote(); the nested `config` block
-# is materialized worker-side into SGLangLLMEngineConfig.
+# is materialized worker-side into SGLangEngineConfig.
 rollout:
-  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
     tp_size: 1
     # ARTrainer pre-expands the req to prompts*samples_per_prompt entries (one

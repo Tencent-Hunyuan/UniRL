@@ -99,9 +99,10 @@ rollout:
   # SGLang LLM engine, DISAGGREGATED: owns its own GPU slab and stays RESIDENT
   # (no sleep()/wake_up()). tp_size=1 → one single-GPU engine per rollout GPU.
   # NCCLWeightSync is single-stage / TP=1 scoped, which this satisfies.
-  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
     max_new_tokens: 8192

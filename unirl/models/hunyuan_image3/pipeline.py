@@ -61,8 +61,8 @@ class HunyuanImage3Pipeline(Pipeline):
       :class:`HunyuanImage3DiffusionParams` (t2i / it2i).
     - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t / t2ti).
 
-    t2ti (text → CoT text + image) requires
-    ``ComposedSamplingParams(ar=..., diffusion=...)`` and returns TWO
+    t2ti (text → CoT text + image) requires a sampling dict with both
+    ``"ar"`` and ``"diffusion"`` entries and returns TWO
     tracks: ``"ar"`` (root, the CoT TextSegment) and ``"image"``
     (``parent_track="ar"``, the LatentSegment). Fan-out
     (``samples_per_prompt``) is NOT honored by t2ti — replication

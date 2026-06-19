@@ -34,7 +34,6 @@ from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, s
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
 
 
 class DitInputAdapter:
@@ -59,7 +58,7 @@ class DitInputAdapter:
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
         texts = texts_from_req(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
         negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
 
@@ -68,7 +67,7 @@ class DitInputAdapter:
         optional ``max_sequence_length`` / ``seed``, sparse SDE indices, and
         the driver-authoritative x_T recipe."""
         texts = texts_from_req(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
 
         diff_kwargs = core_diff_kwargs(req, diff_params)
         max_seq_len = getattr(diff_params, "max_sequence_length", None)

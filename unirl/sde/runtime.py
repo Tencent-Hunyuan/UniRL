@@ -58,8 +58,6 @@ from typing import Any, Dict, Optional, Union
 import numpy as np
 import torch
 
-from unirl.types.sampling import get_diffusion_params
-
 logger = logging.getLogger(__name__)
 
 
@@ -488,7 +486,7 @@ def ensure_req_sigmas(req: Any, policy: FlowMatchSchedulePolicy) -> None:
     """
     if req.sigmas is not None:
         return
-    diffusion = get_diffusion_params(req.sampling_params)
+    diffusion = req.sampling_params.get("diffusion")
     if diffusion is None:
         raise ValueError(
             "ensure_req_sigmas: req.sampling_params must contain diffusion params for σ schedule computation."
