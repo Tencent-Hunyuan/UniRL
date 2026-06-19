@@ -19,7 +19,11 @@ from .conditions import QwenVLARConditions
 
 logger = logging.getLogger(__name__)
 
-_SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
+# Qwen2.5-VL has NO flex_attention support (its mask path predates flex), so the
+# only reachable sparse-block kernel here is FlashAttention (flash_attention_2/3/4,
+# whichever flash-attn package is installed). flex is intentionally omitted — listing
+# it would let the gate pass on a backend the model cannot actually run.
+_SPARSE_PACKED_ATTN = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
 @functools.lru_cache(maxsize=None)
@@ -31,9 +35,10 @@ def _warn_packed_disabled(attn_impl: str) -> None:
     """
     logger.warning(
         "packed-varlen replay disabled: attn_implementation=%r is not a "
-        "sparse-block kernel; using the padded replay path. Set "
-        "attn_implementation='flex_attention' (or 'flash_attention_2' with "
-        "flash_attn installed) to enable packed replay.",
+        "sparse-block kernel; using the padded replay path. Qwen2.5-VL has no "
+        "flex_attention, so set attn_implementation to a FlashAttention backend "
+        "('flash_attention_2'/'flash_attention_3', or 'flash_attention_4' for the "
+        "pinned flash-attn-4) to enable packed replay.",
         attn_impl,
     )
 
@@ -41,9 +46,9 @@ def _warn_packed_disabled(attn_impl: str) -> None:
 def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     """Feature-detect the packed varlen replay prerequisites (review #43).
 
-    1. A sparse-block attention backend (flex_attention or flash_attention_2);
+    1. A FlashAttention sparse-block backend (Qwen2.5-VL has no flex_attention);
        on plain sdpa packed attention is full O((sum L)^2) and can regress, so
-       require a sparse backend (checked first; warns once on fallback).
+       require a flash backend (checked first; warns once on fallback).
     2. transformers building a block-causal mask from restarting position_ids
        (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
        older versions the forward would silently attend ACROSS sequence
