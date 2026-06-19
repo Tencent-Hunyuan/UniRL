@@ -136,7 +136,7 @@ class WeightSync:
         diffusion ``_register_lora_state_dict`` clears and replaces the registry
         entry for a re-used nickname and ``set_lora`` always reloads from
         tensors, so same-name pushes serve fresh weights. Versioned nicknames
-        (the ``sglang_llm`` rotation) leak here instead — the diffusion
+        (the ``sglang`` rotation) leak here instead — the diffusion
         ``lora_adapters`` registry never evicts other nicknames, so each sync
         would strand one GPU-resident adapter copy (~34 MB/sync measured).
         """

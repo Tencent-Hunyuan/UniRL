@@ -37,7 +37,6 @@ from unirl.sde.runtime import ensure_req_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -159,7 +158,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         if not bool(self.cfg.init_same_noise):
             return None
 
-        diffusion = get_diffusion_params(req.sampling_params)
+        diffusion = req.sampling_params.get("diffusion")
         require(
             diffusion is not None and diffusion.seed is not None,
             "init_same_noise=True requires req.sampling_params diffusion seed",

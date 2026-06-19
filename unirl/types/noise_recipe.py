@@ -104,10 +104,8 @@ class NoiseRecipe:
         already known (fixed-shape models populate ``req.init_noise_latent_shape``).
         Duck-typed on the req's attributes so it doesn't import RolloutReq.
         """
-        from unirl.types.sampling import get_diffusion_params
-
         cond = (getattr(req, "request_conditions", None) or {}).get("initial_latents")
-        diffusion = get_diffusion_params(getattr(req, "sampling_params", None))
+        diffusion = (getattr(req, "sampling_params", None) or {}).get("diffusion")
         seed = int(diffusion.seed) if diffusion is not None and getattr(diffusion, "seed", None) is not None else 0
         shape = getattr(req, "init_noise_latent_shape", None)
         return cls(

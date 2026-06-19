@@ -39,7 +39,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import QwenImageBundle
 from .conditions import QwenImageConditions
@@ -234,7 +234,7 @@ class QwenImagePipeline(Pipeline):
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         if self.text_embed is None:
             raise RuntimeError(

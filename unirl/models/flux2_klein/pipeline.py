@@ -44,7 +44,6 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_diffusion_params
 
 from .bundle import Flux2KleinBundle
 from .conditions import Flux2KleinConditions
@@ -68,9 +67,8 @@ class Flux2KleinPipeline(Pipeline):
     - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
       The canonical Klein recipe runs at ``guidance_scale=1.0`` with
       no negative branch.
-    - ``sampling_params: DiffusionSamplingParams`` — typed sampling
-      config; the relevant subset is mapped onto
-      :class:`Flux2KleinDiffusionParams` via ``get_diffusion_params``.
+    - ``sampling_params: Dict[str, BaseSamplingParams]`` — the ``"diffusion"``
+      entry is mapped onto :class:`Flux2KleinDiffusionParams`.
     - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
 
     Writes to ``RolloutResp.tracks["image"]: RolloutTrack``:
@@ -239,7 +237,7 @@ class Flux2KleinPipeline(Pipeline):
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        sampling = get_diffusion_params(req.sampling_params)
+        sampling = req.sampling_params.get("diffusion")
         allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
         params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
         params = Flux2KleinDiffusionParams(**params_dict)

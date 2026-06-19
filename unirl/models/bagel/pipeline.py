@@ -10,8 +10,8 @@ the composed **t2ti** (native think-then-generate: the AR und path plans a
 linked tracks).
 
 Task routing (``_resolve_task``): explicit ``req.stage_config["task"]`` wins;
-else ``ComposedSamplingParams`` ⇒ ``t2ti``; ``ARSamplingParams`` ⇒ text-out; an
-``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
+else both ``ar`` + ``diffusion`` sampling entries ⇒ ``t2ti``; ``ar`` only ⇒
+text-out; an ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
 
 Per prompt the pipeline builds the three KV-cache contexts the sampler needs
 (mirroring ``InterleaveInferencer.interleave_inference``, ``think=False``;
@@ -56,7 +56,6 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import ARSamplingParams, ComposedSamplingParams, get_ar_params, get_diffusion_params
 from unirl.types.segments.latent import LatentSegment
 from unirl.types.segments.text import TextSegment
 
@@ -269,18 +268,20 @@ class BagelPipeline(Pipeline):
     def _resolve_task(req: RolloutReq) -> str:
         """Resolve the task mode: explicit ``stage_config["task"]`` wins, else infer.
 
-        Inference: ``ComposedSamplingParams`` ⇒ ``t2ti`` (think-then-generate);
-        ``ARSamplingParams`` ⇒ text-out (``it2t`` with an ``Images`` input, else
-        ``t2t``; pure ``i2t`` — image, no prompt — must be explicit); diffusion
-        params ⇒ image-out (``it2i`` with an ``Images`` input, else ``t2i``).
+        Inference from the modality-keyed ``sampling_params`` dict: both
+        ``"ar"`` + ``"diffusion"`` ⇒ ``t2ti`` (think-then-generate); ``"ar"``
+        only ⇒ text-out (``it2t`` with an ``Images`` input, else ``t2t``; pure
+        ``i2t`` — image, no prompt — must be explicit); ``"diffusion"`` only ⇒
+        image-out (``it2i`` with an ``Images`` input, else ``t2i``).
         """
         task = req.stage_config.get("task")
         if task is not None:
             return str(task)
-        if isinstance(req.sampling_params, ComposedSamplingParams):
+        sp = req.sampling_params
+        if "ar" in sp and "diffusion" in sp:
             return "t2ti"
         has_image = isinstance(req.primitives.get("image"), Images)
-        if isinstance(req.sampling_params, ARSamplingParams):
+        if "ar" in sp:
             return "it2t" if has_image else "t2t"
         return "it2i" if has_image else "t2i"
 
@@ -312,7 +313,7 @@ class BagelPipeline(Pipeline):
                 f"BagelPipeline.generate: req.primitives['text'] must be Texts, "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        params = get_diffusion_params(req.sampling_params)
+        params = req.sampling_params.get("diffusion")
         if not isinstance(params, BagelDiffusionParams):
             raise TypeError(
                 f"BagelPipeline.generate: sampling_params must be BagelDiffusionParams, got {type(params).__name__}"
@@ -437,7 +438,7 @@ class BagelPipeline(Pipeline):
         ``understanding_output=True``): image ingested ViT-only, then the
         prompt text; ``BagelARStage`` owns prefill + decode + replay.
         """
-        ar_params = get_ar_params(req.sampling_params)
+        ar_params = req.sampling_params.get("ar")
         if ar_params is None:
             raise TypeError(
                 f"BagelPipeline.generate ({task}): sampling_params must carry ARSamplingParams, "
@@ -548,19 +549,19 @@ class BagelPipeline(Pipeline):
         think]`` — one bundle, two stages. Emits two linked tracks: ``"ar"`` (the
         planning text, grouped by prompt) and ``"image"`` (``parent_track="ar"``
         → grouped by the rewrite, mirroring the PE composition's lineage). The
-        request carries :class:`ComposedSamplingParams` (``ar`` + ``diffusion``).
+        request carries both ``ar`` + ``diffusion`` sampling entries.
         """
         if req.sigmas is None:
             raise ValueError(
                 "BagelPipeline.generate (t2ti): req.sigmas is None — the hosting engine must call "
                 "ensure_req_sigmas(req, pipeline.build_schedule_policy()) before generate."
             )
-        ar_params = get_ar_params(req.sampling_params)
-        diff_params = get_diffusion_params(req.sampling_params)
+        ar_params = req.sampling_params.get("ar")
+        diff_params = req.sampling_params.get("diffusion")
         if ar_params is None or not isinstance(diff_params, BagelDiffusionParams):
             raise TypeError(
-                "BagelPipeline.generate (t2ti): sampling_params must be ComposedSamplingParams carrying "
-                f"ar=ARSamplingParams + diffusion=BagelDiffusionParams; got {type(req.sampling_params).__name__}."
+                "BagelPipeline.generate (t2ti): sampling_params must carry both an 'ar' (ARSamplingParams) "
+                f"and a 'diffusion' (BagelDiffusionParams) entry; got keys {sorted(req.sampling_params)}."
             )
         texts = req.primitives.get("text")
         if not isinstance(texts, Texts):

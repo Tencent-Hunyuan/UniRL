@@ -97,7 +97,7 @@ diffusion:
       _target_: hydra.utils.get_class
       path: unirl.models.sd3.conditions.SD3Conditions
     # FlowGRPO.replay needs the same guidance_scale / eta the rollout
-    # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
+    # sampled with — bind to the "diffusion" entry of the sampling dict.
     params: ${sampling.diffusion}
   stack:
     _target_: unirl.train.stack.TrainStack
@@ -193,10 +193,9 @@ data_source:
     algorithm:
       prompts_per_rollout: ${batch_size}
 
-# ComposedSamplingParams drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# Modality-keyed sampling dict drives PEPipeline's fan-out: ar.samples_per_prompt = N
 # rewrites, diffusion.samples_per_prompt = M images per rewrite.
 sampling:
-  _target_: unirl.types.sampling.ComposedSamplingParams
   ar:
     _target_: unirl.types.sampling.ARSamplingParams
     samples_per_prompt: 4       # N rewrites per prompt

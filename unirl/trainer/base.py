@@ -4,11 +4,33 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.device_pool import DevicePool
+from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
+    """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict.
+
+    ``RolloutReq.sampling_params`` is a ``Dict[str, BaseSamplingParams]`` keyed by
+    modality. Two config shapes are accepted so the flat single-modality recipes
+    need no rewrite:
+
+    - **Flat** (``sampling: {_target_: …DiffusionSamplingParams, …}``) — one
+      params object, wrapped under its modality key (``"ar"`` for
+      ``ARSamplingParams``, else ``"diffusion"``).
+    - **Composed** (``sampling: {ar: {_target_: …}, diffusion: {_target_: …}}``)
+      — each entry instantiated under its key. (Hydra does not recurse into a
+      ``_target_``-less mapping, so we instantiate per entry.)
+    """
+    if "_target_" in sampling_cfg:
+        obj = instantiate(sampling_cfg)
+        return {"ar" if isinstance(obj, ARSamplingParams) else "diffusion": obj}
+    return {key: instantiate(sub) for key, sub in sampling_cfg.items()}
 
 
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
@@ -174,7 +196,7 @@ class BaseTrainer:
             "num_devices": self.num_devices,
             "batch_size": getattr(self, "batch_size", None),
             "num_rollouts": num_rollouts,
-            "samples_per_prompt": getattr(sampling_params, "samples_per_prompt", None),
+            "samples_per_prompt": total_samples_per_prompt(sampling_params) if sampling_params else None,
         }
         if extra:
             run_config.update(extra)

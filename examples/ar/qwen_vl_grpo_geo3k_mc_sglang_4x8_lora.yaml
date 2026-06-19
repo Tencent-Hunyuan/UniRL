@@ -84,9 +84,10 @@ backend:
       - o_proj
 
 rollout:
-  _target_: unirl.rollout.engine.sglang_llm.engine.SGLangLLMRolloutEngine
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
-    _target_: unirl.rollout.engine.sglang_llm.config.SGLangLLMEngineConfig
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
     tp_size: 1
     samples_pre_expanded: true

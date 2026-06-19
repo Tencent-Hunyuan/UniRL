@@ -31,7 +31,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import SD3Bundle
 from .conditions import SD3Conditions
@@ -151,7 +151,7 @@ class SD3Pipeline(Pipeline):
                 f"SD3Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
         # init_same_noise shares the initial latent within each prompt group. The
         # group key is the per-sample group id, which rides on the (already-sliced)
         # req — surface it to the noise sampler when the driver didn't pre-ship

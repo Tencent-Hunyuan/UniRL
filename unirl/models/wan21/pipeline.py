@@ -32,7 +32,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import DiffusionSamplingParams, get_diffusion_params
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import WAN21Bundle
 from .clip_vision_encode import WAN21CLIPVisionEncodeStage
@@ -172,7 +172,7 @@ class WAN21Pipeline(Pipeline):
                 f"WAN21Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
             )
 
-        params: DiffusionSamplingParams = get_diffusion_params(req.sampling_params)
+        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         text_cond = self.text_embed.embed(texts)
         # CFG negative encoding: WAN's training-time convention encodes
