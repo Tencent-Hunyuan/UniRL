@@ -65,7 +65,12 @@ backend:
     fsdp_mode: full
     reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
     activation_checkpointing: false   # matches sd3_trainside (reference uses bf16_full_ac)
-    sp_size: 2  # Ulysses degree; 8-GPU pod -> dp=4, sp=2. heads(24)%2==0.
+    # SP disabled: SD3 @512² is ~1357 tokens (below the SP memory threshold), and its
+    # fixed 77+256=333 text stream is divisible by no sp>1 (coprime with the 1024 image
+    # tokens), which the diffusion SP divisibility guard now rejects. The VeOmni FSDP2
+    # backend still applies here; correct diffusion SP needs the latent-only / text-
+    # replicate follow-up + a long-sequence config before sp>1 is meaningful for SD3.
+    sp_size: 1
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig

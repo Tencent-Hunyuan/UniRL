@@ -321,6 +321,26 @@ def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _assert_seq_divisible(length: int, sp_size: int, what: str) -> None:
+    """Fail fast if a to-be-sharded stream length is not a multiple of ``sp_size``.
+
+    Diffusion SP v1 shards the sequence with no padded/masked attention path:
+    ``slice_input_tensor`` zero-pads a non-divisible sequence on the right, and full
+    (non-causal) joint attention then attends to that pad, silently corrupting every
+    real token's output (the post-gather truncation at ``norm_out`` cannot undo it).
+    Refuse instead of corrupting. The *text/encoder* stream is the usual offender
+    (SD3's fixed 77+256=333; qwen-image's variable prompt length); keeping it
+    un-sharded is the planned latent-only-sharding follow-up.
+    """
+    if length % sp_size != 0:
+        raise ValueError(
+            f"diffusion SP: {what} length {length} is not divisible by sp_size={sp_size}. "
+            "Ulysses v1 has no padded/masked path, so a non-divisible stream would be "
+            "zero-padded and corrupt full attention. Use a resolution / max_sequence_length "
+            "whose per-stream token count is a multiple of sp_size, or set sp_size=1 for this model."
+        )
+
+
 def _install_boundary_hooks(
     model, sp_group, blocks_attr, norm_out_attr, rope_hook=None, rope_attr="pos_embed", slice_encoder=True
 ):
@@ -337,23 +357,30 @@ def _install_boundary_hooks(
     # block0_pre records the pre-slice image length; norm_out_pre reads it to drop SP
     # divisibility padding after the gather.
     state: Dict[str, int] = {}
+    import torch.distributed as dist
+
+    sp_size = dist.get_world_size(sp_group)
 
     def block0_pre(_m, args, kwargs):
         if not get_parallel_state().ulysses_enabled:
             return None
         new_args = list(args)
         if "hidden_states" in kwargs:
+            _assert_seq_divisible(kwargs["hidden_states"].shape[1], sp_size, "image stream")
             state["img_len"] = kwargs["hidden_states"].shape[1]
             kwargs["hidden_states"] = slice_input_tensor(kwargs["hidden_states"], dim=1, group=sp_group)
         elif new_args:
+            _assert_seq_divisible(new_args[0].shape[1], sp_size, "image stream")
             state["img_len"] = new_args[0].shape[1]
             new_args[0] = slice_input_tensor(new_args[0], dim=1, group=sp_group)
         if slice_encoder:
             if "encoder_hidden_states" in kwargs:
+                _assert_seq_divisible(kwargs["encoder_hidden_states"].shape[1], sp_size, "text/encoder stream")
                 kwargs["encoder_hidden_states"] = slice_input_tensor(
                     kwargs["encoder_hidden_states"], dim=1, group=sp_group
                 )
             elif len(new_args) >= 2:
+                _assert_seq_divisible(new_args[1].shape[1], sp_size, "text/encoder stream")
                 new_args[1] = slice_input_tensor(new_args[1], dim=1, group=sp_group)
         return tuple(new_args), kwargs
 

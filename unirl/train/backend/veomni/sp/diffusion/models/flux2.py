@@ -2,7 +2,7 @@
 
 import logging
 
-from unirl.train.backend.veomni.sp.diffusion.ulysses import _make_rope_slice_hook, _sp, register
+from unirl.train.backend.veomni.sp.diffusion.ulysses import _assert_seq_divisible, _make_rope_slice_hook, _sp, register
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +23,18 @@ def _wrap_flux2(model, sp_group):
         sp.gather_outputs,
     )
 
+    import torch.distributed as dist
+
+    sp_size = dist.get_world_size(sp_group)
+
     def model_pre(_m, args, kwargs):
         if not get_parallel_state().ulysses_enabled:
             return None
         if kwargs.get("hidden_states") is not None:
+            _assert_seq_divisible(kwargs["hidden_states"].shape[1], sp_size, "image stream")
             kwargs["hidden_states"] = slice_input_tensor(kwargs["hidden_states"], dim=1, group=sp_group)
         if kwargs.get("encoder_hidden_states") is not None:
+            _assert_seq_divisible(kwargs["encoder_hidden_states"].shape[1], sp_size, "text/encoder stream")
             kwargs["encoder_hidden_states"] = slice_input_tensor(kwargs["encoder_hidden_states"], dim=1, group=sp_group)
         return args, kwargs
 
