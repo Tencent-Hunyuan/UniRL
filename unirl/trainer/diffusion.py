@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, instantiate
@@ -55,6 +55,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_chunk_prompts: int = 16,
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        stage_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -82,6 +83,12 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_chunk_prompts = int(eval_chunk_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
+        # Per-request routing metadata pinned by the recipe (e.g. {"task": "it2i"}),
+        # forwarded onto every RolloutReq. Pinning the task makes a dataset that is
+        # MISSING source images fail loudly in the pipeline (it2i requires an input
+        # image) instead of silently degrading to t2i. Empty ⇒ the pipeline infers
+        # the task as before (unchanged for every other recipe).
+        self._stage_config: Dict[str, Any] = dict(stage_config) if stage_config else {}
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -317,6 +324,7 @@ class DiffusionTrainer(BaseTrainer):
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
+            stage_config=dict(self._stage_config),
             sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
             init_noise_group_ids=init_noise_group_ids,

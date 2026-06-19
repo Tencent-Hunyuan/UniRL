@@ -44,6 +44,13 @@ eval_eta: 0.0
 transport_kind: colocate_store
 workers_per_device: 1
 
+# Pin the it2i edit task. This recipe is image-EDIT only: every sample MUST carry a
+# source image (dataset `media` entry with role: condition). Pinning the task makes a
+# dataset that is missing source images FAIL LOUDLY (BagelPipeline._extract_input_images
+# raises) instead of silently falling back to t2i and scoring a single-image edit.
+stage_config:
+  task: it2i
+
 logging:
   report_to_wandb: true
   project_name: ${oc.env:WANDB_PROJECT,bagel-editreward}
