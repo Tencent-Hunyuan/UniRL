@@ -233,7 +233,7 @@ class PEPipeline(Pipeline):
             group_ids=list(group_ids),
             primitives={"text": texts},
             request_conditions={},
-            sampling_params=req.sampling_params.get("ar"),
+            sampling_params={"ar": req.sampling_params.get("ar")},
             stage_config={k: v for k, v in req.stage_config.items() if k in ("chat",)},
             sigmas=None,
         )
@@ -260,7 +260,7 @@ class PEPipeline(Pipeline):
             group_ids=list(group_ids),
             primitives={"text": texts},
             request_conditions=dict(req.request_conditions),
-            sampling_params=req.sampling_params.get("diffusion"),
+            sampling_params={"diffusion": req.sampling_params.get("diffusion")},
             sigmas=req.sigmas,
         )
 

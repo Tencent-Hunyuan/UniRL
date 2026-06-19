@@ -200,7 +200,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             group_ids=list(req.group_ids),
             primitives={"text": text_primitive},
             request_conditions=dict(req.request_conditions),
-            sampling_params=ar_params,
+            sampling_params={"ar": ar_params},
             stage_config=ar_stage_config,
             sigmas=None,
         )
@@ -274,7 +274,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             group_ids=list(diff_shell.parent_ids or diff_shell.sample_ids),
             primitives={"text": Texts(texts=expanded_texts)},
             request_conditions=dict(req.request_conditions),
-            sampling_params=diff_params,
+            sampling_params={"diffusion": diff_params},
             sigmas=req.sigmas,
         )
         diff_resp = self._diffusion.generate(diff_sub_req)
