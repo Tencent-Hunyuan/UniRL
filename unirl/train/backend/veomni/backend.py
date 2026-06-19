@@ -21,9 +21,10 @@ Lifecycle differences vs FSDPBackend (all internal to construction):
   post-materialize resets *after* the weight load.
 
 Checkpointing: ``save``/``load`` are inherited from the base; the optimizer-state
-mechanism is supplied by the hooks below as a plain per-rank ``state_dict()``
-(NOT DCP) — VeOmni shards over a folded ``dp_shard x ulysses`` mesh where the DCP
-optimizer gather is unverified.
+hooks below gather the FULL optimizer state to rank 0 (and broadcast + reshard on
+load) — the same DCP path the torch-native FSDP backend uses. The folded
+``dp_shard x ulysses`` mesh is a plain 2D DeviceMesh that DCP redistributes across
+both dims (already exercised by the ``dcp`` checkpoint format on this mesh).
 """
 
 from __future__ import annotations
@@ -36,7 +37,11 @@ from unirl.models.types.bundle import Bundle
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.sharded_load import load_trainable_weights
-from unirl.train.backend.sharded_state import StateDict, move_optimizer_state
+from unirl.train.backend.sharded_state import (
+    StateDict,
+    gather_optimizer_state_dict,
+    load_optimizer_state_dict,
+)
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
 from unirl.train.configs import (
@@ -173,15 +178,18 @@ class VeOmniBackend(BaseFSDP2Backend):
         return clip_grad_norm(self.model, max_grad_norm)
 
     def _gather_optimizer_state(self) -> StateDict:
-        # Plain per-rank state_dict (NOT DCP): VeOmni shards over a folded
-        # dp_shard x ulysses mesh where the DCP optimizer gather is unverified.
-        # Every rank computes its dict; only dist rank 0's is written.
-        return self.optimizer.state_dict()
+        # Full optimizer state gathered to rank 0 via DCP (full_state_dict=True);
+        # the base writes only rank 0's. A plain per-rank optimizer.state_dict()
+        # would persist just rank 0's DTensor shard and load it onto every rank,
+        # corrupting ranks>0 momentum on resume. The folded dp_shard x ulysses
+        # mesh is a plain 2D DeviceMesh DCP gathers across both dims (same path
+        # the dcp checkpoint format already uses on this mesh).
+        return gather_optimizer_state_dict(self.model, self.optimizer)
 
     def _load_optimizer_state(self, optimizer_state: StateDict) -> None:
-        # Every rank loaded the full checkpoint, so the dict is real locally.
-        self.optimizer.load_state_dict(optimizer_state)
-        move_optimizer_state(self.optimizer, self._device)
+        # Full state on rank 0, broadcast + resharded into each rank's local
+        # shard (set_optimizer_state_dict, broadcast_from_rank0=True).
+        load_optimizer_state_dict(self.model, self.optimizer, optimizer_state)
 
     def _onload_model(self) -> None:
         veomni_onload(self.model, self._device)
