@@ -29,6 +29,16 @@ def _maybe_disable_cudnn() -> None:
         import torch
 
         torch.backends.cudnn.enabled = False
+        # cudnn.enabled=False does NOT gate the SDPA cuDNN backend — that is a
+        # separate flag. On this stack the cuDNN-SDP kernel aborts the process
+        # (``munmap_chunk(): invalid pointer``) inside diffusers' _native_attention
+        # (the WAN DiT forward). Turn the cuDNN SDPA backend off explicitly so
+        # F.scaled_dot_product_attention falls back to flash / mem-efficient
+        # (both verified OK here). Guarded: the toggle exists on recent torch only.
+        try:
+            torch.backends.cuda.enable_cudnn_sdp(False)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001 — best-effort; torch may be absent in CPU-only utility imports
         pass
 
