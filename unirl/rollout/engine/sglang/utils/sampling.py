@@ -2,7 +2,7 @@
 
 The predecessor resolved sampling inline across ``generate`` and the async
 helper, re-deriving the precedence per field. This is the one place it happens
-now: typed ``ARSamplingParams`` (``req.sampling_params``) > the
+now: typed ``ARSamplingParams`` (``req.sampling_params['ar']``) > the
 ``req.stage_config['ar']`` bag > engine-config defaults, including the
 ``top_k`` translation and the ``samples_pre_expanded`` n-logic. Pure —
 table-testable with config/req stand-ins.
@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import get_ar_params
 
 
 @dataclass(frozen=True)
@@ -53,7 +52,7 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
       ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
       come from ``stage_config['ar']``.
     """
-    ar = get_ar_params(req.sampling_params)
+    ar = req.sampling_params.get("ar")
     stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
 
     if config.samples_pre_expanded:

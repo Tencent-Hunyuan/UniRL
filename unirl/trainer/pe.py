@@ -35,10 +35,10 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams, get_diffusion_params
+from unirl.types.sampling import BaseSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -50,17 +50,31 @@ TRACK_NAMES: Tuple[str, ...] = ("ar", "diffusion")
 
 @dataclass
 class _Side:
-    """The sibling Remotes that make up one trained track."""
+    """The sibling Remotes that make up one track.
+
+    ``bundle`` + ``pipeline`` are always built (the pipeline is the rollout
+    sampler). The training trio (``backend`` / ``algorithm`` / ``stack``) is
+    ``None`` for a frozen, rollout-only side (``freeze_llm=True`` skips them on
+    the AR side — see :meth:`PETrainer._wire_rollout_only_side`); a trained side
+    populates all five.
+    """
 
     bundle: Any
     pipeline: Any
-    backend: Any
-    algorithm: Any
-    stack: Any
+    backend: Any = None
+    algorithm: Any = None
+    stack: Any = None
 
 
 class PETrainer(BaseTrainer):
-    """PE joint trainer: two TrainStack siblings + composed trainside rollout."""
+    """PE joint trainer: two TrainStack siblings + composed trainside rollout.
+
+    ``freeze_llm=True`` switches the AR side to a frozen, rollout-only rewriter:
+    the LLM still generates the N prompt rewrites each rollout (the composed
+    :class:`PEPipeline` samples its live module under ``torch.no_grad``), but it
+    has no backend / algorithm / stack and never trains — only the diffusion
+    track updates. Use it to learn diffusion against a fixed prompt-enhancer.
+    """
 
     def __init__(
         self,
@@ -76,6 +90,7 @@ class PETrainer(BaseTrainer):
         sync_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = False,
+        freeze_llm: bool = False,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -84,12 +99,20 @@ class PETrainer(BaseTrainer):
         # Never runs for trainside (it samples the live FSDP modules) — see train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._rollout_is_trainside = False
+        # Frozen LLM: the AR side is a rollout-only rewriter — built bundle +
+        # pipeline (so the composed PEPipeline can sample it under no_grad), but
+        # NO backend / algorithm / stack, so it never trains. Only the diffusion
+        # track updates. ``_train_tracks`` is the set ``train_step`` routes to
+        # ``stack.train_track``; with a frozen LLM that's diffusion alone.
+        self._freeze_llm = bool(freeze_llm)
+        self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
 
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        # ComposedSamplingParams(ar=N, diffusion=M) — drives PEPipeline's fan-out.
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        # {"ar": ARSamplingParams(N), "diffusion": DiffusionSamplingParams(M)} —
+        # the modality-keyed sampling dict driving PEPipeline's two-level fan-out.
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Per-track weight-sync bridges; None trainside (shares the modules).
         self.diffusion_sync = None
@@ -97,7 +120,8 @@ class PETrainer(BaseTrainer):
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.diffusion = self._wire_side(diffusion_cfg)
-            self.ar = self._wire_side(ar_cfg)
+            # Frozen LLM → rollout-only AR (bundle + pipeline, no training trio).
+            self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
             # Pass the (composed) pipeline only to engines whose role_cls
             # declares it (trainside). For a separate-process engine
@@ -126,11 +150,14 @@ class PETrainer(BaseTrainer):
 
             # Non-trainside: one bridge per track, each routed to its child of
             # the composed engine by ``track_prefix`` (set in the sync block).
+            # A frozen LLM has no AR backend (and never trains), so it needs no
+            # AR sync bridge — only the diffusion adapter is pushed to the engine.
             if sync_cfg is not None:
                 self.diffusion_sync = remote_hydra(
                     sync_cfg.diffusion, backend=self.diffusion.backend, rollout=self.rollout
                 )
-                self.ar_sync = remote_hydra(sync_cfg.ar, backend=self.ar.backend, rollout=self.rollout)
+                if not self._freeze_llm:
+                    self.ar_sync = remote_hydra(sync_cfg.ar, backend=self.ar.backend, rollout=self.rollout)
 
     def _wire_side(self, cfg: DictConfig) -> _Side:
         """Build one track's bundle → pipeline → backend → algorithm → stack.
@@ -145,11 +172,27 @@ class PETrainer(BaseTrainer):
         stack = remote_hydra(cfg.stack, fsdp_backend=backend, algorithm=algorithm)
         return _Side(bundle=bundle, pipeline=pipeline, backend=backend, algorithm=algorithm, stack=stack)
 
+    def _wire_rollout_only_side(self, cfg: DictConfig) -> _Side:
+        """Build a frozen, rollout-only side: bundle + pipeline, NO training trio.
+
+        Used for the AR side under ``freeze_llm=True``. The bundle materializes
+        the model on its device at load time (e.g. ``Qwen3Bundle.from_config``
+        does ``.to(device)``), and the composed :class:`PEPipeline` samples this
+        pipeline's stage under ``torch.no_grad`` via the trainside engine's
+        eval-scope — so the LLM rewrites prompts but never trains. ``backend`` /
+        ``algorithm`` / ``stack`` stay ``None``; the recipe's AR training blocks
+        (if present) are intentionally ignored. The model is frozen by absence
+        of an optimizer — no LoRA/FSDP train state is built for it.
+        """
+        bundle = remote_hydra(cfg.bundle)
+        pipeline = remote_hydra(cfg.pipeline, bundle=bundle)
+        return _Side(bundle=bundle, pipeline=pipeline)
+
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
-        from ``ComposedSamplingParams`` (``ar.samples_per_prompt`` rewrites,
+        from the sampling dict (``ar.samples_per_prompt`` rewrites,
         ``diffusion.samples_per_prompt`` images each). The single-track trainer
         pre-expands here; PE must not, or it would double-count.
 
@@ -160,10 +203,10 @@ class PETrainer(BaseTrainer):
         :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
         The AR sub-block has no SDE machinery and is left untouched.
         """
-        diff_params = get_diffusion_params(self.sampling_params)
+        diff_params = self.sampling_params.get("diffusion")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = dataclasses.replace(self.sampling_params, diffusion=diffusion)
+        sampling_params = {**self.sampling_params, "diffusion": diffusion}
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -195,18 +238,22 @@ class PETrainer(BaseTrainer):
         self.rollout.wake_up()
         if sync_weights and self.diffusion_sync is not None:
             self.diffusion_sync.sync()
-            self.ar_sync.sync()
+            if self.ar_sync is not None:
+                self.ar_sync.sync()
         # Free both tracks' train state during the separate-engine generate.
-        # Sync above reads the FSDP weights, so offload only after it.
+        # Sync above reads the FSDP weights, so offload only after it. A frozen
+        # LLM has no AR backend, so only the diffusion train state is offloaded.
         do_fsdp_offload = self._enable_fsdp_offload and not self._rollout_is_trainside
         if do_fsdp_offload:
             self.diffusion.backend.offload()
-            self.ar.backend.offload()
+            if self.ar.backend is not None:
+                self.ar.backend.offload()
         resp = self.rollout.generate(req)
         self.rollout.sleep()
         if do_fsdp_offload:
             self.diffusion.backend.onload()
-            self.ar.backend.onload()
+            if self.ar.backend is not None:
+                self.ar.backend.onload()
 
         # 1. Score the IMAGE track only — the AR track's TextSegment is not
         #    directly scorable; its reward is credit-assigned below.
@@ -227,7 +274,9 @@ class PETrainer(BaseTrainer):
         resp.tracks["diffusion"] = scored
 
         # 2. Credit-assign image reward up the lineage → fills the "ar" track
-        #    (mean over the M images of each rewrite).
+        #    (mean over the M images of each rewrite). Kept even with a frozen
+        #    LLM: it is cheap and gives the AR track a logged reward for parity,
+        #    though the resulting AR advantage is unused when the LLM is frozen.
         resp = resp.propagate_rewards(op="mean")
 
         # 3. Mean image reward for the log line.
@@ -237,8 +286,9 @@ class PETrainer(BaseTrainer):
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
         # 4. Per-track GRPO advantages — "ar" groups by prompt (N rewrites),
-        #    "diffusion" groups by rewrite (M images).
-        for name in TRACK_NAMES:
+        #    "diffusion" groups by rewrite (M images). Only the trained tracks
+        #    need advantages; a frozen LLM skips the AR advantage entirely.
+        for name in self._train_tracks:
             resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
 
         # ``reward_req`` text is repeat_interleaved to the diffusion track size
@@ -250,10 +300,11 @@ class PETrainer(BaseTrainer):
             rollout_id=rollout_id,
             media_prompts={"diffusion": list(reward_req.primitives["text"].texts)},
         )
-        # 5. Route each track to its own stack (each DP_SCATTER-sharded on dispatch).
+        # 5. Route each TRAINED track to its own stack (each DP_SCATTER-sharded
+        #    on dispatch). A frozen LLM trains the diffusion track only.
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(resp.tracks[name], training_progress=float(training_progress))
-            for name in TRACK_NAMES
+            for name in self._train_tracks
         }
         self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
         return results, mean_reward

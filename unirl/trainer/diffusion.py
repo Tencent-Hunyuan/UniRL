@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, instantiate
@@ -12,10 +12,10 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class DiffusionTrainer(BaseTrainer):
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Per-sample latent shape for the driver-authored x_T recipe (see
         # _build_req), resolved ONCE here via the pipeline's framework-level
@@ -233,7 +233,7 @@ class DiffusionTrainer(BaseTrainer):
         if latent_shape_fn is None:
             return None
         try:
-            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=self.sampling_params)
+            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=self.sampling_params.get("diffusion"))
         except NotImplementedError:
             return None
         return [int(x) for x in shape]
@@ -241,18 +241,20 @@ class DiffusionTrainer(BaseTrainer):
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
 
-        Expands ``inputs`` by ``sampling_params.samples_per_prompt`` so each
-        prompt produces an N-sample GRPO group (sibling samples consecutive,
+        Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
+        each prompt produces an N-sample GRPO group (sibling samples consecutive,
         sample IDs ``prompt:<gid>:sample:<j>``).
 
         ``rollout_id`` keys the SDE step scheduler (``get_sde_indices``): the
-        resolved indices are stamped onto a per-request copy of the sampling
-        params, and the schedule config itself is nulled so only the resolved
-        ``sde_indices`` ride to the engine.
+        resolved indices are stamped onto a per-request copy of the diffusion
+        sampling params, and the schedule config itself is nulled so only the
+        resolved ``sde_indices`` ride to the engine.
         """
-        inputs = inputs.expand(self.sampling_params.samples_per_prompt)
-        sde_indices = self.sampling_params.resolve_sde_indices(rollout_id)
-        sampling_params = dataclasses.replace(self.sampling_params, sde_indices=sde_indices, scheduler=None)
+        inputs = inputs.expand(total_samples_per_prompt(self.sampling_params))
+        diffusion = self.sampling_params.get("diffusion")
+        sde_indices = diffusion.resolve_sde_indices(rollout_id)
+        diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
+        sampling_params = {**self.sampling_params, "diffusion": diffusion}
         # Driver-authoritative x_T, shipped as a deterministic RECIPE. The driver
         # is the single source of initial noise: it authors per-sample noise group
         # ids keyed on (rollout_id, STABLE sample/group id); base_seed rides on
@@ -276,7 +278,7 @@ class DiffusionTrainer(BaseTrainer):
         init_noise_group_ids: list = []
         init_noise_latent_shape = self._noise_latent_shape
         if init_noise_latent_shape is not None:
-            if bool(getattr(self.sampling_params, "init_same_noise", False)):
+            if bool(getattr(self.sampling_params.get("diffusion"), "init_same_noise", False)):
                 init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
             else:
                 init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]

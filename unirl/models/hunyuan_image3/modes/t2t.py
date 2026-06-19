@@ -23,7 +23,6 @@ from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_ar_params
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
@@ -32,6 +31,17 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
+
+# The upstream tokenizer's apply_chat_template asserts
+# ``bot_task in {"image", "auto", "think", "recaption", "img_ratio"}`` —
+# the composite presets must be mapped before any template call. Mirrors
+# vllm-omni ``pipeline_hunyuan_image3.py:1461-1465``. The ORIGINAL value
+# still drives stop-token selection and the params record.
+_TOKENIZER_BOT_TASKS = {"think_recaption": "think", "vanilla": "image"}
+
+
+def _tokenizer_bot_task(bot_task: str) -> str:
+    return _TOKENIZER_BOT_TASKS.get(bot_task, bot_task)
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
@@ -45,7 +55,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         )
 
     # Build HunyuanImage3ARParams from typed sampling params + model-specific stage_config.
-    ar = get_ar_params(req.sampling_params)
+    ar = req.sampling_params.get("ar")
     model_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
@@ -61,13 +71,16 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         taylor_cache_order=model_cfg.get("taylor_cache_order"),
     )
     bot_task = str(ar_params.bot_task)
+    tok_bot_task = _tokenizer_bot_task(bot_task)
 
     # Resolve the system prompt. Mirrors upstream's
     # ``HunyuanImage3ForCausalMM.generate_image`` flow: per-bot_task
     # defaults under ``use_system_prompt='dynamic'``, an explicit string
     # under ``use_system_prompt='custom'``, or one of the named presets.
+    # Uses the MAPPED bot_task — upstream get_system_prompt's ``dynamic``
+    # branch only knows {think, recaption, image}.
     system_prompt = _resolve_system_prompt(
-        pipeline.bundle, bot_task, ar_params.use_system_prompt, ar_params.system_prompt
+        pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
     )
     system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
 
@@ -75,7 +88,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     # ``mm`` is ``{"fused": HunyuanImage3FusedMultimodalCondition, "tokenizer_output": Any}``.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
-        bot_task=bot_task,
+        bot_task=tok_bot_task,
         system_prompt=system_prompt_list,
         cot_text=([ar_params.cot_text] * len(texts.texts) if ar_params.cot_text else None),
     )
@@ -174,7 +187,7 @@ def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
     ``ar_params.stop_token_ids`` to override.
     """
     transformer = bundle.transformer
-    tkw = getattr(transformer, "_tkwrapper", None)
+    tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
     if tkw is None:
         # Bundle hasn't had its tokenizer loaded yet (fake-bundle path
         # or pre-prefill). Return empty -- ``autoregress`` then runs

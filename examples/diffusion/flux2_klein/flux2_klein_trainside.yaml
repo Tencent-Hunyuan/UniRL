@@ -1,0 +1,205 @@
+# @package _global_
+# FLUX.2-klein-9B GRPO — trainside (in-process FSDP) colocate.
+# Mirrors examples/diffusion/sd3/sd3_trainside.yaml and qwen_image/qwen_image_trainside.yaml
+# in structure, with Klein knobs (DanceSDE + empirical-mu schedule, klein LoRA).
+#
+# Trainside = rollout runs in-process on the FSDP-wrapped training pipeline
+# (no separate rollout actor, no weight sync). Strongest colocate form.
+#
+# Klein-specific recipe knobs:
+#   sde_type            = dance        (DanceSDEStrategy + empirical-mu schedule)
+#   num_inference_steps = 10
+#   num_sde_steps       = 3
+#   timestep_fraction   = [0.0, 0.5]
+#   eta                 = 0.7
+#   clip_range          = 5.0e-3       (loosened vs SD3's 1e-4 — Klein sigmas
+#                                       skew to 1.0 and the ratio drifts fast)
+#   guidance_scale      = 1.0          (Klein transformer ignores guidance)
+#   height x width      = 512 x 512
+#   lora_rank/alpha     = 16 / 32
+#   learning_rate       = 5.0e-5
+#   fsdp_precision      = fp32         (Klein's empirical-mu schedule is
+#                                       numerically sensitive; bf16 master
+#                                       drifts reward after ~hundreds of rollouts)
+#   logprob_precision   = fp32         (PPO ratio stability)
+#   trajectory_precision = fp16        (rollout cache fits per actor)
+#
+# Launch (4 nodes x 8 GPUs, taiji SPMD):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_trainside
+
+num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
+batch_size: 64                # prompts_per_rollout (64 x 16 samples = 1024 global)
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config:
+    _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-9B}
+    model_precision: bf16
+    max_sequence_length: 512
+    # Static-shift fallback only; Klein's checkpoint enables empirical-mu
+    # dynamic shifting (build_schedule_policy) and this value is ignored at runtime.
+    shift: 1.0
+
+# Pipeline uses the optional-stages constructor (mirrors SD3 / Qwen-Image): the
+# trainer auto-injects `bundle=self.bundle`; text_embed/diffusion/vae_decode are
+# built from the bundle here using the precision policy + DanceSDE strategy below.
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy:
+    _target_: unirl.sde.kernels.DanceSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FLUX.2-klein transformer block classes (dual-stream + single-stream); these
+  # match the installed diffusers Flux2Transformer2DModel._no_split_modules
+  # (['Flux2TransformerBlock', 'Flux2SingleTransformerBlock']).
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # fp32 master — Klein's empirical-mu schedule is numerically sensitive; bf16
+    # master weights drift reward after ~hundreds of rollouts.
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # FLUX.2-klein-9B transformer LoRA targets, matched against the diffusers
+    # Flux2Transformer2DModel nn.Linear module names (verified with PEFT on a
+    # tiny dummy build). Coverage:
+    #   - DUAL  Flux2TransformerBlock       × 8: every nn.Linear (12 / block):
+    #       attn.{to_q, to_k, to_v, to_out.0, add_q_proj, add_k_proj, add_v_proj, to_add_out}
+    #       ff.linear_{in,out}, ff_context.linear_{in,out}
+    #   - SINGLE Flux2SingleTransformerBlock × 48: the fused QKV+MLP only:
+    #       attn.to_qkv_mlp_proj  (the dominant single-block linear; ~70% of its
+    #         parameter mass — see comment below for why to_out is excluded).
+    # Single-block attn.to_out is intentionally NOT listed: bare "to_out" would
+    # also endswith-match the dual block's `attn.to_out` ModuleList wrapper
+    # (Linear + Dropout) and PEFT cannot wrap a ModuleList, crashing
+    # get_peft_model. Recovering that final 30% of single-block params would
+    # require regex target_modules — left as a follow-up.
+    target_modules:
+      # DUAL block (Flux2TransformerBlock × 8): image-stream attention
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      # DUAL block: text-stream attention (klein is dual-stream — must include)
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      # DUAL block: image FFN + text FFN (qualified to avoid bare "linear_in"
+      # also catching unrelated time/guidance/modulation projections)
+      - ff.linear_in
+      - ff.linear_out
+      - ff_context.linear_in
+      - ff_context.linear_out
+      # SINGLE block (Flux2SingleTransformerBlock × 48): fused QKV+MLP linear.
+      # This single linear is ~70% of single-block params; recovering it
+      # restores LoRA on the 48 single layers (~86% of the model's depth).
+      - to_qkv_mlp_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # Klein 9B + VAE + Qwen3 text encoder are heavy; chunk the rollout forward to
+  # bound peak memory (VAE decode on 32-ch latents). 16 = samples_per_prompt so
+  # groups never straddle a chunk boundary (matters with init_same_noise).
+  forward_batch_size: 16
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Loosened vs SD3's 1e-4 — Klein sigmas are heavily skewed to 1.0 and the
+  # PPO ratio drifts past 1 +/- 1e-4 quickly.
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (pi_old frozen once)
+
+data_source:
+  # Real prompts loaded from file (MultimodalRLDataSource reads TXT/JSON/JSONL).
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt        # relative to repo cwd (Hydra 1.3 no-chdir)
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: true
+  # SDE step schedule: which denoising steps record SDE log-probs.
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    # SDE-step window: [0,0.5] confines SDE noise to the early high-sigma steps.
+    timestep_fraction: [0, 0.5]

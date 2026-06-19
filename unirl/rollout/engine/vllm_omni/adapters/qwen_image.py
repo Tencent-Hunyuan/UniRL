@@ -35,7 +35,6 @@ from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, texts_from
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
 
 
 def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextEmbedCondition:
@@ -77,7 +76,7 @@ class QwenImageInputAdapter(DitInputAdapter):
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
         texts = texts_from_req(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
         if float(diff_params.guidance_scale) > 1.0:
             negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
             return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
@@ -85,7 +84,7 @@ class QwenImageInputAdapter(DitInputAdapter):
 
     def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
         sampling = super().build_sampling(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
         kwargs = sampling[0].kwargs
         # Qwen's CFG knob: set it ALWAYS so upstream's ``or 4.0`` default
         # never fires (at <= 1.0 ``do_true_cfg`` stays False regardless of

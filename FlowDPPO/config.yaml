@@ -2,7 +2,7 @@
 # FlowDPPO — annotated config EXTRACT (for reading, not launching).
 #
 # Lifted from the full runnable recipe:
-#     examples/diffusion/sd3_flowdppo.yaml
+#     examples/diffusion/sd3/sd3_flowdppo.yaml
 # Launch that recipe to actually train (see this folder's README.md). FlowDPPO
 # uses the SAME GRPO-style SDE rollout; it only swaps the loss (KL-mask instead of
 # ratio-clip) and so additionally records the per-step Gaussian means.

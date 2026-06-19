@@ -55,8 +55,6 @@ bundle:
     _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
     model_precision: bf16
-    autocast_precision: bf16
-    logprob_precision: fp32
     freeze_vision_tower: true # train the LLM only; ViT frozen
     use_gradient_checkpointing: true
     max_prompt_length: 2048

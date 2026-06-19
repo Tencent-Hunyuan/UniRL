@@ -1,0 +1,192 @@
+# @package _global_
+# SD3.5 + DiffusionNFT, v2 trainer — SGLang SEPARATE-mode variant.
+#
+# DiffusionNFT rolls out under the EMA-smoothed "old" adapter
+# (requires_ema_rollout=True). In SEPARATE mode the in-process EMA swap
+# (backend.apply_eval_ema) cannot reach the distinct SGLang process, so the
+# weight sync instead folds the EMA shadow adapter into the pushed base. The
+# sync auto-derives WHICH adapter from the backend's single source of truth
+# (FSDPBackend.rollout_adapter_name, set from ema_lora_cfg.shadow_adapter), so
+# the SGLang engine samples under the EMA weights — faithful to v1. No per-recipe
+# wiring needed; set sync.adapter_name only to override.
+
+num_devices: 16               # 2 nodes x 8 GPUs (v1: 4 train + 4 rollout / node)
+
+# prompts_per_rollout. v1 nft_sd3_sglang keeps 48 (global = 48*16 = 768). The
+# whole batch runs on the rollout slab only; reduce if SGLang's memory pool
+# leaves no room for the DiT forward (cf. the GRPO sglang configs at 16).
+batch_size: 48
+adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+
+# Layout: two sibling device slabs (8 train GPUs + 8 rollout GPUs).
+layout: separate
+train_fraction: 0.5
+
+weight_sync_interval: 1
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false  # SD3.5-medium is small (~5 GB bf16 full); keep params gathered, skip bwd re-gather
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # DiffusionNFT dual-adapter EMA. shadow_adapter ("old") becomes the backend's
+  # rollout_adapter_name, which the weight sync auto-folds into the pushed base
+  # (see header), so SGLang rollout samples under the EMA weights.
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  model_config: ${bundle.config}
+  strategy: ${pipeline.strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: sd3
+    tp_size: 1
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 32-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory (it runs the whole batch in one forward otherwise),
+    # without shrinking the logical batch. Mirrors sd3_nft.
+    forward_batch_size: 32
+    engine_kwargs:
+      model_type: sd3
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.99
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 8
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.0
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0
+
+# Merged full-weight sync → SGLang rollout (separate-slab NCCL broadcast).
+# Folds the EMA shadow adapter (backend.rollout_adapter_name, auto-derived) into
+# the pushed base; lora_merged: true is required for that fold (see header).
+sync:
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  lora_merged: true
+  group_name: weight_sync
+  bucket_size_mb: 512
+  flush_cache: true
+  name_remap: {"*": "transformer.*"}
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-diffusionNFT}
+  run_name: ${oc.env:WANDB_RUN_NAME,sd3_nft_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["sd3.5", "nft", "sglang", "separate", "v2"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1

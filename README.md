@@ -92,7 +92,7 @@ Examples are self-contained YAML files selected with
 
 | Domain | Trains | Entrypoint | Example |
 |---|---|---|---|
-| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3_sglang_rollout_colocate` |
+| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3/sd3_sglang_rollout_colocate` |
 | `ar/` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` |
 | `pe/` | Prompt-enhancer (AR rewriter + diffusion reward) | `train_pe` | `pe/pe_sglang_full_pickscore` |
 | `unified_model/` | Unified AR + diffusion models | `train_unified_model` | `unified_model/hi3_vllmomni` |
@@ -106,8 +106,8 @@ Install dependencies first — see [INSTALL.md](INSTALL.md).
 
 ```bash
 # compose-check, then launch a single-node example
-python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job --resolve
-bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
+python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg job --resolve
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ```
 
 Full [launch guide](examples/README.md#running-a-recipe) — multi-node, every entrypoint, mooncake.

@@ -56,8 +56,6 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     # fp32 master weights for Megatron-parity AdamW (see the DRPO recipe rationale).
     model_precision: fp32
-    autocast_precision: bf16
-    logprob_precision: fp32
     use_gradient_checkpointing: true
 
 pipeline:

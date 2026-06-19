@@ -35,9 +35,9 @@
 #
 # Examples:
 #   # SPMD batch (taiji lands this same line on every node):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_rollout_colocate
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
 #   # ssh fan-out (run once on the head only):
-#   LAUNCH=ssh bash examples/run_experiment_multinode_taiji.sh diffusion/sd3_sglang_rollout_colocate
+#   LAUNCH=ssh bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
 #   # VLM/AR recipe (4x8):
 #   ENTRY=train_ar bash examples/run_experiment_multinode_taiji.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #

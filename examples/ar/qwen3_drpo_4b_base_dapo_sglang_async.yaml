@@ -53,8 +53,6 @@ bundle:
     _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     model_precision: fp32
-    autocast_precision: bf16
-    logprob_precision: fp32
     use_gradient_checkpointing: true
 
 pipeline:

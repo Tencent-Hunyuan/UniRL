@@ -8,7 +8,7 @@ pushes too aggressively in the reward-improving direction.
 
 - **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`_gaussian_kl_div`, `_flowdppo_kl_adv_loss`, `FlowDPPO`)
 - **SDE / replay path:** [`unirl/models/sd3/diffusion.py`](../unirl/models/sd3/diffusion.py), [`unirl/sde/kernels.py`](../unirl/sde/kernels.py)
-- **Recipe:** [`examples/diffusion/sd3_flowdppo.yaml`](../examples/diffusion/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
+- **Recipe:** [`examples/diffusion/sd3/sd3_flowdppo.yaml`](../examples/diffusion/sd3/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
 - **Checkpoints:** [🤗 FlowDPPO](https://huggingface.co/Eculid/sd3.5-flowdppo)
 - **Paper:** *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models."*
 
@@ -149,7 +149,7 @@ Metric source: `masked_fraction`, `kl_mask_fraction`, `kl_new_old_mean/max`, and
 
 ```bash
 PRETRAINED_MODEL=stabilityai/stable-diffusion-3.5-medium \
-python -m unirl.train_diffusion --config-name=diffusion/sd3_flowdppo num_devices=8
+python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_flowdppo num_devices=8
 ```
 
 ![FlowDPPO training curve: rollout/reward_mean for SD3.5-medium rises from ~0.75 to ~0.89 over ~270 rollout steps.](../assets/flowdppo_wandb.png)

@@ -60,8 +60,6 @@ bundle:
     # steps land exactly in fp32 instead of rounding away below the bf16 ULP
     # (lr 1e-6 vs ULP ~7.8e-5 at |w|~0.02 → most updates silently vanished).
     model_precision: fp32
-    autocast_precision: bf16
-    logprob_precision: fp32
     use_gradient_checkpointing: true
     # flex_attention: packed varlen replay gets a fused block-causal kernel
     # (BlockMask skips cross-sequence blocks; sdpa falls back to the math kernel
