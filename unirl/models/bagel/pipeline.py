@@ -96,6 +96,7 @@ class BagelPipeline(Pipeline):
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
         shift: float = 3.0,
+        replay_mode: str = "train",
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -115,6 +116,7 @@ class BagelPipeline(Pipeline):
             model=bundle,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            replay_mode=replay_mode,
         )
         self.autocast_precision = autocast_precision
         # FlowMatch time-shift for the σ schedule policy (read by the hosting engine

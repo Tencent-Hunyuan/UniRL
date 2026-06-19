@@ -63,9 +63,10 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 __all__ = [
@@ -73,10 +74,13 @@ __all__ = [
     "disable_inference_cache",
     "forward_flow",
     "init_und_context",
+    "pack_und_forward_inputs",
     "prefill_text_split",
     "prefill_vit_split",
     "require_inference_dispatch",
     "score_response",
+    "score_response_with_prompt",
+    "und_replay_logits",
 ]
 
 
@@ -277,6 +281,15 @@ def decode_text(
     curr = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
     tokens: List[int] = []
     logps: List[float] = []
+    # Always run a FIXED ``max_new`` forwards (no early EOS break). Under an
+    # FSDP-sharded MoT each forward triggers an all-gather collective; a
+    # data-dependent forward count per rank (early break at a sample's own EOS)
+    # desyncs the collective and deadlocks. A fixed loop makes every sample issue
+    # an identical number of all-gathers — the same lockstep the Qwen-VL AR stage
+    # uses. Recording stops at the first stop token, so the returned list is
+    # unchanged (up to and including the stop token); forwards past it advance the
+    # KV cache unrecorded.
+    done = False
     for j in range(max_new):
         emb = lm.model.embed_tokens(curr)
         out = lm.forward_inference(
@@ -295,10 +308,11 @@ def decode_text(
         logits = lm.lm_head(out.packed_query_sequence)  # [1, vocab]
         token_id, log_prob = sample_fn(logits)
         tid = int(token_id.item())
-        tokens.append(tid)
-        logps.append(float(log_prob.item()))
-        if tid in stop_set:
-            break
+        if not done:
+            tokens.append(tid)
+            logps.append(float(log_prob.item()))
+            if tid in stop_set:
+                done = True
         curr = token_id.to(device=device, dtype=torch.long).reshape(1)
     return tokens, logps
 
@@ -370,3 +384,198 @@ def score_response(
         else:
             parts.append(_chunk_logp(h, tgt))
     return torch.cat(parts, dim=0)
+
+
+def score_response_with_prompt(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    prompt_ids: torch.Tensor,
+    response_ids: torch.Tensor,
+    start_token_id: int,
+    temperature: float = 1.0,
+    logprob_chunk: int = 1024,
+    device: torch.device,
+) -> torch.Tensor:
+    """Inference-mode replay scorer: ONE grad ``forward_inference`` over ``[prompt + start +
+    response[:-1]]`` attending to a (no_grad, frozen) image context ``ctx``.
+
+    The caller prefills ONLY the image split into ``ctx`` under ``no_grad`` (frozen
+    image understanding, ``is_causal=False`` as at rollout); the prompt text rides
+    INSIDE this single grad forward, so the und path trains through prompt+response.
+    Staying on ``forward_inference`` keeps the kernel matched to the rollout
+    (``old_logp`` ratio ≈ 1), and a SINGLE grad forward keeps FSDP backward sound
+    (no grad across two forwards). The last ``n`` query rows predict ``response[j]``;
+    full-softmax ``log_softmax(lm_head(h)/T)`` gathered on the response tokens.
+    """
+    require_inference_dispatch(model)  # inference-mode replay stays in eval()
+    disable_inference_cache(model)
+    lm = model.language_model
+    kv_len, pos = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
+    n = int(response_ids.numel())
+    if n == 0:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+
+    response_ids = response_ids.to(device=device, dtype=torch.long)
+    prompt = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).reshape(-1)
+    start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
+    query_ids = torch.cat([prompt, start, response_ids[:-1]], dim=0)  # [P + n]
+    m = int(query_ids.numel())
+
+    emb = lm.model.embed_tokens(query_ids)
+    out = lm.forward_inference(
+        packed_query_sequence=emb,
+        query_lens=torch.tensor([m], dtype=torch.int, device=device),
+        packed_query_position_ids=torch.arange(pos, pos + m, dtype=torch.long, device=device),
+        packed_query_indexes=torch.arange(kv_len, kv_len + m, dtype=torch.long, device=device),
+        past_key_values=ctx["past_key_values"],
+        key_values_lens=torch.tensor([kv_len], dtype=torch.int, device=device),
+        packed_key_value_indexes=torch.arange(kv_len, dtype=torch.long, device=device),
+        update_past_key_values=False,
+        is_causal=True,
+        mode="und",
+    )
+    hidden = out.packed_query_sequence[-n:]  # the n response-predicting rows
+
+    temp = float(temperature) if float(temperature) > 0.0 else 1.0
+
+    def _chunk_logp(h: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        logits = lm.lm_head(h).float() / temp
+        return logits.gather(-1, tgt.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
+
+    use_ckpt = torch.is_grad_enabled() and hidden.requires_grad
+    parts: List[torch.Tensor] = []
+    for s in range(0, n, int(logprob_chunk)):
+        h, tgt = hidden[s : s + int(logprob_chunk)], response_ids[s : s + int(logprob_chunk)]
+        if use_ckpt:
+            parts.append(checkpoint(_chunk_logp, h, tgt, use_reentrant=False))
+        else:
+            parts.append(_chunk_logp(h, tgt))
+    return torch.cat(parts, dim=0)
+
+
+def pack_und_forward_inputs(
+    model: Any,
+    *,
+    new_token_ids: Dict[str, Any],
+    prompt_ids: List[int],
+    image: Optional[Any],
+    response_input: torch.Tensor,
+    device: torch.device,
+    vit_transform: Callable[[Any], Any] = lambda x: x,
+) -> Dict[str, Any]:
+    """Train-mode packing: one und sample ``[ViT image | prompt | response_input]`` for
+    the MoT TRAINING forward (``forward_train`` layout) with a nested attention mask.
+
+    Attention is ``full`` over the image block and ``causal`` over the text (built
+    per-sample via ``prepare_attention_mask_per_sample``); the image block shares
+    its rope position then prompt+response increment, matching the rollout KV build.
+    ``ce_loss_indexes`` marks the response-input positions whose logits predict the
+    response tokens. ``image`` is the already-``vit_transform``-ed tensor stored on
+    the conditions, so ``vit_transform`` defaults to identity.
+    """
+    from .vendor.data.data_utils import prepare_attention_mask_per_sample
+
+    text_ids: List[int] = []
+    text_indexes: List[int] = []
+    position_ids: List[int] = []
+    vit_tokens = None
+    vit_position_ids = None
+    vit_token_indexes: List[int] = []
+    vit_token_seqlens: Optional[torch.Tensor] = None
+    split_lens: List[int] = []
+    attn_modes: List[str] = []
+    pos = 0
+    rope = 0
+
+    if image is not None:
+        vit_input, _, _ = model.prepare_vit_images(
+            curr_kvlens=[0],
+            curr_rope=[0],
+            images=[image],
+            transforms=vit_transform,
+            new_token_ids=new_token_ids,
+        )
+        img_block_len = int(vit_input["packed_seqlens"][0].item())
+        text_ids.extend(int(t) for t in vit_input["packed_text_ids"].tolist())
+        text_indexes.extend(int(t) for t in vit_input["packed_text_indexes"].tolist())
+        position_ids.extend(int(p) for p in vit_input["packed_position_ids"].tolist())
+        vit_token_indexes.extend(int(t) for t in vit_input["packed_vit_token_indexes"].tolist())
+        vit_tokens = vit_input["packed_vit_tokens"].to(device=device, dtype=model.dtype)
+        vit_position_ids = vit_input["packed_vit_position_ids"].to(device)
+        vit_token_seqlens = vit_input["vit_token_seqlens"].to(device)
+        pos = img_block_len
+        rope = 1
+        split_lens.append(img_block_len)
+        attn_modes.append("full")
+
+    text_block = list(prompt_ids) + [int(t) for t in response_input.tolist()]
+    resp_start = pos + len(prompt_ids)
+    for tid in text_block:
+        text_ids.append(int(tid))
+        text_indexes.append(pos)
+        position_ids.append(rope)
+        pos += 1
+        rope += 1
+    split_lens.append(len(text_block))
+    attn_modes.append("causal")
+    ce_loss_indexes = list(range(resp_start, resp_start + int(response_input.shape[0])))
+
+    seqlen = pos
+    nested_mask = prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)
+
+    return {
+        "seqlen": seqlen,
+        "sample_lens": [seqlen],
+        "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=device),
+        "packed_text_indexes": torch.tensor(text_indexes, dtype=torch.long, device=device),
+        "packed_position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
+        "nested_attention_masks": [nested_mask],
+        "packed_vit_tokens": vit_tokens,
+        "packed_vit_position_ids": vit_position_ids,
+        "packed_vit_token_indexes": (
+            torch.tensor(vit_token_indexes, dtype=torch.long, device=device) if vit_token_indexes else None
+        ),
+        "vit_token_seqlens": vit_token_seqlens,
+        "ce_loss_indexes": torch.tensor(ce_loss_indexes, dtype=torch.long, device=device),
+    }
+
+
+def und_replay_logits(model: Any, packed: Dict[str, Any]) -> torch.Tensor:
+    """Train-mode grad-carrying und TRAINING forward; returns response-position logits ``[R, V]``.
+
+    Mirrors ``Bagel.forward``'s understanding path (text embed + ViT embed → packed
+    sequence → ``language_model`` MoT ``forward_train``) but returns ``lm_head``
+    logits at the ce-loss (response) positions. The caller must have the language
+    model in ``train()`` mode (so the navit dispatch routes ``forward_train``) and
+    ``freeze_und=False``.
+    """
+    lm = model.language_model
+    packed_text_embedding = lm.model.embed_tokens(packed["packed_text_ids"])
+    packed_sequence = packed_text_embedding.new_zeros((packed["seqlen"], model.hidden_size))
+    packed_sequence[packed["packed_text_indexes"]] = packed_text_embedding
+
+    packed_und_token_indexes = packed["packed_text_indexes"]
+    if packed["packed_vit_tokens"] is not None:
+        cu_seqlens = F.pad(torch.cumsum(packed["vit_token_seqlens"], dim=0), (1, 0)).to(torch.int32)
+        max_seqlen = int(torch.max(packed["vit_token_seqlens"]).item())
+        vit_embed = model.vit_model(
+            packed_pixel_values=packed["packed_vit_tokens"],
+            packed_flattened_position_ids=packed["packed_vit_position_ids"],
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        vit_embed = model.connector(vit_embed)
+        vit_embed = vit_embed + model.vit_pos_embed(packed["packed_vit_position_ids"])
+        packed_sequence[packed["packed_vit_token_indexes"]] = vit_embed
+        packed_und_token_indexes = torch.cat([packed["packed_text_indexes"], packed["packed_vit_token_indexes"]], dim=0)
+
+    last_hidden_state = lm(
+        packed_sequence=packed_sequence,
+        sample_lens=packed["sample_lens"],
+        attention_mask=packed["nested_attention_masks"],
+        packed_position_ids=packed["packed_position_ids"],
+        packed_und_token_indexes=packed_und_token_indexes,
+        packed_gen_token_indexes=None,
+    )
+    return lm.lm_head(last_hidden_state[packed["ce_loss_indexes"]])

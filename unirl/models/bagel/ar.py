@@ -127,10 +127,24 @@ class BagelARStage(ARStage[BagelARConditions]):
         model: "BagelBundle",
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_mode: str = "train",
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="BagelARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="BagelARStage.logprob_precision")
+        # Replay scorer for the GRPO ratio's new_logp:
+        #   "train"     — one grad forward_train per sample (nested mask: image full +
+        #                 text causal); the und path INCLUDING the image is trained.
+        #                 Exact attention, but a different kernel than the rollout's
+        #                 forward_inference, so the on-policy ratio is ~1±1e-2.
+        #   "inference" — image prefilled no_grad (frozen) + one grad forward_inference
+        #                 over [prompt+response]; same kernel as rollout (ratio ~1),
+        #                 FSDP-safe, but the image understanding is not trained.
+        self.replay_mode = str(replay_mode).strip().lower()
+        require(
+            self.replay_mode in ("train", "inference"),
+            f"BagelARStage: replay_mode must be 'train' or 'inference'; got {replay_mode!r}.",
+        )
         # A checkpoint trained with freeze_und detaches the und hidden states in
         # forward_train — a signal the und path was never meant to train. The
         # inference-path replay is unaffected mechanically, but fail loudly.
@@ -237,6 +251,22 @@ class BagelARStage(ARStage[BagelARConditions]):
     # Replay
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _split_image_and_prompt_ids(splits: List[Dict[str, Any]]) -> Tuple[Optional[Any], List[int]]:
+        """From a sample's ordered splits, pull the (single) ViT image tensor and the
+        concatenated prompt token ids (already ``[bos]+enc+[eos]`` wrapped)."""
+        image: Optional[Any] = None
+        prompt_ids: List[int] = []
+        for sp in splits:
+            kind = sp.get("kind")
+            if kind == "vit":
+                image = sp["image"]
+            elif kind == "text":
+                prompt_ids.extend(int(t) for t in sp["ids"].tolist())
+            else:
+                raise ValueError(f"BagelARStage.replay: unknown split kind {kind!r}.")
+        return image, prompt_ids
+
     def replay(
         self,
         conditions: BagelARConditions,
@@ -244,13 +274,18 @@ class BagelARStage(ARStage[BagelARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        """Per-token log-prob replay over a stored rollout segment.
+        """Per-token grad-capable log-prob replay (``new_logp``) over a stored segment.
 
-        Per sample: grad-capable context re-prefill from the stored splits, then
-        one teacher-forced ``score_response`` pass. Returns packed varlen
-        ``[total_tokens]`` fp32 aligned with ``segment.log_probs``. Caller owns
-        the grad scope and eval() mode; the stage owns the autocast scope.
-        Empty-response samples contribute zero tokens.
+        Dispatches on ``self.replay_mode``: ``"train"`` (one grad
+        ``forward_train`` per sample, image+text trained, nested mask) or
+        ``"inference"`` (no_grad frozen-image prefill + one grad
+        ``forward_inference`` over ``[prompt+response]``, kernel-matched to rollout).
+        Returns packed varlen ``[total_tokens]`` aligned with ``segment.log_probs``.
+        Each mode sets the language-model train/eval mode it needs and does NOT
+        restore it: the navit dispatch (and activation-checkpoint recompute in
+        backward) reads ``self.training``, so the mode must persist through the
+        caller's ``backward()``; the rollout engine re-sets eval() around every
+        ``generate``. Empty-response samples contribute zero tokens.
         """
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError(
@@ -262,14 +297,95 @@ class BagelARStage(ARStage[BagelARConditions]):
             f"BagelARStage.replay: conditions batch ({conditions.batch_size}) != "
             f"segment samples ({int(segment.lengths.numel())}).",
         )
-        bagel = self.model.model
         device = next(self.model.transformer.parameters()).device
-        rl_ops.require_inference_dispatch(bagel)
-
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
         lengths = [int(n) for n in segment.lengths.tolist()]
         start_id = int(self.model.new_token_ids["bos_token_id"])
 
+        if self.replay_mode == "train":
+            parts = self._replay_train(
+                conditions,
+                segment=segment,
+                cu=cu,
+                lengths=lengths,
+                start_id=start_id,
+                temperature=temperature,
+                device=device,
+            )
+        else:
+            parts = self._replay_inference(
+                conditions,
+                segment=segment,
+                cu=cu,
+                lengths=lengths,
+                start_id=start_id,
+                temperature=temperature,
+                device=device,
+            )
+        if not parts:
+            return torch.zeros(0, dtype=self.logprob_dtype, device=device)
+        return torch.cat(parts, dim=0).to(dtype=self.logprob_dtype)
+
+    def _replay_train(
+        self,
+        conditions: BagelARConditions,
+        *,
+        segment: TextSegment,
+        cu: List[int],
+        lengths: List[int],
+        start_id: int,
+        temperature: float,
+        device: torch.device,
+    ) -> List[torch.Tensor]:
+        """Train-mode replay: one grad ``forward_train`` per sample over ``[image | prompt |
+        response_input]`` with the image-full/text-causal nested mask. Trains the und
+        path including the image. forward_train ≠ rollout's forward_inference, so the
+        on-policy ratio carries a ~1e-2 kernel gap (see the recipe note)."""
+        bagel = self.model.model
+        new_token_ids = self.model.new_token_ids
+        temp = float(temperature) if float(temperature) > 0.0 else 1.0
+        bagel.language_model.train()  # navit forward_train dispatch; persists through backward
+        parts: List[torch.Tensor] = []
+        with self._autocast_ctx(device):
+            for i, splits in enumerate(conditions.prompt_splits):
+                n = lengths[i]
+                if n == 0:
+                    continue
+                response = segment.tokens[cu[i] : cu[i] + n].to(device=device, dtype=torch.long)
+                image, prompt_ids = self._split_image_and_prompt_ids(splits)
+                response_input = torch.cat(
+                    [torch.tensor([start_id], device=device, dtype=torch.long), response[:-1]], dim=0
+                )
+                packed = rl_ops.pack_und_forward_inputs(
+                    bagel,
+                    new_token_ids=new_token_ids,
+                    prompt_ids=prompt_ids,
+                    image=image,
+                    response_input=response_input,
+                    device=device,
+                )
+                logits = rl_ops.und_replay_logits(bagel, packed)  # [n, V]
+                logp_full = torch.log_softmax(logits.float() / temp, dim=-1)
+                parts.append(logp_full.gather(-1, response.unsqueeze(-1)).squeeze(-1))
+        return parts
+
+    def _replay_inference(
+        self,
+        conditions: BagelARConditions,
+        *,
+        segment: TextSegment,
+        cu: List[int],
+        lengths: List[int],
+        start_id: int,
+        temperature: float,
+        device: torch.device,
+    ) -> List[torch.Tensor]:
+        """Inference-mode replay: image prefilled under no_grad (frozen), then one grad
+        ``forward_inference`` over ``[prompt+response]``. Kernel-matched to rollout
+        (ratio ~1), FSDP-safe (single grad forward), image not trained."""
+        bagel = self.model.model
+        bagel.language_model.eval()  # navit forward_inference dispatch
+        rl_ops.require_inference_dispatch(bagel)
         parts: List[torch.Tensor] = []
         with self._autocast_ctx(device):
             for i, splits in enumerate(conditions.prompt_splits):
@@ -277,20 +393,25 @@ class BagelARStage(ARStage[BagelARConditions]):
                 if n == 0:
                     continue
                 response = segment.tokens[cu[i] : cu[i] + n]
-                ctx = self._prefill(splits, device=device)
+                image, prompt_ids = self._split_image_and_prompt_ids(splits)
+                with torch.no_grad():
+                    ctx = rl_ops.init_und_context(bagel)
+                    if image is not None:
+                        ctx = rl_ops.prefill_vit_split(
+                            bagel, ctx, image_tensor=image, new_token_ids=self.model.new_token_ids, device=device
+                        )
                 parts.append(
-                    rl_ops.score_response(
+                    rl_ops.score_response_with_prompt(
                         bagel,
                         ctx,
+                        prompt_ids=torch.tensor(prompt_ids, dtype=torch.long, device=device),
                         response_ids=response,
                         start_token_id=start_id,
                         temperature=float(temperature),
                         device=device,
                     )
                 )
-        if not parts:
-            return torch.zeros(0, dtype=self.logprob_dtype, device=device)
-        return torch.cat(parts, dim=0).to(dtype=self.logprob_dtype)
+        return parts
 
 
 __all__ = ["BagelARParams", "BagelARStage", "BagelARStep"]
