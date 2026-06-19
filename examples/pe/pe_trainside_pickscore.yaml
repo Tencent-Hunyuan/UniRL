@@ -18,6 +18,30 @@
 num_devices: 8
 batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
 
+# ── PE prompt-rewrite (mirrors the sglang ComposedRolloutEngine) ─────────────
+# Trainside PEPipeline injects `pe_instruction` as the LLM chat system prompt so
+# Qwen3 actually REWRITES the prompt (instead of conversationally continuing the
+# raw text), then extracts the text after `pe_marker` — stripping any <think>…
+# preamble and falling back to the original prompt on off-format / empty output —
+# before conditioning SD3. Same text as pe_sglang_full_pickscore.yaml so
+# trainside and sglang rewrites match.
+pe:
+  pe_instruction: |
+    You are a Prompt Optimizer specializing in image generation models (e.g., MidJourney, Stable Diffusion). Your core task is to rewrite user-provided prompts into highly clear, easy-to-render versions.
+    When rewriting, prioritize the following principles:
+    1. Start from the user's prompt, do reasoning step by step to analyze the object or scene they want to generate.
+    2. Focus on describing the final visual appearance of the scene. Clarify elements like the main subject's shape, color, and state.
+    3. If you are confident about what the user wants to generate, directly point it out in your explanation and the final revised prompt.
+    4. If technical concepts are necessary but difficult for ordinary users to understand, translate them into intuitive visual descriptions.
+    5. Ensure the final revised prompt is consistent with the user's intent.
+
+    After receiving the user's prompt that needs rewriting, first explain your reasoning for optimization. Then, output the final revised prompt in the fixed format of "Revised Prompt:
+    ". Where the specific revised content is filled in the next line.
+
+    Prompt:
+  # Keep only the substring after the marker; off-format / empty → original prompt.
+  pe_marker: "Revised Prompt:"
+
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
   project_name: unirl

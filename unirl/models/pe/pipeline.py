@@ -27,12 +27,18 @@ diffusion sub-request unchanged.
 
 from __future__ import annotations
 
+import logging
+from typing import Optional
+
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, _track_with_field
 
 from .bundle import PEBundle
+from .instruction import postprocess_pe_texts
+
+logger = logging.getLogger(__name__)
 
 
 class PEPipeline(Pipeline):
@@ -70,10 +76,23 @@ class PEPipeline(Pipeline):
         *,
         diffusion_pipeline: Pipeline,
         llm_pipeline: Pipeline,
+        pe_instruction: Optional[str] = None,
+        pe_marker: Optional[str] = None,
+        pe_max_chars: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.diffusion_pipeline = diffusion_pipeline
         self.llm_pipeline = llm_pipeline
+        # PE prompt-rewrite knobs, mirroring the sglang ComposedRolloutEngine
+        # (composed/config.py): ``pe_instruction`` is injected as the LLM
+        # child's chat ``system_instruction`` so the rewriter actually enhances
+        # the prompt; ``pe_marker`` (+ optional ``pe_max_chars``) governs the
+        # marker-based extraction of the cleaned rewrite from the LLM output
+        # before it conditions the diffusion child. Both default to ``None``,
+        # which preserves the prior "forward the bare prompt verbatim" behavior.
+        self.pe_instruction = pe_instruction
+        self.pe_marker = pe_marker
+        self.pe_max_chars = pe_max_chars
         # Surfaces the composed bundle so downstream code (training-side
         # weight policies, eval introspection, ...) can reach
         # pe_pipeline.bundle.{diffusion, llm} without duplicating the
@@ -182,6 +201,34 @@ class PEPipeline(Pipeline):
         ar_track = _track_with_field(ar_track, "decoded", rewritten)
         ar_track = _track_with_field(ar_track, "conditions", dict(llm_track.conditions))
 
+        # Optional marker-based PE extraction (mirrors ComposedRolloutEngine,
+        # composed/engine.py): keep only the substring after ``pe_marker`` so the
+        # diffusion child conditions on the cleaned rewrite instead of the LLM's
+        # reasoning preamble; off-format / empty outputs fall back to the original
+        # user prompt. Rewrite ``ar_track.decoded`` in place so wandb / logging and
+        # the diffusion conditioning see the same cleaned text. ``texts.texts`` are
+        # the P original prompts; slot k of the P*N rewrites maps to prompt
+        # ``k // n_rewrites``.
+        if self.pe_marker:
+            cleaned_texts, stats = postprocess_pe_texts(
+                rewritten.texts,
+                user_prompts=texts.texts,
+                samples_per_prompt=n_rewrites,
+                marker=self.pe_marker,
+                max_chars=self.pe_max_chars,
+            )
+            if any(stats.values()):
+                logger.info(
+                    "PEPipeline: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
+                    self.pe_marker,
+                    stats["empty"],
+                    len(rewritten.texts),
+                    stats["truncated"],
+                    stats["fallback"],
+                )
+            rewritten = Texts(texts=cleaned_texts)
+            ar_track = _track_with_field(ar_track, "decoded", rewritten)
+
         # ── Level 2: P*N → P*N*M images. Fork from "ar" (parent_track="ar",
         # parent_ids=rewrite). Replicate each rewrite M× for the 1:1 diffusion
         # child; the rewritten prompt is swapped into primitives["text"].
@@ -227,14 +274,26 @@ class PEPipeline(Pipeline):
 
         Carries the (N-replicated) prompts and the AR sampling params; drops
         sigmas, request_conditions, non-text primitives, and diffusion params.
+
+        Forwards the parent's ``stage_config["chat"]`` and, when
+        ``self.pe_instruction`` is set, injects it as the chat
+        ``system_instruction`` (overwriting any inherited value) so the
+        rewriter enhances the prompt — matching ComposedRolloutEngine
+        (composed/engine.py), which likewise forces ``pe_instruction`` onto the
+        AR/chat ``system_instruction`` so generation always uses the recipe's
+        PE prompt.
         """
+        chat_cfg = dict(req.stage_config.get("chat") or {})
+        if self.pe_instruction:
+            chat_cfg["system_instruction"] = self.pe_instruction
+        stage_config = {"chat": chat_cfg} if chat_cfg else {}
         return RolloutReq(
             sample_ids=list(sample_ids),
             group_ids=list(group_ids),
             primitives={"text": texts},
             request_conditions={},
             sampling_params={"ar": req.sampling_params.get("ar")},
-            stage_config={k: v for k, v in req.stage_config.items() if k in ("chat",)},
+            stage_config=stage_config,
             sigmas=None,
         )
 

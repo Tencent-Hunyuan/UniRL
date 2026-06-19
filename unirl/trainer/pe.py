@@ -97,6 +97,7 @@ class PETrainer(BaseTrainer):
         sync_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = False,
+        pe_cfg: Optional[DictConfig] = None,
         freeze_llm: bool = False,
         diffusion_group_scope: str = "rewrite",
     ) -> None:
@@ -129,6 +130,15 @@ class PETrainer(BaseTrainer):
             raise ValueError(
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
+
+        # PE prompt-rewrite knobs forwarded to the composed PEPipeline (trainside
+        # only — they shape the LLM rewrite + the text the diffusion child sees,
+        # mirroring the sglang ComposedRolloutEngine's pe_instruction / pe_marker).
+        # ``None`` everywhere preserves the prior bare-prompt behavior.
+        pe = pe_cfg if pe_cfg is not None else {}
+        self._pe_instruction = pe.get("pe_instruction", None)
+        self._pe_marker = pe.get("pe_marker", None)
+        self._pe_max_chars = pe.get("pe_max_chars", None)
 
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
@@ -163,6 +173,9 @@ class PETrainer(BaseTrainer):
                     PEPipeline,
                     diffusion_pipeline=self.diffusion.pipeline,
                     llm_pipeline=self.ar.pipeline,
+                    pe_instruction=self._pe_instruction,
+                    pe_marker=self._pe_marker,
+                    pe_max_chars=self._pe_max_chars,
                 )
                 self.rollout = remote(**rollout_parsed, pipeline=self.pe_pipeline)
             else:

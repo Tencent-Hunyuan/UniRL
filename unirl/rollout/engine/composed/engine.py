@@ -20,12 +20,13 @@ forwards each subset to the matching child with the prefix stripped.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.pe.instruction import postprocess_pe_texts
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
@@ -33,34 +34,6 @@ from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, _track_with_field
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_pe_text(raw_text: str, marker: str) -> str:
-    """Return the substring after the LAST occurrence of ``marker``.
-
-    Pre-strips an optional ``<think>...</think>`` reasoning preamble (Qwen3
-    chat output), then takes everything after the last ``marker`` and
-    removes a wrapping pair of quotes. Returns ``""`` when the marker is
-    absent so the caller can fall back to the original user prompt.
-    """
-    text = (raw_text or "").strip()
-    if not text:
-        return ""
-
-    think_close = text.rfind("</think>")
-    if think_close != -1:
-        text = text[think_close + len("</think>") :].strip()
-        if not text:
-            return ""
-
-    marker_idx = text.rfind(marker)
-    if marker_idx == -1:
-        return ""
-
-    pe_text = text[marker_idx + len(marker) :].strip()
-    if len(pe_text) >= 2 and pe_text[0] == pe_text[-1] and pe_text[0] in ('"', "'"):
-        pe_text = pe_text[1:-1].strip()
-    return pe_text
 
 
 class ComposedRolloutEngine(BaseRolloutEngine):
@@ -246,10 +219,12 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         # blank text. ``ar_track.decoded`` is rewritten in place so wandb
         # / logging see the cleaned text.
         if self.cfg.pe_marker:
-            cleaned_texts, stats = self._postprocess_pe_texts(
+            cleaned_texts, stats = postprocess_pe_texts(
                 pe_texts.texts,
                 user_prompts=text_primitive.texts,
                 samples_per_prompt=N,
+                marker=self.cfg.pe_marker,
+                max_chars=self.cfg.pe_max_chars,
             )
             if any(stats.values()):
                 logger.info(
@@ -326,36 +301,6 @@ class ComposedRolloutEngine(BaseRolloutEngine):
                 f"expected one of {sorted(self._child_by_name)}."
             )
         return [child]
-
-    def _postprocess_pe_texts(
-        self,
-        raw_texts: List[str],
-        *,
-        user_prompts: List[str],
-        samples_per_prompt: int,
-    ) -> Tuple[List[str], Dict[str, int]]:
-        """Run marker extraction + truncation + empty-fallback over PE outputs.
-
-        ``raw_texts`` is PE-major over ``[P*N]``; the user prompt for slot
-        ``k`` is ``user_prompts[k // samples_per_prompt]``.
-        """
-        marker = self.cfg.pe_marker
-        max_chars = self.cfg.pe_max_chars
-        cleaned: List[str] = []
-        stats = {"empty": 0, "truncated": 0, "fallback": 0}
-        for k, raw in enumerate(raw_texts):
-            pe = _extract_pe_text(raw, marker)
-            if not pe:
-                stats["empty"] += 1
-            if max_chars is not None and len(pe) > int(max_chars):
-                pe = pe[: int(max_chars)]
-                stats["truncated"] += 1
-            if not pe.strip():
-                idx = k // max(1, samples_per_prompt)
-                pe = user_prompts[idx] if idx < len(user_prompts) else ""
-                stats["fallback"] += 1
-            cleaned.append(pe)
-        return cleaned, stats
 
     # ------------------------------------------------------------------
     # Weight sync — prefix-based demux
