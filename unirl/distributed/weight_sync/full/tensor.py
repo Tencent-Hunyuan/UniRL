@@ -62,6 +62,8 @@ class TensorWeightSync(FullWeightSync):
         all-gathers each shard on every rank in lockstep. Each rank talks to
         its own co-located engine, so no cross-rank gather is needed.
         """
+        import os
+
         import torch
 
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
@@ -71,6 +73,15 @@ class TensorWeightSync(FullWeightSync):
         )
 
         monkey_patch_torch_reductions()
+
+        # CPU-stage opt-in: the colocate handoff defaults to zero-copy CUDA-IPC,
+        # which needs the ``pidfd_getfd`` syscall (kernel >= 5.6). On older kernels
+        # (5.4) ``update_weights_from_tensor`` dies with "does not support the
+        # pidfd_getfd syscall ... for CUDA tensors". Staging the flattened bucket
+        # through CPU (shared-memory transport) avoids CUDA-IPC entirely — a copy +
+        # re-upload per bucket, but it works where IPC can't. Opt in with
+        # ``UNIRL_SYNC_CPU_STAGE=1``.
+        _cpu_stage = os.environ.get("UNIRL_SYNC_CPU_STAGE") == "1"
 
         for bucket, is_last in self._iter_buckets():
             # Group by dtype, one FlattenedTensorBucket per dtype (matches the
@@ -84,8 +95,11 @@ class TensorWeightSync(FullWeightSync):
             serialized = []
             for grouped in by_dtype.values():
                 flat = FlattenedTensorBucket(named_tensors=grouped)
+                flat_t = flat.get_flattened_tensor()
+                if _cpu_stage:
+                    flat_t = flat_t.cpu()
                 payload = {
-                    "flattened_tensor": flat.get_flattened_tensor(),
+                    "flattened_tensor": flat_t,
                     "metadata": flat.get_metadata(),
                 }
                 serialized.append(MultiprocessingSerializer.serialize(payload, output_str=True))
