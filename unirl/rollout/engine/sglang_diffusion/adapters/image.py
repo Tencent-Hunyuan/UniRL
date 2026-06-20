@@ -138,15 +138,21 @@ class ImageAdapter(ModelAdapter):
             if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
-        if initial_noise is not None:
-            kwargs["initial_noise"] = initial_noise
         # Per-step SDE noise key. Keyed on sample_ids (unique per sample) so each
         # sample explores its own per-step SDE noise; the fork keyed on group_ids
         # (same-group samples shared per-step noise). x_T is already per-sample
-        # via the initial_noise injection above, so within-group diversity does
-        # not depend on this; it is a secondary exploration knob.
-        if req.sample_ids:
-            kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
+        # via the initial_noise injection below, so within-group diversity does
+        # not depend on this; it is a secondary exploration knob. GATED on
+        # ``initial_noise``: the driver controls x_T and per-step seeds together
+        # (both are the per-sample group K-vectors the grouped-forward slice patch
+        # must split per output). With DISABLE_DRIVER_XT (initial_noise None) the
+        # engine draws BOTH itself — shipping per-sample ``denoise_seeds`` then
+        # leaves a K-length generator list against a batch_size=1 expanded Req
+        # ("Generator list must have the same length as batch size").
+        if initial_noise is not None:
+            kwargs["initial_noise"] = initial_noise
+            if req.sample_ids:
+                kwargs["denoise_seeds"] = [str(sid) for sid in req.sample_ids]
 
         # Layer 4: the upstream rollout machinery is ALWAYS on — the patched
         # stack returns the per-output-sliced T+1 trajectory + σ echo ONLY via
