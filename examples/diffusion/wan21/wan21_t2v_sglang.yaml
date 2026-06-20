@@ -35,16 +35,19 @@ model_config:
   max_sequence_length: 512
   # SGLang builds its LoRA ServerArgs from these two fields.
   use_lora: true
-  # WAN transformer attention (self attn1 + cross attn2); diffusers naming.
+  # WAN transformer attention LoRA targets — SGLANG NAMING (leaf module names).
+  # sglang's WanAttention (runtime/models/dits/wanvideo.py) has SEPARATE leaf
+  # modules to_q/to_k/to_v/to_out (no qkv fusion) under both self- and cross-attn,
+  # and renames diffusers attn1./attn2./.0 away. sglang wraps LoRA by substring
+  # match ``target in module_name``, so diffusers paths (attn1.to_q) miss the
+  # renamed modules → only 90/240 layers applied → sglang ran ~base → flat curve.
+  # Leaf names match every self+cross projection (2 attns × 4 = 8/block = 240).
+  # The trainside (peft) keeps diffusers paths in backend.lora_cfg.target_modules.
   lora_target_modules:
-    - attn1.to_q
-    - attn1.to_k
-    - attn1.to_v
-    - attn1.to_out.0
-    - attn2.to_q
-    - attn2.to_k
-    - attn2.to_v
-    - attn2.to_out.0
+    - to_q
+    - to_k
+    - to_v
+    - to_out
 
 # Shared SDE strategy; SGLang resolves its sde_label from it.
 strategy:
@@ -118,15 +121,12 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
+    # SGLANG leaf names (see model_config.lora_target_modules above).
     target_modules:
-      - attn1.to_q
-      - attn1.to_k
-      - attn1.to_v
-      - attn1.to_out.0
-      - attn2.to_q
-      - attn2.to_k
-      - attn2.to_v
-      - attn2.to_out.0
+      - to_q
+      - to_k
+      - to_v
+      - to_out
   # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
   model_config: ${model_config}
   strategy: ${strategy}
