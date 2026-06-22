@@ -26,8 +26,8 @@ from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images
 from unirl.types.rollout_req import RolloutReq
+from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
-from unirl.types.trajectory_store import compute_trajectory_positions
 
 logger = logging.getLogger(__name__)
 

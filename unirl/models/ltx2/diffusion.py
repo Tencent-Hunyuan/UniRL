@@ -26,9 +26,8 @@ import torch
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
-from unirl.types.sampling import DiffusionSamplingParams
+from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
-from unirl.types.trajectory_store import compute_trajectory_positions
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import LTX2Bundle
