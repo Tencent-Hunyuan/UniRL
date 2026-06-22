@@ -108,6 +108,15 @@ def _replay_aware_forward(
                 return f(self, **kw)
         raise RuntimeError("_replay_aware_forward: no class-level forward found in the MRO")
 
+    # cuDNN's fused SDPA backward (ScaledDotProductCudnnAttentionBackward0) returns
+    # NaN grads on some bf16 sequences while the forward stays finite (confirmed via
+    # torch.autograd.detect_anomaly): it floods every parameter grad and forces the
+    # optimizer to skip the whole step (~half of them, observed on Qwen3-4B-Base AR
+    # RL). Disable the cuDNN SDPA backend so PyTorch uses the stable flash /
+    # mem-efficient attention kernels for the replay forward.
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
     # Body in autocast (matmul bf16, norms fp32); the caller passes None off-CUDA.
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
