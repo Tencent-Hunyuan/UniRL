@@ -159,27 +159,21 @@ If you find UniRL helpful, please cite:
 If you use DRPO, please also cite:
 
 ```bibtex
-@misc{yao2026drpo,
-  title         = {{Rethinking the Divergence Regularization in LLM RL}},
-  author        = {Jiarui Yao and Xiangxin Zhou and Penghui Qi and Wee Sun Lee and Liefeng Bo and Tianyu Pang},
-  year          = {2026},
-  eprint        = {2606.09821},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2606.09821}
+@article{yao2026rethinking,
+  title={Rethinking the Divergence Regularization in LLM RL},
+  author={Yao, Jiarui and Zhou, Xiangxin and Qi, Penghui and Lee, Wee Sun and Bo, Liefeng and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2606.09821},
+  year={2026}
 }
 ```
 
 If you use Flow-DPPO, please also cite:
 
 ```bibtex
-@misc{ping2026flowdppo,
-  title         = {{Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models}},
-  author        = {Bowen Ping and Xiangxin Zhou and Penghui Qi and Minnan Luo and Liefeng Bo and Tianyu Pang},
-  year          = {2026},
-  eprint        = {2606.11025},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2606.11025}
+@article{ping2026flow,
+  title={Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models},
+  author={Ping, Bowen and Zhou, Xiangxin and Qi, Penghui and Luo, Minnan and Bo, Liefeng and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2606.11025},
+  year={2026}
 }
 ```
