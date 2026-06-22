@@ -78,7 +78,7 @@ dimension; all listed models are supported (✅).
 | Qwen3 | LLM AR | Text → Text | ✅ |
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
-| Bagel | Unified AR + diffusion | Text → Image | ✅ |
+| Bagel | Unified AR + diffusion | Text/ Text + Image → Image | ✅ |
 
 </div>
 
