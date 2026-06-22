@@ -249,6 +249,9 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
+        elif canonical.dim() == 4 and canonical.shape[1] == 1:
+            # Single-frame video layout [C, T=1, H, W] — squeeze to image [C, H, W].
+            per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
         else:
