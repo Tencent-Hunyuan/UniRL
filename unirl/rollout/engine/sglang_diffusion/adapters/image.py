@@ -18,7 +18,7 @@ the model-family branches lifted into overridable methods.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion import utils
@@ -36,6 +36,8 @@ class ImageAdapter(ModelAdapter):
 
     #: RolloutResp track key the segment/decoded/conditions are stored under.
     track_name: str = "image"
+    #: Decoded primitive modality expected from SGLang's untyped ``samples``.
+    decoded_kind: Literal["image", "video"] = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
 
@@ -304,7 +306,7 @@ class ImageAdapter(ModelAdapter):
         )
 
     def build_decoded(self, results: List[RawResult]):
-        return utils.stack_decoded_images(results)
+        return utils.stack_decoded_media(results, kind=self.decoded_kind)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         text_cond, neg_text_cond = utils.fuse_text_conditions(results)

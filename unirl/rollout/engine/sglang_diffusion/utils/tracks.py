@@ -12,7 +12,7 @@ branches (those move to adapter overrides).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -24,7 +24,7 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, Video, Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
@@ -237,9 +237,10 @@ def _native_sde_logp(
 def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
     """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
 
-    4-D (video) samples are dropped with a warning — there is no video reward
-    consumer yet, so packing them as ``Videos`` is deferred (matches the old
-    engine's behavior for every family).
+    This helper is image-semantics only: if an image model's decoder leaves a
+    singleton temporal axis as ``[C, T=1, H, W]``, squeeze it back to
+    ``[C, H, W]``. Multi-frame 4-D samples are still dropped because they cannot
+    be represented as ``Images``.
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -249,8 +250,7 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
-        elif canonical.dim() == 4 and canonical.shape[1] == 1:
-            # Single-frame video layout [C, T=1, H, W] — squeeze to image [C, H, W].
+        elif canonical.dim() == 4 and int(canonical.shape[1]) == 1:
             per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
@@ -260,13 +260,51 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             )
     if skipped_video:
         logger.warning(
-            "SGLang result contained 4D (video) samples — Videos primitive packing "
-            "is not yet implemented in the response translator; dropping. "
-            "Add a Videos branch when a video reward consumer lands."
+            "SGLang result contained multi-frame 4D video samples while decoding "
+            "an image track; dropping samples that cannot be represented as Images."
         )
     if not per_sample_tensors:
         return None
     return Images(pixels=torch.stack(per_sample_tensors, dim=0))
+
+
+def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
+    """Pack per-result decoded ``samples`` into ``Videos``.
+
+    ``decode_sample`` canonicalizes 4-D media to ``[C, T, H, W]``. Under video
+    semantics, ``T=1`` is still a video and must be preserved as such; a 3-D
+    frame is wrapped as a single-frame video.
+    """
+    per_sample_videos: List[Video] = []
+    for result in results:
+        canonical = decode_sample(result.samples)
+        if canonical is None:
+            continue
+        if canonical.dim() == 3:
+            frames = canonical.unsqueeze(0)
+        elif canonical.dim() == 4:
+            frames = canonical.permute(1, 0, 2, 3).contiguous()
+        else:
+            raise RuntimeError(
+                f"stack_decoded_videos: unexpected canonical media rank {canonical.dim()}; want 3 (image) or 4 (video)."
+            )
+        per_sample_videos.append(Video(frames=frames.to(torch.float32)))
+    if not per_sample_videos:
+        return None
+    return Videos.from_list(per_sample_videos)
+
+
+def stack_decoded_media(
+    results: Sequence[RawResult],
+    *,
+    kind: Literal["image", "video"],
+) -> Optional[Images | Videos]:
+    """Translate untyped SGLang decoded samples according to adapter modality."""
+    if kind == "image":
+        return stack_decoded_images(results)
+    if kind == "video":
+        return stack_decoded_videos(results)
+    raise ValueError(f"stack_decoded_media: unknown kind {kind!r}; expected 'image' or 'video'.")
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +439,8 @@ def fuse_text_conditions(
 __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
+    "stack_decoded_media",
     "stack_decoded_images",
+    "stack_decoded_videos",
     "fuse_text_conditions",
 ]

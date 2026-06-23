@@ -22,12 +22,14 @@ from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.video import (
     HunyuanVideoAdapter,
     MochiAdapter,
+    VideoAdapter,
 )
 from unirl.rollout.engine.sglang_diffusion.adapters.z_image import ZImageAdapter
 
 __all__ = [
     "ModelAdapter",
     "ImageAdapter",
+    "VideoAdapter",
     "get_adapter",
     "register_adapter",
     "registered_adapters",
