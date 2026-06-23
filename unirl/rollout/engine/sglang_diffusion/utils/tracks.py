@@ -21,11 +21,10 @@ from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
     decode_sample,
     fuse_encoder_outputs,
-    tensorize,
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images, Video, Videos
+from unirl.types.primitives import Images
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
@@ -235,13 +234,17 @@ def _native_sde_logp(
 # ---------------------------------------------------------------------------
 
 
-def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
+def stack_decoded_images(
+    results: Sequence[RawResult],
+    *,
+    squeeze_single_frame_4d: bool = True,
+) -> Optional[Images]:
     """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
 
-    This helper is image-semantics only: if an image model's decoder leaves a
-    singleton temporal axis as ``[C, T=1, H, W]``, squeeze it back to
-    ``[C, H, W]``. Multi-frame 4-D samples are still dropped because they cannot
-    be represented as ``Images``.
+    Image-output adapters may opt into squeezing a singleton temporal axis
+    ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
+    run through the legacy image path should disable this so a true single-frame
+    video is dropped like any other 4-D video sample.
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -251,7 +254,7 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
-        elif canonical.dim() == 4 and int(canonical.shape[1]) == 1:
+        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
             per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
@@ -267,86 +270,6 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
     if not per_sample_tensors:
         return None
     return Images(pixels=torch.stack(per_sample_tensors, dim=0))
-
-
-def _video_frames_from_4d(sample: torch.Tensor, *, expected_num_frames: Optional[int]) -> torch.Tensor:
-    """Normalize one 4-D decoded video tensor to ``[T, C, H, W]``."""
-    expected = int(expected_num_frames) if expected_num_frames is not None else None
-    shape = tuple(int(v) for v in sample.shape)
-    candidates: List[Tuple[str, torch.Tensor]] = []
-
-    if sample.shape[0] in (1, 3, 4) and (expected is None or int(sample.shape[1]) == expected):
-        candidates.append(("[C,T,H,W]", sample.permute(1, 0, 2, 3).contiguous()))
-    if sample.shape[1] in (1, 3, 4) and (expected is None or int(sample.shape[0]) == expected):
-        candidates.append(("[T,C,H,W]", sample.contiguous()))
-    if sample.shape[-1] in (1, 3, 4) and (expected is None or int(sample.shape[0]) == expected):
-        candidates.append(("[T,H,W,C]", sample.permute(0, 3, 1, 2).contiguous()))
-
-    if len(candidates) == 1:
-        return candidates[0][1]
-    if candidates:
-        layouts = ", ".join(name for name, _ in candidates)
-        raise RuntimeError(
-            f"stack_decoded_videos: ambiguous 4D video layout shape={shape}; "
-            f"matches {layouts}. Provide a layout-preserving SGLang sample or avoid "
-            f"ambiguous frame/channel sizes."
-        )
-    raise RuntimeError(
-        f"stack_decoded_videos: unrecognized 4D video layout shape={shape}; "
-        f"expected one of [C,T,H,W], [T,C,H,W], or [T,H,W,C]"
-        + (f" with T={expected}." if expected is not None else ".")
-    )
-
-
-def _decode_video_sample(sample: object, *, expected_num_frames: Optional[int]) -> Optional[torch.Tensor]:
-    """Decode one untyped SGLang media payload to video frames ``[T, C, H, W]``."""
-    if isinstance(sample, tuple) and len(sample) == 2:
-        sample = sample[0]
-    sample_tensor = tensorize(sample)
-    if sample_tensor is None:
-        return None
-    sample_tensor = sample_tensor.detach().cpu()
-    if sample_tensor.dim() == 3:
-        canonical_frame = decode_sample(sample)
-        if canonical_frame is None:
-            return None
-        if canonical_frame.dim() != 3:
-            raise RuntimeError(
-                f"stack_decoded_videos: unexpected canonical frame rank {canonical_frame.dim()}; want 3."
-            )
-        frames = canonical_frame.unsqueeze(0)
-    elif sample_tensor.dim() == 4:
-        frames = _video_frames_from_4d(sample_tensor, expected_num_frames=expected_num_frames)
-    else:
-        raise RuntimeError(
-            f"stack_decoded_videos: unexpected media rank {sample_tensor.dim()}; want 3 (frame) or 4 (video)."
-        )
-    if frames.is_floating_point():
-        frames = frames.clamp(0.0, 1.0)
-    return frames
-
-
-def stack_decoded_videos(
-    results: Sequence[RawResult],
-    *,
-    expected_num_frames: Optional[int],
-) -> Optional[Videos]:
-    """Pack per-result decoded ``samples`` into ``Videos``.
-
-    Under video semantics, ``T=1`` is still a video and must be preserved as
-    such; a 3-D frame is wrapped as a single-frame video. ``expected_num_frames``
-    disambiguates channel/frame axes for small ``T`` without relying on the
-    generic image/video layout heuristic in ``decode_sample``.
-    """
-    per_sample_videos: List[Video] = []
-    for result in results:
-        frames = _decode_video_sample(result.samples, expected_num_frames=expected_num_frames)
-        if frames is None:
-            continue
-        per_sample_videos.append(Video(frames=frames.to(torch.float32)))
-    if not per_sample_videos:
-        return None
-    return Videos.from_list(per_sample_videos)
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +405,5 @@ __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
     "stack_decoded_images",
-    "stack_decoded_videos",
     "fuse_text_conditions",
 ]
