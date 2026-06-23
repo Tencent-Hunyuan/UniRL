@@ -20,7 +20,6 @@ class VideoAdapter(ImageAdapter):
     """
 
     track_name: str = "video"
-    decoded_kind = "video"
     segment_factory = staticmethod(make_video_segment)
 
     def build_segment(
@@ -48,10 +47,19 @@ class VideoAdapter(ImageAdapter):
             segment_factory=self.segment_factory,
         )
 
+    def build_decoded(self, req: RolloutReq, results: List[RawResult]):
+        diffusion = req.sampling_params.get("diffusion")
+        expected_num_frames = int(diffusion.num_frames) if diffusion is not None else None
+        return utils.stack_decoded_videos(results, expected_num_frames=expected_num_frames)
+
 
 @register_adapter("mochi")
-class MochiAdapter(VideoAdapter):
-    """Mochi video adapter."""
+class MochiAdapter(ImageAdapter):
+    """Mochi placeholder.
+
+    There is no in-repo Mochi bundle/recipe yet, so keep the legacy image-path
+    parity behavior until a verified video implementation lands.
+    """
 
     pass
 
