@@ -262,11 +262,28 @@ class BaseFSDP2Backend(Remote):
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 
         if not math.isfinite(grad_norm):
+            # On a skipped step (already discarded), pinpoint which params carry the
+            # non-finite grad (sharded DTensor -> check the local shard) so the
+            # offending module is identifiable from the log. Runs only on this skip
+            # path, so it adds nothing to healthy steps.
+            bad_params = []
+            total_with_grad = 0
+            for _name, _p in self.model.named_parameters():
+                if _p.grad is None:
+                    continue
+                total_with_grad += 1
+                _gl = _p.grad.to_local() if hasattr(_p.grad, "to_local") else _p.grad
+                if _gl.numel() and not bool(torch.isfinite(_gl).all()):
+                    bad_params.append(_name)
             logger.warning(
-                "%s.optimizer_step: non-finite grad norm (%s) at step %d; skipping step.",
+                "%s.optimizer_step: non-finite grad norm (%s) at step %d; skipping step. "
+                "%d/%d grad-params non-finite; first: %s",
                 type(self).__name__,
                 grad_norm,
                 self._optimizer_step_count,
+                len(bad_params),
+                total_with_grad,
+                bad_params[:12],
             )
             self.optimizer.zero_grad(set_to_none=True)
             return grad_norm
