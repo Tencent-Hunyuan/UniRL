@@ -234,12 +234,17 @@ def _native_sde_logp(
 # ---------------------------------------------------------------------------
 
 
-def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
+def stack_decoded_images(
+    results: Sequence[RawResult],
+    *,
+    squeeze_single_frame_4d: bool = True,
+) -> Optional[Images]:
     """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
 
-    4-D (video) samples are dropped with a warning — there is no video reward
-    consumer yet, so packing them as ``Videos`` is deferred (matches the old
-    engine's behavior for every family).
+    Image-output adapters may opt into squeezing a singleton temporal axis
+    ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
+    run through the legacy image path should disable this so a true single-frame
+    video is dropped like any other 4-D video sample.
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -249,6 +254,8 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
+        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
+            per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
         else:
@@ -257,9 +264,8 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             )
     if skipped_video:
         logger.warning(
-            "SGLang result contained 4D (video) samples — Videos primitive packing "
-            "is not yet implemented in the response translator; dropping. "
-            "Add a Videos branch when a video reward consumer lands."
+            "SGLang result contained multi-frame 4D video samples while decoding "
+            "an image track; dropping samples that cannot be represented as Images."
         )
     if not per_sample_tensors:
         return None
