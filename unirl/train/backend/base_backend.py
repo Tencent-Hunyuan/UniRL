@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -354,11 +354,10 @@ class BaseFSDP2Backend(Remote):
         The optimizer gather is per-backend (DCP get-state for torch-native
         FSDP, plain ``state_dict()`` for VeOmni) via :meth:`_gather_optimizer_state`.
         """
+        self._reject_meta(operation="save", checkpoint_format="torch", mode=mode)
         if mode == "adapter":
-            self._reject_lora_meta_params("save")
             policy_state = gather_lora_state_dict(self.model)
         else:
-            self._reject_meta_params("save")
             policy_state = gather_state_dict(self.model)
         optimizer_state = self._gather_optimizer_state()
         state: Dict[str, object] = {
@@ -390,11 +389,7 @@ class BaseFSDP2Backend(Remote):
         """
         import torch.distributed.checkpoint as dcp
 
-        # Frozen aux (vae / vit) on meta is expected and dropped below; a
-        # *trainable* param on meta means materialize missed it, and dropping it
-        # would write a checkpoint missing weights with no error. is_meta alone
-        # can't tell the two apart, but requires_grad can — so fail fast here.
-        self._reject_trainable_meta_params("save")
+        self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
         os.makedirs(path, exist_ok=True)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
@@ -479,11 +474,9 @@ class BaseFSDP2Backend(Remote):
         """
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        strict = checkpoint.get("save_mode", "full") == "full"
-        if strict:
-            self._reject_meta_params("load")
-        else:
-            self._reject_lora_meta_params("load")
+        mode = checkpoint.get("save_mode", "full")
+        strict = mode == "full"
+        self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
         load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
@@ -511,12 +504,7 @@ class BaseFSDP2Backend(Remote):
         meta_path = os.path.join(path, "metadata.pt")
         meta: Dict[str, object] = torch.load(meta_path, map_location="cpu")
         mode = str(meta.get("save_mode", "full"))
-        # Symmetric with _save_dcp: a trainable param on meta would be dropped by
-        # drop_meta_entries below and then left unresolved by the non-strict load
-        # (has_meta_params relaxes strict), silently keeping its pre-load weights.
-        # Reject it here; the remaining meta is the frozen aux that legitimately
-        # relaxes strict.
-        self._reject_trainable_meta_params("load")
+        self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
@@ -537,50 +525,57 @@ class BaseFSDP2Backend(Remote):
             self._optimizer_step_count = int(meta["optimizer_step_count"])
         return int(meta.get("step") or 0)
 
-    def _reject_meta_params(self, op: str) -> None:
-        """Fail fast on never-materialized params (meta-init bundles, e.g. hi3 80B).
+    def _reject_meta(
+        self,
+        *,
+        operation: Literal["save", "load"],
+        checkpoint_format: Literal["torch", "dcp"],
+        mode: str,
+    ) -> None:
+        """Single materialization guard for every checkpoint save/load path.
 
-        Their frozen aux (vae / vit) stays on meta and a full-state-dict gather
-        would die deep inside DCP ("Cannot copy out of meta tensor"). Same
-        verdict on every rank, so raising here is collective-safe. Only the
-        legacy "torch" path needs this — the sharded "dcp" path drops meta keys
-        (they carry no data) instead of gathering them.
+        Args (keyword-only):
+            operation: the calling operation, for the error message ("save" / "load").
+            checkpoint_format: the storage format ("torch" full-gather / "dcp" sharded).
+            mode: the save mode read from the request / checkpoint ("full" / "adapter").
+
+        Raises if a param this ``(checkpoint_format, mode)`` path is responsible
+        for is still on meta. The dispatch below is the single source of truth, so
+        the guard cannot drift from the matching ``_save_*`` / ``_load_*`` (the bug
+        class behind the earlier duplicate / wrong-mode / missing checks). The
+        verdict is a pure function of model structure, identical on every rank, so
+        raising is collective-safe.
+
+        Responsibility by ``(checkpoint_format, mode)``:
+
+        - ``adapter`` (either format): every LoRA param — the trainable
+          ``default`` AND the frozen EMA ``old`` / shadow adapter, both of which
+          ride in the adapter checkpoint.
+        - ``full`` + ``"dcp"``: trainable params only. This is "what must not be
+          silently dropped", NOT "everything persisted": ``_save_dcp`` writes
+          every non-meta entry but ``drop_meta_entries`` drops the frozen aux.
+          Frozen-but-owned state (full-EMA mirror params, a frozen shadow LoRA
+          under full mode) is intentionally not guarded here — see
+          ``docs/dcp_checkpoint_impl.md``.
+        - ``full`` + ``"torch"``: every param — the rank-0 gather encodes the
+          whole model (frozen aux included) and cannot represent meta.
         """
-        meta = [name for name, p in self.model.named_parameters() if p.is_meta]
-        if meta:
-            raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} params are on meta (e.g. {meta[:3]}); "
-                "full-state-dict checkpointing of meta-init bundles is not supported under "
-                "checkpoint_format='torch' (use 'dcp')."
+        named = list(self.model.named_parameters())
+        if mode == "adapter":
+            meta = [n for n, p in named if p.is_meta and ("lora_A" in n or "lora_B" in n)]
+            why = "adapter checkpointing requires materialized LoRA params"
+        elif checkpoint_format == "dcp":
+            meta = [n for n, p in named if p.is_meta and p.requires_grad]
+            why = "trainable params on meta would be silently dropped from the DCP checkpoint (materialize missed them)"
+        else:  # full + torch
+            meta = [n for n, p in named if p.is_meta]
+            why = (
+                "full-state-dict checkpointing of meta-init bundles is not supported "
+                "under checkpoint_format='torch' (use 'dcp')"
             )
-
-    def _reject_trainable_meta_params(self, op: str) -> None:
-        """Fail fast on *trainable* params left on meta (the sharded "dcp" path).
-
-        Both DCP save and load drop every meta entry, which is correct for the
-        frozen aux (vae / vit) that meta-init bundles never materialize. But a param that is
-        ``requires_grad`` AND on meta is a materialize bug, not aux — dropping it
-        would silently produce a checkpoint missing trained weights. ``requires_grad``
-        is what tells the two apart, so this guard rejects only the former and
-        leaves the frozen aux to ``drop_meta_entries``. Same verdict on every rank.
-        """
-        meta = [name for name, param in self.model.named_parameters() if param.requires_grad and param.is_meta]
         if meta:
             raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} trainable params are on meta (e.g. {meta[:3]}); "
-                "they would be silently dropped from the DCP checkpoint (materialize missed them)."
-            )
-
-    def _reject_lora_meta_params(self, op: str) -> None:
-        meta = [
-            name
-            for name, param in self.model.named_parameters()
-            if param.is_meta and ("lora_A" in name or "lora_B" in name)
-        ]
-        if meta:
-            raise RuntimeError(
-                f"{type(self).__name__}.{op}: {len(meta)} LoRA params are on meta (e.g. {meta[:3]}); "
-                "adapter checkpointing requires materialized LoRA params."
+                f"{type(self).__name__}.{operation}: {len(meta)} params on meta (e.g. {meta[:3]}); {why}."
             )
 
     # ------------------------------------------------------------------
