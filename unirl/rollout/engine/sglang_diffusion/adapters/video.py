@@ -17,16 +17,12 @@ class MochiAdapter(ImageAdapter):
 
     squeeze_single_frame_4d = False
 
-    pass
-
 
 @register_adapter("hunyuan_video")
 class HunyuanVideoAdapter(ImageAdapter):
     """HunyuanVideo — legacy image-path parity until verified video output lands."""
 
     squeeze_single_frame_4d = False
-
-    pass
 
 
 __all__ = ["MochiAdapter", "HunyuanVideoAdapter"]
