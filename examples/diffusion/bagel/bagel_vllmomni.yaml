@@ -41,12 +41,12 @@ workers_per_device: 1
 weight_sync_interval: 1
 
 logging:
-  report_to_wandb: true
-  project_name: bagel-pickscore-lora
-  run_name: unirl_main_bagel_pickscore_lora_bs16_g16_cfg1_u2_vllmomni
-  entity: gxhe-rl
-  tags: [bagel, pickscore, lora, vllmomni, cfg1, official-bagel, rl_ops, fp32master]
-
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+  
 bundle:
   _target_: unirl.models.bagel.bundle.BagelBundle.from_config
   config:
