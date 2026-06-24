@@ -17,12 +17,12 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
-from unirl.rollout.engine.vllm_omni.pipelines._shared.bagel_flow_match_sde_scheduler import (
-    BagelFlowSDEScheduler,
-)
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
     resolve_request_noise,
+)
+from unirl.rollout.engine.vllm_omni.pipelines.bagel.bagel_flow_match_sde_scheduler import (
+    BagelFlowSDEScheduler,
 )
 from unirl.utils.dtypes import parse_torch_dtype
 

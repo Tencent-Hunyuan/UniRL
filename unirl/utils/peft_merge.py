@@ -181,7 +181,7 @@ def extract_lora_tensors(
     load-bearing under ``master_dtype=fp32`` (the reward-collapse fix): the
     trainable LoRA params live in fp32, but the rollout engine's vLLM punica
     kernel hard-asserts bf16/fp16 — so the caller passes the FSDP compute dtype
-    (``backend.wire_dtype``) and the all-gather also moves half the bytes.
+    (``backend.weight_sync_dtype``) and the all-gather also moves half the bytes.
     ``None`` keeps each tensor's own dtype (the prior all-bf16-master behavior).
     """
     result: dict[str, torch.Tensor] = {}
@@ -212,7 +212,7 @@ def extract_lora_tensors(
         raise RuntimeError(
             f"extract_lora_tensors: {len(_bad_dtype)} LoRA tensor(s) have "
             f"unsupported dtype for vllm punica kernel (expected bf16/fp16). "
-            f"Sample: [{sample}]. Pass dtype=backend.wire_dtype (or check FSDP "
+            f"Sample: [{sample}]. Pass dtype=backend.weight_sync_dtype (or check FSDP "
             f"MixedPrecisionPolicy.param_dtype)."
         )
 
