@@ -76,9 +76,7 @@ class FSDPBackend(BaseFSDP2Backend):
         # (the reward-collapse fix), but the rollout engine's vLLM punica kernel
         # hard-asserts bf16/fp16 — so LoRA extraction casts to this dtype at the
         # all-gather (also halves sync bandwidth). Read via the ``wire_dtype`` property.
-        self._wire_dtype: torch.dtype = parse_torch_dtype(
-            fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
-        )
+        self._wire_dtype: torch.dtype = parse_torch_dtype(fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype")
 
         model = resolve_trainable_module(bundle, trainable_attr)
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)

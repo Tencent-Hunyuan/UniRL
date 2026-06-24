@@ -146,9 +146,7 @@ class BagelFlowSDEScheduler:
         if eta < 0.0:
             raise ValueError(f"BagelFlowSDEScheduler.set_for_request: eta must be >= 0; got {eta!r}.")
         self._eta = float(eta)
-        self._sde_indices_set = (
-            frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
-        )
+        self._sde_indices_set = frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
         if sigma_max is not None:
             self._sigma_max = float(sigma_max)
         self._trajectory_dtype = trajectory_dtype

@@ -45,9 +45,7 @@ def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: st
 
     model = backend.model
     wire_dtype = getattr(backend, "wire_dtype", None)
-    lora_tensors = extract_lora_tensors(
-        model, param_prefix=param_prefix, adapter_name=adapter_name, dtype=wire_dtype
-    )
+    lora_tensors = extract_lora_tensors(model, param_prefix=param_prefix, adapter_name=adapter_name, dtype=wire_dtype)
     peft_config = _peft_config_dict(model, adapter_name)
     return lora_tensors, peft_config
 

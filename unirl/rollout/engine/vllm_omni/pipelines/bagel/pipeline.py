@@ -159,8 +159,7 @@ class RLBagelPipeline(BagelPipeline):
                 ref = out.get("packed_init_noises")
                 if ref is None:
                     raise RuntimeError(
-                        "RLBagelPipeline noise tap: prepare_vae_latent returned no "
-                        "'packed_init_noises' to override."
+                        "RLBagelPipeline noise tap: prepare_vae_latent returned no 'packed_init_noises' to override."
                     )
                 # Driver x_T is [1, seq, C]; packed_init_noises is unbatched [seq, C].
                 # Squeeze the leading 1 and validate the packed geometry matches.
@@ -208,9 +207,7 @@ class RLBagelPipeline(BagelPipeline):
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
         """This request's driver-authored x_T (batch slice or recipe row)."""
-        self._pending_initial_noise = resolve_request_noise(
-            req, caller="RLBagelPipeline._arm_initial_noise"
-        )
+        self._pending_initial_noise = resolve_request_noise(req, caller="RLBagelPipeline._arm_initial_noise")
 
     # ------------------------------------------------------------------ #
     # harvest — export onto the wire

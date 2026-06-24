@@ -46,7 +46,7 @@ logging:
   run_name: null
   entity: null
   tags: null
-  
+
 bundle:
   _target_: unirl.models.bagel.bundle.BagelBundle.from_config
   config:

@@ -47,7 +47,12 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
-from unirl.rollout.engine.vllm_omni.utils import build_image_segment, collect_dit_outputs, pils_to_images, texts_from_req
+from unirl.rollout.engine.vllm_omni.utils import (
+    build_image_segment,
+    collect_dit_outputs,
+    pils_to_images,
+    texts_from_req,
+)
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_req
 from unirl.sde.runtime import FlowMatchSchedulePolicy
@@ -129,9 +134,7 @@ class BagelInputAdapter(DitInputAdapter):
         if traj_prec is not None:
             extra_args["trajectory_precision"] = str(traj_prec)
 
-        pack_initial_noise_extra_args(
-            extra_args, req, diff_params, n_prompts=len(texts.texts), caller=self.modality
-        )
+        pack_initial_noise_extra_args(extra_args, req, diff_params, n_prompts=len(texts.texts), caller=self.modality)
         diff_kwargs["extra_args"] = extra_args
 
         return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]
