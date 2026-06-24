@@ -9,7 +9,9 @@ pushes too aggressively in the reward-improving direction.
 - **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`_gaussian_kl_div`, `_flowdppo_kl_adv_loss`, `FlowDPPO`)
 - **SDE / replay path:** [`unirl/models/sd3/diffusion.py`](../unirl/models/sd3/diffusion.py), [`unirl/sde/kernels.py`](../unirl/sde/kernels.py)
 - **Recipe:** [`examples/diffusion/sd3/sd3_flowdppo.yaml`](../examples/diffusion/sd3/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
-- **Checkpoints:** [🤗 FlowDPPO](https://huggingface.co/Eculid/sd3.5-flowdppo)
+- **Checkpoints:**
+  - [🤗 Eculid/sd3.5-flowdppo](https://huggingface.co/Eculid/sd3.5-flowdppo) — SD3.5-medium, full weights (community run)
+  - [🤗 Tencent-Hunyuan-Multimodal-RL](https://huggingface.co/Tencent-Hunyuan-Multimodal-RL) — official GenEval2 LoRA adapters (single- & multi-reward) on SD3.5-medium and FLUX.2-klein-base-9B
 - **Paper:** *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models."*
 
 FlowDPPO builds on the same GRPO-style SDE rollout, trained-step gating, and
@@ -154,8 +156,8 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_flowdppo num_dev
 
 ![FlowDPPO training curve: rollout/reward_mean for SD3.5-medium rises from ~0.75 to ~0.89 over ~270 rollout steps.](../assets/flowdppo_wandb.png)
 
-A healthy run climbs `rollout/reward_mean` quickly and then keeps inching up — here
-SD3.5-medium goes from ~0.75 to ~0.89 over ~270 steps.
+A healthy run climbs `rollout/reward_mean` quickly and then keeps inching up — the
+curve above is the **SD3.5-medium** run, going from ~0.75 to ~0.89 over ~270 steps.
 
 ## Related tutorial
 
