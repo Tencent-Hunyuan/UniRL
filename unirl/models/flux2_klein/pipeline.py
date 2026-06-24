@@ -276,9 +276,7 @@ class Flux2KleinPipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(req.group_ids))
 
-        klein_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        klein_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         # Image-edit conditioning: when the request carries a source image
         # (primitives["image"], role="condition" in the data), VAE-encode it

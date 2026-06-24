@@ -117,9 +117,7 @@ def draft_generate(
     # Text encoders are frozen — keep their (large, e.g. T5-XXL) forward graph out
     # of the DRaFT backward; the transformer still gets grad via the latents.
     with torch.no_grad():
-        conditions = pipeline.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        conditions = pipeline.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
     shift = float(getattr(model_config, "shift", 3.0))
     schedule = get_sigma_schedule(int(params.num_inference_steps), shift=shift, device=device)
@@ -137,8 +135,12 @@ def draft_generate(
     )
 
     seg = draft_k_sample(
-        diffusion, conditions,
-        schedule=schedule, params=params, draft_num_steps=draft_num_steps, initial_latents=latents,
+        diffusion,
+        conditions,
+        schedule=schedule,
+        params=params,
+        draft_num_steps=draft_num_steps,
+        initial_latents=latents,
     )
     return pipeline.vae_decode.decode(seg, grad=True, activation_checkpoint=activation_checkpoint)
 

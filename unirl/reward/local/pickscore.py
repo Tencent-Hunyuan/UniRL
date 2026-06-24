@@ -63,9 +63,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
             else nn.Identity()
         )
         crop = T.CenterCrop(_get_size(ip_cfg.get("crop_size"))) if ip_cfg.get("do_center_crop") else nn.Identity()
-        normalise = (
-            T.Normalize(mean=ip.image_mean, std=ip.image_std) if ip_cfg.get("do_normalize") else nn.Identity()
-        )
+        normalise = T.Normalize(mean=ip.image_mean, std=ip.image_std) if ip_cfg.get("do_normalize") else nn.Identity()
         self._clip_tform = T.Compose([resize, crop, normalise])
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:

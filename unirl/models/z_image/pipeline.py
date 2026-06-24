@@ -224,9 +224,7 @@ class ZImagePipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
 
-        z_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        z_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

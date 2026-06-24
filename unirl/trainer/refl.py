@@ -66,12 +66,13 @@ class RewardBackpropTrainer(BaseTrainer):
 
         pdp, rdp = self.policy.dp_size, self.reward.dp_size
         if self.batch_size % pdp or self.batch_size % rdp:
-            raise ValueError(
-                f"batch_size={self.batch_size} must be divisible by policy dp={pdp} and reward dp={rdp}"
-            )
+            raise ValueError(f"batch_size={self.batch_size} must be divisible by policy dp={pdp} and reward dp={rdp}")
         logger.info(
             "RewardBackpropTrainer ready: policy dp=%d reward dp=%d batch=%d max_grad_norm=%.2f",
-            pdp, rdp, self.batch_size, self.max_grad_norm,
+            pdp,
+            rdp,
+            self.batch_size,
+            self.max_grad_norm,
         )
 
     def train_step(self, prompts: Texts, *, rollout_id: int) -> Tuple[float, float, float]:
@@ -110,7 +111,11 @@ class RewardBackpropTrainer(BaseTrainer):
                 mean_reward, grad_norm, dt = self.train_step(prompts, rollout_id=rollout_id)
                 logger.info(
                     "rollout %d/%d  reward=%.4f grad_norm=%.4f  %.1fs",
-                    rollout_id + 1, num_rollouts, mean_reward, grad_norm, dt,
+                    rollout_id + 1,
+                    num_rollouts,
+                    mean_reward,
+                    grad_norm,
+                    dt,
                 )
                 self.wandb_logger.log_step(
                     rollout_id + 1,
@@ -123,8 +128,11 @@ class RewardBackpropTrainer(BaseTrainer):
                     prefix="",
                 )
                 self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts,
-                    save_interval=save_interval, save_dir=save_dir, save_mode=save_mode,
+                    rollout_id,
+                    num_rollouts,
+                    save_interval=save_interval,
+                    save_dir=save_dir,
+                    save_mode=save_mode,
                 )
         finally:
             self._finish_wandb()

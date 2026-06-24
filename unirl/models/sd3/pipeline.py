@@ -184,9 +184,7 @@ class SD3Pipeline(Pipeline):
         # trained against, drifting the GRPO rollout/replay log-prob ratio off 1.0.
         # SD3's CLIP+CLIP+T5 tokenize "" cleanly (unlike Qwen's " "). This conditioning
         # (incl. that default) is shared with the ReFL draft path via build_conditions.
-        sd3_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        sd3_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

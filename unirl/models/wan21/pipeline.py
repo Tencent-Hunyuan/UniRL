@@ -207,9 +207,7 @@ class WAN21Pipeline(Pipeline):
 
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
-        wan_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        wan_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         image_latent_cond: Optional[ImageLatentCondition] = None
         image_embed_cond: Optional[ImageEmbedCondition] = None

@@ -275,9 +275,7 @@ class QwenImagePipeline(Pipeline):
                 "recipes encode in the rollout engine; trainside rollout "
                 "requires load_text_encoder=True."
             )
-        qwen_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        qwen_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

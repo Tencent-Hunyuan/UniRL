@@ -15,10 +15,10 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.types.primitives import Images, Texts
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.rollout_req import PrimitiveValue, RolloutReq
 from unirl.types.rollout_resp import RolloutTrack, _track_with_field
-from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import total_samples_per_prompt
 
 from .base import DifferentiableReward, RewardBackend

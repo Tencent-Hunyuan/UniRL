@@ -77,11 +77,7 @@ class ReFLPolicy(Remote):
         torch.cuda.set_device(self.device)
         # Default PG over the policy role's workers (env:// from Remote.setup's
         # dist_env); FSDP2 fully_shard (mode=full) wraps over it. Phase-0-validated.
-        if (
-            self.rank_info is not None
-            and int(self.rank_info.world_size) > 1
-            and not dist.is_initialized()
-        ):
+        if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
         try:
@@ -108,8 +104,12 @@ class ReFLPolicy(Remote):
         )
         logger.info(
             "ReFLPolicy initialized: pipeline=%s draft_num_steps=%d nfe=%d guidance=%.2f res=%dx%d",
-            self._pipeline_target, self.draft_num_steps, self.num_inference_steps,
-            self.guidance_scale, self.height, self.width,
+            self._pipeline_target,
+            self.draft_num_steps,
+            self.num_inference_steps,
+            self.guidance_scale,
+            self.height,
+            self.width,
         )
 
     # ------------------------------------------------------------------

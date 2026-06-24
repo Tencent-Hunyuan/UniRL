@@ -288,9 +288,7 @@ class HunyuanVideo15Pipeline(Pipeline):
 
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
-        hv_conds = self.build_conditions(
-            texts, negatives=negatives, guidance_scale=float(params.guidance_scale)
-        )
+        hv_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 
