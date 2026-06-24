@@ -1,34 +1,8 @@
 """BagelPipeline — RolloutReq → RolloutResp end-to-end for BAGEL-7B-MoT (T2I).
 
-Four-tier flow, per-sample (navit ``bs=1``)::
-
-    Texts ─build 3 KV contexts─▶ BagelDiffusionConditions ─diffuse─▶ LatentSegment ─vae_decode─▶ Images
-
-Per prompt the pipeline builds the three KV-cache contexts the sampler needs
-(mirroring ``InterleaveInferencer.interleave_inference`` for plain T2I, ``think=False``,
-no input image):
-
-- ``gen``      = init + text(prompt)          (conditional)
-- ``cfg_text`` = init snapshot before the text (unconditional / text-CFG)
-- ``cfg_img``  = init + text(prompt)          (== gen for pure T2I)
-
-then runs ``diffusion.diffuse`` once per sample, accumulates the per-sample latents
-into one batched ``LatentSegment``, decodes them, and packs one ``"image"`` track.
-
-Central-runtime contract (same as SD3 — NOT a flow_grpo port):
-
-- **σ schedule**: the hosting engine pins ``req.sigmas`` via
-  :func:`unirl.sde.runtime.ensure_req_sigmas` (built from :meth:`build_schedule_policy`)
-  BEFORE ``generate``; this pipeline reads it verbatim and passes it to ``diffuse``.
-- **initial noise x_T**: driver-authored via :class:`NoiseRecipe` (per-sample,
-  ``r{rollout_id}:{sample_id}``-keyed, byte-identical across engines). The pipeline
-  resolves it from the request and hands each sample its slice; :meth:`latent_shape`
-  declares the packed ``(seq, C)`` geometry so the driver can author the recipe.
-- **SDE steps**: ``params.sde_indices`` (driver-resolved via
-  ``resolve_sde_indices`` → ``AllSDEScheduler``); shared per rollout across the group.
-
-``BagelBundle`` is imported lazily (it pulls the vendored modeling + flash_attn);
-this keeps ``BagelPipeline`` importable on CPU for fake-stage tests.
+Per prompt builds the three KV contexts, runs ``diffusion.diffuse``, batches the
+per-sample latents, decodes, and packs one ``"image"`` track. Schedule/x_T/SDE steps
+come from the central runtime (same contract as SD3). ``BagelBundle`` imported lazily.
 """
 
 from __future__ import annotations
@@ -98,19 +72,13 @@ class BagelPipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
         self.autocast_precision = autocast_precision
-        # FlowMatch time-shift for the σ schedule policy (read by the hosting engine
-        # via build_schedule_policy → ensure_req_sigmas). Bagel uses static shift.
+        # FlowMatch time-shift for the σ schedule policy (Bagel uses static shift).
         self.shift = shift
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
-        """Packed per-sample x_T shape ``(seq, p²·z)`` for the driver NoiseRecipe.
-
-        Bagel's x_T is packed navit ``[h·w, p²·z]`` (the ``packed_init_noises`` shape),
-        NOT spatial ``[C, H, W]``; ``seq = (H // (vae_downsample·patch))²`` for a square
-        image. Returning a concrete shape (rather than raising) opts Bagel into the
-        driver-authored, cross-engine-reproducible x_T recipe (same as SD3).
-        """
+        """Packed per-sample x_T shape ``(seq, p²·z)`` for the driver NoiseRecipe
+        (Bagel's x_T is packed navit ``[h·w, p²·z]``, not spatial ``[C, H, W]``)."""
         cfg = _cfg_get(model_config, "config", model_config)
         patch = int(_cfg_get(cfg, "latent_patch_size", 2))
         vae_ds = int(_cfg_get(cfg, "vae_downsample", 8))
@@ -119,12 +87,7 @@ class BagelPipeline(Pipeline):
         return bagel_latent_shape((H, W), latent_downsample=vae_ds * patch, latent_patch_size=patch, latent_channels=z)
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
-        """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting).
-
-        The hosting engine calls this once and pins ``req.sigmas`` via
-        ``ensure_req_sigmas``; ``get_sigma_schedule(num_inference_steps, shift)`` then
-        produces the byte-identical schedule the (former) ``bagel_timesteps`` did.
-        """
+        """Static-shift FlowMatch σ policy (the engine pins ``req.sigmas`` from it)."""
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
 
     @classmethod
@@ -151,9 +114,8 @@ class BagelPipeline(Pipeline):
     def _build_contexts(self, prompt: str) -> Tuple[Any, Any, Any]:
         """Build (gen, cfg_text, cfg_img) KV contexts for a plain-T2I prompt.
 
-        Mirrors ``InterleaveInferencer.interleave_inference`` (think=False, no
-        image): ``cfg_text`` is the init snapshot taken *before* the prompt text
-        (unconditional); ``gen`` and ``cfg_img`` both ingest the prompt.
+        ``cfg_text`` is the init snapshot before the text (unconditional); ``gen`` and
+        ``cfg_img`` both ingest the prompt.
         """
         inf = self.bundle.inferencer
         gen = inf.init_gen_context()
@@ -192,8 +154,7 @@ class BagelPipeline(Pipeline):
         schedule = req.sigmas.to(device)
 
         # Driver-authoritative per-sample x_T (NoiseRecipe), [n, seq, C] or None
-        # (engine draws its own — tests / no driver recipe). Per-sample-unique +
-        # per-rollout-fresh via the driver's r{rollout_id}:{sample_id} group ids.
+        # (engine draws its own for tests / no driver recipe).
         initial = NoiseRecipe.from_rollout_req(req).resolve(device=device, dtype=torch.float32)
 
         gen_list: List[Any] = []
@@ -244,10 +205,8 @@ class BagelPipeline(Pipeline):
     def _batch_segments(segments: List[LatentSegment]) -> LatentSegment:
         """Stack per-sample 1-row segments into one ``[N, ...]`` segment.
 
-        With the per-rollout SDE window (``resolve_sde_indices(rollout_id)`` is shared
-        across the group), every sample's ``sde_indices`` / ``indices`` / ``sigmas`` is
-        identical, so the shared fields are taken from ``segments[0]`` and only the
-        per-sample ``latents`` / ``sde_logp`` stack along the batch axis.
+        The SDE window is shared across the group, so the shared fields come from
+        ``segments[0]`` and only ``latents`` / ``sde_logp`` stack along the batch axis.
         """
         if len(segments) == 1:
             return segments[0]

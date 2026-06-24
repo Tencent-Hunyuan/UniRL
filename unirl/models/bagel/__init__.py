@@ -1,24 +1,8 @@
 """Bagel-7B (ByteDance BAGEL-MoT) model package for UniRL — official-repo migration.
 
-Unlike the working ``UniRL/`` integration (which vendors flow_grpo's *fork* and
-monkeypatches RL hacks into the model), this package vendors the **pristine
-official** ``ByteDance-Seed/Bagel`` modeling under ``vendor/`` (no logic edits;
-import roots rewritten only) and adds the RL primitives as standalone functions
-in ``rl_ops.py`` over ``model._forward_flow``. See ``docs/BAGEL_MIGRATION_PLAN.md``.
-
-Bagel is a unified Mixture-of-Transformers model: one transformer runs both the
-text/understanding path and the image-generation (rectified-flow) path. The
-integration mirrors ``unirl.models.hunyuan_image3`` — the diffusion "transformer"
-is the LLM backbone itself and text conditioning flows through a KV cache rather
-than a separate text encoder.
-
-Kept flash-attn-free at import time: ``import unirl.models.bagel`` must not pull
-the vendored modeling (which hard-imports ``flash_attn``). The adapter wrappers
-(config / conditions / diffusion / vae / pipeline) are flash-free; ``BagelBundle``
-is intentionally NOT re-exported (it pulls the vendored modeling + flash_attn at
-import time) — load it explicitly via ``from unirl.models.bagel.bundle import
-BagelBundle`` only where a GPU model is constructed. ``rl_ops`` (the RL primitives)
-is flash-free too (torch + diffusers only).
+Vendors the pristine official ``ByteDance-Seed/Bagel`` modeling under ``vendor/`` and
+adds RL primitives over ``model._forward_flow`` in ``rl_ops.py``. Kept flash-attn-free
+at import: ``BagelBundle`` is NOT re-exported (load it from ``.bundle`` on GPU).
 """
 
 from .conditions import BagelDiffusionConditions

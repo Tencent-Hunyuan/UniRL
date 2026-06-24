@@ -1,19 +1,7 @@
 """BagelBundle — weights+params holder for BAGEL-7B-MoT (gen-only T2I).
 
-Implements the empty :class:`Bundle` Protocol. Pure container of the modules
-BAGEL ships with for text-to-image: one MoT transformer (``Bagel`` wrapping a
-``Qwen2ForCausalLM`` whose ``Qwen2MoTDecoderLayer`` blocks hold both und and gen
-experts) + one FLUX-style VAE + one tokenizer. The und ViT path is disabled
-(``visual_und=False``) — T2I needs only the gen expert + VAE.
-
-LoRA injection / FSDP wrap / autocast lifecycle are owned outside the bundle
-(the train backend), so ``from_config`` only loads + freezes. The trainable
-surface is ``model.language_model`` (the MoT, where the ``*_moe_gen`` experts
-live); the FSDP block class is ``Qwen2MoTDecoderLayer``.
-
-Construction mirrors flow_grpo's ``train_bagel.py`` setup so the vendored
-``InterleaveInferencer`` / ``generate_image`` path the diffusion stage delegates
-to behaves identically.
+Container of the MoT transformer + FLUX-style VAE + tokenizer; the und ViT path is
+disabled. LoRA/FSDP/autocast live in the train backend — ``from_config`` only loads.
 """
 
 from __future__ import annotations
@@ -62,10 +50,9 @@ class BagelBundle(Bundle):
     ) -> None:
         super().__init__()
         self.model = model
-        # The trainable MoT (where the *_moe_gen experts live). Same object the
-        # vendored generate_image / _forward_flow run on, so FSDP2 fully_shard
-        # (in-place) on this reference shards the gen forward too. Named
-        # ``transformer`` so recipes can set backend.trainable_attr: transformer.
+        # The trainable MoT (where the *_moe_gen experts live); same object the
+        # vendored generate_image / _forward_flow run on. Named transformer so
+        # recipes can set backend.trainable_attr: transformer.
         self.transformer = model.language_model
         self.vae = vae
         self.tokenizer = tokenizer
@@ -83,17 +70,9 @@ class BagelBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: BagelPipelineConfig) -> "BagelBundle":
-        """Load BAGEL-7B-MoT (gen-only) from a local checkpoint directory.
+        """Load BAGEL-7B-MoT (gen-only) EMA weights from a local checkpoint directory.
 
-        Replicates flow_grpo/train_bagel.py:316-414 minus LoRA/optimizer (which
-        the train backend owns). Loads the EMA weights via
-        ``load_checkpoint_and_dispatch`` onto a single device; the FSDP wrap and
-        LoRA injection run later in :class:`FSDPBackend`.
-
-        Note: ``load_checkpoint_and_dispatch`` attaches accelerate device hooks.
-        For the dedicated FSDP path (Phase 6) those may need removal via
-        ``accelerate.hooks.remove_hook_from_module`` before ``fully_shard``; for
-        the standalone bundle smoke they are harmless.
+        Loads + freezes only; the FSDP wrap and LoRA injection run later in the backend.
         """
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
@@ -127,12 +106,9 @@ class BagelBundle(Bundle):
             language_model = Qwen2ForCausalLM(llm_config)
             model = Bagel(language_model, None, bagel_config)
 
-        # force_hooks=True attaches accelerate AlignDevicesHooks (matching
-        # flow_grpo/train_bagel.py) so the vendored inferencer / generate_image
-        # path — which builds packed index tensors on CPU and calls submodule
-        # forwards directly — has its inputs auto-moved to the model device.
-        # Phase 6 (UniRL FSDP) must remove these hooks before fully_shard
-        # (accelerate.hooks.remove_hook_from_module(model, recurse=True)).
+        # force_hooks=True attaches accelerate AlignDevicesHooks so the vendored
+        # inferencer (which builds packed index tensors on CPU) gets inputs auto-moved
+        # to the model device; the FSDP path must remove these hooks before fully_shard.
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_dir, "ema.safetensors"),
@@ -146,16 +122,14 @@ class BagelBundle(Bundle):
         tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        # Image transforms match flow_grpo (vae 512/256/8, vit 490/112/7). Only
-        # used for image-conditioned paths; pure T2I never exercises them, but
-        # the inferencer constructor requires both.
+        # Image transforms match flow_grpo (vae 512/256/8, vit 490/112/7); only the
+        # inferencer constructor requires them — pure T2I never exercises them.
         vae_transform = ImageTransform(512, 256, 8)
         vit_transform = ImageTransform(490, 112, 7)
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)
-        # Freeze the whole MoT here; the backend re-enables only the LoRA (or
-        # moe_gen) params it injects/unfreezes.
+        # Freeze the whole MoT; the backend re-enables only the params it injects.
         model.requires_grad_(False)
 
         inferencer = InterleaveInferencer(
@@ -185,13 +159,7 @@ class BagelBundle(Bundle):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the MoT transformer — the FSDP wrap target / trainable root.
-
-        ``model.language_model`` holds the ``Qwen2MoTDecoderLayer`` blocks whose
-        ``*_moe_gen`` experts are the only trained params (via LoRA). The gen
-        heads (``vae2llm`` / ``time_embedder`` / ``llm2vae`` / ``latent_pos_embed``)
-        sit on the parent ``Bagel`` module and stay frozen in the LoRA setup.
-        """
+        """The MoT transformer (``model.language_model``) — FSDP wrap / trainable root."""
         return self.transformer
 
 
