@@ -115,6 +115,15 @@ index-strategy = "unsafe-best-match"
 override-dependencies = [
   "kernels>=0.12,<0.13",
   "tokenizers>=0.22,<0.23",
+  # sglang[diffusion] hard-pins diffusers==0.37.0 (unchanged across every
+  # released sglang through 0.5.13.post1 AND main — upstream curates it as a
+  # tight manual pin, last bumped 0.36->0.37 in sgl PR #20318). It collides
+  # with the base diffusers>=0.38.0 floor LTX-2 needs (#91), making the
+  # ".[sglang,...]" install unsatisfiable. Force the floor graph-wide — same
+  # tactic as the kernels/tokenizers overrides above. This fixes resolution;
+  # sglang's own diffusion runtime then runs against 0.38 (verify rollout
+  # parity on-pod, since upstream only validated 0.37).
+  "diffusers>=0.38.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
