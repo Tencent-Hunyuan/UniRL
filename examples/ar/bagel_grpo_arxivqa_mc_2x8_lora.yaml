@@ -1,0 +1,188 @@
+# @package _global_
+# GRPO BAGEL-7B-MoT on ArxivQA-MC (image+text -> letter) — train_ar (ARTrainer),
+# 2 nodes x 8 GPUs, TRAINSIDE colocate + LoRA on the und path.
+#
+# Text-out RL via the und (understanding) path: it2t. The rollout decodes per
+# token through forward_inference (KV cache). Replay re-scores teacher-forced in a
+# SINGLE grad forward — default replay_mode=train: one forward_train over the
+# packed [image|prompt|response]; replay_mode=inference: no_grad image prefill +
+# one forward_inference over [prompt+response]. Either mode reuses the rollout's
+# prompt prefill, so the old_logp/new_logp ratio stays ~1. Built on the PR #62
+# BagelARStage path.
+#
+# LoRA trains the und/base projections (BAGEL_UND_LORA_TARGETS); the gen experts
+# (mlp_moe_gen.*) and the frozen SigLIP ViT tower are untouched.
+#
+# Data: build once with
+#   python -m unirl.utils.prepare_arxivqa_mc --out-dir data/arxivqa_mc
+# then DATA_PATH=data/arxivqa_mc/train.jsonl (BAGEL_PATH -> local 7B ckpt).
+#
+# Compose check (no GPU/flash-attn needed):
+#   PYTHONPATH=$PWD python -m unirl.train_ar \
+#     --config-name ar/bagel_grpo_arxivqa_mc_2x8_lora --cfg job --resolve
+#
+# Hyperparameters below are the config under multi-node validation on this
+# BagelARStage path: 2x8 HSDP (intra-node shard 8 x inter-node replicate 2),
+# b128 / g8 / T1.0 / und LoRA r64a128 / clip 1e-2 / lr 3e-5 / num_updates 2 /
+# replay_mode=train. The train-replay core mirrors the proven single-domain
+# arxivqa setting that reached ~0.73.
+
+num_devices: 16
+batch_size: 128               # prompts_per_rollout (128 x g8 = 1024 seq/rollout)
+
+num_rollouts: 1000
+weight_sync_interval: 1         # ignored trainside (no `sync` block)
+
+adv_normalization_scope: global
+
+# Full-val eval (166 arxivqa val prompts x g8 @ T1.0) + LoRA-only checkpoint,
+# both every 20 rollouts.
+eval_interval: 20
+eval_num_prompts: 166
+eval_samples_per_prompt: 8
+eval_temperature: 1.0
+
+save_interval: 20
+save_dir: ${oc.env:CKPT_DIR,tmp/ckpt_bagel_arxivqa_mc}
+save_mode: auto                 # LoRA is active -> LoRA-only checkpoints
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    logprob_precision: fp32
+    enable_vit: true            # image-INPUT task (it2t) needs the und ViT tower
+    use_lora: true
+    lora_target_modules:        # = BAGEL_UND_LORA_TARGETS (und path, not gen experts)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  logprob_precision: fp32
+  # Replay scorer for new_logp:
+  #   train     — grad forward_train (image+text trained); attention exact, but a
+  #               different kernel than the rollout's forward_inference → ratio ~1±1e-2
+  #               (the train-replay path that reached arxivqa ~0.73).
+  #   inference — no_grad frozen-image prefill + grad forward_inference over
+  #               [prompt+response]; kernel-matched to rollout (ratio ~1), image frozen.
+  replay_mode: ${oc.env:REPLAY_MODE,train}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32          # fp32 LoRA master + Adam states: stable small GRPO updates
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: hybrid           # HSDP: shard within node (8) x replicate across nodes (2)
+    # Safe with the AR path because rl_ops.decode_text runs a FIXED max_new
+    # forwards (no early EOS break) → every rank issues an identical number of
+    # all-gathers (lockstep), so resharding does not deadlock. This is also the
+    # backward config the diffusion replay is proven on (reshard=false tripped an
+    # FSDP2 no_grad-rollout→grad-replay storage lifecycle bug).
+    reshard_after_forward: true
+    activation_checkpointing: true   # train-mode replay = forward_train over [image|prompt|resp]; recompute keeps memory bounded
+    use_torch_compile: false
+    # Vendored BAGEL calls language_model.model.embed_tokens / lm_head /
+    # forward_inference directly outside a root forward, incompatible with a
+    # root fully_shard group owning those params.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:             # = BAGEL_UND_LORA_TARGETS (und path)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1         # navit bs=1; one sample per generate call
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelARConditions
+  sampling_temperature: 1.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  # MUST be 1 for the AR path. BagelARStage.replay scores per sample (navit bs=1)
+  # — N samples in a micro-batch = N separate grad forwards before one backward.
+  # Under FSDP each forward reshards the block, freeing the earlier samples'
+  # gathered params, so the single backward hits "storage of size 0". One sample
+  # per forward+backward (as the bagel diffusion recipe also uses) keeps it sound.
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # 2 optimizer steps/rollout vs the frozen pi_old anchor
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,data/arxivqa_mc/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,data/arxivqa_mc/val.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8             # MC single-letter answer; cuts the lockstep long tail

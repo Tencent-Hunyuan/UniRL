@@ -66,6 +66,12 @@ class HunyuanVideo15PipelineConfig:
     # under the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
+    # Meta-init the transformer (build on the meta device; the backend loads
+    # weights after sharding) instead of eager ``from_pretrained``. Avoids the
+    # per-rank full-model GPU spike. Consumed by FSDPBackend / VeOmniBackend via
+    # the stashed ``_transformer_weights_path``.
+    meta_init_transformer: bool = False
+
     # VAE latent channel count. ``None`` lets both the driver and the
     # stage fall back to ``HunyuanVideo15DiffusionStage.DEFAULT_LATENT_CHANNELS``
     # (32) which matches the ``hunyuanvideo-community/HunyuanVideo-1.5-Diffusers``

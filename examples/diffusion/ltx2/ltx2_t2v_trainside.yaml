@@ -1,0 +1,163 @@
+# @package _global_
+# LTX-Video-2 T2V GRPO — trainside (in-process FSDP).
+#
+# LTX-2 is a ~2.4B video DiT with flow matching and Gemma3 text encoding.
+# Supports T2V (this recipe), I2V (set primitives["image"]), and T2AV
+# (enable_audio: true, LTX-2.3 checkpoint).
+#
+# Architecture:
+#   - 48 LTX2VideoTransformerBlock layers (unified video+audio attention)
+#   - 3D VAE: 32x spatial, 8x temporal, 128 latent channels
+#   - Gemma3 text encoder + connector projections
+#   - FlowMatch Euler Discrete scheduler
+#
+# Launch (1 node × 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/ltx2/ltx2_t2v_trainside
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-ltx2-t2v}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [ltx2, t2v, grpo, trainside, dancegrpo]
+  log_media: true
+  media_max_items: 4
+  media_log_interval: 1
+
+bundle:
+  _target_: unirl.models.ltx2.bundle.LTX2Bundle.from_config
+  config:
+    _target_: unirl.models.ltx2.config.LTX2PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Lightricks/LTX-2}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    shift: 1.0
+    max_sequence_length: 512
+    enable_audio: false
+    default_height: 512
+    default_width: 768
+    default_num_frames: 33
+    default_frame_rate: 24.0
+
+pipeline:
+  _target_: unirl.models.ltx2.pipeline.LTX2Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["LTX2VideoTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      # Video self-attention
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      # Video cross-attention (text)
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+      # Video FFN
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 2
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 4
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.ltx2.conditions.LTX2Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/vid_prompt/train.txt
+      eval_data_path: datasets/vid_prompt/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 768
+  num_frames: 33
+  eta: 0.7
+  samples_per_prompt: 4
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 5
+    timestep_fraction: [0, 0.5]

@@ -1,4 +1,4 @@
-"""Composed rollout engine — peer of sglang / sglang_llm / vllm_omni / trainside.
+"""Composed rollout engine — peer of sglang / sglang_diffusion / vllm_omni / trainside.
 
 Holds two child engines (``llm`` + ``diffusion``) and orchestrates the
 prompt-enhancement (PE) serial flow internally:

@@ -6,9 +6,9 @@ The trainer owns the placement scope, sibling Remote wiring, and the
 ``train_step → train`` loop; this module just maps the loaded Hydra
 config blocks to constructor kwargs.
 
-Pairs with ``examples/diffusion/sd3_trainside.yaml`` (default) and
-``examples/diffusion/sd3_vllmomni.yaml``. Switch with
-``--config-name diffusion/sd3_vllmomni`` on the CLI.
+Pairs with ``examples/diffusion/sd3/sd3_trainside.yaml`` (default) and
+``examples/diffusion/sd3/sd3_vllmomni.yaml``. Switch with
+``--config-name diffusion/sd3/sd3_vllmomni`` on the CLI.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from omegaconf import DictConfig
 from unirl.trainer.diffusion import DiffusionTrainer
 
 
-@hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3_trainside")
+@hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3/sd3_trainside")
 def main(cfg: DictConfig) -> None:
     trainer = DiffusionTrainer(
         cfg=cfg,
@@ -39,6 +39,13 @@ def main(cfg: DictConfig) -> None:
         train_fraction=cfg.get("train_fraction", 0.5),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
+        eval_interval=cfg.get("eval_interval", 0),
+        eval_num_prompts=cfg.get("eval_num_prompts", 64),
+        eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
+        eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
+        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
+        eval_eta=cfg.get("eval_eta", 0.0),
+        stage_config=cfg.get("stage_config"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

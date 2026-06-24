@@ -66,6 +66,13 @@ class LatentSegment(Segment):
     sde_indices: Optional[torch.Tensor] = shared_field(default=None)
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    # Optional auxiliary per-step latent trajectory stored at the SAME sparse
+    # ``indices`` as ``latents`` (shape ``[B, K, ...]``). First consumer: LTX-2,
+    # which co-denoises an AUDIO latent stream alongside the video one — the
+    # video transformer forward depends on the current audio state (audio→video
+    # cross-attention), so replay must reproduce the audio at each step. Default
+    # ``None`` → every other model is unaffected.
+    aux_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 
     def as_condition(self) -> Optional[Condition]:
         """Promote the *final* step's latent into an ``ImageLatentCondition``.
@@ -95,6 +102,20 @@ class LatentSegment(Segment):
                 f"LatentSegment.latents_at: step_idx={step_idx} not in stored indices={self.indices.tolist()}"
             )
         return self.latents[:, int(matches[0].item())]
+
+    def aux_latents_at(self, step_idx: int) -> torch.Tensor:
+        """Return ``aux_latents`` at the given trajectory step (same sparse
+        ``indices`` map as :meth:`latents_at`). Used by LTX-2 replay to recover
+        the co-denoised audio latent at each step. Raises if not stored.
+        """
+        if self.indices is None or self.aux_latents is None:
+            raise RuntimeError("LatentSegment.aux_latents_at: missing indices or aux_latents")
+        matches = (self.indices == int(step_idx)).nonzero(as_tuple=False).flatten()
+        if matches.numel() == 0:
+            raise KeyError(
+                f"LatentSegment.aux_latents_at: step_idx={step_idx} not in stored indices={self.indices.tolist()}"
+            )
+        return self.aux_latents[:, int(matches[0].item())]
 
 
 def make_image_segment(**kwargs) -> LatentSegment:

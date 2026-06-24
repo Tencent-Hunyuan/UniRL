@@ -1,7 +1,7 @@
 import inspect
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -10,10 +10,10 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer
+from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ class ARTrainer(BaseTrainer):
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        self.sampling_params: BaseSamplingParams = instantiate(sampling_cfg)
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
@@ -108,12 +108,12 @@ class ARTrainer(BaseTrainer):
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
 
-        Expands ``inputs`` by ``sampling_params.samples_per_prompt`` so each
-        prompt produces an N-sample GRPO group (sibling samples consecutive).
+        Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
+        each prompt produces an N-sample GRPO group (sibling samples consecutive).
         AR sampling params ride to the engine untouched — there is no SDE step
         schedule to resolve (that is the diffusion trainer's job).
         """
-        inputs = inputs.expand(self.sampling_params.samples_per_prompt)
+        inputs = inputs.expand(total_samples_per_prompt(self.sampling_params))
         req = RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -165,6 +165,7 @@ class ARTrainer(BaseTrainer):
                     normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
                 )
 
+        self._dump_rollout_samples(req, resp, rollout_id)
         self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
         # verl balance_batch parity: reorder so each DP shard gets a near-equal
@@ -177,7 +178,7 @@ class ARTrainer(BaseTrainer):
             result,
             resp,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params, "max_new_tokens", None),
+            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
         return result, mean_reward
 
@@ -194,11 +195,12 @@ class ARTrainer(BaseTrainer):
 
         eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         inputs = eval_inputs.expand(self.eval_samples_per_prompt)
-        eval_sp = dataclasses.replace(
-            self.sampling_params,
+        eval_ar = dataclasses.replace(
+            self.sampling_params.get("ar"),
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
+        eval_sp = {**self.sampling_params, "ar": eval_ar}
         req = RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -230,6 +232,48 @@ class ARTrainer(BaseTrainer):
         )
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
         return acc
+
+    def _dump_rollout_samples(self, req, resp, rollout_id: int) -> None:
+        """Debug dump of the first N (prompt, output, reward) triples per rollout.
+
+        Off unless ``ROLLOUT_DUMP_DIR`` is set (driver-side env). Writes one
+        ``rollout_<id>.jsonl`` per rollout (``ROLLOUT_DUMP_N`` samples, default
+        4) so rollout-engine quality can be eyeballed without keeping the full
+        decoded batch alive. Must run BEFORE ``_drop_decoded``. Never raises.
+        (Ported from the b182a511 LIN-371 lineage — lost in the rebase.)
+        """
+        import json
+        import os
+
+        out_dir = os.environ.get("ROLLOUT_DUMP_DIR", "")
+        if not out_dir:
+            return
+        try:
+            n = int(os.environ.get("ROLLOUT_DUMP_N", "4"))
+            prompts = getattr(req.primitives.get("text"), "texts", None) or []
+            (track,) = resp.tracks.values()
+            outputs = getattr(track.decoded, "texts", None) or []
+            rewards = track.rewards.to(torch.float32).tolist() if track.rewards is not None else []
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                for i in range(min(n, len(outputs))):
+                    f.write(
+                        json.dumps(
+                            {
+                                "rollout": int(rollout_id),
+                                "sample": i,
+                                "prompt": prompts[i] if i < len(prompts) else None,
+                                "output": outputs[i],
+                                "output_chars": len(outputs[i] or ""),
+                                "reward": rewards[i] if i < len(rewards) else None,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+        except Exception as exc:  # debug path — never let it kill training
+            logger.warning("rollout sample dump failed: %s", exc)
 
     def train(
         self,

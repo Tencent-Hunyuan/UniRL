@@ -1,0 +1,198 @@
+# @package _global_
+# PE (Prompt Enhancement) with a FROZEN LLM rewriter — colocate trainside, v2.
+#
+# Same as pe_trainside_pickscore.yaml, except the Qwen3 LLM is a FROZEN
+# prompt-rewriter: it generates N rewrites per prompt during rollout but never
+# trains. Only the SD3 diffusion track learns (FlowGRPO), against the fixed
+# prompt-enhancer. PickScore scores the image ("diffusion") track; the image
+# reward is still credit-assigned up to the AR track for logging parity, but the
+# AR advantage is unused (no AR optimizer).
+#
+# Enabled by the top-level `freeze_llm: true` below. The AR side therefore needs
+# ONLY `bundle` + `pipeline` (the rollout sampler); its `backend` / `algorithm`
+# / `stack` blocks are omitted — PETrainer._wire_rollout_only_side ignores them.
+#
+# `diffusion_group_scope: prompt` is the OBJECTIVE pairing: the diffusion GRPO
+# group is all N*M images of one ORIGINAL prompt (across every rewrite), so the
+# advantage rewards rendering well for the original intent regardless of how the
+# frozen rewriter phrased it — "same semantics, different wordings → better
+# images". (Default 'rewrite' would only compare the M images of one rewrite.)
+#
+# Pairs with unirl/train_pe.py (PETrainer). Geometry:
+# P=8 prompts × N=4 rewrites × M=8 images = 256 diffusion / 32 ar samples per rollout.
+
+num_devices: 8
+batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
+
+# Frozen LLM: AR side is a rollout-only rewriter (no AR training).
+freeze_llm: true
+# Diffusion GRPO group = all N*M images of one original prompt (see header).
+diffusion_group_scope: prompt
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+# ── Diffusion side (SD3) — trained ─────────────────────────────────────────
+diffusion:
+  bundle:
+    _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+    config:
+      _target_: unirl.models.sd3.config.SD3PipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+      model_precision: bf16
+      autocast_precision: bf16
+      trajectory_precision: bf16
+      logprob_precision: fp32
+      shift: 3.0
+  pipeline:
+    _target_: unirl.models.sd3.pipeline.SD3Pipeline
+    shift: 3.0
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    strategy:
+      _target_: unirl.sde.kernels.FlowSDEStrategy
+  backend:
+    _target_: unirl.train.backend.fsdp.FSDPBackend
+    block_class_names: ["JointTransformerBlock"]
+    trainable_attr: transformer
+    fsdp_cfg:
+      _target_: unirl.train.configs.FSDPConfig
+      param_dtype: bf16
+      cpu_offload: false
+      mixed_precision: true
+      fsdp_mode: full
+      reshard_after_forward: true
+      activation_checkpointing: false
+      use_torch_compile: false
+    optimizer_cfg:
+      _target_: unirl.train.backend.base.OptimizerConfig
+      learning_rate: 3.0e-4
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_epsilon: 1.0e-8
+      weight_decay: 0.0
+    scheduler_cfg:
+      _target_: unirl.train.backend.base.LrSchedulerConfig
+      type: constant
+      warmup_steps: 0
+      total_steps: 10000
+    lora_cfg:
+      _target_: unirl.train.configs.LoraConfig
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      bias: none
+      task_type: FEATURE_EXTRACTION
+      target_modules:
+        - attn.add_k_proj
+        - attn.add_q_proj
+        - attn.add_v_proj
+        - attn.to_add_out
+        - attn.to_k
+        - attn.to_out.0
+        - attn.to_q
+        - attn.to_v
+  algorithm:
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-4
+    clip_schedule: constant
+    old_logp_source: replay
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.sd3.conditions.SD3Conditions
+    params: ${sampling.diffusion}
+  stack:
+    _target_: unirl.train.stack.TrainStack
+    micro_batch_size: 1
+    max_grad_norm: 1.0
+    num_updates_per_batch: 2
+
+# ── AR side (Qwen3) — FROZEN rewriter: bundle + pipeline ONLY ───────────────
+# No backend / algorithm / stack: freeze_llm=true makes PETrainer build a
+# rollout-only side (PETrainer._wire_rollout_only_side), so the LLM samples but
+# never trains. The bundle loads the model on-device; the trainside engine
+# eval-scopes it for generation.
+ar:
+  bundle:
+    _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+    config:
+      _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
+      model_precision: bf16
+      autocast_precision: bf16
+      logprob_precision: fp32
+  pipeline:
+    _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline
+    autocast_precision: bf16
+    logprob_precision: fp32
+
+# ── Composed trainside rollout: shares both pipelines, eval-scopes both ──────
+# stage_attrs still lists both so the AR module is eval-scoped (no_grad) during
+# generate; the frozen AR has no train state but is still the rewriter.
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion, ar]
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Modality-keyed sampling dict drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# rewrites, diffusion.samples_per_prompt = M images per rewrite.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 4       # N rewrites per prompt
+    temperature: 0.7
+    max_new_tokens: 512
+    top_p: 0.9
+  diffusion:
+    _target_: unirl.types.sampling.DiffusionSamplingParams
+    samples_per_prompt: 8       # M images per rewrite
+    num_inference_steps: 10
+    guidance_scale: 1.0
+    height: 512
+    width: 512
+    eta: 0.7
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    # SDE step schedule: one randomly-chosen denoising step per rollout runs the
+    # SDE (eta-noise + log-prob); all others are deterministic. num_sde_steps=1
+    # picks a single step, seeded by rollout_id (PETrainer._build_req resolves it
+    # per rollout). timestep_fraction [0, 0.9] = pool range(0, int(10*0.9))=0..8,
+    # so the LAST step (index 9) is excluded. Replaces the prior sde_indices:[0..9]
+    # which made EVERY step inject noise (over-randomized → smeared images).
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      num_sde_steps: 1
+      timestep_fraction: [0, 0.9]
+
+num_rollouts: 300

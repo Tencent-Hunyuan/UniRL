@@ -11,7 +11,7 @@ machinery.
 
 Reservation is a *hint*, not a contract: the sockets are closed immediately
 after binding (the subprocess must be able to bind them itself), so the usual
-bind-to-zero TOCTOU gap applies — the same trade-off ``sglang_llm``'s
+bind-to-zero TOCTOU gap applies — the same trade-off ``sglang``'s
 ``find_free_port`` already accepts, and SGLang's ``settle_port`` self-heals
 the rare loss. Port *ranges* (vllm_omni-style stride scans) are a different
 reservation primitive and out of scope here.

@@ -27,7 +27,7 @@ from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.sampling import get_diffusion_params, is_forward_process
+from unirl.types.sampling import is_forward_process
 from unirl.types.segments.latent import make_image_segment
 
 
@@ -38,6 +38,8 @@ class ImageAdapter(ModelAdapter):
     track_name: str = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
+    #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are images.
+    squeeze_single_frame_4d: bool = True
 
     # ------------------------------------------------------------------ #
     # Request side
@@ -66,7 +68,7 @@ class ImageAdapter(ModelAdapter):
             f"build_inputs: text count {len(prompts)} != sample_ids count {len(req.sample_ids)}",
         )
 
-        diffusion = get_diffusion_params(req.sampling_params)
+        diffusion = req.sampling_params.get("diffusion")
         require(
             diffusion is not None,
             "build_inputs: req.sampling_params must contain diffusion params",
@@ -232,7 +234,7 @@ class ImageAdapter(ModelAdapter):
         require(bool(raw), "build_response: SGLang returned no results")
         require(req.sigmas is not None, "build_response: req.sigmas must be set")
 
-        diffusion = get_diffusion_params(req.sampling_params)
+        diffusion = req.sampling_params.get("diffusion")
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
@@ -249,7 +251,7 @@ class ImageAdapter(ModelAdapter):
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
         )
-        decoded = self.build_decoded(raw)
+        decoded = self.build_decoded(req, raw)
 
         conditions: Dict[str, Any] = {}
         if self.cfg.populate_conditions:
@@ -303,8 +305,8 @@ class ImageAdapter(ModelAdapter):
             segment_factory=self.segment_factory,
         )
 
-    def build_decoded(self, results: List[RawResult]):
-        return utils.stack_decoded_images(results)
+    def build_decoded(self, req: RolloutReq, results: List[RawResult]):
+        return utils.stack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         text_cond, neg_text_cond = utils.fuse_text_conditions(results)

@@ -18,7 +18,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.rollout_req import PrimitiveValue, RolloutReq
 from unirl.types.rollout_resp import RolloutTrack, _track_with_field
-from unirl.types.sampling import get_ar_params, get_diffusion_params
+from unirl.types.sampling import total_samples_per_prompt
 
 from .base import RewardBackend
 
@@ -192,15 +192,12 @@ class RewardService(Remote):
                     f"count {len(sample_ids)} and not an integer multiple — sample alignment broken."
                 )
             factor = len(sample_ids) // req_batch
-            ar_params = get_ar_params(req.sampling_params)
-            diff_params = get_diffusion_params(req.sampling_params)
-            n = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-            m = int(diff_params.samples_per_prompt) if diff_params is not None else 1
-            if factor != n * m:
+            expected_factor = total_samples_per_prompt(req.sampling_params)
+            if factor != expected_factor:
                 raise RuntimeError(
                     f"RewardService.score_and_attach: implicit expansion factor {factor} "
                     f"(track={len(sample_ids)} / req={req_batch}) does not match sampling_params "
-                    f"N*M={n * m} (N={n}, M={m}). Sample alignment is ambiguous."
+                    f"total_samples_per_prompt={expected_factor}. Sample alignment is ambiguous."
                 )
             req_primitives = {k: v.repeat_interleave(factor) for k, v in req_primitives.items()}
             # Keep metadata aligned with primitives (one entry per sample).
@@ -241,7 +238,7 @@ class RewardService(Remote):
         #   "keep" — leave the raw score (= verl dapo, overlong disabled). No-op here.
         #   "soft" — verl DAPO graded overlong penalty (never a hard zero).
         # seg_lengths and rewards are shard-aligned (one entry per sample).
-        ar_params = get_ar_params(req.sampling_params)
+        ar_params = req.sampling_params.get("ar")
         if self.truncated_reward != "keep" and ar_params is not None and track.segment is not None:
             seg_lengths = getattr(track.segment, "lengths", None)
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():

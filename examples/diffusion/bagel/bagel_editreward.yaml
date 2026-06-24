@@ -1,0 +1,207 @@
+# @package _global_
+# BAGEL-7B-MoT image-EDIT (it2i) GRPO — trainside + remote EditReward.
+#
+# Text + source image -> edited image: condition generation on (source image +
+# instruction), then score the edit remotely with EditReward. This is the T2I recipe
+# (bagel_trainside_lora.yaml) plus the it2i enablement from the BAGEL multi-mode bundle:
+#   - bundle.config.enable_vit: true  -> loads the SigLIP ViT/und path so the SOURCE
+#       image is ingested into the gen/cfg KV contexts (VAE latents + ViT semantics).
+#   - the pipeline auto-takes the it2i branch when the request carries an input image.
+#   - reward -> RemoteRewardBackend (HTTP to an EditReward service on its own GPU; it
+#       builds the [source, edited] pair from the request's input image — no BAGEL code).
+#   - sampling -> the defaults below reproduce the validated single-node run
+#       (cfg_text=1 single-forward; eta=1.0 SDE exploration; group=8; WindowScheduler).
+#       cfg_text>1 enables CFG (amplifies the instruction) at +1 forward/step (more memory).
+#
+# Deploy (keep EditReward OFF the training GPUs):
+#   reward node:  cd unirl-reward-service && ray start --head --num-gpus=1 \
+#                 && python -m reward_service --config configs/editreward_service.yaml
+#   train node:   export REWARD_SERVICE_URL=http://<reward_node_ip>:8080
+#                 # optional local overrides: BAGEL_PATH / EDIT_DATA_PATH / EDIT_EVAL_DATA_PATH
+#                 bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_editreward
+#
+# Compose check (CPU):  python -m unirl.train_diffusion \
+#   --config-name diffusion/bagel/bagel_editreward --cfg job --resolve
+# These defaults reproduce the validated single-node run (8xH20). Smoke first: override
+#   batch_size=2 num_rollouts=2 eval_interval=2 to exercise the path cheaply.
+
+num_devices: 8
+batch_size: 8                  # prompts/rollout (x samples_per_prompt = images/rollout). Single-node
+                               # 7B it2i is memory-tight; raise only with reward off the train GPUs.
+adv_use_global_std: false      # per-group GRPO normalization
+num_rollouts: 10000            # intentionally large; stop manually
+
+# Periodic eval on the eval set (deterministic generation: eval_eta=0), logged under eval/*.
+# eval_interval=0 disables it. Eval prompts are chunked (eval_chunk_prompts) to stay within
+# the it2i driver-memory budget. These match the validated run.
+eval_interval: 25
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_cfg_text_scale: 1
+eval_eta: 0.0
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# Pin the it2i edit task. This recipe is image-EDIT only: every sample MUST carry a
+# source image (dataset `media` entry with role: condition). Pinning the task makes a
+# dataset that is missing source images FAIL LOUDLY (BagelPipeline._extract_input_images
+# raises) instead of silently falling back to t2i and scoring a single-image edit.
+stage_config:
+  task: it2i
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,bagel-editreward}
+  run_name: bagel_editreward_it2i_lora
+  # entity: set via the WANDB_ENTITY env var (wandb picks it up automatically)
+  tags: [bagel, it2i, edit, editreward, lora, trainside, fp32master]
+  log_media: true              # logs the source|edited side-by-side preview for it2i edits
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
+    logprob_precision: fp32
+    shift: 3.0
+    use_lora: true
+    enable_vit: true             # EDIT: load the SigLIP ViT/und path for source-image conditioning
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16                  # COMPUTE dtype (FSDP all-gather + forward/backward)
+    master_dtype: fp32                 # load-bearing: fp32 LoRA master + Adam (reward-collapse fix)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true     # 7B + multi-step replay + dual-CFG forwards: required
+    use_torch_compile: false
+    root_wrap: false                   # vendored BAGEL calls embed_tokens/lm_head outside a root forward
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # = BAGEL_MOE_GEN_LORA_TARGETS (gen experts only; und/ViT frozen)
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1                # navit bs=1; one sample per generate call
+
+# Remote EditReward (own GPU/node). RemoteRewardBackend builds the [source, edited] pair
+# from the request's input image -> model-agnostic, no BAGEL code on the reward side.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: mean
+      aggregation_method: weighted_sum
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay              # recompute pi_old via replay -> ratio!=1 on update 2 = real gradient signal
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # Editing instruction + SOURCE image (role: condition -> the request's input image).
+      data_path: ${oc.env:EDIT_DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EDIT_EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# BAGEL edit sampling (BagelDiffusionParams). Dual-CFG: cfg_text amplifies the INSTRUCTION,
+# cfg_img amplifies the SOURCE (cfg_img active only when cfg_text_scale>1; cfg_img>1 = 3rd forward).
+sampling:
+  _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+  num_inference_steps: 14
+  guidance_scale: 1.0
+  cfg_text_scale: 1                    # 1 = No-CFG single forward (validated config). >1 enables CFG
+                                       # (amplifies the instruction) = +1 forward/step -> more memory.
+  cfg_img_scale: 1.0                   # source<->diversity knob; only active when cfg_text_scale>1
+  cfg_interval: [0.4, 1.0]             # CFG schedule; only active when cfg_text_scale>1
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: text_channel        # CFG renorm; only active when cfg_text_scale>1
+  eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)
+  samples_per_prompt: 8                # GRPO group size
+  height: 512
+  width: 512
+  seed: 42
+  init_same_noise: true                # siblings share x_T; in-group diversity comes from the SDE noise (eta>0)
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.WindowScheduler
+    num_timesteps: 7                   # SDE window drawn from the first half of the 14 inference steps
+    config:
+      _target_: unirl.utils.scheduler_utils.WindowConfig
+      strategy: random
+      window_size: 3                   # a random contiguous 3-step SDE window per rollout

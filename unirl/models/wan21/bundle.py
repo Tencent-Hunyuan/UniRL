@@ -21,12 +21,14 @@ Use :meth:`WAN21Bundle.from_config` to load a HuggingFace checkpoint.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.meta_init import finalize_meta_init
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import WAN21PipelineConfig
@@ -108,13 +110,22 @@ class WAN21Bundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
-        # Dtype unification matters even though from_pretrained got
-        # torch_dtype=dtype: diffusers leaves some parameters / buffers
-        # (timestep embeddings, RoPE freqs, ...) in fp32, and FSDP's
-        # _init_mp_dtypes asserts a uniform original-param dtype across
-        # the wrapped module.
-        transformer = transformer.to(device, dtype=dtype)
+        if config.meta_init_transformer:
+            # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
+            # no per-rank weight allocation; the backend to_empty-materializes
+            # and broadcast-loads from the stashed dir after sharding.
+            transformer_config = WanTransformer3DModel.load_config(path, subfolder="transformer")
+            with torch.device("meta"):
+                transformer = WanTransformer3DModel.from_config(transformer_config)
+            transformer = finalize_meta_init(transformer, dtype=dtype)
+        else:
+            transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
+            # Dtype unification matters even though from_pretrained got
+            # torch_dtype=dtype: diffusers leaves some parameters / buffers
+            # (timestep embeddings, RoPE freqs, ...) in fp32, and FSDP's
+            # _init_mp_dtypes asserts a uniform original-param dtype across
+            # the wrapped module.
+            transformer = transformer.to(device, dtype=dtype)
 
         vae = AutoencoderKLWan.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
         vae.requires_grad_(False)
@@ -159,7 +170,7 @@ class WAN21Bundle(Bundle):
                 "image_encoder_ckpt_path."
             )
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=vae,
             text_encoder=text_encoder,
@@ -171,6 +182,10 @@ class WAN21Bundle(Bundle):
             vision_encoder=vision_encoder,
             image_processor=image_processor,
         )
+        if config.meta_init_transformer:
+            # Consumed by the backend's post-shard weight load.
+            bundle._transformer_weights_path = os.path.join(path, "transformer")
+        return bundle
 
 
 __all__ = ["WAN21Bundle"]

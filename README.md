@@ -68,15 +68,17 @@ dimension; all listed models are supported (✅).
 |---|---|---|---|
 | Stable Diffusion 3 / 3.5 | Image diffusion | Text → Image | ✅ |
 | Qwen-Image | Image diffusion | Text → Image | ✅ |
-| FLUX.2-Klein | Image diffusion | Text → Image | ✅ |
+| FLUX.2-Klein | Image diffusion | Text → Image / Text + Image → Image | ✅ |
+| Z-Image | Image diffusion | Text → Image | ✅ |
 | WAN 2.1 | Video diffusion | Text / Image → Video | ✅ |
 | WAN 2.2 | Video diffusion | Text / Image → Video | ✅ |
 | HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
+| LTX-Video-2 | Video diffusion | Text → Video | ✅ |
 | Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
 | Qwen3 | LLM AR | Text → Text | ✅ |
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
-| Bagel | Unified AR + diffusion | Text → Image | ✅ |
+| Bagel | Unified AR + diffusion | Text/ Text + Image → Image | ✅ |
 
 </div>
 
@@ -91,7 +93,7 @@ Examples are self-contained YAML files selected with
 
 | Domain | Trains | Entrypoint | Example |
 |---|---|---|---|
-| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3_sglang_rollout_colocate` |
+| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3/sd3_sglang_rollout_colocate` |
 | `ar/` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` |
 | `pe/` | Prompt-enhancer (AR rewriter + diffusion reward) | `train_pe` | `pe/pe_sglang_full_pickscore` |
 | `unified_model/` | Unified AR + diffusion models | `train_unified_model` | `unified_model/hi3_vllmomni` |
@@ -105,8 +107,8 @@ Install dependencies first — see [INSTALL.md](INSTALL.md).
 
 ```bash
 # compose-check, then launch a single-node example
-python -m unirl.train_diffusion --config-name=diffusion/sd3_trainside --cfg job --resolve
-bash examples/run_experiment_single_node.sh diffusion/sd3_trainside
+python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg job --resolve
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ```
 
 Full [launch guide](examples/README.md#running-a-recipe) — multi-node, every entrypoint, mooncake.
@@ -157,27 +159,21 @@ If you find UniRL helpful, please cite:
 If you use DRPO, please also cite:
 
 ```bibtex
-@misc{yao2026drpo,
-  title         = {{Rethinking the Divergence Regularization in LLM RL}},
-  author        = {Jiarui Yao and Xiangxin Zhou and Penghui Qi and Wee Sun Lee and Liefeng Bo and Tianyu Pang},
-  year          = {2026},
-  eprint        = {2606.09821},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2606.09821}
+@article{yao2026rethinking,
+  title={Rethinking the Divergence Regularization in LLM RL},
+  author={Yao, Jiarui and Zhou, Xiangxin and Qi, Penghui and Lee, Wee Sun and Bo, Liefeng and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2606.09821},
+  year={2026}
 }
 ```
 
 If you use Flow-DPPO, please also cite:
 
 ```bibtex
-@misc{ping2026flowdppo,
-  title         = {{Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models}},
-  author        = {Bowen Ping and Xiangxin Zhou and Penghui Qi and Minnan Luo and Liefeng Bo and Tianyu Pang},
-  year          = {2026},
-  eprint        = {2606.11025},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.LG},
-  url           = {https://arxiv.org/abs/2606.11025}
+@article{ping2026flow,
+  title={Flow-DPPO: Divergence Proximal Policy Optimization for Flow Matching Models},
+  author={Ping, Bowen and Zhou, Xiangxin and Qi, Penghui and Luo, Minnan and Bo, Liefeng and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2606.11025},
+  year={2026}
 }
 ```

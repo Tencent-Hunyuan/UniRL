@@ -18,6 +18,30 @@
 num_devices: 8
 batch_size: 8                 # P prompts per rollout; PEPipeline fans out to P*N*M
 
+# ── PE prompt-rewrite (mirrors the sglang ComposedRolloutEngine) ─────────────
+# Trainside PEPipeline injects `pe_instruction` as the LLM chat system prompt so
+# Qwen3 actually REWRITES the prompt (instead of conversationally continuing the
+# raw text), then extracts the text after `pe_marker` — stripping any <think>…
+# preamble and falling back to the original prompt on off-format / empty output —
+# before conditioning SD3. Same text as pe_sglang_full_pickscore.yaml so
+# trainside and sglang rewrites match.
+pe:
+  pe_instruction: |
+    You are a Prompt Optimizer specializing in image generation models (e.g., MidJourney, Stable Diffusion). Your core task is to rewrite user-provided prompts into highly clear, easy-to-render versions.
+    When rewriting, prioritize the following principles:
+    1. Start from the user's prompt, do reasoning step by step to analyze the object or scene they want to generate.
+    2. Focus on describing the final visual appearance of the scene. Clarify elements like the main subject's shape, color, and state.
+    3. If you are confident about what the user wants to generate, directly point it out in your explanation and the final revised prompt.
+    4. If technical concepts are necessary but difficult for ordinary users to understand, translate them into intuitive visual descriptions.
+    5. Ensure the final revised prompt is consistent with the user's intent.
+
+    After receiving the user's prompt that needs rewriting, first explain your reasoning for optimization. Then, output the final revised prompt in the fixed format of "Revised Prompt:
+    ". Where the specific revised content is filled in the next line.
+
+    Prompt:
+  # Keep only the substring after the marker; off-format / empty → original prompt.
+  pe_marker: "Revised Prompt:"
+
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
   project_name: unirl
@@ -33,9 +57,6 @@ diffusion:
       _target_: unirl.models.sd3.config.SD3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
       model_precision: bf16
-      autocast_precision: bf16
-      trajectory_precision: bf16
-      logprob_precision: fp32
       shift: 3.0
   pipeline:
     _target_: unirl.models.sd3.pipeline.SD3Pipeline
@@ -100,7 +121,7 @@ diffusion:
       _target_: hydra.utils.get_class
       path: unirl.models.sd3.conditions.SD3Conditions
     # FlowGRPO.replay needs the same guidance_scale / eta the rollout
-    # sampled with — bind to the diffusion sub-block of ComposedSamplingParams.
+    # sampled with — bind to the "diffusion" entry of the sampling dict.
     params: ${sampling.diffusion}
   stack:
     _target_: unirl.train.stack.TrainStack
@@ -116,8 +137,6 @@ ar:
       _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       model_precision: bf16
-      autocast_precision: bf16
-      logprob_precision: fp32
   pipeline:
     # Qwen3Pipeline builds chat_template + ar stages from the (shared) bundle
     # the trainer injects, so the rollout samples the SAME module the backend trains.
@@ -198,10 +217,9 @@ data_source:
     algorithm:
       prompts_per_rollout: ${batch_size}
 
-# ComposedSamplingParams drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# Modality-keyed sampling dict drives PEPipeline's fan-out: ar.samples_per_prompt = N
 # rewrites, diffusion.samples_per_prompt = M images per rewrite.
 sampling:
-  _target_: unirl.types.sampling.ComposedSamplingParams
   ar:
     _target_: unirl.types.sampling.ARSamplingParams
     samples_per_prompt: 4       # N rewrites per prompt
@@ -218,9 +236,6 @@ sampling:
     eta: 0.7
     seed: 42
     init_same_noise: false
-    autocast_precision: bf16
-    trajectory_precision: bf16
-    logprob_precision: fp32
     # Sparse SDE-index schedule (FlowDPPO-style, mirrors sd3_flowdppo.yaml):
     # num_sde_steps random steps drawn from the first half of the denoising
     # schedule, resolved PER ROLLOUT (seeded by rollout_id) by

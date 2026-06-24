@@ -161,11 +161,14 @@ def remote(role_cls, **kwargs):
 
 
 def _to_marker(value):
-    """Replace Handle values with serializable HandleRef markers."""
+    """Replace Handle values with serializable HandleRef markers.
+
+    Carries the source handle's ``sp_size`` so a dependent role inheriting this
+    sibling adopts the same (dp, sp) Ulysses rank layout (see ``HandleRef``)."""
     from unirl.distributed.group.handle import Handle, HandleRef
 
     if isinstance(value, Handle):
-        return HandleRef(role_name=value.role_name)
+        return HandleRef(role_name=value.role_name, sp_size=value.sp_size)
     return value
 
 

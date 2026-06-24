@@ -4,7 +4,7 @@ Registered under ``rollout/engine: composed_pe`` with ``_target_`` pointing at
 :class:`ComposedRolloutEngine`. The composed engine holds two child engines
 (``ar`` and ``diffusion``) and orchestrates the prompt-enhancement (PE)
 serial flow internally — it is a peer of the existing ``sglang``,
-``sglang_llm``, ``vllm_omni``, and ``trainside`` engines as far as the
+``sglang``, ``vllm_omni``, and ``trainside`` engines as far as the
 actor / pipeline layer is concerned.
 
 Each child (``ar`` / ``diffusion``) is a rollout engine config carrying its
