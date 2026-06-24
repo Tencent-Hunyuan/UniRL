@@ -56,6 +56,7 @@ exports the captured triple after the loop.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -97,6 +98,8 @@ class BagelFlowSDEScheduler:
         self._sde_indices_set: Optional[frozenset] = None
         self._trajectory_dtype: torch.dtype = torch.float32
         self._step_index: int = 0
+        # generator is required instead of the reseeded global RNG.
+        self._noise_generator: Optional[torch.Generator] = None
         # Capture buffers (cleared each request).
         self._traj_latents: List[torch.Tensor] = []
         self._traj_timesteps: List[torch.Tensor] = []
@@ -150,6 +153,7 @@ class BagelFlowSDEScheduler:
             self._sigma_max = float(sigma_max)
         self._trajectory_dtype = trajectory_dtype
         self._step_index = 0
+        self._noise_generator = None
         self._traj_latents = []
         self._traj_timesteps = []
         self._traj_log_probs = []
@@ -236,8 +240,33 @@ class BagelFlowSDEScheduler:
                 sample_f32 * (1 + std_dev_t**2 / (2 * sigma) * dt_t)
                 + v_t_f32 * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt_t
             )
+            # Draw z_t from a PER-REQUEST generator, NOT the global RNG
+            # (``generator=None``). ``pipeline_bagel`` reseeds the global torch
+            # RNG to ``sampling_params.seed`` at the start of EVERY request
+            # (pipeline_bagel.py: torch.manual_seed(seed)), and each GRPO-group
+            # sample is a separate bs=1 request reseeded to the SAME value. With
+            # the global RNG that made the per-step z_t identical across the whole
+            # group → frozen exploration noise → broke GRPO's sample independence
+            # → grad-norm spikes → reward regressed after ~100 rollouts. A
+            # dedicated generator seeded from ``os.urandom`` is independent of the
+            # reseeded global RNG, so every group sample gets its own z_t (the
+            # trainside path never reseeds per request, so this restores parity).
+            #
+            # Correct for cfg_parallel_size=1 (the current recipe): CFG is
+            # combined on a single rank, so z_t is drawn once per step here.
+            # cfg_parallel_size>1 would need care — with CFG branches on separate
+            # ranks, os.urandom gives each rank a different z_t and the branches
+            # diverge; there z_t must be drawn deterministically (seed by
+            # (base_seed, group_id, step) on every rank, or draw on rank 0 and
+            # broadcast across cfg_group like x_t).
+            if self._noise_generator is None:
+                self._noise_generator = torch.Generator(device=v_t_f32.device)
+                self._noise_generator.manual_seed(int.from_bytes(os.urandom(8), "big"))
             noise = randn_tensor(
-                v_t_f32.shape, generator=None, device=v_t_f32.device, dtype=torch.float32
+                v_t_f32.shape,
+                generator=self._noise_generator,
+                device=v_t_f32.device,
+                dtype=torch.float32,
             )
             std_var = std_dev_t * torch.sqrt(-dt_t)
             prev_sample = prev_sample_mean + std_var * noise
