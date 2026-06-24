@@ -16,16 +16,16 @@ from; family-specific sub-adapters carry the family prefix and live in the
 family file.
 """
 
+from unirl.rollout.engine.vllm_omni.adapters.bagel import (
+    BagelInputAdapter,
+    BagelOutputAdapter,
+    BagelT2iAdapter,
+)
 from unirl.rollout.engine.vllm_omni.adapters.base import (
     ModelAdapter,
     get_adapter,
     register_adapter,
     registered_adapters,
-)
-from unirl.rollout.engine.vllm_omni.adapters.bagel import (
-    BagelInputAdapter,
-    BagelOutputAdapter,
-    BagelT2iAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import (
