@@ -29,11 +29,11 @@ transport_kind: colocate_store
 workers_per_device: 1
 
 logging:
-  report_to_wandb: true
-  project_name: bagel-pickscore-lora
-  run_name: unirl_main_bagel_pickscore_lora_bs16_g16_cfg1_u2_v3eq_reuse
-  entity: gxhe-rl
-  tags: [bagel, pickscore, lora, trainside, cfg1, migration, official-bagel, rl_ops, reuse, v3eq, fp32master]
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
 
 bundle:
   _target_: unirl.models.bagel.bundle.BagelBundle.from_config
@@ -41,16 +41,16 @@ bundle:
     _target_: unirl.models.bagel.config.BagelPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}   # set BAGEL_PATH to a pod-local copy for faster load
     model_precision: bf16
-    # v3-equivalent: bf16 heads + bf16 transformer compute under autocast bf16 (no
-    # fp32-heads → vendor stays byte-pristine). fp32 LoRA master (below) is the only
-    # precision lever — it is THE reward-collapse fix.
     shift: 3.0
     use_lora: true
 
 pipeline:
   _target_: unirl.models.bagel.pipeline.BagelPipeline
+  # v3-equivalent: bf16 heads + bf16 transformer compute under autocast bf16 (no
+  # fp32-heads → vendor stays byte-pristine). fp32 LoRA master (below) is the only
+  # precision lever — it is THE reward-collapse fix.
   autocast_precision: bf16
-  trajectory_precision: fp32
+  trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
   logprob_precision: fp32
   shift: 3.0
   # Shared SDE step kernel (flow-matching SDE + log-prob) — reused from UniRL, not a
@@ -130,7 +130,7 @@ algorithm:
   clip_schedule: constant
   # Bagel samples and trains at bs=1 (same micro-geometry), so the rollout's
   # stored sde_logp is a valid pi_old anchor → ratio=1 on update 1 without replay.
-  old_logp_source: native
+  old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.bagel.conditions.BagelDiffusionConditions
@@ -162,7 +162,7 @@ sampling:
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0
   cfg_renorm_type: global
-  eta: 0.7                            # SDE noise scale (= flow_grpo noise_level); consumed by FlowSDEStrategy
+  eta: 1.0                             # SDE noise scale (= flow_grpo noise_level); consumed by FlowSDEStrategy
   samples_per_prompt: 16
   height: 512
   width: 512

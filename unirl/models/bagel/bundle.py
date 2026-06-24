@@ -3,8 +3,10 @@
 Implements the empty :class:`Bundle` Protocol. Pure container of the modules
 BAGEL ships with for text-to-image: one MoT transformer (``Bagel`` wrapping a
 ``Qwen2ForCausalLM`` whose ``Qwen2MoTDecoderLayer`` blocks hold both und and gen
-experts) + one FLUX-style VAE + one tokenizer. The und ViT path is disabled
-(``visual_und=False``) — T2I needs only the gen expert + VAE.
+experts) + one FLUX-style VAE + one tokenizer. The und ViT tower is opt-in
+(``config.enable_vit`` → ``visual_und=True``): pure T2I needs only the gen
+expert + VAE; image-INPUT tasks (it2i editing / i2t / it2t) need the ViT to
+prefill image semantics into the KV context.
 
 LoRA injection / FSDP wrap / autocast lifecycle are owned outside the bundle
 (the train backend), so ``from_config`` only loads + freezes. The trainable
@@ -32,7 +34,14 @@ from .vendor.data.data_utils import add_special_tokens
 from .vendor.data.transforms import ImageTransform
 from .vendor.inferencer import InterleaveInferencer
 from .vendor.modeling.autoencoder import load_ae
-from .vendor.modeling.bagel import Bagel, BagelConfig, Qwen2Config, Qwen2ForCausalLM
+from .vendor.modeling.bagel import (
+    Bagel,
+    BagelConfig,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+)
 from .vendor.modeling.qwen2 import Qwen2Tokenizer
 
 # FSDP wrap block class for the MoT decoder (recipe backend.block_class_names).
@@ -83,7 +92,7 @@ class BagelBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: BagelPipelineConfig) -> "BagelBundle":
-        """Load BAGEL-7B-MoT (gen-only) from a local checkpoint directory.
+        """Load BAGEL-7B-MoT (gen + optional und ViT) from a local checkpoint dir.
 
         Replicates flow_grpo/train_bagel.py:316-414 minus LoRA/optimizer (which
         the train backend owns). Loads the EMA weights via
@@ -111,11 +120,20 @@ class BagelBundle(Bundle):
 
         vae_model, vae_config = load_ae(local_path=os.path.join(model_dir, "ae.safetensors"))
 
+        vit_config = None
+        if config.enable_vit:
+            # Official inference setup (ByteDance-Seed/Bagel app.py @ vendored
+            # commit a2fa77d): no RoPE, drop the last SigLIP layer; the checkpoint
+            # stores the patch embedding as a Linear (converted below, pre-load).
+            vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_dir, "vit_config.json"))
+            vit_config.rope = False
+            vit_config.num_hidden_layers -= 1
+
         bagel_config = BagelConfig(
             visual_gen=True,
-            visual_und=False,
+            visual_und=config.enable_vit,
             llm_config=llm_config,
-            vit_config=None,
+            vit_config=vit_config,
             vae_config=vae_config,
             vit_max_num_patch_per_side=70,
             connector_act="gelu_pytorch_tanh",
@@ -125,7 +143,10 @@ class BagelBundle(Bundle):
 
         with init_empty_weights():
             language_model = Qwen2ForCausalLM(llm_config)
-            model = Bagel(language_model, None, bagel_config)
+            vit_model = SiglipVisionModel(vit_config) if config.enable_vit else None
+            model = Bagel(language_model, vit_model, bagel_config)
+            if config.enable_vit:
+                model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 
         # force_hooks=True attaches accelerate AlignDevicesHooks (matching
         # flow_grpo/train_bagel.py) so the vendored inferencer / generate_image

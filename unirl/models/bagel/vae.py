@@ -126,7 +126,14 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
         spatial = unpatchify_latent(clean.float(), h=h, w=w, patch_size=p, latent_channels=z)
         with torch.no_grad():
-            decoded = self.bundle.vae.to(torch.float32).decode(spatial)
+            vae = self.bundle.vae
+            orig_dtype = next(vae.parameters()).dtype
+            decoded = vae.to(torch.float32).decode(spatial)
+            # Restore the VAE's loaded dtype: the image-edit path also ENCODES the
+            # source with this shared VAE on the next rollout, and a left-over fp32
+            # cast would make encode emit fp32 latents that mismatch the bf16 vae2llm.
+            if orig_dtype != torch.float32:
+                vae.to(orig_dtype)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         return Images(pixels=pixels)
 
