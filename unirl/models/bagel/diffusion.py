@@ -316,9 +316,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             cfg_img = inf.update_context_text(clean_prompt, cfg_img)
         return gen, cfg_text, cfg_img
 
-    def _resolve_single(
-        self, conditions: BagelDiffusionConditions
-    ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
 
         Two sources, transparently:
