@@ -77,6 +77,16 @@ def _audio_packed_feature_dim() -> int:
     return _LTX2_AUDIO_LATENT_CHANNELS * (_LTX2_AUDIO_MEL_BINS // _LTX2_AUDIO_MEL_COMPRESSION)
 
 
+def audio_latent_shape(params: DiffusionSamplingParams) -> Tuple[int, int]:
+    """Per-sample PACKED audio-latent shape ``(audio_t, 128)`` — the geometry the
+    LTX-2 audio stream is allocated with. Exposed so the pipeline can resolve a
+    matching audio x_T from the video NoiseRecipe
+    (``recipe.resolve(salt="audio", latent_shape=…)``).
+    """
+    audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+    return (audio_t, _audio_packed_feature_dim())
+
+
 class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
     """Per-step LTX2 denoising kernel — stateless.
 
@@ -235,6 +245,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         params: DiffusionSamplingParams,
         sigmas: torch.Tensor,
         initial_latents: torch.Tensor,
+        initial_audio_latents: Optional[torch.Tensor] = None,
         sde_indices: Optional[List[int]] = None,
     ) -> LatentSegment:
         """Run the full denoising loop, collecting trajectory for RL.
@@ -244,6 +255,9 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
             params: Sampling parameters (guidance_scale, eta, etc.).
             sigmas: Sigma schedule (T+1,) from high → 0.
             initial_latents: Starting noise (B, seq, C) or (B, C, T, H, W).
+            initial_audio_latents: Driver-authoritative audio x_T (B, audio_t,
+                128) resolved by the pipeline from the same NoiseRecipe as video.
+                ``None`` falls back to a bare randn (non-pipeline/test callers).
             sde_indices: Which steps to use SDE (stochastic) for RL.
 
         Returns:
@@ -273,15 +287,17 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         needed.add(num_steps)
 
         x = initial_latents.to(dtype=self.trajectory_dtype)
-        # Audio latent stream: fresh N(0,1) noise, packed shape (B, audio_t, 128).
-        # ODE-denoised in lockstep with video (no RL gradient). diffusers seeds
-        # this from randn too (prepare_audio_latents); we don't need byte-exact
-        # cross-engine audio since it's an internal conditioning signal.
-        a = torch.randn(
-            (int(x.shape[0]), audio_t, _audio_packed_feature_dim()),
-            device=device,
-            dtype=self.trajectory_dtype,
-        )
+        # Audio x_T (B, audio_t, 128): driver-authoritative noise from the
+        # pipeline (same recipe as video → reproducible, off the global RNG
+        # stream); bare randn only when a caller doesn't supply one.
+        if initial_audio_latents is not None:
+            a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
+        else:
+            a = torch.randn(
+                (int(x.shape[0]), audio_t, _audio_packed_feature_dim()),
+                device=device,
+                dtype=self.trajectory_dtype,
+            )
         stored_pairs: List[tuple] = []
         stored_audio: List[torch.Tensor] = []
         if 0 in needed:
