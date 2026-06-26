@@ -330,11 +330,15 @@ class MultimodalRLDataSource:
 
         return batch
 
-    def get_eval_samples(self, batch_size: int) -> Dict[str, Any]:
+    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
         """Get a stable eval batch from the dedicated evaluation prompt source."""
         batch_size = max(0, int(batch_size))
         if batch_size == 0:
-            return {"prompts": []}
+            return RolloutInputs(
+                primitives={"text": Texts(texts=[])},
+                sample_ids=[],
+                group_ids=[],
+            )
 
         self._ensure_eval_dataset()
         if self.eval_dataset is None:
@@ -407,7 +411,12 @@ class DefaultDataSource:
             group_ids=[f"prompt:{i}" for i in range(len(prompts))],
         )
 
-    def get_eval_samples(self, batch_size: int) -> Dict[str, List[str]]:
+    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
         """Get a stable eval batch."""
         batch_size = max(0, int(batch_size))
-        return {"prompts": self.prompts[:batch_size]}
+        prompts = self.prompts[:batch_size]
+        return RolloutInputs(
+            primitives={"text": Texts(texts=prompts)},
+            sample_ids=[f"prompt:{i}:sample:0" for i in range(len(prompts))],
+            group_ids=[f"prompt:{i}" for i in range(len(prompts))],
+        )

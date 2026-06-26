@@ -432,13 +432,25 @@ class DiffusionTrainer(BaseTrainer):
         the KV/decoded on the driver.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
-        # (mirrors the AR trainer's evaluate()).
-        eval_diffusion = dataclasses.replace(
-            self.sampling_params.get("diffusion"),
+        # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
+        # on Bagel's sampling params; for the standard DiffusionSamplingParams
+        # (Qwen-Image, SD3, ...) the CFG strength lives in ``guidance_scale``,
+        # so fall back to that when the field is absent. ``sde_indices=[]`` forces
+        # the ODE forward branch (eval measures final-sample quality, not per-step
+        # logp) and sidesteps the shared_field chunk-slice mismatch (sde_indices
+        # is shared_field on RolloutReq — does NOT slice per chunk).
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs = dict(
             samples_per_prompt=self.eval_samples_per_prompt,
-            cfg_text_scale=self.eval_cfg_text_scale,
             eta=self.eval_eta,
+            sde_indices=[],  # eval runs forward/ODE — no SDE step subset
+            scheduler=None,  # bypass resolve_sde_indices's scheduler branch
         )
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         n_prompts = len(all_inputs.sample_ids)
@@ -447,10 +459,29 @@ class DiffusionTrainer(BaseTrainer):
         self.rollout.wake_up()
         if self.weight_sync is not None:
             self.weight_sync.sync()
+        # Same colocate-FSDP-offload gate as train_step: free the train state for
+        # the memory-heavy generate when a SEPARATE engine does the rollout.
+        _do_fsdp_offload = (
+            self._enable_fsdp_offload
+            and self._layout != "separate"
+            and not self._rollout_is_trainside
+            and not self._uses_ema  # _uses_ema == "is DiffusionNFT"
+        )
+        if _do_fsdp_offload:
+            self.backend.offload()
+        # DiffusionNFT samples under the EMA ("old") adapter. For the trainside
+        # engine (reuses THIS process's model), swap in place around each chunk's
+        # generate and restore "default" after. Separate engines already received
+        # "old" via weight_sync.sync() above. No-op for GRPO (gated on _uses_ema).
+        _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             req = self._build_req(sub, step, base_sampling=eval_sp)
+            if _inproc_ema_swap:
+                self.backend.apply_eval_ema()
             resp = self.rollout.generate(req)
+            if _inproc_ema_swap:
+                self.backend.restore_from_eval()
             for name, track in list(resp.tracks.items()):
                 if track.segment is not None:
                     resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
@@ -460,6 +491,10 @@ class DiffusionTrainer(BaseTrainer):
                     reward_sum += float(rewards.sum().item())
                     reward_n += int(rewards.numel())
                     break  # single-track for now; revisit if multi-track lands
+            # Free decoded media each chunk so it doesn't accumulate across chunks.
+            self._drop_decoded(req, resp, rollout_id=step)
+        if _do_fsdp_offload:
+            self.backend.onload()
         self.rollout.sleep()
         mean_reward = reward_sum / max(1, reward_n)
         logger.info(
