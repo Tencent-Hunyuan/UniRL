@@ -58,7 +58,6 @@ from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_req
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
-from unirl.types.sampling import get_diffusion_params
 
 
 class BagelInputAdapter(DitInputAdapter):
@@ -86,7 +85,7 @@ class BagelInputAdapter(DitInputAdapter):
         ride ``extra_args``; the driver-authoritative x_T recipe is packed in.
         """
         texts = texts_from_req(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
 
         T = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
@@ -168,7 +167,7 @@ class BagelOutputAdapter(DitOutputAdapter):
         """
         del per_request
         texts = texts_from_req(req)
-        diff_params = get_diffusion_params(req.sampling_params)
+        diff_params = req.sampling_params.get("diffusion")
         image_shape = (int(diff_params.height), int(diff_params.width))
         prompts = list(texts.texts)
         conditions = BagelDiffusionConditions(
