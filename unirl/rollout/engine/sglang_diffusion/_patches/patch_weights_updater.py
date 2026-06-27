@@ -133,6 +133,7 @@ def _apply_fused_param_mapping(module, named_tensors):
     model_params = dict(module.named_parameters())
     leftover: list = []
     fused = renamed = dropped = 0
+    unmatched: list = []
     for name, tensor in named_tensors:
         if name in model_params:
             leftover.append((name, tensor))
@@ -165,6 +166,13 @@ def _apply_fused_param_mapping(module, named_tensors):
                     break
                 # rename produced a non-param name; keep trying other patterns.
         if not handled:
+            # Reached only by tensors that are NOT a model param (exact matches
+            # were taken above) and matched no fused/rename rule. The exact-match
+            # loader will silently drop these — which is exactly the stale-weights
+            # failure mode this function exists to prevent. Track them and warn
+            # loudly below so a future model's incomplete mapping surfaces in the
+            # log instead of as a mysteriously flat reward curve.
+            unmatched.append(name)
             leftover.append((name, tensor))
     if fused or renamed or dropped:
         _log.info(
@@ -172,6 +180,14 @@ def _apply_fused_param_mapping(module, named_tensors):
             fused,
             renamed,
             dropped,
+        )
+    if unmatched:
+        _log.warning(
+            "weight-sync: %d tensor(s) matched no param_names_mapping rule and are not model "
+            "params — they will NOT be loaded into the rollout engine (stale-weight risk). "
+            "First few: %s",
+            len(unmatched),
+            unmatched[:5],
         )
     return leftover
 
