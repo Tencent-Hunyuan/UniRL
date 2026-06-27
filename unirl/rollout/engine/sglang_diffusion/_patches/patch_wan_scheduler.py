@@ -56,3 +56,25 @@ def patch_wan_scheduler() -> None:
 
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
     WanPipeline.initialize_pipeline = initialize_pipeline
+
+    # WAN 2.2-A14B dual-expert: sglang's dual-transformer denoising path wraps the
+    # scheduler/cache so that ``DenoisingStage.prepare_extra_func_kwargs`` inspects a
+    # step with a generic ``**kwargs`` signature. That helper only FILTERS its
+    # {generator, eta, batch} dict when the inspected step has NO var-kwargs, so with
+    # the wrapper it stops filtering and leaks the diffusers-style ``eta`` (= batch.eta)
+    # into the call. The RL-mixin ``step`` has no ``eta`` param — SDE strength comes from
+    # ``batch`` + the driver-pinned σ schedule, not ``eta`` — and raises
+    # "unexpected keyword argument 'eta'". (wan21 single-transformer keeps the explicit
+    # step signature, so eta is filtered and never reaches here.) Drop the stray ``eta``
+    # so the dual-expert path matches wan21 semantics. The wrapper itself takes
+    # ``**kwargs`` and pops only ``eta`` → identical {generator, batch} reaches the real
+    # step for every family; a strict no-op wherever eta was already filtered.
+    step_orig = FlowMatchEulerDiscreteScheduler.step
+    if not getattr(step_orig, "_unirl_drop_eta", False):
+
+        def step(self, *args, **kwargs):
+            kwargs.pop("eta", None)
+            return step_orig(self, *args, **kwargs)
+
+        step._unirl_drop_eta = True  # type: ignore[attr-defined]
+        FlowMatchEulerDiscreteScheduler.step = step
