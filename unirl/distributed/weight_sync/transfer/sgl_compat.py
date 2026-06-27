@@ -68,7 +68,13 @@ def monkey_patch_torch_reductions():
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
+    # The device-index arg (and its uuid round-trip on rebuild) exists ONLY on the
+    # CUDA-IPC reduce path. CPU tensors reduce to a SHORTER tuple via a different
+    # rebuild fn — index 6 is out of range there. Guard so CPU-staged tensors
+    # (UNIRL_SYNC_CPU_STAGE, for kernels without pidfd_getfd) pass through
+    # untouched instead of raising ``IndexError: tuple index out of range``.
+    if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
     return output_fn, output_args
 
 
