@@ -169,6 +169,12 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
+            patch_safe_unpickler,
+        )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
+            patch_wan_scheduler,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_weights_updater import (
             patch_weights_updater,
         )
@@ -198,5 +204,7 @@ class SglangDiffusionHijack:
             patch_dance,
             patch_set_timesteps,
             patch_vae_decode_safe,
+            patch_wan_scheduler,
+            patch_safe_unpickler,
         ):
             _safe_apply(patch)

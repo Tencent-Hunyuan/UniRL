@@ -24,7 +24,7 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, Video, Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 from unirl.types.trajectory_store import compute_trajectory_positions
@@ -234,17 +234,12 @@ def _native_sde_logp(
 # ---------------------------------------------------------------------------
 
 
-def stack_decoded_images(
-    results: Sequence[RawResult],
-    *,
-    squeeze_single_frame_4d: bool = True,
-) -> Optional[Images]:
+def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
     """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
 
-    Image-output adapters may opt into squeezing a singleton temporal axis
-    ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
-    run through the legacy image path should disable this so a true single-frame
-    video is dropped like any other 4-D video sample.
+    4-D (video) samples are dropped with a warning — there is no video reward
+    consumer yet, so packing them as ``Videos`` is deferred (matches the old
+    engine's behavior for every family).
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -254,8 +249,6 @@ def stack_decoded_images(
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
-        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
-            per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
         else:
@@ -264,12 +257,44 @@ def stack_decoded_images(
             )
     if skipped_video:
         logger.warning(
-            "SGLang result contained multi-frame 4D video samples while decoding "
-            "an image track; dropping samples that cannot be represented as Images."
+            "SGLang result contained 4D (video) samples — Videos primitive packing "
+            "is not yet implemented in the response translator; dropping. "
+            "Add a Videos branch when a video reward consumer lands."
         )
     if not per_sample_tensors:
         return None
     return Images(pixels=torch.stack(per_sample_tensors, dim=0))
+
+
+def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
+    """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch.
+
+    The video counterpart of :func:`stack_decoded_images`. ``decode_sample``
+    returns canonical channels-first video ``[C, T, H, W]`` (see
+    :func:`unirl.rollout.engine.sglang_diffusion.utils.tensors.normalize_media`);
+    the :class:`~unirl.types.primitives.Video` primitive — and the video reward
+    consumer (``video_pickscore``, which permutes ``frames[T,C,H,W] → [C,T,H,W]``)
+    — want frame-major ``[T, C, H, W]``, so we permute before packing.
+    ``Videos.from_list`` concatenates along T and lets the Batch framework
+    compute the per-sample ``cu_frames`` offsets. Each result carries exactly
+    one decoded sample (mirrors :func:`stack_decoded_images`'s one-per-result
+    contract). Returns ``None`` when no recognizable video was produced.
+    """
+    videos: List[Video] = []
+    for result in results:
+        canonical = decode_sample(result.samples)
+        if canonical is None:
+            continue
+        if canonical.dim() != 4:
+            raise RuntimeError(
+                f"stack_decoded_videos: expected 4-D canonical video [C, T, H, W]; "
+                f"got rank {canonical.dim()}, shape {tuple(canonical.shape)}."
+            )
+        frames = canonical.permute(1, 0, 2, 3).contiguous().to(torch.float32)  # [T, C, H, W]
+        videos.append(Video(frames=frames))
+    if not videos:
+        return None
+    return Videos.from_list(videos)
 
 
 # ---------------------------------------------------------------------------
@@ -405,5 +430,6 @@ __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
     "stack_decoded_images",
+    "stack_decoded_videos",
     "fuse_text_conditions",
 ]
