@@ -46,6 +46,21 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
     return torch.cat(latents, dim=0)
 
 
+def collect_aux_trajectory_latents(results: Sequence[RawResult]) -> Optional[torch.Tensor]:
+    """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim.
+
+    Returns ``None`` when no result carries one (non-LTX-2 families); requires all
+    results to agree (present or absent) so a partial set never silently mis-aligns
+    the per-sample audio the trainside replay cross-attends to.
+    """
+    auxes = [getattr(r, "aux_trajectory_latents", None) for r in results]
+    present = [a is not None for a in auxes]
+    if not any(present):
+        return None
+    require(all(present), "SGLang results inconsistent: some carry aux_trajectory_latents, some do not")
+    return torch.cat([a.detach().cpu() for a in auxes], dim=0)
+
+
 def validate_packed_trajectory(
     traj: torch.Tensor,
     req: RolloutReq,
@@ -139,6 +154,7 @@ def build_latent_segment(
     sde_indices: Optional[List[int]],
     emit_native_logprob: bool,
     segment_factory: Callable[..., LatentSegment] = make_image_segment,
+    aux_trajectory: Optional[torch.Tensor] = None,
 ) -> LatentSegment:
     """Pack an (already-unpacked) trajectory tensor into one batched ``LatentSegment``.
 
@@ -146,6 +162,10 @@ def build_latent_segment(
     passes ``make_video_segment``. The caller owns the model-specific unpack of
     ``trajectories_tensor`` (e.g. Klein); this function is shape-agnostic past
     the T+1 invariant.
+
+    ``aux_trajectory`` (LTX-2 audio, ``[B, T+1, ...]``) — when present it is stored
+    as ``segment.aux_latents`` and column-trimmed in lockstep with the video latents
+    so ``aux_latents_at(step)`` and ``latents_at(step)`` index the same sparse steps.
     """
     sigmas, step_indices = derive_timestep_alignment(
         trajectories_tensor=trajectories_tensor,
@@ -167,6 +187,10 @@ def build_latent_segment(
         if keep_cols and len(keep_cols) < traj_len:
             trajectories_tensor = trajectories_tensor[:, keep_cols]
             indices_t = torch.tensor(keep_cols, dtype=torch.long)
+            # Trim the audio trajectory to the SAME kept columns so it stays indexed
+            # by the same sparse positions as the video latents.
+            if aux_trajectory is not None and aux_trajectory.shape[1] == traj_len:
+                aux_trajectory = aux_trajectory[:, keep_cols]
 
     # sde_indices: always populated (trainer needs to know which steps to replay).
     # sde_logp: best-effort native emission; whether it is used or recomputed is
@@ -186,6 +210,7 @@ def build_latent_segment(
         indices=indices_t,
         sde_logp=sde_logp,
         sde_indices=sde_indices_t,
+        aux_latents=aux_trajectory,
     )
 
 
@@ -234,12 +259,17 @@ def _native_sde_logp(
 # ---------------------------------------------------------------------------
 
 
-def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
+def stack_decoded_images(
+    results: Sequence[RawResult],
+    *,
+    squeeze_single_frame_4d: bool = True,
+) -> Optional[Images]:
     """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
 
-    4-D (video) samples are dropped with a warning — there is no video reward
-    consumer yet, so packing them as ``Videos`` is deferred (matches the old
-    engine's behavior for every family).
+    Image-output adapters may opt into squeezing a singleton temporal axis
+    ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
+    run through the legacy image path should disable this so a true single-frame
+    video is dropped like any other 4-D video sample.
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -249,6 +279,8 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
+        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
+            per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
         else:
@@ -257,9 +289,8 @@ def stack_decoded_images(results: Sequence[RawResult]) -> Optional[Images]:
             )
     if skipped_video:
         logger.warning(
-            "SGLang result contained 4D (video) samples — Videos primitive packing "
-            "is not yet implemented in the response translator; dropping. "
-            "Add a Videos branch when a video reward consumer lands."
+            "SGLang result contained multi-frame 4D video samples while decoding "
+            "an image track; dropping samples that cannot be represented as Images."
         )
     if not per_sample_tensors:
         return None

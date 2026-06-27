@@ -107,11 +107,24 @@ class LTX2TextEmbedStage:
         padding_side="left")`` returns a 3-tuple
         ``(video_text_embedding, audio_text_embedding, binary_attn_mask)``.
         """
-        padding_side = getattr(self.tokenizer, "padding_side", "left")
+        # diffusers-version robustness: newer ``LTX2TextConnectors.forward`` takes a
+        # ``padding_side`` kwarg, but the installed diffusers (0.37.0) signature is
+        # ``(hidden_states, attention_mask, additive_mask=False)`` and rejects it.
+        # The tokenizer is already pinned to left-padding (see ``__init__``), so the
+        # packed hidden states are correctly oriented; only pass ``padding_side``
+        # when the bound connector actually accepts it.
+        import inspect
+
+        conn_kwargs = {}
+        try:
+            if "padding_side" in inspect.signature(self.connectors.forward).parameters:
+                conn_kwargs["padding_side"] = getattr(self.tokenizer, "padding_side", "left")
+        except (TypeError, ValueError):  # pragma: no cover - exotic forward; fall back to no kwarg
+            pass
         video_embeds, audio_embeds, conn_mask = self.connectors(
             packed_hidden,
             attention_mask,
-            padding_side=padding_side,
+            **conn_kwargs,
         )
         return video_embeds, audio_embeds, conn_mask
 

@@ -1,0 +1,200 @@
+# @package _global_
+# LTX-2 T2V GRPO + SGLang rollout (colocate, LoRA-train + merged full-weight push).
+#
+# Video FlowGRPO with the rollout served by the ``sglang_diffusion`` engine
+# (LTX-2 pipeline in SGLang's multimodal_gen runtime) instead of the trainside
+# sampler. The trainside trains a LoRA adapter (backend.lora_cfg); the sync folds
+# it into the base and pushes the merged FULL weights via TensorWeightSync
+# (lora_merged=true) through the fused-shard-aware updater. sglang serves a plain
+# (full) transformer (model_config.use_lora=false). Mirrors
+# hunyuan_video_t2v_sglang_loramerge on the LTX-2 ~2.4B T2V DiT + video_pickscore.
+#
+#   bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_t2v_sglang_loramerge
+#
+# VALIDATION TODO (first LTX-2 sglang config): confirm the sglang LTX-2 server
+# boots + returns text embeds in the format Ltx2T2VAdapter expects (Gemma3 →
+# connector ``video_embeds`` vs raw Gemma — see the adapter docstring) with a
+# 1-rollout EMBED dump, and confirm the LTX-2 DiT param_names_mapping fuses
+# correctly through the weight-sync, before trusting the curve.
+
+num_devices: 8
+batch_size: 4
+adv_use_global_std: true
+num_rollouts: 1000
+
+model_config:
+  _target_: unirl.models.ltx2.config.LTX2PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Lightricks/LTX-2}
+  model_precision: bf16
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  shift: 1.0
+  max_sequence_length: 512
+  enable_audio: false
+  default_height: 512
+  default_width: 768
+  default_num_frames: 33
+  default_frame_rate: 24.0
+  use_lora: false             # sglang serves a plain (merged full) transformer
+  # Park the frozen aux components (VAE, Gemma3, connectors) on CPU on the
+  # trainside: with sglang doing all generation/encode/decode, the trainside only
+  # replays the DiT, so these non-FSDP modules are dead weight that would otherwise
+  # stay GPU-resident during sglang generation and OOM the colocate DiT-resume.
+  aux_components_on_cpu: true
+
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.ltx2.bundle.LTX2Bundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.ltx2.pipeline.LTX2Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["LTX2VideoTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: ltx2
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    forward_batch_size: 1
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    # LTX-2 colocate memory: the trainside process (~38GB: DiT + Gemma3 + 3D-VAE +
+    # connectors) plus the sglang server's generation footprint overflow a single
+    # 95GB GPU during the denoise/decode step. Offload the sglang 3D-VAE decode (the
+    # generation-time memory spike) to CPU — the DiT already rides the default
+    # dit_cpu_offload. NOTE: dit_layerwise_offload also fits but streams every DiT
+    # layer per step → generation so slow the sglang scheduler times out; VAE-only
+    # offload keeps it fast enough.
+    engine_kwargs:
+      vae_cpu_offload: true
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 4
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.ltx2.conditions.LTX2Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 768
+  num_frames: 33
+  eta: 0.7
+  samples_per_prompt: 4
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 5
+    timestep_fraction: [0.0, 0.5]
+
+weight_sync_interval: 1
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: true
+  adapter_name: default
+  bucket_size_mb: 512
+  flush_cache: true
+  name_remap: {"*": "transformer.*"}
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-ltx2-t2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,ltx2_t2v_sglang_loramerge}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["ltx2", "t2v", "grpo", "video", "pickscore", "sglang", "loramerge"]
+  log_media: false
