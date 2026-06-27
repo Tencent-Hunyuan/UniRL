@@ -98,4 +98,50 @@ class MochiAdapter(ImageAdapter):
 
 
 
-__all__ = ["VideoAdapter", "MochiAdapter", "Ltx2T2VAdapter"]
+
+@register_adapter("hunyuan_video")
+class HunyuanVideoAdapter(VideoAdapter):
+    """HunyuanVideo-1.0 T2V — proper video output (6-D trajectory → ``Videos``),
+    consumed by ``video_pickscore``. Like ``Wan21T2VAdapter``, the text/conditions
+    path is the generic fuse from ``ImageAdapter`` (HunyuanVideo uses an LLM text
+    encoder + CLIP pooled embed; both flow through the multi-encoder fuse), and
+    only the ``VideoAdapter`` output-shape overrides apply. sglang resolves the
+    HunyuanVideo pipeline from ``model_path``."""
+
+    def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
+        """Split HunyuanVideo's TWO text encoders into separate conditions.
+
+        sglang returns both encoders stuffed into ``prompt_embeds`` as a list
+        ``[LLaMA [B, seq, 4096], CLIP-pooled [B, 1, 768]]`` (and
+        ``encoder_attention_mask`` likewise ``[LLaMA_mask, CLIP_mask]``). The
+        transformer wants them SEPARATE — LLaMA as ``encoder_hidden_states``
+        (``text_llama``) and the CLIP pooled vector as ``pooled_projections``
+        (``pooled_clip``). The generic single-stream fuse (``ImageAdapter``)
+        would ``cat`` the 4096-d and 768-d streams on the seq axis and crash, so
+        route them here into the keys ``HunyuanVideoConditions.from_dict`` wants.
+        """
+        llama_list: List[torch.Tensor] = []
+        mask_list: List[torch.Tensor] = []
+        clip_list: List[torch.Tensor] = []
+        for r in results:
+            pe = r.prompt_embeds
+            require(
+                isinstance(pe, (list, tuple)) and len(pe) >= 2,
+                "HunyuanVideo: expected prompt_embeds=[LLaMA, CLIP-pooled]; got "
+                f"{type(pe).__name__} len {len(pe) if isinstance(pe, (list, tuple)) else 'n/a'}",
+            )
+            llama_list.append(pe[0].detach().cpu())
+            # CLIP pooled arrives as [B, 1, 768] (token-shaped) → [B, 768].
+            clip_list.append(pe[1].detach().cpu().reshape(pe[1].shape[0], -1))
+            em = r.encoder_attention_mask
+            if isinstance(em, (list, tuple)) and em and em[0] is not None:
+                mask_list.append(em[0].detach().cpu())
+        llama = _cat_padded_rows(llama_list)
+        mask = _cat_padded_rows(mask_list) if mask_list else None
+        clip = torch.cat(clip_list, dim=0)
+        return {
+            "text_llama": TextEmbedCondition(embeds=llama, attn_mask=mask),
+            "pooled_clip": TextEmbedCondition(embeds=clip),
+        }
+
+__all__ = ["HunyuanVideoAdapter", "VideoAdapter", "MochiAdapter", "Ltx2T2VAdapter"]

@@ -265,6 +265,15 @@ class FlowSDEStrategy(SDEStrategy):
         from diffusers.utils.torch_utils import randn_tensor
 
         device = noise_pred.device
+        # cpu_offload (full-FT 13B) can leave the replayed trajectory ``sample`` and
+        # the scheduler ``sigma``/``sigma_next`` on a different device than the freshly
+        # computed ``noise_pred``; align them so the arithmetic below doesn't hit a
+        # cuda/cpu mismatch. No-op when everything is already colocated.
+        sample = sample.to(device)
+        sigma = sigma.to(device)
+        sigma_next = sigma_next.to(device)
+        if prev_sample is not None:
+            prev_sample = prev_sample.to(device)
         dt = sigma_next - sigma
         std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
@@ -394,6 +403,15 @@ class DanceSDEStrategy(SDEStrategy):
         from diffusers.utils.torch_utils import randn_tensor
 
         device = noise_pred.device
+        # cpu_offload (full-FT 13B) can leave the replayed trajectory ``sample`` and
+        # the scheduler ``sigma``/``sigma_next`` on a different device than the freshly
+        # computed ``noise_pred``; align them so the arithmetic below doesn't hit a
+        # cuda/cpu mismatch. No-op when everything is already colocated.
+        sample = sample.to(device)
+        sigma = sigma.to(device)
+        sigma_next = sigma_next.to(device)
+        if prev_sample is not None:
+            prev_sample = prev_sample.to(device)
         dt = sigma_next - sigma
         std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
