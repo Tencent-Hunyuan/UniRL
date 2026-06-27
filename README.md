@@ -74,6 +74,7 @@ dimension; all listed models are supported (✅).
 | WAN 2.2 | Video diffusion | Text / Image → Video | ✅ |
 | HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
 | LTX-Video-2 | Video diffusion | Text → Video | ✅ |
+| LTX-Video-2.3 | Video diffusion | Text → Audio + Video | ✅ |
 | Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
 | Qwen3 | LLM AR | Text → Text | ✅ |
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |

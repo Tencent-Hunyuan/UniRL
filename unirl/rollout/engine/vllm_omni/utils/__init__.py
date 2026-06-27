@@ -9,6 +9,7 @@ input/output sub-adapters; these are the mechanics they lean on.
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.prompts import (
+    grouped_texts_from_req,
     pil_images_from_req,
     texts_from_req,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "collect_dit_outputs",
     "core_diff_kwargs",
     "decoded_text_from_ar",
+    "grouped_texts_from_req",
     "grouped_pils_to_videos",
     "pack_initial_noise_extra_args",
     "pick_stage_output",

@@ -114,6 +114,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     taylor_cache_order: Optional[int] = None
     distilled_guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
+    strength: Optional[float] = None
 
     # --- backward compat (removed once all consumers migrate) ---
     num_samples_per_prompt: int = 1

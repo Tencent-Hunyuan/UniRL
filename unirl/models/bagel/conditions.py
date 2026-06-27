@@ -115,11 +115,22 @@ class BagelDiffusionConditions(Condition):
     gen_contexts: List[Any] = concat_field(default_factory=list)
     cfg_text_contexts: List[Any] = concat_field(default_factory=list)
     cfg_img_contexts: List[Any] = concat_field(default_factory=list)
+    prompts: List[Any] = concat_field(default_factory=list)
     image_shapes: List[Tuple[int, int]] = concat_field(default_factory=list)
 
     @property
     def batch_size(self) -> int:
-        return len(self.gen_contexts)
+        # Opaque-context path counts gen_contexts; deferred-prompt path (vllm_omni)
+        # has empty context lists, so fall back to the prompt count.
+        return len(self.gen_contexts) or len(self.prompts)
+
+    def has_contexts(self) -> bool:
+        """True when opaque KV contexts are present (trainside / colocate path).
+
+        False for the deferred-prompt (vllm_omni) path, where the stage must
+        rebuild the KV contexts from :attr:`prompts` on its own bundle.
+        """
+        return bool(self.gen_contexts) and self.gen_contexts[0] is not None
 
     @classmethod
     def for_sample(
@@ -129,6 +140,7 @@ class BagelDiffusionConditions(Condition):
         image_shape: Tuple[int, int],
         cfg_text_context: Optional[Any] = None,
         cfg_img_context: Optional[Any] = None,
+        prompt: Optional[str] = None,
     ) -> "BagelDiffusionConditions":
         """Build a single-sample conditions (1-element lists).
 
@@ -145,6 +157,7 @@ class BagelDiffusionConditions(Condition):
             gen_contexts=[gen_context],
             cfg_text_contexts=[cfg_text_context],
             cfg_img_contexts=[cfg_img_context],
+            prompts=[prompt],
             image_shapes=[tuple(image_shape)],
         )
 
@@ -161,6 +174,11 @@ class BagelDiffusionConditions(Condition):
             f"BagelDiffusionConditions.single: expected exactly 1 sample (navit bs=1; "
             f"set micro_batch_size=1), got {self.batch_size}.",
         )
+        require(
+            self.has_contexts(),
+            "BagelDiffusionConditions.single: no opaque KV contexts present "
+            "(deferred-prompt path). Rebuild from single_prompt() on a bundle first.",
+        )
         gen = self.gen_contexts[0]
         cfg_text = (
             self.cfg_text_contexts[0] if self.cfg_text_contexts and self.cfg_text_contexts[0] is not None else gen
@@ -168,6 +186,26 @@ class BagelDiffusionConditions(Condition):
         cfg_img = self.cfg_img_contexts[0] if self.cfg_img_contexts and self.cfg_img_contexts[0] is not None else gen
         image_shape = tuple(self.image_shapes[0])
         return gen, cfg_text, cfg_img, image_shape
+
+    def single_prompt(self) -> Tuple[str, Tuple[int, int]]:
+        """Return ``(prompt, image_shape)`` for a 1-sample deferred-prompt batch.
+
+        Used by the vllm_omni path: the stage rebuilds the three KV contexts from
+        this prompt on its own bundle. Raises if the batch isn't exactly one
+        sample or no prompt is present.
+        """
+        require(
+            self.batch_size == 1,
+            f"BagelDiffusionConditions.single_prompt: expected exactly 1 sample "
+            f"(navit bs=1; set micro_batch_size=1), got {self.batch_size}.",
+        )
+        require(
+            bool(self.prompts) and self.prompts[0] is not None,
+            "BagelDiffusionConditions.single_prompt: no prompt present; the rollout "
+            "adapter must ship prompts for the deferred-rebuild path.",
+        )
+        image_shape = tuple(self.image_shapes[0])
+        return str(self.prompts[0]), image_shape
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelDiffusionConditions":

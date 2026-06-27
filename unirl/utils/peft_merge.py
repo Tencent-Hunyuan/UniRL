@@ -164,6 +164,7 @@ def extract_lora_tensors(
     *,
     param_prefix: str = "",
     adapter_name: str = "default",
+    dtype: torch.dtype | None = None,
 ) -> dict[str, torch.Tensor]:
     """Extract LoRA tensors in canonical wire format.
 
@@ -174,6 +175,14 @@ def extract_lora_tensors(
     :func:`adapt_lora_for_vllm` re-adds the envelope for vllm-omni;
     :func:`adapt_lora_for_sglang` strips the prefix and injects ``.alpha``
     for SGLang.
+
+    ``dtype`` (optional) is the wire dtype: floating LoRA tensors are cast to it
+    shard-side in :func:`_to_full_tensor`, BEFORE the DTensor all-gather. This is
+    load-bearing under ``master_dtype=fp32`` (the reward-collapse fix): the
+    trainable LoRA params live in fp32, but the rollout engine's vLLM punica
+    kernel hard-asserts bf16/fp16 — so the caller passes the FSDP compute dtype
+    (``backend.weight_sync_dtype``) and the all-gather also moves half the bytes.
+    ``None`` keeps each tensor's own dtype (the prior all-bf16-master behavior).
     """
     result: dict[str, torch.Tensor] = {}
     prefix = str(param_prefix or "")
@@ -187,12 +196,14 @@ def extract_lora_tensors(
             if adapter != adapter_name:
                 break
             out_name = f"{prefix}{head}.{suffix}.weight"
-            result[out_name] = _to_full_tensor(param).detach().cpu()
+            result[out_name] = _to_full_tensor(param, dtype).detach().cpu()
             break
 
     # Defensive dtype check: vllm punica kernel hard-asserts inputs.dtype in
     # {fp16, bf16}. Catch fp32 LoRA here in trainer (cheap) rather than
-    # crashing ~20min later in rollout.
+    # crashing ~20min later in rollout. With ``dtype`` passed (the normal path)
+    # this never fires; it backstops a caller that forgot to thread the wire
+    # dtype while running master_dtype=fp32.
     _bad_dtype = [
         (k, v.dtype) for k, v in result.items() if ".lora_" in k and v.dtype not in (torch.bfloat16, torch.float16)
     ]
@@ -201,7 +212,8 @@ def extract_lora_tensors(
         raise RuntimeError(
             f"extract_lora_tensors: {len(_bad_dtype)} LoRA tensor(s) have "
             f"unsupported dtype for vllm punica kernel (expected bf16/fp16). "
-            f"Sample: [{sample}]. Check FSDP MixedPrecisionPolicy.param_dtype."
+            f"Sample: [{sample}]. Pass dtype=backend.weight_sync_dtype (or check FSDP "
+            f"MixedPrecisionPolicy.param_dtype)."
         )
 
     return result

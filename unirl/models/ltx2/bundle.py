@@ -126,14 +126,29 @@ class LTX2Bundle(Bundle):
                 from diffusers import AutoencoderKLLTX2Audio
                 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 
+                # low_cpu_mem_usage=False: the vocoder holds non-persistent
+                # anti-alias filter buffers (``*.upsample.filter`` /
+                # ``*.downsample.filter``) that are computed at init, NOT stored
+                # in the checkpoint. With the default meta-device load path those
+                # buffers stay on ``meta`` (HF warns "newly initialized"), and the
+                # subsequent ``.to(device)`` raises "Cannot copy out of meta
+                # tensor". Forcing a real (CPU) instantiation materializes the
+                # filters so ``.to(device)`` works. Mirrors load_pipeline's
+                # low_cpu_mem_usage=False used elsewhere for FSDP compatibility.
                 audio_vae = (
-                    AutoencoderKLLTX2Audio.from_pretrained(path, subfolder="audio_vae", torch_dtype=vae_dtype)
+                    AutoencoderKLLTX2Audio.from_pretrained(
+                        path, subfolder="audio_vae", torch_dtype=vae_dtype, low_cpu_mem_usage=False
+                    )
                     .to(device)
                     .eval()
                 )
                 audio_vae.requires_grad_(False)
 
-                vocoder = LTX2Vocoder.from_pretrained(path, subfolder="vocoder", torch_dtype=dtype).to(device).eval()
+                vocoder = (
+                    LTX2Vocoder.from_pretrained(path, subfolder="vocoder", torch_dtype=dtype, low_cpu_mem_usage=False)
+                    .to(device)
+                    .eval()
+                )
                 vocoder.requires_grad_(False)
             except (ImportError, OSError) as e:
                 raise RuntimeError(

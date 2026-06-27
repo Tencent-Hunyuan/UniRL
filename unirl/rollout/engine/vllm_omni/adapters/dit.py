@@ -78,7 +78,7 @@ class DitInputAdapter:
             diff_kwargs["seed"] = int(seed)
 
         extra_args = sde_extra_args(diff_params)
-        pack_initial_noise_extra_args(extra_args, req, diff_params, n_prompts=len(texts.texts), caller=self.modality)
+        pack_initial_noise_extra_args(extra_args, req, diff_params, n_samples=len(texts.texts), caller=self.modality)
         if extra_args:
             diff_kwargs["extra_args"] = extra_args
 
