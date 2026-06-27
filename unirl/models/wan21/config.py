@@ -16,7 +16,7 @@ an error — there is no silent fallback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from unirl.config.validation import validate_precision_type
 
@@ -62,6 +62,19 @@ class WAN21PipelineConfig:
     # Trainer-side policy wraps the bare DiT, while vLLM-Omni loads it under
     # the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
+
+    # ------------------------------------------------------------------
+    # Optional LoRA hints for rollout-side engines (sglang in particular).
+    #
+    # Trainer-side LoRA lives in ``cfg.training.policies`` (LoRAPolicy →
+    # PEFT injection on the FSDP-wrapped module). The SGLang rollout server
+    # still needs to know at construction time whether to boot in LoRA mode
+    # and which target modules to wrap — those flags travel through this
+    # model_config. ``None`` / ``False`` are the default (no LoRA). Mirrors
+    # ``SD3PipelineConfig`` so the ``sglang_diffusion`` engine's
+    # ``server_intent`` can read them uniformly across families.
+    use_lora: bool = False
+    lora_target_modules: Optional[List[str]] = None
 
     # Meta-init the transformer (build on the meta device; the backend loads
     # weights after sharding) instead of eager ``from_pretrained``. Avoids the
