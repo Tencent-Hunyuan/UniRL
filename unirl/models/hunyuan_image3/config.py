@@ -54,6 +54,14 @@ class HunyuanImage3PipelineConfig:
     # CFG default. Upstream `it2i` config ships 2.5; t2i auto mode varies.
     guidance_scale: float = 2.5
 
+    # Expert parallelism: when true, the meta-init bundle swaps each decoder
+    # layer's HunyuanMoE (nn.ModuleList experts) for a FusedHunyuanMoE (fused
+    # [E,2I,H] experts via veomni grouped GEMM + all_to_all) and the weight load
+    # fuses per-expert checkpoint keys. Set together with backend.fsdp_cfg.ep_size
+    # > 1 (which shards the fused experts across the EP mesh). Default off =
+    # original ModuleList experts (EP unavailable). See unirl.train.backend.veomni.ep.models.hi3.
+    fuse_moe_experts: bool = False
+
     # Trainer-side ``trainable_module()`` returns ``self.model.transformer.model``
     # (bare ``HunyuanImage3Model`` decoder). Its state_dict keys are
     # ``layers.X.*`` with no outer envelope. The rollout model

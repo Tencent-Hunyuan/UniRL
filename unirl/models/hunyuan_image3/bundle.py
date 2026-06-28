@@ -278,6 +278,16 @@ class HunyuanImage3Bundle(Bundle):
         # sd3 meta-init bundles. Harmless on the FSDP path (never called there).
         transformer.model.init_weights = lambda: None  # type: ignore[method-assign]
 
+        # Expert parallelism: swap each decoder layer's HunyuanMoE (ModuleList
+        # experts) for a FusedHunyuanMoE on meta, so veomni's EP shards the fused
+        # [E,2I,H] expert tensors (Shard(0)). Attaches get_parallel_plan to the
+        # decoder; the matching per-expert -> fused key fusion runs in materialize().
+        if config.fuse_moe_experts:
+            from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
+
+            n_swapped = replace_hunyuan_moe_with_fused(transformer.model)
+            logger.info("fuse_moe_experts: swapped %d HunyuanMoE layer(s) for FusedHunyuanMoE", n_swapped)
+
         # Scheduler — same as ``from_config``; tiny, no meta concerns.
         scheduler: Any = None
         try:
@@ -294,7 +304,7 @@ class HunyuanImage3Bundle(Bundle):
             )
             scheduler = None
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=None,
             vit=None,
@@ -306,6 +316,10 @@ class HunyuanImage3Bundle(Bundle):
             pretrained_path=path,
             mrope_section=tuple(config.mrope_section),
         )
+        # Consumed by materialize() to fuse per-expert checkpoint keys into the
+        # FusedHunyuanMoE's [E,...] params (must match the meta-swap above).
+        bundle._fuse_moe_experts = bool(config.fuse_moe_experts)
+        return bundle
 
     # ------------------------------------------------------------------
     # Materialization (single entry point, covers decoder + heads + opt-in aux)
@@ -413,6 +427,15 @@ class HunyuanImage3Bundle(Bundle):
             prefixes = tuple(attr for attr, _ in plan)
             sd = _collect_filtered_state_dict(self.pretrained_path, prefixes=prefixes)
 
+            # Expert parallelism: fuse per-expert checkpoint keys
+            # (model.layers.*.mlp.experts.{j}.{gate_and_up,down}_proj.weight) into
+            # the FusedHunyuanMoE's [E,...] params (gate_and_up half-swapped to
+            # veomni's silu-first convention). Matches from_meta_config's meta-swap.
+            if getattr(self, "_fuse_moe_experts", False):
+                from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
+
+                sd = fuse_expert_state_dict(sd)
+
             # [Bug B fix] LoRA key rename: peft.inject_adapter_in_model wraps
             # q/k/v/o_proj.weight as q/k/v/o_proj.base_layer.weight. The ckpt
             # has original names (*.weight). With strict=False,
@@ -438,7 +461,17 @@ class HunyuanImage3Bundle(Bundle):
         else:
             sd = {}
 
-        # 3. Single DCP load
+        # Expert parallelism: pull the fused expert tensors OUT of the DCP load.
+        # They are EP-sharded DTensors (Shard(0) on the EP mesh); DCP's broadcast
+        # path copies the full [E,...] onto the local [E/ep,...] shard and fails.
+        # load_ep_experts re-shards them with the param's own mesh instead.
+        expert_sd = {}
+        if getattr(self, "_fuse_moe_experts", False):
+            from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
+
+            expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
+
+        # 3. Single DCP load (non-expert params: FSDP-sharded + plain heads)
         set_model_state_dict(
             self.transformer,
             sd,
@@ -448,6 +481,15 @@ class HunyuanImage3Bundle(Bundle):
                 strict=False,
             ),
         )
+
+        if getattr(self, "_fuse_moe_experts", False):
+            from unirl.train.backend.veomni.ep import load_ep_experts
+
+            from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
+
+            n_exp = load_ep_experts(self.transformer, expert_sd, is_fused_expert_key)
+            if _current_rank() == 0:
+                print(f"fuse_moe_experts: loaded {n_exp} EP-sharded expert param(s)", flush=True)
 
         # [Bug B fix] Post-load validation: verify all LoRA base_layer
         # params are finite and not on meta.
