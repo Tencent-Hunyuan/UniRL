@@ -221,6 +221,7 @@ target-version = "py312"
 extend-exclude = [
   "unirl-reward-service",
   "unirl/models/bagel/vendor",
+  "unirl/models/janus_pro/vendor",
   "unirl/models/sensenova_u1/vendor",
 ]
 

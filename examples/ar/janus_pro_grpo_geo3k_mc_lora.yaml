@@ -1,0 +1,140 @@
+# @package _global_
+# GRPO Janus-Pro on Geometry3K-MC (Text+Image -> Text) — train_ar,
+# TRAINSIDE colocate + LoRA on the language model.
+#
+# This recipe only uses Janus-Pro's multimodal-understanding path. Janus-Pro's
+# image generation path is autoregressive image-token generation, not diffusion,
+# and is intentionally not wired here.
+#
+# Data: build once with
+#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+# then set DATA_PATH=data/geo3k_mc/train.jsonl. Each jsonl row must carry the
+# image media reference plus metadata.answer for MCExactMatchRewardScorer.
+#
+# Compose check:
+#   DATA_PATH=data/geo3k_mc/train.jsonl PYTHONPATH=$PWD python -m unirl.train_ar \
+#     --config-name ar/janus_pro_grpo_geo3k_mc_lora --cfg job --resolve
+
+num_devices: 8
+batch_size: 32
+
+num_rollouts: 1000
+weight_sync_interval: 1       # ignored trainside (no `sync` block)
+
+adv_normalization_scope: global
+
+logging:
+  report_to_wandb: false
+  project_name: unirl
+  run_name: janus_pro_grpo_geo3k_mc_lora
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [grpo, janus-pro, geo3k-mc, trainside, lora, it2t]
+
+bundle:
+  _target_: unirl.models.janus_pro.bundle.JanusProBundle.from_config
+  config:
+    _target_: unirl.models.janus_pro.config.JanusProPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:JANUS_PRO_PATH,deepseek-ai/Janus-Pro-7B}
+    trust_remote_code: true
+    model_precision: bf16
+    autocast_precision: bf16
+    logprob_precision: fp32
+    freeze_vision_tower: true
+    freeze_aligner: true
+    freeze_generation_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+    use_lora: true
+
+pipeline:
+  _target_: unirl.models.janus_pro.pipeline.JanusProPipeline.from_bundle
+  config: ${bundle.config}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["LlamaDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false   # bundle enables HF gradient checkpointing
+    use_torch_compile: false
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.janus_pro.conditions.JanusProARConditions
+  sampling_temperature: 0.7
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,data/geo3k_mc/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,data/geo3k_mc/val.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 1024
+  max_new_tokens: 64
