@@ -110,22 +110,28 @@ class VeOmniBackend(BaseFSDP2Backend):
         # Expert parallelism, folded in as a VeOmni "extra parallel": a SEPARATE
         # (ep, ep_fsdp) DeviceMesh over the full world, orthogonal to the
         # dp_shard x ulysses FSDP mesh (so only world % ep_size matters, no dp_size
-        # compensation). ep_size=1 is a true no-op — extra_parallel_sizes=(1,)
-        # leaves any_extra_parallel_enabled False, so the EP branch in
-        # parallelize_model_fsdp2 never fires (identical to the prior no-EP path).
-        # ep_size>1 makes that branch fire and REQUIRE model.get_parallel_plan()
-        # (asserted by VeOmni): the trainable model must name its fused expert
-        # tensors (dim-0 = expert axis) -> Shard(0), like VeOmni's qwen3_moe plan.
+        # compensation). ep_size>1 makes the EP branch in parallelize_model_fsdp2
+        # fire and REQUIRE model.get_parallel_plan() (asserted by VeOmni): the
+        # trainable model must name its fused expert tensors (dim-0 = expert axis)
+        # -> Shard(0), like VeOmni's qwen3_moe plan.
+        #
+        # ep_size=1 (the default for every VeOmni-backed model) omits the
+        # extra_parallel_* kwargs entirely, so the call is byte-identical to the
+        # pre-EP path and never depends on the installed veomni accepting them.
         self._ep_size = int(getattr(fsdp_cfg, "ep_size", 1) or 1)
         if world % self._ep_size != 0:
             raise ValueError(f"VeOmniBackend: world_size {world} not divisible by ep_size {self._ep_size}")
+        extra_parallel_kwargs = (
+            {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)}
+            if self._ep_size > 1
+            else {}
+        )
         init_parallel_state(
             dp_size=world // self._sp_size,
             ulysses_size=self._sp_size,
             dp_mode="fsdp2",
             device_type=self._device.type,
-            extra_parallel_sizes=(self._ep_size,),
-            extra_parallel_names=("ep",),
+            **extra_parallel_kwargs,
         )
 
         self._bundle = bundle

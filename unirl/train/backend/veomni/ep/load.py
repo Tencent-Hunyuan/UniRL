@@ -88,21 +88,35 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
     duration (cached once — all three are frozen under LoRA), then restore it. A
     no-op when the weight is already a plain tensor (so it never double-gathers).
     Returns a per-kind count of the modules hooked.
+
+    The full and sharded weights are cached OFF the module (in closure dicts keyed
+    by ``id(module)``), not as module attributes: assigning an ``nn.Parameter`` to
+    a module silently registers it, so a ``_full_w`` attribute would leak a full,
+    unsharded duplicate of wte/ln_f/lm_head into ``named_parameters()`` /
+    ``state_dict()`` (polluting checkpoint + weight-sync enumeration). ``m.weight``
+    itself is still swapped (FSDP's forward reads ``self.weight``), but only for
+    the call's duration; the persistent ``_parameters['weight']`` is always the
+    sharded DTensor.
     """
     from torch.distributed.tensor import DTensor
+
+    full_cache: Dict[int, nn.Parameter] = {}  # id(module) -> full all-gathered weight
+    sharded_cache: Dict[int, nn.Parameter] = {}  # id(module) -> sharded weight (mid-call only)
 
     def _pre(m, args):
         w = m.weight
         if isinstance(w, DTensor):
-            if getattr(m, "_full_w", None) is None:
-                m._full_w = nn.Parameter(w.full_tensor(), requires_grad=False)
-            m._sharded_w = w
-            m.weight = m._full_w
+            full = full_cache.get(id(m))
+            if full is None:
+                full = nn.Parameter(w.full_tensor(), requires_grad=False)
+                full_cache[id(m)] = full
+            sharded_cache[id(m)] = w
+            m.weight = full
 
     def _post(m, args, output):
-        if hasattr(m, "_sharded_w"):
-            m.weight = m._sharded_w
-            del m._sharded_w
+        w = sharded_cache.pop(id(m), None)
+        if w is not None:
+            m.weight = w
 
     counts = {"wte": 0, "ln_f": 0, "lm_head": 0}
     for name, mod in model.named_modules():
@@ -118,7 +132,6 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
             kind = "lm_head"
         else:
             continue
-        mod._full_w = None
         mod.register_forward_pre_hook(_pre)
         mod.register_forward_hook(_post)
         counts[kind] += 1

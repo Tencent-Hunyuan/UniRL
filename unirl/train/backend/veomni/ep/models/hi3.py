@@ -138,20 +138,6 @@ class FusedHunyuanMoE(nn.Module):
         self.moe_topk = moe_topk
         self.experts = FusedExperts(num_experts, hidden, inter, dtype, device)
 
-    @classmethod
-    def from_hunyuan_moe(cls, moe: nn.Module, num_experts: int, hidden: int, inter: int) -> "FusedHunyuanMoE":
-        """Build from a live ``HunyuanMoE``: adopt its gate/shared_mlp, fuse +
-        half-swap its per-expert weights into the fused parameters."""
-        w0 = moe.experts[0].gate_and_up_proj.weight
-        m = cls(moe.gate, getattr(moe, "shared_mlp", None), num_experts, hidden, inter,
-                moe.moe_topk, w0.dtype, w0.device)
-        with torch.no_grad():
-            gu = torch.stack([moe.experts[i].gate_and_up_proj.weight for i in range(num_experts)])  # [E,2I,H]
-            dn = torch.stack([moe.experts[i].down_proj.weight for i in range(num_experts)])  # [E,H,I]
-            m.experts.gate_and_up_proj.copy_(_swap_gate_up_halves(gu))
-            m.experts.down_proj.copy_(dn)
-        return m
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from torch.distributed.tensor import DTensor
 
