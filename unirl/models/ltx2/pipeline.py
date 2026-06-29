@@ -30,7 +30,7 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage
+from .diffusion import LTX2DiffusionStage, audio_latent_shape
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
@@ -101,6 +101,7 @@ class LTX2Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            audio_joint_sde=config.audio_joint_sde,
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
@@ -271,7 +272,8 @@ class LTX2Pipeline(Pipeline):
         # ``resolve()`` returns None only under DISABLE_DRIVER_XT — then the
         # recipe shape is None too and we cannot draw video noise without a
         # shape, so that path is unsupported here.
-        latents_5d = NoiseRecipe.from_rollout_req(req).resolve(device=self.bundle.device)
+        video_recipe = NoiseRecipe.from_rollout_req(req)
+        latents_5d = video_recipe.resolve(device=self.bundle.device)
         if latents_5d is None:
             raise ValueError(
                 "LTX2Pipeline.generate: no initial latents. The driver x_T recipe "
@@ -282,6 +284,13 @@ class LTX2Pipeline(Pipeline):
         patch_size, patch_size_t = self._patch_sizes()
         initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
+        # Audio x_T: an ``::audio``-salted sibling of the SAME video recipe
+        # (driver-authoritative, independent but reproducible) instead of a bare
+        # randn inside the stage.
+        initial_audio_latents = video_recipe.resolve(
+            device=self.bundle.device, salt="audio", latent_shape=audio_latent_shape(params)
+        )
+
         # 5. Diffusion loop
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
         segment = self.diffusion.generate(
@@ -289,6 +298,7 @@ class LTX2Pipeline(Pipeline):
             params=params,
             sigmas=sigmas,
             initial_latents=initial_latents,
+            initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
         )
 

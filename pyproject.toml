@@ -115,6 +115,10 @@ index-strategy = "unsafe-best-match"
 override-dependencies = [
   "kernels>=0.12,<0.13",
   "tokenizers>=0.22,<0.23",
+  # sglang[diffusion] hard-pins diffusers==0.37.0 (still pinned on sglang main),
+  # colliding with the base diffusers>=0.38.0 floor (#91); override to the floor
+  # so ".[sglang,...]" stays solvable (same tactic as kernels/tokenizers above).
+  "diffusers>=0.38.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",

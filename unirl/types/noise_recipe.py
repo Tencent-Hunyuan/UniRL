@@ -74,24 +74,33 @@ class NoiseRecipe:
         *,
         device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
+        salt: str = "",
+        latent_shape: Optional[Tuple[int, ...]] = None,
     ) -> Optional[torch.Tensor]:
         """Produce x_T, or ``None`` to defer to the engine's own RNG.
 
         Pure resolution — Path 1 (``initial_latents`` tensor) / Path 2
         (``noise_group_ids`` + ``latent_shape`` → CPU-fp32 regen) / None. Batch
         alignment + late shape are a separate concern; see :meth:`for_batch`.
+
+        ``salt`` forks an INDEPENDENT but reproducible sibling stream: group ids
+        are salted (different seed → not a prefix-alias of the base stream) and
+        any Path-1 ``initial_latents`` is bypassed. Pass ``latent_shape`` to
+        override the recipe's own (e.g. LTX-2's audio latent alongside video).
         """
-        if self.initial_latents is not None:
+        if not salt and self.initial_latents is not None:
             return self.initial_latents
-        if not (self.noise_group_ids and self.latent_shape):
+        gids = [f"{g}::{salt}" for g in self.noise_group_ids] if salt else self.noise_group_ids
+        shape = latent_shape if latent_shape is not None else self.latent_shape
+        if not (gids and shape):
             return None
         # Local import avoids a module-level types→sde cycle.
         from unirl.sde.noise import regen_initial_noise
 
         return regen_initial_noise(
-            noise_group_ids=[str(g) for g in self.noise_group_ids],
+            noise_group_ids=[str(g) for g in gids],
             base_seed=int(self.base_seed),
-            latent_shape=tuple(self.latent_shape),
+            latent_shape=tuple(shape),
             device=device,
             dtype=dtype,
         )

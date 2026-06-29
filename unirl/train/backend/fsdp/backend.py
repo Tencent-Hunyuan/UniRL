@@ -36,6 +36,7 @@ from unirl.train.configs import (
     LoraConfig,
 )
 from unirl.train.deferred import apply_deferred_ops
+from unirl.utils.dtypes import parse_torch_dtype
 
 
 class FSDPBackend(BaseFSDP2Backend):
@@ -69,6 +70,15 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # FSDP compute dtype (MixedPrecisionPolicy.param_dtype) = the wire dtype for
+        # weight sync. With master_dtype=fp32 the trainable LoRA params live in fp32
+        # (the reward-collapse fix), but the rollout engine's vLLM punica kernel
+        # hard-asserts bf16/fp16 — so LoRA extraction casts to this dtype at the
+        # all-gather (also halves sync bandwidth). Read via the ``weight_sync_dtype`` property.
+        self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
+            fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
+        )
 
         model = resolve_trainable_module(bundle, trainable_attr)
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
@@ -113,6 +123,16 @@ class FSDPBackend(BaseFSDP2Backend):
             ema_cfg=ema_cfg,
             fsdp_cfg=fsdp_cfg,
         )
+
+    @property
+    def weight_sync_dtype(self) -> torch.dtype:
+        """The dtype LoRA / full-weight sync ships in (FSDP compute ``param_dtype``).
+
+        Decoupled from the trainable params' own dtype: under ``master_dtype=fp32``
+        the LoRA params are fp32, but the rollout engine's vLLM punica kernel
+        requires bf16/fp16, so the sync casts to this at extraction.
+        """
+        return self._weight_sync_dtype
 
     # ------------------------------------------------------------------
     # Engine hooks (torch-native FSDP2)

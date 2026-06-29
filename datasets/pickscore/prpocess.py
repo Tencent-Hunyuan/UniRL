@@ -1,3 +1,4 @@
+import os
 import random
 
 from datasets import load_dataset
@@ -19,10 +20,11 @@ unique_text_dataset = unique_dataset[:test_size]
 train_dataset = unique_dataset[test_size:]
 
 # Save the datasets with shuffling
-with open("dataset/pickscore/train.txt", "w", encoding="utf-8") as file:
+os.makedirs("datasets/pickscore", exist_ok=True)
+with open("datasets/pickscore/train.txt", "w", encoding="utf-8") as file:
     for line in train_dataset:
         file.write(line + "\n")
 
-with open("/dataset/pickscore/test.txt", "w", encoding="utf-8") as file:
+with open("datasets/pickscore/test.txt", "w", encoding="utf-8") as file:
     for line in unique_text_dataset:
         file.write(line + "\n")

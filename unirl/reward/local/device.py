@@ -1,10 +1,19 @@
 """Shared device resolver for reward Specs.
 
 A Spec's ``device: str`` field accepts ``"cpu"``, ``"cuda"``, or ``"auto"``.
-``"auto"`` defers to the backend's ``base_device`` (also
-``"cpu"``/``"cuda"``/``"auto"``); when that itself is ``"auto"``, fall back to
-``"cuda"`` if available else ``"cpu"``. This lets per-component overrides win
-where set, while keeping a single cluster-level default.
+``"auto"`` defers to the backend's ``base_device`` (also ``"cpu"``/``"cuda"``/
+``"auto"``); when that itself is ``"auto"``, fall back to ``"cuda"`` if available
+else ``"cpu"``. This lets per-component overrides win where set, while keeping a
+single cluster-level default.
+
+Device selection here is intentionally coarse (cpu / cuda / auto), NOT a
+GPU-pinning knob. Local rewards are small models that share whatever GPU the
+trainer placed them on; an explicit ordinal like ``"cuda:1"`` cannot be honored
+safely in the distributed local path (every DP worker would pile onto the same
+physical card, and the ordinal mis-maps across nodes / ``CUDA_VISIBLE_DEVICES``),
+so it is **rejected**. To run a reward model on its own dedicated GPU(s), use the
+remote reward backend (``unirl.reward.remote.RemoteRewardBackend``), which owns
+its own device pool independent of the trainer.
 """
 
 from __future__ import annotations
@@ -15,14 +24,24 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_REMOTE_HINT = (
+    "the local reward backend does not support pinning a specific GPU ordinal — "
+    "it is for small models auto-placed on the trainer's GPU. Use device='cuda' "
+    "(or 'auto'), or, to run a reward on dedicated GPU(s), switch to the remote "
+    "reward backend (unirl.reward.remote.RemoteRewardBackend), which owns its own "
+    "device pool."
+)
+
 
 def resolve_device(spec_device: str, base_device: str) -> str:
     """Resolve a Spec's ``device`` against the cluster-level ``base_device``.
 
     Precedence: explicit ``cpu``/``cuda`` on the spec wins; ``auto`` falls
-    through to ``base_device``; if that is also ``auto``, pick ``cuda``
-    when available else ``cpu``. ``cuda`` requested without availability
-    falls back to ``cpu`` with a warning.
+    through to ``base_device``; if that is also ``auto``, pick ``cuda`` when
+    available else ``cpu``. ``cuda`` requested without availability falls back to
+    ``cpu`` with a warning. An explicit ``cuda:<index>`` ordinal raises
+    ``ValueError`` — local rewards do not pin GPUs (see module docstring); use the
+    remote backend instead.
     """
     chosen = _resolve_one(spec_device)
     if chosen == "auto":
@@ -39,6 +58,11 @@ def _resolve_one(value: str) -> str:
     pref = str(value or "").strip().lower()
     if pref in {"cpu", "cuda", "auto"}:
         return pref
+    # Explicit CUDA ordinal (e.g. "cuda:0" / "cuda:1"): reject loudly rather than
+    # silently dropping to CPU. Local rewards have no safe GPU-pinning path; point
+    # the user at the remote backend.
+    if pref.startswith("cuda:"):
+        raise ValueError(f"Reward Spec device={value!r}: {_REMOTE_HINT}")
     logger.warning(
         "Unknown device pref %r; falling back to cpu.",
         value,

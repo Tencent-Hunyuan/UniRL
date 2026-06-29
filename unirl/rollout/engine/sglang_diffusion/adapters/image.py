@@ -38,6 +38,8 @@ class ImageAdapter(ModelAdapter):
     track_name: str = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
+    #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are images.
+    squeeze_single_frame_4d: bool = True
 
     # ------------------------------------------------------------------ #
     # Request side
@@ -249,7 +251,7 @@ class ImageAdapter(ModelAdapter):
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
         )
-        decoded = self.build_decoded(raw)
+        decoded = self.build_decoded(req, raw)
 
         conditions: Dict[str, Any] = {}
         if self.cfg.populate_conditions:
@@ -303,8 +305,8 @@ class ImageAdapter(ModelAdapter):
             segment_factory=self.segment_factory,
         )
 
-    def build_decoded(self, results: List[RawResult]):
-        return utils.stack_decoded_images(results)
+    def build_decoded(self, req: RolloutReq, results: List[RawResult]):
+        return utils.stack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         text_cond, neg_text_cond = utils.fuse_text_conditions(results)

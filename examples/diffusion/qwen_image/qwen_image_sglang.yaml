@@ -155,6 +155,10 @@ rollout:
       # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
       # name "Qwen-Image") — local checkpoint dirs then need no special naming.
       model_id: Qwen-Image
+      # Colocate layout: trainer (~55GB) + rollout DiT (~39GB) per GPU → OOM on
+      # 96GB H20 without layer-wise CPU streaming. This streams DiT layers from
+      # CPU on demand so the resident GPU footprint stays ~few GB, not 38GB.
+      dit_layerwise_offload: true
   # The adapter reads ckpt/LoRA off model_config and sde_label off strategy.
   model_config: ${model_config}
   strategy: ${strategy}
