@@ -491,6 +491,18 @@ class HunyuanImage3Bundle(Bundle):
             if _current_rank() == 0:
                 print(f"fuse_moe_experts: loaded {n_exp} EP-sharded expert param(s)", flush=True)
 
+            # VeOmni root-shards the non-layer params (wte, ln_f, lm_head) into
+            # DTensors; HI3's ForCausalMM wrapper calls them OUTSIDE the decoder
+            # forward (wte -> inputs_embeds for ViT scatter; ln_f/lm_head -> logits),
+            # hitting `aten.* got mixed Tensor and DTensor`. Hook those three to
+            # all-gather their weights for such direct calls. Pass the whole
+            # transformer so lm_head (on the outer ForCausalMM) is reachable too.
+            from unirl.train.backend.veomni.ep import register_unsharded_param_hooks
+
+            n_hooked = register_unsharded_param_hooks(self.transformer)
+            if _current_rank() == 0:
+                print(f"fuse_moe_experts: hooked root params for direct all-gather: {n_hooked}", flush=True)
+
         # [Bug B fix] Post-load validation: verify all LoRA base_layer
         # params are finite and not on meta.
         if _current_rank() == 0:

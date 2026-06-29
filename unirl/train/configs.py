@@ -98,6 +98,17 @@ class FSDPConfig:
     # Must divide the world size and the model's attention head count. Only the
     # VeOmni backend honors it; FSDPBackend ignores it.
     sp_size: int = 1
+    # Expert-parallel degree (default 1 = disabled, a true no-op). When >1 the
+    # VeOmni backend passes it to init_parallel_state as an "extra parallel"
+    # (extra_parallel_sizes=(ep_size,), names=("ep",)), which builds a separate
+    # (ep, ep_fsdp) DeviceMesh over the world: each EP rank owns 1/ep_size of the
+    # experts, replicated-then-FSDP-sharded over the remaining ep_fsdp=world//ep
+    # ranks. Orthogonal to sp_size/dp (a distinct mesh over the same ranks), so
+    # only world % ep_size == 0 is required. REQUIRES the trainable model to
+    # expose ``get_parallel_plan()`` naming its fused expert tensors (dim-0 =
+    # expert axis) -> Shard(0); VeOmni's parallelize asserts this when ep>1.
+    # Only the VeOmni backend honors it; FSDPBackend ignores it.
+    ep_size: int = 1
 
 
 __all__ = [

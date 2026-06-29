@@ -136,7 +136,18 @@ def _enumerate_block_instances(
     if not class_names:
         return ()
     names = set(class_names)
-    return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
+
+    # This runs AFTER ``parallelize_model_fsdp2``, which calls ``fully_shard`` on
+    # each block. FSDP2's ``fully_shard`` swaps the wrapped module's ``__class__``
+    # for a dynamically created subclass named ``FSDP<OriginalName>``, so matching
+    # the bare original name here finds ZERO blocks — activation checkpointing then
+    # wraps nothing and a full forward holds every layer's activations -> OOM
+    # (silent: AC just no-ops). Accept the post-shard ``FSDP``-prefixed name too.
+    def _matches(m: nn.Module) -> bool:
+        n = type(m).__name__
+        return n in names or (n.startswith("FSDP") and n[len("FSDP") :] in names)
+
+    return tuple(m for _, m in model.named_modules() if _matches(m))
 
 
 def _current_rank() -> int:

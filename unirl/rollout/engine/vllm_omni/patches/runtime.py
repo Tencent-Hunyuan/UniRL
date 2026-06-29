@@ -230,6 +230,61 @@ def patch_ar_lora_loader() -> None:
     setattr(WorkerLoRAManager, "_load_adapter", hijack_ar__load_adapter)
 
 
+def patch_ar_merged_lora_fused_tensor() -> None:
+    """Let vLLM's merged-column LoRA layers accept a SINGLE fused 2-D adapter.
+
+    HI3 trains LoRA on the *fused* ``qkv_proj`` base linear, so the adapter we
+    ship has one ``qkv_proj.lora_{A,B}`` pair: ``lora_b`` is ``[q+k+v, rank]``,
+    ``lora_a`` is the shared ``[rank, in]``. But the AR engine's vLLM wraps that
+    base as ``MergedQKVParallelLinearWithLoRA`` (a ``MergedColumnParallel`` whose
+    ``set_lora`` indexes ``lora_b[i]`` per slice, expecting a *list* of the
+    separate q/k/v adapters that PEFT/vLLM would pack). Handed a single fused
+    tensor, ``slice_lora_b`` does ``lora_b[0]`` -> a 1-D row -> ``IndexError:
+    too many indices for tensor of dimension 1`` on the first post-train LoRA
+    push. (The DiT engine uses a different LoRA layer that already takes fused.)
+
+    Split the fused ``lora_b`` along the output dim by the base layer's FULL
+    ``output_sizes`` ([q,k,v] before TP) and replicate the shared ``lora_a`` into
+    the per-slice list the stock ``set_lora`` expects; it then TP-shards each
+    slice via ``slice_lora_b`` as usual. Mirrors sglang's ``patch_lora_slice_2d``
+    (LIN-365). No-op for any already-list / non-fused input.
+    """
+    try:
+        import torch
+        from vllm.lora.layers import column_parallel_linear as _cpl
+    except (ImportError, AttributeError):
+        return  # vllm not in this process; skip
+
+    def _make(orig):
+        def _set_lora(self, index, lora_a, lora_b, *args, _orig=orig, **kwargs):
+            if isinstance(lora_b, torch.Tensor):
+                output_sizes = list(getattr(self.base_layer, "output_sizes", []) or [])
+                if output_sizes and int(lora_b.shape[0]) == sum(output_sizes):
+                    lora_b = list(torch.split(lora_b, output_sizes, dim=0))
+                    if isinstance(lora_a, torch.Tensor):
+                        # fused qkv shares one A across the q/k/v slices
+                        lora_a = [lora_a] * self.n_slices
+            return _orig(self, index, lora_a, lora_b, *args, **kwargs)
+
+        _set_lora._diffrl_fused_merged_tolerant = True  # type: ignore[attr-defined]
+        return _set_lora
+
+    # Patch every merged class that defines its own ``set_lora``; subclasses that
+    # only inherit it are covered transitively by the base-class patch.
+    for _name in (
+        "MergedColumnParallelLinearWithLoRA",
+        "MergedQKVParallelLinearWithLoRA",
+        "QKVParallelLinearWithLoRA",
+    ):
+        cls = getattr(_cpl, _name, None)
+        if cls is None or "set_lora" not in cls.__dict__:
+            continue
+        orig = cls.__dict__["set_lora"]
+        if getattr(orig, "_diffrl_fused_merged_tolerant", False):
+            continue
+        cls.set_lora = _make(orig)
+
+
 def patch_fp32_skip() -> None:
     """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers.
 
@@ -601,6 +656,7 @@ class VLLMOmniHijack:
 
         patch_dit_lora_loader()
         patch_ar_lora_loader()
+        patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
