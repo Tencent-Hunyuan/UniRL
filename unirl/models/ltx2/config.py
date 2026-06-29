@@ -55,6 +55,18 @@ class LTX2PipelineConfig:
     # Audio support (LTX-2.3). Set True to load audio VAE + vocoder.
     enable_audio: bool = False
 
+    # When True (and the bundle has audio), video+audio form a SINGLE joint SDE
+    # policy: audio is SDE-stepped with the same ``eta`` as video, emits its own
+    # per-step log-prob, and the two are merged by an element-weighted mean (the
+    # mean a single SDE over the concatenated ``[video|audio]`` latent would
+    # produce). This keeps the RL importance ratio consistent with the
+    # audio<->video cross-attention coupling. When False, audio is denoised with
+    # ODE (``eta=0``, no log-prob, no RL gradient) and only video carries the
+    # policy signal — the legacy behavior. No effect for ``enable_audio=False``
+    # (T2V): the audio stream is then a synthetic placeholder that is never
+    # decoded or rewarded, so it stays out of the policy regardless of this flag.
+    audio_joint_sde: bool = True
+
     # Video generation defaults.
     default_height: int = 512
     default_width: int = 768

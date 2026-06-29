@@ -77,6 +77,34 @@ def _audio_packed_feature_dim() -> int:
     return _LTX2_AUDIO_LATENT_CHANNELS * (_LTX2_AUDIO_MEL_BINS // _LTX2_AUDIO_MEL_COMPRESSION)
 
 
+def audio_latent_shape(params: DiffusionSamplingParams) -> Tuple[int, int]:
+    """Per-sample PACKED audio-latent shape ``(audio_t, 128)`` — the geometry the
+    LTX-2 audio stream is allocated with. Exposed so the pipeline can resolve a
+    matching audio x_T from the video NoiseRecipe
+    (``recipe.resolve(salt="audio", latent_shape=…)``).
+    """
+    audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+    return (audio_t, _audio_packed_feature_dim())
+
+
+def _combine_modality_logp(
+    video_logp: torch.Tensor,
+    audio_logp: torch.Tensor,
+    n_video: int,
+    n_audio: int,
+) -> torch.Tensor:
+    """Element-weighted mean of the per-step video/audio log-probs.
+
+    Video and audio are stepped by the SAME stateless strategy, each returning a
+    per-sample log-prob already meaned over its own latent dims. Weighting by the
+    element counts reproduces the mean a single SDE over the concatenated
+    ``[video|audio]`` latent would produce, so the joint log-prob keeps the same
+    scale as the video-only path. Mirrors Flow-Factory ``combine_modality_log_prob``.
+    """
+    total = n_video + n_audio
+    return (video_logp * n_video + audio_logp * n_audio) / total
+
+
 class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
     """Per-step LTX2 denoising kernel — stateless.
 
@@ -203,6 +231,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        audio_joint_sde: bool = True,
     ) -> None:
         self.bundle = bundle
         self.step_kernel = LTX2DiffusionStep()
@@ -210,6 +239,13 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        # Joint audio+video SDE policy. Only meaningful when the bundle actually
+        # has audio (LTX-2.3 T2AV); for T2V the audio stream is a synthetic
+        # placeholder that is never decoded/rewarded, so it must stay out of the
+        # policy regardless of the flag. ``_audio_in_policy`` is the resolved
+        # gate used throughout generate()/replay().
+        self.audio_joint_sde = bool(audio_joint_sde)
+        self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
 
     def trainable_module(self) -> torch.nn.Module:
         """The trainable transformer (for FSDP wrapping)."""
@@ -235,6 +271,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         params: DiffusionSamplingParams,
         sigmas: torch.Tensor,
         initial_latents: torch.Tensor,
+        initial_audio_latents: Optional[torch.Tensor] = None,
         sde_indices: Optional[List[int]] = None,
     ) -> LatentSegment:
         """Run the full denoising loop, collecting trajectory for RL.
@@ -244,6 +281,9 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
             params: Sampling parameters (guidance_scale, eta, etc.).
             sigmas: Sigma schedule (T+1,) from high → 0.
             initial_latents: Starting noise (B, seq, C) or (B, C, T, H, W).
+            initial_audio_latents: Driver-authoritative audio x_T (B, audio_t,
+                128) resolved by the pipeline from the same NoiseRecipe as video.
+                ``None`` falls back to a bare randn (non-pipeline/test callers).
             sde_indices: Which steps to use SDE (stochastic) for RL.
 
         Returns:
@@ -273,15 +313,17 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         needed.add(num_steps)
 
         x = initial_latents.to(dtype=self.trajectory_dtype)
-        # Audio latent stream: fresh N(0,1) noise, packed shape (B, audio_t, 128).
-        # ODE-denoised in lockstep with video (no RL gradient). diffusers seeds
-        # this from randn too (prepare_audio_latents); we don't need byte-exact
-        # cross-engine audio since it's an internal conditioning signal.
-        a = torch.randn(
-            (int(x.shape[0]), audio_t, _audio_packed_feature_dim()),
-            device=device,
-            dtype=self.trajectory_dtype,
-        )
+        # Audio x_T (B, audio_t, 128): driver-authoritative noise from the
+        # pipeline (same recipe as video → reproducible, off the global RNG
+        # stream); bare randn only when a caller doesn't supply one.
+        if initial_audio_latents is not None:
+            a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
+        else:
+            a = torch.randn(
+                (int(x.shape[0]), audio_t, _audio_packed_feature_dim()),
+                device=device,
+                dtype=self.trajectory_dtype,
+            )
         stored_pairs: List[tuple] = []
         stored_audio: List[torch.Tensor] = []
         if 0 in needed:
@@ -326,14 +368,19 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 )
                 x = x_next.to(dtype=self.trajectory_dtype)
 
-                # Audio: ODE step (eta=0) — no RL gradient, just track the state
-                # the video branch conditions on. eta=0 → euler velocity step.
-                a_next, _, _ = self.strategy.denoise(
+                # Audio step. Joint mode (LTX-2.3 + audio_joint_sde): share the
+                # video ``eta`` so audio is a stochastic SDE twin, capture its
+                # log-prob, and merge into a single joint-policy log-prob. Legacy
+                # mode: ODE (eta=0), no RL gradient — audio is only the state the
+                # video branch cross-attends to. The strategy is stateless
+                # (step_index passed in), so the same instance serves both steps.
+                audio_eta = step_eta if self._audio_in_policy else 0.0
+                a_next, audio_log_prob, _ = self.strategy.denoise(
                     noise_pred=audio_pred,
                     sample=a,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    eta=0.0,
+                    eta=audio_eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
@@ -343,6 +390,13 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     stored_pairs.append((step_idx + 1, x.detach().clone()))
                     stored_audio.append(a.detach().clone())
                 if log_prob is not None:
+                    if self._audio_in_policy and audio_log_prob is not None:
+                        log_prob = _combine_modality_logp(
+                            log_prob,
+                            audio_log_prob,
+                            n_video=x[0].numel(),
+                            n_audio=a[0].numel(),
+                        )
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions = [p for p, _ in stored_pairs]
@@ -426,11 +480,12 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
                 # Reuse the audio state stored at this step from the rollout, so
                 # the video prediction matches what generate() produced (the
-                # video forward cross-attends to audio). Only the video pred is
-                # used for the log-prob; we discard the audio pred.
+                # video forward cross-attends to audio). In joint mode the audio
+                # pred is also stepped for its own log-prob; in legacy mode it is
+                # discarded.
                 audio_sample = segment.aux_latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
 
-                video_pred, _ = self.step_kernel.predict_noise(
+                video_pred, audio_pred = self.step_kernel.predict_noise(
                     self.bundle,
                     sample,
                     sigma.expand(sample.shape[0]),
@@ -458,6 +513,42 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                         f"LTX2DiffusionStage.replay: strategy returned None log-prob at step_index={step_idx} "
                         f"(deterministic mode); replay requires a stochastic SDE strategy."
                     )
+
+                # Joint mode: replay the audio transition too (same eta) and merge
+                # its log-prob/mean into the joint policy, mirroring generate(). The
+                # combined log-prob keeps the ratio consistent with rollout; the
+                # concatenated means feed FlowDPPO's Gaussian KL (video-only models
+                # leave _audio_in_policy False → unchanged).
+                if self._audio_in_policy:
+                    audio_prev = segment.aux_latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
+                    _, audio_log_prob, audio_prev_mean = self.strategy.denoise(
+                        noise_pred=audio_pred,
+                        sample=audio_sample,
+                        sigma=sigma,
+                        sigma_next=sigma_next,
+                        eta=eta,
+                        prev_sample=audio_prev,
+                        sigma_max=sigma_max,
+                        step_index=step_idx,
+                    )
+                    if audio_log_prob is None:
+                        raise RuntimeError(
+                            f"LTX2DiffusionStage.replay: audio strategy returned None log-prob at "
+                            f"step_index={step_idx}; joint audio SDE requires a stochastic strategy."
+                        )
+                    log_prob = _combine_modality_logp(
+                        log_prob,
+                        audio_log_prob,
+                        n_video=sample[0].numel(),
+                        n_audio=audio_sample[0].numel(),
+                    )
+                    if prev_mean is not None and audio_prev_mean is not None:
+                        # Concat on the sequence dim (both packed latents are
+                        # C=128). KL reduces over all non-batch dims and sigma_t
+                        # broadcasts, so the joint mean is the well-defined mean of
+                        # the concatenated [video|audio] SDE Gaussian.
+                        prev_mean = torch.cat([prev_mean, audio_prev_mean], dim=1)
+
                 log_probs.append(log_prob)
                 if prev_mean is not None:
                     prev_sample_means.append(prev_mean)

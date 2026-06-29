@@ -222,10 +222,32 @@ class Videos(Batch):
     def from_list(cls, items: List[Video]) -> "Videos":
         if not items:
             raise ValueError("Cannot build Videos from an empty list")
+        frames_list = [v.frames for v in items]
+        if any(frames is None or frames.ndim != 4 for frames in frames_list):
+            bad = [None if frames is None else tuple(frames.shape) for frames in frames_list]
+            raise ValueError(f"Videos.from_list expects per-sample frames [T, C, H, W], got {bad}")
+        channels = {int(frames.shape[1]) for frames in frames_list}
+        if len(channels) != 1:
+            raise ValueError(f"Videos.from_list requires a consistent channel count, got {sorted(channels)}")
+        # Packed videos can be ragged in time, but torch.cat still requires the
+        # non-packed C/H/W dimensions to match. Resize (not zero-pad) ragged clips
+        # to the batch-max H/W so mixed-resolution inputs don't get black borders;
+        # model-specific encoders still resize to their requested resolution later.
+        if len({tuple(frames.shape[1:]) for frames in frames_list}) != 1:
+            max_h = max(int(frames.shape[-2]) for frames in frames_list)
+            max_w = max(int(frames.shape[-1]) for frames in frames_list)
+            resized = []
+            for frames in frames_list:
+                if int(frames.shape[-2]) != max_h or int(frames.shape[-1]) != max_w:
+                    frames = torch.nn.functional.interpolate(
+                        frames.float(), size=(max_h, max_w), mode="bilinear", align_corners=False
+                    ).to(frames.dtype)
+                resized.append(frames)
+            frames_list = resized
         # Delegate to ``Batch.pack`` so the framework computes and
         # attaches ``_packed_cu_seqlens``. ``pack`` ``torch.cat``s the
         # per-sample frames along dim 0 internally.
-        return cls.pack(frames=[v.frames for v in items])
+        return cls.pack(frames=frames_list)
 
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens

@@ -286,6 +286,53 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             return torch.autocast("cuda", self.autocast_dtype)
         return nullcontext()
 
+    def _build_contexts_from_prompt(self, prompt: str) -> Tuple[Any, Any, Any]:
+        """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from a prompt.
+
+        The vllm_omni rollout path ships only the prompt text (KV caches can't
+        cross the worker→driver IPC boundary), so replay rebuilds the contexts
+        here on the trainer's own bundle. Mirrors
+        ``BagelPipeline._build_contexts`` (think=False, no image): ``cfg_text`` is
+        the init snapshot taken BEFORE the prompt text (unconditional); ``gen``
+        and ``cfg_img`` both ingest the prompt. The und/text path is frozen, so
+        the rebuilt contexts equal those the rollout worker used.
+        """
+        from copy import deepcopy
+
+        inf = self.model.inferencer
+        device = torch.device(self.model.device)
+        # Match the worker pipeline's prompt preprocessing EXACTLY
+        # (vllm_omni/diffusion/models/bagel/pipeline_bagel.py): it strips any
+        # ``<|im_start|>`` / ``<|im_end|>`` wrappers before ``prepare_prompts`` so
+        # bos/eos aren't double-added. If replay tokenized a differently-wrapped
+        # prompt, the KV context (and thus every step's v_t / log-prob) would
+        # diverge from rollout — a silent rollout↔replay mismatch.
+        clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+        gen = inf.init_gen_context()
+        cfg_img = deepcopy(gen)
+        with torch.no_grad(), self._autocast_ctx(device):
+            cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
+            gen = inf.update_context_text(clean_prompt, gen)
+            cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+        return gen, cfg_text, cfg_img
+
+    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+        """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
+
+        Two sources, transparently:
+
+        - **opaque contexts present** (trainside / colocate): return them directly
+          via :meth:`BagelDiffusionConditions.single`.
+        - **deferred prompts only** (vllm_omni cross-process): rebuild the KV
+          contexts from the shipped prompt on this bundle (the und path is frozen
+          → identical contexts), then return them.
+        """
+        if conditions.has_contexts():
+            return conditions.single()
+        prompt, image_shape = conditions.single_prompt()
+        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(prompt)
+        return gen, cfg_text, cfg_img, image_shape
+
     def _build_generation_inputs(
         self,
         gen: Any,
@@ -411,7 +458,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
         sde_sorted: List[int] = sorted(sde_set)
 
-        gen, cfg_text, cfg_img, image_shape = conditions.single()
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -509,7 +556,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         schedule = segment.sigmas.to(device)
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
 
-        gen, cfg_text, cfg_img, image_shape = conditions.single()
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -570,7 +617,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """
         bagel = self.model.model
         device = torch.device(self.model.device)
-        gen, cfg_text, cfg_img, image_shape = conditions.single()
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
         t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
