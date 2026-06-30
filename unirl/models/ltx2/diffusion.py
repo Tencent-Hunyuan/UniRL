@@ -18,6 +18,7 @@ LTX2-specific deviations from other models:
 
 from __future__ import annotations
 
+import inspect
 from contextlib import nullcontext
 from typing import ClassVar, List, Optional, Set, Tuple
 
@@ -158,17 +159,13 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
         audio_encoder_attention_mask = audio_text_cond.attn_mask
 
         def _run(v_in, a_in, ts_in, enc_hs, enc_mask, a_enc_hs, a_enc_mask):
-            out = transformer(
+            kwargs = dict(
                 hidden_states=v_in,
                 audio_hidden_states=a_in,
                 encoder_hidden_states=enc_hs,
                 audio_encoder_hidden_states=a_enc_hs,
                 timestep=ts_in,
                 audio_timestep=ts_in,
-                # ``sigma``/``audio_sigma`` are consumed only by LTX-2.3 prompt
-                # modulation; harmless for 2.0 and required by 2.3 — pass them.
-                sigma=ts_in,
-                audio_sigma=ts_in,
                 encoder_attention_mask=enc_mask,
                 audio_encoder_attention_mask=a_enc_mask,
                 num_frames=latent_num_frames,
@@ -176,9 +173,20 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
                 width=latent_width,
                 fps=_LTX2_FRAME_RATE,
                 audio_num_frames=audio_num_frames,
-                isolate_modalities=False,
                 return_dict=False,
             )
+            # ``sigma``/``audio_sigma`` (LTX-2.3 prompt modulation) and
+            # ``isolate_modalities`` only exist on newer LTX-2.3 transformer
+            # forwards. Older diffusers (e.g. 0.37's LTX2VideoTransformer3DModel)
+            # don't accept them and would raise TypeError, so only pass each kwarg
+            # when the loaded transformer's forward signature declares it.
+            fwd_params = set(inspect.signature(transformer.forward).parameters)
+            if "sigma" in fwd_params:
+                kwargs["sigma"] = ts_in
+                kwargs["audio_sigma"] = ts_in
+            if "isolate_modalities" in fwd_params:
+                kwargs["isolate_modalities"] = False
+            out = transformer(**kwargs)
             # forward returns (video_out, audio_out).
             return out[0], out[1]
 
