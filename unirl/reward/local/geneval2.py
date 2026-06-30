@@ -263,7 +263,10 @@ class GenEval2Spec(BaseRewardComponentSpec):
     Args:
         batch_size: Batch size for reward computation (kept at 1 due to
             sequential VQA per image).
-        device: Device for the Qwen3-VL model ("auto", "cuda", "cuda:0", etc).
+        device: Device for the Qwen3-VL model: "auto", "cuda", or "cpu". Local
+            rewards are auto-placed on the trainer's GPU and do NOT pin a specific
+            ordinal — an explicit "cuda:<index>" is rejected; to give this heavy
+            VLM its own GPU(s), use the remote reward backend instead.
         model_name: Hugging Face model ID for the VLM (default Qwen3-VL-8B).
         data_path: Path to GenEval2 JSONL file or directory containing
             train.jsonl/test.jsonl. Used for prompt -> vqa_list lookup.

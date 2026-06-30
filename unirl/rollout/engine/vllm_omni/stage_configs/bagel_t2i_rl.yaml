@@ -1,0 +1,97 @@
+# Single-stage BAGEL-7B-MoT text-to-image config for RL rollout.
+#
+# BAGEL is the single-stage topology where the DiT worker owns a full
+# Qwen2-MoT LLM + ViT + VAE + tokenizer and handles text2img end-to-end (no
+# separate AR/Thinker prelude — think mode is off for the T2I GRPO path).
+#
+# Diff vs upstream's bagel_single_stage deploy yaml:
+#   - custom_pipeline_args installs our RLBagelPipeline subclass. Unlike SD3/Qwen
+#     (which swap a diffusers scheduler), RLBagelPipeline sets self.scheduler to
+#     the BAGEL-specific BagelFlowSDEScheduler that upstream generate_image
+#     already threads through its hand-rolled denoise loop — giving per-step SDE
+#     transitions + dense trajectory capture (latents, reconstructed sigmas,
+#     sparse log_probs) whose math matches the trainside FlowSDEStrategy. It also
+#     taps bagel.prepare_vae_latent to inject the driver-authored x_T.
+#   - worker_extension_cls installs DiTWeightSyncExtension so the worker exposes
+#     update_weights_from_ipc (bucketed CUDA-IPC) and the NCCL update_weights
+#     paths the trainer's LoRA sync needs.
+#
+# Contract notes:
+#   - CFG is steered through extra_args (cfg_text_scale / cfg_img_scale / ...),
+#     NOT guidance_scale — and the adapter ALWAYS sends them, because upstream
+#     BAGEL defaults a missing cfg_text_scale to 4.0 (CFG ON). The trainside
+#     recipe runs cfg=1 (single-forward), so the adapter passes 1.0/1.0.
+#   - num_inference_steps is sent as trainside_steps + 1: BAGEL builds
+#     linspace(1, 0, num_timesteps) and loops num_timesteps-1 steps. BAGEL builds
+#     its sigma schedule internally (it ignores sampling_params.sigmas), with a
+#     hardwired timestep_shift=3.0 == the trainside shift, so the worker schedule
+#     equals the engine-pinned req.sigmas; the response sigma-echo verify asserts it.
+#   - trust_remote_code: BAGEL ships custom configs (llm_config.json / vit_config.json).
+#
+# NB: no ``pipeline:`` key — the legacy stage_configs loader reads only
+# ``stage_args``, and ``custom_pipeline_args.pipeline_class`` bypasses model-type
+# detection entirely (the worker imports RLBagelPipeline by qualname, which loads
+# the BAGEL checkpoint itself), exactly like the SD3 / Qwen-Image RL configs.
+#
+# Sized for BAGEL-7B-MoT on TP=1 (navit bs=1; one sample per generate call).
+# Single-GPU rollout matches the trainer's full-forward math more closely than
+# tensor-parallel rollout and avoids the systematic bf16 drift seen in replay
+# log-prob parity checks.
+
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      # Required for vLLM to wrap DiT Linear modules in LoRA-aware variants.
+      # Without ``enable_lora``, ``add_lora`` still registers the adapter (so
+      # checksum probes pass) but no Linear consults it and the forward silently
+      # runs base weights. ``max_lora_rank`` must be >= the recipe's LoRA rank
+      # (64 in bagel_trainside_lora); vllm's default of 16 silently rejects larger.
+      enable_lora: true
+      max_lora_rank: 64
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 1
+        enable_expert_parallel: false
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+      # unirl-specific: install RLBagelPipeline so SDE-mode rollouts get the
+      # trajectory-capturing scheduler + driver-noise injection.
+      custom_pipeline_args:
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.bagel.pipeline.RLBagelPipeline
+      # unirl-specific: install the weight-sync extension so the DiT worker
+      # exposes update_weights_from_ipc (bucketed CUDA-IPC) and later
+      # init_weight_transfer_engine / update_weights (NCCL). Coexists with the
+      # custom pipeline above; vllm-omni composes them via multiple inheritance.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
+    final_output: true
+    final_output_type: image
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1

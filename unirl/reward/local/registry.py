@@ -24,8 +24,10 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "pickscore": ("unirl.reward.local.pickscore", "PickScoreRewardScorer"),
     "geneval2": ("unirl.reward.local.geneval2", "GenEval2RewardScorer"),
     "hpsv3": ("unirl.reward.local.hpsv3", "HPSv3RewardScorer"),
+    "hpsv3pp": ("unirl.reward.local.hpsv3pp", "HPSv3PPRewardScorer"),
     "image_reward": ("unirl.reward.local.image_reward", "ImageRewardScorer"),
     "videopickscore": ("unirl.reward.local.video_pickscore", "VideoPickScoreScorer"),
+    "videoclipdelta": ("unirl.reward.local.video_clip_delta", "VideoCLIPDeltaScorer"),
     "mc_exact_match": ("unirl.reward.local.mc_exact_match", "MCExactMatchRewardScorer"),
 }
 
@@ -37,8 +39,10 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "pickscore": ("unirl.reward.local.pickscore", "PickScoreSpec"),
     "geneval2": ("unirl.reward.local.geneval2", "GenEval2Spec"),
     "hpsv3": ("unirl.reward.local.hpsv3", "HPSv3Spec"),
+    "hpsv3pp": ("unirl.reward.local.hpsv3pp", "HPSv3PPSpec"),
     "image_reward": ("unirl.reward.local.image_reward", "ImageRewardSpec"),
     "videopickscore": ("unirl.reward.local.video_pickscore", "VideoPickScoreSpec"),
+    "videoclipdelta": ("unirl.reward.local.video_clip_delta", "VideoCLIPDeltaSpec"),
     "mc_exact_match": ("unirl.reward.local.mc_exact_match", "MCExactMatchSpec"),
 }
 

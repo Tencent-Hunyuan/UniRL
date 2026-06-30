@@ -23,6 +23,7 @@ with the configured ``shift``. This mirrors legacy
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 from unirl.models.types.pipeline import Pipeline
@@ -157,6 +158,38 @@ class WAN21Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> WAN21Conditions:
+        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``.
+
+        Builds only the text-conditioning slots (``text`` / ``negative_text``);
+        the optional I2V ``image_latent`` / ``image_embed`` slots are left
+        ``None`` and attached by :meth:`generate` when an input image is
+        supplied (their encode path needs ``req`` / ``params``, outside this
+        text-only contract).
+
+        CFG negative encoding: WAN's training-time convention encodes
+        an empty-string negative when none is provided (legacy
+        ``models/wan21.py::encode_inputs`` does ``[""] * len(prompts)``
+        — and so does diffusers' upstream WAN pipeline). Without this,
+        falling back to ``torch.zeros_like(prompt_embeds)`` in
+        ``WAN21DiffusionStep.predict_noise`` would silently use a
+        different unconditional embedding than what the model was
+        trained against, shifting the distribution and making the
+        rollout / replay log-prob ratio drift away from 1.0 in GRPO.
+        Encoding ``[""] * B`` explicitly here keeps both sides aligned.
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run WAN 2.1 T2V end-to-end."""
         texts = req.primitives.get("text")
@@ -174,20 +207,7 @@ class WAN21Pipeline(Pipeline):
 
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG negative encoding: WAN's training-time convention encodes
-        # an empty-string negative when none is provided (legacy
-        # ``models/wan21.py::encode_inputs`` does ``[""] * len(prompts)``
-        # — and so does diffusers' upstream WAN pipeline). Without this,
-        # falling back to ``torch.zeros_like(prompt_embeds)`` in
-        # ``WAN21DiffusionStep.predict_noise`` would silently use a
-        # different unconditional embedding than what the model was
-        # trained against, shifting the distribution and making the
-        # rollout / replay log-prob ratio drift away from 1.0 in GRPO.
-        # Encoding ``[""] * B`` explicitly here keeps both sides aligned.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        wan_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         image_latent_cond: Optional[ImageLatentCondition] = None
         image_embed_cond: Optional[ImageEmbedCondition] = None
@@ -215,12 +235,12 @@ class WAN21Pipeline(Pipeline):
             if self.bundle.uses_clip_vision:
                 image_embed_cond = WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
 
-        wan_conds = WAN21Conditions(
-            text=text_cond,
-            negative_text=negative_text_cond,
-            image_latent=image_latent_cond,
-            image_embed=image_embed_cond,
-        )
+        if image_latent_cond is not None or image_embed_cond is not None:
+            wan_conds = dataclasses.replace(
+                wan_conds,
+                image_latent=image_latent_cond,
+                image_embed=image_embed_cond,
+            )
 
         if req.sigmas is None:
             raise ValueError(

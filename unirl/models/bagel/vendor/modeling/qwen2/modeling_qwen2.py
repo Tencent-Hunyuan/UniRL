@@ -62,6 +62,21 @@ class Qwen2RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# transformers 5 removed ROPE_INIT_FUNCTIONS["default"]; keep default RoPE locally:
+# https://github.com/huggingface/transformers/blob/v4.43.1/src/transformers/modeling_rope_utils.py
+def _compute_default_rope_parameters(config=None, device=None, seq_len=None, **rope_kwargs):
+    if config is not None:
+        base = getattr(config, "rope_theta", 10000.0)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+    else:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, 1.0
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Qwen2
 class Qwen2RotaryEmbedding(nn.Module):
     def __init__(
@@ -102,7 +117,9 @@ class Qwen2RotaryEmbedding(nn.Module):
             self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = (
+            _compute_default_rope_parameters if self.rope_type == "default" else ROPE_INIT_FUNCTIONS[self.rope_type]
+        )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -661,7 +678,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)

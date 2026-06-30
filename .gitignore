@@ -102,3 +102,6 @@ settings.json
 !.cursor/rules/**
 REFACTOR_LOG.md
 uv.lock
+
+# Re-assert bytecode ignore after the force-includes above (last match wins)
+__pycache__/

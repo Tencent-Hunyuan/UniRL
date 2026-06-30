@@ -127,6 +127,25 @@ class SD3Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> SD3Conditions:
+        """Encode prompts (+ optional CFG negatives) into ``SD3Conditions``.
+
+        Shared by :meth:`generate` and the ReFL draft path (``draft_generate``).
+        Applies SD3's empty-negative default (diffusers parity) when CFG is on and
+        no negative was supplied — see the rationale quoted in :meth:`generate`.
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return SD3Conditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run SD3 t2i end-to-end. Requires ``req.sigmas`` to be pinned by
         the hosting engine adapter."""
@@ -159,24 +178,13 @@ class SD3Pipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: SD3 upstream (diffusers v0.37.1
-        # ``pipeline_stable_diffusion_3.py:466-467``) auto-defaults to
-        # ``""`` (empty string) when CFG is enabled and no negative is
-        # passed. Without this default the SD3 diffusion step would fall
-        # back to a zero-init negative-condition path that doesn't match
-        # what the model was trained against; the rollout/replay log-prob
-        # ratio drifts away from 1.0 in GRPO.
-        #
-        # SD3's three text encoders (CLIP + CLIP + T5) tokenize ``""``
-        # cleanly — unlike Qwen-Image, there's no chat-template +
-        # prefix-strip that would degenerate the embedding. Hence the
-        # value ``""`` here vs Qwen's ``" "``; both are the model's
-        # canonical empty-negative per its upstream pipeline.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        sd3_conds = SD3Conditions(text=text_cond, negative_text=negative_text_cond)
+        # CFG empty-negative default (diffusers v0.37.1 parity): when CFG is on and
+        # no negative is passed, SD3 defaults it to "" (empty string). Without it the
+        # diffusion step falls back to a zero-init negative path the model wasn't
+        # trained against, drifting the GRPO rollout/replay log-prob ratio off 1.0.
+        # SD3's CLIP+CLIP+T5 tokenize "" cleanly (unlike Qwen's " "). This conditioning
+        # (incl. that default) is shared with the ReFL draft path via build_conditions.
+        sd3_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

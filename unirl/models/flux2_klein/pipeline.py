@@ -212,6 +212,32 @@ class Flux2KleinPipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> Flux2KleinConditions:
+        """Encode prompts (+ optional CFG negatives) into ``Flux2KleinConditions``.
+
+        CFG empty negative: Klein's canonical training-script setting is
+        ``guidance_scale=1.0`` (the script literally hardcodes it; see
+        ``main_flux_bundle/reproduce_scripts/train_grpo_flux2_klein9b_sglang_multinode.sh``).
+        When CFG is OFF, no negative branch is needed and we leave
+        ``negative_text=None`` so the transformer runs only the
+        conditional forward. When a downstream user opts in to
+        ``guidance_scale > 1`` without supplying ``negative_text``,
+        default to an empty string (the Qwen3 chat-template tokenizer
+        is robust to ``""``: no chat-template prefix is stripped, so
+        the resulting embedding is well-defined).
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run FLUX.2-klein-9B t2i end-to-end. Requires ``req.sigmas``
         to be pinned by the hosting engine adapter."""
@@ -250,21 +276,7 @@ class Flux2KleinPipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(req.group_ids))
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: Klein's canonical training-script setting is
-        # ``guidance_scale=1.0`` (the script literally hardcodes it; see
-        # ``main_flux_bundle/reproduce_scripts/train_grpo_flux2_klein9b_sglang_multinode.sh``).
-        # When CFG is OFF, no negative branch is needed and we leave
-        # ``negative_text=None`` so the transformer runs only the
-        # conditional forward. When a downstream user opts in to
-        # ``guidance_scale > 1`` without supplying ``negative_text``,
-        # default to an empty string (the Qwen3 chat-template tokenizer
-        # is robust to ``""``: no chat-template prefix is stripped, so
-        # the resulting embedding is well-defined).
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        klein_conds = Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
+        klein_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         # Image-edit conditioning: when the request carries a source image
         # (primitives["image"], role="condition" in the data), VAE-encode it
