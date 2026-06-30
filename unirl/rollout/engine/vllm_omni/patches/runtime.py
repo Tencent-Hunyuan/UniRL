@@ -231,38 +231,47 @@ def patch_ar_lora_loader() -> None:
 
 
 def patch_ar_merged_lora_fused_tensor() -> None:
-    """Let vLLM's merged-column LoRA layers accept a SINGLE fused 2-D adapter.
+    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora.
 
-    HI3 trains LoRA on the *fused* ``qkv_proj`` base linear, so the adapter we
-    ship has one ``qkv_proj.lora_{A,B}`` pair: ``lora_b`` is ``[q+k+v, rank]``,
-    ``lora_a`` is the shared ``[rank, in]``. But the AR engine's vLLM wraps that
-    base as ``MergedQKVParallelLinearWithLoRA`` (a ``MergedColumnParallel`` whose
-    ``set_lora`` indexes ``lora_b[i]`` per slice, expecting a *list* of the
-    separate q/k/v adapters that PEFT/vLLM would pack). Handed a single fused
-    tensor, ``slice_lora_b`` does ``lora_b[0]`` -> a 1-D row -> ``IndexError:
-    too many indices for tensor of dimension 1`` on the first post-train LoRA
-    push. (The DiT engine uses a different LoRA layer that already takes fused.)
-
-    Split the fused ``lora_b`` along the output dim by the base layer's FULL
-    ``output_sizes`` ([q,k,v] before TP) and replicate the shared ``lora_a`` into
-    the per-slice list the stock ``set_lora`` expects; it then TP-shards each
-    slice via ``slice_lora_b`` as usual. Mirrors sglang's ``patch_lora_slice_2d``
-    (LIN-365). No-op for any already-list / non-fused input.
+    HI3 trains LoRA on a fused qkv_proj; vLLM expects a list [lora_b_q, lora_b_k,
+    lora_b_v]. The checkpoint qkv_proj is GQA-interleaved, training loads it as-is,
+    so lora_b rows are interleaved. vLLM base is block [q;k;v] after _split_qkv_weight
+    — we mirror that reshape-split on lora_b. Falls back to plain split if the base
+    layer lacks head_size/total_num_kv_heads.
     """
     try:
         import torch
         from vllm.lora.layers import column_parallel_linear as _cpl
     except (ImportError, AttributeError):
-        return  # vllm not in this process; skip
+        return
+
+    def _deinterleave_gqa(lora_b, output_sizes, base_layer):
+        if len(output_sizes) != 3:
+            return None
+        head_size = getattr(base_layer, "head_size", None)
+        num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
+        if head_size is None or num_kv_heads is None:
+            return None
+        q_size, k_size, _v = output_sizes
+        groups = q_size // k_size
+        if groups * k_size != q_size or k_size != num_kv_heads * head_size:
+            return None
+        rank = lora_b.shape[1]
+        try:
+            lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
+        except RuntimeError:
+            return None
+        q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
+        return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
 
     def _make(orig):
         def _set_lora(self, index, lora_a, lora_b, *args, _orig=orig, **kwargs):
             if isinstance(lora_b, torch.Tensor):
                 output_sizes = list(getattr(self.base_layer, "output_sizes", []) or [])
                 if output_sizes and int(lora_b.shape[0]) == sum(output_sizes):
-                    lora_b = list(torch.split(lora_b, output_sizes, dim=0))
+                    slices = _deinterleave_gqa(lora_b, output_sizes, self.base_layer)
+                    lora_b = slices if slices is not None else list(torch.split(lora_b, output_sizes, dim=0))
                     if isinstance(lora_a, torch.Tensor):
-                        # fused qkv shares one A across the q/k/v slices
                         lora_a = [lora_a] * self.n_slices
             return _orig(self, index, lora_a, lora_b, *args, **kwargs)
 
