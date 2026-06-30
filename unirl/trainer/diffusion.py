@@ -47,6 +47,7 @@ class DiffusionTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
+        reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
         adv_use_global_std: bool = False,
         eval_interval: int = 0,
@@ -127,13 +128,37 @@ class DiffusionTrainer(BaseTrainer):
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
 
+        # Reward placement, orthogonal to the rollout ``layout`` below.
+        # ``reward_fraction > 0`` carves reward its OWN disjoint slab of that
+        # fraction of the pool, opened LAST so train/rollout keep their cards —
+        # mirroring how ``layout="separate"`` gives the secondary role (rollout)
+        # the tail of the pool. The reward model then lives on dedicated GPUs and
+        # never shares — nor offload-thrashes — the policy's cards ("reward doesn't
+        # steal cards"). ``reward_fraction == 0`` (default) leaves reward as a
+        # train-side sibling = the unchanged behavior; ``train_fraction`` keeps its
+        # whole-pool meaning either way. Cross-slab ``reward.score_and_attach``
+        # needs no change: it is DP_SCATTER-dispatched over the reward role's own
+        # workgroup and its tensor args cross slabs via the standard TensorRef NCCL
+        # path, exactly as the existing ``layout="separate"`` rollout slab does.
+        reward_fraction = float(reward_fraction)
+        if not 0.0 <= reward_fraction < 1.0:
+            raise ValueError(f"reward_fraction must be in [0, 1), got {reward_fraction}")
+        if self._layout == "separate" and train_fraction + reward_fraction >= 1.0:
+            raise ValueError(
+                f"layout='separate' leaves no rollout GPUs: train_fraction ({train_fraction}) "
+                f"+ reward_fraction ({reward_fraction}) must be < 1.0"
+            )
+        reward_separate = reward_fraction > 0.0
+
         # Construction (_build_train_side / _build_rollout) is shared; only the
         # placement topology and the train→rollout sync wiring differ per layout.
+        # ``reward_cfg=None`` when reward owns its own slab (built last, below) so
+        # ``_build_train_side`` skips it; otherwise reward is a train-side sibling.
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,
             pipeline_cfg=pipeline_cfg,
             backend_cfg=backend_cfg,
-            reward_cfg=reward_cfg,
+            reward_cfg=(None if reward_separate else reward_cfg),
             algorithm_cfg=algorithm_cfg,
             stack_cfg=stack_cfg,
         )
@@ -146,20 +171,28 @@ class DiffusionTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     # NCCL handler: rollout is cross-slab, wired via the handshake below.
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-            # Rollout slab = the rest. Top-level ``fraction`` is relative to the
-            # WHOLE pool (placement.py), so the remainder is ``1 - train_fraction``.
-            with placement(self.pool, fraction=1.0 - train_fraction, shared_workers=True):
+            # Rollout slab = the pool minus train minus the (optional) reward slab.
+            # Top-level ``fraction`` is relative to the WHOLE pool (placement.py).
+            with placement(self.pool, fraction=1.0 - train_fraction - reward_fraction, shared_workers=True):
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=False)
             if self.weight_sync is not None:
                 self._connect_separate(sync_cfg)
         else:
-            # Single slab: train + rollout are siblings on one Worker.
-            with placement(self.pool, fraction=1.0, shared_workers=True):
+            # Single slab: train + rollout are siblings on one Worker; reward (if
+            # separate) takes the tail below, so this slab is the pool minus reward.
+            with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
                 if sync_cfg is not None:
                     # Colocated handlers (tensor/ipc) take the engine as a local sibling.
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+
+        # Reward's own disjoint slab = the tail of the pool, opened LAST so
+        # train/rollout keep their cards. Skipped when colocated (built above as a
+        # train-side sibling); cross-slab scoring uses the same dispatch/NCCL path.
+        if reward_separate:
+            with placement(self.pool, fraction=reward_fraction, shared_workers=True):
+                self.reward = remote_hydra(reward_cfg)
 
     def _build_train_side(
         self,
@@ -175,11 +208,16 @@ class DiffusionTrainer(BaseTrainer):
 
         Scope-agnostic: ``remote_hydra`` lands each remote in whatever
         ``placement(...)`` block is open, so both layouts reuse this.
+
+        ``reward_cfg`` is ``None`` when reward already owns a separate slab (see
+        ``reward_fraction`` in ``__init__``); reward is then built there and skipped
+        here so it is not also colocated on the train slab.
         """
         self.bundle = remote_hydra(bundle_cfg)
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
-        self.reward = remote_hydra(reward_cfg)
+        if reward_cfg is not None:
+            self.reward = remote_hydra(reward_cfg)
         # DiffusionNFT resolves its frozen reference adapter off ``backend.ema`` (the
         # FSDPBackend owns the dual-adapter EMA), so it needs the backend sibling
         # injected alongside ``pipeline``. GRPO takes neither and would reject the

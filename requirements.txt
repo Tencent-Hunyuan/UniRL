@@ -27,5 +27,5 @@ sglang[diffusion]==0.5.12.post1
 tensordict>=0.5
 torch>=2.1
 torchvision>=0.16
-transformers>=4.41
+transformers>=5.6,<5.7
 wandb>=0.16,<0.20
