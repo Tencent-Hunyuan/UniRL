@@ -697,12 +697,8 @@ class UniRLWandBLogger:
             return
 
         if isinstance(results, dict):
-            # Lay each track's optimizer-step metrics on a shared train/step axis.
-            # A multi-update track exposes one metric dict per optimizer update on
-            # ``per_update``; a single-update track collapses to its one aggregate
-            # dict. Tracks may run different update counts (PE: diffusion=2, ar=1),
-            # so the axis length is the max and each track fills only the slots it
-            # actually ran — no averaging across a track's updates.
+            # Per track: an ordered list of per-update metric dicts — a multi-update
+            # track uses ``per_update``, a single-update track its one aggregate.
             per_track_updates: Dict[str, List[Dict[str, Any]]] = {}
             for name, result in results.items():
                 per_update = getattr(result, "per_update", ()) or ()
