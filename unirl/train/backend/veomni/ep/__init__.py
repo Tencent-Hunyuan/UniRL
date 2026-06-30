@@ -9,8 +9,7 @@ EP-sharded fused expert params that DCP's ``set_model_state_dict`` cannot.
 
 from unirl.train.backend.veomni.ep.load import (
     load_ep_experts,
-    register_embedding_allgather_hooks,
     register_unsharded_param_hooks,
 )
 
-__all__ = ["load_ep_experts", "register_unsharded_param_hooks", "register_embedding_allgather_hooks"]
+__all__ = ["load_ep_experts", "register_unsharded_param_hooks"]

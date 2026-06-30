@@ -283,7 +283,6 @@ def patch_ar_merged_lora_fused_tensor() -> None:
     for _name in (
         "MergedColumnParallelLinearWithLoRA",
         "MergedQKVParallelLinearWithLoRA",
-        "QKVParallelLinearWithLoRA",
     ):
         cls = getattr(_cpl, _name, None)
         if cls is None or "set_lora" not in cls.__dict__:

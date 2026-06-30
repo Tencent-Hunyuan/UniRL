@@ -124,7 +124,6 @@ class FusedHunyuanMoE(nn.Module):
         num_experts: int,
         hidden: int,
         inter: int,
-        moe_topk: int,
         dtype,
         device,
     ):
@@ -132,7 +131,6 @@ class FusedHunyuanMoE(nn.Module):
         self.gate = gate
         self.shared_mlp = shared_mlp
         self.num_experts = num_experts
-        self.moe_topk = moe_topk
         self.experts = FusedExperts(num_experts, hidden, inter, dtype, device)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -197,7 +195,6 @@ def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
             num_experts=mlp.num_experts,
             hidden=hidden,
             inter=two_i // 2,
-            moe_topk=mlp.moe_topk,
             dtype=w.dtype,
             device=w.device,
         )

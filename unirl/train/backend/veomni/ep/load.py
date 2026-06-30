@@ -145,8 +145,4 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
     return counts
 
 
-# Back-compat alias (older call sites import the embedding-only name).
-register_embedding_allgather_hooks = register_unsharded_param_hooks
-
-
-__all__ = ["load_ep_experts", "register_unsharded_param_hooks", "register_embedding_allgather_hooks"]
+__all__ = ["load_ep_experts", "register_unsharded_param_hooks"]
