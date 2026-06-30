@@ -19,7 +19,7 @@
 #     is split q/k/v engine-side by vLLM's native packed-modules mapping.
 
 num_devices: 8
-batch_size: 2                 # prompts per rollout; each expands to samples_per_prompt
+batch_size: 4                 # prompts per rollout; each expands to samples_per_prompt
 
 weight_sync_interval: 1
 
