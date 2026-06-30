@@ -13,6 +13,8 @@ included here so the import surface is stable).
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage, EncodeStage
@@ -29,7 +31,7 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
     def __init__(self, bundle: HunyuanImage3Bundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Images:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
         """Decode the final-step latents in *s* into pixel images.
 
         Reads ``s.latents[:, -1]`` (the final stored position, which is
@@ -40,6 +42,12 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         ``decode`` expects ``[B, C, T, H, W]`` (5D) input. For still
         images we add a singleton time dim before decode and squeeze it
         out of the decoded ``[B, 3, T_out, H_out, W_out]`` output.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("HunyuanImage3VAEDecodeStage.decode: segment.latents is None")
@@ -52,13 +60,23 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         # Scaling factor lookup mirrors the SD3 pattern; HunyuanImage3's
         # 3D-VAE config exposes the same attribute.
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
+
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
             latents_f32 = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
             decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
             # decoded: [B, 3, T_out, H_out, W_out]; T_out is 1 for still images.
             if decoded.dim() == 5:
                 decoded = decoded.squeeze(2)  # [B, 3, H_out, W_out]
+            return decoded
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)
 

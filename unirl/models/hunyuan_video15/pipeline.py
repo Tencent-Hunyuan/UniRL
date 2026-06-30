@@ -212,6 +212,45 @@ class HunyuanVideo15Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> HunyuanVideo15Conditions:
+        """Encode prompts (MLLM + Glyph, + optional CFG negatives) into ``HunyuanVideo15Conditions``.
+
+        CFG empty negative: when CFG is on (``guidance_scale > 1``) and
+        caller didn't supply a negative, default to ``[""] * B``. When
+        CFG is off, leave ``negatives=None`` so the negative branch is
+        skipped entirely — saves two text-encoder forwards (MLLM +
+        Glyph) per request. ``HunyuanVideo15DiffusionStep.predict_noise``
+        (diffusion.py:188) already gates the CFG branch on
+        ``guidance_scale > 1 and negative_text_mllm is not None``, so
+        passing None for both negative_text_* is the canonical CFG-off
+        signal. Either-both-or-both-None: the diffusion step (line 191-202)
+        raises if only one of mllm/glyph is set.
+        """
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+
+        text_mllm = self.text_embed.embed_mllm(texts)
+        text_glyph = self.text_embed.embed_glyph(texts)
+        if negatives is not None:
+            negative_text_mllm = self.text_embed.embed_mllm(negatives)
+            negative_text_glyph = self.text_embed.embed_glyph(negatives)
+        else:
+            negative_text_mllm = None
+            negative_text_glyph = None
+
+        return HunyuanVideo15Conditions(
+            text_mllm=text_mllm,
+            text_glyph=text_glyph,
+            negative_text_mllm=negative_text_mllm,
+            negative_text_glyph=negative_text_glyph,
+        )
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run HunyuanVideo-1.5 T2V end-to-end. Requires ``req.sigmas`` to
         be pinned by the hosting engine adapter."""
@@ -249,34 +288,7 @@ class HunyuanVideo15Pipeline(Pipeline):
 
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
-        # CFG empty negative: when CFG is on (``guidance_scale > 1``) and
-        # caller didn't supply a negative, default to ``[""] * B``. When
-        # CFG is off, leave ``negatives=None`` so the negative branch is
-        # skipped entirely — saves two text-encoder forwards (MLLM +
-        # Glyph) per request. ``HunyuanVideo15DiffusionStep.predict_noise``
-        # (diffusion.py:188) already gates the CFG branch on
-        # ``guidance_scale > 1 and negative_text_mllm is not None``, so
-        # passing None for both negative_text_* is the canonical CFG-off
-        # signal. Either-both-or-both-None: the diffusion step (line 191-202)
-        # raises if only one of mllm/glyph is set.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[""] * batch_size)
-
-        text_mllm = self.text_embed.embed_mllm(texts)
-        text_glyph = self.text_embed.embed_glyph(texts)
-        if negatives is not None:
-            negative_text_mllm = self.text_embed.embed_mllm(negatives)
-            negative_text_glyph = self.text_embed.embed_glyph(negatives)
-        else:
-            negative_text_mllm = None
-            negative_text_glyph = None
-
-        hv_conds = HunyuanVideo15Conditions(
-            text_mllm=text_mllm,
-            text_glyph=text_glyph,
-            negative_text_mllm=negative_text_mllm,
-            negative_text_glyph=negative_text_glyph,
-        )
+        hv_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

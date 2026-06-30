@@ -22,7 +22,8 @@ dependencies = [
   "diffusers>=0.38.0",  # LTX-2 needs 0.38: transformer.forward gained sigma/audio_sigma/isolate_modalities/use_cross_timestep, connector gained padding_side, calculate_shift now pins image_seq_len to max_image_seq_len. (>=0.37 was already required for Qwen-Image RoPE text-len-from-mask; 0.38 verified to keep that + every other model API unchanged.)
   "hydra-core>=1.3",
   "omegaconf>=2.3",
-  "transformers>=4.41",
+  # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
+  "transformers>=5.6,<5.7",
   "peft>=0.11",
   "safetensors>=0.4",
   "Pillow>=10",

@@ -209,6 +209,37 @@ class QwenImagePipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> QwenImageConditions:
+        """Encode prompts (+ optional CFG negatives) into ``QwenImageConditions``.
+
+        CFG empty negative: Qwen-Image upstream (diffusers v0.37.1
+        ``QwenImagePipeline`` docstring at ``pipeline_qwenimage.py:509``)
+        recommends a single-space ``" "`` as the canonical empty
+        negative. Empty string ``""`` is unsafe here: ``_get_qwen_prompt_embeds``
+        wraps the prompt in a chat template and strips the first 34
+        tokens of the encoder output (``prompt_template_encode_start_idx``)
+        — an empty user-content slot can degenerate into a near-zero
+        embedding and divide the norm-corrected CFG blend
+        (diffusion.py:248-250) by ~0. Mirrors PR #104 OLD
+        ``encode_inputs`` (``[" "] * batch_size``).
+
+        Compare WAN21/WAN22 (which default to ``[""] * B``): WAN's
+        text encoder doesn't run a 34-token prefix strip, so ``""``
+        is safe there. The empty-negative value is a per-model
+        property, not a framework knob — hence hardcoded per pipeline.
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[" "] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return QwenImageConditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run Qwen-Image t2i end-to-end. Requires ``req.sigmas`` to be
         pinned by the hosting engine adapter."""
@@ -244,26 +275,7 @@ class QwenImagePipeline(Pipeline):
                 "recipes encode in the rollout engine; trainside rollout "
                 "requires load_text_encoder=True."
             )
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: Qwen-Image upstream (diffusers v0.37.1
-        # ``QwenImagePipeline`` docstring at ``pipeline_qwenimage.py:509``)
-        # recommends a single-space ``" "`` as the canonical empty
-        # negative. Empty string ``""`` is unsafe here: ``_get_qwen_prompt_embeds``
-        # wraps the prompt in a chat template and strips the first 34
-        # tokens of the encoder output (``prompt_template_encode_start_idx``)
-        # — an empty user-content slot can degenerate into a near-zero
-        # embedding and divide the norm-corrected CFG blend
-        # (diffusion.py:248-250) by ~0. Mirrors PR #104 OLD
-        # ``encode_inputs`` (``[" "] * batch_size``).
-        #
-        # Compare WAN21/WAN22 (which default to ``[""] * B``): WAN's
-        # text encoder doesn't run a 34-token prefix strip, so ``""``
-        # is safe there. The empty-negative value is a per-model
-        # property, not a framework knob — hence hardcoded per pipeline.
-        if negatives is None and float(params.guidance_scale) > 1.0:
-            negatives = Texts(texts=[" "] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        qwen_conds = QwenImageConditions(text=text_cond, negative_text=negative_text_cond)
+        qwen_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 
