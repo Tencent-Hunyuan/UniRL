@@ -128,7 +128,7 @@ CFG belongs in the diffusion step, with the pipeline and embed stages preparing 
 - Do not build sigma schedules inside the pipeline or stage. Hosting engines pin schedules with `unirl.sde.runtime.ensure_req_sigmas(req, policy)` before calling `generate(req)`.
 - Validate schedule length against the requested step count.
 - Initialize latents from request-provided `initial_latents` when the package supports deterministic driver-side noise; otherwise call the repository noise helper used by the closest template.
-- Store trajectories at `compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
+- Store trajectories at `unirl.types.sampling.compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
 - Keep direct transformer calls inside `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
 - Implement `replay(...)` to recompute log-probs and previous-sample means from stored `LatentSegment` transitions for training.
 - Implement `predict_noise_at_step(conditions, *, sample, sigma, params)` for forward-process algorithms such as DiffusionNFT; it should delegate to the same `predict_noise(...)` path so CFG and guidance behavior match `diffuse(...)` and `replay(...)`.
