@@ -674,45 +674,66 @@ class UniRLWandBLogger:
         self,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
     ) -> None:
-        """Emit ``train/*`` points, per optimizer step, single- and multi-track.
+        """Emit ``train/*`` points, one per optimizer update, single- and multi-track.
 
-        Step-axis matrix (``train/step`` == ``self._optimizer_step``):
+        Step-axis (``train/step`` == ``self._optimizer_step``, advanced once per
+        optimizer update so the axis stays contiguous across rollouts):
 
         - single result, ``per_update`` empty → one aggregate point per backward.
         - single result, ``per_update`` len N>1 → N points (one per optimizer
           update), metrics unprefixed (the on-policy update0 then off-policy drift).
-        - dict results → metrics namespaced ``<track>/<key>``. Cross-track
-          per-update merge ONLY when every track's ``per_update`` shares the same
-          length L>1 (one optimizer driving all tracks, e.g. unified_model);
-          otherwise one aggregate point per rollout. This never interleaves the
-          independent optimizers of a per-track recipe (e.g. PE), and is
-          byte-identical to the legacy path for every single-update recipe.
+        - dict results → metrics namespaced ``<track>/<key>`` on a shared
+          ``train/step`` axis whose length is the MAX per-track update count. Each
+          track fills the slots it actually ran — a ``num_updates_per_batch>1``
+          track contributes its per-update metrics at consecutive slots, a
+          single-update track its one aggregate at slot 0 — so nothing is averaged
+          across a track's own updates and the axis is contiguous. PE
+          (diffusion ``num_updates_per_batch=2``, ar 1) therefore emits 2 train
+          points per rollout: diffusion at every slot, ar at slot 0. Recipes where
+          every track is single-update collapse to one aggregate point per rollout
+          (byte-identical to the legacy path).
         """
         if not self.enabled or not self._initialized:
             return
 
         if isinstance(results, dict):
-            per_update_lens = [len(getattr(r, "per_update", ()) or ()) for r in results.values()]
-            mergeable = bool(per_update_lens) and len(set(per_update_lens)) == 1 and per_update_lens[0] > 1
-            if mergeable:
-                length = per_update_lens[0]
-                for i in range(length):
-                    merged: Dict[str, Any] = {
+            # Lay each track's optimizer-step metrics on a shared train/step axis.
+            # A multi-update track exposes one metric dict per optimizer update on
+            # ``per_update``; a single-update track collapses to its one aggregate
+            # dict. Tracks may run different update counts (PE: diffusion=2, ar=1),
+            # so the axis length is the max and each track fills only the slots it
+            # actually ran — no averaging across a track's updates.
+            per_track_updates: Dict[str, List[Dict[str, Any]]] = {}
+            for name, result in results.items():
+                per_update = getattr(result, "per_update", ()) or ()
+                if len(per_update) > 1:
+                    per_track_updates[name] = [dict(m) for m in per_update]
+                else:
+                    per_track_updates[name] = [dict(aggregate_stage_results([result]))]
+            length = max((len(v) for v in per_track_updates.values()), default=0)
+            if length <= 1:
+                # All tracks single-update: one aggregate point per rollout
+                # (legacy path). Skip entirely when nothing trained this rollout.
+                if any(bool(getattr(r, "has_backward", False)) for r in results.values()):
+                    merged = {
                         f"{name}/{key}": value
-                        for name, result in results.items()
-                        for key, value in dict(result.per_update[i]).items()
+                        for name, updates in per_track_updates.items()
+                        for key, value in updates[0].items()
                     }
                     self._optimizer_step += 1
                     self.log_step(self._optimizer_step, merged)
                 return
-            train_metrics: Dict[str, Any] = {
-                f"{name}/{key}": value
-                for name, result in results.items()
-                for key, value in aggregate_stage_results([result]).items()
-            }
-            if any(bool(getattr(r, "has_backward", False)) for r in results.values()):
+            for i in range(length):
+                merged = {
+                    f"{name}/{key}": value
+                    for name, updates in per_track_updates.items()
+                    if i < len(updates)
+                    for key, value in updates[i].items()
+                }
+                if not merged:
+                    continue
                 self._optimizer_step += 1
-                self.log_step(self._optimizer_step, train_metrics)
+                self.log_step(self._optimizer_step, merged)
             return
 
         # Single-track result.
