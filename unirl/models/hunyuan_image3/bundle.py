@@ -106,6 +106,22 @@ class HunyuanImage3Bundle(Bundle):
         double-prefixed it)."""
         return self.transformer.model
 
+    def prepare_for_expert_parallel(self) -> None:
+        """Make the decoder expert-parallel-ready (backend hook; called only when
+        ``ep_size > 1``, on the meta model, before ``veomni_parallelize``).
+
+        Swaps each decoder layer's ``HunyuanMoE`` (nn.ModuleList experts) for a
+        ``FusedHunyuanMoE`` (fused ``[E,2I,H]`` experts via veomni grouped GEMM +
+        all_to_all) and attaches ``get_parallel_plan`` so VeOmni's EP can
+        ``Shard(0)`` the fused tensors. Flags :meth:`materialize` to fuse the
+        per-expert checkpoint keys and take the EP-sharded load path. Driven
+        solely by ``backend.fsdp_cfg.ep_size`` — there is no separate config flag."""
+        from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
+
+        n_swapped = replace_hunyuan_moe_with_fused(self.transformer.model)
+        logger.info("expert-parallel: swapped %d HunyuanMoE layer(s) for FusedHunyuanMoE", n_swapped)
+        self._ep_enabled = True
+
     @classmethod
     def from_config(cls, config: HunyuanImage3PipelineConfig) -> "HunyuanImage3Bundle":
         """Load all HunyuanImage3 components from a HuggingFace checkpoint.
@@ -278,16 +294,6 @@ class HunyuanImage3Bundle(Bundle):
         # sd3 meta-init bundles. Harmless on the FSDP path (never called there).
         transformer.model.init_weights = lambda: None  # type: ignore[method-assign]
 
-        # Expert parallelism: swap each decoder layer's HunyuanMoE (ModuleList
-        # experts) for a FusedHunyuanMoE on meta, so veomni's EP shards the fused
-        # [E,2I,H] expert tensors (Shard(0)). Attaches get_parallel_plan to the
-        # decoder; the matching per-expert -> fused key fusion runs in materialize().
-        if config.fuse_moe_experts:
-            from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
-
-            n_swapped = replace_hunyuan_moe_with_fused(transformer.model)
-            logger.info("fuse_moe_experts: swapped %d HunyuanMoE layer(s) for FusedHunyuanMoE", n_swapped)
-
         # Scheduler — same as ``from_config``; tiny, no meta concerns.
         scheduler: Any = None
         try:
@@ -304,7 +310,7 @@ class HunyuanImage3Bundle(Bundle):
             )
             scheduler = None
 
-        bundle = cls(
+        return cls(
             transformer=transformer,
             vae=None,
             vit=None,
@@ -316,10 +322,6 @@ class HunyuanImage3Bundle(Bundle):
             pretrained_path=path,
             mrope_section=tuple(config.mrope_section),
         )
-        # Consumed by materialize() to fuse per-expert checkpoint keys into the
-        # FusedHunyuanMoE's [E,...] params (must match the meta-swap above).
-        bundle._fuse_moe_experts = bool(config.fuse_moe_experts)
-        return bundle
 
     # ------------------------------------------------------------------
     # Materialization (single entry point, covers decoder + heads + opt-in aux)
@@ -430,8 +432,8 @@ class HunyuanImage3Bundle(Bundle):
             # Expert parallelism: fuse per-expert checkpoint keys
             # (model.layers.*.mlp.experts.{j}.{gate_and_up,down}_proj.weight) into
             # the FusedHunyuanMoE's [E,...] params (gate_and_up half-swapped to
-            # veomni's silu-first convention). Matches from_meta_config's meta-swap.
-            if getattr(self, "_fuse_moe_experts", False):
+            # veomni's silu-first convention). Matches prepare_for_expert_parallel's swap.
+            if getattr(self, "_ep_enabled", False):
                 from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
 
                 sd = fuse_expert_state_dict(sd)
@@ -466,7 +468,7 @@ class HunyuanImage3Bundle(Bundle):
         # path copies the full [E,...] onto the local [E/ep,...] shard and fails.
         # load_ep_experts re-shards them with the param's own mesh instead.
         expert_sd = {}
-        if getattr(self, "_fuse_moe_experts", False):
+        if getattr(self, "_ep_enabled", False):
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
             expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
@@ -482,14 +484,13 @@ class HunyuanImage3Bundle(Bundle):
             ),
         )
 
-        if getattr(self, "_fuse_moe_experts", False):
+        if getattr(self, "_ep_enabled", False):
             from unirl.train.backend.veomni.ep import load_ep_experts
-
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
             n_exp = load_ep_experts(self.transformer, expert_sd, is_fused_expert_key)
             if _current_rank() == 0:
-                print(f"fuse_moe_experts: loaded {n_exp} EP-sharded expert param(s)", flush=True)
+                print(f"expert-parallel: loaded {n_exp} EP-sharded expert param(s)", flush=True)
 
             # VeOmni root-shards the non-layer params (wte, ln_f, lm_head) into
             # DTensors; HI3's ForCausalMM wrapper calls them OUTSIDE the decoder
@@ -501,7 +502,7 @@ class HunyuanImage3Bundle(Bundle):
 
             n_hooked = register_unsharded_param_hooks(self.transformer)
             if _current_rank() == 0:
-                print(f"fuse_moe_experts: hooked root params for direct all-gather: {n_hooked}", flush=True)
+                print(f"expert-parallel: hooked root params for direct all-gather: {n_hooked}", flush=True)
 
         # [Bug B fix] Post-load validation: verify all LoRA base_layer
         # params are finite and not on meta.

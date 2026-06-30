@@ -35,7 +35,6 @@ def load_ep_experts(
     """
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, distribute_tensor
-
     from veomni.distributed.parallel_state import get_parallel_state
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
@@ -51,22 +50,30 @@ def load_ep_experts(
                 param.data.copy_(expert_state_dict[name].to(device=param.device, dtype=param.dtype))
             n += 1
             continue
-        # The param's dim-0 is ALREADY this rank's local experts (E/ep); broadcast
-        # the full [E,...], slice this rank's expert block by ep_rank, then re-shard
-        # that block with the param's own mesh/placement (handles the dim-1 shard).
+        # The param's dim-0 is ALREADY this rank's local experts (E/ep). Send each
+        # ep_rank's [E/ep,...] block separately (one broadcast per EP group) and keep
+        # only the block this rank owns, then re-shard it with the param's own
+        # mesh/placement (handles the dim-1 ep_fsdp shard). Per-block (not full-[E,...])
+        # so every rank's transient stays [E/ep,...] — the EP memory saving must hold
+        # at LOAD time too, else an 80B model OOMs here even when the sharded steady
+        # state fits. Broadcast-only (no scatter) to work on every NCCL build.
         local_experts = param.shape[0]
-        num_experts = local_experts * ep_size
-        full = (
-            expert_state_dict[name].to(device=param.device, dtype=param.dtype)
-            if rank0
-            else torch.empty((num_experts, *param.shape[1:]), dtype=param.dtype, device=param.device)
-        )
-        if dist.is_initialized():
-            dist.broadcast(full, src=0)
-        my_experts = full[ep_rank * local_experts : (ep_rank + 1) * local_experts]
-        sharded = distribute_tensor(my_experts, param.device_mesh, param.placements)
+        block_shape = (local_experts, *param.shape[1:])
+        full = expert_state_dict[name].to(device=param.device, dtype=param.dtype) if rank0 else None
+        my_block = None
+        for j in range(ep_size):
+            block = (
+                full[j * local_experts : (j + 1) * local_experts].contiguous()
+                if rank0
+                else torch.empty(block_shape, dtype=param.dtype, device=param.device)
+            )
+            if dist.is_initialized():
+                dist.broadcast(block, src=0)
+            if ep_rank == j:
+                my_block = block
+        sharded = distribute_tensor(my_block, param.device_mesh, param.placements)
         param.to_local().copy_(sharded.to_local())
-        del full, sharded, my_experts
+        del full, my_block, sharded
         n += 1
     return n
 

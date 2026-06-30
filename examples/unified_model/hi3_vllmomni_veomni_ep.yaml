@@ -58,11 +58,6 @@ bundle:
     logprob_precision: fp32
     shift: 3.0
     guidance_scale: 1.0
-    # Expert parallelism: swap each decoder layer's HunyuanMoE (ModuleList) for a
-    # FusedHunyuanMoE (fused [E,2I,H] experts via veomni grouped GEMM + all_to_all),
-    # sharded across the EP mesh by backend.fsdp_cfg.ep_size below. Experts are
-    # frozen (LoRA trains attention only) -> EP is a forward-throughput win.
-    fuse_moe_experts: true
 
 pipeline:
   # Assemble from the SHARED bundle (auto-injected by the trainer) so the
@@ -94,10 +89,11 @@ backend:
     activation_checkpointing: true
     use_torch_compile: false
     sp_size: 1
-    # Expert-parallel degree: shards the fused experts across ep_size ranks
-    # (each holds num_experts/ep_size experts; tokens routed via all_to_all).
-    # Must divide world_size and num_experts(=64). Pair with bundle.config
-    # fuse_moe_experts: true above.
+    # Expert-parallel degree (THE single EP switch): when >1 the backend asks the
+    # bundle to fuse its MoE experts ([E,2I,H] via veomni grouped GEMM + all_to_all)
+    # and shards them across ep_size ranks (each holds num_experts/ep_size experts;
+    # tokens routed via all_to_all). Must divide world_size and num_experts(=64).
+    # Experts are frozen (LoRA trains attention only) -> EP is a throughput/memory win.
     ep_size: 8
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig

@@ -38,9 +38,7 @@ import torch
 from torch import nn
 
 # Per-expert weight key: <prefix>.experts.{idx}.{gate_and_up_proj|down_proj}.weight
-_EXPERT_RE = re.compile(
-    r"^(?P<prefix>.*\.experts)\.(?P<idx>\d+)\.(?P<proj>gate_and_up_proj|down_proj)\.weight$"
-)
+_EXPERT_RE = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<idx>\d+)\.(?P<proj>gate_and_up_proj|down_proj)\.weight$")
 
 # FQN globs relative to the module VeOmniBackend wraps (the bare decoder,
 # transformer.model) -> ``layers.*`` (NOT ``model.layers.*``).
@@ -94,7 +92,6 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
 def get_hi3_parallel_plan():
     """Return the VeOmni ``ParallelPlan`` for HI3 expert parallelism (Shard(0))."""
     from torch.distributed._tensor import Shard
-
     from veomni.distributed.parallel_plan import ParallelPlan
 
     ep_plan = {fqn: Shard(dim) for fqn, dim in _EP_PLAN.items()}
@@ -140,7 +137,6 @@ class FusedHunyuanMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         from torch.distributed.tensor import DTensor
-
         from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
 
         bsz, seq, hidden = hidden_states.shape

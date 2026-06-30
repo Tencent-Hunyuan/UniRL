@@ -122,9 +122,7 @@ class VeOmniBackend(BaseFSDP2Backend):
         if world % self._ep_size != 0:
             raise ValueError(f"VeOmniBackend: world_size {world} not divisible by ep_size {self._ep_size}")
         extra_parallel_kwargs = (
-            {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)}
-            if self._ep_size > 1
-            else {}
+            {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)} if self._ep_size > 1 else {}
         )
         init_parallel_state(
             dp_size=world // self._sp_size,
@@ -136,6 +134,21 @@ class VeOmniBackend(BaseFSDP2Backend):
 
         self._bundle = bundle
         model = resolve_trainable_module(bundle, trainable_attr)
+
+        # Expert parallelism is driven solely by ep_size: when >1 the bundle must
+        # make its trainable model EP-ready (e.g. fuse MoE experts + attach
+        # get_parallel_plan) on meta, BEFORE structural injection / veomni_parallelize.
+        # A bundle that doesn't implement the hook can't run with ep_size>1 — fail
+        # fast rather than let VeOmni assert a missing get_parallel_plan deeper in.
+        if self._ep_size > 1:
+            prepare_ep = getattr(bundle, "prepare_for_expert_parallel", None)
+            if not callable(prepare_ep):
+                raise ValueError(
+                    f"VeOmniBackend: ep_size={self._ep_size} requires the bundle to support "
+                    f"expert parallelism via prepare_for_expert_parallel(); "
+                    f"{type(bundle).__name__} does not implement it."
+                )
+            prepare_ep()
 
         # Structural injection on the meta module (the documented
         # unirl.train.deferred contract: mutate on meta, stamp resets).
