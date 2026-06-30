@@ -60,7 +60,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -409,6 +410,7 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
         logprob_precision: str = "fp32",
         vae_scale_factor: int = 8,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -417,6 +419,18 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
+        # Batched-step replay: collapse the per-SDE-step replay loop into ONE
+        # transformer forward over all S steps stacked on the batch dim (and one
+        # vectorized SDE transition), cutting S model forwards + S FSDP
+        # all-gathers per replay down to 1 — the same lever as SD3
+        # (SD3DiffusionStage.batch_replay_steps). Safe ONLY for stateless,
+        # step_index-independent SDE strategies (Flow/Dance/CPS). The Qwen-Image
+        # kernel derives ``img_shapes`` / ``txt_seq_lens`` from the batch size +
+        # latent_h/w and trims text per-call by the (tiled) attn_mask, so the
+        # same prompts tiled S× reproduce the serial per-(sample,step) geometry
+        # exactly; under ``old_logp_source='replay'`` the anchor and train
+        # forward share this path -> on-policy ratio stays 1. Default OFF.
+        self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
             # Read from the transformer config: in_channels is the
             # packed-input dim (C * 4), so the post-VAE channel count is
@@ -610,6 +624,25 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+
+        # Batched-step fast path: stack all S SDE steps on the batch dim and run
+        # ONE transformer forward + one vectorized SDE transition instead of S
+        # serial forwards. Only for stateless SDE strategies (step_index is
+        # unused by Flow/Dance/CPS .step); >1 step makes it worth the tiling.
+        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+            with autocast_ctx:
+                return self._replay_batched_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    target=target,
+                    sigmas=sigmas,
+                    sigma_max=sigma_max,
+                    device=device,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                )
+
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
@@ -647,6 +680,98 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    def _replay_batched_steps(
+        self,
+        conditions: QwenImageConditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+        target: List[int],
+        sigmas: torch.Tensor,
+        sigma_max: torch.Tensor,
+        device: torch.device,
+        latent_h: int,
+        latent_w: int,
+    ) -> ReplayResult:
+        """Replay all ``target`` SDE steps in a single batched forward.
+
+        Equivalent to the serial loop above but stacks the S steps on the batch
+        dim: ``sample``/``prev_sample`` become ``[S*B, C, H, W]`` (step-major),
+        the text embeds + attention mask are tiled S× to ``[S*B, ...]``, and the
+        per-step ``sigma``/``sigma_next`` ride as ``[S*B]`` vectors. The kernel
+        rebuilds ``img_shapes`` (length S*B, all the same latent grid) and trims
+        the tiled embeds by the tiled mask to the same ``max_true`` length, so
+        one ``step_with_logp`` call runs ONE transformer forward (+ the CFG
+        branch when guidance>1) and one vectorized SDE transition over the whole
+        stack; the per-step log-probs reshape back to ``[B, S]``. The Qwen-Image
+        transformer has no cross-sample interaction, so per-sample results match
+        the serial path up to bf16 batch-shape rounding — and because the π_old
+        anchor is replayed through this same method, the on-policy ratio stays
+        exactly 1.
+
+        ``step_index`` is passed as ``target[0]`` for signature parity; the
+        guarded stateless SDE strategies ignore it.
+        """
+        S = len(target)
+        # Step-major stack: rows [k*B:(k+1)*B] are all B samples at step target[k].
+        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
+        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
+        B = sample_all.shape[0] // S
+        # Per-sample sigma vectors aligned with the step-major stack.
+        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
+        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
+        tiled = self._tile_conditions(conditions, S)
+
+        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
+            self.model,
+            tiled,
+            strategy=self.strategy,
+            sample=sample_all,
+            prev_sample=prev_all,
+            sigma=sigma_all,
+            sigma_next=sigma_next_all,
+            guidance_scale=float(params.guidance_scale),
+            eta=float(params.eta),
+            sigma_max=sigma_max,
+            step_index=int(target[0]),
+            latent_h=latent_h,
+            latent_w=latent_w,
+            distilled_guidance_scale=params.distilled_guidance_scale,
+        )
+        if log_prob_all is None:
+            raise RuntimeError(
+                "QwenImageDiffusionStage._replay_batched_steps: strategy returned None log-prob "
+                "(deterministic mode); batched replay requires a stochastic SDE strategy."
+            )
+        # [S*B] -> [S, B] -> [B, S] so slot s aligns with segment.sde_logp ordering.
+        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
+        means_t = None
+        if prev_mean_all is not None:
+            tail = prev_mean_all.shape[1:]
+            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    @staticmethod
+    def _tile_conditions(conditions: QwenImageConditions, repeats: int) -> QwenImageConditions:
+        """Repeat the text (and CFG-negative) embeds + attention mask ``repeats``×
+        along the batch dim so they align with the step-major ``[S*B, ...]``
+        sample stack — each block of B reuses the same per-sample conditioning,
+        since all S steps replay the SAME B trajectories at different timesteps.
+        Qwen-Image's ``TextEmbedCondition.pooled`` is always ``None`` (no pooled
+        text vector), but it is repeated for symmetry / future-proofing."""
+
+        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
+
+        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
+            if cond is None:
+                return None
+            return TextEmbedCondition(
+                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
+            )
+
+        return QwenImageConditions(text=_tile(conditions.text), negative_text=_tile(conditions.negative_text))
 
     # ------------------------------------------------------------------
     # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)

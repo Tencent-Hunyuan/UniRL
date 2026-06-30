@@ -50,7 +50,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -258,6 +259,7 @@ class ZImageDiffusionStage(DiffusionStage[ZImageConditions]):
         logprob_precision: str = "fp32",
         vae_scale_factor: int = 8,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -266,6 +268,14 @@ class ZImageDiffusionStage(DiffusionStage[ZImageConditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
+        # Batched-step replay: collapse the per-SDE-step replay loop into ONE
+        # transformer forward over all S steps stacked on the batch dim (cuts S
+        # model forwards + S FSDP all-gathers per replay to 1). Stateless SDE
+        # strategies only (Flow/Dance/CPS). Z-Image's list-based transformer
+        # consumes a per-sample list, so the S*B stack is just a longer list and
+        # the tiled captions reproduce the serial per-(sample,step) geometry
+        # exactly -> ratio stays 1 under old_logp_source='replay'. Default OFF.
+        self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
             tx_cfg = getattr(model.transformer, "config", None)
             in_channels = getattr(tx_cfg, "in_channels", 16) if tx_cfg is not None else 16
@@ -438,6 +448,23 @@ class ZImageDiffusionStage(DiffusionStage[ZImageConditions]):
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+
+        # Batched-step fast path: stack all S SDE steps on the batch dim and run
+        # ONE transformer forward + one vectorized SDE transition instead of S
+        # serial forwards. Only for stateless SDE strategies (step_index unused
+        # by Flow/Dance/CPS .step); >1 step makes it worth the tiling.
+        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+            with autocast_ctx:
+                return self._replay_batched_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    target=target,
+                    sigmas=sigmas,
+                    sigma_max=sigma_max,
+                    device=device,
+                )
+
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
@@ -472,6 +499,77 @@ class ZImageDiffusionStage(DiffusionStage[ZImageConditions]):
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    def _replay_batched_steps(
+        self,
+        conditions: ZImageConditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+        target: List[int],
+        sigmas: torch.Tensor,
+        sigma_max: torch.Tensor,
+        device: torch.device,
+    ) -> ReplayResult:
+        """Replay all ``target`` SDE steps in a single batched forward.
+
+        Stacks the S steps on the batch dim (``[S*B, C, H, W]``, step-major),
+        tiles the captions S×, and runs one ``step_with_logp``. Z-Image's
+        single-stream transformer lifts the batched latent to a per-sample list
+        and consumes a matching caption list, so the S*B stack is just a longer
+        list with no cross-sample interaction — per-sample results match the
+        serial path up to bf16 batch-shape rounding, and the π_old anchor
+        replayed through this same path keeps the on-policy ratio at exactly 1.
+        """
+        S = len(target)
+        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
+        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
+        B = sample_all.shape[0] // S
+        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
+        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
+        tiled = self._tile_conditions(conditions, S)
+
+        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
+            self.model,
+            tiled,
+            strategy=self.strategy,
+            sample=sample_all,
+            prev_sample=prev_all,
+            sigma=sigma_all,
+            sigma_next=sigma_next_all,
+            guidance_scale=float(params.guidance_scale),
+            eta=float(params.eta),
+            sigma_max=sigma_max,
+            step_index=int(target[0]),
+        )
+        if log_prob_all is None:
+            raise RuntimeError(
+                "ZImageDiffusionStage._replay_batched_steps: strategy returned None log-prob "
+                "(deterministic mode); batched replay requires a stochastic SDE strategy."
+            )
+        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
+        means_t = None
+        if prev_mean_all is not None:
+            tail = prev_mean_all.shape[1:]
+            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    @staticmethod
+    def _tile_conditions(conditions: ZImageConditions, repeats: int) -> ZImageConditions:
+        """Repeat the text (+ CFG-negative) embeds + mask ``repeats``× along the
+        batch dim so they align with the step-major ``[S*B, ...]`` sample stack."""
+
+        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
+
+        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
+            if cond is None:
+                return None
+            return TextEmbedCondition(
+                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
+            )
+
+        return ZImageConditions(text=_tile(conditions.text), negative_text=_tile(conditions.negative_text))
 
     # ------------------------------------------------------------------
     # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)

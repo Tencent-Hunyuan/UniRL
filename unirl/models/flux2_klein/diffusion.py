@@ -57,7 +57,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -332,6 +333,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         vae_scale_factor: int = 8,
         patchify_factor: int = 2,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -341,6 +343,14 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = int(vae_scale_factor)
         self.patchify_factor = int(patchify_factor)
+        # Batched-step replay: collapse the per-SDE-step replay loop into ONE
+        # transformer forward over all S steps stacked on the batch dim (cuts S
+        # forwards + S FSDP all-gathers per replay to 1). Stateless SDE
+        # strategies only (Klein defaults to DanceSDE). The packed latents +
+        # 4-axis RoPE ids are rebuilt per-call from the (stacked) sample, and the
+        # tiled text reproduces the serial per-(sample,step) geometry -> ratio
+        # stays 1 under old_logp_source='replay'. Default OFF.
+        self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
             tx_cfg = getattr(model.transformer, "config", None)
             in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
@@ -541,6 +551,23 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         prior_training = self.model.transformer.training
         self.model.transformer.eval()
         try:
+            # Batched-step fast path: stack all S SDE steps on the batch dim and
+            # run ONE transformer forward + one vectorized SDE transition instead
+            # of S serial forwards. Only for stateless SDE strategies (step_index
+            # unused by Dance/Flow/CPS .step). The ``finally`` below still
+            # restores train() mode on this early return.
+            if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+                with autocast_ctx:
+                    return self._replay_batched_steps(
+                        conditions,
+                        segment=segment,
+                        params=params,
+                        target=target,
+                        sigmas=sigmas,
+                        sigma_max=sigma_max,
+                        device=device,
+                    )
+
             log_probs: List[torch.Tensor] = []
             prev_sample_means: List[torch.Tensor] = []
             with autocast_ctx:
@@ -578,6 +605,85 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    def _replay_batched_steps(
+        self,
+        conditions: Flux2KleinConditions,
+        *,
+        segment: LatentSegment,
+        params: Flux2KleinDiffusionParams,
+        target: List[int],
+        sigmas: torch.Tensor,
+        sigma_max: torch.Tensor,
+        device: torch.device,
+    ) -> ReplayResult:
+        """Replay all ``target`` SDE steps in a single batched forward.
+
+        Stacks the S steps on the batch dim (``[S*B, 128, H_pat, W_pat]``,
+        step-major), tiles the text (and any edit-condition tokens) S×, and runs
+        one ``step_with_logp`` — the kernel rebuilds the packed latents + 4-axis
+        RoPE ids per-call for the whole stack. Klein has no cross-sample
+        interaction, so per-sample results match the serial path up to bf16
+        batch-shape rounding, and the π_old anchor replayed through this same
+        path keeps the on-policy ratio at exactly 1. Runs inside the caller's
+        ``.eval()`` scope (the replay() ``finally`` restores train mode).
+        """
+        S = len(target)
+        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
+        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
+        B = sample_all.shape[0] // S
+        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
+        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
+        tiled = self._tile_conditions(conditions, S)
+
+        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
+            self.model,
+            tiled,
+            strategy=self.strategy,
+            sample=sample_all,
+            prev_sample=prev_all,
+            sigma=sigma_all,
+            sigma_next=sigma_next_all,
+            guidance_scale=float(params.guidance_scale),
+            eta=float(params.eta),
+            sigma_max=sigma_max,
+            step_index=int(target[0]),
+        )
+        if log_prob_all is None:
+            raise RuntimeError(
+                "Flux2KleinDiffusionStage._replay_batched_steps: strategy returned None log-prob "
+                "(deterministic mode); batched replay requires a stochastic SDE strategy."
+            )
+        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
+        means_t = None
+        if prev_mean_all is not None:
+            tail = prev_mean_all.shape[1:]
+            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    @staticmethod
+    def _tile_conditions(conditions: Flux2KleinConditions, repeats: int) -> Flux2KleinConditions:
+        """Repeat the text (+ CFG-negative) embeds and any edit-condition tokens
+        ``repeats``× along the batch dim so they align with the step-major
+        ``[S*B, ...]`` sample stack — each block of B reuses the same per-sample
+        conditioning across all S replayed steps."""
+
+        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
+
+        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
+            if cond is None:
+                return None
+            return TextEmbedCondition(
+                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
+            )
+
+        return Flux2KleinConditions(
+            text=_tile(conditions.text),
+            negative_text=_tile(conditions.negative_text),
+            image_latent=_rep(conditions.image_latent),
+            image_latent_ids=_rep(conditions.image_latent_ids),
+        )
 
     # ------------------------------------------------------------------
     # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
