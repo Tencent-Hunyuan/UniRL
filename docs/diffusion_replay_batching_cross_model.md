@@ -233,6 +233,32 @@ The win grows with world size and S, and tracks all-gather/compute balance
 (Qwen's 20B params ≫ compute-per-forward → largest win; z_image's heavier
 list-based forward → smallest). Every config is bit-identical-ratio (ratio ≡ 1).
 
+### 6.3e Qwen-Image end-to-end recipe A/B (measured, real training loop)
+
+`qwen_image_trainside_veomni.yaml` on 2×H20 (`num_devices=2 +devices_per_node=2`),
+weights copied to local `/data` (see note), reward pointed at local PickScore/CLIP,
+scoped small (batch_size=4, samples_per_prompt=2, 3 rollouts), `+pipeline.batch_replay_steps` off vs on:
+
+| run | step 1→2 | step 2→3 | ratio | reward |
+|-----|---------:|---------:|-------|--------|
+| off (serial replay)  | 97.8 s | 90.7 s | 1.0000±0.0000 | 0.82–0.86 |
+| on  (batched replay) | 62.4 s | 82.0 s | 1.0000±0.0000 | 0.78–0.84 |
+
+End-to-end total step drops ~94 s → ~72 s (**~1.3×**; per-step 1.1–1.5×, noisy at
+this 8-sample/2-GPU scale because the batched replay only accelerates the
+`diffusion_train` fraction of the step while rollout-gen + reward are fixed).
+`ratio=1.0000±0.0000` in both and reward is comparable → **pure speedup, no
+training-dynamics change** — the real-recipe confirmation of the isolated
+microbench (§6.3b: replay itself 3.08–8.26×). PR #144's SD3/PE −47% total step
+(at 256 samples) is the larger-scale analog; the win grows with sample count / S
+/ world size.
+
+> Getting here required copying the 20B checkpoint from the ceph-fuse network
+> mount to local `/data` (ceph-fuse client cache isn't node-RAM-durable, so
+> pre-warm doesn't stick — see §7), and pointing the reward model at local
+> PickScore/CLIP + `HF_HUB_OFFLINE=1` (the HF-repo-id default hit a blocked
+> network). NCCL runs fine under the box's GPU occupier (does not deadlock).
+
 ### 6.4 Implementations landed
 
 `_replay_batched_steps` + `_tile_conditions` + a `batch_replay_steps` gate now
@@ -286,11 +312,14 @@ Status:
      because its shard byte-ranges hit the **slow network mount** (~18–80 MB/s;
      a full sequential page-cache pre-warm doesn't cover the per-rank byte
      ranges VeOmni reads). So the run can't complete a step here.
-   - Net: the recurring, real blocker for the full recipe on this box is the
-     **slow network-mount weight load under multi-rank VeOmni**, not the
-     optimization / NCCL / GPU memory. The FSDP microbench above is the
-     controlled isolate of the optimization's effect (Qwen 3.08–8.26×); PR
-     #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe analog.
+   - **Resolved + completed** (§6.3e): copying the 20B checkpoint to local
+     `/data` (ceph-fuse cache isn't durable) + pointing the reward at local
+     PickScore/CLIP with `HF_HUB_OFFLINE=1` (the HF-repo-id default hit a
+     blocked network) let the A/B run end-to-end at `num_devices=2`. Result:
+     total step ~94 s → ~72 s (~1.3× at this small scale), `ratio=1.0000` exact
+     both, reward comparable. NCCL is fine under the occupier (does not
+     deadlock). The FSDP microbench (§6.3b) is the clean isolate (3.08–8.26×);
+     PR #144's SD3/PE −47% step is the larger-scale analog.
 4. **video / unified** — design the chunked variant; gate behind a memory check.
 
 Environment notes: working env `/root/ep_work/epvenv` (torch 2.10+cu128,
