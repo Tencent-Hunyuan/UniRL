@@ -89,14 +89,18 @@ class VideoAdapter(ImageAdapter):
 class MochiAdapter(ImageAdapter):
     """Mochi — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
 
-    pass
+    # Legacy image-path video family: drop 4-D decoded samples (incl. single-frame)
+    # rather than squeezing them into images.
+    squeeze_single_frame_4d = False
 
 
 @register_adapter("hunyuan_video")
 class HunyuanVideoAdapter(ImageAdapter):
     """HunyuanVideo — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
 
-    pass
+    # Legacy image-path video family: drop 4-D decoded samples (incl. single-frame)
+    # rather than squeezing them into images.
+    squeeze_single_frame_4d = False
 
 
 __all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter"]
