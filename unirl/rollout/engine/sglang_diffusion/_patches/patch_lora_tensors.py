@@ -168,27 +168,6 @@ def patch_lora_tensors() -> None:
             to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
             for name, weight in lora_state_dict.items():
                 name = name.replace("diffusion_model.", "")
-                # Per-layer LoRA alpha (injected by adapt_lora_for_sglang as
-                # "<module>.alpha"). Upstream set_lora_weights looks it up as
-                # "<layer_base>.alpha" in self.lora_adapters to compute
-                # scale = alpha/rank; without it, it falls back to alpha=rank
-                # (scale 1.0) — WRONG when alpha != rank (e.g. WAN lora 128/64).
-                # Map the alpha key through the SAME name mapping as the lora_A
-                # weight so it lands on the matching <layer_base>.alpha key.
-                if name.endswith(".alpha"):
-                    base = name[: -len(".alpha")]
-                    # mirror the lora_A mapping path to recover the layer base
-                    probe = base + ".lora_A.weight"
-                    probe = probe.replace(".weight", "")
-                    probe, _, _ = lora_param_names_mapping_fn(probe)
-                    layer_base, _, _ = param_names_mapping_fn(probe)
-                    # layer_base now looks like "<target>.lora_A"; strip it
-                    for suf in (".lora_A", ".lora_B"):
-                        if layer_base.endswith(suf):
-                            layer_base = layer_base[: -len(suf)]
-                            break
-                    self.lora_adapters[lora_nickname][layer_base + ".alpha"] = weight.to(self.device)
-                    continue
                 name = name.replace(".weight", "")
                 # misc-format -> HF-format
                 name, _, _ = lora_param_names_mapping_fn(name)
