@@ -273,11 +273,17 @@ Status:
    1.18× / 1.55×, ratio=1 exact). **flux2_klein** — implemented + committed;
    runtime validation pending (single-file checkpoint + slow mount).
 3. **Full trainside recipe A/B** (`qwen_image_trainside_veomni.yaml`,
-   `batch_replay_steps` off/on) — NOT run here: it is a long (≫195 s) multi-rank
-   NCCL job, and NCCL collectives deadlock under the box's busy-loop GPU
-   occupier while pausing it for the whole run trips the occupier's respawn
-   watchdog. The FSDP microbench above is the controlled isolate of the same
-   effect; PR #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe
+   `+pipeline.batch_replay_steps=false/true`) — wired + launched, but does not
+   complete here. Correction of an earlier claim: NCCL does **not** deadlock
+   under the busy occupier — verified directly (z_image FSDP w2 with the
+   occupier live at 100% completes at 1.17×, identical to the paused run). The
+   actual blocker is a **container memory-cgroup OOM**: the run boots fully
+   (Ray up, 25432-prompt dataset, `world=8` layout) then a rank hits ~54 GB
+   anon-RSS during the 20B (+15 GB Qwen2.5-VL) multi-rank load and is OOM-killed,
+   taking down the Raylet. It would need memory tuning (fewer ranks /
+   `low_cpu_mem_usage` / meta-load the text encoder) to finish. The FSDP
+   microbench above is the controlled isolate of the same effect (Qwen 3.08–
+   8.26×); PR #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe
    analog.
 4. **video / unified** — design the chunked variant; gate behind a memory check.
 
