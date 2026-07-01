@@ -92,4 +92,11 @@ class MochiAdapter(ImageAdapter):
     pass
 
 
-__all__ = ["VideoAdapter", "MochiAdapter"]
+@register_adapter("hunyuan_video")
+class HunyuanVideoAdapter(ImageAdapter):
+    """HunyuanVideo — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
+
+    pass
+
+
+__all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter"]

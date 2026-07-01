@@ -20,6 +20,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.video import (
+    HunyuanVideoAdapter,
     MochiAdapter,
     VideoAdapter,
 )
@@ -37,5 +38,6 @@ __all__ = [
     "QwenImageAdapter",
     "VideoAdapter",
     "MochiAdapter",
+    "HunyuanVideoAdapter",
     "ZImageAdapter",
 ]

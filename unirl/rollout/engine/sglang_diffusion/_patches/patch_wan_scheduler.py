@@ -40,7 +40,18 @@ def patch_wan_scheduler() -> None:
         # Stock init builds the (UniPC) scheduler + nothing else; run it so any
         # future additions survive, then overwrite the scheduler module.
         orig(self, server_args)
-        self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=server_args.pipeline_config.flow_shift)
+        # flow_shift is normally set on WAN's pipeline_config; guard so a config
+        # variant that omits it degrades to the flow-match neutral shift (1.0)
+        # with a warning instead of an AttributeError at pipeline init.
+        flow_shift = getattr(server_args.pipeline_config, "flow_shift", None)
+        if flow_shift is None:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "patch_wan_scheduler: pipeline_config has no flow_shift; defaulting to 1.0"
+            )
+            flow_shift = 1.0
+        self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
 
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
     WanPipeline.initialize_pipeline = initialize_pipeline
