@@ -207,6 +207,32 @@ already beats SD3 at w8 (2.74×), and at S=6 the collapse of 6 all-gathers → 1
 hits **8.26×**. (Loading the 20B off the network mount is the only practical
 hurdle; pre-warm the page cache first, then the timed run is fast + clean.)
 
+### 6.3c z_image distributed FSDP2 timing (measured, real 6.15B)
+
+`fsdp_replay_microbench.py --model z_image` (Z-Image-Turbo), B=1, ratio=1 exact:
+
+| world | S | serial | batched | **speedup** |
+|------:|--:|-------:|--------:|------------:|
+| 2 | 3 | 1669 ms | 1419 ms | **1.18×** |
+| 8 | 3 | 2589 ms | 1668 ms | **1.55×** |
+
+z_image's win is *smaller* than SD3's despite ~3× the params — a real
+architecture effect: the list-based single-stream S3-DiT forward (+ refiner
+layers) is more compute-heavy per sample, so the all-gather share (and thus the
+batching win) is smaller. Confirms the §3 model: win ∝ all-gather / compute.
+
+### 6.3d Cross-model summary (measured, B=1, ratio=1 exact everywhere)
+
+| model (arch) | params | w2·S3 | w8·S3 | w8·S6 |
+|--------------|-------:|------:|------:|------:|
+| sd3 (MMDiT)          | 2.24B | 1.59× | 2.74× | 3.69× |
+| z_image (list S3-DiT)| 6.15B | 1.18× | 1.55× | — |
+| qwen_image (MMDiT)   | 20.4B | 3.08× | 2.95× | **8.26×** |
+
+The win grows with world size and S, and tracks all-gather/compute balance
+(Qwen's 20B params ≫ compute-per-forward → largest win; z_image's heavier
+list-based forward → smallest). Every config is bit-identical-ratio (ratio ≡ 1).
+
 ### 6.4 Implementations landed
 
 `_replay_batched_steps` + `_tile_conditions` + a `batch_replay_steps` gate now
