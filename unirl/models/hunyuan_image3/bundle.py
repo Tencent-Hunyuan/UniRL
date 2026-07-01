@@ -489,8 +489,14 @@ class HunyuanImage3Bundle(Bundle):
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
             n_exp = load_ep_experts(self.transformer, expert_sd, is_fused_expert_key)
+            if n_exp == 0:
+                raise RuntimeError(
+                    "expert-parallel: load_ep_experts loaded 0 EP-sharded expert params — "
+                    "expert weights would stay meta/uninitialized. Check is_fused_expert_key "
+                    "against the checkpoint keys."
+                )
             if _current_rank() == 0:
-                print(f"expert-parallel: loaded {n_exp} EP-sharded expert param(s)", flush=True)
+                logger.info("expert-parallel: loaded %d EP-sharded expert param(s)", n_exp)
 
             # VeOmni root-shards the non-layer params (wte, ln_f, lm_head) into
             # DTensors; HI3's ForCausalMM wrapper calls them OUTSIDE the decoder
@@ -501,8 +507,14 @@ class HunyuanImage3Bundle(Bundle):
             from unirl.train.backend.veomni.ep import register_unsharded_param_hooks
 
             n_hooked = register_unsharded_param_hooks(self.transformer)
+            if n_hooked == 0:
+                raise RuntimeError(
+                    "expert-parallel: register_unsharded_param_hooks hooked 0 root params — "
+                    "wte/ln_f/lm_head would hit mixed Tensor/DTensor at forward. Check the "
+                    "hook targets against the model."
+                )
             if _current_rank() == 0:
-                print(f"expert-parallel: hooked root params for direct all-gather: {n_hooked}", flush=True)
+                logger.info("expert-parallel: hooked root params for direct all-gather: %d", n_hooked)
 
         # [Bug B fix] Post-load validation: verify all LoRA base_layer
         # params are finite and not on meta.

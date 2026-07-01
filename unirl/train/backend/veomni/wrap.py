@@ -98,6 +98,13 @@ def veomni_parallelize(
 
     block_instances = _enumerate_block_instances(model, block_class_names)
 
+    if activation_checkpointing and not block_instances:
+        raise RuntimeError(
+            "veomni_parallelize: activation_checkpointing=True but no blocks of class "
+            f"{tuple(block_class_names)!r} matched — AC would silently be a no-op and "
+            "training would OOM. Check block_class_names against the model."
+        )
+
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
 
