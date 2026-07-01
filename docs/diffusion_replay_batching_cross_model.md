@@ -264,17 +264,22 @@ off the network mount — ~50–65 s per safetensors shard — so per-model FSDP
 are load-bound. HF/ModelScope are not reachable via the Tencent github proxy, but
 these local mirrors cover the image + video models.)
 
-Proposed order:
-1. **Qwen-Image** (checkpoint present, highest-value): implement
-   `QwenImageDiffusionStage._replay_batched_steps` + `_tile_conditions`
-   (tile `embeds`/`attn_mask`, replicate `img_shapes`/`txt_seq_lens`,
-   keep the per-call max-len trim correct), add a `validate_batched_replay`
-   twin, then run `examples/diffusion/qwen_image_trainside_veomni.yaml` with
-   `batch_replay_steps` off/on (A/B) → step time + ratio=1.
-2. **z_image / flux2_klein**: implement + numerically validate with
-   config-instantiated random-weight transformers (architecture drives the
-   timing); full distributed A/B once checkpoints are fetchable.
-3. **video / unified**: design the chunked variant; gate behind a memory check.
+Status:
+1. **Qwen-Image** — DONE: `_replay_batched_steps` + `_tile_conditions`
+   implemented + threaded; correctness validated on real 20B (parity 1e-6,
+   ratio=1 exact); distributed FSDP2 timing measured (§6.3b: 3.08× / 2.95× /
+   8.26×).
+2. **z_image** — DONE: implemented; distributed FSDP2 timing measured (§6.3c:
+   1.18× / 1.55×, ratio=1 exact). **flux2_klein** — implemented + committed;
+   runtime validation pending (single-file checkpoint + slow mount).
+3. **Full trainside recipe A/B** (`qwen_image_trainside_veomni.yaml`,
+   `batch_replay_steps` off/on) — NOT run here: it is a long (≫195 s) multi-rank
+   NCCL job, and NCCL collectives deadlock under the box's busy-loop GPU
+   occupier while pausing it for the whole run trips the occupier's respawn
+   watchdog. The FSDP microbench above is the controlled isolate of the same
+   effect; PR #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe
+   analog.
+4. **video / unified** — design the chunked variant; gate behind a memory check.
 
 Environment notes: working env `/root/ep_work/epvenv` (torch 2.10+cu128,
 diffusers 0.37, transformers 5.9); 8×H20 (96 GB). A `/tmp/gpu_occupy.py` busy-loop
