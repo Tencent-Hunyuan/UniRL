@@ -21,6 +21,10 @@ with ``FlowMatchEulerDiscreteScheduler(shift=flow_shift)`` after the stock init
 (which only sets the scheduler module). Single-step flow-match transitions also
 match what the trainer replays trainside (FlowSDE), keeping GRPO's rollout↔replay
 consistency. Idempotent via a sentinel; import-safe (sglang imported inside).
+
+Depends on ``patch_set_timesteps`` also being applied: it neutralizes the shift
+so the driver-pinned σ schedule survives ``set_timesteps``' consistency check.
+Both are installed together by the patch suite's ``hijack()``.
 """
 
 from __future__ import annotations
@@ -40,17 +44,16 @@ def patch_wan_scheduler() -> None:
         # Stock init builds the (UniPC) scheduler + nothing else; run it so any
         # future additions survive, then overwrite the scheduler module.
         orig(self, server_args)
-        # flow_shift is normally set on WAN's pipeline_config; guard so a config
-        # variant that omits it degrades to the flow-match neutral shift (1.0)
-        # with a warning instead of an AttributeError at pipeline init.
+        # WAN's correct flow_shift is model-specific (typically != 1.0), so we do
+        # NOT guess a default: a missing flow_shift is a config error, and silently
+        # substituting a wrong shift would skew the rollout distribution unnoticed.
+        # Fail fast with a clear message (vs the raw AttributeError of a bare access).
         flow_shift = getattr(server_args.pipeline_config, "flow_shift", None)
         if flow_shift is None:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "patch_wan_scheduler: pipeline_config has no flow_shift; defaulting to 1.0"
+            raise ValueError(
+                "patch_wan_scheduler: pipeline_config.flow_shift is required for the "
+                "flow-match scheduler but is missing; set it on the WAN pipeline_config."
             )
-            flow_shift = 1.0
         self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
 
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
