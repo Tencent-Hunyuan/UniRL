@@ -190,9 +190,22 @@ Claim 3 (grad flows through batched replay):    PASS
 
 Proves the Qwen-Image tiling (variable-length text trim + `img_shapes` /
 `txt_seq_lens` replication) is correct and ratio=1-exact on real weights.
-Distributed timing follows the SD3 trend scaled by params: Qwen-Image's
-per-forward all-gather is ~10× SD3's (20B vs 2.24B), so the distributed win is at
-least as large.
+
+### 6.3b Qwen-Image distributed FSDP2 timing (measured, real 20B)
+
+`fsdp_replay_microbench.py --model qwen_image`, B=1, ratio=1 exact every row:
+
+| world | S | serial (S all-gathers) | batched (1) | **speedup** |
+|------:|--:|-----------------------:|------------:|------------:|
+| 2 | 3 | 4365 ms | 1416 ms | **3.08×** |
+| 8 | 3 | 8580 ms | 2909 ms | **2.95×** |
+| 8 | 6 | 12183 ms | 1475 ms | **8.26×** |
+
+As predicted by the param scaling (Qwen-Image's per-forward all-gather is ~10×
+SD3's: 20B vs 2.24B), the win is **larger than SD3's** — Qwen at w2 (3.08×)
+already beats SD3 at w8 (2.74×), and at S=6 the collapse of 6 all-gathers → 1
+hits **8.26×**. (Loading the 20B off the network mount is the only practical
+hurdle; pre-warm the page cache first, then the timed run is fast + clean.)
 
 ### 6.4 Implementations landed
 
