@@ -44,16 +44,14 @@ def patch_wan_scheduler() -> None:
         # Stock init builds the (UniPC) scheduler + nothing else; run it so any
         # future additions survive, then overwrite the scheduler module.
         orig(self, server_args)
-        # WAN's correct flow_shift is model-specific (typically != 1.0), so we do
-        # NOT guess a default: a missing flow_shift is a config error, and silently
-        # substituting a wrong shift would skew the rollout distribution unnoticed.
-        # Fail fast with a clear message (vs the raw AttributeError of a bare access).
-        flow_shift = getattr(server_args.pipeline_config, "flow_shift", None)
+        # ``flow_shift`` is a pipeline_config field typed ``float | None``: WAN
+        # variants set a concrete value (3/5/8/…), but the base default is None,
+        # which is a LEGAL config meaning "use the scheduler's own default shift".
+        # We cannot forward None (the scheduler computes ``shift * sigmas / …`` and
+        # ``None * sigmas`` would raise), so map None to the scheduler default (1.0).
+        flow_shift = server_args.pipeline_config.flow_shift
         if flow_shift is None:
-            raise ValueError(
-                "patch_wan_scheduler: pipeline_config.flow_shift is required for the "
-                "flow-match scheduler but is missing; set it on the WAN pipeline_config."
-            )
+            flow_shift = 1.0  # FlowMatchEulerDiscreteScheduler's own default shift
         self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
 
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
