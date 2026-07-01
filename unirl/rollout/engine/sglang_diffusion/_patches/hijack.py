@@ -153,6 +153,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
+            patch_safe_unpickler,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_sampling_io import (
             patch_sampling_io,
         )
@@ -168,9 +171,6 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_srt import patch_srt
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
-            patch_safe_unpickler,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
             patch_wan_scheduler,

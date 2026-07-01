@@ -40,9 +40,7 @@ def patch_wan_scheduler() -> None:
         # Stock init builds the (UniPC) scheduler + nothing else; run it so any
         # future additions survive, then overwrite the scheduler module.
         orig(self, server_args)
-        self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(
-            shift=server_args.pipeline_config.flow_shift
-        )
+        self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(shift=server_args.pipeline_config.flow_shift)
 
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
     WanPipeline.initialize_pipeline = initialize_pipeline
