@@ -273,18 +273,24 @@ Status:
    1.18× / 1.55×, ratio=1 exact). **flux2_klein** — implemented + committed;
    runtime validation pending (single-file checkpoint + slow mount).
 3. **Full trainside recipe A/B** (`qwen_image_trainside_veomni.yaml`,
-   `+pipeline.batch_replay_steps=false/true`) — wired + launched, but does not
-   complete here. Correction of an earlier claim: NCCL does **not** deadlock
-   under the busy occupier — verified directly (z_image FSDP w2 with the
-   occupier live at 100% completes at 1.17×, identical to the paused run). The
-   actual blocker is a **container memory-cgroup OOM**: the run boots fully
-   (Ray up, 25432-prompt dataset, `world=8` layout) then a rank hits ~54 GB
-   anon-RSS during the 20B (+15 GB Qwen2.5-VL) multi-rank load and is OOM-killed,
-   taking down the Raylet. It would need memory tuning (fewer ranks /
-   `low_cpu_mem_usage` / meta-load the text encoder) to finish. The FSDP
-   microbench above is the controlled isolate of the same effect (Qwen 3.08–
-   8.26×); PR #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe
-   analog.
+   `+pipeline.batch_replay_steps=false/true`) — wired + launched + booted, but
+   does not reach a training step here. Findings from the attempt:
+   - NCCL does **not** deadlock under the busy occupier (earlier claim was
+     wrong) — verified directly: z_image FSDP w2 with the occupier live at 100%
+     completes at 1.17×, identical to the paused run.
+   - `world=8` → a rank is OOM-killed during the 20B (+16 GB Qwen2.5-VL)
+     multi-rank load (Raylet dies). `num_devices=2 +devices_per_node=2` gets
+     past that: Ray up, 25432-prompt dataset, `world=2` layout, rank-1 loads
+     (16 GB) and starts its rollout — **but rank-0 stalls indefinitely on the
+     VeOmni per-shard weight load** (236/729, D-state, no progress ~17 min),
+     because its shard byte-ranges hit the **slow network mount** (~18–80 MB/s;
+     a full sequential page-cache pre-warm doesn't cover the per-rank byte
+     ranges VeOmni reads). So the run can't complete a step here.
+   - Net: the recurring, real blocker for the full recipe on this box is the
+     **slow network-mount weight load under multi-rank VeOmni**, not the
+     optimization / NCCL / GPU memory. The FSDP microbench above is the
+     controlled isolate of the optimization's effect (Qwen 3.08–8.26×); PR
+     #144's end-to-end −54% `diffusion_train` on SD3/PE is the recipe analog.
 4. **video / unified** — design the chunked variant; gate behind a memory check.
 
 Environment notes: working env `/root/ep_work/epvenv` (torch 2.10+cu128,
