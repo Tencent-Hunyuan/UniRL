@@ -1,0 +1,204 @@
+# @package _global_
+# BAGEL-7B-MoT x PickScore x LoRA — vLLM-Omni rollout GRPO recipe.
+#
+# This is the vllm_omni-rollout sibling of examples/diffusion/bagel/bagel_trainside_lora.yaml.
+# It keeps that recipe's model / precision / algorithm / data setup verbatim and
+# diverges ONLY on the rollout path: instead of the in-process
+# TrainsideRolloutEngine, generation runs in a separate vLLM-Omni worker
+# subprocess (the BAGEL single-stage DiT topology), and the freshly-trained LoRA
+# is pushed into that worker each rollout via a LocalLoraWeightSync — exactly the
+# shape examples/diffusion/sd3_vllmomni.yaml uses for SD3.
+#
+# What makes BAGEL's vllm_omni path different from SD3's (all handled in
+# unirl/rollout/engine/vllm_omni/{adapters,pipelines}/bagel.*):
+#   - The worker uses RLBagelPipeline, which sets BAGEL's native generate_image
+#     scheduler to a BagelFlowSDEScheduler (SDE math == trainside FlowSDEStrategy)
+#     and injects the driver-authored x_T into bagel.prepare_vae_latent.
+#   - num_inference_steps is sent as steps+1 (BAGEL loops num_timesteps-1) and
+#     BAGEL builds its own sigma schedule (shift 3.0 == trainside) — the response
+#     sigma-echo verify asserts it matches the engine-pinned req.sigmas.
+#   - BAGEL conditioning (opaque KV caches) can't cross the IPC boundary, so the
+#     adapter ships the PROMPTS and BagelDiffusionStage rebuilds the KV contexts
+#     trainer-side at replay (the und/text path is frozen → identical contexts).
+#
+# 16 prompts/rollout, 16 samples/prompt, 2 optimizer updates/rollout, cfg=1.
+#
+# Launch:
+#   cd UniRL-main && PYTHONPATH=$PWD python -m unirl.train_diffusion \
+#     --config-name diffusion/bagel/bagel_vllmomni --cfg job --resolve
+
+num_devices: 8
+batch_size: 16                 # prompts_per_rollout (one UniRL rollout ~ one flow_grpo epoch)
+adv_use_global_std: false      # per-group GRPO normalization (mainline default)
+num_rollouts: 10000            # intentionally large; stop manually
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train). Every
+# N rollouts the loop pushes the freshly-trained adapter into the vLLM-Omni
+# engine. 1 = on-policy; >1 lags rollout weights (off-policy drift).
+weight_sync_interval: 1
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,/root/hf_model/BAGEL-7B-MoT}
+    model_precision: bf16
+    shift: 3.0
+    use_lora: true              # read by the engine's WeightSync (uses_lora)
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32                 # v3: trainable LoRA master + Adam states in fp32 (reward-collapse fix)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4          # lowered from 1.0e-4 (reduce per-update drift / ratio swing)
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # = BAGEL_MOE_GEN_LORA_TARGETS (gen experts only)
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  # model_config carries the σ-schedule ``shift`` (read by the adapter's
+  # schedule_policy) and ``use_lora`` (read by WeightSync); point it at the
+  # bundle's config so train + rollout share one source.
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    # Required; same checkpoint the bundle loads.
+    model_path: ${oc.env:BAGEL_PATH,/root/hf_model/BAGEL-7B-MoT}
+    # BAGEL single-stage T2I diffusion modality (registers BagelT2iAdapter +
+    # boots stage_configs/bagel_t2i_rl.yaml with RLBagelPipeline).
+    modality: bagel_t2i
+    # Required for colocate: trainer calls sleep()/wake_up() around the train
+    # phase, a no-op unless CuMemAllocator is enabled at vLLM-Omni init time.
+    enable_sleep_mode: true
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR_ID,laion/CLIP-ViT-H-14-laion2B-s32B-b79K}
+      model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-5
+  clip_schedule: constant
+  # vllm_omni emits per-step log-probs from the worker SDE scheduler, so the
+  # PPO π_old anchor is the rollout's emitted sde_logp (default). The worker SDE
+  # math matches the trainside FlowSDEStrategy so the on-policy ratio stays ≈ 1.
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Bagel diffusion sampling params (one object shared by trainer expand + diffusion stage).
+sampling:
+  _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+  num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points); adapter sends +1 to the worker
+  guidance_scale: 1.0
+  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path
+  cfg_img_scale: 1.0
+  cfg_interval: [0.0, 1.0]
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: global
+  eta: 1                             # SDE noise scale (= flow_grpo noise_level)
+  samples_per_prompt: 16
+  height: 512
+  width: 512
+  seed: 42
+  init_same_noise: false               # per-sample x_T; diverse GRPO groups
+  trajectory_precision: fp32           # forwarded to the worker scheduler's SDE log-prob storage round-trip
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    num_sde_steps: 2
+
+# LoRA weight sync → vLLM-Omni rollout. Instantiated as a LocalLoraWeightSync
+# (sibling of backend + rollout). The train loop drives cadence via
+# weight_sync_interval (top of file): every N rollouts it calls sync() to push
+# the freshly-trained LoRA (set_lora_from_tensors) into the engine just before
+# that rollout's generate.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: true                         # checksum read-back asserts the synced LoRA landed; catches a wrong prefix
+  # Mirrors BagelPipelineConfig.weight_sync_param_name_prefix; must match the
+  # engine-side LoRA key naming (the trainable module is model.language_model).
+  param_prefix: "language_model."
+  adapter_name: default

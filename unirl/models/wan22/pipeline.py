@@ -19,6 +19,7 @@ sibling stages), matching the SD3 convention of one-package-per-model.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 from unirl.models.types.pipeline import Pipeline
@@ -157,6 +158,32 @@ class WAN22Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> WAN21Conditions:
+        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``.
+
+        Builds only the text-conditioning slots (``text`` / ``negative_text``);
+        the optional ``image_latent`` / ``image_embed`` slots are left ``None``
+        and attached by :meth:`generate` when an input image is supplied.
+
+        CFG empty negative: same rationale as WAN21Pipeline — WAN training
+        encodes an empty-string negative when none is supplied. WAN22 routes
+        CFG by sigma / ``guidance_scale_2``, so :meth:`generate` passes the
+        **effective** guidance (``max(guidance_scale, guidance_scale_2)``) here;
+        gating on ``> 1.0`` then reproduces WAN22's two-branch ``cfg_active``
+        trigger exactly.
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run WAN 2.2 T2V end-to-end."""
         texts = req.primitives.get("text")
@@ -174,18 +201,14 @@ class WAN22Pipeline(Pipeline):
 
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: same rationale as WAN21Pipeline (see that
-        # method's comment) — WAN training encodes an empty-string
-        # negative when none is supplied. WAN22 routes CFG by sigma /
-        # ``guidance_scale_2`` so we trigger the empty-negative encoding
-        # whenever either branch's effective guidance is > 1.
+        # WAN22 routes CFG by sigma / ``guidance_scale_2`` so the empty-negative
+        # encoding fires whenever either branch's effective guidance is > 1; pass
+        # the max of the two scales to build_conditions, whose ``> 1.0`` gate then
+        # reproduces the original ``cfg_active`` trigger.
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
-        cfg_active = max(primary_g, low_g) > 1.0
-        if negatives is None and cfg_active:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        effective_guidance = max(primary_g, low_g)
+        wan_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=effective_guidance)
 
         image_latent_cond: Optional[ImageLatentCondition] = None
         image_embed_cond: Optional[ImageEmbedCondition] = None
@@ -214,12 +237,12 @@ class WAN22Pipeline(Pipeline):
             if getattr(self.bundle, "uses_clip_vision", False):
                 image_embed_cond = WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
 
-        wan_conds = WAN21Conditions(
-            text=text_cond,
-            negative_text=negative_text_cond,
-            image_latent=image_latent_cond,
-            image_embed=image_embed_cond,
-        )
+        if image_latent_cond is not None or image_embed_cond is not None:
+            wan_conds = dataclasses.replace(
+                wan_conds,
+                image_latent=image_latent_cond,
+                image_embed=image_embed_cond,
+            )
 
         if req.sigmas is None:
             raise ValueError(

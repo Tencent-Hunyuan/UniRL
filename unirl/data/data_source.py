@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 import torch
 from torch.utils.data import DataLoader
 
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, Texts, Videos
 from unirl.types.prompts import RolloutInputs
 
 from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_example
@@ -66,6 +66,65 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
     return images_per_prompt
 
 
+def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
+    """Load ``(modality="video", role="condition")`` media refs into ``Video``.
+
+    Returns a per-prompt list of ``Video`` (or ``None`` for prompts that carry
+    no condition video), or ``None`` when no prompt in the batch has a
+    condition video. WAN V2V consumes one reference video per prompt.
+    """
+    if not media_refs:
+        return None
+    # Local imports keep video IO dependencies off text/image-only runs.
+    import torchvision.io
+
+    from unirl.types.primitives import Video as PrimVideo
+
+    videos_per_prompt: List[Any] = []
+    any_loaded = False
+    for refs in media_refs:
+        selected = [
+            r
+            for r in (refs or [])
+            if getattr(r, "modality", None) == "video" and getattr(r, "role", None) == "condition"
+        ]
+        if not selected:
+            videos_per_prompt.append(None)
+            continue
+        if len(selected) > 1:
+            raise ValueError(f"WAN V2V expects <=1 (video, condition) MediaRef per prompt, got {len(selected)}")
+
+        uri = selected[0].uri
+        if str(uri).endswith((".pt", ".pth")):
+            # weights_only=True blocks arbitrary code execution from a crafted
+            # manifest pointing at an untrusted .pt (condition videos are plain tensors).
+            frames = torch.load(uri, map_location="cpu", weights_only=True)
+        elif str(uri).endswith((".npy", ".npz")):
+            import numpy as np
+
+            loaded = np.load(uri)
+            frames = loaded["frames"] if isinstance(loaded, np.lib.npyio.NpzFile) else loaded
+            frames = torch.as_tensor(frames)
+        else:
+            frames, _, _ = torchvision.io.read_video(uri, pts_unit="sec", output_format="TCHW")
+        if frames.numel() == 0:
+            raise ValueError(f"Condition video has no decoded frames: {uri}")
+        if frames.dtype == torch.uint8:
+            frames = frames.to(dtype=torch.float32).div_(255.0)
+        else:
+            frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
+        if int(frames.shape[1]) != 3:
+            raise ValueError(
+                f"WAN V2V expects RGB condition video frames [T, 3, H, W], got {tuple(frames.shape)} from {uri}"
+            )
+        videos_per_prompt.append(PrimVideo(frames=frames))
+        any_loaded = True
+
+    if not any_loaded:
+        return None
+    return videos_per_prompt
+
+
 def _validate_homogeneous_images(images: List[Any]) -> None:
     """Reject batches where some prompts have condition images and others don't."""
     populated = [img for img in images if img is not None]
@@ -79,7 +138,19 @@ def _validate_homogeneous_images(images: List[Any]) -> None:
         )
 
 
-_SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {("image", "condition")}
+def _validate_homogeneous_videos(videos: List[Any]) -> None:
+    """Reject batches where some prompts have condition videos and others don't."""
+    populated = [vid for vid in videos if vid is not None]
+    if populated and len(populated) != len(videos):
+        missing = [i for i, vid in enumerate(videos) if vid is None]
+        raise ValueError(
+            f"Heterogeneous V2V batch — {len(missing)}/{len(videos)} prompts "
+            f"are missing a condition video (e.g. prompt index {missing[0]}). "
+            f"Split into separate requests so each batch is either fully T2V/I2V or fully V2V."
+        )
+
+
+_SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {("image", "condition"), ("video", "condition")}
 
 
 def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> None:
@@ -115,7 +186,7 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
         return
     raise NotImplementedError(
         f"{context}: media_refs include {len(bad)} unsupported (modality, role) "
-        f"entries; the driver currently consumes only (image, condition). "
+        f"entries; the driver currently consumes only (image, condition) and (video, condition). "
         f"First bad entry: prompt={bad[0][0]}, ref={bad[0][1]!r}."
     )
 
@@ -261,6 +332,10 @@ class MultimodalRLDataSource:
         if images is not None:
             _validate_homogeneous_images(images)
             primitives["image"] = Images.from_list([img for img in images if img is not None])
+        videos = _load_condition_videos(media_refs)
+        if videos is not None:
+            _validate_homogeneous_videos(videos)
+            primitives["video"] = Videos.from_list([vid for vid in videos if vid is not None])
 
         metadata_list = [item.get("metadata") for item in batch]
 
@@ -295,6 +370,10 @@ class MultimodalRLDataSource:
         if images is not None:
             _validate_homogeneous_images(images)
             primitives["image"] = Images.from_list([img for img in images if img is not None])
+        videos = _load_condition_videos(media_refs)
+        if videos is not None:
+            _validate_homogeneous_videos(videos)
+            primitives["video"] = Videos.from_list([vid for vid in videos if vid is not None])
 
         metadata_list = [item.get("metadata") for item in prompt_examples]
 

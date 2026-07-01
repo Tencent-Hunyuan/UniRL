@@ -184,6 +184,27 @@ class HunyuanVideoPipeline(Pipeline):
             shift=float(config.shift),
         )
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> HunyuanVideoConditions:
+        """Encode prompts (LLaMA + CLIP) into ``HunyuanVideoConditions``.
+
+        HunyuanVideo-1.0 uses guidance embedding (``guidance_embeds=True``)
+        instead of classifier-free guidance — there is NO negative branch,
+        so ``negatives`` / ``guidance_scale`` are accepted for signature
+        parity with the other families but unused here.
+        """
+        text_llama = self.text_embed.embed_llama(texts)
+        pooled_clip = self.text_embed.embed_clip(texts)
+        return HunyuanVideoConditions(
+            text_llama=text_llama,
+            pooled_clip=pooled_clip,
+        )
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run HunyuanVideo-1.0 T2V end-to-end. Requires ``req.sigmas`` to
         be pinned by the hosting engine adapter."""
@@ -204,13 +225,7 @@ class HunyuanVideoPipeline(Pipeline):
         params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
 
         # Encode texts via LLaMA + CLIP (no negative branch needed).
-        text_llama = self.text_embed.embed_llama(texts)
-        pooled_clip = self.text_embed.embed_clip(texts)
-
-        hv_conds = HunyuanVideoConditions(
-            text_llama=text_llama,
-            pooled_clip=pooled_clip,
-        )
+        hv_conds = self.build_conditions(texts)
 
         schedule = req.sigmas.to(self.bundle.device)
 

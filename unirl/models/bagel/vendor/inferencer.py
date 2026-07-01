@@ -170,7 +170,6 @@ class InterleaveInferencer:
         image = self.decode_image(unpacked_latent[0], image_shape)
         return image
 
-        
     def decode_image(self, latent, image_shape):
         H, W = image_shape
         h, w = H // self.model.latent_downsample, W // self.model.latent_downsample
@@ -178,7 +177,11 @@ class InterleaveInferencer:
         latent = latent.reshape(1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
-        image = self.vae_model.decode(latent)
+        # UniRL may load the VAE in bf16; decode in fp32 like BagelVAEDecodeStage.
+        orig_dtype = next(self.vae_model.parameters()).dtype
+        image = self.vae_model.to(torch.float32).decode(latent.float())
+        if orig_dtype != torch.float32:
+            self.vae_model.to(orig_dtype)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         image = Image.fromarray((image).to(torch.uint8).cpu().numpy())
 

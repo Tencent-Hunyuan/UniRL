@@ -337,7 +337,7 @@ class BagelPipeline(Pipeline):
             for i, prompt in enumerate(prompts)
         ]
         segment, conditions, images = self._diffuse_and_decode(
-            contexts, params=params, req=req, image_shape=image_shape
+            contexts, prompts=prompts, params=params, req=req, image_shape=image_shape
         )
 
         return RolloutResp(
@@ -356,6 +356,7 @@ class BagelPipeline(Pipeline):
         self,
         contexts: List[Tuple[Any, Any, Any]],
         *,
+        prompts: List[str],
         params: BagelDiffusionParams,
         req: RolloutReq,
         image_shape: Tuple[int, int],
@@ -384,6 +385,7 @@ class BagelPipeline(Pipeline):
                 cfg_text_context=cfg_text_ctx,
                 cfg_img_context=cfg_img_ctx,
                 image_shape=image_shape,
+                prompt=prompts[i],
             )
             x0_i = initial[i] if initial is not None else None
             seg_i = self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=x0_i)
@@ -398,6 +400,7 @@ class BagelPipeline(Pipeline):
             gen_contexts=gen_list,
             cfg_text_contexts=cfg_text_list,
             cfg_img_contexts=cfg_img_list,
+            prompts=list(prompts),
             image_shapes=shapes,
         )
         images = self.vae_decode.decode(segment, image_shape=image_shape)
@@ -604,7 +607,7 @@ class BagelPipeline(Pipeline):
             self._build_think_contexts(GEN_THINK_SYSTEM_PROMPT, prompts[i], think_texts.texts[i]) for i in range(n)
         ]
         segment, conditions, images = self._diffuse_and_decode(
-            contexts, params=diff_params, req=req, image_shape=image_shape
+            contexts, prompts=prompts, params=diff_params, req=req, image_shape=image_shape
         )
 
         return RolloutResp(

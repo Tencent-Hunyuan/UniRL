@@ -31,7 +31,7 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
-from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, texts_from_req
+from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, grouped_texts_from_req, texts_from_req
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
@@ -97,6 +97,45 @@ class QwenImageInputAdapter(DitInputAdapter):
         return sampling
 
 
+class QwenImageGroupedInputAdapter(QwenImageInputAdapter):
+    """Qwen-Image request builder using vLLM-Omni's native multi-output prompt shape.
+
+    Unlike SD3 where the conditioning tap fires BEFORE upstream's internal
+    embed repeat, Qwen-Image's ``encode_prompt`` accepts ``num_images_per_prompt``
+    and repeats embeddings internally before returning them. The tap therefore
+    captures ALREADY-repeated embeddings — the output adapter needs no
+    ``repeat_interleave``.
+    """
+
+    def _spp(self, req: RolloutReq) -> int:
+        diff_params = req.sampling_params.get("diffusion")
+        return int(getattr(diff_params, "samples_per_prompt", 1) or 1)
+
+    def build_prompts(self, req: RolloutReq) -> List[Any]:
+        spp = self._spp(req)
+        grouped_texts, _ = grouped_texts_from_req(
+            req,
+            samples_per_prompt=spp,
+            caller=f"{self.modality}.build_prompts",
+        )
+        diff_params = req.sampling_params.get("diffusion")
+        if float(diff_params.guidance_scale) > 1.0:
+            negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
+            return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
+        return [{"prompt": text} for text in grouped_texts]
+
+    def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
+        spp = self._spp(req)
+        grouped_texts_from_req(
+            req,
+            samples_per_prompt=spp,
+            caller=f"{self.modality}.build_sampling",
+        )
+        sampling = super().build_sampling(req)
+        sampling[0].kwargs["num_outputs_per_prompt"] = spp
+        return sampling
+
+
 class QwenImageOutputAdapter(DitOutputAdapter):
     """Single-"image"-track response with the Qwen text-capture conditions."""
 
@@ -155,7 +194,7 @@ class QwenImageT2iAdapter(ModelAdapter):
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = QwenImageInputAdapter(self.modality, model_config=model_config)
+        self.input_adapter = QwenImageGroupedInputAdapter(self.modality, model_config=model_config)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
 
     def validate_request(self, req: RolloutReq) -> None:
@@ -171,4 +210,4 @@ class QwenImageT2iAdapter(ModelAdapter):
         return self.output_adapter.build(req, per_request)
 
 
-__all__ = ["QwenImageInputAdapter", "QwenImageOutputAdapter", "QwenImageT2iAdapter"]
+__all__ = ["QwenImageGroupedInputAdapter", "QwenImageInputAdapter", "QwenImageOutputAdapter", "QwenImageT2iAdapter"]

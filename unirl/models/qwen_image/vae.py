@@ -18,6 +18,8 @@ Per-channel normalization math mirrors PR #104's ``decode_latents``.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -33,7 +35,7 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
     def __init__(self, bundle: QwenImageBundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Images:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
         """Decode the final-step latents in *s* into pixel images.
 
         Reads ``s.latents[:, -1]`` (the final stored position, which is
@@ -42,6 +44,12 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         per-channel un-normalization from ``vae.config.latents_mean`` /
         ``latents_std``, decodes in fp32, then normalizes pixels to
         ``[0, 1]``.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("QwenImageVAEDecodeStage.decode: segment.latents is None")
@@ -55,8 +63,8 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         z_dim = int(vae.config.z_dim)
         device = clean.device
 
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32)
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32)
             # Lift to 5D for the video VAE (T=1).
             latents_5d = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
             latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32).view(
@@ -67,7 +75,15 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             )
             # Recover raw latents: x = z * std + mean.
             latents_5d = latents_5d * latents_std + latents_mean
-            decoded = vae.to(torch.float32).decode(latents_5d, return_dict=False)[0]
+            return vae.to(torch.float32).decode(latents_5d, return_dict=False)[0]
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
         # Drop the temporal dim (Qwen-Image t2i uses T=1) and clamp.
         pixels = ((decoded[:, :, 0] + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)
