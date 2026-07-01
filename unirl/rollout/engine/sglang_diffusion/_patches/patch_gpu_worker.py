@@ -33,7 +33,7 @@ See the module-level RISKS docstring at the bottom for upstream gaps.
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -395,20 +395,35 @@ def _set_lora_from_tensors(
     lora_tensors: dict,
     target: Union[str, List[str]] = "all",
     strength: Union[float, List[float]] = 1.0,
+    lora_alpha: Optional[float] = None,
 ):
-    """Set LoRA adapter from in-memory tensors."""
+    """Set LoRA adapter from in-memory tensors.
+
+    ``lora_alpha`` (optional) is forwarded to the fork's ``set_lora`` as an
+    adapter-level alpha; ``None`` leaves the pipeline on its per-layer path.
+    Passed positionally-safe via keyword so an older fork ``set_lora`` without
+    the parameter is not broken (guarded by the try/except below).
+    """
     from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
     if not isinstance(self.pipeline, LoRAPipeline):
         return OutputBatch(error="Lora is not enabled")
-    self.pipeline.set_lora(
-        lora_nickname,
+    kwargs = dict(
         lora_path=None,
         target=target,
         strength=strength,
         lora_tensors=lora_tensors,
     )
+    if lora_alpha is not None:
+        kwargs["lora_alpha"] = lora_alpha
+    try:
+        self.pipeline.set_lora(lora_nickname, **kwargs)
+    except TypeError:
+        # Older fork whose set_lora predates the lora_alpha kwarg: retry without it
+        # (falls back to the pipeline's per-layer alpha path).
+        kwargs.pop("lora_alpha", None)
+        self.pipeline.set_lora(lora_nickname, **kwargs)
     return OutputBatch()
 
 

@@ -302,12 +302,14 @@ class SGLangBackend:
         lora_tensors: Dict[str, Any],
         target: str = "all",
         strength: float = 1.0,
+        lora_alpha: Optional[float] = None,
     ) -> None:
         request = self._rt["SetLoraFromTensorsReq"](
             lora_nickname=str(lora_nickname),
             lora_tensors=lora_tensors,
             target=target,
             strength=strength,
+            lora_alpha=lora_alpha,
         )
         response = self._rt["sync_scheduler_client"].forward(request)
         error = getattr(response, "error", None)
