@@ -87,7 +87,7 @@ def patch_scheduler() -> None:
                 req.lora_tensors,
                 req.target,
                 req.strength,
-                lora_alpha=getattr(req, "lora_alpha", None),
+                lora_alpha=req.lora_alpha,
             )
 
         def _handle_get_weights_detail(self, reqs: List[Any]) -> OutputBatch:

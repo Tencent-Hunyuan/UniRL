@@ -401,29 +401,20 @@ def _set_lora_from_tensors(
 
     ``lora_alpha`` (optional) is forwarded to the fork's ``set_lora`` as an
     adapter-level alpha; ``None`` leaves the pipeline on its per-layer path.
-    Passed positionally-safe via keyword so an older fork ``set_lora`` without
-    the parameter is not broken (guarded by the try/except below).
     """
     from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
     if not isinstance(self.pipeline, LoRAPipeline):
         return OutputBatch(error="Lora is not enabled")
-    kwargs = dict(
+    self.pipeline.set_lora(
+        lora_nickname,
         lora_path=None,
         target=target,
         strength=strength,
         lora_tensors=lora_tensors,
+        lora_alpha=lora_alpha,
     )
-    if lora_alpha is not None:
-        kwargs["lora_alpha"] = lora_alpha
-    try:
-        self.pipeline.set_lora(lora_nickname, **kwargs)
-    except TypeError:
-        # Older fork whose set_lora predates the lora_alpha kwarg: retry without it
-        # (falls back to the pipeline's per-layer alpha path).
-        kwargs.pop("lora_alpha", None)
-        self.pipeline.set_lora(lora_nickname, **kwargs)
     return OutputBatch()
 
 
