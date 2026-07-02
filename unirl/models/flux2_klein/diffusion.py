@@ -55,6 +55,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import SDEStrategy, StepStrategy
@@ -290,7 +291,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         )
 
 
-class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
+class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2KleinConditions]):
     """FLUX.2-klein rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (DanceSDE by default for Klein), the
@@ -604,61 +605,6 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    def _replay_batched_steps(
-        self,
-        conditions: Flux2KleinConditions,
-        *,
-        segment: LatentSegment,
-        params: Flux2KleinDiffusionParams,
-        target: List[int],
-        sigmas: torch.Tensor,
-        sigma_max: torch.Tensor,
-        device: torch.device,
-    ) -> ReplayResult:
-        """Replay all ``target`` SDE steps in a single batched forward.
-
-        Stacks the S steps on the batch dim (``[S*B, 128, H_pat, W_pat]``,
-        step-major), tiles the text (and any edit-condition tokens) S×, and runs
-        one ``step_with_logp`` — the kernel rebuilds the packed latents + 4-axis
-        RoPE ids per-call for the whole stack. Klein has no cross-sample
-        interaction, so per-sample results match the serial path up to bf16
-        batch-shape rounding, and the π_old anchor replayed through this same
-        path keeps the on-policy ratio at exactly 1. Runs inside the caller's
-        ``.eval()`` scope (the replay() ``finally`` restores train mode).
-        """
-        S = len(target)
-        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
-        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
-        B = sample_all.shape[0] // S
-        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
-        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
-        tiled = self._tile_conditions(conditions, S)
-
-        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
-            self.model,
-            tiled,
-            strategy=self.strategy,
-            sample=sample_all,
-            prev_sample=prev_all,
-            sigma=sigma_all,
-            sigma_next=sigma_next_all,
-            guidance_scale=float(params.guidance_scale),
-            eta=float(params.eta),
-            sigma_max=sigma_max,
-            step_index=int(target[0]),
-        )
-        if log_prob_all is None:
-            raise RuntimeError(
-                "Flux2KleinDiffusionStage._replay_batched_steps: strategy returned None log-prob "
-                "(deterministic mode); batched replay requires a stochastic SDE strategy."
-            )
-        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
-        means_t = None
-        if prev_mean_all is not None:
-            tail = prev_mean_all.shape[1:]
-            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     @staticmethod

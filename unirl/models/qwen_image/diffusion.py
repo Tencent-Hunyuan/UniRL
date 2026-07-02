@@ -54,10 +54,11 @@ Math mirrors PR #104's ``qwen_image_sampler.py`` / ``forward_denoiser``.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import ClassVar, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import SDEStrategy, StepStrategy
@@ -364,7 +365,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         )
 
 
-class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
+class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageConditions]):
     """Qwen-Image rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -639,8 +640,6 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
                     sigmas=sigmas,
                     sigma_max=sigma_max,
                     device=device,
-                    latent_h=latent_h,
-                    latent_w=latent_w,
                 )
 
         log_probs: List[torch.Tensor] = []
@@ -681,76 +680,17 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    def _replay_batched_steps(
-        self,
-        conditions: QwenImageConditions,
-        *,
-        segment: LatentSegment,
-        params: DiffusionSamplingParams,
-        target: List[int],
-        sigmas: torch.Tensor,
-        sigma_max: torch.Tensor,
-        device: torch.device,
-        latent_h: int,
-        latent_w: int,
-    ) -> ReplayResult:
-        """Replay all ``target`` SDE steps in a single batched forward.
-
-        Equivalent to the serial loop above but stacks the S steps on the batch
-        dim: ``sample``/``prev_sample`` become ``[S*B, C, H, W]`` (step-major),
-        the text embeds + attention mask are tiled S× to ``[S*B, ...]``, and the
-        per-step ``sigma``/``sigma_next`` ride as ``[S*B]`` vectors. The kernel
-        rebuilds ``img_shapes`` (length S*B, all the same latent grid) and trims
-        the tiled embeds by the tiled mask to the same ``max_true`` length, so
-        one ``step_with_logp`` call runs ONE transformer forward (+ the CFG
-        branch when guidance>1) and one vectorized SDE transition over the whole
-        stack; the per-step log-probs reshape back to ``[B, S]``. The Qwen-Image
-        transformer has no cross-sample interaction, so per-sample results match
-        the serial path up to bf16 batch-shape rounding — and because the π_old
-        anchor is replayed through this same method, the on-policy ratio stays
-        exactly 1.
-
-        ``step_index`` is passed as ``target[0]`` for signature parity; the
-        guarded stateless SDE strategies ignore it.
-        """
-        S = len(target)
-        # Step-major stack: rows [k*B:(k+1)*B] are all B samples at step target[k].
-        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
-        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
-        B = sample_all.shape[0] // S
-        # Per-sample sigma vectors aligned with the step-major stack.
-        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
-        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
-        tiled = self._tile_conditions(conditions, S)
-
-        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
-            self.model,
-            tiled,
-            strategy=self.strategy,
-            sample=sample_all,
-            prev_sample=prev_all,
-            sigma=sigma_all,
-            sigma_next=sigma_next_all,
-            guidance_scale=float(params.guidance_scale),
-            eta=float(params.eta),
-            sigma_max=sigma_max,
-            step_index=int(target[0]),
-            latent_h=latent_h,
-            latent_w=latent_w,
-            distilled_guidance_scale=params.distilled_guidance_scale,
-        )
-        if log_prob_all is None:
-            raise RuntimeError(
-                "QwenImageDiffusionStage._replay_batched_steps: strategy returned None log-prob "
-                "(deterministic mode); batched replay requires a stochastic SDE strategy."
-            )
-        # [S*B] -> [S, B] -> [B, S] so slot s aligns with segment.sde_logp ordering.
-        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
-        means_t = None
-        if prev_mean_all is not None:
-            tail = prev_mean_all.shape[1:]
-            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+    def _batched_step_kwargs(self, segment: LatentSegment, params: DiffusionSamplingParams) -> Dict[str, Any]:
+        """Qwen-Image's kernel needs the packed-latent grid (to rebuild
+        ``img_shapes`` / RoPE per call) plus optional distilled guidance, on top
+        of the common batched-step args. ``latent_h`` / ``latent_w`` come from
+        the stored latent shape ``[B, K, C, H, W]`` — all S replayed steps share
+        the same grid — and ``distilled_guidance_scale`` rides from ``params``."""
+        return {
+            "latent_h": int(segment.latents.shape[-2]),
+            "latent_w": int(segment.latents.shape[-1]),
+            "distilled_guidance_scale": params.distilled_guidance_scale,
+        }
 
     @staticmethod
     def _tile_conditions(conditions: QwenImageConditions, repeats: int) -> QwenImageConditions:
