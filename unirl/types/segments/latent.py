@@ -9,9 +9,9 @@ SDE log probs are stored densely in ``sde_logp`` of shape ``[N_segs, S]``
 where ``S = len(sde_indices)`` — one elementwise-mean log-prob per SDE
 transition. ``sde_indices`` is a ``[S]`` int tensor naming the step index
 each slot corresponds to. No NaN sentinels: every slot is a valid SDE
-log-prob; non-SDE steps simply aren't represented. This mirrors the
-``Trajectory.index_map`` pattern (``trajectory_store.py``) — replay code
-reads ``sde_logp[:, s]`` and uses ``sde_indices[s]`` for the step lookup.
+log-prob; non-SDE steps simply aren't represented. This mirrors a compact
+index-map pattern — replay code reads ``sde_logp[:, s]`` and uses
+``sde_indices[s]`` for the step lookup.
 
 ``sde_logp`` may be populated either at rollout time by a native log-prob
 source (the rollout engines best-effort emit it — SGLang, vllm_omni) or by

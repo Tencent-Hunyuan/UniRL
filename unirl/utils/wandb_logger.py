@@ -322,6 +322,14 @@ class UniRLWandBLogger:
         try:
             wandb.define_metric("train/step")
             wandb.define_metric("train/*", step_metric="train/step")
+            # Two-level train namespaces (unified-model logs train/ar/* and
+            # train/image/* per optimizer update) bound EXPLICITLY: a "train/*" glob
+            # may not match across the extra "/", which silently drops these onto
+            # wandb's global Step → the per-update curves (e.g. image/rn_raw_ratio_mean)
+            # then render on the wrong, faster axis (every wandb.log call) instead of
+            # train/step (every optimizer update).
+            wandb.define_metric("train/ar/*", step_metric="train/step")
+            wandb.define_metric("train/image/*", step_metric="train/step")
             # rollout/step tracks the outer rollout-train loop step.
             # It behaves like a framework-level global step, but is not the same
             # thing as optimizer update count when one rollout yields multiple updates.

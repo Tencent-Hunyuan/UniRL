@@ -30,6 +30,8 @@ legacy code).
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -45,7 +47,7 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
     def __init__(self, bundle: WAN21Bundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Videos:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
         """Decode the final-step latents in *s* into a packed ``Videos`` payload.
 
         Reads ``s.latents[:, -1]`` (the final stored position, which is
@@ -53,6 +55,12 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         ``[B, C, T_lat, H_lat, W_lat]``. VAE forward runs in fp32; output
         is normalized from ``[-1, 1]`` to ``[0, 1]`` and clamped before
         being packed sample-by-sample into a ``Videos`` primitive.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("WAN21VAEDecodeStage.decode: segment.latents is None")
@@ -75,21 +83,29 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         scaling_factor = getattr(vae_config, "scaling_factor", 1.0)
 
         device = clean.device
-        latents_f32 = clean.to(dtype=torch.float32)
 
-        with torch.no_grad():
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32)
             if latents_mean is not None and latents_std is not None:
                 # diffusers Wan VAE spec: latent ↦ latent * std + mean
                 # (un-normalize). Reshape to [1, C, 1, 1, 1] to broadcast
                 # over the (B, T, H, W) axes.
-                z_dim = int(getattr(vae_config, "z_dim", clean.shape[1]))
+                z_dim = int(getattr(vae_config, "z_dim", lat.shape[1]))
                 mean = torch.tensor(latents_mean, device=device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
                 std = torch.tensor(latents_std, device=device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
                 latents_f32 = latents_f32 * std + mean
             else:
                 latents_f32 = latents_f32 / float(scaling_factor)
 
-            decoded = vae.to(torch.float32).decode(latents_f32).sample
+            return vae.to(torch.float32).decode(latents_f32).sample
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
 
         # Decoded layout is [B, C, T_dec, H_dec, W_dec] in [-1, 1].
         # Normalize to [0, 1] and clamp before packing.

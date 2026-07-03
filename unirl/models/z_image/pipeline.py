@@ -174,6 +174,28 @@ class ZImagePipeline(Pipeline):
 
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> ZImageConditions:
+        """Encode prompts (+ optional CFG negatives) into ``ZImageConditions``.
+
+        CFG empty negative: Z-Image upstream (diffusers ``ZImagePipeline``
+        ``encode_prompt``) defaults to ``""`` (empty string) when CFG is
+        enabled and no negative is passed. Z-Image gates CFG on
+        ``guidance_scale > 0`` (Turbo runs with 0 → CFG off). The Qwen3
+        chat template tokenizes ``""`` cleanly, so no ``" "`` workaround is
+        needed (unlike Qwen-Image).
+        """
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 0.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return ZImageConditions(text=text_cond, negative_text=negative_text_cond)
+
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Run Z-Image t2i end-to-end. Requires ``req.sigmas`` to be pinned
         by the hosting engine adapter."""
@@ -202,17 +224,7 @@ class ZImagePipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
 
-        text_cond = self.text_embed.embed(texts)
-        # CFG empty negative: Z-Image upstream (diffusers ``ZImagePipeline``
-        # ``encode_prompt``) defaults to ``""`` (empty string) when CFG is
-        # enabled and no negative is passed. Z-Image gates CFG on
-        # ``guidance_scale > 0`` (Turbo runs with 0 → CFG off). The Qwen3
-        # chat template tokenizes ``""`` cleanly, so no ``" "`` workaround is
-        # needed (unlike Qwen-Image).
-        if negatives is None and float(params.guidance_scale) > 0.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        z_conds = ZImageConditions(text=text_cond, negative_text=negative_text_cond)
+        z_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
 
         schedule = req.sigmas.to(self.bundle.device)
 

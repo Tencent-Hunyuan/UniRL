@@ -168,6 +168,9 @@ class BaseFSDP2Backend(Remote):
         self.optimizer = build_optimizer(
             optimizer_cfg,
             params=list(trainable_params(model)),
+            # Names enable OptimizerConfig.param_group_lrs (per-substring LR groups,
+            # e.g. BAGEL UniGRPO's und vs "moe_gen" experts); ignored when unset.
+            named_params=list(model.named_parameters()),
         )
         self.scheduler = build_lr_scheduler(
             scheduler_cfg,

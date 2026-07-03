@@ -40,6 +40,32 @@ class PickScoreRewardScorer(LocalRewardBackend):
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
         self.model = self.model.to(dtype=torch.float32)
 
+        # Differentiable image preprocessing (for compute_rewards_differentiable):
+        # replicate the CLIP image processor's resize/center-crop/normalize on a
+        # grad-carrying tensor (the PIL processor path detaches). Mirrors clip.py.
+        import torch.nn as nn
+        import torchvision.transforms as T
+
+        def _get_size(size):
+            if isinstance(size, int):
+                return (size, size)
+            if "height" in size and "width" in size:
+                return (size["height"], size["width"])
+            if "shortest_edge" in size:
+                return size["shortest_edge"]
+            raise ValueError(f"Invalid size: {size}")
+
+        ip = self.processor.image_processor
+        ip_cfg = ip.to_dict()
+        resize = (
+            T.Resize(_get_size(ip_cfg.get("size")), interpolation=T.InterpolationMode.BICUBIC, antialias=True)
+            if ip_cfg.get("do_resize")
+            else nn.Identity()
+        )
+        crop = T.CenterCrop(_get_size(ip_cfg.get("crop_size"))) if ip_cfg.get("do_center_crop") else nn.Identity()
+        normalise = T.Normalize(mean=ip.image_mean, std=ip.image_std) if ip_cfg.get("do_normalize") else nn.Identity()
+        self._clip_tform = T.Compose([resize, crop, normalise])
+
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
         prompts = request.prompts
@@ -93,6 +119,62 @@ class PickScoreRewardScorer(LocalRewardBackend):
                 all_rewards.extend(scores.cpu().tolist())
 
         return all_rewards
+
+    def compute_rewards_differentiable(
+        self,
+        images_tensor: torch.Tensor,
+        prompts: List[str],
+        records=None,
+    ) -> torch.Tensor:
+        """Differentiable PickScore: image tensor ``[B, C, H, W]`` in ``[0, 1]``
+        → ``[B]`` reward with ``grad_fn``. Reuses the frozen CLIP module; only the
+        image path keeps grad (text + logit_scale are constants)."""
+
+        def _extract_tensor(output):
+            if isinstance(output, torch.Tensor):
+                return output
+            if hasattr(output, "pooler_output") and output.pooler_output is not None:
+                return output.pooler_output
+            if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+                return output.last_hidden_state[:, 0]
+            if isinstance(output, (tuple, list)):
+                return output[0]
+            raise TypeError(f"Unexpected output format: {type(output)}")
+
+        if images_tensor.ndim != 4:
+            raise ValueError(
+                f"PickScore.compute_rewards_differentiable: expected [B, C, H, W], got {tuple(images_tensor.shape)}"
+            )
+        images_tensor = images_tensor.to(device=self.device, dtype=torch.float32)
+        pixel_values = self._clip_tform(images_tensor)
+
+        scores: List[torch.Tensor] = []
+        for i in range(0, len(prompts), self.batch_size):
+            px = pixel_values[i : i + self.batch_size]
+            batch_prompts = prompts[i : i + self.batch_size]
+
+            text_inputs = self.processor(
+                text=batch_prompts,
+                padding=True,
+                truncation=True,
+                max_length=77,
+                return_tensors="pt",
+            )
+            text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
+
+            # Image path keeps grad; text/logit_scale are constants.
+            image_embs = _extract_tensor(self.model.get_image_features(pixel_values=px))
+            image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
+            with torch.no_grad():
+                text_embs = _extract_tensor(self.model.get_text_features(**text_inputs))
+                text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
+                logit_scale = self.model.logit_scale.exp()
+
+            # Per-pair alignment = diag(text @ image.T); avoid the BxB matmul.
+            batch_scores = logit_scale * (text_embs * image_embs).sum(dim=-1) / 26
+            scores.append(batch_scores)
+
+        return torch.cat(scores, dim=0)
 
 
 @dataclass
