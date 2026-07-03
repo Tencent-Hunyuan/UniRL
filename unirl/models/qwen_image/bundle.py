@@ -77,7 +77,7 @@ class QwenImageBundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: Optional[nn.Module],
         tokenizer: Any,
         scheduler: Any,
@@ -182,8 +182,17 @@ class QwenImageBundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
-        vae = AutoencoderKLQwenImage.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        # Separate-engine recipes skip the trainer-side VAE (dead weight
+        # there — the engine decodes in its own workers and the trainer
+        # replays predict_noise only); see QwenImagePipelineConfig.load_vae.
+        vae = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLQwenImage.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(device)
+                .eval()
+            )
+            vae.requires_grad_(False)
 
         # vllm-omni recipes skip the trainer-side copy (~15 GiB/rank dead
         # weight there — the engine encodes prompts in its own workers and

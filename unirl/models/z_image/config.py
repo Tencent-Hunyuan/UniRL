@@ -69,6 +69,13 @@ class ZImagePipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # Whether the TRAINER-side bundle loads the VAE. Trainside rollout
+    # requires it (the pipeline decodes latents in-process).
+    # Separate-engine recipes (sglang) should set ``false``: the engine
+    # decodes in its own workers and the trainer never calls the VAE —
+    # the trainer copy is dead weight on memory-razor-thin colocate GPUs.
+    load_vae: bool = True
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="ZImagePipelineConfig.model_precision")
 

@@ -42,6 +42,9 @@ model_config:
   pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
   model_precision: bf16
   max_sequence_length: 512
+  # The trainer-side VAE is never called on the sglang path (the engine
+  # decodes in its own workers; images arrive captured).
+  load_vae: false
   # Static-shift fallback only; the real checkpoint enables dynamic shifting
   # (+ shift_terminal 0.02) via scheduler/scheduler_config.json — and the
   # config's dynamic_shift_overrides carry the same canonical values for

@@ -105,6 +105,13 @@ class QwenImagePipelineConfig:
     # copy is dead weight that starves the colocated engine's boot
     # (LIN-382 qwen probe OOM: 50 MiB free at engine TE load).
     load_text_encoder: bool = True
+    # Whether the TRAINER-side bundle loads the VAE (~0.2-0.5 GiB bf16 per
+    # rank). Trainside rollout requires it (the pipeline decodes latents
+    # in-process). Separate-engine recipes (sglang / vllm-omni) should set
+    # ``false``: the engine decodes in its own workers and the trainer
+    # never calls the VAE — the trainer copy is dead weight on
+    # memory-razor-thin colocate GPUs.
+    load_vae: bool = True
     # VeOmniBackend lifecycle: build the transformer on the meta device
     # (architecture only, no weight allocation). VeOmni's parallelize
     # asserts meta init, materializes storage via ``to_empty``, and the

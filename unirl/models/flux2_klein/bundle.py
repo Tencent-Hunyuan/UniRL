@@ -38,7 +38,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -147,7 +147,7 @@ class Flux2KleinBundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         scheduler: Any,
@@ -223,8 +223,13 @@ class Flux2KleinBundle(Bundle):
             transformer = transformer.to(device)
 
         # --- VAE (frozen, eval) ---
-        vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        # Separate-engine recipes skip the trainer-side VAE (dead weight
+        # there — the engine runs it in its own workers and the trainer
+        # replays predict_noise only); see Flux2KleinPipelineConfig.load_vae.
+        vae = None
+        if config.load_vae:
+            vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         # --- Qwen3 text encoder (frozen, eval) ---
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
