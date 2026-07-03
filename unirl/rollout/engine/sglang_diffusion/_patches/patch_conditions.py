@@ -357,56 +357,26 @@ def _ensure_batched_embed_list(value):
 
 
 def _coalesce_duplicate_single_sample_encodes(value):
-    """Drop duplicate per-output encodes that share a list via ``copy(req)``.
+    """Collapse shallow-copy duplicate prompt encodes.
 
-    ``expand_request_outputs`` builds per-output Reqs with ``copy(req)`` (shallow),
-    so every output Req shares the *same* ``batch.prompt_embeds`` list object. When
-    the text-encoding stage's dedup does NOT collapse the group (e.g. Qwen-Image-
-    Edit-Plus whose condition image is not in the dedup fingerprint, or any
-    single-encoder model whose ``build_dedup_fingerprint`` is per-request unique),
-    each independent encode calls ``batch.prompt_embeds.append(pe)`` on that shared
-    list, accumulating N identical ``(1, seq, hidden)`` tensors — one per output —
-    instead of the correct single ``(1, seq, hidden)`` tensor for this Req's own
-    output. Because the list is shared, every Req ends up holding all N duplicates.
-
-    Downstream ``_merge_conditions`` reads ``len(list)`` as the encoder count, so
-    the N duplicates are misread as N "encoders" and ``fuse_encoder_outputs`` then
-    seq-concatenates them into an oversized sequence that overflows the model's
-    RoPE table (Qwen-Image's 4096-row ``pos_index`` → ``RuntimeError: size of
-    tensor a (4928) must match size of tensor b (4064)`` in the trainside replay).
-
-    The N duplicates are byte-identical encodes of the same prompt+image, so
-    keeping any one of them is correct; ``_merge_conditions`` then batch-concats
-    the per-Req single-sample tensors across the N output Reqs into the proper
-    ``(N, seq, hidden)`` batch.
-
-    The dedup is safe because it only fires when every entry has
-    ``shape[0] == 1`` AND all entries share the exact same shape — a signature
-    unique to the shared-list-accumulation bug. Legitimate multi-encoder models
-    (SD3/FLUX) have per-encoder tensors of *different* shapes (CLIP-L 77×768,
-    CLIP-G 77×1280, T5 256×2048), so they are left untouched. A correctly-batched
-    single-encoder encode is a single ``(B, seq, hidden)`` entry (len 1) — also
-    untouched.
+    Only same-shaped singleton-batch tensors ``[1, seq, hidden]`` are collapsed.
+    Multi-encoder outputs (different shapes), non-tensors, and already-batched
+    tensors are preserved.
     """
     import torch
 
     if not isinstance(value, (list, tuple)) or len(value) <= 1:
         return value
-    tensors = [t for t in value if torch.is_tensor(t)]
-    if len(tensors) != len(value):
-        # Holes (None) present — not the all-tensor duplicate pattern; leave as-is.
+    if not all(torch.is_tensor(t) for t in value):
         return value
-    shapes = {tuple(t.shape) for t in tensors}
-    if len(shapes) != 1:
-        # Differing shapes → genuine multi-encoder; do not dedup.
-        return value
-    first = tensors[0]
-    # Only dedup when dim-0 is the singleton batch axis (the duplicate signature).
+
+    first = value[0]
+    first_shape = tuple(first.shape)
     if first.dim() < 1 or int(first.shape[0]) != 1:
         return value
-    # All entries are identical (1, seq, hidden) encodes of the same prompt+image;
-    # keep one — _merge_conditions batch-concats across output Reqs.
-    return [tensors[0]]
+    if any(tuple(t.shape) != first_shape for t in value[1:]):
+        return value
+    return [first]
 
 
 def _wrap_decoding_stage(DecodingStage) -> None:
