@@ -14,10 +14,13 @@ from .drpo import DRPO, DRPOConfig
 from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .flowgrpo import FlowGRPO, FlowGRPOConfig
 from .grpo import GRPO, GRPOConfig
+from .gspo import GSPO, GSPOConfig
 
 __all__ = [
     "GRPO",
     "GRPOConfig",
+    "GSPO",
+    "GSPOConfig",
     "CPPO",
     "CPPOConfig",
     "DPPO",
