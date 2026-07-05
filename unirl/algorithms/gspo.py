@@ -2,9 +2,9 @@
 
 Implements **GSPO**, introduced in Zheng et al. "Group Sequence Policy
 Optimization" (arXiv:2507.18071). GSPO is the sequence-level sibling of
-:class:`GRPO`: GRPO forms a **per-token** importance ratio
-``exp(new_logp_t - old_logp_t)`` and clips each token; GSPO forms **one ratio per
-sequence** from the length-normalized sequence log-ratio (paper Eq. 7-8)::
+:class:`~unirl.algorithms.grpo.GRPO`: GRPO forms a **per-token** importance
+ratio and clips each token; GSPO forms **one ratio per sequence** from the
+length-normalized sequence log-ratio (paper Eq. 7-8)::
 
     s_i = (1 / |y_i|) * Σ_t (new_logp_{i,t} - old_logp_{i,t})
     ratio_i = exp(s_i)
@@ -16,36 +16,27 @@ pairs naturally with the Qwen3-Omni thinker (a Qwen3-MoE decoder).
 
 Provenance / relation to other code
 ------------------------------------
-This is an **independent UniRL implementation**, not a port: it mirrors the
-sibling :class:`unirl.algorithms.grpo.GRPO` (same ``StageAlgorithm`` contract,
-``stage.replay`` owns the teacher-forced per-token ``new_logp`` recompute) and
-reuses UniRL's shared ``_grpo_clip_loss`` clip math at sequence granularity. It
-reduces per-token log-ratios to per-sequence ratios via ``segment.lengths``
-(``torch.split``) rather than the token-mask vectorization other frameworks use;
-only the algorithm's mathematical definition (the equations above) is shared with
-those, and equations are not copyrightable. GSPO's clip range is much tighter than
-GRPO's (the paper uses ε≈3e-4); set it in the recipe.
+This is an **independent UniRL implementation**, not a port. The construction,
+replay, clip scheduling, backward, and metric plumbing are shared with GRPO via
+:class:`unirl.algorithms._ar_clip._ARClipStageAlgorithm`; this class implements
+only the sequence-level reduction. The per-token → per-sequence reduction uses a
+segment-sum over ``segment.lengths`` (the framework's cu_seqlens), and the shared
+``_grpo_clip_loss`` is reused at sequence granularity so the ratio it forms is
+``exp(s_new - s_old) = exp(s_i)``. Only the algorithm's mathematical definition
+(the equations above) is shared with other GSPO implementations; equations are
+not copyrightable. GSPO's clip range is much tighter than GRPO's (the paper uses
+ε≈3e-4); set it in the recipe.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Dict, Optional, Tuple
 
 import torch
 
-from unirl.types.conditions import Condition
-from unirl.types.segments.text import TextSegment
-
-from .base import (
-    AlgorithmStepResult,
-    BaseAlgorithmConfig,
-    StageAlgorithm,
-    _grpo_clip_loss,
-    _resolve_clip_range_from_schedule,
-    rollout_replay_logp_absdiff,
-    typed_conditions,
-)
+from ._ar_clip import _ARClipStageAlgorithm
+from .base import BaseAlgorithmConfig, _grpo_clip_loss
 
 
 @dataclass
@@ -58,127 +49,86 @@ class GSPOConfig(BaseAlgorithmConfig):
     clip_schedule: str = "constant"
 
 
-class GSPO(StageAlgorithm):
+class GSPO(_ARClipStageAlgorithm):
     """Sequence-level GSPO over an AR ``TextSegment`` via ``ARStage.replay``.
 
-    Args mirror :class:`GRPO`; only the ratio granularity differs (sequence vs
+    Args mirror the shared base; only the ratio granularity differs (sequence vs
     token). ``clip_range`` / ``clip_range_high`` are the sequence-ratio clip
     bounds (much smaller than GRPO's). ``loss_agg_mode`` is accepted for recipe
     symmetry but GSPO is inherently sequence-mean (one term per sequence), so it
     does not change the reduction.
     """
 
-    # old_logp is the frozen rollout log-prob on the segment; reusing it across
-    # num_updates_per_batch>1 is the deliberate rollout-anchored ratio (GRPO parity).
-    supports_multi_update = True
+    # Upper bound on the per-sequence log-ratio before exp(), guarding against
+    # overflow to inf when the sequence is far off-policy (early training).
+    # Mirrors verl's clamp(log_seq_importance_ratio, max=10.0).
+    _MAX_LOG_RATIO = 10.0
 
     def __init__(
         self,
         *,
-        stage: Any = None,
-        pipeline: Any = None,
-        stage_attr: str = "ar",
         clip_range: float = 3e-4,
-        clip_schedule: str = "constant",
-        clip_range_high: Optional[float] = None,
         loss_agg_mode: str = "seq-mean",
-        conditions_cls: Optional[Type[Any]] = None,
-        sampling_temperature: Optional[float] = None,
+        **kwargs,
     ) -> None:
-        super().__init__()
-        if stage is None and pipeline is None:
-            raise ValueError("GSPO: either `stage` or `pipeline` must be provided")
-        if stage is None:
-            stage = getattr(pipeline, stage_attr)
-        self.stage = stage
-        self.clip_range = float(clip_range)
-        self.clip_range_high = None if clip_range_high is None else float(clip_range_high)
-        self.clip_schedule = str(clip_schedule)
-        self.loss_agg_mode = str(loss_agg_mode)
-        self.conditions_cls = conditions_cls
-        if sampling_temperature is None:
-            from unirl.types.sampling import ARSamplingParams
+        super().__init__(clip_range=clip_range, loss_agg_mode=loss_agg_mode, **kwargs)
 
-            sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
-        self.sampling_temperature = float(sampling_temperature)
-
-    def compute_loss_and_backward(
+    def _policy_loss(
         self,
         *,
-        conditions: Mapping[str, Condition],
-        segment: "TextSegment",
+        new_logp: torch.Tensor,
+        old_logp: torch.Tensor,
         advantages: torch.Tensor,
-        training_progress: float,
-        loss_scale: float,
-    ) -> AlgorithmStepResult:
-        if segment.tokens is None or segment.lengths is None or segment.log_probs is None:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
-        if int(segment.tokens.shape[0]) == 0:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+        segment,
+        clip_range: float,
+        clip_range_high: Optional[float],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        seq_new, seq_old, seq_adv = self._reduce_to_sequences(new_logp, old_logp, advantages, segment.lengths)
+        if seq_new.numel() == 0:
+            return None, {}
 
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens], differentiable
-        old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)  # [total_tokens]
-
-        # Reduce per-token log-ratios to ONE length-normalized log-ratio per
-        # sequence (GSPO's s_i). Split by segment.lengths (framework cu_seqlens).
-        lengths = [int(n) for n in segment.lengths.tolist()]
-        adv = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device)  # [B]
-        if int(adv.shape[0]) != len(lengths):
-            raise ValueError(f"GSPO: advantages batch={int(adv.shape[0])} != sequences={len(lengths)}")
-
-        new_parts = torch.split(new_logp, lengths)
-        old_parts = torch.split(old_logp, lengths)
-        seq_new: List[torch.Tensor] = []
-        seq_old: List[torch.Tensor] = []
-        seq_adv: List[torch.Tensor] = []
-        for k, n in enumerate(lengths):
-            if n <= 0:
-                continue
-            # Length-normalized sequence log-prob (mean over tokens). The new side
-            # is differentiable (grad flows through replay); the old side is frozen.
-            seq_new.append(new_parts[k].mean())
-            seq_old.append(old_parts[k].mean())
-            seq_adv.append(adv[k])
-        if not seq_new:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
-
-        seq_new_t = torch.stack(seq_new)  # [B'] differentiable
-        seq_old_t = torch.stack(seq_old)  # [B']
-        seq_adv_t = torch.stack(seq_adv)  # [B']
-
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
-        clip_high = (
-            None
-            if self.clip_range_high is None
-            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
-        )
-        # Reuse the shared PPO clip math at SEQUENCE granularity: one element per
-        # sequence, so the ratio it forms is exp(s_new - s_old) = GSPO's ratio_i.
+        # ratio_i = exp(s_i) with s_i = mean_t(new) - mean_t(old). Clamp the
+        # log-ratio before _grpo_clip_loss exponentiates it (numerical stability).
+        log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = _grpo_clip_loss(
-            new_logp=seq_new_t,
-            old_logp=seq_old_t,
-            advantages=seq_adv_t,
+            new_logp=log_ratio,
+            old_logp=torch.zeros_like(log_ratio),
+            advantages=seq_adv,
             clip_range=clip_range,
-            clip_range_high=clip_high,
+            clip_range_high=clip_range_high,
         )
-        loss = loss_per_seq.mean()  # sequence-mean (GSPO is inherently per-sequence)
-        (loss * loss_scale).backward()
+        return loss_per_seq.mean(), ratio_metrics
 
-        metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
-            "clip_range": float(clip_range),
-            **rollout_replay_logp_absdiff(new_logp, old_logp),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
-        }
-        return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
-            metrics=metrics,
-            num_steps_or_tokens=int(new_logp.shape[0]),
-            has_backward=True,
-        )
+    @staticmethod
+    def _reduce_to_sequences(
+        new_logp: torch.Tensor,
+        old_logp: torch.Tensor,
+        advantages: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce packed per-token log-probs to one length-normalized value per
+        sequence via a vectorized segment-sum over cu_seqlens (no Python loop).
+
+        Returns ``(seq_new, seq_old, seq_adv)`` for sequences with length > 0.
+        ``seq_new`` stays differentiable (grad flows through replay); ``seq_old``
+        is frozen.
+        """
+        device = new_logp.device
+        lengths = lengths.to(device)
+        num_seqs = int(lengths.shape[0])
+        if int(advantages.shape[0]) != num_seqs:
+            raise ValueError(f"GSPO: advantages batch={int(advantages.shape[0])} != sequences={num_seqs}")
+
+        seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
+        denom = lengths.to(new_logp.dtype).clamp(min=1)
+        seq_new = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, new_logp) / denom
+        seq_old = old_logp.new_zeros(num_seqs).index_add(0, seg_ids, old_logp) / denom
+        seq_adv = advantages.detach().to(dtype=new_logp.dtype, device=device)
+
+        valid = lengths > 0
+        if bool(valid.all()):
+            return seq_new, seq_old, seq_adv
+        return seq_new[valid], seq_old[valid], seq_adv[valid]
 
 
 __all__ = ["GSPO", "GSPOConfig"]
