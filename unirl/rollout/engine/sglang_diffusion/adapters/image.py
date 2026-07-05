@@ -41,6 +41,9 @@ class ImageAdapter(ModelAdapter):
     #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are squeezed to
     #: images. Legacy image-path video families set this False (drop 4-D instead).
     squeeze_single_frame_4d: bool = True
+    #: Whether to pad (not drop) the attention mask when shorter than embeds.
+    #: Only Edit-Plus sets this (its embeds carry image-token slots). Default False.
+    pad_mask_to_embeds: bool = False
 
     # ------------------------------------------------------------------ #
     # Request side
@@ -322,7 +325,7 @@ class ImageAdapter(ModelAdapter):
         return utils.stack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        text_cond, neg_text_cond = utils.fuse_text_conditions(results)
+        text_cond, neg_text_cond = utils.fuse_text_conditions(results, allow_mask_pad=self.pad_mask_to_embeds)
         out: Dict[str, Any] = {}
         if text_cond is not None:
             out["text"] = text_cond

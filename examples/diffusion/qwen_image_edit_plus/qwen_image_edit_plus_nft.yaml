@@ -1,0 +1,213 @@
+# @package _global_
+# Qwen-Image-Edit-Plus + DiffusionNFT trainside (FSDP) colocate, v2 trainer, 1x8.
+#
+# The parity oracle for qwen_image_edit_plus_nft_sglang.yaml — same
+# algorithm/bundle/sampling/conditions_cls/checkpoint cadence, byte-identical
+# except for the engine block (the sglang recipe adds weight_sync_interval +
+# sync block + load_text_encoder=false + tags; see its header for the delta
+# list). A fixed-seed run of this recipe vs the sglang one should compare
+# cleanly; any drift is rollout-engine numeric divergence, not config drift.
+#
+# DiffusionNFT = forward-process diffusion RL with a dual-adapter EMA reference:
+#   - backend.ema_lora_cfg installs the "default" (trainable) + "old" (EMA)
+#     LoRA pair via inject_nft; the trainer rolls out under "old" and trains
+#     "default", then EMA-updates "old" at each rollout boundary.
+#   - algorithm._target_ = DiffusionNFT (vs FlowGRPO in the GRPO recipe);
+#     it pulls the EMA handle off backend.ema (trainer injects backend=...).
+#   - sampling.scheduler.num_sde_steps: 0 — KEY: DiffusionNFT forward-process path,
+#     no per-step SDE log_prob recorded.
+#
+# Image-edit path (vs base qwen_image_nft.yaml):
+#   - bundle/pipeline → QwenImageEditPlus* (in_channels=64, source-image
+#     latent token-concat inside predict_noise).
+#   - data_source → datasets/image_edit (JSONL with prompt + media[image,role=condition]).
+#     MultimodalRLDataSource emits primitives["image"]: Images, which the
+#     Edit-Plus pipeline requires at generate(req) (fail-fast if absent).
+#   - reward → PickScore (V1). V2 will swap in EditReward for instruction
+#     following — the local PickScore scorer doesn't read the source image,
+#     only the edited output, so it's a reasonable cold-start signal.
+#   - conditions_cls → QwenImageEditPlusConditions (carries image_latent).
+#     DiffusionNFT resolves typed conditions via conditions_cls.from_dict(
+#     dict(conditions)) on each train step; the dict is what
+#     RolloutResp.tracks["image"].conditions emits (text / negative_text /
+#     image_latent).
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 10000
+
+# Checkpoint cadence: write a checkpoint every N rollouts (and on the last).
+# 0 disables saving. The trainer reads this via cfg.get("save_interval", 0) in
+# unirl/train_diffusion.py; save_dir defaults to a repo-relative path.
+save_interval: 5
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft}
+# Resume from the latest checkpoint (trainer reads cfg.get("load_dir")).
+# Leave unset to start fresh; set LOAD_DIR to a checkpoint dir to resume.
+load_dir: ${oc.env:LOAD_DIR,}
+
+bundle:
+  _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
+  config:
+    _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+    model_precision: bf16
+    max_sequence_length: 512
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.qwen_image_edit_plus.pipeline.QwenImageEditPlusPipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false  # ZeRO-2: keep params unsharded across forward → fewer all-gathers (faster rollout at forward_batch_size=8)
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
+    # Disabled: torch.compile + FSDP2 deadlocks on trainside. The same
+    # compiled transformer forward runs in TWO requires_grad contexts within
+    # one process — rollout under torch.no_grad() (engine.py:101) and NFT
+    # replay under grad (diffusionnft.py:325). Dynamo recompiles on the
+    # no_grad↔grad transition; ranks diverge in compile state across the
+    # rollout↔train boundary, so the FSDP2 post_backward reduce_scatter
+    # collective goes unmatched and NCCL hangs (~1800s watchdog abort).
+    # SGLang colocate is unaffected — rollout runs in a separate SGLang
+    # process, so the compiled FSDP forward only ever sees the grad path.
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # DiffusionNFT dual-adapter EMA (replaces the GRPO recipe's lora_cfg). Fields mirror
+  # the v1 training.ema_lora block. target_modules keep the v1 DiffusionNFT set: bare
+  # (un-prefixed) names that also cover the img/txt MLP projections — broader
+  # than the GRPO recipe's attn-only `attn.*` set. Verified verbatim against
+  # transformer/model.safetensors.index.json (Qwen-Image-Edit-2511-merged_v9.7).
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # forward_batch_size=8: process 8 samples per rank per forward (H200 143GB
+  # allows it; reshard_after_forward=false keeps params unsharded so repeated
+  # forwards skip the all-gather). Was 1 — 8x fewer forward calls per rollout.
+  forward_batch_size: 8
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image_edit_plus.conditions.QwenImageEditPlusConditions
+  params: ${sampling}
+  # DiffusionNFT loss hyperparameters (v1 algorithm.algorithms.diffusion block).
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.2
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.0                      # DiffusionNFT: forward-process, no SDE noise injection
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-diffusionNFT}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_edit_plus_nft}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["qwen-image-edit-plus", "image-edit", "nft", "trainside", "v2"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1

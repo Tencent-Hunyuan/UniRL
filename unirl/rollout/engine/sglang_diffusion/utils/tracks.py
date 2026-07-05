@@ -26,8 +26,8 @@ from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images, Video, Videos
 from unirl.types.rollout_req import RolloutReq
+from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
-from unirl.types.trajectory_store import compute_trajectory_positions
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +335,12 @@ def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(padded, dim=0)
 
 
-def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def _aligned_mask(
+    mask_list: List[torch.Tensor],
+    embeds_cat: Optional[torch.Tensor],
+    *,
+    allow_pad: bool = False,
+) -> Optional[torch.Tensor]:
     """Fuse + mount an attention mask only when it aligns with the fused embeds.
 
     The engine emits the model's embeds-aligned ``prompt_embeds_mask`` (the mask the
@@ -345,22 +350,44 @@ def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tens
     dropped (SD3's ``predict_noise`` ignores the mask — dropping a mismatched mask
     is the safe, correct result and avoids padding the embeds up to a spurious
     length, the historic ~68x LoRA-gradient dilution).
+
+    For Qwen-Image-Edit-Plus the text encoder emits prompt_embeds that include
+    image-placeholder tokens (longer than the text-only attention mask). The
+    extra positions are all valid (image tokens the DiT attends to), so pad the
+    mask with ones up to the embeds seq-len instead of dropping it.
     """
     if not mask_list or embeds_cat is None:
         return None
     mask_cat = _cat_padded_rows(mask_list)
-    if int(mask_cat.shape[1]) != int(embeds_cat.shape[1]):
+    mask_seq = int(mask_cat.shape[1])
+    embeds_seq = int(embeds_cat.shape[1])
+    if mask_seq == embeds_seq:
+        return mask_cat
+    if mask_seq > embeds_seq:
         logger.debug(
             "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
-            int(mask_cat.shape[1]),
-            int(embeds_cat.shape[1]),
+            mask_seq,
+            embeds_seq,
         )
         return None
-    return mask_cat
+    # mask_seq < embeds_seq: pad with ones only when the adapter opts in
+    # (Edit-Plus prompt_embeds carry image-token slots beyond the text mask).
+    if not allow_pad:
+        logger.debug(
+            "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
+            mask_seq,
+            embeds_seq,
+        )
+        return None
+    batch = mask_cat.shape[0]
+    pad = torch.ones((batch, embeds_seq - mask_seq), dtype=mask_cat.dtype, device=mask_cat.device)
+    return torch.cat([mask_cat, pad], dim=1)
 
 
 def fuse_text_conditions(
     results: Sequence[RawResult],
+    *,
+    allow_mask_pad: bool = False,
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
     """Fuse per-result encoder outputs into ``text`` + optional ``negative_text``.
 
@@ -409,11 +436,12 @@ def fuse_text_conditions(
             neg_mask_list.append(neg_mask.detach().cpu())
 
     embeds_cat = _cat_padded_rows(prompt_embeds_list) if prompt_embeds_list else None
+
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
             pooled=torch.cat(pooled_list, dim=0) if pooled_list else None,
-            attn_mask=_aligned_mask(mask_list, embeds_cat),
+            attn_mask=_aligned_mask(mask_list, embeds_cat, allow_pad=allow_mask_pad),
         )
         if embeds_cat is not None
         else None
@@ -424,7 +452,7 @@ def fuse_text_conditions(
         TextEmbedCondition(
             embeds=neg_embeds_cat,
             pooled=torch.cat(neg_pooled_list, dim=0) if neg_pooled_list else None,
-            attn_mask=_aligned_mask(neg_mask_list, neg_embeds_cat),
+            attn_mask=_aligned_mask(neg_mask_list, neg_embeds_cat, allow_pad=allow_mask_pad),
         )
         if neg_embeds_cat is not None
         else None

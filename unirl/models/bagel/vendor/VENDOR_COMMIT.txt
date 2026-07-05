@@ -13,16 +13,27 @@ Mechanical changes (see vendor/__init__.py):
   - import-root rewrite modeling./data./inferencer -> unirl.models.bagel.vendor.*
   - added modeling/cache_utils/__init__.py
   - data/ subset only (data_utils.py + transforms.py + __init__.py)
-Plus ONE grad-safety edit (NOT pristine): modeling/bagel/qwen2_navit.py
+Plus local compatibility edits (NOT pristine):
+  1. Grad-safety edit: modeling/bagel/qwen2_navit.py
   PackedAttention gen-mode output writes into a fresh torch.zeros_like tensor
   instead of inplace-indexing the flash_attn view (autograd forbids inplace on a
   custom-Function view during RL replay backprop). Math unchanged. Marked inline.
+  2. Transformers 5 config compatibility:
+     modeling/qwen2/modeling_qwen2.py and modeling/bagel/qwen2_navit.py use
+     getattr(config, "pad_token_id", None) to preserve transformers 4 behavior
+     for BAGEL's llm_config.json, which omits pad_token_id.
+     modeling/qwen2/modeling_qwen2.py also preserves the default RoPE init path
+     because transformers 5's ROPE_INIT_FUNCTIONS no longer exposes "default".
+  3. Reference-inferencer VAE decode dtype compatibility:
+     inferencer.py mirrors UniRL's BagelVAEDecodeStage by temporarily decoding
+     with the VAE in fp32, then restoring its loaded dtype. This keeps the
+     vendored reference/debug path usable when UniRL loads the VAE in bf16.
 
 To re-vendor a newer upstream:
   1. git -C Bagel fetch && git -C Bagel checkout <new_commit>
   2. recopy modeling/ + inferencer.py + data/{data_utils,transforms,__init__}.py
   3. re-apply the 9 import-root rewrites + cache_utils/__init__.py
-  4. re-apply the qwen2_navit PackedAttention gen-mode grad-safety edit
+  4. re-apply the documented local compatibility edits
   5. bump this file; re-run the Phase 2 ratio==1 test AND a replay-backward/training
      smoke before trusting (the ratio test alone runs under no_grad and won't catch
      grad-only issues like the inplace-on-view above).

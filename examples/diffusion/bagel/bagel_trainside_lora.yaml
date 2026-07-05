@@ -173,8 +173,8 @@ sampling:
   # GRPO group, seeded by rollout_id). Uses UniRL's NATIVE timestep_fraction (early-half
   # restriction) + num_sde_steps (random-k) — zero framework change. Differs from
   # flow_grpo only in that the 2 SDE steps are SCATTERED, not a contiguous window;
-  # diffuse/replay are index-set-based (compute_trajectory_positions stores x_t
-  # before+after each SDE step independently), so non-contiguous is fully supported.
+  # diffuse/replay are index-set-based (unirl.types.sampling.compute_trajectory_positions
+  # stores x_t before+after each SDE step independently), so non-contiguous is fully supported.
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}

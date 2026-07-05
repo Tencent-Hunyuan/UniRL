@@ -1,0 +1,290 @@
+# @package _global_
+# Qwen-Image-Edit-Plus + DiffusionNFT — sglang_diffusion colocate variant, v2 trainer.
+#
+# Same algorithm/bundle/sampling/conditions_cls as qwen_image_edit_plus_nft.yaml
+# (the trainside recipe, which doubles as the parity oracle), but the rollout
+# runs on an in-process SGLang v2 engine (stock upstream 0.5.12.post1
+# QwenImageEditPlusPipeline + the _patches stack) instead of the in-process
+# trainsite engine. Mirrors how qwen_image_sglang.yaml relates to its trainside
+# twin.
+#
+# Engine deltas vs the trainside recipe — rollout block + sync block +
+# weight_sync_interval + load_text_encoder=false + tags only; everything else
+# is byte-identical so a fixed-seed run compares cleanly against trainsite.
+#
+# Image-edit path (vs qwen_image_sglang.yaml):
+#   - bundle/pipeline → QwenImageEditPlus* (in_channels=64, source-image
+#     latent token-concat inside predict_noise).
+#   - rollout.model_family → qwen_image_edit_plus (NEW; reads
+#     req.primitives['image'], injects PIL via the condition_image sampling
+#     kwarg so upstream's InputValidationStage → ImageVAEEncodingStage VAE-
+#     encodes the source image and sets batch.image_latent).
+#   - data_source → datasets/image_edit (JSONL with prompt + condition image).
+#   - patch_conditions captures batch.image_latent + batch.vae_image_sizes
+#     off the SGLang batch and ships them as ImageLatentCondition in the
+#     rollout conditions (the sglang_diffusion engine has no custom_output IPC
+#     channel — patch_conditions extends the text-embed machinery built for
+#     prompt_embeds to also carry image_latent / image_latent_sizes), so the
+#     trainer-side replay (predict_noise_at_step) can reconstruct the concat
+#     input.
+#
+# DiffusionNFT on a colocate SGLang engine: the EMA shadow ("old") reaches the
+# engine via LocalLoraWeightSync (adapter_name defaults to
+# backend.rollout_adapter_name = "old"), exactly like the vLLM-Omni sibling.
+# The in-process apply_eval_ema swap is skipped (it cannot reach the SGLang
+# process's LoRA pool) — see trainer/diffusion.py::_rollout_is_trainside.
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 10000
+weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter into the engine
+
+# Checkpoint cadence: write a checkpoint every N rollouts (and on the last).
+# 0 disables saving. The trainer reads this via cfg.get("save_interval", 0) in
+# unirl/train_diffusion.py; save_dir defaults to a repo-relative path.
+save_interval: 5
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft_sglang}
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (the sglang engine needs both at init).
+model_config:
+  _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+  model_precision: bf16
+  max_sequence_length: 512
+  # Trainer-side TE is dead weight on the separate-engine path (the
+  # engine encodes; the trainer replays captured conditions) and its
+  # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
+  load_text_encoder: false
+  # Static-shift fallback; the real checkpoint enables dynamic shifting via
+  # scheduler/scheduler_config.json and this value is ignored at runtime.
+  shift: 3.0
+  # SGLang builds its LoRA ServerArgs from these two fields.
+  use_lora: true
+  lora_target_modules:
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+    # Match the 4 img/txt MLP projections in backend.ema_lora_cfg.target_modules
+    # (the v1 DiffusionNFT set). SGLang's is_target_layer uses substring match,
+    # so the bare names hit transformer_blocks.N.{img,txt}_mlp.net.* in every
+    # block. Omitting these silently drops 4 LoRA deltas the trainer optimizes
+    # → trajectory divergence vs trainsite.
+    - img_mlp.net.0.proj
+    - img_mlp.net.2
+    - txt_mlp.net.0.proj
+    - txt_mlp.net.2
+
+# Shared SDE strategy; the adapter resolves its sde_label from it.
+# DiffusionNFT: forward-process (num_sde_steps=0) → the engine takes the ODE
+# branch in build_inputs, so the strategy is FlowSDE (no Dance kernel needed).
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.qwen_image_edit_plus.pipeline.QwenImageEditPlusPipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
+    use_torch_compile: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # DiffusionNFT dual-adapter EMA (replaces the GRPO recipe's lora_cfg). Fields mirror
+  # the v1 training.ema_lora block. target_modules keep the v1 DiffusionNFT set: bare
+  # (un-prefixed) names that also cover the img/txt MLP projections — broader
+  # than the GRPO recipe's attn-only `attn.*` set. Verified verbatim against
+  # transformer/model.safetensors.index.json (Qwen-Image-Edit-2511-merged_v9.7).
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  model_config: ${model_config}
+  strategy: ${strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    # Edit-Plus image-edit modality (NEW; reads req.primitives['image'],
+    # injects PIL via the condition_image sampling kwarg so upstream's
+    # InputValidationStage → ImageVAEEncodingStage sets batch.image_latent).
+    model_family: qwen_image_edit_plus
+    # Replay consumes the SERVER's fused text embeds (+ masks) and the
+    # captured image_latent, so the 8B Qwen2.5-VL's rollout-vs-trainside
+    # numeric drift cancels out of the ratio.
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory, without shrinking the logical batch.
+    forward_batch_size: 16
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+      # Match ema_lora_cfg.target_modules (12-module DiffusionNFT set).
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+    engine_kwargs:
+      # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
+      # name "Qwen-Image-Edit-2511") — local checkpoint dirs then need no special
+      # naming. Auto-detection via the "qwen-image-edit-2511" substring would
+      # also work, but the explicit pin mirrors qwen_image_sglang.yaml.
+      model_id: Qwen-Image-Edit-2511
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image_edit_plus.conditions.QwenImageEditPlusConditions
+  params: ${sampling}
+  # DiffusionNFT loss hyperparameters (v1 algorithm.algorithms.diffusion block).
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.2
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.0                      # DiffusionNFT: forward-process, no SDE noise injection
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
+
+# LoRA weight sync → SGLang rollout. Instantiated as a LocalLoraWeightSync
+# (sibling of backend + rollout) from this block's `_target_`, exactly like the
+# blocks above. The train loop drives cadence via `weight_sync_interval` (top of
+# file): every N rollouts it calls sync() to push the freshly-trained LoRA
+# (set_lora_from_tensors) into the engine just before that rollout's generate.
+#
+# adapter_name defaults to backend.rollout_adapter_name = "old" (the EMA
+# shadow) — DiffusionNFT samples under the EMA weights, mirroring the vLLM-Omni
+# sibling. An explicit override here would break that contract.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false  # SGLang engine lacks loaded_lora_checksums (only loaded_param_checksums); skip read-back
+  # Mirrors QwenImageEditPlusPipelineConfig.weight_sync_param_name_prefix; must
+  # match the engine-side LoRA key naming (a wrong prefix yields wrong/zero
+  # loaded layers).
+  param_prefix: "transformer."
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-diffusionNFT}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_edit_plus_nft_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["qwen-image-edit-plus", "image-edit", "nft", "sglang-diffusion", "v2"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1

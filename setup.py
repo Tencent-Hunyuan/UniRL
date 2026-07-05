@@ -23,7 +23,7 @@ setup(
         "diffusers>=0.37.0",
         "hydra-core>=1.3",
         "omegaconf>=2.3",
-        "transformers>=4.41",
+        "transformers>=5.6,<5.7",
         "peft>=0.11",
         "safetensors>=0.4",
         "Pillow>=10",

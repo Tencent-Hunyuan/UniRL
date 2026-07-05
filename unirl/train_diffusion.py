@@ -37,6 +37,7 @@ def main(cfg: DictConfig) -> None:
         logging_cfg=cfg.get("logging"),
         layout=cfg.get("layout", "colocate"),
         train_fraction=cfg.get("train_fraction", 0.5),
+        reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),

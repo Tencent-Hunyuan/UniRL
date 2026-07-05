@@ -15,12 +15,13 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.types.primitives import Images, Texts
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.rollout_req import PrimitiveValue, RolloutReq
 from unirl.types.rollout_resp import RolloutTrack, _track_with_field
 from unirl.types.sampling import total_samples_per_prompt
 
-from .base import RewardBackend
+from .base import DifferentiableReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,26 @@ class RewardService(Remote):
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         return self.backend.compute_rewards(request)
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def score_differentiable(self, *, images: Images, prompts: Texts) -> torch.Tensor:
+        """ReFL scoring: score grad-carrying ``images`` (pixels ``[B, C, H, W]`` in
+        ``[0, 1]``) against ``prompts`` and return a ``[B]`` reward tensor with
+        ``grad_fn`` intact.
+
+        Deliberately bypasses :meth:`score_and_attach` / ``RewardRequest.images``
+        (those go through ``tensor_frame_to_pil`` + ``torch.tensor(...)``, which
+        detach). Under ``enable_grad()`` the framework marks ``images.pixels`` as a
+        grad leaf and chains the returned reward's grad back to it. The backend must
+        satisfy the :class:`~unirl.reward.base.DifferentiableReward` Protocol.
+        """
+        if not isinstance(self.backend, DifferentiableReward):
+            raise TypeError(
+                f"RewardService.score_differentiable: backend "
+                f"{type(self.backend).__name__} is not a DifferentiableReward — ReFL "
+                f"needs a differentiable in-process reward (e.g. pickscore/clip/hpsv2)."
+            )
+        return self.backend.compute_rewards_differentiable(images.pixels, list(prompts.texts))
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def score_and_attach(self, *, req: RolloutReq, track: RolloutTrack) -> RolloutTrack:
