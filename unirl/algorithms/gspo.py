@@ -169,9 +169,7 @@ class GSPO(StageAlgorithm):
             else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
 
-        seq_new, seq_old, seq_adv = self._reduce_to_sequences(
-            new_logp, old_logp, advantages, segment.lengths
-        )
+        seq_new, seq_old, seq_adv = self._reduce_to_sequences(new_logp, old_logp, advantages, segment.lengths)
         if seq_new.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
