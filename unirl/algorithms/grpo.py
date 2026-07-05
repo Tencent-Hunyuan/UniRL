@@ -1,22 +1,32 @@
 """Stage-driven ``GRPO`` over a ``TextSegment``.
 
-GRPO forms a **per-token** importance ratio ``exp(new_logp_t - old_logp_t)``
-and runs the PPO clipped surrogate at token granularity. The construction,
-replay, clip scheduling, backward, and metric plumbing are shared with
-:class:`~unirl.algorithms.gspo.GSPO` via
-:class:`unirl.algorithms._ar_clip._ARClipStageAlgorithm`; this class implements
-only the token-level ratio and the ``loss_agg_mode`` reduction.
+Implements :class:`StageAlgorithm` and shares the module-level
+``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
+:mod:`unirl.algorithms.base`) with :class:`FlowGRPO` so their loss
+math stays identical. The teacher-forced forward and per-token log-prob
+recompute are owned by ``stage.replay(...)``; the algorithm is ~20 lines of
+ratio-clip math.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Type
 
 import torch
 
-from ._ar_clip import _ARClipStageAlgorithm
-from .base import BaseAlgorithmConfig, _grpo_clip_loss
+from unirl.types.conditions import Condition
+from unirl.types.segments.text import TextSegment
+
+from .base import (
+    AlgorithmStepResult,
+    BaseAlgorithmConfig,
+    StageAlgorithm,
+    _grpo_clip_loss,
+    _resolve_clip_range_from_schedule,
+    rollout_replay_logp_absdiff,
+    typed_conditions,
+)
 
 
 @dataclass
@@ -27,56 +37,114 @@ class GRPOConfig(BaseAlgorithmConfig):
     clip_schedule: str = "constant"
 
 
-class GRPO(_ARClipStageAlgorithm):
+class GRPO(StageAlgorithm):
     """GRPO over an AR ``TextSegment`` via ``ARStage.replay``.
 
-    Per-sample advantages are expanded to per-token via ``cu_seqlens`` and fed
-    through the shared PPO clip math at token granularity, then reduced by
-    ``loss_agg_mode``:
+    The teacher-forced forward and per-token log-prob recompute is owned by
+    :meth:`ARStage.replay`; this class expands per-sample advantages to per-
+    token via ``cu_seqlens`` and runs the same PPO clip math.
 
-    - ``"seq-mean-token-sum-norm"`` (Dr.GRPO/DAPO): per-seq token-SUM / horizon,
-      then mean over sequences (length-UNbiased).
-    - ``"seq-mean-token-mean"`` (ORIGINAL GRPO): per-seq token-MEAN, then mean
-      over sequences (length-normalized, the standard-GRPO length bias).
-    - ``"token-mean"`` (default): flat mean over all tokens.
-
-    Args mirror the shared base; ``horizon`` is GRPO-only (the token-sum-norm
-    denominator). See :meth:`ARStage.replay` for the ``sampling_temperature``
-    contract (``logits / T`` so replay's log-softmax matches SGLang sampling).
+    Args:
+        stage: The :class:`ARStage` whose ``replay`` produces packed-varlen
+            new log-probs aligned with ``segment.log_probs``.
+        clip_range: PPO clip range epsilon.
+        clip_schedule: ``"constant"``, ``"linear_decay"``, or
+            ``"cosine_decay"``.
+        conditions_cls: Stage-typed conditions container with
+            ``from_dict(Mapping[str, Condition])``.
+        sampling_temperature: AR rollout temperature, applied as a
+            ``logits / T`` scaling inside :meth:`ARStage.replay` so
+            replay's log-softmax matches SGLang's sampling distribution
+            (``log_softmax(logits / T)``). Injected at construction time
+            from the rollout engine config; falls back to
+            :class:`ARSamplingParams` default when no engine is configured.
     """
+
+    # old_logp is the rollout (SGLang) log-prob, which is frozen on the segment
+    # and does NOT change across mini-batch updates — so reusing it across
+    # num_updates_per_batch>1 is the deliberate rollout-anchored PPO ratio
+    # (verl bypass_mode=True parity), matching DRPO. The ratio then absorbs the
+    # rollout-vs-train engine gap on later mini-batches (accepted for parity).
+    supports_multi_update = True
 
     def __init__(
         self,
         *,
+        stage: Any = None,
+        pipeline: Any = None,
+        stage_attr: str = "ar",
         clip_range: float = 1e-4,
+        clip_schedule: str = "constant",
+        clip_range_high: Optional[float] = None,
         loss_agg_mode: str = "token-mean",
         horizon: int = 8192,
-        **kwargs,
+        conditions_cls: Optional[Type[Any]] = None,
+        sampling_temperature: Optional[float] = None,
     ) -> None:
-        super().__init__(clip_range=clip_range, loss_agg_mode=loss_agg_mode, **kwargs)
+        super().__init__()
+        if stage is None and pipeline is None:
+            raise ValueError("GRPO: either `stage` or `pipeline` must be provided")
+        if stage is None:
+            stage = getattr(pipeline, stage_attr)
+        self.stage = stage
+        self.clip_range = float(clip_range)
+        self.clip_range_high = None if clip_range_high is None else float(clip_range_high)
+        self.clip_schedule = str(clip_schedule)
+        self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
+        self.conditions_cls = conditions_cls
+        if sampling_temperature is None:
+            from unirl.types.sampling import ARSamplingParams
 
-    def _policy_loss(
+            sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
+        self.sampling_temperature = float(sampling_temperature)
+
+    def compute_loss_and_backward(
         self,
         *,
-        new_logp: torch.Tensor,
-        old_logp: torch.Tensor,
+        conditions: Mapping[str, Condition],
+        segment: "TextSegment",
         advantages: torch.Tensor,
-        segment,
-        clip_range: float,
-        clip_range_high: Optional[float],
-    ) -> Tuple[Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        training_progress: float,
+        loss_scale: float,
+    ) -> AlgorithmStepResult:
+        if segment.tokens is None or segment.lengths is None or segment.log_probs is None:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+        if int(segment.tokens.shape[0]) == 0:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        new_logp = self.stage.replay(
+            typed_conds, segment=segment, temperature=self.sampling_temperature
+        )  # [total_tokens]
+        # old_logp = the rollout log-prob, frozen on the segment — the deliberate
+        # rollout-anchored ratio across num_updates_per_batch steps (see the
+        # supports_multi_update class comment; verl bypass_mode=True parity).
+        old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
         adv_per_token = self._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
+        )
+
+        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_high = (
+            None
+            if self.clip_range_high is None
+            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
         loss_per_elem, ratio_metrics = _grpo_clip_loss(
             new_logp=new_logp,
             old_logp=old_logp,
             advantages=adv_per_token,
             clip_range=clip_range,
-            clip_range_high=clip_range_high,
+            clip_range_high=clip_high,
         )
 
+        # Loss aggregation (match DRPO / verl loss_agg_mode):
+        #  - "seq-mean-token-sum-norm" (Dr.GRPO/DAPO): per-seq token-SUM / horizon,
+        #    then mean over sequences (length-UNbiased).
+        #  - "seq-mean-token-mean" (ORIGINAL GRPO): per-seq token-MEAN, then mean
+        #    over sequences (length-normalized, the standard-GRPO length bias).
+        #  - "token-mean" (default): flat mean over all tokens.
         if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean") and segment.lengths is not None:
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             if self.loss_agg_mode == "seq-mean-token-sum-norm":
@@ -85,7 +153,20 @@ class GRPO(_ARClipStageAlgorithm):
                 loss = torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
         else:
             loss = loss_per_elem.mean()
-        return loss, ratio_metrics
+        (loss * loss_scale).backward()
+
+        metrics: Dict[str, Any] = {
+            "policy_loss": float(loss.detach().item()),
+            "clip_range": float(clip_range),
+            **rollout_replay_logp_absdiff(new_logp, old_logp),
+            **{k: float(v.item()) for k, v in ratio_metrics.items()},
+        }
+        return AlgorithmStepResult(
+            loss=float(loss.detach().item()),
+            metrics=metrics,
+            num_steps_or_tokens=int(new_logp.shape[0]),
+            has_backward=True,
+        )
 
     @staticmethod
     def _expand_advantages_to_tokens(
@@ -95,8 +176,13 @@ class GRPO(_ARClipStageAlgorithm):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Expand per-sample ``advantages`` to per-token by repeating each
-        sample's advantage across its ``lengths``-defined token span.
+        """Expand per-sample ``advantages [B]`` to per-token ``[total_tokens]``.
+
+        Each sample's advantage is repeated across its ``lengths``-defined
+        token span so that token positions in segment ``k`` all see
+        ``advantages[k]``. ``lengths`` comes from
+        :attr:`Batch.lengths` on the segment (derived from the framework-
+        managed cu_seqlens).
         """
         bs = int(advantages.shape[0])
         if int(lengths.shape[0]) != bs:
