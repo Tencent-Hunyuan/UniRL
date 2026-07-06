@@ -56,6 +56,25 @@ def _import_diffusers_classes():
     return Cosmos3OmniTransformer, AutoencoderKLWan, UniPCMultistepScheduler, Cosmos3OmniPipeline
 
 
+class _CastOutput(torch.nn.Module):
+    """Parameter-free wrapper casting a module's output dtype.
+
+    Cosmos3's ``forward`` feeds ``time_proj`` sinusoids (always fp32 — diffusers'
+    ``get_timestep_embedding`` calls ``.float()`` internally) straight into
+    ``time_embedder`` and relies on that embedder staying fp32. With the
+    transformer uniformly cast for FSDP2 the embedder is bf16, so restore the
+    standard diffusers convention (cast the projection before the linear).
+    """
+
+    def __init__(self, inner: torch.nn.Module, dtype: torch.dtype) -> None:
+        super().__init__()
+        self.inner = inner
+        self._dtype = dtype
+
+    def forward(self, *args, **kwargs):
+        return self.inner(*args, **kwargs).to(self._dtype)
+
+
 class Cosmos3Bundle:
     """Weights for Cosmos3 SFT: MoT transformer (trainable), WanVAE + tokenizer
     + scheduler (frozen helpers)."""
@@ -82,6 +101,7 @@ class Cosmos3Bundle:
         # matching the other UniRL bundles that run transformers fully in
         # model_precision.
         transformer = transformer.to(device=device, dtype=model_dtype)
+        transformer.time_proj = _CastOutput(transformer.time_proj, model_dtype)
         vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)
         vae.eval()
