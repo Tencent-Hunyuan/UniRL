@@ -476,6 +476,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         if 0 in needed:
             stored_pairs.append((0, x_t.detach().clone()))
         sde_logp_list: List[torch.Tensor] = []
+        # Per-SDE-step mean μ_old (the deterministic transition mean), recorded on the
+        # same SDE steps as sde_logp; consumed by BagelFlowUniGRPO(ratio_norm=True).
+        sde_means_list: List[torch.Tensor] = []
 
         with torch.no_grad(), self._autocast_ctx(device):
             for i in range(T):
@@ -483,7 +486,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 t_next = schedule[i + 1]
                 cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
                 step_eta = float(params.eta) if i in sde_set else 0.0
-                x_t, log_prob, _ = self.step.step_with_logp(
+                x_t, log_prob, prev_mean = self.step.step_with_logp(
                     bagel,
                     self.strategy,
                     x_t=x_t,
@@ -501,10 +504,15 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     stored_pairs.append((i + 1, x_t.detach().clone()))
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
+                    # Nested on purpose: prev_mean is non-None on every step, so appending it
+                    # outside this block would misalign sde_means with sde_logp / sde_indices.
+                    if prev_mean is not None:
+                        sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)  # [1, K, seq, C]
         sde_logp = torch.stack(sde_logp_list, dim=0).unsqueeze(0) if sde_logp_list else None  # [1, S]
+        sde_means = torch.stack(sde_means_list, dim=0).unsqueeze(0) if sde_means_list else None  # [1, S, seq, C]
         sde_indices = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
         indices = torch.tensor(positions_collected, dtype=torch.long, device=device)
@@ -514,6 +522,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             sigmas=schedule,
             indices=indices,
             sde_logp=sde_logp,
+            sde_means=sde_means,
             sde_indices=sde_indices,
         )
 
@@ -597,28 +606,44 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
     # Single-step velocity (forward-process algorithms: DiffusionNFT et al.)
     # ------------------------------------------------------------------
 
-    def predict_noise_at_step(
+    def build_forward_kwargs(
         self,
         conditions: BagelDiffusionConditions,
+        *,
+        params: BagelDiffusionParams,
+        device: torch.device,
+    ) -> Dict[str, Any]:
+        """Rebuild the KV contexts → the step-invariant ``_forward_flow`` kwargs.
+
+        The expensive part (resolving the per-sample gen / cfg contexts and packing
+        the generation inputs) is done ONCE; a caller scoring several steps against
+        the same conditioning then reuses the result via :meth:`predict_velocity_at`
+        (no per-step rebuild). Used by
+        :class:`~unirl.algorithms.bagel_flow_unigrpo.BagelFlowUniGRPO`'s velocity-MSE
+        loop, which evaluates ``v_theta`` / ``v_ref`` across the SDE window.
+        """
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
+        return self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
+
+    def predict_velocity_at(
+        self,
+        forward_kwargs: Dict[str, Any],
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,
         params: BagelDiffusionParams,
     ) -> torch.Tensor:
-        """Single ``(x_t, sigma)`` velocity forward — no scheduler iteration.
+        """Single ``(x_t, sigma)`` CFG velocity reusing prebuilt ``forward_kwargs``.
 
-        Completes the ``DiffusionStage`` protocol (used by forward-process algorithms
-        like DiffusionNFT). Delegates to :meth:`BagelDiffusionStep.predict_velocity` — the same
-        navit ``_forward_flow`` call ``diffuse`` / ``replay`` use — so CFG handling is
-        identical. ``sample`` is packed ``[seq, C]`` (or ``[1, seq, C]``; the unit
-        batch dim is squeezed). Bagel currently ships T2I GRPO only, so this is wired
-        for protocol-completeness / future DiffusionNFT and not exercised by the GRPO path.
+        Pairs with :meth:`build_forward_kwargs` so a caller scoring multiple steps
+        against one conditioning pays the context prefill once. ``sample`` is packed
+        ``[seq, C]`` (or ``[1, seq, C]``; the unit batch dim is squeezed). Grad flows
+        through the velocity forward (gen experts) only — the contexts inside
+        ``forward_kwargs`` are detached constants built under ``no_grad``.
         """
         bagel = self.model.model
         device = torch.device(self.model.device)
-        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
-        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
-        forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
         t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
         cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(t_val, params)
         sample = sample.to(device)
@@ -633,6 +658,28 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 cfg_img_scale=cfg_img_scale,
                 forward_kwargs=forward_kwargs,
             )
+
+    def predict_noise_at_step(
+        self,
+        conditions: BagelDiffusionConditions,
+        *,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        params: BagelDiffusionParams,
+    ) -> torch.Tensor:
+        """Single ``(x_t, sigma)`` velocity forward — no scheduler iteration.
+
+        Completes the ``DiffusionStage`` protocol (used by forward-process algorithms
+        like DiffusionNFT). Rebuilds the contexts (:meth:`build_forward_kwargs`) then
+        runs the same navit ``_forward_flow`` call (:meth:`predict_velocity_at`) that
+        ``diffuse`` / ``replay`` use, so CFG handling is identical. ``sample`` is packed
+        ``[seq, C]`` (or ``[1, seq, C]``). Callers that score multiple steps (e.g. the
+        velocity-MSE loop) should instead build the kwargs once via
+        :meth:`build_forward_kwargs` and loop :meth:`predict_velocity_at`.
+        """
+        device = torch.device(self.model.device)
+        forward_kwargs = self.build_forward_kwargs(conditions, params=params, device=device)
+        return self.predict_velocity_at(forward_kwargs, sample=sample, sigma=sigma, params=params)
 
     # ------------------------------------------------------------------
     # Trainable surface for FSDPPolicy

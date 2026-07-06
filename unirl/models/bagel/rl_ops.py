@@ -125,8 +125,28 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
     ``model._forward_flow`` already does the CFG combine internally (gen / cfg_text /
     cfg_img contexts + ``cfg_text_scale`` / ``cfg_img_scale`` / ``cfg_renorm_*``), so
     the returned velocity is the CFG-combined ``v_t`` the SDE kernel consumes.
+
+    Training-mode contract: the vendored decoder layer dispatches train vs inference
+    on ``self.training``, and ``_forward_flow`` goes through the ``forward_inference``
+    (packed-query) signature, so the language model MUST be in ``eval()`` here. The two
+    stages share one MoT instance within a single optimizer step (AR teacher-force sets
+    train(); this diffusion replay needs eval()), so we cannot rely on the inherited
+    mode. Force eval; under grad (replay) KEEP it eval so activation-checkpointing's
+    recompute in the LATER ``.backward()`` still takes ``forward_inference`` (reverting
+    to a stray train() would dispatch the packed-query kwargs into ``forward_train`` →
+    "unexpected keyword argument 'packed_query_sequence'"). Restore only when no
+    backward follows (rollout / no_grad).
     """
-    return _raw_forward_flow(model)(model, **kwargs)
+    lm = model.language_model
+    was_training = lm.training
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+    try:
+        return _raw_forward_flow(model)(model, **kwargs)
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
 
 
 # ---------------------------------------------------------------------------

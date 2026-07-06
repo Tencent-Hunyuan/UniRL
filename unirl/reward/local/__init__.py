@@ -15,6 +15,7 @@ from .registry import available_builtin_reward_models, resolve_builtin_reward_sc
 from .video import VideoRewardScorer
 from .video_clip_delta import VideoCLIPDeltaScorer
 from .video_pickscore import VideoPickScoreScorer
+from .videoalign import VideoAlignRewardScorer
 
 __all__ = [
     "AestheticRewardScorer",
@@ -29,6 +30,7 @@ __all__ = [
     "OCRRewardScorer",
     "PickScoreRewardScorer",
     "VideoCLIPDeltaScorer",
+    "VideoAlignRewardScorer",
     "VideoPickScoreScorer",
     "VideoRewardScorer",
     "available_builtin_reward_models",

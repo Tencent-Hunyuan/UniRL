@@ -470,13 +470,20 @@ class DiffusionTrainer(BaseTrainer):
         the KV/decoded on the driver.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
-        # (mirrors the AR trainer's evaluate()).
-        eval_diffusion = dataclasses.replace(
-            self.sampling_params.get("diffusion"),
+        # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
+        # on Bagel's sampling params; for the standard DiffusionSamplingParams
+        # (Qwen-Image, SD3, ...) the CFG strength lives in ``guidance_scale``,
+        # so fall back to that when the field is absent.
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs = dict(
             samples_per_prompt=self.eval_samples_per_prompt,
-            cfg_text_scale=self.eval_cfg_text_scale,
             eta=self.eval_eta,
         )
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         n_prompts = len(all_inputs.sample_ids)
