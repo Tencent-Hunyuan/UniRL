@@ -3,47 +3,9 @@
 from __future__ import annotations
 
 import importlib
-import os
 from typing import Dict, Tuple
 
 __version__ = "0.1.0"
-
-
-def _maybe_disable_cudnn() -> None:
-    """Globally disable cuDNN in this process when requested (opt-in).
-
-    Workaround for a cuDNN forward-compat crash — ``munmap_chunk(): invalid
-    pointer`` / SIGABRT inside conv ``_conv_forward`` — seen on this cluster's
-    cuda-compat-13 + driver-535 stack. It is flaky across worker ids and hits
-    any conv path: sglang's VAE decode (also guarded by
-    ``_patches.patch_vae_decode_safe``) AND the reward models' CLIP convs
-    (PickScore / video_pickscore), which run inside unirl Ray actors. Every
-    actor runs ``import unirl``, so disabling cuDNN here routes all convs
-    through PyTorch's native CUDA kernels process-wide. Opt-in via
-    ``UNIRL_DISABLE_CUDNN=1`` (legacy ``DIFFRL_DISABLE_CUDNN=1`` also honored);
-    a no-op (no torch import) otherwise.
-    """
-    if os.environ.get("UNIRL_DISABLE_CUDNN") != "1" and os.environ.get("DIFFRL_DISABLE_CUDNN") != "1":
-        return
-    try:
-        import torch
-
-        torch.backends.cudnn.enabled = False
-        # cudnn.enabled=False does NOT gate the SDPA cuDNN backend — that is a
-        # separate flag. On this stack the cuDNN-SDP kernel aborts the process
-        # (``munmap_chunk(): invalid pointer``) inside diffusers' _native_attention
-        # (the WAN DiT forward). Turn the cuDNN SDPA backend off explicitly so
-        # F.scaled_dot_product_attention falls back to flash / mem-efficient
-        # (both verified OK here). Guarded: the toggle exists on recent torch only.
-        try:
-            torch.backends.cuda.enable_cudnn_sdp(False)
-        except Exception:  # noqa: BLE001
-            pass
-    except Exception:  # noqa: BLE001 — best-effort; torch may be absent in CPU-only utility imports
-        pass
-
-
-_maybe_disable_cudnn()
 
 _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     # shared types
