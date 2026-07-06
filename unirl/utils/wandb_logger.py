@@ -242,6 +242,9 @@ class UniRLWandBLogger:
         # Optimizer-step counter for the ``train/`` panel (moved here from
         # BaseTrainer so all step-axis bookkeeping lives in the logger).
         self._optimizer_step = int(optimizer_step)
+        # Set by MemoryMonitor.install(); when present, log_rollout_step folds
+        # its per-step summary (perf/max_memory_* etc.) into the perf dict.
+        self.memory_monitor = None
 
         # Only enable on rank 0
         self.enabled = enabled and rank == 0
@@ -675,6 +678,13 @@ class UniRLWandBLogger:
             perf["rollout_time_s"] = float(step_time_s)
         if phase_times:
             perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
+        # Memory summary last, and only past the enabled/_initialized early-out
+        # above: no probe RPCs are spent when wandb is off. This is also the
+        # step boundary — the closing probe re-arms peak counters for the next
+        # step ("last log to this log" is the step window; covers async_ar,
+        # which has no train_step to wrap).
+        if self.memory_monitor is not None:
+            perf.update(self.memory_monitor.step_summary(step=step))
         if perf:
             self.log_perf(step, perf)
 

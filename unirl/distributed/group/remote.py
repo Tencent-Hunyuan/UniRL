@@ -186,3 +186,44 @@ class Remote:
         """
         self._grad_inputs.clear()
         self._grad_outputs.clear()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def get_memory_stats(
+        self,
+        reset_peak: bool = False,
+        log_stage: Optional[str] = None,
+        empty_cache: bool = False,
+        dump_snapshot_tag: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Worker-side memory probe — the driver's only window into GPU memory.
+
+        Trainers run on a CUDA-less Ray driver, so ``utils.memory_monitor``
+        gathers all readings through this BROADCAST (one dict per rank back on
+        the driver). Inherited by every role handle, like ``_cleanup_all_grads``.
+
+        One probe can bundle the boundary chores so a hand-off costs a single
+        RPC: read (always, BEFORE any reset so peaks survive), then optionally
+        log a ``[mem] stage=...`` line into this worker's log, run
+        :func:`aggressive_empty_cache` (never on the default monitoring path),
+        reset the peak counters (the caller owns the reset protocol — see
+        memory_monitor), and dump a memory snapshot if this process records one.
+        """
+        if not torch.cuda.is_available():
+            return {}
+        from unirl.utils.memory_utils import (
+            aggressive_empty_cache,
+            get_memory_info,
+            get_process_snapshot_sampler,
+            log_memory_usage,
+        )
+
+        info = log_memory_usage(log_stage) if log_stage else get_memory_info()
+        if empty_cache:
+            aggressive_empty_cache()
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+        if dump_snapshot_tag:
+            sampler = get_process_snapshot_sampler()
+            if sampler is not None:
+                sampler.dump(dump_snapshot_tag)
+        return {**info, "rank": float(self.rank_info.rank)}
