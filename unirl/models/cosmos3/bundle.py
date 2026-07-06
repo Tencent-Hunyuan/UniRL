@@ -76,9 +76,12 @@ class Cosmos3Bundle:
         model_dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_dtype = parse_torch_dtype(config.vae_precision, field_name="vae_precision")
 
-        transformer = Cosmos3OmniTransformer.from_pretrained(
-            path, subfolder="transformer", torch_dtype=model_dtype
-        ).to(device)
+        transformer = Cosmos3OmniTransformer.from_pretrained(path, subfolder="transformer", torch_dtype=model_dtype)
+        # diffusers pins `time_embedder` to fp32 (_keep_in_fp32_modules), but FSDP2
+        # requires a uniform original dtype per param group — cast the whole module,
+        # matching the other UniRL bundles that run transformers fully in
+        # model_precision.
+        transformer = transformer.to(device=device, dtype=model_dtype)
         vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)
         vae.eval()
