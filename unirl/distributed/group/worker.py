@@ -67,9 +67,8 @@ class Worker:
         else:
             self.device = "cpu"
 
-        # Allocator snapshot recording (UNIRL_MEMSNAP=1, default off) must start
-        # in THIS process — allocations happen here, not on the driver. Dumps
-        # are triggered later through Remote.get_memory_stats.
+        # Snapshot recording (UNIRL_MEMSNAP=1) must start in this process; dumps
+        # fire later via Remote.get_memory_stats.
         from unirl.utils.memory_utils import init_process_snapshot_sampler
 
         init_process_snapshot_sampler(rank=nccl_rank if nccl_rank is not None else device_id)

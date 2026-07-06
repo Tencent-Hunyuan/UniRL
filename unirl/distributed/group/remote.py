@@ -195,18 +195,11 @@ class Remote:
         empty_cache: bool = False,
         dump_snapshot_tag: Optional[str] = None,
     ) -> Dict[str, float]:
-        """Worker-side memory probe — the driver's only window into GPU memory.
+        """Worker-side memory probe reached by the CUDA-less driver via BROADCAST.
 
-        Trainers run on a CUDA-less Ray driver, so ``utils.memory_monitor``
-        gathers all readings through this BROADCAST (one dict per rank back on
-        the driver). Inherited by every role handle, like ``_cleanup_all_grads``.
-
-        One probe can bundle the boundary chores so a hand-off costs a single
-        RPC: read (always, BEFORE any reset so peaks survive), then optionally
-        log a ``[mem] stage=...`` line into this worker's log, run
-        :func:`aggressive_empty_cache` (never on the default monitoring path),
-        reset the peak counters (the caller owns the reset protocol — see
-        memory_monitor), and dump a memory snapshot if this process records one.
+        Reads always happen BEFORE any reset so peaks survive; optional chores
+        (log line, empty_cache, peak reset, snapshot dump) are bundled so a
+        hand-off costs one RPC. See ``utils.memory_monitor`` for orchestration.
         """
         if not torch.cuda.is_available():
             return {}
