@@ -44,7 +44,7 @@ def download_dataset(repo: str, local_dir: Optional[str]) -> str:
     return snapshot_download(repo, repo_type="dataset", local_dir=local_dir)
 
 
-def load_meta(root: str) -> Tuple[dict, Dict[int, str], "pandas.DataFrame"]:
+def load_meta(root: str) -> Tuple[dict, Dict[int, str], "object"]:
     pd = _require("pandas")
     with open(os.path.join(root, "meta", "info.json")) as fh:
         info = json.load(fh)
@@ -139,10 +139,10 @@ def resize_clip(clip: np.ndarray, height: int, width: int) -> torch.Tensor:
     return x.round().clamp(0, 255).to(torch.uint8)
 
 
-def iter_episode_rows(dataset_root: str, info: dict, episodes) -> Iterator[Tuple[int, dict, "pandas.DataFrame"]]:
+def iter_episode_rows(dataset_root: str, info: dict, episodes) -> Iterator[Tuple[int, dict, "object"]]:
     """Yield (episode_index, episode_meta_row_dict, per-step dataframe)."""
     pd = _require("pandas")
-    data_files: Dict[Tuple[int, int], "pandas.DataFrame"] = {}
+    data_files: Dict[Tuple[int, int], object] = {}
     template = info.get("data_path", "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet")
     for _, row in episodes.iterrows():
         row = row.to_dict()
