@@ -177,6 +177,69 @@ def aggressive_empty_cache(
     }
 
 
+def _top_frame(frames: Optional[list]) -> str:
+    """The innermost non-torch-internal call frame as ``file:line:func``.
+
+    Attributes an allocation to the user code that requested it, skipping
+    torch's own allocator frames (which are the same for every allocation).
+    """
+    if not frames:
+        return "<no stack captured>"
+    for fr in frames:
+        fn = (fr.get("filename") or "").replace("\\", "/")
+        if fn and "/torch/" not in fn:
+            return f"{fn}:{fr.get('line', '?')}:{fr.get('name', '?')}"
+    fr = frames[0]
+    return f"{fr.get('filename', '?')}:{fr.get('line', '?')}:{fr.get('name', '?')}"
+
+
+def summarize_snapshot(snapshot, top: int = 15) -> str:
+    """Rank the call sites holding live GPU memory — a text report, no GUI.
+
+    ``snapshot`` is either a loaded torch snapshot dict
+    (``torch.cuda.memory._snapshot()``) or a path to a ``.pickle`` dump. The
+    pickle is plain dicts/lists, so this reads it **without torch or CUDA** —
+    an agent can analyse a dump on any machine.
+
+    Groups every still-live block (``state == "active_allocated"``) by its
+    allocating ``file:line`` and sorts by total bytes. For a leak, diff two
+    dumps (e.g. ``memsnap_step2`` vs ``memsnap_step8``): the site whose GB grew
+    is the leak. A single dump already shows the biggest holders.
+    """
+    if isinstance(snapshot, (str, Path)):
+        import pickle
+
+        with open(snapshot, "rb") as f:
+            snapshot = pickle.load(f)
+
+    from collections import defaultdict
+
+    by_site: Dict[str, list] = defaultdict(lambda: [0, 0])  # site -> [bytes, count]
+    total_live = 0
+    total_blocks = 0
+    for seg in snapshot.get("segments", []):
+        for blk in seg.get("blocks", []):
+            if blk.get("state") != "active_allocated":
+                continue
+            size = blk.get("requested_size") or blk.get("size", 0)
+            site = _top_frame(blk.get("frames"))
+            by_site[site][0] += size
+            by_site[site][1] += 1
+            total_live += size
+            total_blocks += 1
+
+    ranked = sorted(by_site.items(), key=lambda kv: kv[1][0], reverse=True)[:top]
+    lines = [
+        f"live GPU allocations: {total_live / _GB:.2f} GB across {total_blocks} blocks",
+        f"top {len(ranked)} call sites by live bytes:",
+    ]
+    for site, (nbytes, count) in ranked:
+        lines.append(f"  {nbytes / _GB:6.2f} GB  x{count:<5d}  {site}")
+    if not ranked:
+        lines.append("  (no live allocations with captured stacks)")
+    return "\n".join(lines)
+
+
 class MemorySnapshotSampler:
     """Record per-allocation history and dump it as memory_viz-openable pickles.
 
@@ -196,20 +259,39 @@ class MemorySnapshotSampler:
         if self._recording or not torch.cuda.is_available():
             return
         try:
-            torch.cuda.memory._record_memory_history(max_entries=self.max_entries)
+            # Capture PYTHON allocation stacks so summarize_snapshot can attribute
+            # live memory to a file:line. stacks="all" gives C++ unwind frames
+            # (useless here — everything collapses to torch::unwind); "python" is
+            # what yields real .py:line sites. Fall back to the minimal call on
+            # older torch that lacks the context/stacks keywords.
+            try:
+                torch.cuda.memory._record_memory_history(max_entries=self.max_entries, context="all", stacks="python")
+            except TypeError:
+                torch.cuda.memory._record_memory_history(max_entries=self.max_entries)
             self._recording = True
             logger.info("memory: snapshot recording started (max_entries=%d)", self.max_entries)
         except Exception:
             logger.warning("memory: failed to start snapshot recording", exc_info=True)
 
     def dump(self, tag: str) -> Optional[str]:
-        """Dump the history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle``; None on failure."""
+        """Dump history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle`` and log a
+        ranked :func:`summarize_snapshot` report inline; None on failure.
+
+        The report (top call sites holding live memory) lands in the training log
+        automatically — no separate file, no manual step. Re-analyse the pickle
+        later with :func:`summarize_snapshot` or the memory_viz GUI if needed.
+        """
         if not self._recording:
             return None
         try:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             path = self.out_dir / f"memsnap_{tag}_rank{self.rank}.pickle"
             torch.cuda.memory._dump_snapshot(str(path))
+            try:
+                report = summarize_snapshot(torch.cuda.memory._snapshot())
+                logger.info("memory: snapshot %s (rank %d)\n%s", tag, self.rank, report)
+            except Exception:  # analysis is a bonus; a failure must not lose the pickle
+                logger.warning("memory: snapshot analysis failed for tag=%s", tag, exc_info=True)
             logger.info("memory: snapshot dumped to %s", path)
             return str(path)
         except Exception:  # never let diagnostics kill training
