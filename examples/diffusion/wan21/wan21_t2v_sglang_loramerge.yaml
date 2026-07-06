@@ -217,9 +217,9 @@ sync:
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
   project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
-  run_name: ${oc.env:WANDB_RUN_NAME,wan21_t2v_sglang}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan21_t2v_sglang_loramerge}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: ["wan21", "t2v", "grpo", "video", "pickscore", "sglang", "v2"]
+  tags: ["wan21", "t2v", "grpo", "video", "pickscore", "sglang", "loramerge", "v2"]
   log_media: false
   media_max_items: 8
   media_log_interval: 1
