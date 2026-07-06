@@ -232,6 +232,10 @@ class MemoryMonitor:
                 dump_tag = f"step{step}"
             closing = self._probe(self._fallback, reset_peak=True, dump_snapshot_tag=dump_tag)
             self._fold(closing)
+            for r in closing:  # driver-side log so the report reaches the training console
+                report = r.get("snapshot_report")
+                if report:
+                    logger.info("memory: snapshot %s (rank %d)\n%s", dump_tag, int(r.get("rank", 0)), report)
         summary = dict(self._step_max)
         driver_rss = _cpu_rss_gb()
         if driver_rss is not None:

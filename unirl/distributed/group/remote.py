@@ -215,8 +215,11 @@ class Remote:
             aggressive_empty_cache()
         if reset_peak:
             torch.cuda.reset_peak_memory_stats()
+        out = {**info, "rank": float(self.rank_info.rank)}
         if dump_snapshot_tag:
             sampler = get_process_snapshot_sampler()
             if sampler is not None:
-                sampler.dump(dump_snapshot_tag)
-        return {**info, "rank": float(self.rank_info.rank)}
+                report = sampler.dump(dump_snapshot_tag)
+                if report:  # carried to the driver so it lands in the training console
+                    out["snapshot_report"] = report
+        return out

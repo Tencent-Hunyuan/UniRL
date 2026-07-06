@@ -274,12 +274,12 @@ class MemorySnapshotSampler:
             logger.warning("memory: failed to start snapshot recording", exc_info=True)
 
     def dump(self, tag: str) -> Optional[str]:
-        """Dump history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle`` and log a
-        ranked :func:`summarize_snapshot` report inline; None on failure.
+        """Dump history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle``; return the
+        ranked :func:`summarize_snapshot` report string (None on failure).
 
-        The report (top call sites holding live memory) lands in the training log
-        automatically — no separate file, no manual step. Re-analyse the pickle
-        later with :func:`summarize_snapshot` or the memory_viz GUI if needed.
+        Runs on the worker; the report is RETURNED (not logged here) so the driver
+        can surface it inline — a worker-side ``logging`` call would only reach the
+        Ray worker log files, not the training console.
         """
         if not self._recording:
             return None
@@ -287,13 +287,12 @@ class MemorySnapshotSampler:
             self.out_dir.mkdir(parents=True, exist_ok=True)
             path = self.out_dir / f"memsnap_{tag}_rank{self.rank}.pickle"
             torch.cuda.memory._dump_snapshot(str(path))
+            logger.info("memory: snapshot dumped to %s", path)
             try:
-                report = summarize_snapshot(torch.cuda.memory._snapshot())
-                logger.info("memory: snapshot %s (rank %d)\n%s", tag, self.rank, report)
+                return summarize_snapshot(torch.cuda.memory._snapshot())
             except Exception:  # analysis is a bonus; a failure must not lose the pickle
                 logger.warning("memory: snapshot analysis failed for tag=%s", tag, exc_info=True)
-            logger.info("memory: snapshot dumped to %s", path)
-            return str(path)
+                return None
         except Exception:  # never let diagnostics kill training
             logger.warning("memory: snapshot dump failed for tag=%s", tag, exc_info=True)
             return None
