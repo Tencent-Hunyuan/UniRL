@@ -22,7 +22,7 @@ the GPUs), orchestration on the CUDA-less Ray driver.
 
 **Opt-in (off by default), observation-only** (no cache clears, no syncs) — each
 wrapped phase spends two blocking BROADCAST probes, so you turn it on when you
-want it: `logging.memory.enabled=true` (or `UNIRL_MEM_MONITOR=1`, or just
+want it: `+logging.memory.enabled=true` (or `UNIRL_MEM_MONITOR=1`, or just
 `UNIRL_MEMSNAP=1` which auto-enables it). Once on, every step it logs four peak
 metrics to wandb on the `rollout/step` axis, **max-across-ranks** (OOM dies on
 the worst rank):
@@ -38,9 +38,15 @@ the worst rank):
 
 | Level | Turn on with | Answers |
 |---|---|---|
-| **0 — curves** | `logging.memory.enabled=true` (or `UNIRL_MEM_MONITOR=1`) | *Is there a problem? Growing?* |
-| **1 — boundary logs** | above + `logging.memory.log_boundaries=true` | *Which phase spikes?* |
+| **0 — curves** | `+logging.memory.enabled=true` (or `UNIRL_MEM_MONITOR=1`) | *Is there a problem? Growing?* |
+| **1 — boundary logs** | above + `+logging.memory.log_boundaries=true` | *Which phase spikes?* |
 | **2 — snapshots** | `UNIRL_MEMSNAP=1` (env; auto-enables the monitor) | *Which line of code allocated it?* |
+
+> These keys aren't in the base config, so as Hydra CLI overrides they need the
+> `+` prefix (`+logging.memory.enabled=true`) — a bare `logging.memory.enabled=true`
+> fails config composition in struct mode. No `+` needed if you add the
+> [`logging.memory`](#configuration) block to your recipe yaml instead. The
+> `UNIRL_*` env vars need neither.
 
 **Level 1** emits a `[mem]` line at each phase's entry/exit. `peak_alloc` is that
 phase's own peak (counter reset on entry); `(rankN, min …)` shows the worst rank
