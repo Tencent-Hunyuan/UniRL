@@ -445,6 +445,10 @@ class DiffusionTrainer(BaseTrainer):
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
             track.rewards = hydrate(track.rewards)
+            # component_rewards values are also TensorRef after DP_SCATTER;
+            # hydrate them so wandb_metrics can read real tensors.
+            if isinstance(track.component_rewards, dict):
+                track.component_rewards = {k: hydrate(v) for k, v in track.component_rewards.items()}
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
             break  # single-track for now; revisit if multi-track lands
 
