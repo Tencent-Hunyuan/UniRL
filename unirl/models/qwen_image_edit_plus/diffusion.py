@@ -18,10 +18,10 @@ overridden Edit-Plus step). Verified: ``step_with_logp`` → ``step`` →
 ``self.predict_noise`` (``qwen_image/diffusion.py:326→349→304``), so the
 override propagates to ``replay`` automatically.
 
-When ``conditions.image_latent is None`` the step falls through to the
-base T2I behavior — a genuine degenerate path, not impossible-scenario
-handling (the base Qwen-Image T2I is a valid input mode for this
-transformer).
+Edit-Plus is edit-only: :meth:`predict_noise` requires
+``conditions.image_latent`` and raises ``ValueError`` when it is ``None``
+(fail-fast, constraint #27). There is no T2I fall-through — a source image
+is always required.
 """
 
 from __future__ import annotations
