@@ -5,7 +5,7 @@ config fields and the ``runtime_overrides`` precedence layer flow into the
 ServerArgs intent, and that the ``tp_size=1`` default path is byte-for-byte the
 pre-change behavior (no ``base_gpu_id`` leak).
 
-Run:  pytest scripts/tests/test_rollout_tp_config.py
+Run:  pytest scripts/tests/rollout/test_tp_config_on_cpu.py
 """
 
 from __future__ import annotations

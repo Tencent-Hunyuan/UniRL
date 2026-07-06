@@ -14,52 +14,18 @@ driving the pure logic:
 The transports are exercised with lightweight fakes for the Ray handle / rollout
 sibling and the FSDP backend, so no GPU / torch.distributed is needed.
 
-Run:  pytest scripts/tests/test_rollout_tp_weight_sync.py
+Run:  pytest scripts/tests/rollout/test_tp_weight_sync_on_cpu.py
 """
 
 from __future__ import annotations
 
-import sys
-import types
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
-
-import pytest
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 from unirl.distributed.group.remote import RankInfo
-from unirl.distributed.weight_sync.full.nccl import NCCLWeightSync
 from unirl.distributed.weight_sync.full.tensor import TensorWeightSync
 
-
-# --------------------------------------------------------------------------- #
-# Fakes
-# --------------------------------------------------------------------------- #
-
-
-@dataclass
-class _FakeBackend:
-    """FSDP backend stand-in: ``rollout_adapter_name`` is all the base reads."""
-    rollout_adapter_name: str = "default"
-
-
-class _FakeRayHandle:
-    """Stand-in for a Ray Worker actor handle recording dispatched RPCs."""
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.calls: List[Tuple[str, Tuple, Dict]] = []
-        self.call = self._Call(self)
-
-    class _Call:
-        def __init__(self, owner): self._o = owner
-        def remote(self, role_name, method_name, args, kwargs, **_):
-            self._o.calls.append((method_name, args, dict(kwargs)))
-            return _FakeRef()
-
-
-@dataclass
-class _FakeRef:
-    """A picklable stand-in for a Ray ObjectRef: ``ray.get`` returns None."""
-    def __init__(self): pass
+from ..conftest import FakeBackend, FakeRayHandle, make_nccl_sync
 
 
 # --------------------------------------------------------------------------- #
@@ -67,30 +33,9 @@ class _FakeRef:
 # --------------------------------------------------------------------------- #
 
 
-def _nccl_for_test(monkeypatch):
-    """Build an NCCLWeightSync whose rank-0-only / ray / pg plumbing is stubbed.
-
-    We bypass the real ``init_process_group`` and ``ray.get`` (the fake handles
-    return non-Ray refs) and seed ``_rollout_targets`` / ``_rollout_role``
-    directly so the ``connect`` body runs without a driver dispatch decorator.
-    """
-    monkeypatch.setattr(
-        "unirl.utils.distributed_utils.init_process_group", lambda **kw: ("pg",)
-    )
-    import ray
-    monkeypatch.setattr(ray, "get", lambda refs: None)
-    sync = NCCLWeightSync.__new__(NCCLWeightSync)
-    sync._group_name = "g"
-    sync._model_update_group = None
-    sync._rollout_targets = []
-    sync._rollout_role = None
-    sync._track_prefix = ""
-    return sync
-
-
 def test_nccl_connect_tp1_matches_baseline(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
-    targets = [_FakeRayHandle(f"e{i}") for i in range(4)]
+    sync = make_nccl_sync(monkeypatch)
+    targets = [FakeRayHandle(f"e{i}") for i in range(4)]
     sync._rollout_targets = targets
     sync._rollout_role = "rollout"
 
@@ -106,9 +51,9 @@ def test_nccl_connect_tp1_matches_baseline(monkeypatch):
 
 
 def test_nccl_connect_tp2_scales_rank_offset(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
+    sync = make_nccl_sync(monkeypatch)
     # Two engines (tp_rank==0 workers), each occupying tp_size=2 NCCL ranks.
-    targets = [_FakeRayHandle("e0"), _FakeRayHandle("e1")]
+    targets = [FakeRayHandle("e0"), FakeRayHandle("e1")]
     sync._rollout_targets = targets
     sync._rollout_role = "rollout"
 
@@ -139,7 +84,7 @@ class _FakeRollout:
 def _tensor_sync_for_test(monkeypatch, rank_info: Optional[RankInfo], rollout: _FakeRollout):
     """Construct a TensorWeightSync with the FSDP walk and serializer stubbed."""
     sync = TensorWeightSync.__new__(TensorWeightSync)
-    sync._backend = _FakeBackend()
+    sync._backend = FakeBackend()
     sync._bucket_bytes = 1 << 30
     sync._flush_cache = True
     sync._lora_merged = False

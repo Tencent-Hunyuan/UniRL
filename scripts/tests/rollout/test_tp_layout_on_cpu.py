@@ -10,7 +10,7 @@ Covers the ``handle.py`` rank-layout core that carves a rollout Handle's
     and ``NCCLWeightSync.connect`` rely on
   - the ``tp_size=1`` baseline is bit-identical to the pre-change flat layout
 
-Run:  pytest scripts/tests/test_rollout_tp_layout.py
+Run:  pytest scripts/tests/rollout/test_tp_layout_on_cpu.py
 """
 
 from __future__ import annotations

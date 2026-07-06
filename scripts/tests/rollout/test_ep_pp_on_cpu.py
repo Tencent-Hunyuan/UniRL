@@ -19,15 +19,10 @@ PP (Pipeline Parallel):
     ``NotImplementedError`` — per-stage rank_offset routing is future work.
   - ``pp_size=1`` is the supported default and never raises.
 
-Run:  pytest scripts/tests/test_rollout_ep_pp.py
+Run:  pytest scripts/tests/rollout/test_ep_pp_on_cpu.py
 """
 
 from __future__ import annotations
-
-import sys
-import types
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -36,9 +31,10 @@ from unirl.distributed.group.handle import (
     _build_rank_infos,
     _parallel_shape_from_init_kwargs,
 )
-from unirl.distributed.group.remote import RankInfo
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
+
+from ..conftest import FakeRayHandle, make_nccl_sync
 
 
 PORTS = SGLangPorts(server_port=30000, nccl_port=30001)
@@ -175,49 +171,9 @@ def test_pp_world_must_divide_tp_times_pp():
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class _FakeBackend:
-    rollout_adapter_name: str = "default"
-
-
-class _FakeRayHandle:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.calls: List[Tuple[str, Tuple, Dict]] = []
-        self.call = self._Call(self)
-
-    class _Call:
-        def __init__(self, owner): self._o = owner
-        def remote(self, role_name, method_name, args, kwargs, **_):
-            self._o.calls.append((method_name, args, dict(kwargs)))
-            return _FakeRef()
-
-
-@dataclass
-class _FakeRef:
-    def __init__(self): pass
-
-
-def _nccl_for_test(monkeypatch):
-    """Build an NCCLWeightSync with ray/pg plumbing stubbed."""
-    monkeypatch.setattr(
-        "unirl.utils.distributed_utils.init_process_group", lambda **kw: ("pg",)
-    )
-    import ray
-    monkeypatch.setattr(ray, "get", lambda refs: None)
-    from unirl.distributed.weight_sync.full.nccl import NCCLWeightSync
-    sync = NCCLWeightSync.__new__(NCCLWeightSync)
-    sync._group_name = "g"
-    sync._model_update_group = None
-    sync._rollout_targets = []
-    sync._rollout_role = None
-    sync._track_prefix = ""
-    return sync
-
-
 def test_pp_size_gt1_connect_fails_closed(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0")]
     sync._rollout_role = "rollout"
     with pytest.raises(NotImplementedError, match="pp_size>1"):
         sync.connect.__wrapped__(
@@ -228,8 +184,8 @@ def test_pp_size_gt1_connect_fails_closed(monkeypatch):
 
 
 def test_pp_size_1_connect_does_not_raise(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0"), _FakeRayHandle("e1")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0"), FakeRayHandle("e1")]
     sync._rollout_role = "rollout"
     # pp_size=1 is the supported default; must go through the normal path.
     sync.connect.__wrapped__(
@@ -243,8 +199,8 @@ def test_pp_size_1_connect_does_not_raise(monkeypatch):
 
 def test_pp_size_default_is_one(monkeypatch):
     # Omitting pp_size entirely must behave identically to pp_size=1.
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0")]
     sync._rollout_role = "rollout"
     sync.connect.__wrapped__(
         sync,

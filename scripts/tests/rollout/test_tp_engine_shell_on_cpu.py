@@ -7,7 +7,7 @@ GPU, and every rollout verb on it must be a safe no-op. If this regresses, an
 
 These tests never require a GPU: the shell path returns before any CUDA work.
 
-Run:  pytest scripts/tests/test_rollout_tp_engine_shell.py
+Run:  pytest scripts/tests/rollout/test_tp_engine_shell_on_cpu.py
 """
 
 from __future__ import annotations
@@ -63,20 +63,6 @@ def test_shell_double_shutdown_is_safe():
     eng = _shell()
     eng.shutdown()
     eng.shutdown()
-
-
-def test_tp_size_one_is_always_tp_zero():
-    # The default single-GPU-per-engine path: tp_rank is 0, so it is NOT a shell.
-    cfg = SGLangEngineConfig(pretrained_model_ckpt_path="/tmp/model", model_family="text")
-    # We only check the pre-boot branch decision, so stop before backend boot by
-    # asserting the flag the ctor would set. Construct with tp_size=1 shell-side
-    # semantics: tp_rank defaults to 0 => _is_tp_zero True (would boot in real
-    # env). We therefore only assert the class-level contract via a tp_rank=0
-    # shell guard: tp_rank=0 must never be treated as a shell.
-    assert 0 == 0  # placeholder: real boot needs a model+GPU (see Tier 1)
-    # The meaningful assertion: a tp_rank=0 engine is not a shell path. This is
-    # covered structurally — the ctor only early-returns when tp_rank != 0.
-    del cfg
 
 
 @pytest.mark.parametrize("tp_rank", [1, 2, 3])

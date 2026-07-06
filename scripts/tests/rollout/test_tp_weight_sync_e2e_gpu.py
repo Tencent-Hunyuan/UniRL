@@ -17,19 +17,16 @@ Setup (once):
         snapshot_download('tiny-random/qwen3.5-moe', local_dir='/tmp/tiny-qwen35-moe')"
 
 Run:
-    UNIRL_TP_E2E_MODEL=/tmp/tiny-qwen35-moe pytest scripts/tests/test_rollout_tp_weight_sync_e2e.py -s
+    UNIRL_TP_E2E_MODEL=/tmp/tiny-qwen35-moe pytest scripts/tests/rollout/test_tp_weight_sync_e2e_gpu.py -s
 """
 
 from __future__ import annotations
 
 import os
-import sys
 
 import pytest
 
-from .conftest import requires_gpus
-
-_RESULT: dict = {}
+from ..conftest import requires_gpus, sglang_e2e_teardown
 
 
 @pytest.fixture
@@ -79,10 +76,10 @@ def test_weight_sync_tp2_e2e(tp2_gate):
             "trust_remote_code": True,
         },
     )
-    prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     eng = SGLangRolloutEngine(
         config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1],
     )
+    passed = False
     try:
         assert eng._is_tp_zero is True
         assert eng.health_check() is True
@@ -152,13 +149,6 @@ def test_weight_sync_tp2_e2e(tp2_gate):
         else:
             pytest.fail("no track with decoded output after sync")
 
-        _RESULT["passed"] = True
+        passed = True
     finally:
-        try:
-            eng.shutdown()
-        except Exception:
-            pass
-        sys.stdout.flush()
-        sys.stderr.flush()
-        if _RESULT.get("passed"):
-            os._exit(0)
+        sglang_e2e_teardown(eng, passed=passed)

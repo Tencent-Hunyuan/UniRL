@@ -15,19 +15,16 @@ Setup (once):
         snapshot_download('tiny-random/qwen3.5-moe', local_dir='/tmp/tiny-qwen35-moe')"
 
 Run:
-    UNIRL_TP_E2E_MODEL=/tmp/tiny-qwen35-moe pytest scripts/tests/test_rollout_tp_ep_pp_8gpu_e2e.py -s
+    UNIRL_TP_E2E_MODEL=/tmp/tiny-qwen35-moe pytest scripts/tests/rollout/test_tp_ep_pp_8gpu_e2e_gpu.py -s
 """
 
 from __future__ import annotations
 
 import os
-import sys
 
 import pytest
 
-from .conftest import requires_gpus
-
-_RESULT: dict = {}
+from ..conftest import requires_gpus, sglang_e2e_teardown
 
 
 def _model_path() -> str:
@@ -92,19 +89,15 @@ def test_tp2_ep2_e2e(tp8_gate):
         engine_kwargs={"mem_fraction_static": 0.3, "skip_server_warmup": True,
                        "disable_cuda_graph": True, "trust_remote_code": True},
     )
-    prev = os.environ.get("CUDA_VISIBLE_DEVICES")
     eng = SGLangRolloutEngine(
         config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1], ep_size=2,
     )
+    passed = False
     try:
         _boot_and_generate(eng, expected_tp_size=2, devices=[0, 1])
-        _RESULT["tp2_ep2"] = True
+        passed = True
     finally:
-        try: eng.shutdown()
-        except Exception: pass
-        sys.stdout.flush(); sys.stderr.flush()
-        if _RESULT.get("tp2_ep2"):
-            os._exit(0)
+        sglang_e2e_teardown(eng, passed=passed)
 
 
 @pytest.mark.gpu
@@ -128,12 +121,9 @@ def test_tp4_ep4_e2e(tp8_gate):
     eng = SGLangRolloutEngine(
         config=cfg, rank=0, tp_rank=0, tp_size=4, tp_device_ids=[0, 1, 2, 3], ep_size=4,
     )
+    passed = False
     try:
         _boot_and_generate(eng, expected_tp_size=4, devices=[0, 1, 2, 3])
-        _RESULT["tp4_ep4"] = True
+        passed = True
     finally:
-        try: eng.shutdown()
-        except Exception: pass
-        sys.stdout.flush(); sys.stderr.flush()
-        if _RESULT.get("tp4_ep4"):
-            os._exit(0)
+        sglang_e2e_teardown(eng, passed=passed)
