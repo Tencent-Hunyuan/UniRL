@@ -41,7 +41,6 @@ def tp8_gate():
 
 def _boot_and_generate(eng, *, expected_tp_size: int, devices: list):
     """Shared assertions: boot, generate, sleep/wake, shutdown."""
-    import torch
     assert eng._is_tp_zero is True
     assert eng._backend is not None
     assert os.environ.get("CUDA_VISIBLE_DEVICES") == ",".join(str(d) for d in devices)
@@ -50,8 +49,10 @@ def _boot_and_generate(eng, *, expected_tp_size: int, devices: list):
     from unirl.types.primitives import Texts
     from unirl.types.rollout_req import RolloutReq
     from unirl.types.sampling import ARSamplingParams
+
     req = RolloutReq(
-        sample_ids=["s0"], group_ids=["s0"],
+        sample_ids=["s0"],
+        group_ids=["s0"],
         primitives={"text": Texts(texts=["Hello"])},
         request_conditions={},
         sampling_params={"default": ARSamplingParams(samples_per_prompt=1)},
@@ -84,13 +85,28 @@ def test_tp2_ep2_e2e(tp8_gate):
 
     cfg = SGLangEngineConfig(
         pretrained_model_ckpt_path=_model_path(),
-        model_family="text", tp_size=2, ep_size=2, enable_expert_parallel=True,
-        max_new_tokens=8, temperature=1.0, top_p=1.0, samples_pre_expanded=True,
-        engine_kwargs={"mem_fraction_static": 0.3, "skip_server_warmup": True,
-                       "disable_cuda_graph": True, "trust_remote_code": True},
+        model_family="text",
+        tp_size=2,
+        ep_size=2,
+        enable_expert_parallel=True,
+        max_new_tokens=8,
+        temperature=1.0,
+        top_p=1.0,
+        samples_pre_expanded=True,
+        engine_kwargs={
+            "mem_fraction_static": 0.3,
+            "skip_server_warmup": True,
+            "disable_cuda_graph": True,
+            "trust_remote_code": True,
+        },
     )
     eng = SGLangRolloutEngine(
-        config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1], ep_size=2,
+        config=cfg,
+        rank=0,
+        tp_rank=0,
+        tp_size=2,
+        tp_device_ids=[0, 1],
+        ep_size=2,
     )
     passed = False
     try:
@@ -113,13 +129,28 @@ def test_tp4_ep4_e2e(tp8_gate):
 
     cfg = SGLangEngineConfig(
         pretrained_model_ckpt_path=_model_path(),
-        model_family="text", tp_size=4, ep_size=4, enable_expert_parallel=True,
-        max_new_tokens=8, temperature=1.0, top_p=1.0, samples_pre_expanded=True,
-        engine_kwargs={"mem_fraction_static": 0.3, "skip_server_warmup": True,
-                       "disable_cuda_graph": True, "trust_remote_code": True},
+        model_family="text",
+        tp_size=4,
+        ep_size=4,
+        enable_expert_parallel=True,
+        max_new_tokens=8,
+        temperature=1.0,
+        top_p=1.0,
+        samples_pre_expanded=True,
+        engine_kwargs={
+            "mem_fraction_static": 0.3,
+            "skip_server_warmup": True,
+            "disable_cuda_graph": True,
+            "trust_remote_code": True,
+        },
     )
     eng = SGLangRolloutEngine(
-        config=cfg, rank=0, tp_rank=0, tp_size=4, tp_device_ids=[0, 1, 2, 3], ep_size=4,
+        config=cfg,
+        rank=0,
+        tp_rank=0,
+        tp_size=4,
+        tp_device_ids=[0, 1, 2, 3],
+        ep_size=4,
     )
     passed = False
     try:

@@ -27,7 +27,6 @@ from unirl.distributed.weight_sync.full.tensor import TensorWeightSync
 
 from ..conftest import FakeBackend, FakeRayHandle, make_nccl_sync
 
-
 # --------------------------------------------------------------------------- #
 # NCCLWeightSync.connect rank_offset + world_size math
 # --------------------------------------------------------------------------- #
@@ -57,9 +56,7 @@ def test_nccl_connect_tp2_scales_rank_offset(monkeypatch):
     sync._rollout_targets = targets
     sync._rollout_role = "rollout"
 
-    sync.connect.__wrapped__(
-        sync, master_addr="127.0.0.1", master_port=1234, num_rollout_gpus=4, tp_size=2
-    )
+    sync.connect.__wrapped__(sync, master_addr="127.0.0.1", master_port=1234, num_rollout_gpus=4, tp_size=2)
 
     e0_offset = targets[0].calls[0][2]["rank_offset"]
     e1_offset = targets[1].calls[0][2]["rank_offset"]
@@ -76,7 +73,10 @@ def test_nccl_connect_tp2_scales_rank_offset(monkeypatch):
 
 class _FakeRollout:
     """Records update_weights_from_tensor calls; used as the colocate sibling."""
-    def __init__(self): self.pushes: List[List[str]] = []
+
+    def __init__(self):
+        self.pushes: List[List[str]] = []
+
     def update_weights_from_tensor(self, *, serialized_named_tensors, load_format, flush_cache, track_prefix):
         self.pushes.append(list(serialized_named_tensors))
 
@@ -106,12 +106,14 @@ def _tensor_sync_for_test(monkeypatch, rank_info: Optional[RankInfo], rollout: _
     def _iter_buckets():
         for b in fake_buckets:
             yield b
+
     monkeypatch.setattr(sync, "_iter_buckets", _iter_buckets)
 
     # Stub the SGLang serializer path: one payload per dtype bucket. The sync
     # body imports these locally (from sgl_compat when the rollout sibling is
     # not SGLang), so patch the source module the local import reads from.
     from unirl.distributed.weight_sync.transfer import sgl_compat
+
     monkeypatch.setattr(sgl_compat, "FlattenedTensorBucket", _FakeFlatBucket)
     monkeypatch.setattr(sgl_compat, "MultiprocessingSerializer", _FakeSerializer)
     monkeypatch.setattr(sgl_compat, "monkey_patch_torch_reductions", lambda: None)
@@ -124,14 +126,20 @@ class _FakeTensor:
 
 
 class _FakeFlatBucket:
-    def __init__(self, *, named_tensors): self._nt = named_tensors
-    def get_flattened_tensor(self): return _FakeTensor()
-    def get_metadata(self): return {"names": [n for n, _ in self._nt]}
+    def __init__(self, *, named_tensors):
+        self._nt = named_tensors
+
+    def get_flattened_tensor(self):
+        return _FakeTensor()
+
+    def get_metadata(self):
+        return {"names": [n for n, _ in self._nt]}
 
 
 class _FakeSerializer:
     @staticmethod
-    def serialize(payload, output_str=True): return "PAYLOAD"
+    def serialize(payload, output_str=True):
+        return "PAYLOAD"
 
 
 def test_tensor_sync_tp1_ships_single_payload(monkeypatch):

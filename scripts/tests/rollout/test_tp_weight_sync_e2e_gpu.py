@@ -77,7 +77,11 @@ def test_weight_sync_tp2_e2e(tp2_gate):
         },
     )
     eng = SGLangRolloutEngine(
-        config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1],
+        config=cfg,
+        rank=0,
+        tp_rank=0,
+        tp_size=2,
+        tp_device_ids=[0, 1],
     )
     passed = False
     try:
@@ -90,9 +94,7 @@ def test_weight_sync_tp2_e2e(tp2_gate):
         #    FSDP shards; here we drive the same verb directly with the full
         #    state dict to exercise the tp_size-aware payload replication
         #    (the [payload]*tp_size path in TensorWeightSync).
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path, trust_remote_code=True, dtype=torch.bfloat16
-        ).cuda()
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, dtype=torch.bfloat16).cuda()
         model.eval()
 
         # Build the SGLang weight payload the same way TensorWeightSync does:

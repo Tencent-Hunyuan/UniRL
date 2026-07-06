@@ -342,11 +342,11 @@ class Handle:
                     "tp_size": ri.tp_size,
                     "tp_device_ids": self.device_ids[start:stop],
                     "pp_rank": ri.pp_rank,
-                        "pp_size": ri.pp_size,
-                        "ep_rank": ri.ep_rank,
-                        "ep_size": ri.ep_size,
-                    }
-                )
+                    "pp_size": ri.pp_size,
+                    "ep_rank": ri.ep_rank,
+                    "ep_size": ri.ep_size,
+                }
+            )
             return kwargs
 
         ray.get(

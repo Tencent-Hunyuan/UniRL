@@ -36,7 +36,6 @@ from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
 from ..conftest import FakeRayHandle, make_nccl_sync
 
-
 PORTS = SGLangPorts(server_port=30000, nccl_port=30001)
 
 
@@ -94,8 +93,9 @@ def test_ep_does_not_change_rank_layout():
 
 
 def test_ep_does_not_change_nccl_rank_offset():
-    # NCCL rank_offset = engine_idx * tp_size + 1, independent of ep_size.
-    num_engines, tp, ep = 2, 2, 4
+    # NCCL rank_offset = engine_idx * tp_size + 1, independent of ep_size: the
+    # math below never references ep, which is exactly the invariant asserted.
+    num_engines, tp = 2, 2
     offsets = [i * tp + 1 for i in range(num_engines)]
     world = num_engines * tp + 1
     assert offsets == [1, 3]
@@ -103,9 +103,7 @@ def test_ep_does_not_change_nccl_rank_offset():
 
 
 def test_ep_composes_with_tp_in_shape_resolution():
-    sp, tp, pp, ep = _parallel_shape_from_init_kwargs(
-        {"config": {"tp_size": 2, "ep_size": 4}}, 4, SGLangRolloutEngine
-    )
+    sp, tp, pp, ep = _parallel_shape_from_init_kwargs({"config": {"tp_size": 2, "ep_size": 4}}, 4, SGLangRolloutEngine)
     assert (sp, tp, pp, ep) == (1, 2, 1, 4)
 
 
@@ -147,17 +145,12 @@ def test_pp2_dispatch_collect_filter_selects_tp0_last_stage():
     # is_pipeline_last_stage AND sp_rank==0. Under tp=2 pp=2 world=8, the
     # collected ranks are those with tp_rank==0 and pp_rank==1.
     r = _build_rank_infos(8, tp_size=2, pp_size=2)
-    collected = [
-        i for i, ri in enumerate(r)
-        if ri.tp_rank == 0 and ri.is_pipeline_last_stage and ri.sp_rank == 0
-    ]
+    collected = [i for i, ri in enumerate(r) if ri.tp_rank == 0 and ri.is_pipeline_last_stage and ri.sp_rank == 0]
     assert collected == [2, 6]  # one per DP group
 
 
 def test_pp_shape_resolution_from_sglang_config():
-    sp, tp, pp, ep = _parallel_shape_from_init_kwargs(
-        {"config": {"tp_size": 2, "pp_size": 2}}, 8, SGLangRolloutEngine
-    )
+    sp, tp, pp, ep = _parallel_shape_from_init_kwargs({"config": {"tp_size": 2, "pp_size": 2}}, 8, SGLangRolloutEngine)
     assert (sp, tp, pp, ep) == (1, 2, 2, 1)
 
 
@@ -178,8 +171,11 @@ def test_pp_size_gt1_connect_fails_closed(monkeypatch):
     with pytest.raises(NotImplementedError, match="pp_size>1"):
         sync.connect.__wrapped__(
             sync,
-            master_addr="127.0.0.1", master_port=1234,
-            num_rollout_gpus=2, tp_size=1, pp_size=2,
+            master_addr="127.0.0.1",
+            master_port=1234,
+            num_rollout_gpus=2,
+            tp_size=1,
+            pp_size=2,
         )
 
 
@@ -190,8 +186,11 @@ def test_pp_size_1_connect_does_not_raise(monkeypatch):
     # pp_size=1 is the supported default; must go through the normal path.
     sync.connect.__wrapped__(
         sync,
-        master_addr="127.0.0.1", master_port=1234,
-        num_rollout_gpus=2, tp_size=1, pp_size=1,
+        master_addr="127.0.0.1",
+        master_port=1234,
+        num_rollout_gpus=2,
+        tp_size=1,
+        pp_size=1,
     )
     all_calls = [c for h in sync._rollout_targets for c in h.calls]
     assert len(all_calls) == 2  # one init_weights_update_group per engine
@@ -204,8 +203,10 @@ def test_pp_size_default_is_one(monkeypatch):
     sync._rollout_role = "rollout"
     sync.connect.__wrapped__(
         sync,
-        master_addr="127.0.0.1", master_port=1234,
-        num_rollout_gpus=1, tp_size=1,
+        master_addr="127.0.0.1",
+        master_port=1234,
+        num_rollout_gpus=1,
+        tp_size=1,
     )
     assert sync._rollout_targets[0].calls[0][2]["rank_offset"] == 1
 
@@ -220,7 +221,12 @@ def test_ep_pp_does_not_affect_tp_shell_guard():
     # guard keys on tp_rank alone, not ep/pp.
     cfg = _cfg(tp_size=2, ep_size=2, pp_size=1)
     eng = SGLangRolloutEngine(
-        config=cfg, rank=1, tp_rank=1, tp_size=2, tp_device_ids=[0, 1], ep_size=2,
+        config=cfg,
+        rank=1,
+        tp_rank=1,
+        tp_size=2,
+        tp_device_ids=[0, 1],
+        ep_size=2,
     )
     assert eng._is_tp_zero is False
     assert eng._backend is None

@@ -37,7 +37,6 @@ def test_tp2_engine_boot_and_generate(tp2_gate, tmp_path):
     GPU) and run manually before merging any rollout-TP change.
     """
     pytest.importorskip("sglang")
-    import torch
     from unirl.rollout.engine.sglang.config import SGLangEngineConfig
     from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 

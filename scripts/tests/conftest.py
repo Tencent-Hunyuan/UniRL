@@ -17,10 +17,9 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import pytest
-
 
 # --------------------------------------------------------------------------- #
 # GPU gate

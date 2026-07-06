@@ -45,7 +45,6 @@ def test_rollout_tp2_e2e_boot_generate_sleep(tp2_gate):
       - shutdown restores the original CUDA_VISIBLE_DEVICES
     """
     pytest.importorskip("sglang")
-    import torch
     from unirl.rollout.engine.sglang.config import SGLangEngineConfig
     from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
     from unirl.types.primitives import Texts
@@ -72,14 +71,22 @@ def test_rollout_tp2_e2e_boot_generate_sleep(tp2_gate):
 
     # tp_rank=1: no-op shell. Must construct without booting SGLang.
     shell = SGLangRolloutEngine(
-        config=cfg, rank=1, tp_rank=1, tp_size=2, tp_device_ids=[0, 1],
+        config=cfg,
+        rank=1,
+        tp_rank=1,
+        tp_size=2,
+        tp_device_ids=[0, 1],
     )
     assert shell._is_tp_zero is False
     assert shell._backend is None
 
     # tp_rank=0: boots the 2-GPU SGLang engine.
     eng = SGLangRolloutEngine(
-        config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1],
+        config=cfg,
+        rank=0,
+        tp_rank=0,
+        tp_size=2,
+        tp_device_ids=[0, 1],
     )
     passed = False
     try:

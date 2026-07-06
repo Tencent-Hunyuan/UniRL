@@ -90,9 +90,7 @@ def test_shape_reads_tp_from_sglang_config():
 
 
 def test_shape_reads_pp_ep_from_sglang_config():
-    sp, tp, pp, ep = _parallel_shape_from_init_kwargs(
-        {"config": {"tp_size": 2, "ep_size": 2}}, 8, SGLangRolloutEngine
-    )
+    sp, tp, pp, ep = _parallel_shape_from_init_kwargs({"config": {"tp_size": 2, "ep_size": 2}}, 8, SGLangRolloutEngine)
     assert (sp, tp, pp, ep) == (1, 2, 1, 2)
 
 
