@@ -78,14 +78,24 @@ def _resolve_param_names_mapping(module) -> dict:
 def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int, num_shards: int) -> None:
     """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param.
 
-    Prefers the param's SGLang ``weight_loader`` when it accepts a shard id (it
-    derives each shard's offset/size from the layer's ``output_sizes`` and is thus
-    TP- and GQA-correct). The manual fallback splits dim 0 into ``num_shards`` EQUAL
-    slices, so it is correct ONLY for equal-sized shards (q==k==v, w1==w3) — which
-    holds for Z-Image base (MHA: ``num_attention_heads == n_kv_heads``) at
-    ``tp_size=1``, the only fused model reaching it here. A future fused GQA model
-    must go through the ``weight_loader`` path (the equal-split fallback would
-    silently corrupt unequal shards).
+    SGLang fused projections pack ``[shard_0 | shard_1 | … | shard_{n-1}]``
+    contiguously along dim 0 in shard-id order. Two layouts occur:
+
+    * **all-equal** — ``q==k==v`` (Z-Image ``to_qkv``), ``w1==w3`` (``w13``): each
+      slice is ``shard_id * size``.
+    * **trailing-unequal** — HunyuanVideo single-block ``linear1 = [q, k, v, mlp]``
+      packs three ``H``-sized attention shards + one ``4H``-sized MLP shard. The
+      leading shards are equal (``shard_id * size``); the LAST shard is larger and
+      sits at the tail (``dim0 - size``).
+
+    Placing the trailing shard at the tail (rather than the legacy ``dim0 //
+    num_shards`` equal split, which slices four ``1.75H`` chunks for ``linear1`` and
+    crashes writing an ``H`` tensor into a ``1.75H`` slot) is exact for both layouts
+    and needs no sibling shards — so it is robust to the sender's bucketing (a
+    block's q/k/v/mlp may arrive in different buckets). It deliberately does NOT
+    support an unequal MIDDLE shard (no SGLang fused param has one). The param's own
+    ``weight_loader`` is tried first when it accepts a shard id (TP-correct); plain
+    ``ReplicatedLinear`` (``tp_size=1``) takes no shard id, so it falls through here.
     """
     wl = getattr(param, "weight_loader", None)
     if wl is not None:
@@ -96,10 +106,15 @@ def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int,
             pass
     data = param.data
     total = int(data.shape[0])
-    if total % num_shards != 0:
-        raise ValueError(f"fused param dim0={total} not divisible by num_shards={num_shards}")
-    s = total // num_shards
-    data[shard_id * s : (shard_id + 1) * s].copy_(tensor.to(param.dtype))
+    size = int(tensor.shape[0])
+    # Leading shards are equal-sized; a (possibly larger) trailing shard sits at the
+    # tail. For all-equal fusions the two formulas coincide (``(n-1)*size == dim0 - size``).
+    offset = total - size if shard_id == num_shards - 1 else shard_id * size
+    if offset < 0 or offset + size > total:
+        raise ValueError(
+            f"fused shard {shard_id}/{num_shards}: size={size} at offset={offset} does not fit fused param dim0={total}"
+        )
+    data[offset : offset + size].copy_(tensor.to(param.dtype))
 
 
 def _apply_fused_param_mapping(module, named_tensors):

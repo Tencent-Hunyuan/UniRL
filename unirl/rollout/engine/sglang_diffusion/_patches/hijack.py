@@ -48,6 +48,86 @@ class _DiffrlPatchedTarget:
         self._target = target
 
     def __call__(self, *args, **kwargs):
+        # Two independent NCCL hazards in the sglang scheduler subprocess:
+        #
+        # (1) launch_server() deadlock — stale NCCL env vars inherited from the
+        #     Ray worker's train-side FSDP setup (Remote.setup writes them into
+        #     os.environ at remote.py:104). The scheduler subprocess is a fresh
+        #     single-process dist world (num_gpus=1), but it inherits
+        #     NCCL_TOPO_FILE pointing at a parent-process fd (/proc/self/fd/NNN)
+        #     that doesn't exist here → NCCL ``new_group`` →
+        #     ``eager_connect_single_device`` hangs on a dead pipe. The other
+        #     NCCL knobs (SOCKET_IFNAME, BUFFSIZE, ...) are train-mesh-specific
+        #     and have no correct value in this subprocess; let NCCL use
+        #     defaults. gpu_worker.init_device_and_model re-sets MASTER_ADDR/
+        #     MASTER_PORT/WORLD_SIZE/RANK before init_process_group, so those
+        #     are not cleared. This hang is nondeterministic across workers
+        #     (timing of NCCL topo detection), hence only some workers hit it.
+        #
+        # (2) HeartbeatMonitor SIGSEGV — after init_process_group succeeds, the
+        #     NCCL HeartbeatMonitor thread starts and calls glibc ``getenv``
+        #     (via DumpPipe::DumpPipe(int) → getCvarString) on a background
+        #     thread. glibc ``getenv`` is NOT thread-safe: sglang's model-load
+        #     path concurrently calls ``os.environ[k]=v`` (putenv, which may
+        #     realloc the environ array) — e.g. lora_pipeline.py:33 sets
+        #     TOKENIZERS_PARALLELISM at import, gpu_worker.py:126-130 sets
+        #     MASTER_ADDR/MASTER_PORT/... If the windows overlap →
+        #     use-after-free → SIGSEGV in getenv. This is also timing-dependent
+        #     (FlowGRPO 06-24 didn't hit it; NFT 06-25 did). Setting
+        #     TORCH_NCCL_ENABLE_MONITORING=0 (verified against libtorch_cuda.so
+        #     strings) fully disables the monitor thread; the monitor provides
+        #     no value in a single-process (world_size=1) NCCL world.
+        #
+        # NOTE (torch 2.11): ``TORCH_NCCL_ENABLE_MONITORING`` does not exist in
+        # this build (the monitor has no disable flag; only
+        # ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``). The monitor thread therefore
+        # always starts after ``init_process_group``. The remaining race is the
+        # monitor thread's glibc ``getenv`` vs ``os.environ[k]=v`` (``putenv``)
+        # during model load — e.g. ``lora_pipeline.py:33`` sets
+        # ``TOKENIZERS_PARALLELISM`` at *import* time, and the lora module is
+        # imported during model construction (after init_process_group).
+        # Pre-setting ``TOKENIZERS_PARALLELISM`` and pre-importing the lora
+        # pipeline module here (before the scheduler target runs, hence before
+        # ``init_process_group`` starts the monitor) eliminates the concurrent
+        # ``putenv``: by the time the monitor thread calls ``getenv``, no
+        # further ``putenv`` will fire.
+        import os as _os
+
+        # PRECONDITION: this scrub assumes the scheduler subprocess hosts a
+        # single-process NCCL world (num_gpus=1 / tp_size=1 — the only
+        # validated colocate topology). Deployments that need these knobs
+        # inside the subprocess (engine TP>1, multi-NIC hosts pinning
+        # NCCL_SOCKET_IFNAME) can set UNIRL_SGLANG_KEEP_NCCL_ENV=1 to skip it.
+        if _os.environ.get("UNIRL_SGLANG_KEEP_NCCL_ENV") not in ("1", "true"):
+            # NCCL_TOPO_FILE is the actual deadlock trigger, but only when it
+            # dangles (a /proc/self/fd/NNN path of the dead parent). A real,
+            # readable topo file is a legitimate host-level setting — keep it.
+            _topo = _os.environ.get("NCCL_TOPO_FILE")
+            if _topo is not None and not _os.path.exists(_topo):
+                _os.environ.pop("NCCL_TOPO_FILE", None)
+            for _k in (
+                "NCCL_SOCKET_IFNAME",
+                "NCCL_BUFFSIZE",
+                "NCCL_NET_FORCE_FLUSH",
+                "NCCL_NVLSTREE_MAX_CHUNKSIZE",
+                "NCCL_NVLS_CHUNKSIZE",
+                "NCCL_P2P_NET_CHUNKSIZE",
+                "NCCL_TUNER_PLUGIN",
+            ):
+                _os.environ.pop(_k, None)
+
+        # Pre-set the env vars that sglang's gpu_worker.py:126-130 and
+        # lora_pipeline.py:33 will (re)set later, so the later ``os.environ[k]=v``
+        # assignments are no-ops on the glibc ``environ`` array only if the value
+        # is unchanged — they still call ``putenv``. The robust guard is to
+        # pre-import lora_pipeline (triggering its module-level ``putenv`` for
+        # TOKENIZERS_PARALLELISM) HERE, before init_process_group.
+        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        try:
+            import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
+        except Exception:
+            pass
+
         SglangDiffusionHijack.hijack()
         return self._target(*args, **kwargs)
 
@@ -153,6 +233,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
+            patch_safe_unpickler,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_sampling_io import (
             patch_sampling_io,
         )
@@ -168,6 +251,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_srt import patch_srt
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
+        )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
+            patch_wan_scheduler,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_weights_updater import (
             patch_weights_updater,
@@ -198,5 +284,7 @@ class SglangDiffusionHijack:
             patch_dance,
             patch_set_timesteps,
             patch_vae_decode_safe,
+            patch_wan_scheduler,
+            patch_safe_unpickler,
         ):
             _safe_apply(patch)

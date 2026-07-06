@@ -52,6 +52,7 @@ eval cadence, structured logging.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
 import os
@@ -62,7 +63,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from unirl.distributed.group.placement import placement
+from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
@@ -138,14 +139,15 @@ class UnifiedModelTrainer(BaseTrainer):
         bundle_cfg: DictConfig,
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
-        ar_rollout_cfg: DictConfig,
-        dit_rollout_cfg: DictConfig,
         reward_cfg: DictConfig,
         ar_algorithm_cfg: DictConfig,
         image_algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
+        ar_rollout_cfg: Optional[DictConfig] = None,
+        dit_rollout_cfg: Optional[DictConfig] = None,
+        rollout_cfg: Optional[DictConfig] = None,
         sync_cfg: Optional[DictConfig] = None,
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
@@ -199,6 +201,36 @@ class UnifiedModelTrainer(BaseTrainer):
                 ar_algorithm=self.ar_algorithm,
                 image_algorithm=self.image_algorithm,
             )
+
+            # Rollout wiring. Single-engine (M=1 / UniGRPO — a trainside or single
+            # engine on the SHARED pipeline) short-circuits the two-engine HI3 path
+            # below: no GPU partition, no weight sync, and (trainside) no base
+            # offload since it samples the live FSDP modules. ``_shared_advantage``
+            # makes train_step copy the AR's prompt-level advantage onto the 1:1
+            # image track (M=1) instead of the degenerate per-rewrite grouping.
+            self._single_engine = rollout_cfg is not None
+            self._shared_advantage = self._single_engine
+            self._rollout_is_trainside = False
+            if self._single_engine:
+                self.dp = 1
+                self.ar_rollouts = []
+                self.dit_rollouts = []
+                self.ar_rollout = None
+                self.dit_rollout = None
+                rollout_parsed = parse_hydra_cfg(rollout_cfg)
+                self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+                if self._rollout_is_trainside:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
+                    self._enable_fsdp_offload = False  # shares live FSDP modules
+                else:
+                    self.rollout = remote(**rollout_parsed)
+                return
+
+            if ar_rollout_cfg is None or dit_rollout_cfg is None:
+                raise ValueError(
+                    "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
+                    "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
+                )
 
             # COLOCATE MEMORY: offload the ~150GB frozen base to CPU BEFORE
             # booting the engines. Each engine grabs ~70GB (AR) / ~45GB (DiT) on
@@ -339,6 +371,11 @@ class UnifiedModelTrainer(BaseTrainer):
         scatter/concat correctness; issuing the per-replica ``generate()`` as Ray
         futures for true concurrent throughput is the follow-up (handoff §8).
         """
+        # Single-engine (M=1 / UniGRPO): the shared pipeline returns the 2-track
+        # {"ar","image"} resp directly (DP_SCATTER-sharded like the train stack —
+        # no anchored-engine single-handle hydration needed).
+        if self._single_engine:
+            return self.rollout.generate(req)
         texts = req.primitives.get("text")
         if not isinstance(texts, Texts):
             raise TypeError("UnifiedModelTrainer.run_rollout: req.primitives['text'] must be a Texts primitive.")
@@ -514,33 +551,30 @@ class UnifiedModelTrainer(BaseTrainer):
         the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        # Colocate memory dance (150GB base can't coexist with an awake engine on
-        # the same card). Steady state on entry: base offloaded, engines asleep.
-        #   1. EXTRACT while engines ASLEEP + base ONLOADED — extract() runs a
-        #      train-mesh collective whose state_dict() gathers the full FSDP model
-        #      to GPU; an awake engine (~85GB) alongside the onloaded base
-        #      (~19GB/card) would OOM. extract() caches the adapter on rank 0
-        #      (nothing returned); offload the base again right after.
-        if sync_weights and self.weight_sync is not None:
+        if self._single_engine:
+            # Trainside / single-engine (M=1): the rollout shares the live FSDP
+            # modules — no engine wake/sleep, no base offload, no weight sync.
+            resp = self.run_rollout(req)
+        else:
+            # Colocate memory dance (150GB base can't coexist with an awake engine
+            # on the same card). Steady state on entry: base offloaded, engines
+            # asleep. EXTRACT (base onloaded) -> wake engines -> PUSH adapter ->
+            # rollout (base offloaded) -> sleep engines -> onload base for backward.
+            if sync_weights and self.weight_sync is not None:
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.offload()
+            for _eng in self.ar_rollouts + self.dit_rollouts:
+                _eng.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.push()
+            resp = self.run_rollout(req)
+            for _eng in self.ar_rollouts + self.dit_rollouts:
+                _eng.sleep()
             if self._enable_fsdp_offload:
                 self.backend.onload()
-            self.weight_sync.extract()
-            if self._enable_fsdp_offload:
-                self.backend.offload()
-        #   2. Wake both engines (base on CPU → room; AR 0-3, DiT 4-7 disjoint),
-        #      then PUSH the cached adapter from rank 0 into each engine's
-        #      set_lora_from_tensors_copy (cross-process; engines are not siblings).
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.push()
-        #   3. Rollout (base offloaded), then sleep engines and onload the base
-        #      for the train backward.
-        resp = self.run_rollout(req)
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.sleep()
-        if self._enable_fsdp_offload:
-            self.backend.onload()
 
         # 1. Score the IMAGE track only — the AR track's TextSegment is not
         #    directly scorable; its reward is credit-assigned below.
@@ -556,13 +590,21 @@ class UnifiedModelTrainer(BaseTrainer):
         n_img = int(diff_params.samples_per_prompt)
         orig_texts = req.primitives.get("text")
         reward_texts = Texts(texts=[orig_texts.texts[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))])
+        # Per-sample metadata, expanded 1:1 with the image track by the SAME
+        # prompt-index map as reward_texts. GenEval-style rewards read each
+        # image's compositional spec (tag/include/exclude) from metadata[i];
+        # without this expansion the geneval scorer raises (no per-item spec).
+        # Empty when the data source carries no metadata (e.g. pickscore prompts).
+        reward_metadata = (
+            [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))] if req.metadata else []
+        )
         reward_req = RolloutReq(
             sample_ids=list(img_track.sample_ids),
             group_ids=list(img_track.parent_ids) if img_track.parent_ids else list(img_track.sample_ids),
             primitives={"text": reward_texts},
             request_conditions={},
             sampling_params=req.sampling_params,
-            metadata=[],
+            metadata=reward_metadata,
         )
         scored = self.reward.score_and_attach(req=reward_req, track=img_track)
         if scored.rewards is not None:
@@ -583,9 +625,17 @@ class UnifiedModelTrainer(BaseTrainer):
         if self.dump_dir:
             self._dump_rollout(self._dump_rollout_id, req, resp)
 
-        # 4. Per-track GRPO advantages.
-        for name in (AR_TRACK, IMAGE_TRACK):
-            resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
+        # 4. GRPO advantages. AR always groups by prompt. In single-engine
+        #    (M=1 / UniGRPO) mode the image is 1:1 with its AR chain, so it SHARES
+        #    the AR's prompt-level advantage (Â_i) — the framework's per-rewrite
+        #    image grouping would be a degenerate size-1 group (advantage 0) at M=1.
+        resp.tracks[AR_TRACK] = resp.tracks[AR_TRACK].compute_advantages(normalize=True)
+        if self._shared_advantage:
+            resp.tracks[IMAGE_TRACK] = _track_with_field(
+                resp.tracks[IMAGE_TRACK], "advantages", resp.tracks[AR_TRACK].advantages
+            )
+        else:
+            resp.tracks[IMAGE_TRACK] = resp.tracks[IMAGE_TRACK].compute_advantages(normalize=True)
 
         # after the debug dump (which reads decoded), before training.
         # ``reward_texts`` is 1:1 with the image track (built at scoring), so it

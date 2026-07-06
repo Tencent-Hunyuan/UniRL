@@ -112,7 +112,7 @@ def get_node_ip_and_port(pg, bundle_index: int = 0) -> Tuple[str, int]:
     controller-vs-worker mismatch. Uses a lightweight probe actor.
     """
     import ray
-    from ray.util.placement_group import PlacementGroupSchedulingStrategy
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     @ray.remote(num_cpus=0)
     class _Probe:

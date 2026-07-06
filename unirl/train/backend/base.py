@@ -9,6 +9,7 @@ Config-layer schemas (torch-free — shared by every train backend):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict, Optional
 
 
 @dataclass
@@ -20,6 +21,13 @@ class OptimizerConfig:
     adam_beta2: float
     adam_epsilon: float
     weight_decay: float
+    # Optional per-param-group learning rates: maps a parameter-NAME substring to
+    # an LR. A trainable param whose name contains a key gets that LR (first match
+    # wins); the rest use ``learning_rate``. ``None`` (default) => a single LR over
+    # all trainable params (unchanged). Used e.g. for BAGEL MoT UniGRPO, where the
+    # text (und) experts and image (gen, "moe_gen") experts train at different LRs
+    # within one shared optimizer step.
+    param_group_lrs: Optional[Dict[str, float]] = None
 
 
 @dataclass

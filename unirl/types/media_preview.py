@@ -55,6 +55,13 @@ class MediaPreview(Batch):
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
+    # Per-sample audio waveforms (mono [L] float32 CPU tensors) for muxing into
+    # the mp4 upload. Parallel to ``videos`` — same length. ``None``/empty for
+    # non-audio tracks.
+    audios: List[Any] = concat_field(default_factory=list)
+    # Source sample rate of the waveforms in ``audios``. Batch-shared (one rate
+    # per preview). None when audios is empty.
+    audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
 
@@ -63,6 +70,7 @@ class MediaPreview(Batch):
         for name, val in (
             ("images", self.images),
             ("videos", self.videos),
+            ("audios", self.audios),
             ("prompts", self.prompts),
             ("rewards", self.rewards),
         ):
@@ -227,11 +235,33 @@ def build_media_preview_for_track(
     if not selected_indices:
         return None
 
+    # T2AV: extract per-sample audio waveforms for muxing into the mp4 upload.
+    audios_out: List[Any] = []
+    audio_sr: Optional[int] = None
+    decoded_audio = getattr(track, "decoded_audio", None)
+    if decoded_audio is not None and hasattr(decoded_audio, "to_list"):
+        from unirl.distributed.tensor import hydrate, map_tree
+
+        decoded_audio = map_tree(decoded_audio, hydrate)
+        audio_list = decoded_audio.to_list()
+        for idx in selected_indices:
+            if idx < len(audio_list):
+                audios_out.append(audio_list[idx].waveform.detach().cpu().float())
+            else:
+                audios_out.append(None)
+        audio_sr = getattr(track, "audio_sample_rate", None)
+        # Drop audio if none of the selected samples have it
+        if all(a is None for a in audios_out):
+            audios_out = []
+            audio_sr = None
+
     prompts_out = [str(prompt_texts[i]) if i < len(prompt_texts) else "" for i in selected_indices]
     reward_values = [float(rewards_flat[i]) if i < len(rewards_flat) else 0.0 for i in selected_indices]
     return MediaPreview(
         images=images,
         videos=videos,
+        audios=audios_out,
+        audio_sample_rate=int(audio_sr) if audio_sr is not None else None,
         prompts=prompts_out,
         rewards=reward_values,
     )
