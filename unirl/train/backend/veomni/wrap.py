@@ -98,6 +98,13 @@ def veomni_parallelize(
 
     block_instances = _enumerate_block_instances(model, block_class_names)
 
+    if activation_checkpointing and not block_instances:
+        raise RuntimeError(
+            "veomni_parallelize: activation_checkpointing=True but no blocks of class "
+            f"{tuple(block_class_names)!r} matched — AC would silently be a no-op and "
+            "training would OOM. Check block_class_names against the model."
+        )
+
     if activation_checkpointing:
         from torch.utils import checkpoint as _ckpt
 
@@ -136,7 +143,10 @@ def _enumerate_block_instances(
     if not class_names:
         return ()
     names = set(class_names)
-    return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
+    # ``parallelize_model_fsdp2`` (run before this) ``fully_shard``s each block,
+    # which renames its class to ``FSDP<OriginalName>``; strip that prefix before
+    # matching (a no-op when absent) so AC actually finds the post-shard blocks.
+    return tuple(m for _, m in model.named_modules() if type(m).__name__.removeprefix("FSDP") in names)
 
 
 def _current_rank() -> int:

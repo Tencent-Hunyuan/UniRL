@@ -230,6 +230,69 @@ def patch_ar_lora_loader() -> None:
     setattr(WorkerLoRAManager, "_load_adapter", hijack_ar__load_adapter)
 
 
+def patch_ar_merged_lora_fused_tensor() -> None:
+    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora.
+
+    HI3 trains LoRA on a fused qkv_proj; vLLM expects a list [lora_b_q, lora_b_k,
+    lora_b_v]. The checkpoint qkv_proj is GQA-interleaved, training loads it as-is,
+    so lora_b rows are interleaved. vLLM base is block [q;k;v] after _split_qkv_weight
+    — we mirror that reshape-split on lora_b. Falls back to plain split if the base
+    layer lacks head_size/total_num_kv_heads.
+    """
+    try:
+        import torch
+        from vllm.lora.layers import column_parallel_linear as _cpl
+    except (ImportError, AttributeError):
+        return
+
+    def _deinterleave_gqa(lora_b, output_sizes, base_layer):
+        if len(output_sizes) != 3:
+            return None
+        head_size = getattr(base_layer, "head_size", None)
+        num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
+        if head_size is None or num_kv_heads is None:
+            return None
+        q_size, k_size, _v = output_sizes
+        groups = q_size // k_size
+        if groups * k_size != q_size or k_size != num_kv_heads * head_size:
+            return None
+        rank = lora_b.shape[1]
+        try:
+            lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
+        except RuntimeError:
+            return None
+        q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
+        return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
+
+    def _make(orig):
+        def _set_lora(self, index, lora_a, lora_b, *args, _orig=orig, **kwargs):
+            if isinstance(lora_b, torch.Tensor):
+                output_sizes = list(getattr(self.base_layer, "output_sizes", []) or [])
+                if output_sizes and int(lora_b.shape[0]) == sum(output_sizes):
+                    slices = _deinterleave_gqa(lora_b, output_sizes, self.base_layer)
+                    lora_b = slices if slices is not None else list(torch.split(lora_b, output_sizes, dim=0))
+                    if isinstance(lora_a, torch.Tensor):
+                        lora_a = [lora_a] * self.n_slices
+            return _orig(self, index, lora_a, lora_b, *args, **kwargs)
+
+        _set_lora._diffrl_fused_merged_tolerant = True  # type: ignore[attr-defined]
+        return _set_lora
+
+    # Patch every merged class that defines its own ``set_lora``; subclasses that
+    # only inherit it are covered transitively by the base-class patch.
+    for _name in (
+        "MergedColumnParallelLinearWithLoRA",
+        "MergedQKVParallelLinearWithLoRA",
+    ):
+        cls = getattr(_cpl, _name, None)
+        if cls is None or "set_lora" not in cls.__dict__:
+            continue
+        orig = cls.__dict__["set_lora"]
+        if getattr(orig, "_diffrl_fused_merged_tolerant", False):
+            continue
+        cls.set_lora = _make(orig)
+
+
 def patch_fp32_skip() -> None:
     """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers.
 
@@ -601,6 +664,7 @@ class VLLMOmniHijack:
 
         patch_dit_lora_loader()
         patch_ar_lora_loader()
+        patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
