@@ -244,9 +244,10 @@ class MemoryMonitor:
     def boundary(self, stage: str, handle: Any) -> None:
         if handle is None or not callable(getattr(handle, "get_memory_stats", None)):
             return
-        readings = self._probe(handle, log_stage=stage)
+        readings = self._probe(handle, log_stage=stage if self.log_boundaries else None)
         self._fold(readings)
-        self._log_line(stage, readings)
+        if self.log_boundaries:
+            self._log_line(stage, readings)
 
 
 def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:

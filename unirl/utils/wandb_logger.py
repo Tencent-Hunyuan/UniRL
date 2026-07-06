@@ -660,6 +660,16 @@ class UniRLWandBLogger:
         previews via :meth:`log_generated_media` at this same step value and
         frees them before dispatch.
         """
+        # Memory step boundary runs BEFORE the wandb early-out: the closing probe
+        # re-arms peak counters and fires snapshot dumps (Level 2), neither of
+        # which should depend on wandb being enabled. Its wandb keys are folded
+        # into perf on the enabled path below. Covers async_ar (no train_step to
+        # wrap), and this is the step window boundary for the peak counters.
+        mem_summary = (
+            self.memory_monitor.step_summary(step=rollout_id + 1)
+            if self.memory_monitor is not None
+            else None
+        )
         if not self.enabled or not self._initialized:
             return
         # Lazy import keeps wandb_logger importable without the training stack.
@@ -678,13 +688,8 @@ class UniRLWandBLogger:
             perf["rollout_time_s"] = float(step_time_s)
         if phase_times:
             perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
-        # Memory summary last, and only past the enabled/_initialized early-out
-        # above: no probe RPCs are spent when wandb is off. This is also the
-        # step boundary — the closing probe re-arms peak counters for the next
-        # step ("last log to this log" is the step window; covers async_ar,
-        # which has no train_step to wrap).
-        if self.memory_monitor is not None:
-            perf.update(self.memory_monitor.step_summary(step=step))
+        if mem_summary:
+            perf.update(mem_summary)
         if perf:
             self.log_perf(step, perf)
 
