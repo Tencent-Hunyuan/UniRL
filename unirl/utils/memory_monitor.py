@@ -170,28 +170,30 @@ class MemoryMonitor:
                 if self.log_boundaries:
                     self._log_line(phase, end)
 
-        _probed._unirl_mem_wrapped = True  # type: ignore[attr-defined]
         return _probed
 
-    def install(self, trainer: Any) -> None:
-        """Wrap the collaborator methods and register with the live wandb logger.
-
-        Called from ``BaseTrainer._init_wandb`` — the collaborators are built by
-        the subclass ``__init__`` (after the base one), and the live logger has
-        just replaced the null-object, so both are ready here.
-        """
-        if self._installed:
-            return
+    def _wrap_collaborators(self, trainer: Any) -> None:
         for attr_path, method, phase in _MEM_PHASE_SPECS:
             handle = _resolve_attr(trainer, attr_path)
             if handle is None:
                 continue
             fn = getattr(handle, method, None)
-            if not callable(fn) or getattr(fn, "_unirl_mem_wrapped", False):
+            if not callable(fn):
                 continue
             if not callable(getattr(handle, "get_memory_stats", None)):
                 continue  # local (non-Remote) collaborator — nothing to probe
             setattr(handle, method, self._wrap(handle, fn, phase))
+
+    def install(self, trainer: Any) -> None:
+        """Register with the live logger now; defer collaborator wrapping to step 1.
+
+        Called from ``BaseTrainer._init_wandb``. Wrapping is deferred until after
+        the first ``train_step`` so it lands OUTSIDE ``install_phase_timing``'s
+        wrappers (which install lazily on step 1) — the memory probes then stay
+        out of ``perf/<phase>_time_s`` (step 1 itself is unmonitored).
+        """
+        if self._installed:
+            return
         for attr in ("stack", "backend"):
             handle = getattr(trainer, attr, None)
             if handle is not None and callable(getattr(handle, "get_memory_stats", None)):
@@ -199,6 +201,22 @@ class MemoryMonitor:
                 break
         trainer.wandb_logger.memory_monitor = self
         self._installed = True
+
+        inner = getattr(trainer, "train_step", None)
+        if not callable(inner):
+            self._wrap_collaborators(trainer)
+            return
+
+        @functools.wraps(inner)
+        def _wrap_after_first_step(*args: Any, **kwargs: Any):
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                self._wrap_collaborators(trainer)
+                if trainer.train_step is _wrap_after_first_step:
+                    trainer.train_step = inner
+
+        trainer.train_step = _wrap_after_first_step
 
     # ── per-step summary (consumed by log_rollout_step) ──────────────────
 
@@ -234,17 +252,28 @@ class MemoryMonitor:
 def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:
     """Build a monitor from the trainer's ``logging.memory`` block (or env override).
 
-    Returns None when disabled — in that case nothing is ever wrapped and the
-    system is byte-identical to an unpatched tree. ``UNIRL_MEM_MONITOR=0/1``
-    overrides ``logging.memory.enabled`` (default: enabled).
+    Returns None when disabled — nothing is wrapped and the tree is unpatched.
+    Disabled by default (opt-in): even the folding path spends two blocking
+    BROADCAST probes per wrapped phase. ``UNIRL_MEM_MONITOR=0/1`` overrides
+    ``logging.memory.enabled``. ``UNIRL_MEMSNAP=1`` force-enables the monitor
+    (snapshots dump only through its closing probe), unless ``UNIRL_MEM_MONITOR=0``
+    explicitly wins.
     """
     logging_cfg = getattr(trainer, "logging_cfg", None) or {}
     mem_cfg = logging_cfg.get("memory") if hasattr(logging_cfg, "get") else None
     mem_cfg = mem_cfg or {}
-    enabled = bool(mem_cfg.get("enabled", True))
+    enabled = bool(mem_cfg.get("enabled", False))
     env_override = os.environ.get("UNIRL_MEM_MONITOR")
     if env_override is not None:
         enabled = _truthy(env_override, default=enabled)
+    if _truthy(os.environ.get("UNIRL_MEMSNAP")):
+        if env_override is not None and not enabled:
+            logger.warning(
+                "memory: UNIRL_MEMSNAP=1 but UNIRL_MEM_MONITOR is off — snapshots will "
+                "record (overhead) but never dump; set UNIRL_MEM_MONITOR=1 to dump them."
+            )
+        else:
+            enabled = True
     if not enabled:
         return None
     return MemoryMonitor(
