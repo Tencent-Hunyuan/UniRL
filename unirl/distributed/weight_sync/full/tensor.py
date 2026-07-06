@@ -61,8 +61,21 @@ class TensorWeightSync(FullWeightSync):
         Runs on every train rank (``BROADCAST``); the ``raw_state_dict`` walk
         all-gathers each shard on every rank in lockstep. Each rank talks to
         its own co-located engine, so no cross-rank gather is needed.
+
+        Rollout TP: a SGLang engine with ``tp_size>1`` is hosted only by its
+        tp_rank==0 worker (the others are no-op shells). This weight-sync role
+        is colocated with the train backend on EVERY worker, so it must still
+        drive the ``_iter_buckets`` generator on every rank (the all-gather is
+        lockstep) but only PUSH to the engine on tp_rank==0. SGLang's
+        ``update_weights_from_tensor`` picks ``serialized_named_tensors[tp_rank]``
+        per scheduler subprocess, so tp_rank==0 ships ``tp_size`` copies of the
+        (full) payload — SGLang's own ``weight_loader`` reshards each.
         """
         import torch
+
+        ri = self.rank_info
+        tp_size = int(ri.tp_size) if ri is not None else 1
+        is_tp_zero = ri is None or ri.tp_rank == 0
 
         # Use SGLang's own reductions when the rollout engine is SGLang-based
         # so pickles reference ``sglang.srt.utils.patch_torch._rebuild_cuda_tensor_modified``
@@ -91,6 +104,14 @@ class TensorWeightSync(FullWeightSync):
         monkey_patch_torch_reductions()
 
         for bucket, is_last in self._iter_buckets():
+            # Non-tp-zero ranks still drive the generator (lockstep all-gather)
+            # but never push — the engine on this worker is a no-op shell.
+            if not is_tp_zero:
+                del bucket
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
             # Group by dtype, one FlattenedTensorBucket per dtype (matches the
             # receiver's flattened_bucket load_format).
             by_dtype: dict = {}
@@ -110,10 +131,14 @@ class TensorWeightSync(FullWeightSync):
 
             n_dtypes = len(serialized)
             for i, payload in enumerate(serialized):
-                # TP=1 → the worker picks serialized_named_tensors[0], so ship a
-                # single-element list. flush only on the very last payload.
+                # SGLang picks ``serialized_named_tensors[tp_rank]`` per scheduler
+                # subprocess, so ship ``tp_size`` copies of the full payload
+                # (tp_size=1 → a single-element list, the historical path).
+                # ``payload`` is a serialized string, so the copies share the
+                # bytes and cost no extra device memory. Flush only on the very
+                # last payload.
                 self._rollout.update_weights_from_tensor(
-                    serialized_named_tensors=[payload],
+                    serialized_named_tensors=[payload] * tp_size,
                     load_format="flattened_bucket",
                     flush_cache=(self._flush_cache and is_last and i == n_dtypes - 1),
                     track_prefix=self._track_prefix,

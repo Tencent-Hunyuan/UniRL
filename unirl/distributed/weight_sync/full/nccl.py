@@ -9,23 +9,32 @@ non-blocking ``handle.call.remote(...)`` + ``ray.get`` from inside its own
 Worker. This provides the concurrency the NCCL rendezvous barrier needs without
 threads (train rank 0 and the rollout workers are distinct processes).
 
-Group layout: train rank 0 is group rank 0; rollout Omni worker ``i`` joins at
-``rank_offset = i + 1`` (worker computes ``global_rank = rank_offset +
-local_rank``; TP=1 → ``local_rank == 0``). Other train ranks are NOT in the
+Group layout: train rank 0 is group rank 0; rollout engine ``i`` joins at
+``rank_offset = i*tp_size + 1`` and its SGLang scheduler subprocesses compute
+``global_rank = rank_offset + tp_rank`` internally. With ``tp_size=1`` this is
+the historical ``rank_offset = i + 1``. Other train ranks are NOT in the
 broadcast group — they participate only in the train-mesh all-gather that
 ``raw_state_dict`` performs (so rank 0 sees full tensors), then discard.
+
+Rollout TP: the driver passes only the tp_rank==0 worker of each engine as a
+target (and ``num_rollout_gpus = num_engines*tp_size``). ``dist.broadcast``
+delivers the FULL tensor to every group rank; each SGLang TP rank's own
+``weight_loader`` reshards it — so ``sync()`` is unchanged, only ``connect``'s
+rank_offset/world_size scale with ``tp_size``.
 
 Driver wiring (in the trainer, once both slabs exist; engine workers alive)::
 
     addr, port = ws.pick_master()[0]
-    ws.set_rollout_targets(rollout.workers, rollout.role_name)
-    ws.connect(master_addr=addr, master_port=port, num_rollout_gpus=len(rollout.workers))
+    tp = rollout.tp_size
+    targets = [w for w, ri in zip(rollout.workers, rollout.rank_infos) if ri.tp_rank == 0]
+    ws.set_rollout_targets(targets, rollout.role_name)
+    ws.connect(master_addr=addr, master_port=port, num_rollout_gpus=len(targets)*tp, tp_size=tp)
     ...
     ws.sync()   # every weight_sync_interval
 
-Scope: single-/multi-node, TP=1, single-stage (SD3). Multi-stage (HI3) needs a
-per-stage rank_offset map and is out of scope. Torch/ray imports are deferred so
-the driver can import this module for ``remote(...)``.
+Scope: single-/multi-node, rollout TP≥1, single-stage. PP>1 needs a per-stage
+rank_offset map and is out of scope (raise upstream). Torch/ray imports are
+deferred so the driver can import this module for ``remote(...)``.
 """
 
 from __future__ import annotations
@@ -95,13 +104,22 @@ class NCCLWeightSync(FullWeightSync):
         self._rollout_role = str(role_name)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-    def connect(self, *, master_addr: str, master_port: int, num_rollout_gpus: int) -> None:
-        """Bring up the broadcast group (rank 0 + all rollout workers).
+    def connect(
+        self, *, master_addr: str, master_port: int, num_rollout_gpus: int, tp_size: int = 1, pp_size: int = 1
+    ) -> None:
+        """Bring up the broadcast group (rank 0 + all rollout engine GPUs).
 
         Fires each rollout worker's ``init_weights_update_group`` NON-BLOCKING
         first, then joins as group rank 0 (which blocks on the barrier), then
         awaits the rollout joins. The non-blocking fire is what lets the
         rendezvous complete — no thread needed (distinct processes).
+
+        Rollout TP: each ``_rollout_targets`` entry is the tp_rank==0 worker of
+        one SGLang engine, and SGLang internally assigns ``rank_offset +
+        tp_rank`` to its ``tp_size`` scheduler subprocesses. So engine ``i``
+        occupies the contiguous NCCL block ``[i*tp_size+1, (i+1)*tp_size]`` and
+        the group world size is ``num_engines*tp_size + 1``. ``tp_size=1``
+        reproduces the historical ``rank_offset = i+1`` layout exactly.
         """
         import ray
 
@@ -110,6 +128,16 @@ class NCCLWeightSync(FullWeightSync):
         if self._rollout_role is None:
             raise RuntimeError("NCCLWeightSync.connect: call set_rollout_targets() first")
 
+        # PP>1 needs a per-stage rank_offset map (each PP stage holds a disjoint
+        # slice of the model). Fail closed until that lands; the tp/dp path is
+        # the supported one today.
+        if pp_size > 1:
+            raise NotImplementedError(
+                "NCCLWeightSync.connect: rollout pp_size>1 is not implemented "
+                f"(got pp_size={pp_size}); only tp_size/dp_size are supported."
+            )
+
+        tp = max(1, int(tp_size))
         world = int(num_rollout_gpus) + 1
         refs = [
             handle.call.remote(
@@ -119,7 +147,7 @@ class NCCLWeightSync(FullWeightSync):
                 {
                     "master_address": master_addr,
                     "master_port": int(master_port),
-                    "rank_offset": i + 1,
+                    "rank_offset": i * tp + 1,
                     "world_size": world,
                     "group_name": self._group_name,
                     "backend": "nccl",

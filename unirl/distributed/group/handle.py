@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from itertools import count
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type
 
 import ray
 
@@ -95,35 +95,37 @@ def reset_role_name_counter() -> None:
     _role_name_counter.clear()
 
 
-def _sp_size_from_init_kwargs(init_kwargs: Optional[Dict[str, Any]], world_size: int) -> int:
-    """Ulysses ``sp_size`` for the rank layout.
+def _cfg_get(cfg: Any, key: str, default: int) -> int:
+    # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
+    # arrive here as PLAIN DICTS, not instantiated configs. Read dict keys and
+    # object attrs alike.
+    if isinstance(cfg, dict):
+        val = cfg.get(key, default)
+    else:
+        val = getattr(cfg, key, default)
+    return int(val or default)
 
-    A role takes the SP layout if either (a) it is itself the VeOmni training
-    backend, created with an ``fsdp_cfg`` carrying ``sp_size`` (or a bare
-    ``sp_size`` kwarg), or (b) it holds a sibling ``HandleRef`` to an SP-enabled
-    role — e.g. the train stack (``fsdp_backend=<SP backend>``) or a trainside
-    rollout (which samples through the same SP model). Case (b) is essential:
-    such a role's ``DP_SCATTER`` must shard over the SAME ``dp_size`` as the
-    model's mesh, else the two ranks of an SP pair get different shards and the
-    Ulysses all-to-all desyncs (mismatched shapes -> NCCL hang). Layout-agnostic
-    siblings (``BROADCAST``-only weight sync) inherit it too but are unaffected.
 
-    Returns 1 unless the resolved ``sp_size > 1`` and evenly divides
-    ``world_size``.
+def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
+    cls = _owning_class(role_cls)
+    return cls.__module__ == "unirl.rollout.engine.sglang.engine" and cls.__name__ == "SGLangRolloutEngine"
+
+
+def _parallel_shape_from_init_kwargs(
+    init_kwargs: Optional[Dict[str, Any]],
+    world_size: int,
+    role_cls: Type[Remote],
+) -> Tuple[int, int, int, int]:
+    """Resolve ``(sp, tp, pp, ep)`` layout hints for this handle.
+
+    ``sp_size`` keeps the existing VeOmni/Ulysses inheritance behavior. Rollout
+    TP/PP/EP is only read from ``SGLangRolloutEngine`` config (or inherited from
+    a sibling ``HandleRef`` such as ``rollout=...`` on weight sync roles) so
+    diffusion engines with their own ``tp_size`` config do not accidentally adopt
+    the AR rollout layout.
     """
     if not init_kwargs:
-        return 1
-
-    def _cfg_get(cfg: Any, key: str, default: int) -> int:
-        # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
-        # (e.g. fsdp_cfg) arrive here as PLAIN DICTS, not instantiated configs —
-        # getattr(dict, "sp_size") would silently return the default. Read the
-        # key for dicts and the attr for instantiated configs alike.
-        if isinstance(cfg, dict):
-            val = cfg.get(key, default)
-        else:
-            val = getattr(cfg, key, default)
-        return int(val or default)
+        return 1, 1, 1, 1
 
     sp = 1
     fsdp_cfg = init_kwargs.get("fsdp_cfg")
@@ -131,31 +133,81 @@ def _sp_size_from_init_kwargs(init_kwargs: Optional[Dict[str, Any]], world_size:
         sp = _cfg_get(fsdp_cfg, "sp_size", 1)
     elif "sp_size" in init_kwargs:
         sp = int(init_kwargs.get("sp_size") or 1)
-    # Inherit from the largest SP-enabled sibling handle (case (b) above).
+
+    tp = int(init_kwargs.get("tp_size") or 1)
+    pp = int(init_kwargs.get("pp_size") or 1)
+    ep = int(init_kwargs.get("ep_size") or 1)
+
+    if _is_sglang_rollout_role(role_cls):
+        cfg = init_kwargs.get("config")
+        if cfg is not None:
+            tp = max(tp, _cfg_get(cfg, "tp_size", 1))
+            pp = max(pp, _cfg_get(cfg, "pp_size", 1))
+            ep = max(ep, _cfg_get(cfg, "ep_size", 1))
+
+    # Inherit from sibling handles. This preserves the existing SP behavior and
+    # lets colocated weight-sync roles adopt their rollout sibling's TP layout.
     for value in init_kwargs.values():
         if isinstance(value, HandleRef):
             sp = max(sp, int(getattr(value, "sp_size", 1) or 1))
-    return sp if (sp > 1 and world_size % sp == 0) else 1
+            tp = max(tp, int(getattr(value, "tp_size", 1) or 1))
+            pp = max(pp, int(getattr(value, "pp_size", 1) or 1))
+            ep = max(ep, int(getattr(value, "ep_size", 1) or 1))
+
+    sp = sp if (sp > 1 and world_size % sp == 0) else 1
+    tp = max(1, tp)
+    pp = max(1, pp)
+    ep = max(1, ep)
+    if sp > 1 and (tp > 1 or pp > 1):
+        raise ValueError(f"sp_size ({sp}) cannot be combined with rollout tp/pp layout ({tp=}, {pp=})")
+    inner = tp * pp
+    if world_size % inner != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by tp_size*pp_size ({inner})")
+    return sp, tp, pp, ep
 
 
-def _build_rank_infos(world_size: int, sp_size: int = 1) -> List[RankInfo]:
-    """Contiguous (dp, sp) rank layout: rank ``i`` -> ``dp_rank i//sp``, ``sp_rank i%sp``.
+def _build_rank_infos(
+    world_size: int,
+    sp_size: int = 1,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    ep_size: int = 1,
+) -> List[RankInfo]:
+    """Build contiguous rank layout.
 
-    Matches VeOmni's ``init_sequence_parallel`` SP grouping
-    (``range(j*sp, (j+1)*sp)``) so the controller's data dispatch and VeOmni's
-    sequence-parallel groups agree: ranks in one SP group share a ``dp_rank``
-    (DP_SCATTER feeds them the same shard) and only ``sp_rank==0`` is collected.
-    ``sp_size=1`` reproduces the flat one-rank-per-dp layout exactly.
+    The default ``tp=pp=sp=1`` reproduces the flat one-rank-per-DP layout.
+    Ulysses SP keeps its historical contiguous ``(dp, sp)`` layout. Rollout TP
+    uses ``(dp, pp, tp)`` with TP rank fastest so one SGLang engine owns a
+    contiguous ``tp_size`` block of workers.
     """
-    dp_size = world_size // sp_size
+    if sp_size > 1:
+        dp_size = world_size // sp_size
+        return [
+            RankInfo(
+                rank=i,
+                world_size=world_size,
+                dp_rank=i // sp_size,
+                dp_size=dp_size,
+                sp_rank=i % sp_size,
+                sp_size=sp_size,
+            )
+            for i in range(world_size)
+        ]
+
+    inner = tp_size * pp_size
+    dp_size = world_size // inner
     return [
         RankInfo(
             rank=i,
             world_size=world_size,
-            dp_rank=i // sp_size,
+            dp_rank=i // inner,
             dp_size=dp_size,
-            sp_rank=i % sp_size,
-            sp_size=sp_size,
+            tp_rank=i % tp_size,
+            tp_size=tp_size,
+            pp_rank=(i // tp_size) % pp_size,
+            pp_size=pp_size,
+            ep_rank=0,
+            ep_size=ep_size,
         )
         for i in range(world_size)
     ]
@@ -183,6 +235,9 @@ class HandleRef:
 
     role_name: str
     sp_size: int = 1
+    tp_size: int = 1
+    pp_size: int = 1
+    ep_size: int = 1
 
 
 class Handle:
@@ -240,33 +295,67 @@ class Handle:
             "GROUP_NAME": self.role_name,
         }
 
-        # Register role on each Worker with dist_env
-        # Sequence parallelism (Ulysses): a VeOmni backend created with
-        # fsdp_cfg.sp_size>1 lays out ranks as contiguous SP blocks matching
-        # VeOmni's mesh; roles that hold an SP sibling (or get an explicit
-        # ``sp_size=`` layout hint) inherit it; everything else stays flat
-        # (sp=1). See _build_rank_infos / _sp_size_from_init_kwargs.
-        sp_size = _sp_size_from_init_kwargs(init_kwargs, self.world_size)
-        self.rank_infos = _build_rank_infos(self.world_size, sp_size)
+        # Register role on each Worker with dist_env. Sequence parallelism
+        # (Ulysses) keeps the historical contiguous (dp, sp) layout. SGLang
+        # rollout TP/PP uses a (dp, pp, tp) layout with TP fastest; colocated
+        # weight sync inherits that layout from its rollout HandleRef.
+        sp_size, tp_size, pp_size, ep_size = _parallel_shape_from_init_kwargs(init_kwargs, self.world_size, role_cls)
+        self.rank_infos = _build_rank_infos(
+            self.world_size,
+            sp_size=sp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+        )
         logger.info(
-            "Handle layout: role=%s world=%d dp_size=%d sp_size=%d",
+            "Handle layout: role=%s world=%d dp=%d sp=%d tp=%d pp=%d ep=%d",
             self.role_name,
             self.world_size,
             self.rank_infos[0].dp_size,
             self.rank_infos[0].sp_size,
+            self.rank_infos[0].tp_size,
+            self.rank_infos[0].pp_size,
+            self.rank_infos[0].ep_size,
         )
-        # ``sp_size`` is a reserved handle-layout hint, not a role constructor
-        # arg (e.g. the trainside rollout, whose model is SP-parallelized but
-        # whose __init__ takes no sp_size) — consume it before forwarding.
-        if init_kwargs:
-            init_kwargs.pop("sp_size", None)
+        # Layout hints are consumed by Handle; per-rank rollout layout values
+        # are injected below for constructors that must branch before
+        # Remote.setup() installs rank_info. Only SGLangRolloutEngine accepts
+        # these kwargs — weight sync / reward / algorithm roles do not, so gate
+        # the injection on the role class to avoid TypeError on sibling roles
+        # that share the rollout Handle's layout via HandleRef.
+        is_tp_engine = _is_sglang_rollout_role(role_cls)
+        base_init_kwargs = dict(init_kwargs or {})
+        for key in ("sp_size", "tp_size", "pp_size", "ep_size"):
+            base_init_kwargs.pop(key, None)
+
+        def _rank_init_kwargs(i: int) -> Dict[str, Any]:
+            kwargs = dict(base_init_kwargs)
+            ri = self.rank_infos[i]
+            if not is_tp_engine or (ri.tp_size <= 1 and ri.pp_size <= 1 and ri.ep_size <= 1):
+                return kwargs
+            engine_index = ri.dp_rank * ri.pp_size + ri.pp_rank
+            start = engine_index * ri.tp_size
+            stop = start + ri.tp_size
+            kwargs.update(
+                {
+                    "tp_rank": ri.tp_rank,
+                    "tp_size": ri.tp_size,
+                    "tp_device_ids": self.device_ids[start:stop],
+                    "pp_rank": ri.pp_rank,
+                        "pp_size": ri.pp_size,
+                        "ep_rank": ri.ep_rank,
+                        "ep_size": ri.ep_size,
+                    }
+                )
+            return kwargs
+
         ray.get(
             [
                 w.add_remote.remote(
                     self.role_name,
                     role_cls,
                     self.rank_infos[i],
-                    init_kwargs=init_kwargs or {},
+                    init_kwargs=_rank_init_kwargs(i),
                     dist_env={"RANK": str(i), **self._dist_env_base},
                 )
                 for i, w in enumerate(self.workers)
@@ -292,6 +381,31 @@ class Handle:
         Read by ``_to_marker`` when this handle is passed as a sibling so the
         dependent role inherits the same (dp, sp) layout (see ``HandleRef``)."""
         return self.rank_infos[0].sp_size if self.rank_infos else 1
+
+    @property
+    def tp_size(self) -> int:
+        """Tensor-parallel degree of this handle's rank layout."""
+        return self.rank_infos[0].tp_size if self.rank_infos else 1
+
+    @property
+    def pp_size(self) -> int:
+        """Pipeline-parallel degree of this handle's rank layout."""
+        return self.rank_infos[0].pp_size if self.rank_infos else 1
+
+    @property
+    def ep_size(self) -> int:
+        """Expert-parallel degree requested for rollout-side engines."""
+        return self.rank_infos[0].ep_size if self.rank_infos else 1
+
+    @property
+    def tp_zero_workers(self) -> List[Any]:
+        """Worker actor handles that host a SGLang engine (tp_rank==0).
+
+        With rollout TP, one SGLang engine per TP group is hosted by its
+        tp_rank==0 worker; the others are no-op shells. Weight sync targets and
+        server-actor discovery must use this filtered list. ``tp_size==1``
+        returns every worker (identical to ``self.workers``)."""
+        return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
 
     # ── User-facing initialize ──
 

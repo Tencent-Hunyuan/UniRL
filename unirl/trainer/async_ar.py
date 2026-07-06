@@ -218,11 +218,16 @@ class AsyncARTrainer(ARTrainer):
                 f"(NCCLWeightSync); got sync._target_={target!r}."
             )
         addr, port = self.weight_sync.pick_master()[0]
-        self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
+        tp_size = self.rollout.tp_size
+        pp_size = self.rollout.pp_size
+        targets = self.rollout.tp_zero_workers
+        self.weight_sync.set_rollout_targets(targets, self.rollout.role_name)
         self.weight_sync.connect(
             master_addr=addr,
             master_port=port,
-            num_rollout_gpus=len(self.rollout.workers),
+            num_rollout_gpus=len(targets) * tp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
         )
 
     # ------------------------------------------------------------------

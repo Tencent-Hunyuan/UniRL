@@ -116,6 +116,10 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     # --- Parallelism & GPU ---
     tp_size: Optional[int] = None
+    pp_size: Optional[int] = None
+    ep_size: Optional[int] = None
+    dp_size: Optional[int] = None
+    enable_expert_parallel: Optional[bool] = None
 
     # --- SGLang network ---
     # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
@@ -181,6 +185,18 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
         )
         require(
+            self.pp_size is None or self.pp_size >= 1,
+            f"SGLangEngineConfig.pp_size must be >= 1 when set; got {self.pp_size!r}",
+        )
+        require(
+            self.ep_size is None or self.ep_size >= 1,
+            f"SGLangEngineConfig.ep_size must be >= 1 when set; got {self.ep_size!r}",
+        )
+        require(
+            self.dp_size is None or self.dp_size >= 1,
+            f"SGLangEngineConfig.dp_size must be >= 1 when set; got {self.dp_size!r}",
+        )
+        require(
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
@@ -226,6 +242,7 @@ class SGLangEngineConfig(BaseEngineConfig):
         *,
         ports: SGLangPorts,
         extra: Optional[Dict[str, Any]] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Spell this config (+ the reserved ports) as ServerArgs intent.
 
@@ -246,6 +263,14 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
             intent["tp_size"] = int(self.tp_size)
+        if self.pp_size is not None:
+            intent["pp_size"] = int(self.pp_size)
+        if self.ep_size is not None:
+            intent["ep_size"] = int(self.ep_size)
+        if self.dp_size is not None:
+            intent["dp_size"] = int(self.dp_size)
+        if self.enable_expert_parallel is not None:
+            intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
         if self.host is not None:
             intent["host"] = str(self.host)
 
@@ -253,12 +278,18 @@ class SGLangEngineConfig(BaseEngineConfig):
         if extra:
             intent.update(extra)
 
-        # Layer 4: the reserved ports (highest) — real ServerArgs fields.
+        # Layer 4: runtime overrides (per-rank rollout layout; higher than cfg).
+        if runtime_overrides:
+            intent.update(runtime_overrides)
+
+        # Layer 5: the reserved ports (highest) — real ServerArgs fields.
         intent["port"] = ports.server_port
         intent["nccl_port"] = ports.nccl_port
 
         intent.setdefault("host", "0.0.0.0")
         intent.setdefault("tp_size", 1)
+        intent.setdefault("pp_size", 1)
+        intent.setdefault("ep_size", 1)
         intent.setdefault("mem_fraction_static", 0.88)
 
         return intent
