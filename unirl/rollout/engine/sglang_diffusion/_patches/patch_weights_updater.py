@@ -118,9 +118,28 @@ def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int,
 
 
 def _apply_fused_param_mapping(module, named_tensors):
-    """Consume separate-projection tensors into their fused params via the model's
-    ``param_names_mapping``; return the leftover ``(name, tensor)`` list for the
+    """Apply the model's ``param_names_mapping`` to the incoming named tensors.
+
+    A model's ``param_names_mapping`` (the same dict its checkpoint loader applies)
+    has two entry kinds; a model may use either or both:
+
+    * **fused projections** — ``{regex: (replacement, shard_id, num_shards)}`` —
+      write the trainer's separate-projection tensor into a dim-0 slice of the
+      model's fused param (Z-Image ``to_q/k/v -> to_qkv``, ``w1/w3 -> w13``).
+    * **plain renames** — ``{regex: replacement_str}`` — the model simply renamed
+      a param vs the checkpoint. WAN's mapping is entirely of this kind
+      (``patch_embedding.* -> patch_embedding.proj.*``,
+      ``blocks.N.attn1.to_q.* -> blocks.N.to_q.*``,
+      ``ffn.net.0.proj -> ffn.fc_in``, …). An EMPTY replacement means the model
+      dropped that param (e.g. WAN ``attn2.norm_added_q``) — the tensor is discarded.
+
+    Returns the leftover ``(name, tensor)`` list (renamed where applicable) for the
     exact-match loader. No-op when the module declares no mapping.
+
+    Before this handled the rename kind, simple-rename models (WAN) matched NOTHING
+    in the in-memory update path → 112/113 transformer tensors silently skipped →
+    the rollout engine ran stale base weights → flat reward curve (cross-engine
+    divergence), exactly the fused-model bug one step removed.
     """
     mapping = _resolve_param_names_mapping(module)
     if not mapping:
@@ -128,31 +147,59 @@ def _apply_fused_param_mapping(module, named_tensors):
 
     model_params = dict(module.named_parameters())
     leftover: list = []
-    fused = 0
+    fused = renamed = dropped = 0
     for name, tensor in named_tensors:
         if name in model_params:
             leftover.append((name, tensor))
             continue
         handled = False
         for pat, val in mapping.items():
-            if not isinstance(val, (tuple, list)) or len(val) != 3:
-                continue
             m = re.match(pat, name)
             if m is None:
                 continue
-            replacement, shard_id, num_shards = val
-            target = m.expand(replacement)
-            param = model_params.get(target)
-            if param is None:
-                continue
-            _write_fused_shard(param, tensor, int(shard_id), int(num_shards))
-            fused += 1
-            handled = True
-            break
+            if isinstance(val, (tuple, list)) and len(val) == 3:
+                replacement, shard_id, num_shards = val
+                param = model_params.get(m.expand(replacement))
+                if param is None:
+                    continue
+                _write_fused_shard(param, tensor, int(shard_id), int(num_shards))
+                fused += 1
+                handled = True
+                break
+            if isinstance(val, str):
+                if val == "":
+                    # model dropped this param — nothing to load.
+                    dropped += 1
+                    handled = True
+                    break
+                target = re.sub(pat, val, name)
+                if target in model_params:
+                    leftover.append((target, tensor))
+                    renamed += 1
+                    handled = True
+                    break
+                # rename produced a non-param name; keep trying other patterns.
         if not handled:
             leftover.append((name, tensor))
-    if fused:
-        _log.info("weight-sync: loaded %d fused shard(s) (e.g. qkv/w13) via param_names_mapping", fused)
+    if fused or renamed or dropped:
+        _log.info(
+            "weight-sync: param_names_mapping applied — %d fused, %d renamed, %d dropped",
+            fused,
+            renamed,
+            dropped,
+        )
+    # A leftover name that is still not a real model param slipped through every
+    # mapping branch (unmatched pattern, or a rename whose target does not exist).
+    # It will silently no-op in the exact-match loader — exactly the stale-weight
+    # failure this mapping is meant to prevent — so surface it loudly instead.
+    unmatched = [n for n, _ in leftover if n not in model_params]
+    if unmatched:
+        _log.warning(
+            "weight-sync: %d tensor(s) matched no model param after param_names_mapping "
+            "(e.g. %s) — likely a mapping gap; these will not update any weight",
+            len(unmatched),
+            unmatched[:5],
+        )
     return leftover
 
 
