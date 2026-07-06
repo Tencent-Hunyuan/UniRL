@@ -376,6 +376,12 @@ def _coalesce_duplicate_single_sample_encodes(value):
         return value
     if any(tuple(t.shape) != first_shape for t in value[1:]):
         return value
+    # Value check: only coalesce when the same-shape entries are actually
+    # byte-identical (the shared-list duplicate signature). Same-shape-but-
+    # differing tensors are a genuine multi-encoder whose outputs must NOT be
+    # collapsed — hardens the shape-only heuristic per the examples/ README note.
+    if not all(torch.equal(first, t) for t in value[1:]):
+        return value
     return [first]
 
 
