@@ -7,6 +7,14 @@ compatibility/grad fixes below:
 - import roots rewritten ``modeling.`` / ``data.`` / ``inferencer`` ->
   ``unirl.models.bagel.vendor.{modeling,data,inferencer}`` (9 statements across
   ``modeling/bagel/{bagel,qwen2_navit,siglip_navit}.py`` and ``inferencer.py``);
+- the navit files' ``from flash_attn import flash_attn_varlen_func`` is left PRISTINE;
+  the optional-flash-attn fallback is resolved in this package ``__init__`` instead (the
+  executable block after this docstring). Real flash-attn is used when it exports
+  ``flash_attn_varlen_func`` (fused kernel); an SDPA reimplementation
+  (``unirl/models/bagel/sdpa_varlen.py``) is injected only when the symbol is missing
+  (no flash-attn, or an incompatible build such as flash-attn-4). The GENERATION /
+  inference path goes through this; the training / replay path uses SDPA /
+  ``flex_attention`` directly and is unaffected;
 - added ``modeling/cache_utils/__init__.py`` (upstream ships ``cache_utils`` as a
   bare dir without an ``__init__``);
 - only a subset of upstream ``data/`` is vendored (``data_utils.py`` +
@@ -39,3 +47,28 @@ Apart from those documented fixes the modeling is byte-pristine. The RL primitiv
 ``__wrapped__``), so an upstream bump is a re-vendor + import-rewrite + re-applying
 the documented local fixes. This subtree is excluded from repo lint/format.
 """
+
+# Optional-flash-attn fallback for the vendored generation / inference attention.
+#
+# The pristine navit files (``modeling/bagel/{qwen2_navit,siglip_navit}.py``) do
+# ``from flash_attn import flash_attn_varlen_func``. This package ``__init__`` runs
+# before any vendored submodule is imported, so it is the place to make that symbol
+# resolvable WITHOUT editing the upstream files: keep the real flash-attn when it
+# exports the function (faster fused kernel), and fall back to the SDPA reimplementation
+# only when it is absent — no flash-attn installed, or a build (e.g. flash-attn-4) whose
+# API lacks ``flash_attn_varlen_func``. That function is the only symbol the vendored
+# navit code imports straight from the ``flash_attn`` package.
+import importlib
+import sys
+import types
+
+try:
+    _flash_attn = importlib.import_module("flash_attn")
+except Exception:
+    _flash_attn = types.ModuleType("flash_attn")
+    sys.modules["flash_attn"] = _flash_attn
+
+if not hasattr(_flash_attn, "flash_attn_varlen_func"):
+    from unirl.models.bagel.sdpa_varlen import flash_attn_varlen_func as _sdpa_flash_attn_varlen_func
+
+    _flash_attn.flash_attn_varlen_func = _sdpa_flash_attn_varlen_func

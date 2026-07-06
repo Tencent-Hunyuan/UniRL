@@ -1,0 +1,291 @@
+# @package _global_
+# Qwen-Image-Edit-Plus + FlowDPPO — sglang_diffusion colocate variant, v2 trainer.
+#
+# Composition: the rollout/sync/model_config blocks of
+# qwen_image_edit_plus_nft_sglang.yaml (edit-plus bundle/pipeline/conditions,
+# in-process SGLang engine, image-edit adapter, LocalLoraWeightSync) x the
+# FlowDPPO algorithm + lora_cfg + SDE sampling blocks of sd3_flowdppo.yaml
+# (the validated FlowDPPO reference), adapted for the qwen_image_edit_plus
+# bundle/pipeline/conditions.
+#
+# FlowDPPO replaces PPO ratio clipping (FlowGRPO) with KL-ADV masking:
+#   - algorithm._target_ = FlowDPPO (vs FlowGRPO).
+#   - kl_mask_threshold: KL threshold below which updates pass unmasked.
+#   - add_kl_coefficient: normalize KL by sigma_t (flow-matching noise scale).
+#   - old_logp_source: replay — sglang_diffusion emits trajectories but not
+#     reliable per-step log-probs; the trainer replays at pre-update weights
+#     to capture both the π_old log-prob anchor and prev_sample_means (the KL
+#     reference). Mirrors FlowGRPO sglang's old_logp_source=replay pattern.
+#   - No clip_range (replaced by KL masking). FlowDPPO's prepare_segment
+#     freezes sde_logp + sde_means once, so the ratio and KL anchor stay fixed
+#     across every num_updates_per_batch optimizer step.
+#
+# Diverges from qwen_image_edit_plus_flowgrpo_sglang.yaml:
+#   - algorithm: FlowGRPO → FlowDPPO (KL-ADV masking vs PPO ratio clipping).
+#   - algorithm hyperparams: drop clip_range/clip_schedule; add
+#     kl_mask_threshold + add_kl_coefficient.
+#   - logging tags/run_name: flowgrpo → flowdppo.
+# Everything else byte-identical (same SDE sampling, single-adapter LoRA,
+# sglang colocate rollout, fp32 master, AC, reshard).
+#
+# Image-edit path (unchanged from the NFT/FlowGRPO sglang recipes — same as
+# qwen_image_edit_plus_nft_sglang.yaml):
+#   - bundle/pipeline → QwenImageEditPlus* (in_channels=64, source-image
+#     latent token-concat inside predict_noise).
+#   - rollout.model_family → qwen_image_edit_plus (reads
+#     req.primitives['image'], injects PIL via the condition_image sampling
+#     kwarg so upstream's InputValidationStage → ImageVAEEncodingStage VAE-
+#     encodes the source image and sets batch.image_latent).
+#   - data_source → datasets/image_edit (JSONL with prompt + condition image).
+#   - patch_conditions captures batch.image_latent + batch.vae_image_sizes
+#     off the SGLang batch and ships them as ImageLatentCondition in the
+#     rollout conditions, so the trainer-side replay (predict_noise_at_step)
+#     can reconstruct the concat input.
+#
+# FlowDPPO + SGLang colocate: the trainable "default" adapter reaches the
+# engine via LocalLoraWeightSync (adapter_name=default), driven by
+# weight_sync_interval=1 (on-policy). The in-process apply_eval_ema swap is
+# NFT-only and does not run for FlowDPPO.
+#
+#   1x8:  bash examples/run_experiment_single_node.sh diffusion/qwen_image_edit_plus/qwen_image_edit_plus_flowdppo_sglang
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 10000
+weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter into the engine
+save_interval: 5              # checkpoint every 5 rollouts
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_flowdppo_sglang}
+save_mode: auto               # LoRA-only when LoRA active, full otherwise
+eval_interval: 0              # disabled — eval path + FlowDPPO SDE noise recipe shape mismatch (TODO)
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (the sglang engine needs both at init).
+model_config:
+  _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+  model_precision: bf16
+  max_sequence_length: 512
+  # Trainer-side TE is dead weight on the separate-engine path (the
+  # engine encodes; the trainer replays captured conditions) and its
+  # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
+  load_text_encoder: false
+  # Static-shift fallback; the real checkpoint enables dynamic shifting via
+  # scheduler/scheduler_config.json and this value is ignored at runtime.
+  shift: 3.0
+  # SGLang builds its LoRA ServerArgs from these two fields.
+  use_lora: true
+  lora_target_modules:
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+
+# Shared SDE strategy; the adapter resolves its sde_label from it.
+# FlowDPPO: Flow-SDE kernel (Coupled paradigm — SDE noise injection in early
+# steps, ODE in late steps). DanceSDEStrategy is DanceGRPO-only.
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.qwen_image_edit_plus.pipeline.QwenImageEditPlusPipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # THE reward-collapse fix: bf16 master loses the ~1e-4 ratio-based updates
+    # to rounding → ratio stays 1.0, reward flat; fp32 master + bf16 compute is
+    # stable. FlowDPPO uses (-adv * ratio) like FlowGRPO, so the same fix
+    # applies (see qwen_image_edit_plus_flowgrpo_sglang.yaml / bagel_trainside).
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # FlowDPPO single-adapter LoRA (same set as FlowGRPO — attn-only 8 modules).
+  # target_modules match qwen_image_edit_plus_flowgrpo_sglang.yaml: attn-only
+  # 8 modules (JointAttnProcessor image stream + text stream).
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  model_config: ${model_config}
+  strategy: ${strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    # Edit-Plus image-edit modality (reads req.primitives['image'], injects
+    # PIL via the condition_image sampling kwarg so upstream's
+    # InputValidationStage → ImageVAEEncodingStage sets batch.image_latent).
+    model_family: qwen_image_edit_plus
+    # Replay consumes the SERVER's fused text embeds (+ masks) and the
+    # captured image_latent, so the 8B Qwen2.5-VL's rollout-vs-trainside
+    # numeric drift cancels out of the ratio.
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into 16-sample sub-batches so sglang bounds its DiT-forward
+    # / VAE-decode peak memory, without shrinking the logical batch.
+    forward_batch_size: 16
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+    engine_kwargs:
+      # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
+      # name "Qwen-Image-Edit-2511") — local checkpoint dirs then need no special
+      # naming. Auto-detection via the "qwen-image-edit-2511" substring would
+      # also work, but the explicit pin mirrors qwen_image_sglang.yaml.
+      model_id: Qwen-Image-Edit-2511
+      # Siblings omit dit_layerwise_offload and run stably on 8× H20 96GB
+      # (trainer ~55GB + rollout DiT ~39GB fits). dit_layerwise_offload caused
+      # a SIGSEGV (exit code -11) in sglang's local server launch on this setup,
+      # so we omit it too. Re-enable only if OOM is observed on smaller GPUs.
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowdppo.FlowDPPO
+  stage_attr: diffusion
+  # FlowDPPO KL-ADV masking hyperparameters (v1 algorithm.algorithms.diffusion
+  # block, mirrored from sd3_flowdppo.yaml).
+  kl_mask_threshold: 1.0e-5
+  add_kl_coefficient: true
+  # REPLAY mode: trainer replays at pre-update weights to capture both the
+  # π_old log-prob anchor AND prev_sample_means (the KL reference). The sglang
+  # engine emits trajectories but not reliable per-step log-probs, so
+  # old_logp_source='rollout' would raise (segment.sde_logp is None). Mirrors
+  # FlowGRPO sglang's old_logp_source=replay pattern.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image_edit_plus.conditions.QwenImageEditPlusConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (KL anchor frozen once); v1 parity
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # qwen_384 preset default
+  guidance_scale: 1.0
+  height: 384
+  width: 384
+  eta: 0.7                      # FlowDPPO (Coupled): SDE noise injection in early steps
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3            # FlowDPPO: record 3 SDE steps for the per-step ratio + KL
+    # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps
+    # (the validated reproduce setting); [0,1] spreads it across all steps.
+    timestep_fraction: [0, 0.5]
+
+# LoRA weight sync → SGLang rollout. Instantiated as a LocalLoraWeightSync
+# (sibling of backend + rollout) from this block's `_target_`, exactly like the
+# blocks above. The train loop drives cadence via `weight_sync_interval` (top of
+# file): every N rollouts it calls sync() to push the freshly-trained LoRA
+# (set_lora_from_tensors) into the engine just before that rollout's generate.
+#
+# adapter_name=default: FlowDPPO samples under the trainable "default" adapter
+# (not the EMA shadow "old" used by DiffusionNFT). An explicit override here
+# avoids silently deferring to backend.rollout_adapter_name.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false  # SGLang engine lacks loaded_lora_checksums (only loaded_param_checksums); skip read-back
+  # Mirrors QwenImageEditPlusPipelineConfig.weight_sync_param_name_prefix; must
+  # match the engine-side LoRA key naming (a wrong prefix yields wrong/zero
+  # loaded layers).
+  param_prefix: "transformer."
+  adapter_name: default
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flowdppo}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_edit_plus_flowdppo_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["qwen-image-edit-plus", "image-edit", "flowdppo", "dppo", "kl-adv", "sglang-diffusion", "v2"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
