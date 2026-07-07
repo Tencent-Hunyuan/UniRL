@@ -135,3 +135,18 @@ class Wan22T2VAdapter(VideoAdapter):
 
 
 __all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter", "Wan22T2VAdapter"]
+@register_adapter("wan21")
+class Wan21T2VAdapter(VideoAdapter):
+    """WAN 2.1 T2V — proper video output consumed by ``video_pickscore``.
+
+    The text/conditions path is the generic UMT5 fuse from ``ImageAdapter``
+    (single text encoder; no CFG negative branch when ``guidance_scale <= 1``);
+    only the video-output overrides on ``VideoAdapter`` apply. The sglang server
+    resolves the WAN pipeline from ``model_path`` (the ``Wan-AI/Wan2.1-T2V-1.3B``
+    -Diffusers checkpoint), so no extra ``boot_kwargs`` are needed.
+    """
+
+    pass
+
+
+__all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter", "Wan21T2VAdapter"]
