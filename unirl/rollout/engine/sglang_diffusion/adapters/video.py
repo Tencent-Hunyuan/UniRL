@@ -23,7 +23,7 @@ holds; only families with a real video consumer (WAN) move to ``VideoAdapter``.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
@@ -103,4 +103,55 @@ class HunyuanVideoAdapter(ImageAdapter):
     squeeze_single_frame_4d = False
 
 
-__all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter"]
+@register_adapter("wan22")
+class Wan22T2VAdapter(VideoAdapter):
+    """WAN 2.2-A14B T2V — DUAL-EXPERT (high-noise / low-noise) MoE.
+
+    WAN 2.2-A14B runs two ``WanTransformer3DModel`` experts switched at a sigma
+    boundary (``boundary_ratio=0.875``): high-noise for ``sigma >= boundary``
+    (coarse structure, early steps), low-noise for ``sigma < boundary`` (detail).
+    The entire dual-expert mechanism lives ENGINE-SIDE in sglang and needs no
+    adapter work: ``composed_pipeline_base.load_modules`` auto-loads ``transformer_2``
+    when the checkpoint's ``model_index.json`` carries ``boundary_ratio`` + both
+    ``transformer``/``transformer_2`` (the A14B-Diffusers ckpt does), and the generic
+    ``DenoisingStage._select_and_manage_model`` routes per-step by the boundary
+    timestep (and applies ``guidance_scale_2`` to the low-noise branch). So the
+    UniRL side is byte-identical to WAN 2.1 — same UMT5 single-text fuse, same 6-D
+    video trajectory + ``video_pickscore`` consumer, same segment contract (no aux
+    audio). The trainside ``WAN22DiffusionStage`` replays with the SAME boundary
+    routing, so rollout↔replay stays aligned.
+
+    ``build_sampling`` additionally forwards ``guidance_scale_2`` so the engine's
+    low-noise CFG branch matches the trainside; it is omitted (engine falls back to
+    ``guidance_scale``) when unset, so a ``guidance_scale=1.0`` smoke is unaffected.
+    """
+
+    def build_sampling(self, req: RolloutReq, *, diffusion: Any) -> Dict[str, Any]:
+        kwargs = super().build_sampling(req, diffusion=diffusion)
+        g2 = getattr(diffusion, "guidance_scale_2", None)
+        if g2 is not None:
+            kwargs["guidance_scale_2"] = float(g2)
+        return kwargs
+
+
+@register_adapter("wan21")
+class Wan21T2VAdapter(VideoAdapter):
+    """WAN 2.1 T2V — proper video output consumed by ``video_pickscore``.
+
+    The text/conditions path is the generic UMT5 fuse from ``ImageAdapter``
+    (single text encoder; no CFG negative branch when ``guidance_scale <= 1``);
+    only the video-output overrides on ``VideoAdapter`` apply. The sglang server
+    resolves the WAN pipeline from ``model_path`` (the ``Wan-AI/Wan2.1-T2V-1.3B``
+    -Diffusers checkpoint), so no extra ``boot_kwargs`` are needed.
+    """
+
+    pass
+
+
+__all__ = [
+    "VideoAdapter",
+    "MochiAdapter",
+    "HunyuanVideoAdapter",
+    "Wan21T2VAdapter",
+    "Wan22T2VAdapter",
+]

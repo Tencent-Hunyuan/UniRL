@@ -1,0 +1,212 @@
+# @package _global_
+# GRPO WAN 2.2-A14B T2V + SGLang rollout (colocate), DUAL-EXPERT.
+#
+# Video FlowGRPO with the rollout served by the ``sglang_diffusion`` engine on the
+# WAN 2.2-A14B dual-expert pipeline. WAN 2.2-A14B runs two WanTransformer3DModel
+# experts switched at a sigma boundary (high-noise for sigma >= boundary_ratio,
+# low-noise below). The DUAL-EXPERT mechanism is entirely engine-side and needs no
+# new sglang code: ``composed_pipeline_base.load_modules`` auto-loads ``transformer_2``
+# because the Wan2.2-T2V-A14B-Diffusers ``model_index.json`` carries ``boundary_ratio``
+# + both ``transformer``/``transformer_2``, and the generic ``DenoisingStage.
+# _select_and_manage_model`` routes per-step by the boundary timestep. The UniRL side
+# is the ``wan22`` adapter (a thin subclass of the wan21 adapter — same UMT5 single-text
+# fuse, same 6-D video trajectory + video_pickscore, no aux audio). The trainside
+# ``WAN22DiffusionStage`` replays with the SAME boundary routing → rollout↔replay align.
+#
+#   1x8:  bash examples/run_experiment_single_node.sh diffusion/wan22/wan22_t2v_14b_sglang
+#
+# old_logp_source=replay: the trainer recomputes the pi_old anchor with the WAN22
+# dual-expert pipeline (cross-engine safe). Flip to ``rollout`` once the sglang "sde"
+# kernel is confirmed bit-equal for WAN.
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 1000
+
+model_config:
+  _target_: unirl.models.wan22.config.WAN22PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-T2V-A14B-Diffusers}
+  model_precision: bf16
+  shift: 5.0
+  max_sequence_length: 512
+  boundary_ratio: 0.875        # WAN 2.2 reference: sigma >= 0.875 → high_noise, else low_noise
+  num_train_timesteps: 1000
+  # SGLang builds its LoRA ServerArgs from these two fields.
+  use_lora: true
+  # WAN attention LoRA targets — SGLANG leaf names (no qkv fusion); applied to BOTH
+  # experts' self+cross attn. Trainside (peft) keeps diffusers paths in backend.lora_cfg.
+  lora_target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out
+
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.wan22.bundle.WAN22Bundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.wan22.pipeline.WAN22Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: true            # 27B dual-expert frozen base: offload during sglang gen
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: wan22
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    forward_batch_size: 8
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    # Memory: A14B is TWO 14B experts (~56GB resident) + heavy video activations on a
+    # single GPU (tp=1). Offload the inactive expert (A14B uses ONE at a time via the
+    # boundary-switch) AND the frozen aux (Gemma/UMT5 text encoder + VAE decode spike)
+    # to CPU so peak HBM ≈ one 14B DiT + activations.
+    engine_kwargs:
+      # A14B = two 13.5B experts (~54GB if both resident) — too big for one GPU at
+      # tp=1 even with the inactive expert nominally on CPU (LoRA-wrapping pins both).
+      # dit_layerwise_offload streams each transformer block CPU→GPU per step and frees
+      # it after, so resident weights ≈ a few layers → either expert fits with room for
+      # video activations. Slower per step, but the only way to fit 27B at tp=1 colocate.
+      dit_layerwise_offload: true
+      dit_offload_prefetch_size: 2.0
+      text_encoder_cpu_offload: true
+      vae_cpu_offload: true
+    # SGLANG leaf names (see model_config.lora_target_modules above).
+    target_modules:
+      - to_q
+      - to_k
+      - to_v
+      - to_out
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.wan21.conditions.WAN21Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0           # no CFG → no negative-prompt branch
+  guidance_scale_2: null        # low-noise expert CFG; null → engine reuses guidance_scale
+  height: 480
+  width: 832
+  num_frames: 5                 # (num_frames-1)%4==0 → 2 latent frames after WAN VAE 4x temporal
+  eta: 0.7
+  samples_per_prompt: 8
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    num_sde_steps: null
+
+weight_sync_interval: 1
+
+# Dual-expert LoRA sync: the trainside LoRA lives on transformer.high_noise.* and
+# transformer.low_noise.*; after the ``transformer.`` prefix strip the keys become
+# high_noise.* / low_noise.*, which the sync layer remaps to the engine's
+# transformer.* (high) / transformer_2.* (low) via WAN22Bundle.weight_sync_name_map().
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false
+  param_prefix: "transformer."
+  adapter_name: default
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_t2v_14b_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["wan22", "a14b", "t2v", "grpo", "video", "pickscore", "sglang", "dual-expert"]
+  log_media: false
