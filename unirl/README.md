@@ -11,19 +11,16 @@ see [`distributed/README.md`](distributed/README.md).)
   <img src="../assets/code-architecture-new.png" alt="UniRL code architecture: a thin entrypoint hands a recipe to the trainer (the driver), which places a Worker pool and wires each stage (rollout / reward / algorithm / train / weight-sync) as a Remote from the recipe's _target_; the Remotes run the model code (models, sde) and rest on types (the shared contracts) and distributed (the Remote/Worker/transport substrate)" width="100%">
 </div>
 
-UniRL is a thin entrypoint that hands a recipe to the trainer (the **driver**),
-which places a Worker pool and wires each stage as a `Remote` from the recipe's
-`_target_` — not by import. As source, the package falls into four groups:
+The **driver** — a per-task **recipe** (its `<Domain>Trainer` + `@hydra.main`
+entrypoint) — lives in [`recipes/`](../recipes/README.md), *outside* this package. It
+hands its config to the trainer, which places a Worker pool and wires each stage as a
+`Remote` from the config's `_target_` — not by import. This README maps the **library**
+the recipe composes. As source, `unirl/` falls into two groups:
 
-- **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
-  `train_unified_model.py`) — one per domain. Each composes and validates the Hydra
-  recipe, then hands off to its trainer.
-- **Orchestration** (`trainer/`) — the per-domain `<Domain>Trainer` owns GPU
-  placement, builds the rollout and train workers, and runs the
-  rollout→reward→advantage→train loop.
 - **Training loop** (`rollout/`, `reward/`, `algorithms/`, `train/`) — the four
   pluggable stages of one rollout, plus the components they share: `models/`
   (per-model bundles), `sde/` (step kernels / σ schedule), and `data/` (sources).
+  The `BaseTrainer` a recipe subclasses lives here too, in `train/base_trainer.py`.
 - **Foundation** (`distributed/`, `config/`, `types/`, `utils/`) — the
   cross-cutting infrastructure every layer rests on: the Ray
   worker/dispatch/transport runtime, config build-and-validate, the shared typed
@@ -33,12 +30,10 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 
 | Path | Responsibility |
 |---|---|
-| `train_diffusion.py`, `train_ar.py`, `train_pe.py`, `train_unified_model.py` | Per-domain Hydra entrypoints |
-| `trainer/` | Per-domain training lifecycle (`base.py` + `diffusion`/`ar`/`pe`/`unified_model`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
 | `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
 | `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, composed) |
-| `train/` | Train stack: `TrainStack`, FSDP backend, LoRA/DiffusionNFT/mirror injection, EMA shadow, optimizer/lr |
+| `train/` | Train stack (`TrainStack`, FSDP backend, LoRA/DiffusionNFT/mirror injection, EMA shadow, optimizer/lr) + `base_trainer.py` (the `BaseTrainer` a recipe subclasses) |
 | `algorithms/` | Per-track loss algorithms (GRPO, DiffusionNFT, FlowDPPO, DRPO) |
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
@@ -69,8 +64,8 @@ flows through them like this:
   <img src="../assets/pipeline-dataflow-new.png" alt="UniRL data flow: the prompt becomes one RolloutTrack that is decorated in place — generate (a diffusion or AR pipeline) fills its segment (LatentSegment for image, TextSegment for text) and decoded media, reward.score_and_attach adds rewards, compute_advantages adds advantages, and train consumes segment + advantages to produce gradients" width="100%">
 </div>
 
-1. An entrypoint composes the chosen `examples/<domain>/<recipe>.yaml` and runs validators.
-2. The `<Domain>Trainer` (e.g. `trainer/diffusion.py`) acquires a Ray `DevicePool` and builds the rollout and train workers.
+1. A recipe's entrypoint (`recipes/<task>/trainer.py`) composes the chosen `configs/<config>.yaml` and runs validators.
+2. The `<Domain>Trainer` (e.g. `recipes/diffusion/trainer.py`) acquires a Ray `DevicePool` and builds the rollout and train workers.
 3. The trainer builds a typed `RolloutReq` and dispatches it to the rollout engine.
 4. The engine returns a `RolloutResp`, whose `tracks[name]` carry conditions, segments, rewards, and media previews.
 5. `RewardService.score_and_attach` attaches rewards; `RolloutTrack.compute_advantages` z-scores them into advantages.
@@ -80,7 +75,7 @@ flows through them like this:
 
 ## Deeper Module Docs
 
-- `trainer/README.md`: the orchestration hub — how a `<Domain>Trainer` places workers and drives the loop.
+- [`../recipes/README.md`](../recipes/README.md): the recipes (the driver) — how a `<Domain>Trainer` places workers and drives the loop, plus the launch guide.
 - `config/README.md`: flat-recipe config — `require`/precision validators, `_target_` instantiation, cross-component contracts.
 - `rollout/README.md`: rollout modes, engines, request/response flow.
 - `train/readme.md`: train stack, FSDP backend, injection, EMA shadow.

@@ -90,7 +90,7 @@ unmaintainable. This layer hides it behind two ideas:
 **Extending it:** a new dispatch mode is an enum entry + a `(dispatch, collect)` pair
 in `group/dispatch.py`; a new transport is a backend under `tensor/backend/`
 implementing the transport ABC and wired into the `build_transport()` kind-dispatch in `tensor/factory.py`; a new physical
-layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
+layout is a `placement(…)` wiring in the trainer (`recipes/diffusion/trainer.py`).
 
 ## Gotchas
 

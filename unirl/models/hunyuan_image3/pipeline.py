@@ -153,7 +153,7 @@ class HunyuanImage3Pipeline(Pipeline):
         ``from_config`` / ``from_meta_config`` each build their own bundle; this
         instead takes a bundle the caller already constructed. Trainers build ONE
         bundle and share it across the FSDP backend and this pipeline, so replay
-        reads the trained weights — see :class:`~unirl.trainer.unified_model.`
+        reads the trained weights — see :class:`~recipes.unified_model.trainer.`
         ``UnifiedModelTrainer``, whose ``pipeline_cfg`` targets this with ``bundle=`` auto-
         injected from the shared sibling.
         """

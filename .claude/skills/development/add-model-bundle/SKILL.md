@@ -39,7 +39,7 @@ The current architecture is a typed pipeline:
 11. In `pipeline.py`, implement `<Model>Pipeline(Pipeline)` with `from_config(...)` and `generate(req)`. Validate required primitives and sampling params, require `req.sigmas` for diffusion pipelines, call stages in order, and return `RolloutResp(tracks={...})` with `RolloutTrack(sample_ids, parent_ids, conditions, segment, decoded)`.
 12. Add `latent_shape(cls, *, model_config, sampling_spec)` when the driver should precompute `request_conditions["initial_latents"]` for deterministic group noise or resume behavior.
 13. Update the package `__init__.py` to import and export public symbols from `config.py`, `bundle.py`, `pipeline.py`, and condition classes so importing `unirl.models.<model_name>` re-exports them.
-14. Add at least one recipe YAML under `examples/<domain>/` (the v2 config dir, grouped by trainer domain) and document external checkpoint requirements there or in launcher environment docs.
+14. Add at least one recipe YAML under `recipes/<domain>/configs/` (the v2 config dir, grouped by trainer domain) and document external checkpoint requirements there or in launcher environment docs.
 
 ## Wiring Touchpoints
 
@@ -175,4 +175,4 @@ Adjust the command to real files before running. If the model is AR-only or pipe
 - The sigma schedule is consumed from `req.sigmas`; it is not rebuilt in the model package.
 - Bundle loading normalizes dtype/device, freezes auxiliary modules, and keeps trainable module naming compatible with `weight_sync_param_name_prefix`.
 - LoRA target modules are explicit for production models; `None` is only used deliberately.
-- Recipe YAML exists under `examples/<domain>/` (the v2 config dir, grouped by trainer domain) and documents required checkpoints or environment variables.
+- Recipe YAML exists under `recipes/<domain>/configs/` (the v2 config dir, grouped by trainer domain) and documents required checkpoints or environment variables.

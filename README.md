@@ -29,20 +29,23 @@ across multimodal model families.
   <img src="assets/UniRL_arch_new.png" alt="UniRL architecture" width="900">
 </div>
 
-UniRL is a layered, composable system. Each **entrypoint** (`train_diffusion`,
-`train_ar`, `train_pe`, `train_unified_model`) loads a **Hydra example config**
-covering model, algorithm, rollout, reward, placement, and sync, then creates the
-matching domain **trainer** (`DiffusionTrainer`, `ARTrainer`, `PETrainer`,
-`UnifiedModelTrainer`). The trainer coordinates the RL loop across pluggable
-**rollout engines**, **algorithms**, **model bundles**, **reward services**, and
-the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
-Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
-runtime loop, deployment modes, and module map.
+UniRL is a layered, composable system. The library (`unirl/`) is pure components; the
+runnable programs live in [`recipes/`](recipes/README.md). Each **recipe**
+(`recipes/diffusion`, `recipes/ar`, `recipes/pe`, `recipes/unified_model`, …) is a
+self-contained package — a domain **trainer** (`DiffusionTrainer`, `ARTrainer`,
+`PETrainer`, `UnifiedModelTrainer`) merged with its `@hydra.main` entrypoint, plus its
+**configs** under `configs/`. Launched with `python -m recipes.<task>`, a recipe loads a
+config covering model, algorithm, rollout, reward, placement, and sync; the trainer
+coordinates the RL loop across pluggable **rollout engines**, **algorithms**, **model
+bundles**, **reward services**, and the shared **distributed runtime**: Ray `DevicePool`,
+FSDP, Transfer Queue (TQ), and LoRA/full-weight sync. See
+[`unirl/README.md`](unirl/README.md) for the runtime loop and module map, and
+[`recipes/README.md`](recipes/README.md) for the launch guide.
 
 ## Team-Proposed Algorithms 🌟
 
 > **🌟 These algorithms are proposed by our team — the highlight of UniRL.** Each
-> algorithm's folder holds a step-by-step tutorial and a runnable example recipe.
+> algorithm's folder holds a step-by-step tutorial and a runnable example config.
 > We highly recommend trying them in our framework!
 
 | Algorithm | Paper | Tutorial | Notes |
@@ -59,7 +62,7 @@ UniRL also wires in standard reference algorithms — **(LLM's)GRPO**, **Diffusi
 Model and algorithm support are **two independent dimensions** that compose within
 a domain: any diffusion algorithm (see above) runs on a diffusion
 model, AR algorithms on AR models — so UniRL covers many more model × algorithm
-combinations than the shipped example recipes alone. The table below is the model
+combinations than the shipped example configs alone. The table below is the model
 dimension; all listed models are supported (✅).
 
 <div align="center">
@@ -83,24 +86,25 @@ dimension; all listed models are supported (✅).
 
 </div>
 
-Each model maps to a domain entrypoint (`train_diffusion`, `train_ar`, `train_pe`,
-`train_unified_model`); see **Getting Started** below to run any of them.
+Each model maps to a recipe (`recipes.diffusion`, `recipes.ar`, `recipes.pe`,
+`recipes.unified_model`); see **Getting Started** below to run any of them.
 
 ## Training Modes 🧩
 
-UniRL unifies four training modes, one Hydra example bucket and entrypoint each.
-Examples are self-contained YAML files selected with
-`--config-name=<domain>/<example>`:
+UniRL unifies four training modes, one **recipe** each. A recipe is launched with
+`python -m recipes.<task>` and picks a self-contained config from its own `configs/`
+with `--config-name=<config>`:
 
-| Domain | Trains | Entrypoint | Example |
+| Recipe | Trains | Launch | Example config |
 |---|---|---|---|
-| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3/sd3_sglang_rollout_colocate` |
-| `ar/` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` |
-| `pe/` | Prompt-enhancer (AR rewriter + diffusion reward) | `train_pe` | `pe/pe_sglang_full_pickscore` |
-| `unified_model/` | Unified AR + diffusion models | `train_unified_model` | `unified_model/hi3_vllmomni` |
+| `diffusion` | Image / video diffusion models | `python -m recipes.diffusion` | `sd3/sd3_sglang_rollout_colocate` |
+| `ar` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `python -m recipes.ar` | `qwen_vl_grpo_geo3k_mc_4x8`, `qwen3_drpo_4b_base_dapo_sglang` |
+| `pe` | Prompt-enhancer (AR rewriter + diffusion reward) | `python -m recipes.pe` | `pe_sglang_full_pickscore` |
+| `unified_model` | Unified AR + diffusion models | `python -m recipes.unified_model` | `hi3_vllmomni` |
 
-See [`examples/README.md`](examples/README.md) for the full launch guide, naming
-schema, and how to add a recipe.
+`recipes.refl` (differentiable-reward backprop) and `recipes.async_ar` (disaggregated
+async AR) round out the set. See [`recipes/README.md`](recipes/README.md) for the full
+launch guide, config-name schema, and how to add a recipe.
 
 ## Getting Started ⚡
 
@@ -108,11 +112,11 @@ Install dependencies first — see [INSTALL.md](INSTALL.md).
 
 ```bash
 # compose-check, then launch a single-node example
-python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg job --resolve
-bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
+python -m recipes.diffusion --config-name=sd3/sd3_trainside --cfg job --resolve
+bash scripts/run_experiment_single_node.sh sd3/sd3_trainside
 ```
 
-Full [launch guide](examples/README.md#running-a-recipe) — multi-node, every entrypoint, mooncake.
+Full [launch guide](recipes/README.md#running-a-recipe) — multi-node, every recipe, mooncake.
 
 ## Roadmap 🗺️
 
@@ -129,7 +133,7 @@ Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencen
 
 Contributions and questions are welcome. Before opening a pull request, read the
 repository conventions in [`AGENTS.md`](AGENTS.md), run the
-[pre-PR checks](examples/README.md#adding-or-editing-a-recipe) for the files you
+[pre-PR checks](recipes/README.md#adding-or-editing-a-config) for the files you
 touched, and fill in the [pull request template](.github/pull_request_template.md).
 For questions, bug reports, and feature requests,
 [open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues).

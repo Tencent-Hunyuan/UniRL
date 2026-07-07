@@ -159,7 +159,12 @@ where = ["."]
 include = [
   "unirl",
   "unirl.*",
+  "recipes",
+  "recipes.*",
 ]
+
+[tool.setuptools.package-data]
+recipes = ["**/configs/**/*.yaml", "**/configs/**/*.yml"]
 
 [tool.ruff]
 line-length = 120
@@ -176,7 +181,7 @@ select = ["E", "F", "W", "I"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["unirl"]
+known-first-party = ["unirl", "recipes"]
 
 [tool.ruff.format]
 quote-style = "double"

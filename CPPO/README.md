@@ -9,7 +9,7 @@ applies a **position-weighted, cumulative-prefix-budget Binary-TV mask** on top 
 DPPO ratio-advantage surrogate (this repo ships the **Binary-TV** variant).
 
 - **Loss:** [`unirl/algorithms/cppo.py`](../unirl/algorithms/cppo.py) (`CPPO`, `_cppo_loss`, `_cppo_mask`)
-- **Recipe (SGLang):** [`examples/ar/qwen3_cppo_30b_a3b_base_dapo_sglang.yaml`](../examples/ar/qwen3_cppo_30b_a3b_base_dapo_sglang.yaml) — Qwen3-30B-A3B-Base on DAPO-Math
+- **Recipe (SGLang):** [`recipes/ar/configs/qwen3_cppo_30b_a3b_base_dapo_sglang.yaml`](../recipes/ar/configs/qwen3_cppo_30b_a3b_base_dapo_sglang.yaml) — Qwen3-30B-A3B-Base on DAPO-Math
 - **Config extract:** [`config.yaml`](config.yaml)
 
 Lineage: **PPO → GRPO → DPPO → CPPO**. CPPO is the **hard-mask** sibling of DPPO Binary-TV;
@@ -111,7 +111,7 @@ matching `GRPO` / `DRPO`.
 
 ## From rollout to update
 
-1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
+1. `recipes.ar` builds `ARTrainer` for the text-only Qwen3 recipe.
 2. `SGLangRolloutEngine` samples completions and returns an `"ar"` track with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
 3. `MathVerifyRewardScorer` scores each completion correct/incorrect.
@@ -150,7 +150,7 @@ share — paper Fig. 7), and the AR-only `rollout_replay_logp_absdiff_mean` are 
 python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-python -m unirl.train_ar --config-name=ar/qwen3_cppo_30b_a3b_base_dapo_sglang num_devices=128
+python -m recipes.ar --config-name=qwen3_cppo_30b_a3b_base_dapo_sglang num_devices=128
 ```
 
 The model defaults to `Qwen/Qwen3-30B-A3B-Base`; set `QWEN3_PATH` to a local checkpoint dir to

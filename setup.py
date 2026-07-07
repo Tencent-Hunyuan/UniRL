@@ -13,6 +13,8 @@ setup(
         include=(
             "unirl",
             "unirl.*",
+            "recipes",
+            "recipes.*",
         ),
     ),
     install_requires=[

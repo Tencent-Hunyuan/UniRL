@@ -58,4 +58,4 @@ environment variables via `${oc.env:...}`. Common variables:
 
 Sample prompt lists are committed under `datasets/`.
 
-Once installed, see the [launch guide](examples/README.md#running-a-recipe) to run an experiment.
+Once installed, see the [launch guide](recipes/README.md#running-a-recipe) to run an experiment.

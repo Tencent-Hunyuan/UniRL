@@ -22,7 +22,7 @@ Examples:
 - `SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure`
 - `pytest`
 - Hydra config validation:
-  `python -m unirl.train_diffusion --config-name=<domain>/<recipe> --cfg job --resolve`
+  `python -m recipes.<recipe> --config-name=<config> --cfg job --resolve`
 - Training / rollout smoke test:
 - Not run; reason:
 -->
