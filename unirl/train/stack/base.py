@@ -41,6 +41,7 @@ update shares the same PPO anchor; this is only correct for algorithms with
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Dict, List, Mapping, Optional, Tuple
 
@@ -345,10 +346,28 @@ class TrainStack(Remote):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
         )
-        self.prepare_segment(resp_track, plans=plans)
-        result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
+        # Opt-in profiler (UNIRL_PROFILE=train profiles this whole step; one-update is
+        # handled in _run_updates). See unirl/train/readme.md.
+        from unirl.utils.profiling import profile_scope
+
+        profiler = self._train_step_profiler() if profile_scope() == "train" else None
+        with profiler.record("train_track") if profiler is not None else nullcontext():
+            self.prepare_segment(resp_track, plans=plans)
+            result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
+        if profiler is not None:
+            profiler.step()
         self.on_rollout_end()
         return result
+
+    def _train_step_profiler(self):
+        """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
+        cached = getattr(self, "_profiler_cache", "unset")
+        if cached == "unset":
+            from unirl.utils.profiling import maybe_build_train_profiler
+
+            cached = maybe_build_train_profiler(int(getattr(self.fsdp_backend, "_rank", 0)))
+            self._profiler_cache = cached
+        return cached
 
     def _run_updates(
         self,
@@ -369,7 +388,21 @@ class TrainStack(Remote):
         each update's own metrics are attached on ``per_update`` (see
         :func:`_aggregate_update_results`).
         """
-        results = [self._run_update(resp_track, micros=micros, training_progress=training_progress) for micros in plans]
+        # UNIRL_PROFILE=one-update: wrap each optimizer update in a one-shot profiler
+        # (fires once, on rank0, past warmup) so the trace captures ONLY one update
+        # (forward + backward + cross-GPU comm + optimizer) — the compute/comm overlap window.
+        from unirl.utils.profiling import maybe_profile_update, profile_scope
+
+        scope_update = profile_scope() == "one-update"
+        results = []
+        for micros in plans:
+            cm = (
+                maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0)))
+                if scope_update
+                else nullcontext()
+            )
+            with cm:
+                results.append(self._run_update(resp_track, micros=micros, training_progress=training_progress))
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)

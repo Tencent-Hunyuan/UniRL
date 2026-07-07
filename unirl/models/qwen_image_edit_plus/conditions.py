@@ -8,9 +8,10 @@ dimension before the transformer call, then slices the prediction back to the
 noise segment — mirrors ``vde_editplus.py:232,246`` and the FLUX.2-Klein
 image-edit pattern (``flux2_klein/diffusion.py:160-183``).
 
-``image_latent`` is optional so the conditions container round-trips cleanly
-for the T2I degenerate path (no source image); the Edit-Plus pipeline itself
-requires a source image and raises at ``generate(req)`` time if absent
+``image_latent`` is declared ``Optional`` only so ``from_dict`` / ``to_dict``
+round-trip cleanly when the key is absent from a raw dict; Edit-Plus is
+edit-only, so both the pipeline (``generate(req)``) and the diffusion step
+(``predict_noise``) require a source image and raise if it is missing
 (fail-fast, constraint #27).
 """
 

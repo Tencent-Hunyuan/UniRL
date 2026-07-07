@@ -131,7 +131,7 @@ backend:
   # the v1 training.ema_lora block. target_modules keep the v1 DiffusionNFT set: bare
   # (un-prefixed) names that also cover the img/txt MLP projections — broader
   # than the GRPO recipe's attn-only `attn.*` set. Verified verbatim against
-  # transformer/model.safetensors.index.json (Qwen-Image-Edit-2511-merged_v9.7).
+  # transformer/model.safetensors.index.json (Qwen-Image-Edit-2511).
   ema_lora_cfg:
     _target_: unirl.train.configs.EmaLoraConfig
     rank: 64
