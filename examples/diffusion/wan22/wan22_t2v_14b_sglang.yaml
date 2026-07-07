@@ -28,9 +28,6 @@ model_config:
   _target_: unirl.models.wan22.config.WAN22PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-T2V-A14B-Diffusers}
   model_precision: bf16
-  autocast_precision: bf16
-  trajectory_precision: fp16
-  logprob_precision: fp32
   shift: 5.0
   max_sequence_length: 512
   boundary_ratio: 0.875        # WAN 2.2 reference: sigma >= 0.875 → high_noise, else low_noise
@@ -188,9 +185,6 @@ sampling:
   samples_per_prompt: 8
   seed: 42
   init_same_noise: false
-  autocast_precision: bf16
-  trajectory_precision: fp16
-  logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
