@@ -26,8 +26,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.video import (
     HunyuanVideoAdapter,
     MochiAdapter,
     VideoAdapter,
-    Wan22T2VAdapter,
     Wan21T2VAdapter,
+    Wan22T2VAdapter,
 )
 from unirl.rollout.engine.sglang_diffusion.adapters.z_image import ZImageAdapter
 

@@ -134,7 +134,6 @@ class Wan22T2VAdapter(VideoAdapter):
         return kwargs
 
 
-__all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter", "Wan22T2VAdapter"]
 @register_adapter("wan21")
 class Wan21T2VAdapter(VideoAdapter):
     """WAN 2.1 T2V — proper video output consumed by ``video_pickscore``.
@@ -149,4 +148,10 @@ class Wan21T2VAdapter(VideoAdapter):
     pass
 
 
-__all__ = ["VideoAdapter", "MochiAdapter", "HunyuanVideoAdapter", "Wan21T2VAdapter"]
+__all__ = [
+    "VideoAdapter",
+    "MochiAdapter",
+    "HunyuanVideoAdapter",
+    "Wan21T2VAdapter",
+    "Wan22T2VAdapter",
+]
