@@ -54,13 +54,29 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         """Extract LoRA from the local FSDP model and load it into the engine.
 
         Runs on every Worker (``BROADCAST``); the extract is a train-mesh
-        collective that lines up because every rank runs together. The engine must
-        be awake (the caller wakes it before ``sync``); ``set_lora_from_tensors``
-        drops any existing adapter and loads the new one on every stage's workers.
+        collective that lines up because every rank runs together. With rollout
+        TP, only ``tp_rank==0`` hosts the SGLang server, so every rank extracts
+        but only that TP leader pushes; SGLang then fans the adapter out to its
+        internal TP workers.
         """
         lora_tensors, peft_config = self._extract()
+        ri = self.rank_info
+        rank = ri.rank if ri is not None else 0
+        is_tp_zero = ri is None or ri.tp_rank == 0
+        if not is_tp_zero:
+            logger.debug(
+                "[LoRA-SYNC] rank %s: extracted %d LoRA tensors but skipped rollout push "
+                "(tp_rank=%s/%s, adapter=%s, track=%s)",
+                rank,
+                len(lora_tensors),
+                ri.tp_rank,
+                ri.tp_size,
+                self._adapter_name,
+                self._track_prefix or "<single>",
+            )
+            return
+
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
-        rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(
             "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout (adapter=%s, track=%s)",
             rank,

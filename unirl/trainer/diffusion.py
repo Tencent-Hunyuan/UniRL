@@ -322,6 +322,12 @@ class DiffusionTrainer(BaseTrainer):
                 pp_size=pp_size,
             )
         else:
+            # LoRA-over-Ray (RemoteLoraWeightSync): pushes adapters via Ray RPC
+            # to each engine's set_lora_from_tensors. tp_rank>0 shells no-op the
+            # RPC, so passing all workers is SAFE but wastes one RPC per shell.
+            # Keep all workers here because RemoteLoraWeightSync's target format
+            # is [(role, workers)] (a list of one pair) and the shell no-op guard
+            # in engine.set_lora_from_tensors is the correctness backstop.
             self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
     def _resolve_noise_latent_shape(self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig) -> Optional[list]:

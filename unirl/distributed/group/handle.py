@@ -107,8 +107,18 @@ def _cfg_get(cfg: Any, key: str, default: int) -> int:
 
 
 def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
+    """True if ``role_cls`` opts into per-rank rollout-TP kwargs.
+
+    SGLangRolloutEngine sets ``_accepts_rollout_tp_kwargs = True`` so Handle
+    injects ``tp_rank``/``tp_size``/``tp_device_ids``/``pp_rank``/``ep_size``
+    into its ``__init__``. Other roles (weight sync, reward, algorithms) do NOT
+    set this flag — they share the rollout Handle's layout via ``HandleRef``
+    but their ``__init__`` doesn't accept these kwargs, so injecting would
+    raise ``TypeError``. A class-attribute flag (vs a string name check) survives
+    rename and subclassing without silently dropping the injection.
+    """
     cls = _owning_class(role_cls)
-    return cls.__module__ == "unirl.rollout.engine.sglang.engine" and cls.__name__ == "SGLangRolloutEngine"
+    return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
 
 
 def _parallel_shape_from_init_kwargs(
@@ -325,6 +335,9 @@ class Handle:
         # that share the rollout Handle's layout via HandleRef.
         is_tp_engine = _is_sglang_rollout_role(role_cls)
         base_init_kwargs = dict(init_kwargs or {})
+        # These layout hints were consumed by _parallel_shape_from_init_kwargs
+        # above; strip them so they don't leak into role_cls.__init__ as
+        # unexpected kwargs (weight sync / reward roles don't accept them).
         for key in ("sp_size", "tp_size", "pp_size", "ep_size"):
             base_init_kwargs.pop(key, None)
 

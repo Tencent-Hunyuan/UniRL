@@ -46,6 +46,14 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
     _component_name = "sglang"
 
+    # Marks this role as accepting per-rank rollout-TP kwargs (tp_rank/tp_size/
+    # tp_device_ids/pp_rank/ep_rank/ep_size) from Handle. Read by
+    # ``_is_sglang_rollout_role`` in group/handle.py to gate the kwargs
+    # injection — a string-name check would silently break on rename or
+    # subclassing, so an explicit opt-in flag is safer. Other roles (weight
+    # sync, reward, algorithms) do NOT set this and never receive these kwargs.
+    _accepts_rollout_tp_kwargs: bool = True
+
     def __init__(
         self,
         config: SGLangEngineConfig,
@@ -93,6 +101,9 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._tp_size = int(tp_size)
         self._pp_rank = int(pp_rank)
         self._pp_size = int(pp_size)
+        # ep_rank/ep_size are recorded for completeness / future use: EP is
+        # sharded INSIDE SGLang (within the TP group), so UniRL never branches
+        # on them here. SGLang receives ep_size via server_intent → ServerArgs.
         self._ep_rank = int(ep_rank)
         self._ep_size = int(ep_size)
         self._tp_device_ids = list(tp_device_ids) if tp_device_ids else None
@@ -215,8 +226,11 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         """Run text generation against the engine and return a typed response.
 
         Only tp_rank==0 hosts a SGLang server; other TP ranks in the group are
-        no-op shells. The DP_SCATTER collect filters ``tp_rank==0`` results, so
-        returning ``None`` from a shell is dropped before the merge.
+        no-op shells. The ``DP_SCATTER`` collect (``_collect_dp_merge``) keeps
+        only results from ranks where ``tp_rank==0 and
+        is_pipeline_last_stage and sp_rank==0``, so a shell's return value is
+        dropped by the collect (the ``return None`` below is defensive — the
+        collect filters on ``RankInfo``, not on ``None``).
         """
         if not self._is_tp_zero:
             return None

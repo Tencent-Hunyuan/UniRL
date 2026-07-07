@@ -115,6 +115,12 @@ class SGLangEngineConfig(BaseEngineConfig):
     model_family: Optional[str] = None
 
     # --- Parallelism & GPU ---
+    # ``tp_size`` / ``pp_size`` / ``ep_size`` are read by Handle to build the
+    # rollout rank layout; ``tp_size>1`` is what makes a multi-GPU SGLang engine.
+    # ``dp_size`` is forwarded to SGLang ServerArgs but NOT read by UniRL's
+    # Handle (UniRL derives dp_size = world_size // (tp*pp) internally); it is
+    # kept as an escape hatch for SGLang's own data-parallel semantics. Leave
+    # None unless a SGLang server-level dp override is explicitly needed.
     tp_size: Optional[int] = None
     pp_size: Optional[int] = None
     ep_size: Optional[int] = None
