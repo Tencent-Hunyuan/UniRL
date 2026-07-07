@@ -665,11 +665,7 @@ class UniRLWandBLogger:
         # which should depend on wandb being enabled. Its wandb keys are folded
         # into perf on the enabled path below. Covers async_ar (no train_step to
         # wrap), and this is the step window boundary for the peak counters.
-        mem_summary = (
-            self.memory_monitor.step_summary(step=rollout_id + 1)
-            if self.memory_monitor is not None
-            else None
-        )
+        mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
             return
         # Lazy import keeps wandb_logger importable without the training stack.
