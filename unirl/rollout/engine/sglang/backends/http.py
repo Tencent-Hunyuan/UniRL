@@ -292,9 +292,28 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
+
         server_args = rt["ServerArgs"](**server_kwargs)
+
+        # SGLang server subprocess needs all TP GPUs visible. In colocate mode
+        # Ray limits the parent actor's CUDA_VISIBLE_DEVICES to one GPU, so the
+        # spawned child inherits that restriction. Temporarily expose all GPUs
+        # for the spawn, then restore the parent's single-GPU view so the train
+        # side (FSDP) is unaffected.
+        # NOTE: torch.cuda.device_count() returns 1 here (Ray's CVD is active),
+        # so read the real count from the SGLang tp_size in server_kwargs.
+        _tp_size = int(server_kwargs.get("tp_size", 1))
+        _base_gpu_id = int(server_kwargs.get("base_gpu_id", 0))
+        all_gpus = ",".join(str(_base_gpu_id + i) for i in range(_tp_size))
+        _saved_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = all_gpus
         process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
         process.start()
+        # Restore immediately — the child already captured env at spawn time.
+        if _saved_cvd is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cvd
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
         wait_server_healthy(
@@ -626,7 +645,17 @@ class HTTPBackend:
         accepts serialized LoRA tensors + a PEFT config dict and hot-loads the
         adapter on all TP workers internally.
         """
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        # Serialize with plain pickle instead of ForkingPickler to avoid
+        # resource_sharer fd handles that race across TP>1 scheduler subprocesses.
+        # SafeUnpickler (used by SGLang for deserialization) handles plain pickle
+        # CPU tensors correctly — the tensor data is inlined, no fd passing.
+        import io as _io
+        import pickle as _pickle
+        import pybase64
+
+        buf = _io.BytesIO()
+        _pickle.dump(lora_tensors, buf)
+        serialized = pybase64.b64encode(buf.getvalue()).decode("utf-8")
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](

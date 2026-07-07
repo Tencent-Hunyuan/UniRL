@@ -162,24 +162,16 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             ports = SGLangPorts.reserve()
 
         # Rollout-TP runtime overrides. When a single SGLang engine spans
-        # ``tp_size`` GPUs (this worker's + its TP siblings'), expose all of
-        # them to the scheduler subprocesses and pin SGLang's device numbering
-        # to the local base. We override CUDA_VISIBLE_DEVICES for the spawn (the
-        # SGLang schedulers are spawned children that inherit this env), then
-        # let SGLang's base_gpu_id/gpu_id_step index within the visible set.
+        # ``tp_size`` GPUs, pass ``base_gpu_id`` (the first device id of this
+        # engine's TP group) so SGLang locates its GPUs without overriding
+        # CUDA_VISIBLE_DEVICES. Keeping all GPUs visible avoids resource_sharer
+        # fd mismatches across the spawn'd scheduler subprocesses (verl-style).
         runtime_overrides: Dict[str, Any] = {}
         if self._tp_size > 1:
             runtime_overrides["tp_size"] = self._tp_size
-            runtime_overrides["base_gpu_id"] = 0
             runtime_overrides["gpu_id_step"] = 1
             if self._tp_device_ids:
-                self._prev_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in self._tp_device_ids)
-                logger.info(
-                    "SGLangRolloutEngine tp_rank=0: CUDA_VISIBLE_DEVICES=%s for tp_size=%d",
-                    os.environ["CUDA_VISIBLE_DEVICES"],
-                    self._tp_size,
-                )
+                runtime_overrides["base_gpu_id"] = self._tp_device_ids[0]
 
         # Backend (the seam) — booted from the config-spelled intent.
         intent = config.server_intent(
@@ -335,13 +327,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero or self._backend is None:
             return
         self._backend.shutdown()
-        # Restore CUDA_VISIBLE_DEVICES if we overrode it for a multi-GPU spawn.
-        prev = getattr(self, "_prev_cuda_visible_devices", None)
-        if self._tp_size > 1 and self._tp_device_ids:
-            if prev is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = prev
 
     def __del__(self):
         try:

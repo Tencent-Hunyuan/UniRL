@@ -187,7 +187,23 @@ class NativeBackend:
         # ``set_start_method`` is process-global; matches the HTTP impl so
         # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
+
+        # SGLang Engine spawns scheduler subprocesses that need all TP GPUs
+        # visible. In colocate mode Ray limits the parent actor's
+        # CUDA_VISIBLE_DEVICES to one GPU. Temporarily expose all GPUs for the
+        # Engine construction (which spawns the children), then restore.
+        # NOTE: torch.cuda.device_count() returns 1 here (Ray's CVD is active),
+        # so derive the GPU list from tp_size + base_gpu_id in engine_kwargs.
+        _tp_size = int(engine_kwargs.get("tp_size", 1))
+        _base_gpu_id = int(engine_kwargs.get("base_gpu_id", 0))
+        all_gpus = ",".join(str(_base_gpu_id + i) for i in range(_tp_size))
+        _saved_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = all_gpus
         engine = rt["Engine"](**engine_kwargs)
+        if _saved_cvd is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _saved_cvd
+        else:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles
@@ -443,7 +459,17 @@ class NativeBackend:
         this server-side).
         """
         self._require_alive("set_lora")
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        # Serialize with plain pickle instead of ForkingPickler to avoid
+        # resource_sharer fd handles that race across TP>1 scheduler subprocesses.
+        # SafeUnpickler (used by SGLang for deserialization) handles plain pickle
+        # CPU tensors correctly — the tensor data is inlined, no fd passing.
+        import io as _io
+        import pickle as _pickle
+        import pybase64
+
+        buf = _io.BytesIO()
+        _pickle.dump(lora_tensors, buf)
+        serialized = pybase64.b64encode(buf.getvalue()).decode("utf-8")
         obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
             lora_name=str(lora_name),
             config_dict=dict(config_dict or {}),
