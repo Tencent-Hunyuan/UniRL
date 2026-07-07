@@ -6,8 +6,10 @@ PPO-style ratio clipping with a KL-ADV masking criterion. Uses
 new policy, then masks updates where KL is high AND the ratio direction is
 aligned with advantage (i.e. overly aggressive policy updates).
 
-Module-level helpers ``_gaussian_kl_div`` and ``_flowdppo_kl_adv_loss`` contain
-the core math; the class wires them into the stage-driven training contract.
+The KL-ADV mask math lives in the module-level ``_flowdppo_kl_adv_loss`` (built on
+the shared ``_gaussian_kl_div`` in :mod:`unirl.algorithms.base`); the class wires it
+into the stage-driven training contract and adds the optional ``beta`` reference-policy
+KL penalty (Flow-DPPO eq.17).
 """
 
 from __future__ import annotations
@@ -22,7 +24,18 @@ from unirl.config.require import require
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
-from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm, gather_sde_field, typed_conditions
+from .base import (
+    AlgorithmStepResult,
+    BaseAlgorithmConfig,
+    StageAlgorithm,
+    _gaussian_kl_div,
+    _reference_kl_loss,
+    _reference_replay_means,
+    _resolve_reference_model,
+    _transition_sigma,
+    gather_sde_field,
+    typed_conditions,
+)
 
 
 @dataclass
@@ -31,6 +44,7 @@ class FlowDPPOConfig(BaseAlgorithmConfig):
     conditions_cls: str = ""
     kl_mask_threshold: float = 1e-5
     add_kl_coefficient: bool = True
+    beta: float = 0.0
     old_logp_source: str = "rollout"
     params: Any = dc_field(default=None)
 
@@ -38,17 +52,6 @@ class FlowDPPOConfig(BaseAlgorithmConfig):
 # ---------------------------------------------------------------------------
 # Loss helpers
 # ---------------------------------------------------------------------------
-
-
-def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """KL-style squared error between Gaussian means scaled by variance (x-space).
-
-    For two Gaussians N(p, sigma^2) and N(q, sigma^2) with shared variance,
-    KL(N(p,...) || N(q,...)) = (p - q)^2 / (2 * sigma^2).
-
-    Returns per-element KL; caller reduces over spatial dims.
-    """
-    return (p - q) ** 2 / (2 * sigma**2)
 
 
 def _flowdppo_kl_adv_loss(
@@ -167,19 +170,36 @@ class FlowDPPO(StageAlgorithm):
         params: Per-call params (e.g. ``SD3DiffusionParams``).
         kl_mask_threshold: KL divergence threshold for masking. Updates
             with per-sample KL below this pass without masking.
-        add_kl_coefficient: If True, normalize KL by
-            ``sigma_t = std_dev_t * sqrt(-dt)`` (flow-matching noise scale).
-            If False, use unnormalized squared error.
+        add_kl_coefficient: If True, normalize the KL-ADV **masking** score by
+            ``sigma_t = std_dev_t * sqrt(-dt)`` (flow-matching noise scale). If False,
+            use unnormalized squared error. Governs only the masking gate; the ``beta``
+            term below is always normalized.
+        beta: Reference-policy KL coefficient (Flow-DPPO eq.17). ``> 0`` adds
+            ``beta * KL(pi_theta || pi_ref)`` to the loss, where ``pi_ref`` is the
+            base model with its LoRA adapter disabled (a per-update no_grad reference
+            replay). Always the variance-normalized Gaussian KL — independent of
+            ``add_kl_coefficient``, matching FlowGRPO. ``0`` (default) disables the term
+            and skips that replay; the ``beta`` penalty is separate from the
+            ``kl_mask_threshold`` KL-to-old masking gate. Requires a LoRA recipe + the
+            injected ``backend``. See ``FlowGRPO``'s ``beta`` note on the
+            normalization-scale difference vs the reference flow_grpo code
+            (don't port ``beta`` values 1:1).
         old_logp_source: ``"rollout"`` (default) trusts the rollout engine's
             emitted ``segment.sde_logp``; ``"replay"`` uses the replayed
             log-probs. ``sde_means`` is always replayed regardless. See
             :meth:`prepare_segment`.
+        backend: FSDP backend sibling (injected by the v2 trainer). Only used when
+            ``beta > 0`` to reach the trainable model for the adapter-disabled
+            reference replay.
         conditions_cls: Stage-typed conditions container.
     """
 
     # prepare_segment freezes segment.sde_logp + sde_means once, so the ratio
     # and KL anchor stay fixed across every num_updates_per_batch optimizer step.
     supports_multi_update = True
+    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2
+    # trainer must inject the FSDP backend (the trainable model lives on it).
+    requires_backend = True
     anchor_fields = ("sde_logp", "sde_means")
 
     def recomputes_anchor(self) -> bool:
@@ -196,7 +216,9 @@ class FlowDPPO(StageAlgorithm):
         stage_attr: str = "diffusion",
         kl_mask_threshold: float = 1e-5,
         add_kl_coefficient: bool = True,
+        beta: float = 0.0,
         old_logp_source: str = "rollout",
+        backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         # v1 (track_builder) passes `stage`; v2 (DiffusionTrainer) passes the
@@ -209,6 +231,8 @@ class FlowDPPO(StageAlgorithm):
         self.params = params
         self.kl_mask_threshold = float(kl_mask_threshold)
         self.add_kl_coefficient = bool(add_kl_coefficient)
+        self.beta = float(beta)
+        self._ref_model = _resolve_reference_model(backend, beta=self.beta, algo="FlowDPPO")
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
             self.old_logp_source in ("rollout", "replay"),
@@ -316,14 +340,43 @@ class FlowDPPO(StageAlgorithm):
             kl_mask_threshold=self.kl_mask_threshold,
         )
 
-        loss = loss_per_elem.mean()
-        (loss * loss_scale).backward()
-
+        policy_loss = loss_per_elem.mean()
+        loss = policy_loss
         metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
+            "policy_loss": float(policy_loss.detach().item()),
             "kl_mask_threshold": float(self.kl_mask_threshold),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
+
+        # Optional reference-policy KL penalty (Flow-DPPO eq.17): pull pi_theta toward
+        # pi_ref (LoRA-disabled base model). Distinct from the KL-to-old masking above.
+        if self.beta > 0.0:
+            ref_means = _reference_replay_means(
+                self.stage,
+                self._ref_model,
+                conditions=typed_conds,
+                segment=segment,
+                params=self.params,
+                target_steps=target_steps,
+            ).to(dtype=new_means.dtype, device=new_means.device)
+            # The beta term is the true Gaussian KL (eq.17): always normalize by the SDE
+            # transition std, independent of add_kl_coefficient (which only governs the
+            # KL-ADV masking gate above), so it matches FlowGRPO's beta term.
+            kl_sigma_t = _transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=target_steps,
+                eta=float(self.params.eta),
+                device=new_logp.device,
+                add_coefficient=True,
+            )
+            kl_ref = _reference_kl_loss(new_means, ref_means, kl_sigma_t)
+            loss = loss + self.beta * kl_ref
+            metrics["beta"] = float(self.beta)
+            metrics["kl_ref_mean"] = float(kl_ref.detach().item())
+
+        (loss * loss_scale).backward()
+
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,
@@ -345,32 +398,18 @@ class FlowDPPO(StageAlgorithm):
         target_steps: List[int],
         device: torch.device,
     ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t, delegated to the SDE strategy.
-
-        Returns ``stage.strategy.transition_std(...)`` so the KL uses each
-        strategy's own transition std (Flow/Dance: ``std_dev_t * sqrt(-dt)``;
-        CPS: ``std_dev_t``, no ``sqrt(-dt)``). When ``add_kl_coefficient=False``,
-        returns ones (unnormalized MSE). Shape ``[1, S', 1, 1, 1]`` for
-        broadcasting with the means tensors.
+        """Per-step KL-normalization sigma_t for the KL-ADV mask, via the shared
+        :func:`~unirl.algorithms.base._transition_sigma`. ``add_kl_coefficient=False``
+        returns ones (unnormalized MSE). Shape ``[1, S', 1, 1, 1]``.
         """
-        if not self.add_kl_coefficient:
-            return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
-
-        if segment.sigmas is None:
-            raise ValueError("FlowDPPO with add_kl_coefficient=True requires segment.sigmas.")
-        sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
-        eta = float(self.params.eta)
-
-        # Vectorized: index into sigmas with target_steps tensor
-        idx = torch.tensor(target_steps, dtype=torch.long, device=device)
-        s = sigmas[idx]
-        s_next = sigmas[idx + 1]
-        # Delegate to the SDE strategy so the KL normalizer matches each strategy's
-        # transition std (Flow/Dance: std_dev_t*sqrt(-dt); CPS: std_dev_t, no sqrt(-dt)).
-        # sigma_max=sigmas[1] mirrors the stage's sigma==1 handling (used by Flow only).
-        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-        sigma_t = self.stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=eta, sigma_max=sigma_max)
-        return sigma_t.reshape(1, -1, 1, 1, 1)
+        return _transition_sigma(
+            self.stage,
+            segment=segment,
+            target_steps=target_steps,
+            eta=float(self.params.eta),
+            device=device,
+            add_coefficient=self.add_kl_coefficient,
+        )
 
 
 __all__ = ["FlowDPPO", "FlowDPPOConfig"]

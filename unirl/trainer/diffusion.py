@@ -219,15 +219,18 @@ class DiffusionTrainer(BaseTrainer):
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
         # DiffusionNFT resolves its frozen reference adapter off ``backend.ema`` (the
-        # FSDPBackend owns the dual-adapter EMA), so it needs the backend sibling
-        # injected alongside ``pipeline``. GRPO takes neither and would reject the
-        # extra kwarg, so gate on the algorithm's declared ``requires_ema_rollout``
-        # (off-policy algorithms set it True). The same flag drives the eval-EMA
-        # swap around ``generate`` in ``train_step``: on-policy algorithms MUST
-        # sample with the trainable weights so the first-step importance ratio is 1.
+        # FSDPBackend owns the dual-adapter EMA), and FlowGRPO / FlowDPPO reach the
+        # trainable model directly (LoRA disabled = the ``beta`` KL reference policy),
+        # so both need the backend sibling injected alongside ``pipeline``. GRPO takes
+        # neither and would reject the extra kwarg, so gate on the algorithms' declared
+        # flags (``requires_ema_rollout`` / ``requires_backend``).
+        # ``requires_ema_rollout`` additionally drives the eval-EMA swap around
+        # ``generate`` in ``train_step``: on-policy algorithms MUST sample with the
+        # trainable weights so the first-step importance ratio is 1.
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
-        algo_extra = {"backend": self.backend} if self._uses_ema else {}
+        needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
+        algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
