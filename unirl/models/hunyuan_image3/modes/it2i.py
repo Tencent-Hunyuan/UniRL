@@ -63,32 +63,25 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
             "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
         )
     schedule = req.sigmas.to(pipeline.bundle.device)
-    # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
-    # and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
-    cfg_factor = 2 if cfg else 1
 
     # 1. ViT cond features. Returns joint_image_info (forwarded to chat
     #    template), cond_vit_images, vit_kwargs.
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # 2. VAE encode + ViT-cond duplication for CFG, all via the upstream
-    #    ``_encode_cond_image`` so per-sample list shapes match what the
-    #    unified-MM forward iterates with at hunyuan.py:1903.
+    # 2. VAE encode + ViT cond, built at cfg_factor=1 (ONE copy per sample). The
+    #    cfg uncond branch keeps the SAME source image, so cfg doubling of these
+    #    payloads is a pure block duplication (_encode_cond_image / vit_kwargs do
+    #    ``.repeat`` / ``list*cfg``); the diffusion stage re-applies it when it
+    #    expands CFG. Keeping them B-batched (not doubled) means they survive the
+    #    B-sample track transport that a 2B batch would not.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
-        vit["joint_image_info"], cfg_factor=cfg_factor
+        vit["joint_image_info"], cfg_factor=1
     )
+    vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
 
-    # 3. vit_kwargs duplicated for CFG -- mirror upstream pipeline
-    #    (hunyuan.py:2298-2299).
-    vit_kwargs = vit["vit_kwargs"]
-    if cfg_factor > 1:
-        vit_kwargs = {
-            "spatial_shapes": vit_kwargs["spatial_shapes"] * cfg_factor,
-            "attention_mask": vit_kwargs["attention_mask"] * cfg_factor,
-        }
-
-    # 4. Build the unified-MM tensors with cond-image markers spliced in.
+    # 3. Build the unified-MM tensors with cond-image markers spliced in. With
+    #    cfg=True the fused is the cfg-doubled [cond; uncond] N=2B batch.
     bot_task = str(req.stage_config.get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
@@ -98,6 +91,21 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         bot_task=bot_task,
         batch_cond_image_info=vit["joint_image_info"],
     )
+
+    # 4. Split the cfg-doubled fused into cond (-> fused) + uncond (-> fused_uncond),
+    #    both B-batched (one row per sample). The uncond branch genuinely differs from
+    #    cond (its prompt tokens are replaced by <cfg> tokens), so it must be carried
+    #    explicitly; storing it as its own B-aligned field lets it survive the
+    #    B-sample track transport, and the stage re-stacks [cond; uncond] for a GUIDED
+    #    replay (ratio=1 at cfg>1). cfg=False -> single branch, fused_uncond=None.
+    fused_full = mm["fused"]
+    if cfg:
+        n = int(fused_full.input_ids.shape[0]) // 2
+        fused_cond = fused_full.slice(0, n)
+        fused_uncond = fused_full.slice(n, 2 * n)
+    else:
+        fused_cond = fused_full
+        fused_uncond = None
 
     # 5. Pack into the typed conditions container. The chat-template
     #    path drives the fused sequence via input_ids; cond-image data
@@ -110,7 +118,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         spatial_shapes=vit_kwargs["spatial_shapes"],
     )
     diff_conds = HunyuanImage3DiffusionConditions(
-        fused=mm["fused"],
+        fused=fused_cond,
+        fused_uncond=fused_uncond,
         cond_vae=cond_vae,
         cond_vit=cond_vit,
         cond_timestep=cond_timestep,
