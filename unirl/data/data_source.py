@@ -409,12 +409,9 @@ class MultimodalRLDataSource:
 
         return batch
 
-    def get_eval_samples(self, batch_size: int) -> Dict[str, Any]:
-        """Get a stable eval batch from the dedicated evaluation prompt source."""
-        batch_size = max(0, int(batch_size))
-        if batch_size == 0:
-            return {"prompts": []}
-
+    def iter_eval_batches(self, batch_size: int) -> Iterator[RolloutInputs]:
+        """Yield the full evaluation prompt source in deterministic batches."""
+        batch_size = max(1, int(batch_size))
         self._ensure_eval_dataset()
         if self.eval_dataset is None:
             raise RuntimeError(
@@ -429,14 +426,23 @@ class MultimodalRLDataSource:
                 "get_prompt_example(idx) -> {'prompt': ..., 'metadata': ...}."
             )
 
-        prompt_examples = [
-            normalize_prompt_example(
-                get_prompt_example(idx),
-                default_prompt_id=f"eval:{idx}",
-            )
-            for idx in range(min(batch_size, len(self.eval_dataset)))
-        ]
-        return self._prompt_examples_to_batch(prompt_examples)
+        for start in range(0, len(self.eval_dataset), batch_size):
+            end = min(start + batch_size, len(self.eval_dataset))
+            prompt_examples = [
+                normalize_prompt_example(
+                    get_prompt_example(idx),
+                    default_prompt_id=f"eval:{idx}",
+                )
+                for idx in range(start, end)
+            ]
+            yield self._prompt_examples_to_batch(prompt_examples)
+
+    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
+        """Get the first stable eval batch from the dedicated evaluation source."""
+        batch_size = max(0, int(batch_size))
+        if batch_size == 0:
+            return self._prompt_examples_to_batch([])
+        return next(self.iter_eval_batches(batch_size), self._prompt_examples_to_batch([]))
 
 
 class DefaultDataSource:
@@ -486,7 +492,23 @@ class DefaultDataSource:
             group_ids=[f"prompt:{i}" for i in range(len(prompts))],
         )
 
-    def get_eval_samples(self, batch_size: int) -> Dict[str, List[str]]:
-        """Get a stable eval batch."""
+    def _prompts_to_inputs(self, prompts: List[str], *, offset: int = 0) -> RolloutInputs:
+        return RolloutInputs(
+            primitives={"text": Texts(texts=prompts)},
+            sample_ids=[f"prompt:{offset + i}:sample:0" for i in range(len(prompts))],
+            group_ids=[f"prompt:{offset + i}" for i in range(len(prompts))],
+        )
+
+    def iter_eval_batches(self, batch_size: int) -> Iterator[RolloutInputs]:
+        """Yield all default eval prompts in stable batches."""
+        batch_size = max(1, int(batch_size))
+        for start in range(0, len(self.prompts), batch_size):
+            end = min(start + batch_size, len(self.prompts))
+            yield self._prompts_to_inputs(self.prompts[start:end], offset=start)
+
+    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
+        """Get the first stable eval batch."""
         batch_size = max(0, int(batch_size))
-        return {"prompts": self.prompts[:batch_size]}
+        if batch_size == 0:
+            return self._prompts_to_inputs([])
+        return next(self.iter_eval_batches(batch_size), self._prompts_to_inputs([]))

@@ -183,50 +183,61 @@ class ARTrainer(BaseTrainer):
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
-        """Periodic eval — ``avg@k`` accuracy on the eval prompt set (no training).
+        """Periodic eval — ``avg@k`` accuracy over the full eval prompt set.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
-        advantage/backward: pull ``eval_num_prompts`` eval prompts
-        (``run.eval_data_path``), expand each to ``eval_samples_per_prompt``
-        siblings, generate at ``eval_temperature``, score, and log the mean
-        reward (= avg@k accuracy since reward is 0/1) under ``eval/*``. Returns it.
+        advantage/backward: iterate all prompts from ``run.eval_data_path`` in
+        batches of ``eval_num_prompts``, expand each prompt to
+        ``eval_samples_per_prompt`` siblings, generate at ``eval_temperature``,
+        score, and log the mean reward (= avg@k accuracy since reward is 0/1)
+        under ``eval/*``. Returns it.
         """
         import dataclasses
 
-        eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        inputs = eval_inputs.expand(self.eval_samples_per_prompt)
         eval_ar = dataclasses.replace(
             self.sampling_params.get("ar"),
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        req = RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=eval_sp,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
-        )
-        self.rollout.wake_up()
-        if self.weight_sync is not None:
-            self.weight_sync.sync()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        eval_batches = self.data_source.iter_eval_batches(self.eval_num_prompts)
+        reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        acc = 0.0
-        for track in resp.tracks.values():
-            if track.segment is not None:
-                track = self.reward.score_and_attach(req=req, track=track)
-            if track.rewards is not None:
-                track.rewards = hydrate(track.rewards)
-                acc = float(track.rewards.to(torch.float32).mean().item())
-                break  # single-track for now; revisit if multi-track lands
+        self.rollout.wake_up()
+        try:
+            if self.weight_sync is not None:
+                self.weight_sync.sync()
+            for eval_inputs in eval_batches:
+                batch_n += 1
+                prompt_n += len(eval_inputs.sample_ids)
+                inputs = eval_inputs.expand(self.eval_samples_per_prompt)
+                req = RolloutReq(
+                    sample_ids=list(inputs.sample_ids),
+                    group_ids=list(inputs.group_ids),
+                    primitives=dict(inputs.primitives),
+                    request_conditions={},
+                    sampling_params=eval_sp,
+                    metadata=list(inputs.metadata) if inputs.metadata else [],
+                )
+                resp = self.rollout.generate(req)
+                for track in resp.tracks.values():
+                    if track.segment is not None:
+                        track = self.reward.score_and_attach(req=req, track=track)
+                    if track.rewards is not None:
+                        rewards = hydrate(track.rewards).to(torch.float32)
+                        reward_sum += float(rewards.sum().item())
+                        reward_n += int(rewards.numel())
+                        break  # single-track for now; revisit if multi-track lands
+        finally:
+            self.rollout.sleep()
+
+        acc = reward_sum / max(1, reward_n)
         logger.info(
-            "EVAL rollout %d  eval_acc(avg@%d over %d prompts)=%.4f",
+            "EVAL rollout %d  eval_acc(avg@%d over %d prompts, %d batches of <=%d)=%.4f",
             rollout_id + 1,
             self.eval_samples_per_prompt,
+            prompt_n,
+            batch_n,
             self.eval_num_prompts,
             acc,
         )
