@@ -1,0 +1,183 @@
+# @package _global_
+# Qwen3-Omni THINKER · GSPO + LoRA · VIDEO MCQA · TRAINSIDE (in-process) smoke.
+#
+# Extends the text smoke (qwen3_omni_text_gspo_smoke.yaml) with the
+# (video, prompt) media-ref path: the Qwen3-Omni processor loads each video file
+# and samples frames itself (fps-driven), so video_grid_thw / second_per_grid
+# match its TMRoPE. replay self-fuses video embeds + DeepStack and rebuilds the
+# 3-D TMRoPE positions so the differentiable forward reproduces autoregress
+# exactly (the rollout↔replay k3≈0 gate).
+#
+# TRAINSIDE colocate: the training pipeline IS the sampler — no rollout actors,
+# no weight sync. Tiny by design (2 GPUs, 2 prompts x 4 samples).
+#
+# The model/LoRA/video-preprocessing blocks mirror the validated vLLM-Omni
+# recipes (examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x{4,8}.yaml) so
+# both backends train the same parameter set over the same prompts. The GSPO
+# clip, reward spec, and generation length stay trainside-specific; each is
+# annotated where it differs.
+#
+# Data format: a jsonl whose rows carry a (video, prompt) media-ref pointing at a
+# video file, plus a letter ground_truth scored by mc_exact_match, e.g.::
+#
+#   {"prompt": "<question + A/B/C/D options>",
+#    "prompt_id": "0",
+#    "media_refs": [{"modality": "video", "role": "prompt", "uri": "videos/0.mp4"}],
+#    "metadata": {"answer": "B"}}
+#
+# `uri` is resolved relative to the jsonl's directory. The (video, prompt) role
+# hands the raw file to the processor (see data_source.py::_load_prompt_videos).
+# Point DATA_PATH / EVAL_DATA_PATH at your local train/val jsonl. The model
+# defaults to the public HF id `Qwen/Qwen3-Omni-30B-A3B-Instruct`; set
+# QWEN3_OMNI_PATH to a local dir to use a cache.
+#
+# Launch (from repo root):
+#   DATA_PATH=<train.jsonl> EVAL_DATA_PATH=<val.jsonl> \
+#   python -m unirl.train_ar --config-name=ar/qwen3_omni_video_gspo_lora num_devices=2
+#
+# Multi-step 8-GPU run (override num_devices / num_rollouts / scheduler on the CLI
+# so this file stays the canonical 2-GPU smoke):
+#   DATA_PATH=<train.jsonl> EVAL_DATA_PATH=<val.jsonl> \
+#   python -m unirl.train_ar --config-name=ar/qwen3_omni_video_gspo_lora \
+#     num_devices=8 devices_per_node=8 \
+#     num_rollouts=100 backend.scheduler_cfg.total_steps=100
+
+num_devices: 2
+devices_per_node: 2 # single-node 2-GPU smoke (default is 8/node)
+batch_size: 2
+
+num_rollouts: 2
+weight_sync_interval: 1 # ignored trainside (no `sync` block)
+
+adv_normalization_scope: group
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-qwen3-omni
+  run_name: qwen3_omni_video_gspo_lora
+  tags: [gspo, qwen3-omni, thinker, video, trainside, lora, smoke]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,Qwen/Qwen3-Omni-30B-A3B-Instruct}
+    model_precision: bf16
+    attn_implementation: sdpa
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    use_gradient_checkpointing: true
+    # Rollout-engine hint only (read by VLLMOmniRolloutEngine); inert trainside.
+    use_lora: true
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+    max_prompt_length: 12288
+    # Frame/pixel caps bound the prompt token count; same budget the vLLM-Omni
+    # recipes are validated against.
+    video_fps: 1.0
+    video_max_frames: 64
+    video_max_pixels: 262144
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
+  max_prompt_length: 12288
+  video_fps: 1.0
+  video_max_frames: 64
+  video_max_pixels: 262144
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false # bundle enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    # Qwen3OmniMoeAudioAttention also names its projections q/k/v_proj, so PEFT
+    # would inject adapters under the frozen encoders without this exclusion.
+    exclude_modules: ".*visual.*|.*audio_tower.*"
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    # Plain exact match: this recipe takes an arbitrary MCQA jsonl, so it cannot
+    # assume the video-r1 <answer>X</answer> convention the vLLM-Omni recipes
+    # score against (require_answer_tag / graded_format_reward).
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.gspo.GSPO
+  stage_attr: ar
+  # Paper defaults, unlike the vLLM-Omni recipes: trainside rollout and replay
+  # run the same module, so there is no engine numerics drift to absorb.
+  clip_range: 3.0e-4
+  clip_range_high: 4.0e-4
+  clip_schedule: constant
+  # sampling_temperature MUST equal sampling.temperature so replay's
+  # log_softmax(logits/T) matches the autoregress sampler (ratio≈1 on-policy).
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 2
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 4
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 512

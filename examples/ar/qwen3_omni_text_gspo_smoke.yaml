@@ -1,0 +1,153 @@
+# @package _global_
+# Qwen3-Omni THINKER · GSPO + LoRA · text-only · TRAINSIDE (in-process) smoke.
+#
+# Drives the unirl/models/qwen3_omni bundle through the ARTrainer
+# rollout→reward→advantage→train loop on a text task with the GSPO algorithm,
+# validating that autoregress↔replay log-probs align (ratio≈1, k3≈0 on the
+# on-policy first update).
+#
+# TRAINSIDE colocate: the training pipeline IS the sampler, so there are no
+# rollout actors and no weight sync (the `sync` block is absent — the module is
+# shared). Tiny by design (2 GPUs, 2 prompts x 4 samples, a couple of rollouts).
+#
+# The LoRA scope matches the validated vLLM-Omni recipes
+# (examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x{4,8}.yaml) so both
+# backends train the same parameter set.
+#
+# Data: any GSM8K-style jsonl whose answers carry the `#### <n>` marker scored by
+# gsm8k_exact_match. Point DATA_PATH / EVAL_DATA_PATH at your local train/val
+# jsonl. The model defaults to the public HF id `Qwen/Qwen3-Omni-30B-A3B-Instruct`;
+# set QWEN3_OMNI_PATH to a local dir to use a cache.
+#
+# Launch (from repo root):
+#   DATA_PATH=<train.jsonl> EVAL_DATA_PATH=<val.jsonl> \
+#   python -m unirl.train_ar --config-name=ar/qwen3_omni_text_gspo_smoke num_devices=2
+
+num_devices: 2
+devices_per_node: 2 # single-node 2-GPU smoke (default is 8/node)
+batch_size: 2
+
+num_rollouts: 2
+weight_sync_interval: 1 # ignored trainside (no `sync` block)
+
+adv_normalization_scope: group
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-qwen3-omni
+  run_name: qwen3_omni_text_gspo_smoke
+  tags: [gspo, qwen3-omni, thinker, text, trainside, lora, smoke]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,Qwen/Qwen3-Omni-30B-A3B-Instruct}
+    model_precision: bf16
+    # sdpa is safe everywhere; flex_attention would enable packed replay but the
+    # thinker packed path is not wired yet (this recipe uses dense padded replay).
+    attn_implementation: sdpa
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 1024
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
+  max_prompt_length: 1024
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false # bundle enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2
+  # LoRA on the thinker LLM decoder attention projections (vision + audio towers
+  # frozen by the bundle). rank 32 for a 30B-A3B MoE base.
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    # Qwen3OmniMoeAudioAttention also names its projections q/k/v_proj, so PEFT
+    # would inject adapters under the frozen encoders without this exclusion.
+    exclude_modules: ".*visual.*|.*audio_tower.*"
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.gspo.GSPO
+  stage_attr: ar
+  # GSPO's sequence-level ratio is low-variance → tight clip (paper ε≈3e-4).
+  clip_range: 3.0e-4
+  clip_range_high: 4.0e-4
+  clip_schedule: constant
+  # sampling_temperature MUST equal sampling.temperature so replay's
+  # log_softmax(logits/T) matches the autoregress sampler (ratio≈1 on-policy).
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 2
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 4
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 1024
