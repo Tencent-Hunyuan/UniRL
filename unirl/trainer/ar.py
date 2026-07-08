@@ -54,7 +54,8 @@ class ARTrainer(BaseTrainer):
         normalize_adv_by_std: bool = True,
         balance_shards: bool = False,
         eval_interval: int = 0,
-        eval_num_prompts: int = 60,
+        eval_num_prompts: int = -1,
+        eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
     ) -> None:
@@ -74,8 +75,17 @@ class ARTrainer(BaseTrainer):
         self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
         # AIME-style periodic eval — avg@k accuracy on the eval prompt set
         # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
+        # ``eval_num_prompts`` sentinel:
+        #   -1 (default, or any negative)  → full eval set
+        #    0                             → yield nothing (explicit skip)
+        #    N > 0                         → cap: score first N prompts
+        # ``eval_batch_size`` (default 8) is the iteration batch size, decoupled
+        # from the eval-set size (mirrors verl's ``data.val_batch_size``). Bounds
+        # peak GPU memory during eval-time rollout.
         self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
+        _num = int(eval_num_prompts)
+        self.eval_num_prompts = -1 if _num < 0 else _num
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
@@ -183,14 +193,18 @@ class ARTrainer(BaseTrainer):
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
-        """Periodic eval — ``avg@k`` accuracy over the full eval prompt set.
+        """Periodic eval — ``avg@k`` accuracy on the eval prompt set.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
-        advantage/backward: iterate all prompts from ``run.eval_data_path`` in
-        batches of ``eval_num_prompts``, expand each prompt to
-        ``eval_samples_per_prompt`` siblings, generate at ``eval_temperature``,
-        score, and log the mean reward (= avg@k accuracy since reward is 0/1)
-        under ``eval/*``. Returns it.
+        advantage/backward: iterate up to ``eval_num_prompts`` prompts from
+        ``run.eval_data_path`` in ``eval_batch_size``-sized batches, expand
+        each prompt to ``eval_samples_per_prompt`` siblings, generate at
+        ``eval_temperature``, score, and log the mean reward (= avg@k accuracy
+        since reward is 0/1) under ``eval/*``. Returns it.
+
+        ``eval_num_prompts=-1`` (default) evaluates the full eval set;
+        ``eval_num_prompts=0`` yields no batches (explicit skip). See the
+        sentinel table on :meth:`~unirl.data.data_source.MultimodalRLDataSource.iter_eval_batches`.
         """
         import dataclasses
 
@@ -200,7 +214,10 @@ class ARTrainer(BaseTrainer):
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        eval_batches = self.data_source.iter_eval_batches(self.eval_num_prompts)
+        eval_batches = self.data_source.iter_eval_batches(
+            self.eval_batch_size,
+            eval_num_prompts=self.eval_num_prompts,
+        )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
         self.rollout.wake_up()
@@ -238,7 +255,7 @@ class ARTrainer(BaseTrainer):
             self.eval_samples_per_prompt,
             prompt_n,
             batch_n,
-            self.eval_num_prompts,
+            self.eval_batch_size,
             acc,
         )
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})

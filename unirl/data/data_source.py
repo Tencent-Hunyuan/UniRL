@@ -409,9 +409,30 @@ class MultimodalRLDataSource:
 
         return batch
 
-    def iter_eval_batches(self, batch_size: int) -> Iterator[RolloutInputs]:
-        """Yield the full evaluation prompt source in deterministic batches."""
-        batch_size = max(1, int(batch_size))
+    def iter_eval_batches(
+        self,
+        batch_size: int,
+        *,
+        eval_num_prompts: int = -1,
+    ) -> Iterator[RolloutInputs]:
+        """Yield the evaluation prompt source in deterministic batches.
+
+        Args:
+            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
+                yields nothing (safer than clamping to 1, which would silently
+                iterate the full dataset prompt-by-prompt).
+            eval_num_prompts: cap on total prompts iterated across all batches.
+                Sentinel encoding (matches the trainer's ``eval_num_prompts``
+                config knob):
+                  * ``-1`` (default, or any negative value) — full eval dataset.
+                  * ``0`` — yield nothing (explicit opt-out).
+                  * ``N > 0`` — first ``min(N, len(eval_dataset))`` prompts; the
+                    tail batch may be shorter than ``batch_size``.
+        """
+        batch_size = int(batch_size)
+        eval_num_prompts = int(eval_num_prompts)
+        if batch_size <= 0 or eval_num_prompts == 0:
+            return
         self._ensure_eval_dataset()
         if self.eval_dataset is None:
             raise RuntimeError(
@@ -426,8 +447,10 @@ class MultimodalRLDataSource:
                 "get_prompt_example(idx) -> {'prompt': ..., 'metadata': ...}."
             )
 
-        for start in range(0, len(self.eval_dataset), batch_size):
-            end = min(start + batch_size, len(self.eval_dataset))
+        total = len(self.eval_dataset)
+        limit = total if eval_num_prompts < 0 else min(eval_num_prompts, total)
+        for start in range(0, limit, batch_size):
+            end = min(start + batch_size, limit)
             prompt_examples = [
                 normalize_prompt_example(
                     get_prompt_example(idx),
@@ -438,11 +461,18 @@ class MultimodalRLDataSource:
             yield self._prompt_examples_to_batch(prompt_examples)
 
     def get_eval_samples(self, batch_size: int) -> RolloutInputs:
-        """Get the first stable eval batch from the dedicated evaluation source."""
-        batch_size = max(0, int(batch_size))
-        if batch_size == 0:
+        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`).
+
+        ``batch_size <= 0`` returns an empty batch. Otherwise yields the first
+        deterministic batch of up to ``batch_size`` prompts.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
             return self._prompt_examples_to_batch([])
-        return next(self.iter_eval_batches(batch_size), self._prompt_examples_to_batch([]))
+        return next(
+            self.iter_eval_batches(batch_size),
+            self._prompt_examples_to_batch([]),
+        )
 
 
 class DefaultDataSource:
@@ -499,16 +529,38 @@ class DefaultDataSource:
             group_ids=[f"prompt:{offset + i}" for i in range(len(prompts))],
         )
 
-    def iter_eval_batches(self, batch_size: int) -> Iterator[RolloutInputs]:
-        """Yield all default eval prompts in stable batches."""
-        batch_size = max(1, int(batch_size))
-        for start in range(0, len(self.prompts), batch_size):
-            end = min(start + batch_size, len(self.prompts))
+    def iter_eval_batches(
+        self,
+        batch_size: int,
+        *,
+        eval_num_prompts: int = -1,
+    ) -> Iterator[RolloutInputs]:
+        """Yield the default eval prompts in deterministic batches.
+
+        Args:
+            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
+                yields nothing.
+            eval_num_prompts: cap on total prompts iterated. Same sentinel
+                encoding as :meth:`MultimodalRLDataSource.iter_eval_batches`:
+                ``-1`` (default) = full list; ``0`` = empty; ``N > 0`` = first
+                ``min(N, len(self.prompts))``.
+        """
+        batch_size = int(batch_size)
+        eval_num_prompts = int(eval_num_prompts)
+        if batch_size <= 0 or eval_num_prompts == 0:
+            return
+        total = len(self.prompts)
+        limit = total if eval_num_prompts < 0 else min(eval_num_prompts, total)
+        for start in range(0, limit, batch_size):
+            end = min(start + batch_size, limit)
             yield self._prompts_to_inputs(self.prompts[start:end], offset=start)
 
     def get_eval_samples(self, batch_size: int) -> RolloutInputs:
-        """Get the first stable eval batch."""
-        batch_size = max(0, int(batch_size))
-        if batch_size == 0:
+        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`)."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
             return self._prompts_to_inputs([])
-        return next(self.iter_eval_batches(batch_size), self._prompts_to_inputs([]))
+        return next(
+            self.iter_eval_batches(batch_size),
+            self._prompts_to_inputs([]),
+        )
