@@ -465,6 +465,7 @@ class NativeBackend:
         # CPU tensors correctly — the tensor data is inlined, no fd passing.
         import io as _io
         import pickle as _pickle
+
         import pybase64
 
         buf = _io.BytesIO()
