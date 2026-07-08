@@ -38,11 +38,12 @@ def test_rollout_tp2_e2e_boot_generate_sleep(tp2_gate):
     """Boot a 2-GPU SGLang engine via UniRL, generate, sleep/wake, shutdown.
 
     Validates the full rollout-side TP path:
-      - tp_rank=0 overrides CUDA_VISIBLE_DEVICES and boots a multi-GPU SGLang
+      - tp_rank=0 boots a multi-GPU SGLang engine via runtime_overrides
+        (base_gpu_id, not CUDA_VISIBLE_DEVICES)
       - tp_rank=1 is a no-op shell (no server, no ports)
       - generate produces tokens via the UniRL adapter path
       - sleep releases weights/kv_cache; wake_up restores
-      - shutdown restores the original CUDA_VISIBLE_DEVICES
+      - shutdown cleans up the backend
     """
     pytest.importorskip("sglang")
     from unirl.rollout.engine.sglang.config import SGLangEngineConfig
@@ -92,7 +93,7 @@ def test_rollout_tp2_e2e_boot_generate_sleep(tp2_gate):
     try:
         assert eng._is_tp_zero is True
         assert eng._backend is not None
-        assert os.environ.get("CUDA_VISIBLE_DEVICES") == "0,1"
+        assert eng._tp_size == 2
         assert eng.health_check() is True
 
         # Generate via the UniRL RolloutReq path.

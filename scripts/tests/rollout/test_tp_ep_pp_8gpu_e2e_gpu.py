@@ -39,11 +39,16 @@ def tp8_gate():
     return requires_gpus(8)
 
 
-def _boot_and_generate(eng, *, expected_tp_size: int, devices: list):
+@pytest.fixture
+def tp4_gate():
+    return requires_gpus(4)
+
+
+def _boot_and_generate(eng, *, expected_tp_size: int):
     """Shared assertions: boot, generate, sleep/wake, shutdown."""
     assert eng._is_tp_zero is True
     assert eng._backend is not None
-    assert os.environ.get("CUDA_VISIBLE_DEVICES") == ",".join(str(d) for d in devices)
+    assert eng._tp_size == expected_tp_size
     assert eng.health_check() is True
 
     from unirl.types.primitives import Texts
@@ -110,14 +115,14 @@ def test_tp2_ep2_e2e(tp8_gate):
     )
     passed = False
     try:
-        _boot_and_generate(eng, expected_tp_size=2, devices=[0, 1])
+        _boot_and_generate(eng, expected_tp_size=2)
         passed = True
     finally:
         sglang_e2e_teardown(eng, passed=passed)
 
 
 @pytest.mark.gpu
-def test_tp4_ep4_e2e(tp8_gate):
+def test_tp4_ep4_e2e(tp4_gate):
     """tp=4 + ep=4 on 4 GPUs: 1 engine spanning 4 GPUs, EP shards across TP group.
 
     SGLang requires ``ep_size`` to divide ``tp_size`` (EP is intra-TP-group),
@@ -154,7 +159,7 @@ def test_tp4_ep4_e2e(tp8_gate):
     )
     passed = False
     try:
-        _boot_and_generate(eng, expected_tp_size=4, devices=[0, 1, 2, 3])
+        _boot_and_generate(eng, expected_tp_size=4)
         passed = True
     finally:
         sglang_e2e_teardown(eng, passed=passed)

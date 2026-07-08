@@ -56,18 +56,17 @@ def test_tp2_engine_boot_and_generate(tp2_gate, tmp_path):
     shell = SGLangRolloutEngine(config=cfg, rank=1, tp_rank=1, tp_size=2, tp_device_ids=[0, 1])
     assert shell._is_tp_zero is False and shell._backend is None
 
-    # tp_rank=0: boots a 2-GPU SGLang engine. CUDA_VISIBLE_DEVICES is overridden
-    # to "0,1" so the SGLang scheduler subprocesses see both cards.
+    # tp_rank=0: boots a 2-GPU SGLang engine. The engine passes base_gpu_id
+    # via runtime_overrides (not CUDA_VISIBLE_DEVICES) so the SGLang scheduler
+    # subprocesses see both cards without breaking the train side's CVD view.
     eng = SGLangRolloutEngine(config=cfg, rank=0, tp_rank=0, tp_size=2, tp_device_ids=[0, 1])
     try:
         assert eng._is_tp_zero is True
         assert eng._backend is not None
-        assert os.environ.get("CUDA_VISIBLE_DEVICES") == "0,1"
+        assert eng._tp_size == 2
         assert eng.health_check() is True
     finally:
         eng.shutdown()
-        # CUDA_VISIBLE_DEVICES restored after shutdown.
-        assert os.environ.get("CUDA_VISIBLE_DEVICES") != "0,1"
 
 
 @pytest.mark.gpu
