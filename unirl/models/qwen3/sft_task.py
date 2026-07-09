@@ -84,6 +84,7 @@ class Qwen3SFTTask(SFTTaskBase):
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True,
             tokenize=True,
+            return_dict=False,
         )
         response_ids = tok.encode(response, add_special_tokens=False)
         eos = tok.eos_token_id
