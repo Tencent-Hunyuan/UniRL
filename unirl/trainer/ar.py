@@ -54,7 +54,8 @@ class ARTrainer(BaseTrainer):
         normalize_adv_by_std: bool = True,
         balance_shards: bool = False,
         eval_interval: int = 0,
-        eval_num_prompts: int = 60,
+        eval_num_prompts: int = -1,
+        eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
     ) -> None:
@@ -74,8 +75,17 @@ class ARTrainer(BaseTrainer):
         self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
         # AIME-style periodic eval — avg@k accuracy on the eval prompt set
         # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
+        # ``eval_num_prompts`` sentinel:
+        #   -1 (default, or any negative)  → full eval set
+        #    0                             → yield nothing (explicit skip)
+        #    N > 0                         → cap: score first N prompts
+        # ``eval_batch_size`` (default 8) is the iteration batch size, decoupled
+        # from the eval-set size (mirrors verl's ``data.val_batch_size``). Bounds
+        # peak GPU memory during eval-time rollout.
         self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
+        _num = int(eval_num_prompts)
+        self.eval_num_prompts = -1 if _num < 0 else _num
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
@@ -183,51 +193,69 @@ class ARTrainer(BaseTrainer):
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
-        """Periodic eval — ``avg@k`` accuracy on the eval prompt set (no training).
+        """Periodic eval — ``avg@k`` accuracy on the eval prompt set.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
-        advantage/backward: pull ``eval_num_prompts`` eval prompts
-        (``run.eval_data_path``), expand each to ``eval_samples_per_prompt``
-        siblings, generate at ``eval_temperature``, score, and log the mean
-        reward (= avg@k accuracy since reward is 0/1) under ``eval/*``. Returns it.
+        advantage/backward: iterate up to ``eval_num_prompts`` prompts from
+        ``run.eval_data_path`` in ``eval_batch_size``-sized batches, expand
+        each prompt to ``eval_samples_per_prompt`` siblings, generate at
+        ``eval_temperature``, score, and log the mean reward (= avg@k accuracy
+        since reward is 0/1) under ``eval/*``. Returns it.
+
+        ``eval_num_prompts=-1`` (default) evaluates the full eval set;
+        ``eval_num_prompts=0`` yields no batches (explicit skip). See the
+        sentinel table on :meth:`~unirl.data.data_source.MultimodalRLDataSource.iter_eval_batches`.
         """
         import dataclasses
 
-        eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        inputs = eval_inputs.expand(self.eval_samples_per_prompt)
         eval_ar = dataclasses.replace(
             self.sampling_params.get("ar"),
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        req = RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=eval_sp,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
+        eval_batches = self.data_source.iter_eval_batches(
+            self.eval_batch_size,
+            eval_num_prompts=self.eval_num_prompts,
         )
-        self.rollout.wake_up()
-        if self.weight_sync is not None:
-            self.weight_sync.sync()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        acc = 0.0
-        for track in resp.tracks.values():
-            if track.segment is not None:
-                track = self.reward.score_and_attach(req=req, track=track)
-            if track.rewards is not None:
-                track.rewards = hydrate(track.rewards)
-                acc = float(track.rewards.to(torch.float32).mean().item())
-                break  # single-track for now; revisit if multi-track lands
+        self.rollout.wake_up()
+        try:
+            if self.weight_sync is not None:
+                self.weight_sync.sync()
+            for eval_inputs in eval_batches:
+                batch_n += 1
+                prompt_n += len(eval_inputs.sample_ids)
+                inputs = eval_inputs.expand(self.eval_samples_per_prompt)
+                req = RolloutReq(
+                    sample_ids=list(inputs.sample_ids),
+                    group_ids=list(inputs.group_ids),
+                    primitives=dict(inputs.primitives),
+                    request_conditions={},
+                    sampling_params=eval_sp,
+                    metadata=list(inputs.metadata) if inputs.metadata else [],
+                )
+                resp = self.rollout.generate(req)
+                for track in resp.tracks.values():
+                    if track.segment is not None:
+                        track = self.reward.score_and_attach(req=req, track=track)
+                    if track.rewards is not None:
+                        rewards = hydrate(track.rewards).to(torch.float32)
+                        reward_sum += float(rewards.sum().item())
+                        reward_n += int(rewards.numel())
+                        break  # single-track for now; revisit if multi-track lands
+        finally:
+            self.rollout.sleep()
+
+        acc = reward_sum / max(1, reward_n)
         logger.info(
-            "EVAL rollout %d  eval_acc(avg@%d over %d prompts)=%.4f",
+            "EVAL rollout %d  eval_acc(avg@%d over %d prompts, %d batches of <=%d)=%.4f",
             rollout_id + 1,
             self.eval_samples_per_prompt,
-            self.eval_num_prompts,
+            prompt_n,
+            batch_n,
+            self.eval_batch_size,
             acc,
         )
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
