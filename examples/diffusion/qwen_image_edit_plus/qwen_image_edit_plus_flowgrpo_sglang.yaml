@@ -69,9 +69,6 @@ model_config:
   # engine encodes; the trainer replays captured conditions) and its
   # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
   load_text_encoder: false
-  # The trainer-side VAE is likewise never called on this path (the engine
-  # encodes the source image and decodes outputs in its own workers;
-  # image_latent and images arrive captured).
   load_vae: false
   # Static-shift fallback; the real checkpoint enables dynamic shifting via
   # scheduler/scheduler_config.json and this value is ignored at runtime.

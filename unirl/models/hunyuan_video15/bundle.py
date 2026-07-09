@@ -137,9 +137,6 @@ class HunyuanVideo15Bundle(Bundle):
         else:
             transformer = transformer.to(device=device, dtype=dtype)
 
-        # Separate-engine recipes skip the trainer-side VAE (dead weight
-        # there — the engine decodes in its own workers and the trainer
-        # replays predict_noise only); see HunyuanVideo15PipelineConfig.load_vae.
         vae: Optional[nn.Module] = None
         if config.load_vae:
             vae = (

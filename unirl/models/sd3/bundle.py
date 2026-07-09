@@ -108,9 +108,6 @@ class SD3Bundle(Bundle):
                 device
             )
 
-        # Separate-engine recipes skip the trainer-side VAE (dead weight
-        # there — the engine decodes in its own workers and the trainer
-        # replays predict_noise only); see SD3PipelineConfig.load_vae.
         vae = None
         if config.load_vae:
             vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()

@@ -28,8 +28,6 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
     shift: 3.0
-    # The trainer-side VAE is never called on the separate-engine path
-    # (the engine decodes in its own workers; images arrive captured).
     load_vae: false
 
 pipeline:

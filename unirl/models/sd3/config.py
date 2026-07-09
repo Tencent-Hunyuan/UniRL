@@ -60,12 +60,7 @@ class SD3PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Whether the TRAINER-side bundle loads the VAE. Trainside rollout
-    # (and ReFL direct-reward backprop) requires it — the pipeline decodes
-    # latents in-process. Separate-engine recipes (sglang / vllm-omni)
-    # should set ``false``: the engine decodes in its own workers and the
-    # trainer never calls the VAE — the trainer copy is dead weight on
-    # memory-razor-thin colocate GPUs.
+    # Trainer-side VAE. False for separate-engine recipes (engine owns decode).
     load_vae: bool = True
 
     # VeOmniBackend lifecycle: build the transformer on the meta device

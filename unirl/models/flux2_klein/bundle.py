@@ -223,9 +223,6 @@ class Flux2KleinBundle(Bundle):
             transformer = transformer.to(device)
 
         # --- VAE (frozen, eval) ---
-        # Separate-engine recipes skip the trainer-side VAE (dead weight
-        # there — the engine runs it in its own workers and the trainer
-        # replays predict_noise only); see Flux2KleinPipelineConfig.load_vae.
         vae = None
         if config.load_vae:
             vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()

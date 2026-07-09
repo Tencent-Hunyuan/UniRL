@@ -182,9 +182,6 @@ class QwenImageBundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
-        # Separate-engine recipes skip the trainer-side VAE (dead weight
-        # there — the engine decodes in its own workers and the trainer
-        # replays predict_noise only); see QwenImagePipelineConfig.load_vae.
         vae = None
         if config.load_vae:
             vae = (

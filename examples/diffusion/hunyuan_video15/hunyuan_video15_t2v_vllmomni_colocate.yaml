@@ -60,8 +60,6 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
     shift: 5.0
-    # The trainer-side 3D VAE is never called on the vllm-omni path (the
-    # engine decodes in its own workers; videos arrive captured).
     load_vae: false
 
 pipeline:

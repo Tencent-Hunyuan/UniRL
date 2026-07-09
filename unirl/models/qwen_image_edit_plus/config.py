@@ -62,11 +62,7 @@ class QwenImageEditPlusPipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     load_text_encoder: bool = True
-    # Whether the TRAINER-side bundle loads the VAE. Trainside rollout
-    # requires it (in-process source-image encode + decode). Separate-engine
-    # recipes (sglang / vllm-omni) should set ``false``: the engine
-    # encodes/decodes in its own workers (image_latent arrives captured)
-    # and the trainer never calls the VAE.
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
     meta_init_transformer: bool = False
 

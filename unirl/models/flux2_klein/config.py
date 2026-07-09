@@ -85,11 +85,7 @@ class Flux2KleinPipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Whether the TRAINER-side bundle loads the VAE. Trainside rollout
-    # requires it (the pipeline encodes/decodes in-process).
-    # Separate-engine recipes (sglang) should set ``false``: the engine
-    # runs the VAE in its own workers and the trainer never calls it —
-    # the trainer copy is dead weight on memory-razor-thin colocate GPUs.
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
 
     def __post_init__(self) -> None:

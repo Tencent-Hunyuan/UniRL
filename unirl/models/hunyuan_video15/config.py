@@ -111,11 +111,7 @@ class HunyuanVideo15PipelineConfig:
     # the SigLIP module itself is skipped.
     load_vision_encoder: bool = False
 
-    # Whether the TRAINER-side bundle loads the 3D VAE. Trainside rollout
-    # requires it (the pipeline decodes latents in-process).
-    # Separate-engine recipes (vllm-omni) should set ``false``: the engine
-    # decodes in its own workers and the trainer never calls the VAE —
-    # the trainer copy is dead weight on memory-razor-thin colocate GPUs.
+    # Trainer-side 3D VAE. False for separate-engine recipes (engine owns decode).
     load_vae: bool = True
 
     # LoRA hints for rollout-side engines (e.g. ``sglang``). Mirrors
