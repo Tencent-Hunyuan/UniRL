@@ -87,3 +87,38 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
+
+## Profiling → Perfetto
+
+Opt-in `torch.profiler` (`unirl/utils/profiling.py`): one env var writes a gzipped Perfetto
+trace to `outputs/profiler/` on rank 0 (no-op otherwise). Training compute only (not rollout).
+
+Both capture **one snapshot of a single train step** (after a short warmup, then off — one
+trace, not one per step; training keeps running). They differ in *which slice* they record:
+
+- **`one-update`** — one optimizer update (forward + backward + optimizer) with its cross-GPU
+  comm. Skips the anchor forward; small; **for compute/comm overlap**.
+- **`train`** — the whole step: anchor forward (recompute old-policy log-probs; for diffusion
+  it replays the denoising trajectory, so it's large) + all updates. **For step-time breakdown.**
+
+> The unified-model stack (HI3, AR+image) only supports `train` — it fuses each step into a
+> single update, so there is no per-update boundary for `one-update` to wrap (a warning is
+> logged and no trace is produced).
+
+```bash
+UNIRL_PROFILE=one-update  python -m unirl.train_diffusion --config-name=<recipe> ...
+UNIRL_PROFILE=train       python -m unirl.train_diffusion --config-name=<recipe> ...
+```
+
+Download the `.gz` to your local machine, then <https://ui.perfetto.dev/> → *Open trace file*.
+
+### Configurable env vars (defaults are fine)
+
+| var | what it does | default |
+|-----|--------------|---------|
+| `UNIRL_PROFILE` | `one-update` / `train` (unset = off) | off |
+| `UNIRL_PROFILE_DIR` | where the trace is written (auto-created) | `outputs/profiler` |
+| `UNIRL_PROFILE_RANKS` | which ranks profile: `0`, `all`, or a list like `0,8` | `0` |
+| `UNIRL_PROFILE_CUDA` | record GPU kernels; `0` = CPU-only trace | `1` |
+| `UNIRL_PROFILE_WARMUP` | skip the first few iterations before recording (avoids the one-time first-iter compile / alloc) — one-update: skip N updates; train: schedule warmup | `2` / `1` |
+| `UNIRL_PROFILE_MEMORY` | also record CUDA memory alloc/free (memory-over-time; bigger trace) | off |

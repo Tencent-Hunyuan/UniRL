@@ -24,7 +24,7 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, Video, Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
@@ -244,7 +244,8 @@ def stack_decoded_images(
     Image-output adapters may opt into squeezing a singleton temporal axis
     ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
     run through the legacy image path should disable this so a true single-frame
-    video is dropped like any other 4-D video sample.
+    video is dropped like any other 4-D video sample. Multi-frame 4-D samples are
+    dropped with a warning either way (no Videos packing on the image track).
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -270,6 +271,37 @@ def stack_decoded_images(
     if not per_sample_tensors:
         return None
     return Images(pixels=torch.stack(per_sample_tensors, dim=0))
+
+
+def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
+    """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch.
+
+    The video counterpart of :func:`stack_decoded_images`. ``decode_sample``
+    returns canonical channels-first video ``[C, T, H, W]`` (see
+    :func:`unirl.rollout.engine.sglang_diffusion.utils.tensors.normalize_media`);
+    the :class:`~unirl.types.primitives.Video` primitive — and the video reward
+    consumer (``video_pickscore``, which permutes ``frames[T,C,H,W] → [C,T,H,W]``)
+    — want frame-major ``[T, C, H, W]``, so we permute before packing.
+    ``Videos.from_list`` concatenates along T and lets the Batch framework
+    compute the per-sample ``cu_frames`` offsets. Each result carries exactly
+    one decoded sample (mirrors :func:`stack_decoded_images`'s one-per-result
+    contract). Returns ``None`` when no recognizable video was produced.
+    """
+    videos: List[Video] = []
+    for result in results:
+        canonical = decode_sample(result.samples)
+        if canonical is None:
+            continue
+        if canonical.dim() != 4:
+            raise RuntimeError(
+                f"stack_decoded_videos: expected 4-D canonical video [C, T, H, W]; "
+                f"got rank {canonical.dim()}, shape {tuple(canonical.shape)}."
+            )
+        frames = canonical.permute(1, 0, 2, 3).contiguous().to(torch.float32)  # [T, C, H, W]
+        videos.append(Video(frames=frames))
+    if not videos:
+        return None
+    return Videos.from_list(videos)
 
 
 # ---------------------------------------------------------------------------
@@ -433,5 +465,6 @@ __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
     "stack_decoded_images",
+    "stack_decoded_videos",
     "fuse_text_conditions",
 ]

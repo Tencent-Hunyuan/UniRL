@@ -91,15 +91,20 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         pil_images = images_prim.to_pils()
         if len(pil_images) != len(prompts):
             raise ValueError(f"build_prompts: image batch {len(pil_images)} != prompt count {len(prompts)}")
-        # Collapse PILs in parallel with prompts: one image per unique prompt.
+        # Collapse PILs in parallel with prompts: one source image per group.
+        # Mirror ``deexpand_prompts_from_groups``'s group logic (first image per
+        # group, in first-seen group order) rather than assuming a contiguous
+        # group-major layout — ``pil_images[::k]`` would misalign images vs
+        # prompts if ``group_ids`` are interleaved ([A,B,A,B,...]). ``k == 1``
+        # means no collapse happened (heterogeneous K or no grouping), so the
+        # PILs stay 1:1 with the prompts.
         if k > 1:
-            # K-expanded: all K samples in a group share the same source image
-            # (same prompt + same source, K different noise draws). The PILs
-            # are laid out group-major — ``pil_images[g*k : (g+1)*k]`` are the
-            # K copies for group ``g`` — so stride ``[::k]`` picks one per
-            # group. (``[:N]`` would be wrong when ``N <= K``: all N picks
-            # would land inside group 0.)
-            unique_pils = pil_images[::k]
+            unique_pils = self._first_per_group(pil_images, list(req.group_ids))
+            if len(unique_pils) != len(unique_prompts):
+                raise ValueError(
+                    f"build_prompts: collapsed image count {len(unique_pils)} != unique prompt "
+                    f"count {len(unique_prompts)} (group_ids/image misalignment)."
+                )
         else:
             unique_pils = pil_images
         out: Dict[str, Any] = {
@@ -173,6 +178,22 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                 f"to ragged-pad."
             )
         return torch.cat(tensors, dim=0)
+
+    @staticmethod
+    def _first_per_group(items: List[Any], group_ids: List[str]) -> List[Any]:
+        """First item of each group, in first-seen group order.
+
+        Mirrors how :func:`utils.deexpand_prompts_from_groups` collapses prompts,
+        so the source-image collapse aligns with the prompt collapse regardless
+        of the sample layout (contiguous or interleaved ``group_ids``).
+        """
+        seen: set[str] = set()
+        out: List[Any] = []
+        for item, gid in zip(items, group_ids):
+            if gid not in seen:
+                seen.add(gid)
+                out.append(item)
+        return out
 
     def _deexpand_prompts(self, prompts: List[str], req: RolloutReq):
         """Collapse K-expanded prompts back to unique + repeat count.

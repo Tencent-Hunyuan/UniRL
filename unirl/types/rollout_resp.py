@@ -100,6 +100,17 @@ class RolloutTrack(Batch):
     conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
     segment: Optional[Segment] = field(kind=FieldKind.CONCAT, default=None)
     decoded: Optional[Decoded] = field(kind=FieldKind.CONCAT, default=None)
+    # Parallel secondary media decoded alongside ``decoded`` for the SAME samples
+    # (not a separate track — keeps GRPO grouping / advantage alignment intact).
+    # First consumer: LTX-2.3 T2AV, where ``decoded`` holds the video and
+    # ``decoded_audio`` the jointly-generated audio waveform. The reward service
+    # injects it into the reward request as a side-channel so a composite scorer
+    # can read video + audio together. ``None`` for every single-modality track.
+    decoded_audio: Optional[Audios] = field(kind=FieldKind.CONCAT, default=None)
+    # Source sample rate (Hz) of ``decoded_audio`` waveforms (e.g. the LTX-2
+    # vocoder's output rate). Batch-shared metadata — one rate per track. The
+    # reward service forwards it to audio scorers via RewardRequest.audio_sample_rate.
+    audio_sample_rate: Optional[int] = shared_field(default=None)
     media_preview: Optional[MediaPreview] = concat_field(default=None)
 
     rewards: Optional[torch.Tensor] = concat_field(default=None)
@@ -127,6 +138,7 @@ class RolloutTrack(Batch):
         light.conditions = {}
         light.segment = None
         light.decoded = None
+        light.decoded_audio = None
         return light
 
     @property
