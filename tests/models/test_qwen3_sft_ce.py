@@ -18,8 +18,10 @@ from unirl.models.qwen3.sft_task import Qwen3SFTTask
 class _FakeTokenizer:
     eos_token_id = 99
 
-    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True):
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, return_dict=False):
         # Deterministic: one token per character of the user content, + a marker.
+        # `return_dict` mirrors the transformers-5.x kwarg the task passes
+        # (Qwen3SFTTask.load_record uses return_dict=False -> flat id list).
         content = messages[0]["content"]
         return [1] + [ord(c) % 50 for c in content]
 
