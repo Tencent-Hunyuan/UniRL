@@ -80,9 +80,7 @@ class Cosmos3SFTTaskBase:
             actions = torch.load(os.path.join(root, record["actions_path"]), weights_only=True)
             chunk = self.config.action_chunk_size
             if actions.shape != (chunk, self.config.raw_action_dim):
-                raise ValueError(
-                    f"actions must be [{chunk}, {self.config.raw_action_dim}], got {tuple(actions.shape)}"
-                )
+                raise ValueError(f"actions must be [{chunk}, {self.config.raw_action_dim}], got {tuple(actions.shape)}")
             if frames.shape[0] != chunk + 1:
                 raise ValueError(
                     f"policy BC pairs {chunk} actions with {chunk + 1} frames, got {frames.shape[0]} frames"
@@ -149,9 +147,7 @@ class Cosmos3SFTTaskBase:
                 record["actions"].to(device=device, dtype=torch.float32),
                 int(self.bundle.transformer.config.action_dim),
             )
-            x_t_action, v_target_action = noise_action_latents(
-                x0_action, sigma, cfg.raw_action_dim, generator
-            )
+            x_t_action, v_target_action = noise_action_latents(x0_action, sigma, cfg.raw_action_dim, generator)
             action_kwargs = {
                 "action_tokens": x_t_action,
                 "action_condition_frame_indexes": (),  # policy BC: fully noisy chunk
@@ -242,7 +238,11 @@ class Cosmos3SFTTaskBase:
                 view_point=cfg.action_view_point,
             )
             out = self.pipe(
-                prompt=record["instruction"], action=condition, guidance_scale=1.0, fps=record.get("fps", cfg.fps), **common
+                prompt=record["instruction"],
+                action=condition,
+                guidance_scale=1.0,
+                fps=record.get("fps", cfg.fps),
+                **common,
             )
             # `out.action` may be a list or a tensor; avoid ambiguous tensor
             # truthiness (`if tensor` raises for multi-element tensors).

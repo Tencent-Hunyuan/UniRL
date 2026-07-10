@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Prepare a small LeRobot-v3 robot dataset (default ``lerobot/droid_100``) into
 self-contained Cosmos3 SFT debug samples.
 
@@ -172,9 +171,11 @@ def main() -> None:
     parser.add_argument("--eval-episodes", type=int, default=5, help="last N episodes held out")
     parser.add_argument("--action-key", default="action")
     parser.add_argument(
-        "--expect-action-dim", type=int, default=7,
+        "--expect-action-dim",
+        type=int,
+        default=7,
         help="action width the Cosmos3 recipe assumes (Cosmos3SFTConfig.raw_action_dim); "
-             "prep warns if the dataset's actual dim differs so config drift is caught here.",
+        "prep warns if the dataset's actual dim differs so config drift is caught here.",
     )
     args = parser.parse_args()
 
@@ -206,8 +207,14 @@ def main() -> None:
     # Policy-DROID reproduction the gripper should be left unnormalized (or
     # min-max'd) rather than z-scored like the continuous cartesian dims.
     action_dim = int(len(mean))
-    stats = {"mean": mean.tolist(), "std": std.tolist(), "count": int(count),
-             "source": args.repo, "action_key": args.action_key, "action_dim": action_dim}
+    stats = {
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "count": int(count),
+        "source": args.repo,
+        "action_key": args.action_key,
+        "action_dim": action_dim,
+    }
     with open(os.path.join(args.root, "stats.json"), "w") as fh:
         json.dump(stats, fh, indent=1)
     print(f"action stats over {count} steps: dim={action_dim}")

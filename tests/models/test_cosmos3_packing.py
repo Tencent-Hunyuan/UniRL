@@ -32,7 +32,12 @@ def test_sample_train_sigma_bounds_and_shift_identity():
     gen_a = torch.Generator().manual_seed(7)
     gen_b = torch.Generator().manual_seed(7)
     s1 = sample_train_sigma(
-        time_dist="uniform", logitnormal_mean=0.0, logitnormal_std=1.0, shift=1.0, generator=gen_a, device=torch.device("cpu")
+        time_dist="uniform",
+        logitnormal_mean=0.0,
+        logitnormal_std=1.0,
+        shift=1.0,
+        generator=gen_a,
+        device=torch.device("cpu"),
     )
     base = torch.rand((), generator=gen_b)
     assert torch.allclose(s1, base.clamp(1e-4, 1 - 1e-4))
