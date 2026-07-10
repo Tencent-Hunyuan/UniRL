@@ -1,0 +1,71 @@
+# @package _global_
+# Cosmos3-Nano video-prediction SFT on the droid_100 debug set — 1x8, gen-stream
+# full finetune (und/AR tower frozen), flow-matching velocity MSE.
+#
+# The first-milestone recipe: obs frame 0 (clean) + instruction -> predict the
+# next 16 frames. Data comes from `python -m unirl.utils.prepare_droid100`
+# (self-contained uint8 clips; no video decoding in the training loop).
+#
+# Launch (single node): ray start --head; RAY_ADDRESS=auto python -m unirl.train_sft \
+#   --config-name sft/cosmos3_droid100_videopred
+
+num_devices: 8
+batch_size: 8                # one packed sample per rank per step
+num_rollouts: 200            # optimizer steps
+max_grad_norm: 1.0
+save_interval: 100
+save_mode: auto
+eval_interval: 50
+eval_num_samples: 1
+save_dir: ${oc.env:SAVE_DIR,outputs/cosmos3_droid100_videopred}
+
+policy:
+  _target_: unirl.train.sft.policy.SFTPolicy
+  task_target: unirl.models.cosmos3.sft_task.Cosmos3VideoSFTTask
+  seed: 42
+  model_config:
+    _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
+    model_precision: bf16
+    vae_precision: fp32
+    freeze_understanding: true
+    time_dist: logitnormal
+    fps: 15.0
+    condition_on_first_frame: true
+    sample_num_inference_steps: 20
+    sample_guidance_scale: 6.0
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 10
+    total_steps: ${num_rollouts}
+  lora_cfg: null               # full finetune of the (unfrozen) gen stream
+
+data_source:
+  _target_: unirl.train.sft.data.JsonlSFTDataSource
+  manifest_path: ${oc.env:DATA_PATH,datasets/droid100_debug/manifest.jsonl}
+  eval_manifest_path: ${oc.env:EVAL_DATA_PATH,datasets/droid100_debug/eval_manifest.jsonl}
+  seed: 42
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,cosmos3_droid100_videopred}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["cosmos3", "sft", "videopred", "droid100"]
+  log_media: false

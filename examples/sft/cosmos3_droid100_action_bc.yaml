@@ -1,0 +1,78 @@
+# @package _global_
+# Cosmos3-Nano action behavior cloning (policy mode) on droid_100 — 1x8.
+#
+# Mirrors Cosmos3-Nano-Policy-DROID's pretraining objective at debug scale:
+# latent frame 0 = clean observation, future video frames + the whole action
+# chunk are noised and jointly denoised; loss = vision MSE + 10x action MSE
+# (upstream action_loss_weight), sigma ~ logitnormal with flow_shift=5.0
+# (upstream action-recipe schedule).
+#
+# NB droid_100 carries LeRobot's collapsed 7-D `action` field, not the 10-D
+# EE-pose layout the droid_lerobot domain head was pretrained on — fine for a
+# debug BC run (the head is being finetuned), documented in examples/sft/README.md.
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 300
+max_grad_norm: 1.0
+save_interval: 100
+save_mode: auto
+eval_interval: 100
+eval_num_samples: 1
+save_dir: ${oc.env:SAVE_DIR,outputs/cosmos3_droid100_action_bc}
+
+policy:
+  _target_: unirl.train.sft.policy.SFTPolicy
+  task_target: unirl.models.cosmos3.sft_task.Cosmos3ActionBCTask
+  seed: 42
+  model_config:
+    _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
+    model_precision: bf16
+    vae_precision: fp32
+    freeze_understanding: true
+    flow_shift: 5.0
+    time_dist: logitnormal
+    fps: 15.0
+    condition_on_first_frame: true
+    action_domain_name: droid_lerobot
+    action_chunk_size: 16
+    raw_action_dim: 7
+    action_loss_weight: 10.0
+    action_view_point: third_person_view
+    sample_num_inference_steps: 30
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 10
+    total_steps: ${num_rollouts}
+  lora_cfg: null
+
+data_source:
+  _target_: unirl.train.sft.data.JsonlSFTDataSource
+  manifest_path: ${oc.env:DATA_PATH,datasets/droid100_debug/manifest.jsonl}
+  eval_manifest_path: ${oc.env:EVAL_DATA_PATH,datasets/droid100_debug/eval_manifest.jsonl}
+  seed: 42
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,cosmos3_droid100_action_bc}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["cosmos3", "sft", "action-bc", "policy-mode", "droid100"]
+  log_media: false
