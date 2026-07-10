@@ -133,6 +133,22 @@ checkpoint (`save_interval`) → periodic samples (`eval_interval`, written to
   the joint objective Cosmos3-Nano-Policy-DROID was post-trained with
   (`action_loss_weight=10`, `flow_shift=5.0` per the upstream action recipes).
 
+## Verified runs (2026-07-06, 1×8 H20, nvidia/Cosmos3-Nano, droid_100 512 train / 16 eval windows)
+
+- `cosmos3_droid100_videopred` (6-step smoke): loss 0.345 → 0.230, grad_norm
+  1.6–14.6, ~1 s/step after load; eval samples at steps 3/6; `checkpoint-6`
+  written and resumable.
+- `cosmos3_droid100_action_bc` (150 steps ≈ 2.3 epochs, batch 8): total loss
+  (vision + 10× action) mean 12.89 (first 25 steps) → 9.95 (last 25), min 4.12
+  — per-step values are noisy by construction (logitnormal σ). Eval samples at
+  steps 50/100/150 each contain the generated video `[17,3,192,320]` and the
+  predicted action chunk `[16,10]`; final `checkpoint-150` (55 GB torch format;
+  prefer `checkpoint_format: dcp` or LoRA for long runs).
+
+Note: ~half of droid_100's episodes carry no language annotation (the dataset
+has 47 task strings over 100 episodes); those windows fall back to the generic
+"perform the task" instruction.
+
 ## Known Cosmos3 debug-scale simplifications
 
 - **droid_100 actions are LeRobot's collapsed 7-D `action` field** (≈ 6-D
