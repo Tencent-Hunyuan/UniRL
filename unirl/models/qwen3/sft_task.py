@@ -139,9 +139,7 @@ class Qwen3SFTTask(SFTTaskBase):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def sample(
-        self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None
-    ) -> Dict[str, Any]:
+    def sample(self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]:
         device = self.bundle.device
         prompt_ids = torch.tensor([loaded["prompt_ids"]], dtype=torch.long, device=device)
         self.bundle.transformer.eval()

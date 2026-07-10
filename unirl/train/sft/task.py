@@ -58,9 +58,7 @@ class SFTTask(Protocol):
         self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]: ...
 
-    def sample(
-        self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None
-    ) -> Dict[str, Any]: ...
+    def sample(self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]: ...
 
 
 class SFTTaskBase(ABC):
@@ -91,9 +89,7 @@ class SFTTaskBase(ABC):
     ) -> Tuple[torch.Tensor, Dict[str, float]]: ...
 
     @abstractmethod
-    def sample(
-        self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None
-    ) -> Dict[str, Any]: ...
+    def sample(self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]: ...
 
 
 __all__ = ["SFTTask", "SFTTaskBase"]

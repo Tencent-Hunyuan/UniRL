@@ -63,7 +63,9 @@ class SFTTrainer(BaseTrainer):
         self.dp_size = int(self.policy.dp_size)
         if self.batch_size % self.dp_size:
             raise ValueError(f"batch_size={self.batch_size} must be divisible by policy dp={self.dp_size}")
-        logger.info("SFTTrainer ready: dp=%d batch=%d max_grad_norm=%.2f", self.dp_size, self.batch_size, self.max_grad_norm)
+        logger.info(
+            "SFTTrainer ready: dp=%d batch=%d max_grad_norm=%.2f", self.dp_size, self.batch_size, self.max_grad_norm
+        )
 
     def train_step(self, records: List[Dict[str, Any]], *, step: int) -> Tuple[Dict[str, float], float, float]:
         t0 = time.perf_counter()
@@ -119,7 +121,12 @@ class SFTTrainer(BaseTrainer):
                 )
                 self.wandb_logger.log_step(
                     step + 1,
-                    {"train/loss": metrics.get("loss/total", 0.0), "train/grad_norm": grad_norm, "perf/step_time_s": dt, **metrics},
+                    {
+                        "train/loss": metrics.get("loss/total", 0.0),
+                        "train/grad_norm": grad_norm,
+                        "perf/step_time_s": dt,
+                        **metrics,
+                    },
                     prefix="",
                 )
                 if self.eval_interval and (step + 1) % self.eval_interval == 0:
