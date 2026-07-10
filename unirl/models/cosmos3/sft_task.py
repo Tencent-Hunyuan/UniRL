@@ -182,6 +182,14 @@ class Cosmos3SFTTaskBase:
         if pred_v.dim() == 4:  # [C, T_lat, H, W] -> [1, C, T_lat, H, W]
             pred_v = pred_v.unsqueeze(0)
         noisy_frames = meta["vision_noisy_frames"]
+        # We index the prediction by absolute latent-frame idx, so it must be the
+        # DENSE per-frame grid aligned with v_target's frame axis (not just the
+        # noisy tokens). Assert rather than silently misalign if the transformer
+        # ever returns a packed/token-only layout.
+        assert pred_v.shape[2] == v_target.shape[2], (
+            f"vision pred frame axis {pred_v.shape[2]} != target {v_target.shape[2]}; "
+            "expected a dense per-frame latent grid"
+        )
         vision_loss = F.mse_loss(pred_v[:, :, noisy_frames].float(), v_target[:, :, noisy_frames])
         loss = cfg.vision_loss_weight * vision_loss
         metrics = {
@@ -236,7 +244,9 @@ class Cosmos3SFTTaskBase:
             out = self.pipe(
                 prompt=record["instruction"], action=condition, guidance_scale=1.0, fps=record.get("fps", cfg.fps), **common
             )
-            action = out.action[0] if out.action else None
+            # `out.action` may be a list or a tensor; avoid ambiguous tensor
+            # truthiness (`if tensor` raises for multi-element tensors).
+            action = out.action[0] if (out.action is not None and len(out.action) > 0) else None
             return {"video": out.video.cpu(), "action": action}
         out = self.pipe(
             prompt=record["instruction"],

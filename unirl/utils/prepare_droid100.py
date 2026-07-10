@@ -171,6 +171,11 @@ def main() -> None:
     parser.add_argument("--max-eval-windows", type=int, default=16)
     parser.add_argument("--eval-episodes", type=int, default=5, help="last N episodes held out")
     parser.add_argument("--action-key", default="action")
+    parser.add_argument(
+        "--expect-action-dim", type=int, default=7,
+        help="action width the Cosmos3 recipe assumes (Cosmos3SFTConfig.raw_action_dim); "
+             "prep warns if the dataset's actual dim differs so config drift is caught here.",
+    )
     args = parser.parse_args()
 
     dataset_root = download_dataset(args.repo, args.hf_local_dir)
@@ -196,10 +201,22 @@ def main() -> None:
         count += actions.shape[0]
     mean = sums / count
     std = np.sqrt(np.maximum(sq_sums / count - mean**2, 1e-8))
-    stats = {"mean": mean.tolist(), "std": std.tolist(), "count": int(count), "source": args.repo, "action_key": args.action_key}
+    # NOTE: every action channel is z-normalized uniformly here, including the
+    # near-binary gripper column. Fine for a debug BC run, but for faithful
+    # Policy-DROID reproduction the gripper should be left unnormalized (or
+    # min-max'd) rather than z-scored like the continuous cartesian dims.
+    action_dim = int(len(mean))
+    stats = {"mean": mean.tolist(), "std": std.tolist(), "count": int(count),
+             "source": args.repo, "action_key": args.action_key, "action_dim": action_dim}
     with open(os.path.join(args.root, "stats.json"), "w") as fh:
         json.dump(stats, fh, indent=1)
-    print(f"action stats over {count} steps: dim={len(mean)}")
+    print(f"action stats over {count} steps: dim={action_dim}")
+    if action_dim != args.expect_action_dim:
+        print(
+            f"WARNING: dataset action dim {action_dim} != --expect-action-dim "
+            f"{args.expect_action_dim}. Set Cosmos3SFTConfig.raw_action_dim={action_dim} "
+            "in the recipe or the Cosmos3 task will raise on load."
+        )
 
     # Pass 2: window extraction.
     manifests = {"train": [], "eval": []}
