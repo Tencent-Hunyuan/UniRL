@@ -105,9 +105,14 @@ class SFTPolicy(Remote):
         generator.manual_seed(self.base_seed + 100_003 * int(step) + self._dp_rank())
 
         totals: Dict[str, float] = {}
-        for record in shard:
+        last = len(shard) - 1
+        for i, record in enumerate(shard):
             loaded = self.task.load_record(record)
             loss, metrics = self.task.compute_loss(loaded, generator=generator)
+            # Defer the FSDP2 reduce-scatter to the last micro-sample so it runs
+            # once per optimizer step instead of once per sample (a multi-node
+            # win; no-op unless defer_grad_sync + ZeRO-2). Must precede backward.
+            self.backend.set_grad_sync(i == last)
             (loss / len(shard)).backward()
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0.0) + float(value) / len(shard)
@@ -128,7 +133,9 @@ class SFTPolicy(Remote):
             loaded = self.task.load_record(record)
             out = self.task.sample(loaded, generator=generator)
             out["sample_id"] = record.get("sample_id")
-            out["instruction"] = record.get("instruction")
+            # AR rows carry `prompt` not `instruction`; fall back so the eval
+            # dump keeps a human-readable label instead of a bare None.
+            out["instruction"] = record.get("instruction") or record.get("prompt")
             outputs.append(out)
         self.backend.model.train()
         return outputs if self._dp_rank() == 0 else None

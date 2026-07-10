@@ -9,9 +9,12 @@ is injected into every record so relative paths stay portable.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class JsonlSFTDataSource:
@@ -34,6 +37,7 @@ class JsonlSFTDataSource:
         self._epoch = 0
         self._pos = 0
         self._order = self._make_order()
+        self._warned_eval_fallback = False
 
     @staticmethod
     def _load(path: Optional[str]) -> List[Dict[str, Any]]:
@@ -69,6 +73,12 @@ class JsonlSFTDataSource:
         return batch
 
     def eval_samples(self, k: int) -> List[Dict[str, Any]]:
+        if not self.eval_records_all and not self._warned_eval_fallback:
+            logger.warning(
+                "no eval manifest given; eval_samples() is falling back to the TRAIN "
+                "set — eval metrics/samples will be measured on training data."
+            )
+            self._warned_eval_fallback = True
         pool = self.eval_records_all or self.records
         return pool[: max(1, int(k))]
 

@@ -8,17 +8,25 @@ model-agnostic (one skeleton, AR + diffusion).
 Flow-matching SFT (mirrors how the SD3 RL/rollout path defines the field):
 
     x0    = VAE-encode(image)                       # clean latent
-    sigma ~ logit-normal: sigmoid(N(0,1))            # SD3-default noise weighting
+    sigma ~ logit-normal: sigmoid(N(0,1))            # unshifted (see note below)
     x_t   = (1 - sigma) * x0 + sigma * noise         # forward interpolation
     v     = SD3DiffusionStep.predict_noise(x_t, ..)  # transformer predicts velocity
     loss  = MSE(v, noise - x0)                        # target velocity dx/dsigma
 
 The velocity convention (target = ``noise - x0``, NOT ``noise``) matches
 ``FlowSDEStrategy.step``'s drift term ``noise_pred * (sigma_next - sigma)`` —
-i.e. ``predict_noise`` outputs ``dx/dsigma``. Training draws ``sigma`` from a
-logit-normal distribution (``sigmoid(z), z~N(0,1)``) — the SD3 default (Esser et
-al. 2024) used by diffusers' ``train_dreambooth_lora_sd3``, concentrating
-samples on the informative mid-noise band. Reuses:
+i.e. ``predict_noise`` outputs ``dx/dsigma``. Training draws ``sigma`` from an
+**unshifted** logit-normal distribution (``sigmoid(z), z~N(0,1)``), the
+logit-normal timestep weighting Esser et al. 2024 found best. NOTE this is a
+deliberate simplification, not a bit-exact copy of diffusers'
+``train_dreambooth_lora_sd3``: that script draws the logit-normal ``u`` and then
+maps it through the scheduler's resolution/shift warp (``shift=3`` for SD3), so
+its training ``sigma`` is shifted toward high noise the same way inference is.
+Here training uses the raw ``sigmoid(z)`` (concentrated on the mid-noise band),
+while :meth:`sample` denoises over the ``shift=3.0`` inference grid — so the
+train/eval schedules differ by that warp. Unshifted logit-normal is a known,
+acceptable finetuning choice; apply ``self.shift`` to the drawn sigma if exact
+train/eval schedule parity is wanted. Reuses:
 :meth:`SD3Bundle.from_config`, :class:`SD3TextEmbedStage` (text→embeds),
 :meth:`SD3DiffusionStep.predict_noise` (CFG-aware transformer forward, here with
 ``guidance_scale=1.0`` so only the conditional branch runs), and
@@ -34,6 +42,7 @@ Record schema (one JSONL row): ``{"sample_id": str, "image_path": str, "prompt":
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -89,6 +98,13 @@ class SD3SFTTask(SFTTaskBase):
             )
         root = record.get("_root", "")
         img = PILImage.open(os.path.join(root, image_path)).convert("RGB")
+        # SD3's patch-embed (patch_size 2 over an /8 VAE) needs H and W divisible
+        # by 16, else the transformer forward crashes / silently crops. Resize to
+        # a square, 16-aligned resolution so any manifest image conforms.
+        res = int(getattr(self.config, "sft_resolution", 512))
+        res = max(16, (res // 16) * 16)
+        if img.size != (res, res):
+            img = img.resize((res, res), PILImage.BICUBIC)
         arr = torch.from_numpy(_pil_to_float01(img))  # [3, H, W] in [0, 1]
         loaded = dict(record)
         loaded["pixels"] = arr
@@ -111,7 +127,10 @@ class SD3SFTTask(SFTTaskBase):
         if shift_factor is not None:
             z = z - float(shift_factor)
         z = z * scaling_factor
-        return z.to(dtype=self.bundle.dtype)
+        # Keep the clean latent in fp32: compute_loss builds the fp32 supervised
+        # target `noise - x0` from it, so a bf16 round-trip here is needless
+        # precision loss. predict_noise casts x_t to the param dtype itself.
+        return z.to(dtype=torch.float32)
 
     # ------------------------------------------------------------------
     # Loss
@@ -126,13 +145,14 @@ class SD3SFTTask(SFTTaskBase):
 
         conditions = SD3Conditions(text=self.text_embed.embed(Texts(texts=[loaded["prompt"]])))
 
-        # Sample the training noise level from a logit-normal distribution:
-        # sigma = sigmoid(z), z ~ N(0, 1). This is the SD3 default (Esser et al.
-        # 2024 found logit-normal timestep weighting best across schemes) and
-        # what diffusers' train_dreambooth_lora_sd3 uses. It concentrates samples
-        # near the informative mid-noise band (sigma ~ 0.5), unlike a uniform
-        # draw over the inference schedule (which is shift=3-biased toward high
-        # sigma — an RL rollout-schedule convention, not an SFT training one).
+        # Sample the training noise level from an UNSHIFTED logit-normal:
+        # sigma = sigmoid(z), z ~ N(0, 1) — the logit-normal weighting Esser et
+        # al. 2024 found best, concentrating samples on the informative mid-noise
+        # band. This is a deliberate simplification: diffusers'
+        # train_dreambooth_lora_sd3 additionally warps sigma through the
+        # scheduler's shift=3 map (matching inference), which we skip here (see
+        # the module docstring). A uniform draw over the shift=3 inference grid —
+        # the RL rollout convention — would instead over-weight high sigma.
         z = torch.randn(1, generator=generator, device=device, dtype=torch.float32)
         sigma = torch.sigmoid(z).view(1)
 
@@ -142,7 +162,15 @@ class SD3SFTTask(SFTTaskBase):
         v_target = noise - x0.float()
 
         self.bundle.transformer.train()
-        v_pred = self.diffusion.predict_noise(self.bundle, x_t, sigma, conditions, guidance_scale=1.0)
+        # Match the rollout forward (SD3DiffusionStage.diffuse), which runs
+        # predict_noise under autocast; on CPU (tests) autocast is skipped.
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            v_pred = self.diffusion.predict_noise(self.bundle, x_t, sigma, conditions, guidance_scale=1.0)
         loss = F.mse_loss(v_pred.float(), v_target)
         metrics = {"loss/total": float(loss.detach().item()), "train/sigma": float(sigma.item())}
         return loss, metrics
