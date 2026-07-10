@@ -33,7 +33,6 @@ def build_task(x0, predict_fn):
     task.diffusion = types.SimpleNamespace(predict_noise=predict_fn)
     task.shift = 3.0
     task.autocast_dtype = torch.bfloat16
-    task._num_sched_steps = 100
     task._encode_image = lambda pixels: x0
     return task
 
