@@ -8,18 +8,22 @@ model-agnostic (one skeleton, AR + diffusion).
 Flow-matching SFT (mirrors how the SD3 RL/rollout path defines the field):
 
     x0    = VAE-encode(image)                       # clean latent
-    sigma ~ shifted schedule (get_sigma_schedule)   # noise level in (0, 1)
+    sigma ~ logit-normal: sigmoid(N(0,1))            # SD3-default noise weighting
     x_t   = (1 - sigma) * x0 + sigma * noise         # forward interpolation
     v     = SD3DiffusionStep.predict_noise(x_t, ..)  # transformer predicts velocity
     loss  = MSE(v, noise - x0)                        # target velocity dx/dsigma
 
 The velocity convention (target = ``noise - x0``, NOT ``noise``) matches
 ``FlowSDEStrategy.step``'s drift term ``noise_pred * (sigma_next - sigma)`` —
-i.e. ``predict_noise`` outputs ``dx/dsigma``. Reuses:
+i.e. ``predict_noise`` outputs ``dx/dsigma``. Training draws ``sigma`` from a
+logit-normal distribution (``sigmoid(z), z~N(0,1)``) — the SD3 default (Esser et
+al. 2024) used by diffusers' ``train_dreambooth_lora_sd3``, concentrating
+samples on the informative mid-noise band. Reuses:
 :meth:`SD3Bundle.from_config`, :class:`SD3TextEmbedStage` (text→embeds),
 :meth:`SD3DiffusionStep.predict_noise` (CFG-aware transformer forward, here with
 ``guidance_scale=1.0`` so only the conditional branch runs), and
-:func:`unirl.sde.runtime.get_sigma_schedule` (the static SD3 ``shift=3.0`` grid).
+:func:`unirl.sde.runtime.get_sigma_schedule` (the static SD3 ``shift=3.0`` grid,
+used by :meth:`sample` for the few-step eval denoiser).
 Image→latent VAE encode is written here (inverse of ``SD3VAEDecodeStage``).
 
 Batch note: the SFT policy calls ``compute_loss`` per record (B = 1).
@@ -64,9 +68,6 @@ class SD3SFTTask(SFTTaskBase):
         self.autocast_dtype = parse_torch_dtype(
             getattr(config, "autocast_precision", "bf16"), field_name="SD3SFTTask.autocast_precision"
         )
-        # A generous static schedule to sample sigma from; the exact length does
-        # not matter for training (we draw one interior sigma per sample).
-        self._num_sched_steps = int(getattr(config, "sft_num_sched_steps", 1000))
 
     @classmethod
     def from_config(cls, config: SD3PipelineConfig) -> "SD3SFTTask":
@@ -125,10 +126,15 @@ class SD3SFTTask(SFTTaskBase):
 
         conditions = SD3Conditions(text=self.text_embed.embed(Texts(texts=[loaded["prompt"]])))
 
-        # Draw one interior sigma from the shifted schedule (drop the terminal 0/1).
-        sigmas = get_sigma_schedule(self._num_sched_steps, shift=self.shift, device=device)
-        idx = int(torch.randint(1, len(sigmas) - 1, (1,), generator=generator, device=device).item())
-        sigma = sigmas[idx].to(dtype=torch.float32).view(1)
+        # Sample the training noise level from a logit-normal distribution:
+        # sigma = sigmoid(z), z ~ N(0, 1). This is the SD3 default (Esser et al.
+        # 2024 found logit-normal timestep weighting best across schemes) and
+        # what diffusers' train_dreambooth_lora_sd3 uses. It concentrates samples
+        # near the informative mid-noise band (sigma ~ 0.5), unlike a uniform
+        # draw over the inference schedule (which is shift=3-biased toward high
+        # sigma — an RL rollout-schedule convention, not an SFT training one).
+        z = torch.randn(1, generator=generator, device=device, dtype=torch.float32)
+        sigma = torch.sigmoid(z).view(1)
 
         noise = torch.randn(x0.shape, generator=generator, device=device, dtype=torch.float32)
         s = sigma.view(1, *([1] * (x0.ndim - 1)))

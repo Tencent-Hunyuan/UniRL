@@ -27,7 +27,6 @@ def _make_task(predict_noise_fn, x0):
     task.diffusion = types.SimpleNamespace(predict_noise=predict_noise_fn)
     task.shift = 3.0
     task.autocast_dtype = torch.bfloat16
-    task._num_sched_steps = 100
     # Stub VAE encode to return the given clean latent.
     task._encode_image = lambda pixels: x0
     return task
