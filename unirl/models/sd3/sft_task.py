@@ -180,9 +180,7 @@ class SD3SFTTask(SFTTaskBase):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def sample(
-        self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None
-    ) -> Dict[str, Any]:
+    def sample(self, loaded: Dict[str, Any], *, generator: Optional[torch.Generator] = None) -> Dict[str, Any]:
         # A few-step Euler flow-match sampler over the same schedule, decoded via
         # the VAE. Kept minimal — eval is a qualitative smoke, not the training
         # objective. Returns pixels [3, H, W] in [0, 1].

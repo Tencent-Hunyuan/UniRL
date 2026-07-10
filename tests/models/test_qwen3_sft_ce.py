@@ -54,9 +54,7 @@ class _FakeTransformer:
 def _make_task(logp_row):
     task = Qwen3SFTTask.__new__(Qwen3SFTTask)  # bypass __init__ (no real bundle)
     transformer = _FakeTransformer(logp_row)
-    bundle = types.SimpleNamespace(
-        transformer=transformer, tokenizer=_FakeTokenizer(), device=torch.device("cpu")
-    )
+    bundle = types.SimpleNamespace(transformer=transformer, tokenizer=_FakeTokenizer(), device=torch.device("cpu"))
     task.bundle = bundle
     task.config = types.SimpleNamespace(autocast_precision="bf16")
     task.tokenizer = bundle.tokenizer

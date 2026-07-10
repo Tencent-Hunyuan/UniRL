@@ -79,8 +79,12 @@ def main():
 
     # Two SEPARATE model instances so the _replay_aware_forward install on the
     # "ours" model can never shadow the stock labels= forward on the HF model.
-    hf_model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").to(device).eval()
-    our_model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").to(device).eval()
+    hf_model = (
+        AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").to(device).eval()
+    )
+    our_model = (
+        AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").to(device).eval()
+    )
 
     print(f"TRUE parity (HF-native .loss vs ours) over {len(records)} records, fp32:")
     diffs = []

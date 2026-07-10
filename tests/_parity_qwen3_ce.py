@@ -37,9 +37,7 @@ def tokenize(tok, prompt, response):
 def reference_ce(model, prompt_ids, response_ids, device):
     """HF/TRL-standard: full logits, shift, F.cross_entropy with prompt = -100."""
     full = torch.tensor([prompt_ids + response_ids], dtype=torch.long, device=device)
-    labels = torch.tensor(
-        [[-100] * len(prompt_ids) + list(response_ids)], dtype=torch.long, device=device
-    )
+    labels = torch.tensor([[-100] * len(prompt_ids) + list(response_ids)], dtype=torch.long, device=device)
     logits = model(input_ids=full, use_cache=False).logits.float()  # [1, L, V]
     # standard causal shift: logits[:-1] predict labels[1:]
     shift_logits = logits[:, :-1, :]
@@ -79,9 +77,11 @@ def ours_ce(model, prompt_ids, response_ids, device):
 def main():
     device = torch.device("cuda")
     tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.float32, attn_implementation="sdpa"
-    ).to(device).eval()
+    model = (
+        AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32, attn_implementation="sdpa")
+        .to(device)
+        .eval()
+    )
 
     records = [json.loads(x) for x in open(DATA)][:N]
     print(f"parity over {len(records)} records (fp32, single GPU):")
