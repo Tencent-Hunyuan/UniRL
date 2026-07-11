@@ -40,6 +40,90 @@ if TYPE_CHECKING:
 module_logger = logging.getLogger(__name__)
 
 
+def _write_video_with_audio(
+    frames: Any,
+    fps: int,
+    audio: torch.Tensor,
+    audio_sample_rate: int,
+) -> str:
+    """Mux video frames + audio waveform into a single mp4 file using PyAV.
+
+    Mirrors Flow-Factory's ``LogVideo._write_mp4_with_audio``. Video is H.264,
+    audio is AAC. Returns the temp file path (caller passes to ``wandb.Video``).
+    Falls back to writing video-only if PyAV is unavailable.
+    """
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        from fractions import Fraction
+
+        import av
+
+        container = av.open(path, mode="w")
+        video_stream = container.add_stream("libx264", rate=int(fps))
+        video_stream.width = int(frames.shape[2])
+        video_stream.height = int(frames.shape[1])
+        video_stream.pix_fmt = "yuv420p"
+
+        audio_stream = container.add_stream("aac", rate=audio_sample_rate)
+        audio_stream.codec_context.sample_rate = audio_sample_rate
+        audio_stream.codec_context.layout = "stereo"
+        audio_stream.codec_context.time_base = Fraction(1, audio_sample_rate)
+
+        for frame_array in frames:
+            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+            for packet in video_stream.encode(frame):
+                container.mux(packet)
+        for packet in video_stream.encode():
+            container.mux(packet)
+
+        samples = audio.float().cpu()
+        if samples.ndim == 1:
+            samples = samples.unsqueeze(0)
+        if samples.shape[0] == 1:
+            samples = samples.expand(2, -1)
+        samples = samples.T  # (T, 2)
+        samples = torch.clamp(samples, -1.0, 1.0)
+        int16_samples = (samples * 32767.0).to(torch.int16)
+
+        audio_frame = av.AudioFrame.from_ndarray(
+            int16_samples.contiguous().reshape(1, -1).numpy(),
+            format="s16",
+            layout="stereo",
+        )
+        audio_frame.sample_rate = audio_sample_rate
+
+        target_format = audio_stream.codec_context.format or "fltp"
+        target_layout = audio_stream.codec_context.layout or "stereo"
+        resampler = av.audio.resampler.AudioResampler(
+            format=target_format,
+            layout=target_layout,
+            rate=audio_sample_rate,
+        )
+        audio_next_pts = 0
+        for rframe in resampler.resample(audio_frame):
+            if rframe.pts is None:
+                rframe.pts = audio_next_pts
+            audio_next_pts += rframe.samples
+            rframe.sample_rate = audio_sample_rate
+            container.mux(audio_stream.encode(rframe))
+        for packet in audio_stream.encode():
+            container.mux(packet)
+
+        container.close()
+    except ImportError:
+        module_logger.warning("PyAV (av) not installed; writing video without audio. Install with: pip install av")
+        os.unlink(path)
+        fd2, path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd2)
+        import imageio
+
+        imageio.mimwrite(path, frames, fps=fps, format="FFMPEG", codec="libx264", pixelformat="yuv420p")
+    return path
+
+
 class PhaseTimer:
     """Per-phase wall-clock timer for one train step.
 
@@ -117,7 +201,7 @@ def install_phase_timing(trainer: Any) -> None:
     If a collaborator ever becomes async-submit (returns before the work
     finishes), its phase collapses to submission time and the wait leaks into
     the residual — a sudden near-zero phase plus a large
-    ``rollout_time_s - sum(phases)`` residual is the tell.
+    ``step_time_s - sum(phases)`` residual is the tell.
     """
     inner = getattr(trainer, "train_step", None)
     if not callable(inner):
@@ -242,6 +326,9 @@ class UniRLWandBLogger:
         # Optimizer-step counter for the ``train/`` panel (moved here from
         # BaseTrainer so all step-axis bookkeeping lives in the logger).
         self._optimizer_step = int(optimizer_step)
+        # Set by MemoryMonitor.install(); when present, log_rollout_step folds
+        # its per-step summary (perf/max_memory_* etc.) into the perf dict.
+        self.memory_monitor = None
 
         # Only enable on rank 0
         self.enabled = enabled and rank == 0
@@ -546,6 +633,8 @@ class UniRLWandBLogger:
             else:
                 video_key = f"{key}/videos"
 
+        # Temp mp4 files written by the audio-mux path; unlinked after upload.
+        _muxed_paths: List[str] = []
         try:
             n = max(len(images) if has_images else 0, len(videos) if has_videos else 0)
 
@@ -565,6 +654,9 @@ class UniRLWandBLogger:
 
             if has_videos:
                 wandb_videos: List[Any] = []
+                # Per-sample audio waveforms for muxing (T2AV); empty list if none.
+                audios = getattr(media_preview, "audios", None) or []
+                audio_sr = getattr(media_preview, "audio_sample_rate", None)
                 for idx in range(min(len(videos), n)):
                     vid = videos[idx]
                     if not torch.is_tensor(vid):
@@ -587,13 +679,31 @@ class UniRLWandBLogger:
                         .permute(1, 0, 2, 3)  # [C, T, H, W] -> [T, C, H, W]
                         .numpy()
                     )
-                    wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
+                    # Mux audio into mp4 when available (T2AV); otherwise plain array.
+                    audio_wf = audios[idx] if idx < len(audios) else None
+                    if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
+                        # PyAV expects (T, H, W, C) RGB24 frames; arr is (T, C, H, W).
+                        arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
+                        path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                        _muxed_paths.append(path)
+                        wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
+                    else:
+                        wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
                 if wandb_videos:
                     payload[video_key] = wandb_videos
 
             wandb.log(payload)
         except Exception as e:
             print(f"Warning: Failed to log generated media: {e}")
+        finally:
+            # wandb.Video copies the file into the run dir on construction, so the
+            # temp mp4s are safe to remove once logging is done. Avoids leaking a
+            # /tmp mp4 per muxed sample every media-log step.
+            for _p in _muxed_paths:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
 
     def log_eval(
         self,
@@ -645,7 +755,7 @@ class UniRLWandBLogger:
           any ``extra_metrics`` (e.g. ``sync_weights``) merged in.
         - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
           (see :meth:`_log_train`).
-        - ``perf/rollout_time_s``: optional wall-clock for the step.
+        - ``perf/step_time_s``: optional total wall-clock for the step.
         - ``perf/<phase>_time_s``: optional per-phase wall-clocks from
           ``phase_times`` (e.g. ``generate``/``weight_sync``/``reward``/
           ``train``), so the step total can be attributed without log
@@ -657,6 +767,12 @@ class UniRLWandBLogger:
         previews via :meth:`log_generated_media` at this same step value and
         frees them before dispatch.
         """
+        # Memory step boundary runs BEFORE the wandb early-out: the closing probe
+        # re-arms peak counters and fires snapshot dumps (Level 2), neither of
+        # which should depend on wandb being enabled. Its wandb keys are folded
+        # into perf on the enabled path below. Covers async_ar (no train_step to
+        # wrap), and this is the step window boundary for the peak counters.
+        mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
             return
         # Lazy import keeps wandb_logger importable without the training stack.
@@ -672,9 +788,11 @@ class UniRLWandBLogger:
 
         perf: Dict[str, float] = {}
         if step_time_s is not None:
-            perf["rollout_time_s"] = float(step_time_s)
+            perf["step_time_s"] = float(step_time_s)
         if phase_times:
             perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
+        if mem_summary:
+            perf.update(mem_summary)
         if perf:
             self.log_perf(step, perf)
 

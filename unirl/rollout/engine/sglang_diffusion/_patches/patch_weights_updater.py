@@ -78,14 +78,24 @@ def _resolve_param_names_mapping(module) -> dict:
 def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int, num_shards: int) -> None:
     """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param.
 
-    Prefers the param's SGLang ``weight_loader`` when it accepts a shard id (it
-    derives each shard's offset/size from the layer's ``output_sizes`` and is thus
-    TP- and GQA-correct). The manual fallback splits dim 0 into ``num_shards`` EQUAL
-    slices, so it is correct ONLY for equal-sized shards (q==k==v, w1==w3) — which
-    holds for Z-Image base (MHA: ``num_attention_heads == n_kv_heads``) at
-    ``tp_size=1``, the only fused model reaching it here. A future fused GQA model
-    must go through the ``weight_loader`` path (the equal-split fallback would
-    silently corrupt unequal shards).
+    SGLang fused projections pack ``[shard_0 | shard_1 | … | shard_{n-1}]``
+    contiguously along dim 0 in shard-id order. Two layouts occur:
+
+    * **all-equal** — ``q==k==v`` (Z-Image ``to_qkv``), ``w1==w3`` (``w13``): each
+      slice is ``shard_id * size``.
+    * **trailing-unequal** — HunyuanVideo single-block ``linear1 = [q, k, v, mlp]``
+      packs three ``H``-sized attention shards + one ``4H``-sized MLP shard. The
+      leading shards are equal (``shard_id * size``); the LAST shard is larger and
+      sits at the tail (``dim0 - size``).
+
+    Placing the trailing shard at the tail (rather than the legacy ``dim0 //
+    num_shards`` equal split, which slices four ``1.75H`` chunks for ``linear1`` and
+    crashes writing an ``H`` tensor into a ``1.75H`` slot) is exact for both layouts
+    and needs no sibling shards — so it is robust to the sender's bucketing (a
+    block's q/k/v/mlp may arrive in different buckets). It deliberately does NOT
+    support an unequal MIDDLE shard (no SGLang fused param has one). The param's own
+    ``weight_loader`` is tried first when it accepts a shard id (TP-correct); plain
+    ``ReplicatedLinear`` (``tp_size=1``) takes no shard id, so it falls through here.
     """
     wl = getattr(param, "weight_loader", None)
     if wl is not None:
@@ -96,16 +106,40 @@ def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int,
             pass
     data = param.data
     total = int(data.shape[0])
-    if total % num_shards != 0:
-        raise ValueError(f"fused param dim0={total} not divisible by num_shards={num_shards}")
-    s = total // num_shards
-    data[shard_id * s : (shard_id + 1) * s].copy_(tensor.to(param.dtype))
+    size = int(tensor.shape[0])
+    # Leading shards are equal-sized; a (possibly larger) trailing shard sits at the
+    # tail. For all-equal fusions the two formulas coincide (``(n-1)*size == dim0 - size``).
+    offset = total - size if shard_id == num_shards - 1 else shard_id * size
+    if offset < 0 or offset + size > total:
+        raise ValueError(
+            f"fused shard {shard_id}/{num_shards}: size={size} at offset={offset} does not fit fused param dim0={total}"
+        )
+    data[offset : offset + size].copy_(tensor.to(param.dtype))
 
 
 def _apply_fused_param_mapping(module, named_tensors):
-    """Consume separate-projection tensors into their fused params via the model's
-    ``param_names_mapping``; return the leftover ``(name, tensor)`` list for the
+    """Apply the model's ``param_names_mapping`` to the incoming named tensors.
+
+    A model's ``param_names_mapping`` (the same dict its checkpoint loader applies)
+    has two entry kinds; a model may use either or both:
+
+    * **fused projections** — ``{regex: (replacement, shard_id, num_shards)}`` —
+      write the trainer's separate-projection tensor into a dim-0 slice of the
+      model's fused param (Z-Image ``to_q/k/v -> to_qkv``, ``w1/w3 -> w13``).
+    * **plain renames** — ``{regex: replacement_str}`` — the model simply renamed
+      a param vs the checkpoint. WAN's mapping is entirely of this kind
+      (``patch_embedding.* -> patch_embedding.proj.*``,
+      ``blocks.N.attn1.to_q.* -> blocks.N.to_q.*``,
+      ``ffn.net.0.proj -> ffn.fc_in``, …). An EMPTY replacement means the model
+      dropped that param (e.g. WAN ``attn2.norm_added_q``) — the tensor is discarded.
+
+    Returns the leftover ``(name, tensor)`` list (renamed where applicable) for the
     exact-match loader. No-op when the module declares no mapping.
+
+    Before this handled the rename kind, simple-rename models (WAN) matched NOTHING
+    in the in-memory update path → 112/113 transformer tensors silently skipped →
+    the rollout engine ran stale base weights → flat reward curve (cross-engine
+    divergence), exactly the fused-model bug one step removed.
     """
     mapping = _resolve_param_names_mapping(module)
     if not mapping:
@@ -113,31 +147,59 @@ def _apply_fused_param_mapping(module, named_tensors):
 
     model_params = dict(module.named_parameters())
     leftover: list = []
-    fused = 0
+    fused = renamed = dropped = 0
     for name, tensor in named_tensors:
         if name in model_params:
             leftover.append((name, tensor))
             continue
         handled = False
         for pat, val in mapping.items():
-            if not isinstance(val, (tuple, list)) or len(val) != 3:
-                continue
             m = re.match(pat, name)
             if m is None:
                 continue
-            replacement, shard_id, num_shards = val
-            target = m.expand(replacement)
-            param = model_params.get(target)
-            if param is None:
-                continue
-            _write_fused_shard(param, tensor, int(shard_id), int(num_shards))
-            fused += 1
-            handled = True
-            break
+            if isinstance(val, (tuple, list)) and len(val) == 3:
+                replacement, shard_id, num_shards = val
+                param = model_params.get(m.expand(replacement))
+                if param is None:
+                    continue
+                _write_fused_shard(param, tensor, int(shard_id), int(num_shards))
+                fused += 1
+                handled = True
+                break
+            if isinstance(val, str):
+                if val == "":
+                    # model dropped this param — nothing to load.
+                    dropped += 1
+                    handled = True
+                    break
+                target = re.sub(pat, val, name)
+                if target in model_params:
+                    leftover.append((target, tensor))
+                    renamed += 1
+                    handled = True
+                    break
+                # rename produced a non-param name; keep trying other patterns.
         if not handled:
             leftover.append((name, tensor))
-    if fused:
-        _log.info("weight-sync: loaded %d fused shard(s) (e.g. qkv/w13) via param_names_mapping", fused)
+    if fused or renamed or dropped:
+        _log.info(
+            "weight-sync: param_names_mapping applied — %d fused, %d renamed, %d dropped",
+            fused,
+            renamed,
+            dropped,
+        )
+    # A leftover name that is still not a real model param slipped through every
+    # mapping branch (unmatched pattern, or a rename whose target does not exist).
+    # It will silently no-op in the exact-match loader — exactly the stale-weight
+    # failure this mapping is meant to prevent — so surface it loudly instead.
+    unmatched = [n for n, _ in leftover if n not in model_params]
+    if unmatched:
+        _log.warning(
+            "weight-sync: %d tensor(s) matched no model param after param_names_mapping "
+            "(e.g. %s) — likely a mapping gap; these will not update any weight",
+            len(unmatched),
+            unmatched[:5],
+        )
     return leftover
 
 

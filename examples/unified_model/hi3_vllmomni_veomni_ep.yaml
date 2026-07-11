@@ -1,0 +1,262 @@
+# @package _global_
+# HunyuanImage3 think_recaption RL — v2 unified-backbone trainer, COLOCATE.
+#
+# One shared HunyuanImage3 transformer (mode=gen_text for AR, mode=gen_image for
+# DiT) trained jointly by GRPO (AR TextSegment) + FlowGRPO (DiT
+# LatentSegment), both backward-accumulating into ONE LoRA adapter with a single
+# optimizer step (UnifiedModelTrainStack). Rollout is a two-engine vLLM-Omni setup
+# (modality=ar_recaption: AR think/recaption → modality=dit_recaption: DiT); the
+# trained LoRA is synced back into both engines every rollout.
+#
+# Pairs with unirl/train_unified_model.py (UnifiedModelTrainer). Modeled on
+# sd3_vllmomni_full_ipc.yaml (single-backbone v2 + vllm-omni + colocate sync)
+# and pe_trainside_pickscore.yaml (two-algorithm shape).
+#
+# Confirm at smoke time (GPU-specific, can't be unit-checked):
+#   - backend.block_class_names: the HF HunyuanImage3 decoder-layer class name.
+#   - sync.param_prefix: must match the engine-side LoRA key naming (see
+#     HunyuanImage3PipelineConfig.weight_sync_param_name_prefix). The fused qkv
+#     is split q/k/v engine-side by vLLM's native packed-modules mapping.
+
+num_devices: 8
+batch_size: 4                 # prompts per rollout; each expands to samples_per_prompt
+
+weight_sync_interval: 1
+
+# Intrusive debug dump (UnifiedModelTrainer._dump_rollout): per rollout, dump original
+# prompt + AR output text (the think/recaption fed into DiT) + decoded images +
+# image rewards. null = disabled (default); set to a writable path to enable.
+dump_dir: null
+
+# W&B reporting (UnifiedModelTrainer._init_wandb). Secrets stay in the env:
+# WANDB_API_KEY + WANDB_ENTITY (entity falls back to ${oc.env:WANDB_ENTITY}).
+# report_to_wandb=false → fully no-op. Override run_name per launch.
+logging:
+  report_to_wandb: true
+  project_name: hi3-grpo
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  logging_dir: null
+  tags: [hi3, two-engine, grpo]
+  # Generated-image previews (off by default elsewhere; HI3 wants them).
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+bundle:
+  # 80B path: meta-init (no per-rank full load) → FSDPBackend wraps the meta
+  # decoder and calls bundle.materialize(), which loads each rank's shard via
+  # DCP (~20GB/card). ``from_config`` (the .to(device) path) would try to put
+  # the full ~160GB model on one GPU → OOM (see bundle.from_config docstring).
+  _target_: unirl.models.hunyuan_image3.bundle.HunyuanImage3Bundle.from_meta_config
+  config:
+    _target_: unirl.models.hunyuan_image3.config.HunyuanImage3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    shift: 3.0
+    guidance_scale: 1.0
+
+pipeline:
+  # Assemble from the SHARED bundle (auto-injected by the trainer) so the
+  # algorithms' replay reads the FSDP-trained weights. from_bundle builds all
+  # sub-stages (text_embed / diffusion / vae_* / ar / vit); shift + precisions
+  # come off the bundle config. (The raw __init__ would need all 6 stages
+  # passed explicitly; from_config/from_meta_config would build a SECOND,
+  # unshared bundle — wrong for colocate.)
+  _target_: unirl.models.hunyuan_image3.pipeline.HunyuanImage3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  # VeOmni FSDP2 + expert parallelism. resolve_trainable_module prefers the
+  # bundle's trainable_module() -> the bare decoder (transformer.model), so
+  # VeOmni root-shards the single decoder (not the composite wrapper); the frozen
+  # VAE/ViT/heads stay outside the wrap. Needs meta-init (from_meta_config).
+  _target_: unirl.train.backend.veomni.backend.VeOmniBackend
+  block_class_names: ["HunyuanImage3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false       # VeOmniBackend v1 rejects cpu_offload=true
+    mixed_precision: true    # VeOmniBackend v1 requires mixed_precision=true
+    fsdp_mode: full          # VeOmniBackend v1 supports only 'full'
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    sp_size: 1
+    # Expert-parallel degree (THE single EP switch): when >1 the backend asks the
+    # bundle to fuse its MoE experts ([E,2I,H] via veomni grouped GEMM + all_to_all)
+    # and shards them across ep_size ranks (each holds num_experts/ep_size experts;
+    # tokens routed via all_to_all). Must divide world_size and num_experts(=64).
+    # Experts are frozen (LoRA trains attention only) -> EP is a throughput/memory win.
+    ep_size: 8
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  # Single shared LoRA adapter — both AR and DiT algorithms train it.
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - qkv_proj
+      - o_proj
+
+# Two standalone vLLM-Omni engines (the v2 two-engine design). The AR engine
+# (modality ar_recaption, single LLM stage, GPUs 0-3) emits N think/recaption
+# texts per prompt; the DiT engine (modality dit_recaption, single diffusion
+# stage, GPUs 4-7) renders M distinct-noise images per recaption. UnifiedModelTrainer
+# wires both with remote() in the shared placement; each engine clears
+# CUDA_VISIBLE_DEVICES for its multi-GPU HI3 modality and its stage YAML's
+# runtime.devices pins the physical cards (a real partition, NOT anchor+pop).
+# Both run enable_sleep_mode so the trainer can sleep/wake them around the
+# colocate train phase. The two engines share ONE backbone/LoRA via sync.
+ar_rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    # AR-only think/recaption stage (is_comprehension:false), GPUs 0-3.
+    modality: hi3_ar_recaption
+    enable_sleep_mode: true
+
+dit_rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    # Standalone DiT stage that eats an externally-injected recaption, GPUs 4-7.
+    modality: hi3_dit_recaption
+    enable_sleep_mode: true
+
+reward:
+  # main reward API (#169): one RewardService over a single backend (the old
+  # RewardServiceNew + executors[] / InProcessRewardExecutor wrapper was dropped).
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 4
+      device: auto
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR,yuvalkirstain/PickScore_v1}
+      model_id: ${oc.env:PICKSCORE_MODEL,yuvalkirstain/PickScore_v1}
+
+# Two algorithms over the one shared pipeline. ``ar`` resolves pipeline.ar,
+# ``image`` resolves pipeline.diffusion (via stage_attr). UnifiedModelTrainer reads
+# cfg.algorithm.ar / cfg.algorithm.image.
+algorithm:
+  ar:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2            # AR/LLM trust region (matches ar/qwen_vl grpo; 0.2 never binds -> no clip)
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.hunyuan_image3.conditions.HunyuanImage3ARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  image:
+    _target_: unirl.algorithms.flowgrpo.FlowGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-4            # diffusion trust region (matches sd3/qwen_image; 0.2 never binds -> no clip on SDE-logprob ratio)
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
+    # FlowGRPO.replay needs the same guidance_scale / eta the rollout
+    # sampled with — bind to the "diffusion" entry of the sampling dict.
+    params: ${sampling.diffusion}
+
+# One stack: single backend + both algorithms → one optimizer step.
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Modality-keyed sampling dict: intended hierarchy is
+#   original prompt → ar.samples_per_prompt AR trajectories (temperature-sampled
+#   think/recaption) → each trajectory → diffusion.samples_per_prompt images.
+#   AR GRPO groups by original prompt; image GRPO groups by AR trajectory.
+#
+# NOTE (current engine reality): the two-engine ar_recaption→dit_recaption flow
+# runs ONE AR + ONE image per request (flat 1:1; num_images_per_prompt defaults
+# to 1). So today
+# ar/diffusion samples_per_prompt simply multiply to G = N*M flat (AR, image)
+# pairs per prompt, each with its own temperature-sampled think/recaption and its
+# own seed. True 2-level "M images per AR trajectory" needs engine-side
+# num_images_per_prompt fan-out + response.py lineage for n images/AR (follow-up).
+# These small values are for the dump-first observe run.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 2       # N AR trajectories per prompt (temperature-driven)
+    temperature: 0.6            # >0 so the N trajectories actually differ
+    max_new_tokens: 4096
+    top_p: 0.95
+    top_k: 1024
+  diffusion:
+    _target_: unirl.types.sampling.DiffusionSamplingParams
+    samples_per_prompt: 2       # M images per AR trajectory (see NOTE above)
+    num_inference_steps: 16
+    guidance_scale: 1.0
+    height: 1024
+    width: 1024
+    eta: 1.0
+    # Base seed; per-sample exploration needs distinct noise per sample. The dump
+    # surfaces whether images within a prompt actually differ (seed check).
+    seed: 42
+    init_same_noise: false
+    scheduler:
+      # Sparse SDE (mirrors sd3_vllmomni / sd3_dancegrpo): record SDE log-probs at
+      # only a few steps, ODE elsewhere -> lower-variance GRPO gradient. null = all-SDE.
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      num_sde_steps: 3               # sparse subset (sd3.5 uses 3)
+      timestep_fraction: [0, 0.5]    # SDE steps drawn from the first-half high-σ steps
+
+# LoRA → vLLM-Omni rollout (cross-process Ray push). RemoteLoraWeightSync.sync()
+# extracts the adapter on the train workers and pushes it from rank 0 into both
+# engines (AR + DiT) via each engine's set_lora_from_tensors_copy (the engines are
+# anchored on separate workers — wired in UnifiedModelTrainer via set_rollout_targets).
+# copy: true is required — the AR / DiT stages are TP>1, where the zero-copy LoRA
+# handle's one-shot fd breaks the collective_rpc broadcast to ranks 2..N.
+# param_prefix mirrors HunyuanImage3PipelineConfig.weight_sync_param_name_prefix.
+# The fused qkv is shipped WHOLE and split into q/k/v engine-side by vLLM's native
+# packed-modules mapping (post-#181: no trainer-side packed_modules block).
+sync:
+  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  copy: true
+  param_prefix: "model."
+  adapter_name: default
+
+num_rollouts: 100

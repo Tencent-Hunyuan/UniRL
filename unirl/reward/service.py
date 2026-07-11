@@ -95,9 +95,22 @@ def _build_request_for_track(
         samples_per_prompt=samples_per_prompt,
     )
 
+    # Side-channel: a track may carry a parallel audio stream decoded alongside
+    # the primary media (LTX-2.3 T2AV puts video in ``decoded`` and audio in
+    # ``decoded_audio``). Inject it under ``generated["audio"]`` regardless of
+    # the primary ``reward_input_kind`` so a composite scorer can read both. The
+    # audio source sample rate rides on the track's ``audio_sample_rate``.
+    generated: Dict[str, Any] = {gen_key: decoded}
+    audio_sample_rate: Optional[int] = None
+    if getattr(track, "decoded_audio", None) is not None:
+        generated["audio"] = track.decoded_audio
+        rate = getattr(track, "audio_sample_rate", None)
+        audio_sample_rate = int(rate) if rate is not None else None
+
     return RewardRequest(
         primitives=dict(req_primitives),
-        generated={gen_key: decoded},
+        generated=generated,
+        audio_sample_rate=audio_sample_rate,
         prompt_ids=list(prompt_ids),
         sample_ids=list(sample_ids),
         group_ids=list(group_ids),

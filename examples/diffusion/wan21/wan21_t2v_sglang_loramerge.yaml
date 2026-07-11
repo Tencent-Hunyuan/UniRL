@@ -1,0 +1,219 @@
+# @package _global_
+# GRPO WAN 2.1 T2V + SGLang rollout (colocate), v2 trainer, 1x8.
+#
+# Video FlowGRPO with the rollout served by the ``sglang_diffusion`` engine
+# (WAN pipeline runs inside SGLang's multimodal_gen runtime) instead of the
+# trainside FSDP sampler. Mirrors sd3_sglang_rollout_colocate, but on the WAN
+# 2.1 T2V 1.3B video pipeline + video_pickscore reward, driven by the new
+# ``wan21`` video adapter (proper 6-D video trajectory + Videos decoded media).
+#
+#   1x8:  bash examples/run_experiment_single_node.sh diffusion/wan21/wan21_t2v_sglang
+#
+# Resolution: 480x832 is WAN 2.1 T2V **1.3B**'s native supported resolution
+# (720p is the 14B preset); num_frames=5 → 2 latent frames after the WAN VAE's
+# 4x temporal compression ((F-1)%4==0 required). Kept small for a fast RL loop.
+#
+# old_logp_source=replay: the trainer recomputes the π_old anchor with the WAN
+# pipeline (cross-engine safe — independent of SGLang's native log-prob emission).
+# Flip to ``rollout`` once the SGLang "sde" kernel is confirmed bit-equal for WAN.
+
+num_devices: 8                # 1 node x 8 GPUs
+batch_size: 8                 # prompts_per_rollout (small for the sglang video smoke)
+adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+num_rollouts: 1000
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (SGLang needs both at init).
+model_config:
+  _target_: unirl.models.wan21.config.WAN21PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
+  model_precision: bf16
+  shift: 5.0
+  max_sequence_length: 512
+  # sglang loads a FULL transformer (NOT LoRA layers): the LoRA-merged sync pushes
+  # merged base weights, so the engine must not also apply an online adapter.
+  # The trainside still trains LoRA via backend.lora_cfg (peft) — independent of
+  # this flag, which only gates the sglang engine's LoRA ServerArgs.
+  use_lora: false
+  # WAN transformer attention LoRA targets — SGLANG NAMING (leaf module names).
+  # sglang's WanAttention (runtime/models/dits/wanvideo.py) has SEPARATE leaf
+  # modules to_q/to_k/to_v/to_out (no qkv fusion) under both self- and cross-attn,
+  # and renames diffusers attn1./attn2./.0 away. sglang wraps LoRA by substring
+  # match ``target in module_name``, so diffusers paths (attn1.to_q) miss the
+  # renamed modules → only 90/240 layers applied → sglang ran ~base → flat curve.
+  # Leaf names match every self+cross projection (2 attns × 4 = 8/block = 240).
+  # The trainside (peft) keeps diffusers paths in backend.lora_cfg.target_modules.
+  lora_target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out
+
+# Shared SDE strategy; SGLang resolves its sde_label from it.
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.wan21.pipeline.WAN21Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn1.to_q
+      - attn1.to_k
+      - attn1.to_v
+      - attn1.to_out.0
+      - attn2.to_q
+      - attn2.to_k
+      - attn2.to_v
+      - attn2.to_out.0
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: wan21
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    # Chunk generate into sub-batches so sglang bounds its DiT-forward / VAE-decode
+    # peak memory (video latents are heavy); without shrinking the logical batch.
+    # fbs=4 < samples_per_prompt mirrors full-FT: a partial-group chunk avoids the
+    # grouped-forward num_outputs slice bug, so driver x_T (same-noise alignment)
+    # works without DISABLE_DRIVER_XT.
+    forward_batch_size: 4
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    # NO target_modules: LoRA-merged path pushes the FULL transformer (use_lora
+    # =false), so the weight sync updates the whole 'transformer' module via
+    # sync.name_remap, not per-leaf LoRA targets. Leaving leaf names here made the
+    # sync request modules 'to_q'/'to_k'/'to_v'/'to_out' that don't exist as
+    # top-level pipeline modules ("not found in pipeline").
+  # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # REPLAY mode: recompute π_old trainside (cross-engine safe). See header.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.wan21.conditions.WAN21Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0          # no CFG → no negative-prompt branch
+  height: 480                  # WAN 2.1 T2V 1.3B native (480x832); not the 14B 720p preset
+  width: 832
+  num_frames: 5                # (num_frames-1)%4==0 required → 2 latent frames
+  eta: 0.7
+  samples_per_prompt: 8
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]   # SDE noise confined to the early high-σ steps
+    num_sde_steps: null
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train).
+# Every N rollouts the loop pushes the freshly-trained adapter into SGLang.
+weight_sync_interval: 1
+
+# LoRA-MERGED full-weight sync: fold the trained LoRA into the base transformer
+# and push the merged FULL weights via the proven TensorWeightSync (CPU-staged,
+# UNIRL_SYNC_CPU_STAGE) — the same path that aligns full-FT to 3 decimals. This
+# sidesteps the online LoRA-adapter sync (LocalLoraWeightSync), whose delta is
+# mis-applied in sglang (reward DECLINED post-sync). sglang loads a FULL
+# transformer (model_config.use_lora=false) and receives merged base weights.
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: true
+  adapter_name: default
+  bucket_size_mb: 512
+  flush_cache: true
+  name_remap: {"*": "transformer.*"}
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan21_t2v_sglang_loramerge}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["wan21", "t2v", "grpo", "video", "pickscore", "sglang", "loramerge", "v2"]
+  log_media: false
+  media_max_items: 8
+  media_log_interval: 1

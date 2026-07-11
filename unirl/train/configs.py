@@ -98,6 +98,9 @@ class FSDPConfig:
     # Must divide the world size and the model's attention head count. Only the
     # VeOmni backend honors it; FSDPBackend ignores it.
     sp_size: int = 1
+    # Expert-parallel degree (default 1 = disabled); when >1 the VeOmni backend shards fused
+    # experts over a separate mesh and requires the model to expose get_parallel_plan(). VeOmni only.
+    ep_size: int = 1
 
 
 __all__ = [

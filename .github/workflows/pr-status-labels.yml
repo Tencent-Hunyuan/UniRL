@@ -1,0 +1,67 @@
+name: PR Status Labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-status-labels-${{ github.event.pull_request.number }}
+
+jobs:
+  sync-label:
+    name: Sync PR status label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute and apply status label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          event="$GITHUB_EVENT_PATH"
+          number=$(jq -r '.pull_request.number' "$event")
+          draft=$(jq -r '.pull_request.draft' "$event")
+
+          has_label() {
+            jq -e --arg name "$1" '.pull_request.labels | any(.name == $name)' "$event" >/dev/null
+          }
+
+          if [ "$GITHUB_EVENT_NAME" = "pull_request_review" ]; then
+            [ "$draft" = "true" ] && exit 0
+            if [ "$(jq -r '.action' "$event")" = "dismissed" ]; then
+              target="need review"
+            else
+              case "$(jq -r '.review.state' "$event")" in
+                approved) target="approved" ;;
+                changes_requested) target="changes requested" ;;
+                *) exit 0 ;;
+              esac
+            fi
+          else
+            [ "$(jq -r '.pull_request.state' "$event")" = "open" ] || exit 0
+            if [ "$draft" = "true" ]; then
+              target="wip"
+            elif [ "$(jq -r '.action' "$event")" = "synchronize" ]; then
+              # New commits only move the status back to review after changes were requested.
+              has_label "changes requested" || exit 0
+              target="need review"
+            else
+              target="need review"
+            fi
+          fi
+
+          for label in "wip" "need review" "changes requested" "approved"; do
+            [ "$label" = "$target" ] && continue
+            if has_label "$label"; then
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/issues/$number/labels/$(jq -rn --arg l "$label" '$l | @uri')" \
+                >/dev/null || true
+            fi
+          done
+          if ! has_label "$target"; then
+            gh api "repos/$GITHUB_REPOSITORY/issues/$number/labels" -f "labels[]=$target" >/dev/null
+          fi

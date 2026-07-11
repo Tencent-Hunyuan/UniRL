@@ -40,12 +40,17 @@ as the vLLM-Omni BAGEL fix (PR #89, heguangxin's comment): ``pipeline_bagel``
 reseeds the global RNG per request and the SDE scheduler drew z_t from it. Fix
 (mirrors ``BagelFlowSDEScheduler.step``): when ``_rollout_variance_noise``
 receives a single ``torch.Generator`` (not a denoise_seeds list), replace it
-with a per-request generator seeded from ``os.urandom``, independent of the
-reseeded batch/global RNG. Stashed on ``batch`` so the generator persists across
-SDE steps within one request. The denoise_seeds path (list of generators) is
-unaffected — it fires for models whose denoising stage inherits the base
-``_run_denoising_step`` (e.g. SD3), preserving its deterministic driver-aligned
-per-sample noise.
+with a per-request generator whose seed is derived from
+``(base_seed, denoise_seeds[0])`` — the per-sample-unique ``sample_id`` that
+``patch_latent_prep`` slices onto each B=1 output — via the same blake2b
+derivation as ``_make_step_generators``, so the fallback stays reproducible from
+``seed`` AND independent per GRPO sample (distinct sample_ids → distinct seeds,
+the property that fixes the reward regression; ``os.urandom`` is used only when
+neither a base seed nor a sample key is available). Stashed on ``batch`` so the
+generator persists across SDE steps within one request. The denoise_seeds path
+(list of generators) is unaffected — it fires for models whose denoising stage
+inherits the base ``_run_denoising_step`` (e.g. SD3), preserving its
+deterministic driver-aligned per-sample noise.
 """
 
 from __future__ import annotations
@@ -87,6 +92,27 @@ def _resolve_base_seed(batch) -> int | None:
     if seed is None:
         seed = getattr(getattr(batch, "sampling_params", None), "seed", None)
     return int(seed) if seed is not None else None
+
+
+def _resolve_fallback_seed(batch) -> int:
+    """Deterministic per-request seed for the single-``torch.Generator`` fallback.
+
+    Prefer a stable per-sample key so the fallback stays reproducible from
+    ``seed`` AND independent per GRPO sample: derive from
+    ``(base_seed, denoise_seeds[0])`` — the per-sample-unique ``sample_id`` that
+    ``patch_latent_prep`` slices onto each B=1 output — via the same blake2b
+    derivation as :func:`_make_step_generators`. Fall back to ``os.urandom`` only
+    when neither the base seed nor a sample key is available (keeps samples
+    independent, but non-reproducible).
+    """
+    base_seed = _resolve_base_seed(batch)
+    denoise_seeds = getattr(batch, "denoise_seeds", None)
+    sample_key = str(denoise_seeds[0]) if denoise_seeds else None
+    if base_seed is not None and sample_key is not None:
+        payload = (f"{int(base_seed)}::fallback::sample::{sample_key}").encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="big", signed=False) % _MAX_TORCH_SEED
+    return int.from_bytes(os.urandom(8), byteorder="big") % _MAX_TORCH_SEED
 
 
 def patch_denoising() -> None:
@@ -165,8 +191,10 @@ def _patch_rollout_variance_noise_device() -> None:
             # ``BagelFlowSDEScheduler.step`` in
             # ``vllm_omni/pipelines/bagel/bagel_flow_match_sde_scheduler.py``):
             # replace the shared generator with a per-request generator
-            # seeded from ``os.urandom``, independent of the reseeded
-            # batch/global RNG. Stash on ``batch`` so the generator
+            # seeded deterministically from ``(base_seed, sample_id)`` via
+            # ``_resolve_fallback_seed`` so it stays reproducible AND per-sample
+            # independent (``os.urandom`` only when no stable key exists). Stash
+            # on ``batch`` so the generator
             # persists across SDE steps within one request (each
             # per-output forward has its own batch -> generator is
             # naturally per-sample). The denoise_seeds path (list of
@@ -178,7 +206,7 @@ def _patch_rollout_variance_noise_device() -> None:
             gen = getattr(batch, "_unirl_noise_gen", None)
             if gen is None:
                 gen = torch.Generator(device=device)
-                gen.manual_seed(int.from_bytes(os.urandom(8), "big"))
+                gen.manual_seed(_resolve_fallback_seed(batch))
                 try:
                     batch._unirl_noise_gen = gen  # type: ignore[attr-defined]
                 except AttributeError:

@@ -47,6 +47,11 @@ class RewardRequest:
     group_ids: Optional[List[str]] = None
     reward_types: List[RewardType] = field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
     return_components: bool = False
+    # Source sample rate (Hz) of any waveforms in ``generated["audio"]``. Set by
+    # the reward service when a track carries a parallel audio stream (LTX-2.3
+    # T2AV). ``None`` for non-audio requests. Audio reward scorers (CLAP /
+    # ImageBind) read it to resample to their model's expected rate.
+    audio_sample_rate: Optional[int] = None
 
     @property
     def prompts(self) -> List[str]:
@@ -79,6 +84,19 @@ class RewardRequest:
         return list(prim.texts)
 
     @property
+    def audio(self) -> Optional[List[torch.Tensor]]:
+        """Generated audio waveforms, one ``[C, L]`` (or ``[L]``) tensor per sample.
+
+        Populated when a track carries a parallel audio stream (LTX-2.3 T2AV);
+        the reward service places the decoded ``Audios`` under
+        ``generated["audio"]``. ``None`` for non-audio requests.
+        """
+        prim = self.generated.get("audio")
+        if prim is None:
+            return None
+        return [a.waveform for a in prim.to_list()]
+
+    @property
     def batch_size(self) -> int:
         for v in self.generated.values():
             if v is not None:
@@ -91,6 +109,10 @@ class RewardRequest:
     @property
     def is_video(self) -> bool:
         return "video" in self.generated
+
+    @property
+    def has_audio(self) -> bool:
+        return "audio" in self.generated
 
 
 @dataclass

@@ -28,7 +28,11 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "image_reward": ("unirl.reward.local.image_reward", "ImageRewardScorer"),
     "videopickscore": ("unirl.reward.local.video_pickscore", "VideoPickScoreScorer"),
     "videoclipdelta": ("unirl.reward.local.video_clip_delta", "VideoCLIPDeltaScorer"),
+    "videoalign": ("unirl.reward.local.videoalign", "VideoAlignRewardScorer"),
     "mc_exact_match": ("unirl.reward.local.mc_exact_match", "MCExactMatchRewardScorer"),
+    "clap": ("unirl.reward.local.clap", "CLAPRewardScorer"),
+    "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer"),
+    "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer"),
 }
 
 _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
@@ -43,7 +47,11 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "image_reward": ("unirl.reward.local.image_reward", "ImageRewardSpec"),
     "videopickscore": ("unirl.reward.local.video_pickscore", "VideoPickScoreSpec"),
     "videoclipdelta": ("unirl.reward.local.video_clip_delta", "VideoCLIPDeltaSpec"),
+    "videoalign": ("unirl.reward.local.videoalign", "VideoAlignSpec"),
     "mc_exact_match": ("unirl.reward.local.mc_exact_match", "MCExactMatchSpec"),
+    "clap": ("unirl.reward.local.clap", "CLAPSpec"),
+    "imagebind": ("unirl.reward.local.imagebind", "ImageBindSpec"),
+    "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeSpec"),
 }
 
 

@@ -9,8 +9,9 @@ lives in ``unirl.train.ema``.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from functools import partial
-from typing import Sequence
+from typing import Iterator, Sequence
 
 from torch import nn
 
@@ -69,6 +70,28 @@ def _reset_adapter(model: nn.Module, *, name: str) -> None:
         logger.info("_reset_adapter(%r): %d LoraLayer(s)", name, n_reset)
 
 
+@contextmanager
+def adapters_disabled(model: nn.Module) -> Iterator[None]:
+    """Temporarily route every PEFT LoRA layer through its frozen base weights.
+
+    This mirrors PEFT's adapter-disabling behavior without changing
+    ``requires_grad``. The beta KL reference replay wraps this in ``no_grad`` so
+    the shared FSDP model can act as pi_ref while preserving the trainable adapter
+    state.
+    """
+    from peft.tuners.lora import LoraLayer
+
+    layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
+    prev = [bool(getattr(m, "_disable_adapters", False)) for m in layers]
+    try:
+        for m in layers:
+            m._disable_adapters = True
+        yield
+    finally:
+        for m, was_disabled in zip(layers, prev):
+            m._disable_adapters = was_disabled
+
+
 def _current_rank() -> int:
     import torch.distributed as dist
 
@@ -77,4 +100,4 @@ def _current_rank() -> int:
     return 0
 
 
-__all__ = ["inject_lora"]
+__all__ = ["adapters_disabled", "inject_lora"]
