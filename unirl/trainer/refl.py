@@ -47,11 +47,19 @@ class RewardBackpropTrainer(BaseTrainer):
         data_source_cfg: DictConfig,
         max_grad_norm: float = 1.0,
         reward_fraction: float = 0.25,
+        eval_interval: int = 0,
+        eval_num_prompts: int = 12,
         logging_cfg: Optional[DictConfig] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = int(batch_size)
         self.max_grad_norm = float(max_grad_norm)
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
+        # eval_interval=0 disables it. ReFL has no rollout engine / tracks: eval
+        # samples via ReFLPolicy.eval_sample (deterministic ODE, no grad) and scores
+        # with the same differentiable reward, mean logged as eval/reward.
+        self.eval_interval = int(eval_interval)
+        self.eval_num_prompts = int(eval_num_prompts)
         self.data_source = instantiate(data_source_cfg)
 
         # Unified reward placement — SAME knob/semantics as DiffusionTrainer's
@@ -104,6 +112,48 @@ class RewardBackpropTrainer(BaseTrainer):
         self.policy.zero_grad()
         return mean_reward, float(grad_norm or 0.0), time.perf_counter() - t0
 
+    def evaluate(self, step: int) -> float:
+        """Periodic eval — mean reward over the eval prompt set (no training).
+
+        ReFL has no rollout engine or tracks, so this mirrors :meth:`train_step`'s
+        sample→score path (minus ``enable_grad``/backward): pull
+        ``eval_num_prompts`` eval prompts (``run.eval_data_path``), sample images
+        with :meth:`ReFLPolicy.eval_sample` (deterministic ODE, ``model.eval()`` +
+        ``no_grad``), score with the differentiable reward, and log the mean under
+        ``eval/reward``. Returns it.
+
+        ``step`` keys the wandb log axis (and ``eval_sample``'s seed), mirroring
+        :meth:`DiffusionTrainer.evaluate` — so re-running a checkpoint via
+        ``num_rollouts=0 load_dir=checkpoint-k`` (→ baseline ``evaluate(k)``) evals
+        the restored weights at the same step. NOTE: eval is NOT bit-exact — the
+        init latent is drawn unseeded (see ``eval_sample``), so A vs B agree only
+        within sampling noise (~σ), not byte-identically.
+
+        Chunked by ``self.batch_size`` — both ``eval_sample`` and
+        ``score_differentiable`` are DP_SCATTER, and ``batch_size`` is validated
+        divisible by both the policy and reward dp sizes in ``__init__``; a ragged
+        tail (``eval_num_prompts`` not a multiple of ``batch_size``) is floored off.
+        """
+        eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
+        prompts = eval_inputs.primitives["text"]
+        if not isinstance(prompts, Texts):
+            prompts = Texts(texts=list(prompts))
+        texts = list(prompts.texts)
+        chunk = max(1, self.batch_size)
+        usable = len(texts) - len(texts) % chunk or len(texts)
+        reward_sum, reward_n = 0.0, 0
+        for start in range(0, usable, chunk):
+            sub = Texts(texts=texts[start : start + chunk])
+            images = self.policy.eval_sample(prompts=sub, rollout_id=step)
+            rewards = self.reward.score_differentiable(images=images, prompts=sub)
+            r = hydrate(rewards).float()
+            reward_sum += float(r.sum().item())
+            reward_n += int(r.numel())
+        mean_reward = reward_sum / max(1, reward_n)
+        logger.info("EVAL step %d  eval_reward(%d prompts)=%.4f", step, self.eval_num_prompts, mean_reward)
+        self.wandb_logger.log_eval(step, {"reward": mean_reward})
+        return mean_reward
+
     def train(
         self,
         *,
@@ -116,6 +166,8 @@ class RewardBackpropTrainer(BaseTrainer):
         start = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
+            if self.eval_interval > 0:
+                self.evaluate(start)  # baseline eval before any training
             for rollout_id in range(start, num_rollouts):
                 inputs = self.data_source.get_samples(self.batch_size)
                 prompts = inputs.primitives["text"]
@@ -140,6 +192,10 @@ class RewardBackpropTrainer(BaseTrainer):
                     },
                     prefix="",
                 )
+                # eval(k) BEFORE save(checkpoint-k) at the same step, so a
+                # resumed checkpoint re-runs the same eval (A/B consistency).
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(
                     rollout_id,
                     num_rollouts,

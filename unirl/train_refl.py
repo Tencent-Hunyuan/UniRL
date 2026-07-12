@@ -25,6 +25,8 @@ def main(cfg: DictConfig) -> None:
         data_source_cfg=cfg.data_source,
         max_grad_norm=float(cfg.get("max_grad_norm", 1.0)),
         reward_fraction=float(cfg.get("reward_fraction", 0.25)),
+        eval_interval=int(cfg.get("eval_interval", 0)),
+        eval_num_prompts=int(cfg.get("eval_num_prompts", cfg.batch_size)),
         logging_cfg=cfg.get("logging"),
     )
     trainer.train(

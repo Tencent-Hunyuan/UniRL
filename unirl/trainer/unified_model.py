@@ -152,6 +152,9 @@ class UnifiedModelTrainer(BaseTrainer):
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
+        eval_interval: int = 0,
+        eval_num_prompts: int = 32,
+        eval_eta: float = 0.0,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -159,6 +162,16 @@ class UnifiedModelTrainer(BaseTrainer):
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
+        # eval_interval=0 disables it. Scores only the image track (PickScore) like
+        # train_step, mean logged as eval/reward. eval_eta forces the diffusion
+        # sub-block onto a deterministic ODE for eval (recipe trains at eta>0). No
+        # eval_samples_per_prompt knob: the 2-track fan-out makes a single count
+        # ambiguous (bagel is M=1, image shares the AR advantage).
+        self.eval_interval = int(eval_interval)
+        self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_eta = float(eval_eta)
 
         # W&B logging (logging_cfg, wandb_logger, optimizer-step counter) is owned
         # by BaseTrainer + UniRLWandBLogger now — see super().__init__ above.
@@ -335,7 +348,9 @@ class UnifiedModelTrainer(BaseTrainer):
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
 
-    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
+    def _build_req(
+        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
+    ) -> RolloutReq:
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         Like :meth:`PETrainer._build_req`, NO pre-expansion: ``train_step`` fans
@@ -346,11 +361,15 @@ class UnifiedModelTrainer(BaseTrainer):
         ``samples_per_prompt`` to validate the expansion factor); the SDE step
         schedule is resolved off the diffusion sub-block per rollout and stamped
         back onto a per-request copy.
+
+        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
+        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
-        diff_params = self.sampling_params.get("diffusion")
+        base = base_sampling if base_sampling is not None else self.sampling_params
+        diff_params = base.get("diffusion")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**self.sampling_params, "diffusion": diffusion}
+        sampling_params = {**base, "diffusion": diffusion}
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -740,6 +759,88 @@ class UnifiedModelTrainer(BaseTrainer):
         except Exception as exc:  # noqa: BLE001 — dump must never break training
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
+    def evaluate(self, step: int) -> float:
+        """Periodic eval on the eval set (no training); returns the mean image reward.
+
+        Mirrors :meth:`train_step`'s rollout+reward path but skips
+        credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
+        (``run.eval_data_path``), run the ``P→P*N→P*N*M`` fan-out through
+        :meth:`run_rollout` (so both the single-engine trainside path and the
+        two-engine HI3 path work), with the diffusion sub-block forced onto a
+        deterministic ODE (``eta=eval_eta``), score ONLY the image track
+        (PickScore), and log the mean under ``eval/reward``. Returns it.
+
+        The two-engine path replicates ``train_step``'s colocate memory dance
+        (wake engines → rollout → sleep → onload base → re-offload to steady
+        state); the single-engine trainside path needs none of it
+        (``_enable_fsdp_offload`` is forced False, no engines to wake). Chunked by
+        ``self.batch_size`` (the un-expanded P-prompt req DP-splits, so the chunk
+        must be dp-divisible; ``batch_size`` is what training runs). A ragged tail
+        is floored off.
+        """
+        base_diffusion = self.sampling_params.get("diffusion")
+        eval_diffusion = dataclasses.replace(base_diffusion, eta=self.eval_eta)
+        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.batch_size)
+        usable = n_prompts - n_prompts % chunk or n_prompts
+        reward_sum, reward_n = 0.0, 0
+        for start in range(0, usable, chunk):
+            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            req = self._build_req(sub, step, base_sampling=eval_sp)
+            if self._single_engine:
+                resp = self.run_rollout(req)
+            else:
+                for eng in self.ar_rollouts + self.dit_rollouts:
+                    eng.wake_up()
+                resp = self.run_rollout(req)
+                for eng in self.ar_rollouts + self.dit_rollouts:
+                    eng.sleep()
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
+            # Score the image track only; build a reward req aligned 1:1 with the
+            # image track (each image's ORIGINAL prompt) so req and track shard
+            # together across DP ranks (mirrors train_step).
+            img_track = resp.tracks[IMAGE_TRACK]
+            ar_params = req.sampling_params.get("ar")
+            diff_params = req.sampling_params.get("diffusion")
+            n_rec = int(ar_params.samples_per_prompt) if ar_params is not None else 1
+            n_img = int(diff_params.samples_per_prompt)
+            orig_texts = req.primitives.get("text")
+            reward_texts = Texts(
+                texts=[orig_texts.texts[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))]
+            )
+            reward_metadata = (
+                [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))] if req.metadata else []
+            )
+            reward_req = RolloutReq(
+                sample_ids=list(img_track.sample_ids),
+                group_ids=list(img_track.parent_ids) if img_track.parent_ids else list(img_track.sample_ids),
+                primitives={"text": reward_texts},
+                request_conditions={},
+                sampling_params=req.sampling_params,
+                metadata=reward_metadata,
+            )
+            scored = self.reward.score_and_attach(req=reward_req, track=img_track)
+            if scored.rewards is not None:
+                r = hydrate(scored.rewards).to(torch.float32)
+                reward_sum += float(r.sum().item())
+                reward_n += int(r.numel())
+            # Back to steady state (base on CPU) so the next chunk's engines have room.
+            if self._enable_fsdp_offload and not self._single_engine:
+                self.backend.offload()
+        mean_reward = reward_sum / max(1, reward_n)
+        logger.info(
+            "EVAL step %d  eval_reward(%d prompts, eta=%.1f)=%.4f",
+            step,
+            self.eval_num_prompts,
+            self.eval_eta,
+            mean_reward,
+        )
+        self.wandb_logger.log_eval(step, {"reward": mean_reward})
+        return mean_reward
+
     def train(
         self,
         *,
@@ -769,6 +870,8 @@ class UnifiedModelTrainer(BaseTrainer):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
+            if self.eval_interval > 0:
+                self.evaluate(start_rollout)  # baseline eval before any training
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 self._dump_rollout_id = rollout_id  # picked up by train_step's dump
@@ -797,6 +900,10 @@ class UnifiedModelTrainer(BaseTrainer):
                 # logp convention (temperature / top-k-p filtering / full-vs-renorm
                 # softmax) doesn't match vLLM's sampler.
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
+                # eval(k) BEFORE save(checkpoint-k) at the same step, so a
+                # resumed checkpoint re-runs the same eval (A/B consistency).
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
