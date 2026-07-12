@@ -46,7 +46,7 @@ class RewardBackpropTrainer(BaseTrainer):
         reward_cfg: DictConfig,
         data_source_cfg: DictConfig,
         max_grad_norm: float = 1.0,
-        policy_device_fraction: float = 0.75,
+        reward_fraction: float = 0.25,
         logging_cfg: Optional[DictConfig] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -54,11 +54,24 @@ class RewardBackpropTrainer(BaseTrainer):
         self.max_grad_norm = float(max_grad_norm)
         self.data_source = instantiate(data_source_cfg)
 
-        policy_frac = float(policy_device_fraction)
-        with placement(self.pool, fraction=policy_frac, shared_workers=True):
-            self.policy = remote_hydra(policy_cfg)
-        with placement(self.pool, fraction=1.0 - policy_frac, shared_workers=True):
-            self.reward = remote_hydra(reward_cfg)
+        # Unified reward placement — SAME knob/semantics as DiffusionTrainer's
+        # ``reward_fraction``: ``> 0`` carves the (frozen, differentiable) reward
+        # its OWN disjoint slab (the tail of the pool), policy takes the rest; the
+        # DRaFT-K gradient crosses the slab boundary back into the policy via the
+        # distributed ``enable_grad()`` context. ``== 0`` colocates reward on the
+        # policy's cards (cheapest grad) at the cost of sharing its GPU memory.
+        reward_frac = float(reward_fraction)
+        if not 0.0 <= reward_frac < 1.0:
+            raise ValueError(f"reward_fraction must be in [0, 1), got {reward_frac}")
+        if reward_frac > 0.0:
+            with placement(self.pool, fraction=1.0 - reward_frac, shared_workers=True):
+                self.policy = remote_hydra(policy_cfg)
+            with placement(self.pool, fraction=reward_frac, shared_workers=True):
+                self.reward = remote_hydra(reward_cfg)
+        else:
+            with placement(self.pool, fraction=1.0, shared_workers=True):
+                self.policy = remote_hydra(policy_cfg)
+                self.reward = remote_hydra(reward_cfg)
 
         self.policy.initialize()
         # BaseTrainer.maybe_save/load_checkpoint operate on ``self.backend``.

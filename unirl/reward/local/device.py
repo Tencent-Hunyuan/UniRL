@@ -7,13 +7,17 @@ else ``"cpu"``. This lets per-component overrides win where set, while keeping a
 single cluster-level default.
 
 Device selection here is intentionally coarse (cpu / cuda / auto), NOT a
-GPU-pinning knob. Local rewards are small models that share whatever GPU the
-trainer placed them on; an explicit ordinal like ``"cuda:1"`` cannot be honored
-safely in the distributed local path (every DP worker would pile onto the same
-physical card, and the ordinal mis-maps across nodes / ``CUDA_VISIBLE_DEVICES``),
-so it is **rejected**. To run a reward model on its own dedicated GPU(s), use the
-remote reward backend (``unirl.reward.remote.RemoteRewardBackend``), which owns
-its own device pool independent of the trainer.
+GPU-pinning knob. An explicit ordinal like ``"cuda:1"`` cannot be honored safely
+in the distributed local path (every DP worker would pile onto the same physical
+card, and the ordinal mis-maps across nodes / ``CUDA_VISIBLE_DEVICES``), so it is
+**rejected**. To give a (possibly heavy) reward model its OWN dedicated GPU(s), do
+NOT pin an ordinal — instead either:
+  * set the trainer's ``reward_fraction`` so the reward role is placed on its own
+    disjoint GPU slab in the SAME job (each reward worker still resolves
+    ``device="cuda"``/``"auto"`` to its assigned card via ``CUDA_VISIBLE_DEVICES``);
+    validated for an 8B VLM reward (Qwen3-VL) at 8- and 16-GPU; or
+  * use the remote reward backend (``unirl.reward.remote.RemoteRewardBackend``),
+    which owns its own device pool independent of the trainer.
 """
 
 from __future__ import annotations
@@ -26,10 +30,10 @@ logger = logging.getLogger(__name__)
 
 _REMOTE_HINT = (
     "the local reward backend does not support pinning a specific GPU ordinal — "
-    "it is for small models auto-placed on the trainer's GPU. Use device='cuda' "
-    "(or 'auto'), or, to run a reward on dedicated GPU(s), switch to the remote "
-    "reward backend (unirl.reward.remote.RemoteRewardBackend), which owns its own "
-    "device pool."
+    "each reward worker auto-resolves to its own assigned card. Use device='cuda' "
+    "(or 'auto'). To give the reward its own dedicated GPU(s), set the trainer's "
+    "reward_fraction (places the reward role on its own slab in the same job), or "
+    "switch to the remote reward backend (unirl.reward.remote.RemoteRewardBackend)."
 )
 
 
