@@ -57,14 +57,12 @@ class RewardBackpropTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = int(batch_size)
         self.max_grad_norm = float(max_grad_norm)
-        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
         # eval_interval=0 disables it. ReFL has no rollout engine / tracks: eval
-        # samples via ReFLPolicy.eval_sample (deterministic ODE, no grad) and scores
-        # with the same differentiable reward, mean logged as eval/reward.
-        # eval_cfg_text_scale sets the eval CFG strength (maps onto the SD3-family
-        # guidance_scale; recipes train at guidance_scale=1.0 = no CFG; set it to
-        # the train value to eval in the training regime instead) — mirrors
-        # DiffusionTrainer's knob of the same name.
+        # samples via ReFLPolicy.eval_sample (deterministic ODE, no grad, CFG=
+        # eval_cfg_text_scale — same knob/semantics as DiffusionTrainer, mapped
+        # onto the SD3-family guidance_scale) and scores with the differentiable
+        # reward. Extra eval-only rewards: unirl.trainer.eval_suites.
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)

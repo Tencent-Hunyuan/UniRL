@@ -139,16 +139,13 @@ class PETrainer(BaseTrainer):
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
 
-        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
-        # eval_interval=0 disables it. Scores only the image ("diffusion") track
-        # (PickScore) like train_step, mean logged as eval/reward. Eval generates
-        # at the deterministic best-quality setting, mirroring DiffusionTrainer:
-        # eval_cfg_text_scale sets the CFG strength (recipes train at
-        # guidance_scale=1.0 = no CFG; set it to the train value to eval in the
-        # training regime instead) and eval_eta forces the diffusion sub-block
-        # onto a deterministic ODE (recipe trains at eta>0 for exploration). No
-        # eval_samples_per_prompt knob: PE fans out P->P*N*M two levels, so a
-        # single per-prompt count is ambiguous (N*M is already a dense eval).
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
+        # eval_interval=0 disables it. Scores only the image ("diffusion") track,
+        # generated at the deterministic best-quality setting (CFG=
+        # eval_cfg_text_scale, eta=eval_eta) — same knobs/semantics as
+        # DiffusionTrainer; extra eval-only rewards: unirl.trainer.eval_suites.
+        # No eval_samples_per_prompt knob: the P->P*N*M two-level fan-out makes
+        # a single per-prompt count ambiguous (N*M is already a dense eval).
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)

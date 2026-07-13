@@ -166,16 +166,12 @@ class UnifiedModelTrainer(BaseTrainer):
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
 
-        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
-        # eval_interval=0 disables it. Scores only the image track (PickScore) like
-        # train_step, mean logged as eval/reward. Eval generates at the
-        # deterministic best-quality setting, mirroring DiffusionTrainer:
-        # eval_cfg_text_scale sets the CFG strength (UniGRPO recipes train at
-        # cfg_text_scale=1.0 = no CFG; set it to the train value to eval in the
-        # training regime instead) and eval_eta forces the diffusion sub-block
-        # onto a deterministic ODE (recipe trains at eta>0). No
-        # eval_samples_per_prompt knob: the 2-track fan-out makes a single count
-        # ambiguous (bagel is M=1, image shares the AR advantage).
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
+        # eval_interval=0 disables it. Scores only the image track, generated at
+        # the deterministic best-quality setting (CFG=eval_cfg_text_scale,
+        # eta=eval_eta) — same knobs/semantics as DiffusionTrainer; extra
+        # eval-only rewards: unirl.trainer.eval_suites. No eval_samples_per_prompt
+        # knob: the 2-track fan-out makes a single count ambiguous (bagel is M=1).
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
@@ -776,29 +772,26 @@ class UnifiedModelTrainer(BaseTrainer):
         """Periodic eval on the eval set (no training); returns the mean image reward.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
-        credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
-        (``run.eval_data_path``), run the ``P→P*N→P*N*M`` fan-out through
-        :meth:`run_rollout` (so both the single-engine trainside path and the
-        two-engine HI3 path work), with the diffusion sub-block forced onto the
-        deterministic best-quality setting (CFG at ``eval_cfg_text_scale``,
-        ``eta=eval_eta``), and score ONLY the image track. The training reward
-        plus every shared-set ``eval_rewards`` suite scores the SAME generated
-        images; each own-set suite then gets its own generation pass over its
-        own prompts. All means land in one ``eval/*`` row (``eval/reward`` +
-        ``eval/<suite>``); returns ``eval/reward``.
+        credit-assign/advantage/backward: run the ``P→P*N→P*N*M`` fan-out through
+        :meth:`run_rollout` (works on both the single-engine trainside and the
+        two-engine HI3 path) at the deterministic best-quality setting (CFG at
+        ``eval_cfg_text_scale``, ``eta=eval_eta``) and score ONLY the image
+        track — the training reward plus the ``eval_rewards`` suites (see
+        :mod:`unirl.trainer.eval_suites`). Logs one ``eval/*`` row; returns
+        ``eval/reward``.
 
         The two-engine path syncs the live adapter into the engines once per
         eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
         :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
-        so without this the engines would eval weights one update stale, and a
-        restored-checkpoint baseline eval would see fresh (unloaded) engine
-        weights. Pushed weights persist across engine sleep/wake cycles (as
-        train_step relies on), so the passes below just wake/sleep around each
-        chunk's rollout. Unlike train_step, eval never onloads the base after
-        the extract: there is no backward, so the FSDP state stays offloaded
-        (the steady state) throughout. The single-engine trainside path needs
-        none of it (the rollout shares the live FSDP modules;
-        ``_enable_fsdp_offload`` is forced False).
+        so without this the engines would eval one update stale, and a
+        restored-checkpoint baseline eval would see fresh engine weights.
+        Pushed weights persist across sleep/wake cycles (as train_step relies
+        on), so the passes below just wake/sleep around each chunk's rollout.
+        Unlike train_step, eval never onloads the base after the extract: there
+        is no backward, so the FSDP state stays offloaded (the steady state)
+        throughout. The single-engine trainside path needs none of it (the
+        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
+        forced False).
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict.
         # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
