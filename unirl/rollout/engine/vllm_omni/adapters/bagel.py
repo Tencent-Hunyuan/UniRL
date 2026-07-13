@@ -63,6 +63,29 @@ from unirl.types.rollout_resp import RolloutResp
 class BagelInputAdapter(DitInputAdapter):
     """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent."""
 
+    def _spp(self, req: RolloutReq) -> int:
+        """``samples_per_prompt`` — the GRPO group size; 1 disables grouping."""
+        return int(getattr(req.sampling_params.get("diffusion"), "samples_per_prompt", 1) or 1)
+
+    @staticmethod
+    def _grouped_texts(texts: List[str], spp: int) -> List[str]:
+        """Collapse the ``[p0]*spp + [p1]*spp + ...`` sample layout to one text
+        per prompt group. Guards the block layout the grouped noise-slice
+        (``resolve_request_noise``) + the per-group request-id index both assume."""
+        n = len(texts)
+        if n % spp != 0:
+            raise ValueError(f"bagel grouped rollout: prompt count {n} not divisible by samples_per_prompt {spp}.")
+        grouped: List[str] = []
+        for g in range(n // spp):
+            block = texts[g * spp : (g + 1) * spp]
+            if any(t != block[0] for t in block):
+                raise ValueError(
+                    f"bagel grouped rollout: samples in group {g} are not the same prompt; expand layout "
+                    f"must be block [p0*spp, p1*spp, ...] to match the grouped x_T slice."
+                )
+            grouped.append(block[0])
+        return grouped
+
     def build_prompts(self, req: RolloutReq) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
 
@@ -71,11 +94,18 @@ class BagelInputAdapter(DitInputAdapter):
         the text2img diffusion path we want. No ``negative_prompt`` key is added
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
+
+        With ``samples_per_prompt > 1`` the prompt's samples collapse to ONE
+        request (``num_outputs_per_prompt=spp``); the worker packs the ``spp``
+        images into one ``generate_image`` and the engine splits them back.
         """
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
         texts = texts_from_req(req)
-        return [{"prompt": text} for text in texts.texts]
+        spp = self._spp(req)
+        if spp <= 1:
+            return [{"prompt": text} for text in texts.texts]
+        return [{"prompt": text} for text in self._grouped_texts(list(texts.texts), spp)]
 
     def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
         """One diffusion-stage intent with the BAGEL-specific kwargs.
@@ -96,7 +126,9 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            num_outputs_per_prompt=1,
+            # >1 groups the prompt's samples into one packed generate_image; the
+            # worker splits the log-prob/trajectory per image, the engine the images.
+            num_outputs_per_prompt=self._spp(req),
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
@@ -133,7 +165,7 @@ class BagelInputAdapter(DitInputAdapter):
         if traj_prec is not None:
             extra_args["trajectory_precision"] = str(traj_prec)
 
-        pack_initial_noise_extra_args(extra_args, req, diff_params, n_prompts=len(texts.texts), caller=self.modality)
+        pack_initial_noise_extra_args(extra_args, req, diff_params, n_samples=len(texts.texts), caller=self.modality)
         diff_kwargs["extra_args"] = extra_args
 
         return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]

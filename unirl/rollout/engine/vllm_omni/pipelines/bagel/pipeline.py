@@ -38,11 +38,19 @@ class RLBagelPipeline(BagelPipeline):
         self._sde_scheduler = BagelFlowSDEScheduler()
         self._sde_scheduler_installed = False
         self._noise_tap_installed = False
+        self._gi_tap_installed = False
         self._rope_fp32_patched = False
         self._rmsnorm_fp32_patched = False
         # Per-request x_T hand-off: armed every request, consumed once by the
         # prepare_vae_latent tap. None = upstream RNG draw fires.
         self._pending_initial_noise: Optional[torch.Tensor] = None
+        # Grouped-t2i batching: ``spp == num_outputs_per_prompt`` same-prompt
+        # images packed into ONE ``generate_image`` (shared prompt KV replicated
+        # ``spp``×). ``1`` == the plain bs=1 path; the taps below key off it.
+        self._pending_spp: int = 1
+        # Captured by the ``generate_image`` tap: the ``spp`` per-image latents
+        # (upstream ``forward`` decodes ``latents[0]`` only; batched decodes the rest).
+        self._pending_batched_latents: Optional[list] = None
         # Stored trajectory dtype (matches trainside trajectory_precision).
         self._trajectory_dtype: torch.dtype = torch.float32
 
@@ -152,6 +160,15 @@ class RLBagelPipeline(BagelPipeline):
         pipeline_self = self
 
         def tapped(*args: Any, **kw: Any) -> Any:
+            spp = pipeline_self._pending_spp
+            # Grouped t2i: replicate the single prompt's KV span ``spp``× so
+            # ``prepare_input`` builds ``spp`` packed image blocks (each attends
+            # its own copy of the shared prompt KV). Upstream calls with keywords.
+            if spp > 1 and "image_sizes" in kw and len(kw["image_sizes"]) == 1:
+                kw = dict(kw)
+                kw["image_sizes"] = list(kw["image_sizes"]) * spp
+                kw["curr_kvlens"] = list(kw["curr_kvlens"]) * spp
+                kw["curr_rope"] = list(kw["curr_rope"]) * spp
             out = orig(*args, **kw)
             noise = pipeline_self._pending_initial_noise
             if noise is not None:
@@ -161,10 +178,11 @@ class RLBagelPipeline(BagelPipeline):
                     raise RuntimeError(
                         "RLBagelPipeline noise tap: prepare_vae_latent returned no 'packed_init_noises' to override."
                     )
-                # Driver x_T is [1, seq, C]; packed_init_noises is unbatched [seq, C].
-                # Squeeze the leading 1 and validate the packed geometry matches.
-                if noise.dim() == ref.dim() + 1 and int(noise.shape[0]) == 1:
-                    noise = noise.squeeze(0)
+                # Driver x_T is [spp, seq, C] (grouped span) or [1, seq, C]; BAGEL's
+                # packed_init_noises is unbatched [spp*seq, C] (spp==1 → [seq, C]).
+                # Flatten the leading batch dim into the packed token dim.
+                if noise.dim() == ref.dim() + 1:
+                    noise = noise.reshape(-1, noise.shape[-1]) if noise.shape[0] > 1 else noise.squeeze(0)
                 if tuple(noise.shape) != tuple(ref.shape):
                     raise RuntimeError(
                         "RLBagelPipeline noise tap: driver x_T shape "
@@ -180,11 +198,41 @@ class RLBagelPipeline(BagelPipeline):
         self.bagel.prepare_vae_latent = tapped  # type: ignore[assignment]
         self._noise_tap_installed = True
 
+    def _install_gi_tap(self) -> None:
+        """Wrap ``bagel.generate_image`` for the grouped-t2i batched forward.
+
+        The ``prepare_vae_latent`` tap already expanded the packed image blocks +
+        ``key_values_lens`` to ``spp``; here we only replicate the shared prompt
+        KV cache ``spp``× (each block indexes its own copy) and stash the ``spp``
+        per-image latents (upstream decodes ``latents[0]`` only). No-op when
+        ``spp == 1``. Idempotent.
+        """
+        if self._gi_tap_installed:
+            return
+
+        orig = self.bagel.generate_image
+        pipeline_self = self
+        merge = type(self.bagel)._merge_naive_caches
+
+        def tapped(*args: Any, **kw: Any) -> Any:
+            spp = pipeline_self._pending_spp
+            if spp > 1 and kw.get("past_key_values") is not None:
+                kw = dict(kw)
+                kw["past_key_values"] = merge([kw["past_key_values"]] * spp)
+            result = orig(*args, **kw)
+            if spp > 1:
+                # generate_image returns (unpacked_latent_list, traj_*, ...).
+                pipeline_self._pending_batched_latents = list(result[0])
+            return result
+
+        self.bagel.generate_image = tapped  # type: ignore[assignment]
+        self._gi_tap_installed = True
+
     # ------------------------------------------------------------------ #
     # arm — every request (stale-leak guards)
     # ------------------------------------------------------------------ #
 
-    def _arm_sde(self, req: OmniDiffusionRequest) -> None:
+    def _arm_sde(self, req: OmniDiffusionRequest, image_token_sizes: Optional[list] = None) -> None:
         """This request's SDE strength + sparse step gate + σ_max + storage dtype."""
         sp = req.sampling_params
         eta = float(getattr(sp, "eta", 0.0) or 0.0)
@@ -203,6 +251,7 @@ class RLBagelPipeline(BagelPipeline):
             sde_indices=extra.get("sde_indices"),
             sigma_max=float(sigma_max) if sigma_max is not None else None,
             trajectory_dtype=traj_dtype,
+            image_token_sizes=image_token_sizes,
         )
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
@@ -222,6 +271,19 @@ class RLBagelPipeline(BagelPipeline):
     # the protocol
     # ------------------------------------------------------------------ #
 
+    def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
+        """Grouped-DiT batching applies only to pure text→image at cfg=1.
+
+        i2i (image-prefill) and CFG>1 go through the untouched single path:
+        i2i has its own KV-prefill geometry, and CFG>1 runs the extra
+        cfg_text/cfg_img branches this packed path does not replicate.
+        """
+        fp = req.prompts[0] if getattr(req, "prompts", None) else None
+        has_image = isinstance(fp, dict) and ((fp.get("multi_modal_data") or {}).get("image") is not None)
+        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        cfg1 = float(extra.get("cfg_text_scale", 1.0)) <= 1.0 and float(extra.get("cfg_img_scale", 1.0)) <= 1.0
+        return (not has_image) and cfg1
+
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
         self._install_noise_tap()
@@ -229,6 +291,10 @@ class RLBagelPipeline(BagelPipeline):
         # log-prob ratio stays ≈ 1 (see the install methods).
         self._install_rope_fp32()
         self._install_rmsnorm_fp32()
+
+        spp = int(getattr(req.sampling_params, "num_outputs_per_prompt", 1) or 1)
+        if spp > 1 and self._is_batchable_t2i(req):
+            return self._forward_batched(req, spp, **kwargs)
 
         self._arm_sde(req)
         self._arm_initial_noise(req)
@@ -238,6 +304,38 @@ class RLBagelPipeline(BagelPipeline):
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
+        return out
+
+    def _forward_batched(self, req: OmniDiffusionRequest, spp: int, **kwargs) -> DiffusionOutput:
+        """Group ``spp`` same-prompt images into ONE packed ``generate_image``.
+
+        The prompt KV is built once by upstream ``forward`` and replicated
+        ``spp``× (``generate_image`` tap); the ``prepare_vae_latent`` tap packs
+        ``spp`` image blocks + injects the ``spp`` driver x_T rows. Upstream
+        decodes ``latents[0]``; we decode the rest and overwrite ``output`` with
+        the ``spp`` PILs so the engine splits them per request.
+        """
+        self._install_gi_tap()
+        ds = int(self.bagel.latent_downsample)
+        per = (int(req.sampling_params.height) // ds) * (int(req.sampling_params.width) // ds)
+        self._arm_sde(req, image_token_sizes=[per] * spp)
+        self._arm_initial_noise(req)  # [spp, seq, C] grouped span
+        self._pending_spp = spp
+        self._pending_batched_latents = None
+        try:
+            out = super().forward(req, **kwargs)  # taps expand single→spp
+            self._harvest_trajectory(out)  # trajectory_latents = [spp, T+1, seq, C]
+            lats = self._pending_batched_latents
+            if not lats or len(lats) != spp:
+                raise RuntimeError(
+                    f"RLBagelPipeline batched forward: generate_image tap captured "
+                    f"{0 if not lats else len(lats)} latents, expected spp={spp}."
+                )
+            image_shape = (int(req.sampling_params.height), int(req.sampling_params.width))
+            out.output = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in lats]
+        finally:
+            self._pending_spp = 1
+            self._pending_batched_latents = None
         return out
 
 
