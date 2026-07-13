@@ -201,7 +201,7 @@ def install_phase_timing(trainer: Any) -> None:
     If a collaborator ever becomes async-submit (returns before the work
     finishes), its phase collapses to submission time and the wait leaks into
     the residual — a sudden near-zero phase plus a large
-    ``rollout_time_s - sum(phases)`` residual is the tell.
+    ``step_time_s - sum(phases)`` residual is the tell.
     """
     inner = getattr(trainer, "train_step", None)
     if not callable(inner):
@@ -755,7 +755,7 @@ class UniRLWandBLogger:
           any ``extra_metrics`` (e.g. ``sync_weights``) merged in.
         - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
           (see :meth:`_log_train`).
-        - ``perf/rollout_time_s``: optional wall-clock for the step.
+        - ``perf/step_time_s``: optional total wall-clock for the step.
         - ``perf/<phase>_time_s``: optional per-phase wall-clocks from
           ``phase_times`` (e.g. ``generate``/``weight_sync``/``reward``/
           ``train``), so the step total can be attributed without log
@@ -788,7 +788,7 @@ class UniRLWandBLogger:
 
         perf: Dict[str, float] = {}
         if step_time_s is not None:
-            perf["rollout_time_s"] = float(step_time_s)
+            perf["step_time_s"] = float(step_time_s)
         if phase_times:
             perf.update({f"{name}_time_s": float(v) for name, v in phase_times.items()})
         if mem_summary:

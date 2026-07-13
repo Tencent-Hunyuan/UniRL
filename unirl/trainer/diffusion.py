@@ -194,6 +194,21 @@ class DiffusionTrainer(BaseTrainer):
             with placement(self.pool, fraction=reward_fraction, shared_workers=True):
                 self.reward = remote_hydra(reward_cfg)
 
+        # Pre-flight for the reward_fraction footgun: when reward takes its own
+        # slab the policy/rollout DP is the REDUCED card count, and the per-rollout
+        # sample count must divide BOTH the rollout DP and the reward DP — else the
+        # DP_SCATTER fails deep in generate()/score_and_attach with an opaque "not
+        # divisible by dp_size" error. Fail early here, naming the knob.
+        n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
+        if n_samples % self.rollout.dp_size or n_samples % self.reward.dp_size:
+            raise ValueError(
+                f"batch_size({batch_size}) * samples_per_prompt = {n_samples} samples/rollout must be "
+                f"divisible by BOTH rollout dp_size={self.rollout.dp_size} and reward dp_size="
+                f"{self.reward.dp_size}. reward_fraction={reward_fraction} placed reward on its own slab, "
+                f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
+                f"samples_per_prompt divisible by both."
+            )
+
     def _build_train_side(
         self,
         *,
