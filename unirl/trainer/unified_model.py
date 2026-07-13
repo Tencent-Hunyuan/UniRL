@@ -57,7 +57,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -68,6 +68,7 @@ from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
@@ -156,6 +157,7 @@ class UnifiedModelTrainer(BaseTrainer):
         eval_num_prompts: int = 32,
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -207,6 +209,11 @@ class UnifiedModelTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
             self.reward = remote_hydra(reward_cfg)
+            # Extra eval-only rewards (eval_rewards) — siblings of the training
+            # reward on this slab; see unirl.trainer.eval_suites.
+            self._eval_suites = build_eval_suites(
+                eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+            )
 
             # Two algorithms over the SAME shared pipeline (each resolves its
             # own stage via ``stage_attr``: ar→pipeline.ar, image→pipeline.diffusion).
@@ -774,21 +781,24 @@ class UnifiedModelTrainer(BaseTrainer):
         :meth:`run_rollout` (so both the single-engine trainside path and the
         two-engine HI3 path work), with the diffusion sub-block forced onto the
         deterministic best-quality setting (CFG at ``eval_cfg_text_scale``,
-        ``eta=eval_eta``), score ONLY the image track (PickScore), and log the
-        mean under ``eval/reward``. Returns it.
+        ``eta=eval_eta``), and score ONLY the image track. The training reward
+        plus every shared-set ``eval_rewards`` suite scores the SAME generated
+        images; each own-set suite then gets its own generation pass over its
+        own prompts. All means land in one ``eval/*`` row (``eval/reward`` +
+        ``eval/<suite>``); returns ``eval/reward``.
 
         The two-engine path syncs the live adapter into the engines once per
-        eval (EXTRACT with the base onloaded → wake → PUSH, mirroring
-        :meth:`train_step`) — train_step syncs BEFORE its generate, so without
-        this the engines would eval weights one update stale, and a
+        eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
+        :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
+        so without this the engines would eval weights one update stale, and a
         restored-checkpoint baseline eval would see fresh (unloaded) engine
-        weights. Unlike train_step it never onloads the base afterwards: eval
-        has no backward, so the FSDP state stays offloaded (the steady state)
-        throughout. The single-engine trainside path needs none of it (the
-        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
-        forced False). Chunked by ``self.batch_size`` (the un-expanded P-prompt
-        req DP-splits, so the chunk must be dp-divisible; ``batch_size`` is
-        what training runs). A ragged tail is floored off.
+        weights. Pushed weights persist across engine sleep/wake cycles (as
+        train_step relies on), so the passes below just wake/sleep around each
+        chunk's rollout. Unlike train_step, eval never onloads the base after
+        the extract: there is no backward, so the FSDP state stays offloaded
+        (the steady state) throughout. The single-engine trainside path needs
+        none of it (the rollout shares the live FSDP modules;
+        ``_enable_fsdp_offload`` is forced False).
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict.
         # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
@@ -802,21 +812,57 @@ class UnifiedModelTrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
-        chunk = max(1, self.batch_size)
-        usable = n_prompts - n_prompts % chunk or n_prompts
-        reward_sum, reward_n = 0.0, 0
-        # Two-engine: extract the CURRENT adapter once for the whole eval (PUSH
-        # rides the first chunk's wake below — it needs awake engines; pushed
-        # weights persist across engine sleep/wake cycles, as train_step relies on).
-        eval_sync = not self._single_engine and self.weight_sync is not None
-        if eval_sync:
+        # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH
+        # needs awake engines, so it rides one short wake/sleep cycle here).
+        if not self._single_engine and self.weight_sync is not None:
             if self._enable_fsdp_offload:
                 self.backend.onload()
             self.weight_sync.extract()
             if self._enable_fsdp_offload:
                 self.backend.offload()
+            for eng in self.ar_rollouts + self.dit_rollouts:
+                eng.wake_up()
+            self.weight_sync.push()
+            for eng in self.ar_rollouts + self.dit_rollouts:
+                eng.sleep()
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        logger.info(
+            "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
+            step,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self,
+        data_source: Any,
+        num_prompts: int,
+        scorers: List[Tuple[str, Any]],
+        eval_sp: Dict[str, BaseSamplingParams],
+        step: int,
+    ) -> Dict[str, float]:
+        """One generate→score sweep over one eval set; returns each scorer's mean.
+
+        Chunked by ``self.batch_size`` (the un-expanded P-prompt req DP-splits,
+        so the chunk must be dp-divisible; ``batch_size`` is what training
+        runs). A ragged tail (``num_prompts`` not a multiple of ``batch_size``)
+        is floored off.
+        """
+        all_inputs = data_source.get_eval_samples(num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.batch_size)
+        usable = n_prompts - n_prompts % chunk or n_prompts
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             req = self._build_req(sub, step, base_sampling=eval_sp)
@@ -825,9 +871,6 @@ class UnifiedModelTrainer(BaseTrainer):
             else:
                 for eng in self.ar_rollouts + self.dit_rollouts:
                     eng.wake_up()
-                if eval_sync:
-                    self.weight_sync.push()
-                    eval_sync = False
                 resp = self.run_rollout(req)
                 for eng in self.ar_rollouts + self.dit_rollouts:
                     eng.sleep()
@@ -854,22 +897,13 @@ class UnifiedModelTrainer(BaseTrainer):
                 sampling_params=req.sampling_params,
                 metadata=reward_metadata,
             )
-            scored = self.reward.score_and_attach(req=reward_req, track=img_track)
-            if scored.rewards is not None:
-                r = hydrate(scored.rewards).to(torch.float32)
-                reward_sum += float(r.sum().item())
-                reward_n += int(r.numel())
-        mean_reward = reward_sum / max(1, reward_n)
-        logger.info(
-            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f eta=%.1f)=%.4f",
-            step,
-            self.eval_num_prompts,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
-            mean_reward,
-        )
-        self.wandb_logger.log_eval(step, {"reward": mean_reward})
-        return mean_reward
+            for name, reward in scorers:
+                scored = reward.score_and_attach(req=reward_req, track=img_track)
+                if scored.rewards is not None:
+                    r = hydrate(scored.rewards).to(torch.float32)
+                    sums[name] += float(r.sum().item())
+                    counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(
         self,

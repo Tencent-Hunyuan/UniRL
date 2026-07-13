@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -38,6 +38,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import BaseSamplingParams
@@ -106,6 +107,7 @@ class PETrainer(BaseTrainer):
         eval_num_prompts: int = 8,
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -204,6 +206,11 @@ class PETrainer(BaseTrainer):
                 self.rollout = remote(**rollout_parsed)
 
             self.reward = remote_hydra(reward_cfg)
+            # Extra eval-only rewards (eval_rewards) — siblings of the training
+            # reward on this slab; see unirl.trainer.eval_suites.
+            self._eval_suites = build_eval_suites(
+                eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+            )
 
             # Non-trainside: one bridge per track, each routed to its child of
             # the composed engine by ``track_prefix`` (set in the sync block).
@@ -384,14 +391,12 @@ class PETrainer(BaseTrainer):
         credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
         (``run.eval_data_path``), generate the composed ``P→P*N*M`` fan-out with
         the diffusion sub-block forced onto the deterministic best-quality setting
-        (CFG at ``eval_cfg_text_scale``, ``eta=eval_eta``), score ONLY the image
-        ("diffusion") track (PickScore), and log the mean under ``eval/reward``.
-        Returns it.
-
-        Chunked by ``self.batch_size`` — the rollout DP-splits the un-expanded
-        P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
-        is what training already runs, so it is divisible. A ragged tail
-        (``eval_num_prompts`` not a multiple of ``batch_size``) is floored off.
+        (CFG at ``eval_cfg_text_scale``, ``eta=eval_eta``), and score ONLY the
+        image ("diffusion") track. The training reward plus every shared-set
+        ``eval_rewards`` suite scores the SAME generated images; each own-set
+        suite then gets its own generation pass over its own prompts. All means
+        land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``); returns
+        ``eval/reward``.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict.
         # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
@@ -405,16 +410,50 @@ class PETrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
-        chunk = max(1, self.batch_size)
-        usable = n_prompts - n_prompts % chunk or n_prompts
-        reward_sum, reward_n = 0.0, 0
         self.rollout.wake_up()
         if self.diffusion_sync is not None:  # no-op trainside (bridges are None)
             self.diffusion_sync.sync()
             if self.ar_sync is not None:
                 self.ar_sync.sync()
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        self.rollout.sleep()
+        logger.info(
+            "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
+            step,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self,
+        data_source: Any,
+        num_prompts: int,
+        scorers: List[Tuple[str, Any]],
+        eval_sp: Dict[str, BaseSamplingParams],
+        step: int,
+    ) -> Dict[str, float]:
+        """One generate→score sweep over one eval set; returns each scorer's mean.
+
+        Chunked by ``self.batch_size`` — the rollout DP-splits the un-expanded
+        P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
+        is what training already runs, so it is divisible. A ragged tail
+        (``num_prompts`` not a multiple of ``batch_size``) is floored off.
+        """
+        all_inputs = data_source.get_eval_samples(num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.batch_size)
+        usable = n_prompts - n_prompts % chunk or n_prompts
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             req = self._build_req(sub, step, base_sampling=eval_sp)
@@ -425,23 +464,13 @@ class PETrainer(BaseTrainer):
             diff_track = resp.tracks["diffusion"]
             n_track, p = len(diff_track.sample_ids), max(1, req.batch_size)
             reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
-            scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
-            if scored.rewards is not None:
-                r = hydrate(scored.rewards).to(torch.float32)
-                reward_sum += float(r.sum().item())
-                reward_n += int(r.numel())
-        self.rollout.sleep()
-        mean_reward = reward_sum / max(1, reward_n)
-        logger.info(
-            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f eta=%.1f)=%.4f",
-            step,
-            self.eval_num_prompts,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
-            mean_reward,
-        )
-        self.wandb_logger.log_eval(step, {"reward": mean_reward})
-        return mean_reward
+            for name, reward in scorers:
+                scored = reward.score_and_attach(req=reward_req, track=diff_track)
+                if scored.rewards is not None:
+                    r = hydrate(scored.rewards).to(torch.float32)
+                    sums[name] += float(r.sum().item())
+                    counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     # ---- checkpointing (PE trains two sides → one subdir per trained side) --
 

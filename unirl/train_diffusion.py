@@ -46,6 +46,7 @@ def main(cfg: DictConfig) -> None:
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
         eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        eval_rewards_cfg=cfg.get("eval_rewards"),
         stage_config=cfg.get("stage_config"),
     )
     trainer.train(

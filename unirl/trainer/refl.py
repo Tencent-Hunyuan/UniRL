@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -28,6 +28,7 @@ from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
 from unirl.distributed.tensor.ref import hydrate
 from unirl.trainer.base import BaseTrainer
+from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.utils.hydra import remote_hydra
 
@@ -50,6 +51,7 @@ class RewardBackpropTrainer(BaseTrainer):
         eval_interval: int = 0,
         eval_num_prompts: int = 12,
         eval_cfg_text_scale: float = 4.0,
+        eval_rewards_cfg: Optional[Any] = None,
         logging_cfg: Optional[DictConfig] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -82,10 +84,19 @@ class RewardBackpropTrainer(BaseTrainer):
                 self.policy = remote_hydra(policy_cfg)
             with placement(self.pool, fraction=reward_frac, shared_workers=True):
                 self.reward = remote_hydra(reward_cfg)
+                # Extra eval-only rewards (eval_rewards) ride the reward slab —
+                # see unirl.trainer.eval_suites. Their backends must be
+                # differentiable-capable like the training reward.
+                self._eval_suites = build_eval_suites(
+                    eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+                )
         else:
             with placement(self.pool, fraction=1.0, shared_workers=True):
                 self.policy = remote_hydra(policy_cfg)
                 self.reward = remote_hydra(reward_cfg)
+                self._eval_suites = build_eval_suites(
+                    eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+                )
 
         self.policy.initialize()
         # BaseTrainer.maybe_save/load_checkpoint operate on ``self.backend``.
@@ -119,14 +130,17 @@ class RewardBackpropTrainer(BaseTrainer):
         return mean_reward, float(grad_norm or 0.0), time.perf_counter() - t0
 
     def evaluate(self, step: int) -> float:
-        """Periodic eval — mean reward over the eval prompt set (no training).
+        """Periodic eval — mean reward(s) over the eval prompt set (no training).
 
         ReFL has no rollout engine or tracks, so this mirrors :meth:`train_step`'s
-        sample→score path (minus ``enable_grad``/backward): pull
-        ``eval_num_prompts`` eval prompts (``run.eval_data_path``), sample images
-        with :meth:`ReFLPolicy.eval_sample` (deterministic ODE, ``model.eval()`` +
-        ``no_grad``, CFG at ``eval_cfg_text_scale``), score with the differentiable
-        reward, and log the mean under ``eval/reward``. Returns it.
+        sample→score path (minus ``enable_grad``/backward): sample images with
+        :meth:`ReFLPolicy.eval_sample` (deterministic ODE, ``model.eval()`` +
+        ``no_grad``, CFG at ``eval_cfg_text_scale``) and score. The training
+        reward plus every shared-set ``eval_rewards`` suite scores the SAME
+        images from the default eval set (``run.eval_data_path``,
+        ``eval_num_prompts`` prompts); each own-set suite then runs its own
+        sample→score pass over its own prompts. All means land in one ``eval/*``
+        row (``eval/reward`` + ``eval/<suite>``); returns ``eval/reward``.
 
         ``step`` keys the wandb log axis (and ``eval_sample``'s seed), mirroring
         :meth:`DiffusionTrainer.evaluate` — so re-running a checkpoint via
@@ -134,37 +148,50 @@ class RewardBackpropTrainer(BaseTrainer):
         the restored weights at the same step. NOTE: eval is NOT bit-exact — the
         init latent is drawn unseeded (see ``eval_sample``), so A vs B agree only
         within sampling noise (~σ), not byte-identically.
+        """
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], step))
+        logger.info(
+            "EVAL step %d  (cfg=%.1f)  %s",
+            step,
+            self.eval_cfg_text_scale,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self, data_source: Any, num_prompts: int, scorers: List[Tuple[str, Any]], step: int
+    ) -> Dict[str, float]:
+        """One sample→score sweep over one eval set; returns each scorer's mean.
 
         Chunked by ``self.batch_size`` — both ``eval_sample`` and
         ``score_differentiable`` are DP_SCATTER, and ``batch_size`` is validated
         divisible by both the policy and reward dp sizes in ``__init__``; a ragged
-        tail (``eval_num_prompts`` not a multiple of ``batch_size``) is floored off.
+        tail (``num_prompts`` not a multiple of ``batch_size``) is floored off.
         """
-        eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
+        eval_inputs = data_source.get_eval_samples(num_prompts)
         prompts = eval_inputs.primitives["text"]
         if not isinstance(prompts, Texts):
             prompts = Texts(texts=list(prompts))
         texts = list(prompts.texts)
         chunk = max(1, self.batch_size)
         usable = len(texts) - len(texts) % chunk or len(texts)
-        reward_sum, reward_n = 0.0, 0
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
             sub = Texts(texts=texts[start : start + chunk])
             images = self.policy.eval_sample(prompts=sub, rollout_id=step, guidance_scale=self.eval_cfg_text_scale)
-            rewards = self.reward.score_differentiable(images=images, prompts=sub)
-            r = hydrate(rewards).float()
-            reward_sum += float(r.sum().item())
-            reward_n += int(r.numel())
-        mean_reward = reward_sum / max(1, reward_n)
-        logger.info(
-            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f)=%.4f",
-            step,
-            self.eval_num_prompts,
-            self.eval_cfg_text_scale,
-            mean_reward,
-        )
-        self.wandb_logger.log_eval(step, {"reward": mean_reward})
-        return mean_reward
+            for name, reward in scorers:
+                r = hydrate(reward.score_differentiable(images=images, prompts=sub)).float()
+                sums[name] += float(r.sum().item())
+                counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(
         self,
