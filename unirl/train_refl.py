@@ -24,7 +24,7 @@ def main(cfg: DictConfig) -> None:
         reward_cfg=cfg.reward,
         data_source_cfg=cfg.data_source,
         max_grad_norm=float(cfg.get("max_grad_norm", 1.0)),
-        policy_device_fraction=float(cfg.get("policy_device_fraction", 0.75)),
+        reward_fraction=float(cfg.get("reward_fraction", 0.25)),
         logging_cfg=cfg.get("logging"),
     )
     trainer.train(

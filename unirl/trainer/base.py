@@ -129,6 +129,14 @@ class BaseTrainer:
 
         install_phase_timing(self)
 
+        # verl-parity memory monitoring (perf/max_memory_* + [mem] boundary
+        # lines). Only constructed here — the collaborators to wrap don't exist
+        # until the subclass __init__ finishes, so install() runs in _init_wandb.
+        # None when disabled (logging.memory.enabled=false / UNIRL_MEM_MONITOR=0).
+        from unirl.utils.memory_monitor import install_memory_monitoring
+
+        self._memory_monitor = install_memory_monitoring(self)
+
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 
     def _install_train_step_reset_hook(self) -> None:
@@ -219,6 +227,12 @@ class BaseTrainer:
         )
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
+
+        # Every trainer calls _init_wandb at the top of train(): the subclass
+        # __init__ has finished (collaborators exist) and the live logger is in
+        # place — wrap the hand-off boundaries with memory probes here, once.
+        if self._memory_monitor is not None:
+            self._memory_monitor.install(self)
 
     def _drop_decoded(
         self,
@@ -317,7 +331,13 @@ class BaseTrainer:
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        # Checkpoint saving gathers a full state_dict — a memory spike worth
+        # bracketing (the one hand-off boundary outside the per-step phases).
+        if self._memory_monitor is not None:
+            self._memory_monitor.boundary("ckpt_save:begin", self.backend)
         self.backend.save(path, step=step, mode=save_mode)
+        if self._memory_monitor is not None:
+            self._memory_monitor.boundary("ckpt_save:end", self.backend)
         # Driver-owned state rides beside the worker-written checkpoint.pt:
         # the wandb run id + train/ step axis let a resume append to the SAME
         # wandb run instead of starting a fresh, misaligned one.

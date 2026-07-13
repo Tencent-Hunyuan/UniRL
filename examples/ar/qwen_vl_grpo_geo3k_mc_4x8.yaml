@@ -41,7 +41,8 @@ adv_normalization_scope: global
 
 # Online wandb reporting (driver/rank-0 only). Absent this block wandb is a
 # no-op. Per-rollout: rollout/reward_mean + train/{loss,grad_norm,lr,ratio_*,
-# clip_fraction,approx_kl} + perf/rollout_time_s. WANDB_API_KEY from launcher env.
+# clip_fraction,approx_kl} + perf/step_time_s + perf/<phase>_time_s.
+# WANDB_API_KEY from launcher env.
 logging:
   report_to_wandb: true
   project_name: unirl-flowgrpo-newstac

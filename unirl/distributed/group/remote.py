@@ -186,3 +186,40 @@ class Remote:
         """
         self._grad_inputs.clear()
         self._grad_outputs.clear()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def get_memory_stats(
+        self,
+        reset_peak: bool = False,
+        log_stage: Optional[str] = None,
+        empty_cache: bool = False,
+        dump_snapshot_tag: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Worker-side memory probe reached by the CUDA-less driver via BROADCAST.
+
+        Reads always happen BEFORE any reset so peaks survive; optional chores
+        (log line, empty_cache, peak reset, snapshot dump) are bundled so a
+        hand-off costs one RPC. See ``utils.memory_monitor`` for orchestration.
+        """
+        if not torch.cuda.is_available():
+            return {}
+        from unirl.utils.memory_utils import (
+            aggressive_empty_cache,
+            get_memory_info,
+            get_process_snapshot_sampler,
+            log_memory_usage,
+        )
+
+        info = log_memory_usage(log_stage) if log_stage else get_memory_info()
+        if empty_cache:
+            aggressive_empty_cache()
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+        out = {**info, "rank": float(self.rank_info.rank)}
+        if dump_snapshot_tag:
+            sampler = get_process_snapshot_sampler()
+            if sampler is not None:
+                report = sampler.dump(dump_snapshot_tag)
+                if report:  # carried to the driver so it lands in the training console
+                    out["snapshot_report"] = report
+        return out

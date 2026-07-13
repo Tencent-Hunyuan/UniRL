@@ -102,6 +102,14 @@ class BagelPipelineConfig:
     use_lora: bool = False
     lora_target_modules: Tuple[str, ...] = BAGEL_MOE_GEN_LORA_TARGETS
 
+    # T2I prompt-context cache: dedup the prompt prefill across the N GRPO siblings
+    # (BAGEL navit bs=1 sends them one per generate call). Safe ONLY when the
+    # und/prefill path is frozen (gen-only LoRA); BagelPipeline additionally
+    # auto-disables it at runtime if any non-gen param is trainable, so this flag
+    # is just the opt-out / cache-size knob.
+    cache_t2i_contexts: bool = True
+    context_cache_size: int = 32
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="BagelPipelineConfig.model_precision")
         if not isinstance(self.lora_target_modules, tuple):

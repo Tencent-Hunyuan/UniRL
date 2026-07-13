@@ -1,7 +1,8 @@
 # @package _global_
 # LTX-Video-2 T2V GRPO — trainside (in-process FSDP).
 #
-# LTX-2 is a ~2.4B video DiT with flow matching and Gemma3 text encoding.
+# LTX-2 is a ~19B video DiT (ltx-2-19b-dev; HF Lightricks/LTX-2, diffusers layout)
+# with flow matching and Gemma3 text encoding.
 # Supports T2V (this recipe), I2V (set primitives["image"]), and T2AV
 # (enable_audio: true, LTX-2.3 checkpoint).
 #
