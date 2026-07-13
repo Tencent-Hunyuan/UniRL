@@ -777,13 +777,18 @@ class UnifiedModelTrainer(BaseTrainer):
         ``eta=eval_eta``), score ONLY the image track (PickScore), and log the
         mean under ``eval/reward``. Returns it.
 
-        The two-engine path replicates ``train_step``'s colocate memory dance
-        (wake engines → rollout → sleep → onload base → re-offload to steady
-        state); the single-engine trainside path needs none of it
-        (``_enable_fsdp_offload`` is forced False, no engines to wake). Chunked by
-        ``self.batch_size`` (the un-expanded P-prompt req DP-splits, so the chunk
-        must be dp-divisible; ``batch_size`` is what training runs). A ragged tail
-        is floored off.
+        The two-engine path syncs the live adapter into the engines once per
+        eval (EXTRACT with the base onloaded → wake → PUSH, mirroring
+        :meth:`train_step`) — train_step syncs BEFORE its generate, so without
+        this the engines would eval weights one update stale, and a
+        restored-checkpoint baseline eval would see fresh (unloaded) engine
+        weights. Unlike train_step it never onloads the base afterwards: eval
+        has no backward, so the FSDP state stays offloaded (the steady state)
+        throughout. The single-engine trainside path needs none of it (the
+        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
+        forced False). Chunked by ``self.batch_size`` (the un-expanded P-prompt
+        req DP-splits, so the chunk must be dp-divisible; ``batch_size`` is
+        what training runs). A ragged tail is floored off.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict.
         # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
@@ -802,6 +807,16 @@ class UnifiedModelTrainer(BaseTrainer):
         chunk = max(1, self.batch_size)
         usable = n_prompts - n_prompts % chunk or n_prompts
         reward_sum, reward_n = 0.0, 0
+        # Two-engine: extract the CURRENT adapter once for the whole eval (PUSH
+        # rides the first chunk's wake below — it needs awake engines; pushed
+        # weights persist across engine sleep/wake cycles, as train_step relies on).
+        eval_sync = not self._single_engine and self.weight_sync is not None
+        if eval_sync:
+            if self._enable_fsdp_offload:
+                self.backend.onload()
+            self.weight_sync.extract()
+            if self._enable_fsdp_offload:
+                self.backend.offload()
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             req = self._build_req(sub, step, base_sampling=eval_sp)
@@ -810,11 +825,12 @@ class UnifiedModelTrainer(BaseTrainer):
             else:
                 for eng in self.ar_rollouts + self.dit_rollouts:
                     eng.wake_up()
+                if eval_sync:
+                    self.weight_sync.push()
+                    eval_sync = False
                 resp = self.run_rollout(req)
                 for eng in self.ar_rollouts + self.dit_rollouts:
                     eng.sleep()
-                if self._enable_fsdp_offload:
-                    self.backend.onload()
             # Score the image track only; build a reward req aligned 1:1 with the
             # image track (each image's ORIGINAL prompt) so req and track shard
             # together across DP ranks (mirrors train_step).
@@ -843,9 +859,6 @@ class UnifiedModelTrainer(BaseTrainer):
                 r = hydrate(scored.rewards).to(torch.float32)
                 reward_sum += float(r.sum().item())
                 reward_n += int(r.numel())
-            # Back to steady state (base on CPU) so the next chunk's engines have room.
-            if self._enable_fsdp_offload and not self._single_engine:
-                self.backend.offload()
         mean_reward = reward_sum / max(1, reward_n)
         logger.info(
             "EVAL step %d  eval_reward(%d prompts, cfg=%.1f eta=%.1f)=%.4f",
