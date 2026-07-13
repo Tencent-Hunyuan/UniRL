@@ -154,6 +154,7 @@ class UnifiedModelTrainer(BaseTrainer):
         enable_fsdp_offload: bool = True,
         eval_interval: int = 0,
         eval_num_prompts: int = 32,
+        eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -165,12 +166,17 @@ class UnifiedModelTrainer(BaseTrainer):
 
         # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
         # eval_interval=0 disables it. Scores only the image track (PickScore) like
-        # train_step, mean logged as eval/reward. eval_eta forces the diffusion
-        # sub-block onto a deterministic ODE for eval (recipe trains at eta>0). No
+        # train_step, mean logged as eval/reward. Eval generates at the
+        # deterministic best-quality setting, mirroring DiffusionTrainer:
+        # eval_cfg_text_scale sets the CFG strength (UniGRPO recipes train at
+        # cfg_text_scale=1.0 = no CFG; set it to the train value to eval in the
+        # training regime instead) and eval_eta forces the diffusion sub-block
+        # onto a deterministic ODE (recipe trains at eta>0). No
         # eval_samples_per_prompt knob: the 2-track fan-out makes a single count
         # ambiguous (bagel is M=1, image shares the AR advantage).
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
 
         # W&B logging (logging_cfg, wandb_logger, optimizer-step counter) is owned
@@ -766,9 +772,10 @@ class UnifiedModelTrainer(BaseTrainer):
         credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
         (``run.eval_data_path``), run the ``P→P*N→P*N*M`` fan-out through
         :meth:`run_rollout` (so both the single-engine trainside path and the
-        two-engine HI3 path work), with the diffusion sub-block forced onto a
-        deterministic ODE (``eta=eval_eta``), score ONLY the image track
-        (PickScore), and log the mean under ``eval/reward``. Returns it.
+        two-engine HI3 path work), with the diffusion sub-block forced onto the
+        deterministic best-quality setting (CFG at ``eval_cfg_text_scale``,
+        ``eta=eval_eta``), score ONLY the image track (PickScore), and log the
+        mean under ``eval/reward``. Returns it.
 
         The two-engine path replicates ``train_step``'s colocate memory dance
         (wake engines → rollout → sleep → onload base → re-offload to steady
@@ -778,8 +785,17 @@ class UnifiedModelTrainer(BaseTrainer):
         must be dp-divisible; ``batch_size`` is what training runs). A ragged tail
         is floored off.
         """
+        # Override only the "diffusion" entry of the modality-keyed sampling dict.
+        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
+        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (HI3,
+        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
         base_diffusion = self.sampling_params.get("diffusion")
-        eval_diffusion = dataclasses.replace(base_diffusion, eta=self.eval_eta)
+        replace_kwargs = dict(eta=self.eval_eta)
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         n_prompts = len(all_inputs.sample_ids)
@@ -832,9 +848,10 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.backend.offload()
         mean_reward = reward_sum / max(1, reward_n)
         logger.info(
-            "EVAL step %d  eval_reward(%d prompts, eta=%.1f)=%.4f",
+            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f eta=%.1f)=%.4f",
             step,
             self.eval_num_prompts,
+            self.eval_cfg_text_scale,
             self.eval_eta,
             mean_reward,
         )

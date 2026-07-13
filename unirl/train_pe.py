@@ -36,6 +36,7 @@ def main(cfg: DictConfig) -> None:
         diffusion_group_scope=cfg.get("diffusion_group_scope", "rewrite"),
         eval_interval=int(cfg.get("eval_interval", 0)),
         eval_num_prompts=int(cfg.get("eval_num_prompts", cfg.batch_size)),
+        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
         eval_eta=float(cfg.get("eval_eta", 0.0)),
     )
     trainer.train(

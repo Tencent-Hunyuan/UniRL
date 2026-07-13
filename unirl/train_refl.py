@@ -27,6 +27,7 @@ def main(cfg: DictConfig) -> None:
         reward_fraction=float(cfg.get("reward_fraction", 0.25)),
         eval_interval=int(cfg.get("eval_interval", 0)),
         eval_num_prompts=int(cfg.get("eval_num_prompts", cfg.batch_size)),
+        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
         logging_cfg=cfg.get("logging"),
     )
     trainer.train(

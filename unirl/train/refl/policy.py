@@ -143,7 +143,7 @@ class ReFLPolicy(Remote):
         )
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def eval_sample(self, *, prompts: Texts, rollout_id: int = 0) -> Images:
+    def eval_sample(self, *, prompts: Texts, rollout_id: int = 0, guidance_scale: Optional[float] = None) -> Images:
         """Eval sampling: ``model.eval()`` + ``no_grad`` DRaFT-K, no autograd graph.
 
         The eval sibling of :meth:`sample_and_decode`. Reused outside the driver's
@@ -153,6 +153,10 @@ class ReFLPolicy(Remote):
         mode + ``torch.no_grad()`` so the returned ``Images`` carry no grad_fn and
         no graph is retained. The next ``train_step`` re-asserts ``model.train()``
         via ``sample_and_decode``, so no explicit mode restore is needed.
+
+        ``guidance_scale`` overrides the training CFG strength for eval (the
+        trainer passes ``eval_cfg_text_scale``; recipes train at 1.0 = no CFG);
+        ``None`` falls back to the training value.
 
         The seed is offset from ``sample_and_decode``'s so eval does not reuse the
         exact training-step params at the same ``rollout_id``. NOTE: the init latent
@@ -164,7 +168,7 @@ class ReFLPolicy(Remote):
         dp_rank = int(self.rank_info.dp_rank) if self.rank_info is not None else 0
         params = DiffusionSamplingParams(
             num_inference_steps=self.num_inference_steps,
-            guidance_scale=self.guidance_scale,
+            guidance_scale=self.guidance_scale if guidance_scale is None else float(guidance_scale),
             height=self.height,
             width=self.width,
             eta=0.0,  # deterministic ODE eval

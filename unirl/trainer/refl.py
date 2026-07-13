@@ -49,6 +49,7 @@ class RewardBackpropTrainer(BaseTrainer):
         reward_fraction: float = 0.25,
         eval_interval: int = 0,
         eval_num_prompts: int = 12,
+        eval_cfg_text_scale: float = 4.0,
         logging_cfg: Optional[DictConfig] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -58,8 +59,13 @@ class RewardBackpropTrainer(BaseTrainer):
         # eval_interval=0 disables it. ReFL has no rollout engine / tracks: eval
         # samples via ReFLPolicy.eval_sample (deterministic ODE, no grad) and scores
         # with the same differentiable reward, mean logged as eval/reward.
+        # eval_cfg_text_scale sets the eval CFG strength (maps onto the SD3-family
+        # guidance_scale; recipes train at guidance_scale=1.0 = no CFG; set it to
+        # the train value to eval in the training regime instead) — mirrors
+        # DiffusionTrainer's knob of the same name.
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.data_source = instantiate(data_source_cfg)
 
         # Unified reward placement — SAME knob/semantics as DiffusionTrainer's
@@ -119,8 +125,8 @@ class RewardBackpropTrainer(BaseTrainer):
         sample→score path (minus ``enable_grad``/backward): pull
         ``eval_num_prompts`` eval prompts (``run.eval_data_path``), sample images
         with :meth:`ReFLPolicy.eval_sample` (deterministic ODE, ``model.eval()`` +
-        ``no_grad``), score with the differentiable reward, and log the mean under
-        ``eval/reward``. Returns it.
+        ``no_grad``, CFG at ``eval_cfg_text_scale``), score with the differentiable
+        reward, and log the mean under ``eval/reward``. Returns it.
 
         ``step`` keys the wandb log axis (and ``eval_sample``'s seed), mirroring
         :meth:`DiffusionTrainer.evaluate` — so re-running a checkpoint via
@@ -144,13 +150,19 @@ class RewardBackpropTrainer(BaseTrainer):
         reward_sum, reward_n = 0.0, 0
         for start in range(0, usable, chunk):
             sub = Texts(texts=texts[start : start + chunk])
-            images = self.policy.eval_sample(prompts=sub, rollout_id=step)
+            images = self.policy.eval_sample(prompts=sub, rollout_id=step, guidance_scale=self.eval_cfg_text_scale)
             rewards = self.reward.score_differentiable(images=images, prompts=sub)
             r = hydrate(rewards).float()
             reward_sum += float(r.sum().item())
             reward_n += int(r.numel())
         mean_reward = reward_sum / max(1, reward_n)
-        logger.info("EVAL step %d  eval_reward(%d prompts)=%.4f", step, self.eval_num_prompts, mean_reward)
+        logger.info(
+            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f)=%.4f",
+            step,
+            self.eval_num_prompts,
+            self.eval_cfg_text_scale,
+            mean_reward,
+        )
         self.wandb_logger.log_eval(step, {"reward": mean_reward})
         return mean_reward
 

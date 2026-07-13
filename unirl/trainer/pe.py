@@ -104,6 +104,7 @@ class PETrainer(BaseTrainer):
         diffusion_group_scope: str = "rewrite",
         eval_interval: int = 0,
         eval_num_prompts: int = 8,
+        eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -138,13 +139,17 @@ class PETrainer(BaseTrainer):
 
         # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
         # eval_interval=0 disables it. Scores only the image ("diffusion") track
-        # (PickScore) like train_step, mean logged as eval/reward. eval_eta forces
-        # the diffusion sub-block onto a deterministic ODE for eval (recipe trains
-        # at eta>0 for exploration). No eval_samples_per_prompt knob: PE fans out
-        # P->P*N*M two levels, so a single per-prompt count is ambiguous (N*M is
-        # already a dense eval).
+        # (PickScore) like train_step, mean logged as eval/reward. Eval generates
+        # at the deterministic best-quality setting, mirroring DiffusionTrainer:
+        # eval_cfg_text_scale sets the CFG strength (recipes train at
+        # guidance_scale=1.0 = no CFG; set it to the train value to eval in the
+        # training regime instead) and eval_eta forces the diffusion sub-block
+        # onto a deterministic ODE (recipe trains at eta>0 for exploration). No
+        # eval_samples_per_prompt knob: PE fans out P->P*N*M two levels, so a
+        # single per-prompt count is ambiguous (N*M is already a dense eval).
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
 
         # PE prompt-rewrite knobs forwarded to the composed PEPipeline (trainside
@@ -378,17 +383,27 @@ class PETrainer(BaseTrainer):
         Mirrors :meth:`train_step`'s rollout+reward path but skips
         credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
         (``run.eval_data_path``), generate the composed ``P→P*N*M`` fan-out with
-        the diffusion sub-block forced onto a deterministic ODE (``eta=eval_eta``),
-        score ONLY the image ("diffusion") track (PickScore), and log the mean
-        under ``eval/reward``. Returns it.
+        the diffusion sub-block forced onto the deterministic best-quality setting
+        (CFG at ``eval_cfg_text_scale``, ``eta=eval_eta``), score ONLY the image
+        ("diffusion") track (PickScore), and log the mean under ``eval/reward``.
+        Returns it.
 
         Chunked by ``self.batch_size`` — the rollout DP-splits the un-expanded
         P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
         is what training already runs, so it is divisible. A ragged tail
         (``eval_num_prompts`` not a multiple of ``batch_size``) is floored off.
         """
+        # Override only the "diffusion" entry of the modality-keyed sampling dict.
+        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
+        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (SD3,
+        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
         base_diffusion = self.sampling_params.get("diffusion")
-        eval_diffusion = dataclasses.replace(base_diffusion, eta=self.eval_eta)
+        replace_kwargs = dict(eta=self.eval_eta)
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         n_prompts = len(all_inputs.sample_ids)
@@ -418,9 +433,10 @@ class PETrainer(BaseTrainer):
         self.rollout.sleep()
         mean_reward = reward_sum / max(1, reward_n)
         logger.info(
-            "EVAL step %d  eval_reward(%d prompts, eta=%.1f)=%.4f",
+            "EVAL step %d  eval_reward(%d prompts, cfg=%.1f eta=%.1f)=%.4f",
             step,
             self.eval_num_prompts,
+            self.eval_cfg_text_scale,
             self.eval_eta,
             mean_reward,
         )
