@@ -18,6 +18,7 @@ those slots via the ``HunyuanStaticCache``.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from unirl.config.require import require
@@ -57,6 +58,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
 
     params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
+    # The driver carries the deterministic x_T recipe on the request rather
+    # than mutating the shared sampling params. Attach those IDs to a
+    # request-local copy so the existing NoiseRecipe path in diffuse() consumes
+    # sampling.seed. With seed=None, preserve the engine-local RNG fallback.
+    recipe_ids = [str(noise_id) for noise_id in (getattr(req, "init_noise_group_ids", None) or [])]
+    if params.seed is not None and recipe_ids:
+        params = replace(
+            params,
+            noise_group_ids=recipe_ids,
+        )
+
     if req.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "
