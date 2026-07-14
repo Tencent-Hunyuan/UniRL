@@ -162,6 +162,7 @@ sampling:
     temperature: 0.7
     max_new_tokens: 256
     top_p: 0.9
+    top_k: 1024
   diffusion:
     _target_: unirl.types.sampling.DiffusionSamplingParams
     samples_per_prompt: 4       # M images per rewrite
