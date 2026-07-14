@@ -199,8 +199,10 @@ class ARTrainer(BaseTrainer):
         advantage/backward: iterate up to ``eval_num_prompts`` prompts from
         ``run.eval_data_path`` in ``eval_batch_size``-sized batches, expand
         each prompt to ``eval_samples_per_prompt`` siblings, generate at
-        ``eval_temperature``, score, and log the mean reward (= avg@k accuracy
-        since reward is 0/1) under ``eval/*``. Returns it.
+        ``eval_temperature``, score, and log the mean reward under both
+        ``eval/acc`` (= avg@k accuracy, since the MC reward is 0/1) and
+        ``eval/reward`` (shares the eval axis with the other trainers).
+        Returns it.
 
         ``eval_num_prompts=-1`` (default) evaluates the full eval set;
         ``eval_num_prompts=0`` yields no batches (explicit skip). See the
@@ -258,7 +260,9 @@ class ARTrainer(BaseTrainer):
             self.eval_batch_size,
             acc,
         )
-        self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
+        # MC reward is 0/1 so mean reward == accuracy; also emit it as `reward`
+        # so this run shares the eval/reward axis with the other trainers.
+        self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
 
     def _dump_rollout_samples(self, req, resp, rollout_id: int) -> None:
