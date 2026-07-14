@@ -47,6 +47,7 @@ import logging
 from collections import OrderedDict
 from contextlib import nullcontext
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -84,28 +85,6 @@ def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
         except Exception:
             return default
     return getattr(cfg, key, default)
-
-
-class _VaeEncodeDtypeAdapter:
-    """Dtype boundary for the vendored VAE-encode path.
-
-    ``forward_cache_update_vae`` (vendor bagel.py:491-526) calls only
-    ``vae_model.encode(...)`` on the object it is handed. The shared VAE rests in
-    fp32 after the first decode (see ``BagelVAEDecodeStage``), so this adapter
-    casts the input to the VAE's live parameter dtype and the resulting latent to
-    the live dtype of its ``vae2llm`` consumer. Reading both modules at call time
-    keeps the boundary correct after either module is recast and avoids assuming
-    that the bundle's configured ``vae_dtype`` matches the consumer.
-    """
-
-    def __init__(self, vae: Any, consumer: Any) -> None:
-        self._vae = vae
-        self._consumer = consumer
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        vae_dtype = next(self._vae.parameters()).dtype
-        consumer_dtype = next(self._consumer.parameters()).dtype
-        return self._vae.encode(x.to(dtype=vae_dtype)).to(dtype=consumer_dtype)
 
 
 class BagelPipeline(Pipeline):
@@ -263,8 +242,17 @@ class BagelPipeline(Pipeline):
                 new_token_ids=self.bundle.new_token_ids,
             )
             gi = _to_device(gi, device)
-            vae = _VaeEncodeDtypeAdapter(self.bundle.vae, bagel.vae2llm)
-            past = bagel.forward_cache_update_vae(vae, ctx["past_key_values"], **gi)
+            # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
+            vae_mod, proj = self.bundle.vae, bagel.vae2llm
+
+            def _vae_encode(x: torch.Tensor) -> torch.Tensor:
+                return vae_mod.encode(x.to(dtype=next(vae_mod.parameters()).dtype)).to(
+                    dtype=next(proj.parameters()).dtype
+                )
+
+            past = bagel.forward_cache_update_vae(
+                SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi
+            )
             ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
         if vit:
             gi, kv_lens, ropes = bagel.prepare_vit_images(

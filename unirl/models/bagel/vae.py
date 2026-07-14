@@ -165,10 +165,10 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         # Framework convention (qwen_image / sd3 / flux2_klein): the VAE stays fp32
         # after the first decode — the .to(float32) above is a one-time lazy upcast,
         # a no-op on later calls. The shared encode path is dtype-safe regardless:
-        # pipeline.py's _VaeEncodeDtypeAdapter casts encode inputs/outputs at the
-        # boundary, so the downstream bf16 vae2llm is unaffected. (This also removes
-        # the old restore's leak, where an activation_checkpoint backward recompute
-        # re-cast the VAE to fp32 after the restore had run.)
+        # pipeline.py casts encode inputs/outputs at the vendor boundary, so the
+        # downstream bf16 vae2llm is unaffected. (This also removes the old restore's
+        # leak, where an activation_checkpoint backward recompute re-cast the VAE to
+        # fp32 after the restore had run.)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Move to CPU before returning: decoded pixels are only ever consumed as
         # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow

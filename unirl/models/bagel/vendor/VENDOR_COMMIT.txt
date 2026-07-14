@@ -27,8 +27,8 @@ Plus local compatibility edits (NOT pristine):
   3. Reference-inferencer VAE decode dtype compatibility:
      inferencer.py temporarily decodes with the VAE in fp32, then restores its
      loaded dtype. Unlike BagelVAEDecodeStage's sticky-fp32 pipeline path, the
-     standalone inferencer encodes through the VAE directly and does not use
-     _VaeEncodeDtypeAdapter.
+     standalone inferencer encodes through the VAE directly and does not cast
+     encode I/O at the boundary.
 
 To re-vendor a newer upstream:
   1. git -C Bagel fetch && git -C Bagel checkout <new_commit>

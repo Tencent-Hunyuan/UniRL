@@ -40,7 +40,7 @@ compatibility/grad fixes below:
   latents directly to ``vae.decode``. The local edit decodes through a temporary
   fp32 VAE cast, then restores the loaded dtype. This intentionally differs from
   ``BagelVAEDecodeStage``'s sticky-fp32 pipeline path: the standalone inferencer
-  encodes through the VAE directly and does not use ``_VaeEncodeDtypeAdapter``.
+  encodes through the VAE directly and does not cast encode I/O at the boundary.
 
 Apart from those documented fixes the modeling is byte-pristine. The RL primitives
 (SDE step + log-prob, window sampler, replay) live OUTSIDE this tree in
