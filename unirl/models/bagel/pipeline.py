@@ -250,9 +250,7 @@ class BagelPipeline(Pipeline):
                     dtype=next(proj.parameters()).dtype
                 )
 
-            past = bagel.forward_cache_update_vae(
-                SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi
-            )
+            past = bagel.forward_cache_update_vae(SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi)
             ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
         if vit:
             gi, kv_lens, ropes = bagel.prepare_vit_images(
