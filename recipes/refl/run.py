@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Hydra entry point for the recipes.refl_wan REFL recipe."""
+"""Hydra entry point for the recipes.refl REFL recipe."""
 
 from __future__ import annotations
 
 import hydra
 from omegaconf import DictConfig
 
-from recipes.refl_wan.trainer import REFLTrainer
+from recipes.refl.trainer import REFLTrainer
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="wan22_face_refl")

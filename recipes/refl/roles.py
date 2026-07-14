@@ -13,8 +13,9 @@ from omegaconf import OmegaConf
 from unirl.distributed.group.dispatch import distributed
 from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 from unirl.reward.base import DifferentiableReward
+from unirl.reward.role import RewardRole
 from unirl.sde.runtime import get_sigma_schedule
-from unirl.trainer.base_role import Role
+from unirl.trainer.role import Role
 from unirl.types.primitives import Images, Texts
 from unirl.types.rollout_req import RolloutReq
 
@@ -174,51 +175,4 @@ class ReflActorRole(Role):
         )
 
 
-class ReflRewardRole(Role):
-    """Generic local differentiable reward role for REFL recipes."""
-
-    backend: Any
-
-    @property
-    def preferred_input_kind(self) -> str:
-        kind = str(getattr(self.backend, "preferred_input_kind", "") or "").strip().lower()
-        if kind not in {"image", "video", "text"}:
-            raise ValueError(f"Reward backend must expose preferred_input_kind image/video/text, got {kind!r}.")
-        return kind
-
-    @distributed
-    def score_differentiable(self, *, req: RolloutReq, generated: Any) -> torch.Tensor:
-        """Score live-grad decoded media through the official differentiable reward path."""
-        decoded = generated.decoded
-        if not isinstance(decoded, torch.Tensor):
-            raise TypeError(
-                f"ReflRewardRole.score_differentiable: generated.decoded must be Tensor, "
-                f"got {type(decoded).__name__}."
-            )
-        texts = req.primitives.get("text") if req.primitives else None
-        if not isinstance(texts, Texts):
-            raise TypeError("ReflRewardRole.score_differentiable: req.primitives['text'] must be Texts.")
-
-        if not isinstance(self.backend, DifferentiableReward):
-            raise TypeError(
-                f"{type(self.backend).__name__} must implement compute_rewards_differentiable "
-                "for REFL reward backprop."
-            )
-
-        records = list(req.metadata) if req.metadata else None
-        kind = self.preferred_input_kind
-        if kind == "image" and decoded.ndim != 4:
-            raise ValueError(f"image backend expects [B,C,H,W], got {tuple(decoded.shape)}")
-        if kind == "video" and decoded.ndim != 5:
-            raise ValueError(f"video backend expects [B,C,T,H,W], got {tuple(decoded.shape)}")
-        if kind not in {"image", "video"}:
-            raise ValueError(f"ReflRewardRole.score_differentiable: unsupported input_kind={kind!r}.")
-
-        return self.backend.compute_rewards_differentiable(
-            decoded,
-            list(texts.texts),
-            records=records,
-        )
-
-
-__all__ = ["ReflActorRole", "ReflRewardRole"]
+__all__ = ["ReflActorRole"]

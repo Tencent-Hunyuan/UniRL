@@ -1,0 +1,11 @@
+transformers==4.45.2
+peft==0.10.0
+trl==0.8.6
+accelerate==0.34.0
+decord==0.6.0
+opencv-python-headless
+safetensors
+huggingface_hub
+einops
+flash-attn==2.5.8
+setuptools<70

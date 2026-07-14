@@ -1,6 +1,6 @@
 """Recipe-local WAN 2.1 T2V step + stage + pipeline for REFL BPTT.
 
-Mirrors ``recipes.refl_wan.models.wan22`` but targets the WAN 2.1 T2V
+Mirrors ``recipes.refl.models.wan22`` but targets the WAN 2.1 T2V
 single-DiT stack. The REFL-specific pieces live here:
 
 - :class:`Wan21ReflDiffusionStep` — strict recipe-local single-branch

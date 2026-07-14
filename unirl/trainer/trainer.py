@@ -315,8 +315,6 @@ class Trainer(BaseTrainer):
         finally:
             self._finish_wandb()
 
-    fit = train
-
     def log_metrics(self, metrics: Dict[str, Any], *, rollout_id: int, num_rollouts: int) -> None:
         trainer_name = self.__class__.__name__.removesuffix("Trainer") or self.__class__.__name__
         metric_text = " ".join(

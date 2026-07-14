@@ -3,7 +3,7 @@
 Self-contained port of the VideoAlign reward family for the REFL WAN recipe.
 The reward model code (``Qwen2VLRewardModelBT``), prompt templates, config
 dataclasses and checkpoint-loading helpers all live under
-:mod:`recipes.refl_wan.rewards.videoalign.model`, matching the recipe-local
+:mod:`recipes.refl.rewards.videoalign.model`, matching the recipe-local
 layout used by the WAN22 face reward.
 
 Public API

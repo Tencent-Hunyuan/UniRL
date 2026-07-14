@@ -9,7 +9,7 @@ save_dir: ${oc.env:OUTPUT_DIR,outputs/wan22_face_refl}
 
 roles:
   - name: actor
-    _target_: recipes.refl_wan.roles.ReflActorRole
+    _target_: recipes.refl.roles.ReflActorRole
     placement:
       n_devices: ${num_devices}
 
@@ -25,7 +25,7 @@ roles:
         num_train_timesteps: 1000
 
     pipeline:
-      _target_: recipes.refl_wan.models.wan22.Wan22ReflPipeline
+      _target_: recipes.refl.models.wan22.Wan22ReflPipeline
       shift: 5.0
       autocast_precision: bf16
       trajectory_precision: bf16
@@ -81,16 +81,16 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: recipes.refl_wan.roles.ReflRewardRole
+    _target_: unirl.reward.role.RewardRole
     placement:
       share_with: actor
 
     backend:
-      _target_: recipes.refl_wan.rewards.face.FaceRewardScorer
+      _target_: recipes.refl.rewards.face.FaceRewardScorer
       base_device: cuda
       config:
-        _target_: recipes.refl_wan.rewards.face.FaceRewardSpec
-        model_path: ${oc.env:FACE_MODEL_PATH,/apdcephfs_gy8/share_301869871/staryding/gy6_data/ckpt/ckpt_0303/apdcephfs_wza/xiangwshen/a/antelodev2/antelodev2}
+        _target_: recipes.refl.rewards.face.FaceRewardSpec
+        model_path: ${oc.env:FACE_MODEL_PATH,/path/to/antelodev2_face_ckpt}
         device: cuda
         batch_size: 1
         image_size: 112
@@ -110,8 +110,8 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH,/apdcephfs_gy8/share_301869871/yohunawu/gy6/yohunawu/refl_wan_data/wan22_face_refl_prompts.jsonl}
-      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,/apdcephfs_gy8/share_301869871/yohunawu/gy6/yohunawu/refl_wan_data/wan22_face_refl_prompts.jsonl}}
+      data_path: ${oc.env:DATA_PATH,/path/to/wan22_face_refl_prompts.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,/path/to/wan22_face_refl_prompts.jsonl}}
       seed: 42
       shuffle: false
     algorithm:

@@ -9,7 +9,7 @@ save_dir: ${oc.env:OUTPUT_DIR,outputs/wan21_t2v_videoalign_refl}
 
 roles:
   - name: actor
-    _target_: recipes.refl_wan.roles.ReflActorRole
+    _target_: recipes.refl.roles.ReflActorRole
     placement:
       n_devices: ${num_devices}
 
@@ -23,7 +23,7 @@ roles:
         max_sequence_length: 512
 
     pipeline:
-      _target_: recipes.refl_wan.models.wan21.Wan21ReflPipeline
+      _target_: recipes.refl.models.wan21.Wan21ReflPipeline
       shift: 5.0
       autocast_precision: bf16
       trajectory_precision: bf16
@@ -84,19 +84,19 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: recipes.refl_wan.roles.ReflRewardRole
+    _target_: unirl.reward.role.RewardRole
     placement:
       # BPTT gradients must live on the same worker — no cross-process
       # autograd. VideoAlign co-locates with the actor.
       share_with: actor
 
     backend:
-      _target_: recipes.refl_wan.rewards.videoalign.VideoAlignRewardScorer
+      _target_: recipes.refl.rewards.videoalign.VideoAlignRewardScorer
       base_device: cuda
       config:
-        _target_: recipes.refl_wan.rewards.videoalign.VideoAlignSpec
+        _target_: recipes.refl.rewards.videoalign.VideoAlignSpec
         reward_model_path: ${oc.env:VIDEOALIGN_MODEL_PATH}
-        device: auto
+        device: cuda
         batch_size: 1
         resize_height: 336
         resize_width: 588

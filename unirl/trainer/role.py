@@ -70,22 +70,12 @@ class Role(Remote):
             else:
                 self.backend = instantiate(backend_cfg)
 
-    def _max_grad_norm(self) -> float:
-        algo_cfg = getattr(self, "algo_cfg", None)
-        if algo_cfg is None:
-            algo_cfg = getattr(self, "algorithm_cfg", None)
-        if algo_cfg is not None and hasattr(algo_cfg, "get"):
-            return float(algo_cfg.get("max_grad_norm", 1.0))
-        if algo_cfg is not None and hasattr(algo_cfg, "max_grad_norm"):
-            return float(algo_cfg.max_grad_norm)
-        return float(getattr(self, "max_grad_norm", 1.0))
-
     @distributed
     def step(self) -> RoleStepResult:
         """Clip gradients and run one backend optimizer step."""
         if not hasattr(self, "backend") or not hasattr(self.backend, "optimizer_step"):
             raise RuntimeError(f"{type(self).__name__}.step requires a backend with optimizer_step(...).")
-        grad_norm = float(self.backend.optimizer_step(max_grad_norm=self._max_grad_norm()))
+        grad_norm = float(self.backend.optimizer_step(max_grad_norm=float(self.algo_cfg.get("max_grad_norm", 1.0))))
         lr = 0.0
         try:
             sched = getattr(self.backend, "scheduler", None)
