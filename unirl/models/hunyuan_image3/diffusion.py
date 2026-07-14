@@ -203,12 +203,14 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 if image_mask_in is not None:
                     image_mask_in = torch.gather(image_mask_in, dim=1, index=position_ids_in)
         # [ROPE-FIX] config.rope_type=="2d" needs a 2-D RoPE for EVERY image
-        # section (gen + it2i's cond_vae + cond_vit). The native builder
-        # (build_batch_rope_image_info) derives these from the real
-        # sections/all_image_slices, with overlap/interleave position bookkeeping
-        # that CANNOT be faithfully reverse-engineered from token masks (a
-        # mask-only rebuild mis-positions tokens AND overflows build_2d_rope's
-        # arange(last_pos, seq_len) under train-mode's tight seqlen). But the
+        # section (gen + it2i's cond_vae + cond_vit). For the MULTI-section it2i
+        # layout the native builder (build_batch_rope_image_info) derives these
+        # from the real sections/all_image_slices, with overlap/interleave
+        # position bookkeeping that CANNOT be faithfully reverse-engineered from
+        # token masks (a mask-only rebuild mis-positions tokens AND overflows
+        # build_2d_rope's arange(last_pos, seq_len) under train-mode's tight
+        # seqlen); the single-gen-image t2i case IS mask-recoverable — see the
+        # else branch below. But for trainside sampling+replay the
         # rollout ALREADY computed the correct native (cos, sin) and stashed it in
         # ``fused.rope_cache`` (text_embed._fused_common). So: seed the model's
         # CachedRoPE with that native cache and pass rope_image_info=None →
@@ -229,7 +231,39 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             # __call__ takes the hit branch and skips build_2d_rope.
             _cr.seq_len = int(input_ids_in.shape[1])
             _cr.rope_image_info = None
-        rope_image_info_val = None  # → CachedRoPE hit path (no rebuild)
+            rope_image_info_val: Optional[List[List[Any]]] = None  # → CachedRoPE hit path (no rebuild)
+        else:
+            # No carried rope — the two-engine vllm-omni path. The ENGINE builds
+            # its rope with vllm-omni's own build_2d_rope n_elem convention
+            # ([.., 64] tables vs this forward's [.., 128] apply_rotary_pos_emb),
+            # so an engine capture must not be seeded here (adapters/hi3.py
+            # deliberately doesn't ship it). Rebuild the 2-D rope info from
+            # gen_image_mask + the latent shape instead — single-gen-image (t2i)
+            # scope, exactly the reconstruction this path was validated with
+            # (image ratio 0.95 → 0.996 when introduced):
+            #   - slice: the contiguous image-token run from gen_image_mask.
+            #   - (token_h, token_w): patchify uses uniform square patches, so
+            #     the token grid preserves the LATENT aspect ratio and
+            #     token_h * token_w == n; solve token_w = round(sqrt(n*W/H)).
+            _B = int(fused.input_ids.shape[0])
+            rope_image_info_val = [[] for _ in range(_B)]
+            if fused.gen_image_mask is not None:
+                _h_lat = int(sample.shape[-2])
+                _w_lat = int(sample.shape[-1])
+                _gm = fused.gen_image_mask
+                for _b in range(_B):
+                    _idx = _gm[_b].nonzero(as_tuple=False).flatten()
+                    if _idx.numel() == 0:
+                        continue
+                    _start = int(_idx[0].item())
+                    _n = int(_idx.numel())
+                    _contig = (int(_idx[-1].item()) - _start + 1) == _n
+                    if not _contig or _w_lat <= 0 or _h_lat <= 0:
+                        continue
+                    _tw = int(round((_n * _w_lat / _h_lat) ** 0.5))
+                    _th = _n // _tw if _tw > 0 else 0
+                    if _tw > 0 and _th * _tw == _n:
+                        rope_image_info_val[_b] = [(slice(_start, _start + _n), (_th, _tw))]
         # Forward-scatter index for the timestep continuous embedding: on is_first
         # the model scatters into the full sequence; on decode steps it scatters
         # into the [timestep, image] slice where the timestep is the first token

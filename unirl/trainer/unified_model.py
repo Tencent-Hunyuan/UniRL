@@ -435,12 +435,13 @@ class UnifiedModelTrainer(BaseTrainer):
         # merge; segment rows are 1:1 with track samples, so the AR/image
         # segments stay globally consistent across replicas.
         #
-        # rope_cache note — the hi3 fused condition overrides the base's
-        # shared tuple with a per-sample stacked ``[B, 2, L, D]`` CONCAT tensor,
-        # so this concat row-aligns every replica's rope with its own samples
-        # (no replica-0 cross-feed). That matters now: replay CONSUMES
-        # ``fused.rope_cache`` (diffusion.py ``predict_noise`` seeds the model's
-        # CachedRoPE from it), so a wrong-row rope would silently skew gradients.
+        # rope_cache note — the hi3 fused condition overrides the base's shared
+        # tuple with a per-sample stacked ``[B, 2, L, D]`` CONCAT tensor, so a
+        # populated rope would row-align with its own samples across this concat
+        # (no replica-0 cross-feed). On THIS two-engine path the capture
+        # deliberately ships NO rope_cache (the engine's tables use vllm-omni's
+        # internal layout — see pipelines/hi3), so replay rebuilds rope natively
+        # from gen_image_mask (diffusion.py ``predict_noise`` else-branch).
         return RolloutResp(
             tracks={name: RolloutTrack.concat([s.tracks[name] for s in shards]) for name in (AR_TRACK, IMAGE_TRACK)}
         )

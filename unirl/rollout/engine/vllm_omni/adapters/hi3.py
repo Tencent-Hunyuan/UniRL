@@ -107,8 +107,11 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
     ``prepare_inputs_for_generation``. For think_recaption mode different
     prompts produce different AR output lengths → different ``L`` per
     capture; right-pad shorter sequences to ``max_L`` (pad 0 for input_ids,
-    False for masks, 0.0 for rope_cache) so the dim-0 concat works. t2i
-    scope: the it2i ``cond_*`` fields stay unpopulated.
+    False for masks) so the dim-0 concat works. t2i scope: the it2i
+    ``cond_*`` fields stay unpopulated. ``rope_cache`` is deliberately NOT
+    shipped: the engine's rope tables use vllm-omni's own layout and are not
+    compatible with the HF-side replay forward — replay rebuilds rope
+    natively from ``gen_image_mask`` (see ``models/hunyuan_image3/diffusion.py``).
     """
     captures = [(getattr(d, "custom_output", None) or {}).get("fused_mm_capture") for d in diff_outputs]
     if any(c is None for c in captures):
@@ -161,9 +164,6 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
                     "position_ids": _pad_to(c.get("position_ids"), max_L, dim=-1, value=0),
                     "gen_image_mask": _pad_to(c.get("gen_image_mask"), max_L, dim=-1, value=False),
                     "gen_timestep_scatter_index": c.get("gen_timestep_scatter_index"),
-                    # rope_cache is captured pre-stacked as [N, 2, L, D]
-                    # (idx 0=cos, 1=sin); dim=-2 pads the L axis.
-                    "rope_cache": _pad_to(c.get("rope_cache"), max_L, dim=-2, value=0.0),
                 }
             )
 
@@ -174,12 +174,9 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
         "gen_image_mask": torch.cat([c["gen_image_mask"] for c in padded_captures], dim=0),
         "gen_timestep_scatter_index": torch.cat([c["gen_timestep_scatter_index"] for c in padded_captures], dim=0),
     }
-    # Stacked [N, 2, L, D] rope rides the same dim-0 cat as every other CONCAT
-    # field (the HunyuanImage3FusedMultimodalCondition.rope_cache layout).
-    fused_dict["rope_cache"] = torch.cat([c["rope_cache"] for c in padded_captures], dim=0)
-
     # ``from_dict`` skips optional fields when absent; cond_* fields stay
-    # ``None`` for t2i (out of scope for the it2i extension).
+    # ``None`` for t2i (out of scope for the it2i extension) and rope_cache is
+    # never shipped on this path (engine-internal layout — see docstring).
     return {"fused": HunyuanImage3FusedMultimodalCondition.from_dict(fused_dict)}
 
 
