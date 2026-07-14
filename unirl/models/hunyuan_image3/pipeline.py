@@ -176,6 +176,7 @@ class HunyuanImage3Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            diffuse_kv_cache=bool(config.diffuse_kv_cache),
         )
         vae_decode = HunyuanImage3VAEDecodeStage(bundle)
         vae_encode = HunyuanImage3VAEEncodeStage(bundle)

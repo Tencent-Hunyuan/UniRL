@@ -18,8 +18,9 @@
 #       (a) CFG asymmetry — guided sampling (guidance_scale>1 -> fused cond+uncond
 #           N=2) vs unguided replay (N=1). Fixed by training at guidance_scale=1.0
 #           (train cfg=1; eval/deploy with cfg>1 — the flow_grpo cfg=1 paradigm).
-#       (b) KV-cached sampling decode vs replay full-prefill. Set env
-#           HI3_DIFFUSE_KV_CACHE=0 so sampling ALSO full-prefills every step.
+#       (b) KV-cached sampling decode vs replay full-prefill. Set
+#           bundle.config.diffuse_kv_cache=false (as this recipe does) so
+#           sampling ALSO full-prefills every step.
 #     Together => native ratio=1.0000 (velocity bit-identical). Update-2+ ratio!=1 =
 #     real gradient signal. (old_logp_source=replay also works — ratio=1 by
 #     construction on update-1 — but adds an extra pi_old replay forward per update.)
@@ -42,7 +43,6 @@
 #   reward node: standalone MiMo EditReward HTTP server on :8080.
 #   train node:  export REWARD_SERVICE_URL=http://<reward_node_ip>:8080
 #                export PRETRAINED_MODEL=... EDIT_DATA_PATH=... EDIT_EVAL_DATA_PATH=...
-#                export HI3_DIFFUSE_KV_CACHE=0
 #                PYTHONPATH=$PWD python -m unirl.train_diffusion --config-name unified_model/hi3_it2i
 #
 # Smoke: override batch_size=1 num_rollouts=2 logging.report_to_wandb=false.
@@ -95,6 +95,8 @@ bundle:
     shift: 3.0
     guidance_scale: 1.0          # TRAIN cfg=1 (see header (a)): sampling & replay both unguided.
                                  # Eval/deploy with cfg>1 for edit-instruction adherence.
+    diffuse_kv_cache: false      # Full-prefill sampling (see header (b)): bit-match replay for
+                                 # the exact native ratio=1. REQUIRED with old_logp_source=rollout.
 
 pipeline:
   # Trainside pipeline (the SAME module the FSDPBackend trains -> rollout reuses it).
@@ -176,7 +178,7 @@ algorithm:
   clip_range: 5.0e-3
   clip_schedule: constant
   # native (rollout) pi_old: reuse the rollout log-prob (no extra replay forward).
-  # Exact ratio=1 on update-1 requires the cfg=1 + HI3_DIFFUSE_KV_CACHE=0 discipline
+  # Exact ratio=1 on update-1 requires the cfg=1 + diffuse_kv_cache=false discipline
   # above; switch to `replay` for the ratio-1-by-construction (extra-forward) variant.
   old_logp_source: rollout
   conditions_cls:

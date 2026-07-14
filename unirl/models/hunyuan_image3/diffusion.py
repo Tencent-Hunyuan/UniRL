@@ -34,7 +34,6 @@ follow-up.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -623,6 +622,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         logprob_precision: str = "fp32",
         vae_scale_factor: int = 16,
         latent_channels: int = 32,
+        diffuse_kv_cache: bool = True,
     ) -> None:
         self.model = model
         self.step = step
@@ -632,6 +632,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         self.latent_channels = latent_channels
+        self.diffuse_kv_cache = bool(diffuse_kv_cache)
 
     # ------------------------------------------------------------------
     # Sampling
@@ -762,13 +763,12 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         # different forward (short cached-decode, is_first=False) than REPLAY's
         # full-prefill recompute. Under old_logp_source=rollout (native) that
         # sampling-vs-replay bf16 gap surfaces as ratio≈0.997 instead of ~1e-5. Set
-        # HI3_DIFFUSE_KV_CACHE=0 to disable the cache so sampling ALSO does a full
-        # prefill every step (state=None => predict_noise is_first=True always),
-        # bit-matching replay's path → native ratio→~1e-5. Default keeps the cache
-        # (faster sampling; harmless under old_logp_source=replay where ratio=1 by
-        # construction regardless).
-        _use_kv_cache = os.environ.get("HI3_DIFFUSE_KV_CACHE", "1") != "0"
-        state = HunyuanImage3DiffusionState() if _use_kv_cache else None
+        # diffuse_kv_cache=false (HunyuanImage3PipelineConfig) to disable the cache
+        # so sampling ALSO does a full prefill every step (state=None =>
+        # predict_noise is_first=True always), bit-matching replay's path → native
+        # ratio→~1e-5. Default keeps the cache (faster sampling; harmless under
+        # old_logp_source=replay where ratio=1 by construction regardless).
+        state = HunyuanImage3DiffusionState() if self.diffuse_kv_cache else None
 
         for i in range(T):
             sigma = schedule[i].to(device)
