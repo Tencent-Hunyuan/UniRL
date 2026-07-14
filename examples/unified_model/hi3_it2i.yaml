@@ -55,9 +55,11 @@ batch_size: 8                  # prompts/rollout. TRAINSIDE DP_SCATTER splits (b
 adv_use_global_std: false      # per-group GRPO normalization
 num_rollouts: 10000            # intentionally large; stop manually
 
-# Periodic eval is DISABLED: the trainer's eval path does
-# dataclasses.replace(sampling, cfg_text_scale=...) which is a BAGEL-only field
-# (hi3 DiffusionSamplingParams uses guidance_scale, not cfg_text_scale) -> TypeError.
+# Periodic eval is DISABLED: not yet validated for it2i (the eval path must
+# carry the source-image condition end-to-end). The old blocker — the trainer
+# replacing the BAGEL-only ``cfg_text_scale`` sampling field (TypeError on hi3)
+# — was fixed by #202 (field-checked, falls back to ``guidance_scale``), so
+# this can be enabled once an it2i eval run is validated.
 eval_interval: 0
 
 transport_kind: colocate_store
@@ -107,7 +109,7 @@ pipeline:
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
-  block_class_names: ["HunyuanImage3DecoderLayer"]   # VERIFY at smoke
+  block_class_names: ["HunyuanImage3DecoderLayer"]   # verified in the 2x8 H20 smoke
   trainable_attr: transformer
   # it2i trainside encodes the SOURCE image in-process: the VAE (cond_vae latents)
   # and ViT (cond_vit features) must be MATERIALIZED off meta (with_aux), which also

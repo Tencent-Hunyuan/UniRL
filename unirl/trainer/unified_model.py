@@ -100,11 +100,12 @@ def deep_hydrate(obj: Any) -> Any:
     structure and apply it to every ``TensorRef``.
 
     NB: this walks TUPLES too (rebuilding them), unlike ``_collect_leaves``
-    which skips them. HunyuanImage3's fused condition stores ``rope_cache`` as a
-    ``tuple`` of two TensorRef; the DP scatter's driver-side
-    ``RolloutTrack.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
-    → ``t.ndim``), so the rope MUST be real tensors here. (dp=1 never concats on
-    the driver, so it never tripped on this.)
+    which skips them — kept for generality even though HunyuanImage3's
+    ``rope_cache`` is now a single stacked ``[B, 2, L, D]`` CONCAT tensor
+    (no tuple-valued condition field remains today). The driver-side
+    ``RolloutTrack.concat`` still pads L-fields (``conditions.concat`` →
+    ``_pad_seq``), so every leaf MUST be a real tensor here. (dp=1 never
+    concats on the driver, so it never tripped on this.)
     """
     if isinstance(obj, TensorRef):
         return hydrate(obj)
@@ -434,17 +435,12 @@ class UnifiedModelTrainer(BaseTrainer):
         # merge; segment rows are 1:1 with track samples, so the AR/image
         # segments stay globally consistent across replicas.
         #
-        # CAVEAT — the fused condition's rope_cache is a ``shared_field``
-        # (FusedMultimodalCondition), so this concat keeps replica-0's tensor
-        # verbatim: the merged condition carries a rope_cache whose batch dim is
-        # replica-0's sample count, NOT the global P*N*M. Harmless TODAY because
-        # HI3 replay rebuilds rope from gen_image_mask + the real latent shape
-        # (diffusion.py ``predict_noise`` [ROPE-FIX]; ar.py likewise) and never
-        # reads the track's rope_cache — it only rides along in the KV-propagation
-        # kwargs. If a future change makes replay consume ``fused.rope_cache``,
-        # dp>1 would SILENTLY feed replica-0 rope to every sample (wrong gradient,
-        # no crash, reward unaffected); make rope_cache a tuple-aware CONCAT field
-        # before relying on it.
+        # rope_cache note — the hi3 fused condition overrides the base's
+        # shared tuple with a per-sample stacked ``[B, 2, L, D]`` CONCAT tensor,
+        # so this concat row-aligns every replica's rope with its own samples
+        # (no replica-0 cross-feed). That matters now: replay CONSUMES
+        # ``fused.rope_cache`` (diffusion.py ``predict_noise`` seeds the model's
+        # CachedRoPE from it), so a wrong-row rope would silently skew gradients.
         return RolloutResp(
             tracks={name: RolloutTrack.concat([s.tracks[name] for s in shards]) for name in (AR_TRACK, IMAGE_TRACK)}
         )

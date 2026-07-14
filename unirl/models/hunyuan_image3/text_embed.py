@@ -267,7 +267,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[B, L] long``,
                                   attention_mask ``[B, 1, L, L] bool``,
                                   position_ids ``[B, L] long``,
-                                  rope_cache ``(cos, sin)`` each ``[B, L, D] float``,
+                                  rope_cache ``[B, 2, L, D] float`` (stacked cos/sin),
                                   cond_vit_image_mask ``[B, L] bool`` (i2t / it2i;
                                   ``None`` for t2t).
                 tokenizer_output: opaque upstream apply_chat_template output (carries
@@ -414,7 +414,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[N, L] long``,
                                   attention_mask ``[N, 1, L, L] bool``,
                                   position_ids ``[N, L] long``,
-                                  rope_cache ``(cos, sin)`` ``([N, L, D], [N, L, D]) float``,
+                                  rope_cache ``[N, 2, L, D] float`` (stacked cos/sin),
                                   gen_image_mask ``[N, L] bool``,
                                   gen_timestep_scatter_index ``[N, K] long``,
                                   cond_vae_image_mask / cond_vit_image_mask /
