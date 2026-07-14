@@ -929,6 +929,9 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         cache is only meaningful inside an SDE trajectory, which DiffusionNFT-style
         forward-process algorithms don't traverse.
         """
+        # Re-stack the guided [cond; uncond] batch exactly as diffuse()/replay()
+        # do, so guidance behavior matches them (no-op when fused_uncond is None).
+        conditions = _expand_cfg_for_forward(conditions)
         return self.step.predict_noise(
             self.model,
             sample,
