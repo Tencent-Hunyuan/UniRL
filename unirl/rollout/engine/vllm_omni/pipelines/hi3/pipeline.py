@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
@@ -151,11 +152,16 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
             if pipeline_self._captured_conditioning is None:
                 # ``input_ids`` is the only positional arg upstream passes.
                 input_ids = args[0] if args else kw.get("input_ids")
+                # The model hands rope as a ``(cos, sin)`` pair; the typed
+                # condition's ``rope_cache`` is a stacked ``[B, 2, L, D]``
+                # CONCAT tensor (idx 0=cos, 1=sin). Stack at capture so the
+                # field pads/cats/transports like ``input_ids``.
+                rope_pair = detach_cpu_pair(kw.get("custom_pos_emb"))
                 pipeline_self._captured_conditioning = {
                     "input_ids": detach_cpu(input_ids),
                     "attention_mask": detach_cpu(kw.get("attention_mask")),
                     "position_ids": detach_cpu(kw.get("position_ids")),
-                    "rope_cache": detach_cpu_pair(kw.get("custom_pos_emb")),
+                    "rope_cache": torch.stack(rope_pair, dim=1) if isinstance(rope_pair, tuple) else rope_pair,
                     "gen_image_mask": detach_cpu(kw.get("image_mask")),
                     "gen_timestep_scatter_index": detach_cpu(kw.get("gen_timestep_scatter_index")),
                 }

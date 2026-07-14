@@ -112,6 +112,15 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
         ):
             if name in d and d[name] is not None:
                 kwargs[name] = d[name]
+        rope_cache = kwargs.get("rope_cache")
+        if rope_cache is not None and not isinstance(rope_cache, torch.Tensor):
+            # Fail fast at the wire boundary: a legacy (cos, sin) tuple here
+            # would otherwise blow up deep inside a track merge or replay.
+            raise TypeError(
+                "HunyuanImage3FusedMultimodalCondition.from_dict: rope_cache "
+                f"must be a stacked [B, 2, L, D] tensor; got {type(rope_cache).__name__}. "
+                "Producers must stack (cos, sin) pairs via torch.stack(pair, dim=1)."
+            )
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
