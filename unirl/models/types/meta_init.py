@@ -122,10 +122,17 @@ def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Modu
       so the backend's ``to_empty`` later materializes directly in ``dtype``;
     * stamp ``init_weights`` to a no-op — VeOmni's ``parallelize`` calls it
       unconditionally after ``to_empty``; the real weights load afterwards;
-    * warn about non-persistent buffers absent from the checkpoint — if the
-      model relies on their init-time values they must be restored via
-      :func:`stamp_init_state_restore` (see SD3's sincos ``pos_embed`` and
-      Qwen-Image's rope tables).
+    * auto-restore non-persistent buffers absent from the checkpoint. These
+      init-computed tables (SD3's sincos ``pos_embed``, WAN's / Qwen-Image's
+      rope ``freqs``) are neither in the checkpoint nor rebuilt by the no-op
+      ``init_weights``, so ``to_empty`` would leave them garbage — silently
+      corrupting the forward pass (and zeroing the gradient of any adapter
+      whose output they multiply). When they are still **real** (the model was
+      built under ``accelerate.init_empty_weights(include_buffers=False)``,
+      parameters on meta but buffers/attrs real) this captures + stamps their
+      restore via :func:`stamp_init_state_restore`, replayed after the sharded
+      weight load. When they are on **meta** (built under
+      ``torch.device("meta")``) they cannot be recovered — this warns loudly.
 
     ``nn.Module.to`` is in place and returns ``self``; callers rebind by
     convention. Quirk fixes that must run *before* the cast (e.g. rebuilding
@@ -135,12 +142,28 @@ def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Modu
     transformer = transformer.to(dtype)
     transformer.init_weights = lambda: None
     non_persistent = sorted(set(n for n, _ in transformer.named_buffers()) - set(transformer.state_dict()))
-    if non_persistent:
+    if not non_persistent:
+        return transformer
+    np_set = set(non_persistent)
+    on_meta = [n for n, b in transformer.named_buffers() if n in np_set and b.is_meta]
+    if on_meta:
         logger.warning(
-            "finalize_meta_init: %d non-persistent buffer(s) absent from the "
-            "checkpoint and NOT restored by the weight load: %s%s. If the model "
-            "relies on their init-time values, stamp stamp_init_state_restore.",
-            len(non_persistent),
+            "finalize_meta_init: %d non-persistent buffer(s) are on META and "
+            "CANNOT be auto-restored: %s%s. Build the transformer under "
+            "accelerate.init_empty_weights(include_buffers=False) (not "
+            "torch.device('meta')) so their init-computed values stay real and "
+            "get captured; otherwise to_empty leaves them garbage.",
+            len(on_meta),
+            on_meta[:8],
+            " ..." if len(on_meta) > 8 else "",
+        )
+    else:
+        n = stamp_init_state_restore(transformer)
+        logger.info(
+            "finalize_meta_init: stamped restore for %d init-computed "
+            "non-persistent tensor(s) (e.g. %s%s); replayed after the sharded "
+            "weight load.",
+            n,
             non_persistent[:8],
             " ..." if len(non_persistent) > 8 else "",
         )

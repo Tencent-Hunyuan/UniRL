@@ -114,8 +114,16 @@ class WAN21Bundle(Bundle):
             # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
             # no per-rank weight allocation; the backend to_empty-materializes
             # and broadcast-loads from the stashed dir after sharding.
+            # Build under init_empty_weights(include_buffers=False) — parameters
+            # land on meta, but WanRotaryPosEmbed's freqs_cos/freqs_sin (non-
+            # persistent buffers, absent from the checkpoint and init-computed)
+            # stay REAL so finalize_meta_init can capture + stamp their restore.
+            # torch.device("meta") would force them to meta too -> to_empty
+            # leaves them garbage, zeroing self-attn to_q/to_k LoRA gradients.
+            from accelerate import init_empty_weights
+
             transformer_config = WanTransformer3DModel.load_config(path, subfolder="transformer")
-            with torch.device("meta"):
+            with init_empty_weights(include_buffers=False):
                 transformer = WanTransformer3DModel.from_config(transformer_config)
             transformer = finalize_meta_init(transformer, dtype=dtype)
         else:
