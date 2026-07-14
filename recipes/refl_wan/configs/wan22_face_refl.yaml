@@ -1,0 +1,143 @@
+# @package _global_
+# REFL WAN 2.2 I2V — Remote role config.
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 1000
+save_interval: 100
+save_dir: ${oc.env:OUTPUT_DIR,outputs/wan22_face_refl}
+
+roles:
+  - name: actor
+    _target_: recipes.refl_wan.roles.ReflActorRole
+    placement:
+      n_devices: ${num_devices}
+
+    model:
+      _target_: unirl.models.wan22.bundle.WAN22Bundle.from_config
+      config:
+        _target_: unirl.models.wan22.config.WAN22PipelineConfig
+        pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
+        model_precision: bf16
+        shift: 5.0
+        max_sequence_length: 512
+        boundary_ratio: 0.9
+        num_train_timesteps: 1000
+
+    pipeline:
+      _target_: recipes.refl_wan.models.wan22.Wan22ReflPipeline
+      shift: 5.0
+      autocast_precision: bf16
+      trajectory_precision: bf16
+      logprob_precision: fp32
+      max_sequence_length: 512
+      strategy:
+        # eta=0.0 below reduces FlowSDE to deterministic ODE — REFL wants a
+        # deterministic transition on the differentiable path.
+        _target_: unirl.sde.kernels.FlowSDEStrategy
+
+    backend:
+      _target_: unirl.train.backend.fsdp.FSDPBackend
+      block_class_names: ["WanTransformerBlock"]
+      trainable_attr: transformer
+      fsdp_cfg:
+        _target_: unirl.train.configs.FSDPConfig
+        param_dtype: bf16
+        master_dtype: fp32
+        cpu_offload: false
+        mixed_precision: true
+        fsdp_mode: full
+        reshard_after_forward: true
+        activation_checkpointing: true
+        use_torch_compile: false
+      optimizer_cfg:
+        _target_: unirl.train.backend.base.OptimizerConfig
+        learning_rate: 2.5e-6
+        adam_beta1: 0.9
+        adam_beta2: 0.999
+        adam_epsilon: 1.0e-8
+        weight_decay: 0.0
+      scheduler_cfg:
+        _target_: unirl.train.backend.base.LrSchedulerConfig
+        type: linear_warmup
+        warmup_steps: 10
+        total_steps: ${num_rollouts}
+      lora_cfg:
+        _target_: unirl.train.configs.LoraConfig
+        rank: 32
+        alpha: 32
+        dropout: 0.0
+        bias: none
+        task_type: FEATURE_EXTRACTION
+        module_prefix: low_noise
+        target_modules:
+          - to_q
+          - to_k
+          - to_v
+          - to_out.0
+          - ffn.net.0.proj
+          - ffn.net.2
+
+    algorithm: ${algorithm}
+
+  - name: reward
+    _target_: recipes.refl_wan.roles.ReflRewardRole
+    placement:
+      share_with: actor
+
+    backend:
+      _target_: recipes.refl_wan.rewards.face.FaceRewardScorer
+      base_device: cuda
+      config:
+        _target_: recipes.refl_wan.rewards.face.FaceRewardSpec
+        model_path: ${oc.env:FACE_MODEL_PATH,/apdcephfs_gy8/share_301869871/staryding/gy6_data/ckpt/ckpt_0303/apdcephfs_wza/xiangwshen/a/antelodev2/antelodev2}
+        device: cuda
+        batch_size: 1
+        image_size: 112
+        ref_max_frames: 81
+        ref_max_pixels: 230400
+        differentiable: true
+
+algorithm:
+  reward_weight: 0.1
+  reward_baseline: 0.54
+  reward_scale: 0.16
+  kl_weight: 1.0
+  max_grad_norm: 1.0
+  sampling_params: ${sampling}
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,/apdcephfs_gy8/share_301869871/yohunawu/gy6/yohunawu/refl_wan_data/wan22_face_refl_prompts.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,/apdcephfs_gy8/share_301869871/yohunawu/gy6/yohunawu/refl_wan_data/wan22_face_refl_prompts.jsonl}}
+      seed: 42
+      shuffle: false
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 8
+  guidance_scale: 1.0
+  guidance_scale_2: 1.0
+  height: 352
+  width: 640
+  num_frames: 81
+  eta: 0.0
+  samples_per_prompt: 1
+  seed: 42
+  init_same_noise: false
+  sampler_kwargs:
+    mid_timestep: 4
+    final_timestep: 7
+    kl_weight: 1.0
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-refl}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_face_refl}
+  tags: ["wan22", "i2v", "refl", "face", "recipe"]
+  log_media: false
+  metric_prefix: refl_recipe/

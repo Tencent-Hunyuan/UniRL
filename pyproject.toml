@@ -80,6 +80,17 @@ eval = [
   "torchvision>=0.16",
   "easyocr>=1.7",
 ]
+face_reward = [
+  "onnx>=1.14",
+  "onnx2torch>=1.5",
+  "scikit-image>=0.21",
+  "imageio>=2.31",
+  "imageio-ffmpeg>=0.4",
+  "scipy>=1.11",
+]
+video_align_reward = [
+  "flash-attn==2.7.0.post2",
+]
 # VeOmni's torch-native distributed layer (FSDP2/EP parallelize), consumed
 # exclusively through unirl.train.backend.veomni._compat — a selective import
 # that never executes veomni/__init__.py or veomni/models/__init__.py, so the

@@ -81,14 +81,13 @@ class WAN21Bundle(Bundle):
     def from_config(cls, config: WAN21PipelineConfig) -> "WAN21Bundle":
         """Load all WAN 2.1 components from a HuggingFace checkpoint."""
         try:
-            from diffusers import AutoencoderKLWan, WanTransformer3DModel
+            from diffusers import WanTransformer3DModel
         except ImportError:
             # Fallback for older diffusers: ``AutoModel`` does dynamic
             # dispatch on the checkpoint config. Matches the fallback in
             # legacy ``models/wan21.py``.
             from diffusers import AutoModel
 
-            AutoencoderKLWan = AutoModel
             WanTransformer3DModel = AutoModel
         try:
             from transformers import AutoTokenizer, UMT5EncoderModel
@@ -136,7 +135,17 @@ class WAN21Bundle(Bundle):
 
         vae: Optional[nn.Module] = None
         if config.load_vae:
-            vae = AutoencoderKLWan.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            from .wan_video_vae import WanVideoVAE
+
+            vae = (
+                WanVideoVAE.load_from_diffusers(
+                    vae_path,
+                    use_nested_grad_checkpoint=True,
+                    use_act_grad_only_conv=True,
+                )
+                .to(device=device, dtype=vae_dtype)
+                .eval()
+            )
             vae.requires_grad_(False)
 
         text_encoder = (

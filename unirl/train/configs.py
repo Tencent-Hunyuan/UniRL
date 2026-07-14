@@ -19,6 +19,9 @@ class LoraConfig:
     # Like ``target_modules``, tuples match exact names/suffixes and strings are
     # regular expressions. This lets a regex exclude an entire frozen sub-tower.
     exclude_modules: Any = None
+    # Restrict sequence-style target suffixes to a named model subtree.
+    # This cannot be combined with regex or ``all-linear`` target strings.
+    module_prefix: str = ""
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"

@@ -50,7 +50,7 @@ from unirl.train.backend.sharded_state import (
 )
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
-from unirl.train.lora import inject_lora
+from unirl.train.lora import inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
 if TYPE_CHECKING:
@@ -208,6 +208,7 @@ class BaseFSDP2Backend(Remote):
                 rank=lora_cfg.rank,
                 alpha=lora_cfg.alpha,
                 target_modules=lora_cfg.target_modules,
+                module_prefix=lora_cfg.module_prefix,
                 exclude_modules=lora_cfg.exclude_modules,
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
@@ -273,11 +274,22 @@ class BaseFSDP2Backend(Remote):
         # Checkpointed for export tooling: the LoRA fold needs scaling =
         # alpha / rank, and alpha is not derivable from the weights.
         active_lora = lora_cfg or ema_lora_cfg
+        recorded_target_modules = None
+        if active_lora is not None:
+            recorded_target_modules = active_lora.target_modules
+            if lora_cfg is not None:
+                recorded_target_modules, _ = resolve_target_modules_pattern(
+                    target_modules=lora_cfg.target_modules,
+                    module_prefix=lora_cfg.module_prefix,
+                )
         self._lora_meta = (
             {
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
-                "target_modules": active_lora.target_modules,
+                # Store the selector actually passed to PEFT. For prefixed LoRA
+                # this is a regex, so exported adapters keep the same subtree
+                # restriction instead of matching equivalent suffixes elsewhere.
+                "target_modules": recorded_target_modules,
                 "exclude_modules": active_lora.exclude_modules,
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
