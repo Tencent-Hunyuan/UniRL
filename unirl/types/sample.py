@@ -166,6 +166,14 @@ class Part(Batch):
             return len(self.sample_ids)
         return super().batch_size
 
+    def validated_sample_ids(self, *, context: str) -> List[str]:
+        """Return non-empty unique sample identities or raise."""
+        if not all(isinstance(sample_id, str) and sample_id.strip() for sample_id in self.sample_ids):
+            raise ValueError(f"{context} requires non-empty string sample_ids")
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError(f"{context} requires globally unique sample_ids")
+        return self.sample_ids
+
     @property
     def is_root(self) -> bool:
         """Whether this is a chain head (input/root) — its sample ids carry no"""
@@ -220,6 +228,7 @@ class Part(Batch):
             raise ValueError("Part.fork: parent has no sample_ids")
         if branch < 1:
             raise ValueError(f"Part.fork: branch must be >= 1, got {branch}")
+        self.validated_sample_ids(context="Part.fork")
 
         child_sample_ids = [child_id(pid, j) for pid in self.sample_ids for j in range(branch)]
 
