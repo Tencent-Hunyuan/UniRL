@@ -66,10 +66,6 @@ outputs/
 logs/
 local/
 !unirl/reward/local/
-!unirl/reward/local/**
-# ...but never track bytecode under it: the `**` re-include above would otherwise
-# defeat the global `__pycache__/` ignore for this source dir.
-unirl/reward/local/**/__pycache__/
 **/rollout_data/
 **/buffer_stats/
 *.out
@@ -97,11 +93,8 @@ settings.json
 .DS_Store
 .claude/*
 !.claude/skills/
-!.claude/skills/**
 .cursor/*
 !.cursor/skills/
-!.cursor/skills/**
 !.cursor/rules/
-!.cursor/rules/**
 REFACTOR_LOG.md
 uv.lock

@@ -37,7 +37,6 @@ What each half proves about the migrated ``_run_rollout_one``:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 import sys
@@ -75,9 +74,7 @@ def _log(msg: str) -> None:
 
 
 def _ar_params() -> ARSamplingParams:
-    return ARSamplingParams(
-        samples_per_prompt=_N, temperature=0.6, max_new_tokens=128, top_p=0.95, top_k=1024
-    )
+    return ARSamplingParams(samples_per_prompt=_N, temperature=0.6, max_new_tokens=128, top_p=0.95, top_k=1024)
 
 
 def _diff_params() -> DiffusionSamplingParams:
@@ -99,7 +96,7 @@ def _diff_params() -> DiffusionSamplingParams:
 def _unified_request(prompts: list[str], rid: int = 0) -> Sample:
     """Pre-forked unified lineage ``[input, ar_shell(P*N), image_shell(P*N*M)]`` —
     mirrors :meth:`UnifiedModelTrainer._build_request_sample`."""
-    input_part = Part.input([f"r{rid}:p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts))
+    input_part = Part.input([f"r{rid}:p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)})
     return (
         Sample.request(input_part)
         .fork(_ar_params().samples_per_prompt, sampling_params=_ar_params())
@@ -115,9 +112,7 @@ def _shells(sample: Sample):
 
 def _build_engine(modality: str) -> VLLMOmniRolloutEngine:
     model_path = os.environ["PRETRAINED_MODEL"]
-    model_config = HunyuanImage3PipelineConfig(
-        pretrained_model_ckpt_path=model_path, model_precision="bf16", shift=3.0
-    )
+    model_config = HunyuanImage3PipelineConfig(pretrained_model_ckpt_path=model_path, model_precision="bf16", shift=3.0)
     engine_config = VLLMOmniEngineConfig(
         model_path=model_path,
         modality=modality,
@@ -136,18 +131,20 @@ def run_ar(prompts: list[str], rid: int = 0) -> int:
     # Level 1: P*N pre-expanded prompts re-rooted flat (1:1); a params-only
     # diffusion shell rides AHEAD of the AR frontier so the carries_target_size
     # adapter can read height/width while only the AR stage runs.
-    ar_texts = Texts(texts=[t for t in input_part.primitive.texts for _ in range(n_rec)])
+    ar_texts = Texts(texts=[t for t in input_part.primitives["text"].texts for _ in range(n_rec)])
     n_ar = len(ar_texts.texts)
     ar_input = Part.input(
-        [f"r{rid}:a{k}" for k in range(n_ar)], primitive=ar_texts, control=dict(input_part.control)
+        [f"r{rid}:a{k}" for k in range(n_ar)], primitives={"text": ar_texts}, control=dict(input_part.control)
     )
     ar_request = (
         Sample.request(ar_input)
         .fork(1, sampling_params=image_shell.sampling_params)
         .fork(1, sampling_params=ar_shell.sampling_params)
     )
-    _log(f"AR request: {len(ar_request.parts)} parts (input, params-only diff shell, ar frontier); "
-         f"expecting {n_ar} recaptions (= P*N = {_P}*{_N})")
+    _log(
+        f"AR request: {len(ar_request.parts)} parts (input, params-only diff shell, ar frontier); "
+        f"expecting {n_ar} recaptions (= P*N = {_P}*{_N})"
+    )
 
     engine = None
     try:
@@ -155,7 +152,7 @@ def run_ar(prompts: list[str], rid: int = 0) -> int:
         _log("calling engine.generate(ar_request) — think/recaption ...")
         ar_out = engine.generate(ar_request)
         ar_gen = ar_out.parts[-1]
-        recaptions = ar_gen.primitive
+        recaptions = ar_gen.primitives.get("text")
 
         assert isinstance(ar_gen.segment, TextSegment), f"ar segment must be TextSegment; got {type(ar_gen.segment)}"
         assert isinstance(recaptions, Texts), f"ar primitive must be Texts; got {type(recaptions)}"
@@ -201,8 +198,7 @@ def run_dit(prompts: list[str], rid: int = 0) -> int:
         recaptions = []
     if not recaptions:
         recaptions = [
-            f"A highly detailed, photorealistic, well-lit photograph of {prompts[i // n_rec]}."
-            for i in range(n_ar)
+            f"A highly detailed, photorealistic, well-lit photograph of {prompts[i // n_rec]}." for i in range(n_ar)
         ]
         _log(f"using {n_ar} SYNTHETIC recaptions (DiT half runs standalone)")
 
@@ -212,11 +208,13 @@ def run_dit(prompts: list[str], rid: int = 0) -> int:
     dit_prompts = Texts(texts=[prompts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
     dit_cot = Texts(texts=[recaptions[i] for i in range(n_ar) for _ in range(n_img)])
     n_total = len(dit_prompts.texts)
-    dit_input = Part.input([sid.replace("/", "_") for sid in image_shell.sample_ids], primitive=dit_prompts)
-    cot_input = dit_input.input_child(dit_cot)
+    dit_input = Part.input([sid.replace("/", "_") for sid in image_shell.sample_ids], primitives={"text": dit_prompts})
+    cot_input = dit_input.input_child({"text": dit_cot})
     dit_request = Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params)
-    _log(f"DiT request: {len(dit_request.parts)} parts (prompt input, cot_text input child, image frontier); "
-         f"expecting {n_total} images (= P*N*M = {_P}*{_N}*{_M})")
+    _log(
+        f"DiT request: {len(dit_request.parts)} parts (prompt input, cot_text input child, image frontier); "
+        f"expecting {n_total} images (= P*N*M = {_P}*{_N}*{_M})"
+    )
 
     engine = None
     try:
@@ -228,12 +226,18 @@ def run_dit(prompts: list[str], rid: int = 0) -> int:
         assert len(img_gen.sample_ids) == n_total, (
             f"DiT must be 1:1: expected {n_total} images; got {len(img_gen.sample_ids)}"
         )
-        assert isinstance(img_gen.segment, LatentSegment), f"image segment must be LatentSegment; got {type(img_gen.segment)}"
+        assert isinstance(img_gen.segment, LatentSegment), (
+            f"image segment must be LatentSegment; got {type(img_gen.segment)}"
+        )
         assert img_gen.segment.latents is not None, "image LatentSegment.latents is None"
-        assert isinstance(img_gen.primitive, Images) and len(img_gen.primitive) == n_total, "images decoded wrong"
+        assert isinstance(img_gen.primitives.get("image"), Images) and len(img_gen.primitives["image"]) == n_total, (
+            "images decoded wrong"
+        )
         assert img_gen.conditions, "image replay conditions empty (expected the fused HI3 conditions)"
 
-        _log(f"PASS: {n_total} images; latents={tuple(img_gen.segment.latents.shape)} dtype={img_gen.segment.latents.dtype}")
+        _log(
+            f"PASS: {n_total} images; latents={tuple(img_gen.segment.latents.shape)} dtype={img_gen.segment.latents.dtype}"
+        )
         _log(f"PASS: ids={list(img_gen.sample_ids)}")
         _log(f"PASS: image conditions={sorted(img_gen.conditions.keys())}")
         _log("HI3 UNIFIED DiT SMOKE PASSED ✅  (cot_text via input_child → rendered images)")

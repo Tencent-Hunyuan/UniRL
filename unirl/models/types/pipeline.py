@@ -3,7 +3,7 @@
 A ``Pipeline`` is the top-level entrypoint that maps a request ``Sample`` (an
 ordered ``parts`` chain whose frontier is a pre-forked generation shell) into a
 filled ``Sample`` (the same chain with the frontier Part's ``segment`` /
-``primitive`` populated). Concrete pipelines compose stage instances
+``primitives`` populated). Concrete pipelines compose stage instances
 (``EmbedStage`` / ``EncodeStage`` / ``DiffusionStage`` / ``ARStage`` /
 ``DecodeStage``) for one model bundle.
 
@@ -15,7 +15,7 @@ frontier Part is filled via ``Part.fill``).
 
 Per-bundle contract documentation (which ``sample.conditioning()`` primitives are
 read, which ``frontier.sampling_params`` fields, and what ``segment`` /
-``primitive`` the frontier Part is filled with) lives in each concrete
+``primitives`` the frontier Part is filled with) lives in each concrete
 ``Pipeline``'s docstring so multiple bundles don't drift.
 
 σ schedule contract

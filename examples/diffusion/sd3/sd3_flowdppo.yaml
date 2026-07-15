@@ -23,7 +23,7 @@ num_rollouts: 10000
 # Advantage scale: group-mean advantages divided by ONE batch-wide std (like the
 # v1 recipe's use_global_std=true), not each prompt's own std. NB this reduces over
 # the FULL batch; v1 reduced per rollout actor (1/actor_count of the batch). Same
-# expectation, intentionally topology-independent. See RolloutTrack.compute_advantages.
+# expectation, intentionally topology-independent. See Part.compute_advantages.
 adv_use_global_std: true
 
 bundle:
@@ -112,6 +112,8 @@ algorithm:
   # FlowDPPO hyperparameters (v1 algorithm.algorithms.diffusion block).
   kl_mask_threshold: 1.0e-5
   add_kl_coefficient: true
+  # beta: reference-policy KL coeff (Flow-DPPO eq.17), LoRA-only; 0 disables. Detail in FlowDPPO/config.yaml.
+  beta: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack

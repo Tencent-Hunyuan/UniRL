@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images
 from unirl.types.sample import Sample
 
 # One sample's chat conversation: an ordered list of role-tagged messages.
@@ -96,10 +96,7 @@ def build_text_conversations(
     cols = [t.content.texts for t in turns]
     prefix = _system_prefix(system_instruction, roles)
 
-    conversations = [
-        prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))]
-        for row in rep
-    ]
+    conversations = [prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))] for row in rep]
     return conversations, k
 
 

@@ -48,7 +48,7 @@ def build_request_sample() -> Sample:
     branch-1 fork gives one gen sample per prompt.
     """
     prompts = ["a photo of a red apple on a wooden table", "an astronaut riding a horse on the moon"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts))
+    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)})
     diff_params = DiffusionSamplingParams(
         num_inference_steps=4,
         guidance_scale=1.0,  # CFG off (matches the sd3_vllmomni example)
@@ -104,14 +104,18 @@ def main() -> int:
         )
         assert isinstance(gen.segment, LatentSegment), f"segment must be LatentSegment; got {type(gen.segment)}"
         assert gen.segment.latents is not None, "LatentSegment.latents is None (no trajectory captured)"
-        assert isinstance(gen.primitive, Images), f"decoded primitive must be Images; got {type(gen.primitive)}"
-        assert len(gen.primitive) == 2, f"expected 2 decoded images; got {len(gen.primitive)}"
+        assert isinstance(gen.primitives.get("image"), Images), (
+            f"decoded image primitive must be Images; got {type(gen.primitives.get('image'))}"
+        )
+        assert len(gen.primitives["image"]) == 2, f"expected 2 decoded images; got {len(gen.primitives['image'])}"
         assert gen.conditions, "replay conditions empty (expected at least 'text')"
 
         lat = gen.segment.latents
         _log(f"PASS: latents shape={tuple(lat.shape)} dtype={lat.dtype}")
-        _log(f"PASS: images={len(gen.primitive)} conditions={sorted(gen.conditions.keys())}")
-        _log(f"PASS: sigmas pinned len={None if gen.sampling_params.sigmas is None else int(gen.sampling_params.sigmas.shape[0])}")
+        _log(f"PASS: images={len(gen.primitives['image'])} conditions={sorted(gen.conditions.keys())}")
+        _log(
+            f"PASS: sigmas pinned len={None if gen.sampling_params.sigmas is None else int(gen.sampling_params.sigmas.shape[0])}"
+        )
         _log("ROLLOUT SMOKE PASSED ✅  (σ-verified inside build_image_segment; Sample filled correctly)")
         return 0
     except Exception:

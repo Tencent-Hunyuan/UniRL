@@ -43,7 +43,7 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
 | `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
-| `types/` | Shared typed contracts: `RolloutReq` / `RolloutResp`, conditions, segments, rewards, sampling |
+| `types/` | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling |
 | `data/` | Data source and dataset readers |
 | `utils/` | Logging, dtype, media, timing, checkpoint, and misc helpers |
 
@@ -66,15 +66,15 @@ The layers above turn one recipe into a repeating loop. A single training step
 flows through them like this:
 
 <div align="center">
-  <img src="../assets/pipeline-dataflow-new.png" alt="UniRL data flow: the prompt becomes one RolloutTrack that is decorated in place — generate (a diffusion or AR pipeline) fills its segment (LatentSegment for image, TextSegment for text) and decoded media, reward.score_and_attach adds rewards, compute_advantages adds advantages, and train consumes segment + advantages to produce gradients" width="100%">
+  <img src="../assets/pipeline-dataflow-new.png" alt="UniRL data flow: the prompt becomes a Sample lineage whose generated Part is filled with a segment and modality-keyed primitives; reward scoring attaches rewards, advantage computation annotates the Part, and training consumes its segment plus advantages" width="100%">
 </div>
 
 1. An entrypoint composes the chosen `examples/<domain>/<recipe>.yaml` and runs validators.
 2. The `<Domain>Trainer` (e.g. `trainer/diffusion.py`) acquires a Ray `DevicePool` and builds the rollout and train workers.
-3. The trainer builds a typed `RolloutReq` and dispatches it to the rollout engine.
-4. The engine returns a `RolloutResp`, whose `tracks[name]` carry conditions, segments, rewards, and media previews.
-5. `RewardService.score_and_attach` attaches rewards; `RolloutTrack.compute_advantages` z-scores them into advantages.
-6. `TrainStack.train_track(...)` shards the track across train workers and runs the mini-batch optimizer loop.
+3. The trainer builds a typed `Sample` lineage and dispatches it to the rollout engine.
+4. The engine returns the lineage with generated `Part`s filled with conditions, segments, primitive maps, and media previews.
+5. `RewardService.score_and_attach` attaches rewards; `Part.compute_advantages` z-scores them into advantages.
+6. `TrainStack.train_track(...)` shards the generated `Part` across train workers and runs the mini-batch optimizer loop.
 7. Each train worker owns a model `Bundle`, an `FSDPBackend`, and one loss algorithm.
 8. Dedicated-rollout modes (separate / colocate) sync trainer weights back to the rollout workers.
 

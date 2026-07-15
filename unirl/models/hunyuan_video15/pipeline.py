@@ -65,7 +65,7 @@ class HunyuanVideo15Pipeline(Pipeline):
     frontier Part:
 
     - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitive: Videos`` — the decoded videos.
+    - ``primitives["video"]: Videos`` — the decoded videos.
 
     ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
     deferred; CFG uses a synthesized empty negative across the MLLM + Glyph encoders.
@@ -206,23 +206,33 @@ class HunyuanVideo15Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def _conditions_for(self, texts: Texts, params: DiffusionSamplingParams) -> HunyuanVideo15Conditions:
-        """Encode prompts via MLLM + Glyph → :class:`HunyuanVideo15Conditions`. Shared
-        by rollout-``generate`` and trainer-side replay (re-encode), so both build
-        conditions identically.
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> HunyuanVideo15Conditions:
+        """Encode prompts (MLLM + Glyph, + optional CFG negatives) into ``HunyuanVideo15Conditions``.
 
-        CFG empty negative: when CFG is on (``guidance_scale > 1``), default to
-        ``[""] * B``. When CFG is off, leave ``negatives=None`` so the negative
-        branch is skipped entirely — saves two text-encoder forwards (MLLM +
+        CFG empty negative: when CFG is on (``guidance_scale > 1``) and
+        caller didn't supply a negative, default to ``[""] * B``. When
+        CFG is off, leave ``negatives=None`` so the negative branch is
+        skipped entirely — saves two text-encoder forwards (MLLM +
         Glyph) per request. ``HunyuanVideo15DiffusionStep.predict_noise``
         (diffusion.py:188) already gates the CFG branch on
-        ``guidance_scale > 1 and negative_text_mllm is not None``, so passing None
-        for both negative_text_* is the canonical CFG-off signal.
-        Either-both-or-both-None: the diffusion step (line 191-202) raises if only
-        one of mllm/glyph is set. User-supplied negatives are deferred.
+        ``guidance_scale > 1 and negative_text_mllm is not None``, so
+        passing None for both negative_text_* is the canonical CFG-off
+        signal. Either-both-or-both-None: the diffusion step (line 191-202)
+        raises if only one of mllm/glyph is set.
         """
-        batch_size = len(texts.texts)
-        negatives = Texts(texts=[""] * batch_size) if float(params.guidance_scale) > 1.0 else None
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"HunyuanVideo15Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
 
         text_mllm = self.text_embed.embed_mllm(texts)
         text_glyph = self.text_embed.embed_glyph(texts)
@@ -269,7 +279,7 @@ class HunyuanVideo15Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        hv_conds = self._conditions_for(texts, params)
+        hv_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -281,7 +291,7 @@ class HunyuanVideo15Pipeline(Pipeline):
 
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=latent_seg, primitive=videos, conditions=hv_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=hv_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

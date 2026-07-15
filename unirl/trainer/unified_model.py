@@ -52,21 +52,23 @@ eval cadence, structured logging.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-from unirl.distributed.group.placement import placement
+from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.types.prompts import RolloutInputs
 from unirl.types.sample import Part, Sample
@@ -131,18 +133,24 @@ class UnifiedModelTrainer(BaseTrainer):
         bundle_cfg: DictConfig,
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
-        ar_rollout_cfg: DictConfig,
-        dit_rollout_cfg: DictConfig,
         reward_cfg: DictConfig,
         ar_algorithm_cfg: DictConfig,
         image_algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
+        ar_rollout_cfg: Optional[DictConfig] = None,
+        dit_rollout_cfg: Optional[DictConfig] = None,
+        rollout_cfg: Optional[DictConfig] = None,
         sync_cfg: Optional[DictConfig] = None,
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
+        eval_interval: int = 0,
+        eval_num_prompts: int = 32,
+        eval_cfg_text_scale: float = 4.0,
+        eval_eta: float = 0.0,
+        eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -150,6 +158,17 @@ class UnifiedModelTrainer(BaseTrainer):
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
+        # eval_interval=0 disables it. Scores only the image track, generated at
+        # the deterministic best-quality setting (CFG=eval_cfg_text_scale,
+        # eta=eval_eta) — same knobs/semantics as DiffusionTrainer; extra
+        # eval-only rewards: unirl.trainer.eval_suites. No eval_samples_per_prompt
+        # knob: the 2-track fan-out makes a single count ambiguous (bagel is M=1).
+        self.eval_interval = int(eval_interval)
+        self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
+        self.eval_eta = float(eval_eta)
 
         # W&B logging (logging_cfg, wandb_logger, optimizer-step counter) is owned
         # by BaseTrainer + UniRLWandBLogger now — see super().__init__ above.
@@ -179,6 +198,11 @@ class UnifiedModelTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
             self.reward = remote_hydra(reward_cfg)
+            # Extra eval-only rewards (eval_rewards) — siblings of the training
+            # reward on this slab; see unirl.trainer.eval_suites.
+            self._eval_suites = build_eval_suites(
+                eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+            )
 
             # Two algorithms over the SAME shared pipeline (each resolves its
             # own stage via ``stage_attr``: ar→pipeline.ar, image→pipeline.diffusion).
@@ -192,6 +216,37 @@ class UnifiedModelTrainer(BaseTrainer):
                 ar_algorithm=self.ar_algorithm,
                 image_algorithm=self.image_algorithm,
             )
+
+            # Rollout wiring. Single-engine (M=1 / UniGRPO — a trainside or single
+            # engine on the SHARED pipeline) short-circuits the two-engine HI3 path
+            # below: no GPU partition, no weight sync, and (trainside) no base
+            # offload since it samples the live FSDP modules. ``_shared_advantage``
+            # makes train_step copy the AR's prompt-level advantage onto the 1:1
+            # image track (M=1) instead of the degenerate per-rewrite grouping.
+            self._single_engine = rollout_cfg is not None
+            diffusion_params = self.sampling_params.get("diffusion")
+            self._shared_advantage = int(diffusion_params.samples_per_prompt) == 1
+            self._rollout_is_trainside = False
+            if self._single_engine:
+                self.dp = 1
+                self.ar_rollouts = []
+                self.dit_rollouts = []
+                self.ar_rollout = None
+                self.dit_rollout = None
+                rollout_parsed = parse_hydra_cfg(rollout_cfg)
+                self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+                if self._rollout_is_trainside:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
+                    self._enable_fsdp_offload = False  # shares live FSDP modules
+                else:
+                    self.rollout = remote(**rollout_parsed)
+                return
+
+            if ar_rollout_cfg is None or dit_rollout_cfg is None:
+                raise ValueError(
+                    "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
+                    "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
+                )
 
             # COLOCATE MEMORY: offload the ~150GB frozen base to CPU BEFORE
             # booting the engines. Each engine grabs ~70GB (AR) / ~45GB (DiT) on
@@ -296,7 +351,13 @@ class UnifiedModelTrainer(BaseTrainer):
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
 
-    def _build_request_sample(self, inputs: RolloutInputs, rollout_id: int) -> Sample:
+    def _build_request_sample(
+        self,
+        inputs: RolloutInputs,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``.
 
         Pre-forks the unified lineage shells ``[input, ar_shell(P*N),
@@ -304,10 +365,17 @@ class UnifiedModelTrainer(BaseTrainer):
         drives the two engines and fills these shells. ``rollout_id`` keys the
         diffusion SDE-step schedule (``scheduler`` nulled so only the concrete
         ``sde_indices`` ride) and salts the root ids. The AR sub-block has no SDE
-        machinery and is left untouched.
+        machinery and is left untouched. ``sampling`` optionally supplies the
+        evaluation sampling parameters.
         """
-        diff_params = self.sampling_params.get("diffusion")
-        ar_params = self.sampling_params.get("ar")
+        unsupported = set(inputs.primitives) - {"text"}
+        if unsupported:
+            raise ValueError(
+                f"UnifiedModelTrainer._build_request_sample: unsupported input primitive keys: {sorted(unsupported)}"
+            )
+        base = sampling if sampling is not None else self.sampling_params
+        diff_params = base.get("diffusion")
+        ar_params = base.get("ar")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         # Driver-x_T opt-out: env DISABLE_DRIVER_XT (parity with DiffusionTrainer) OR a
         # recipe-set params flag. The hi3 DiT adapter skips init_noise_group_ids when
@@ -319,7 +387,7 @@ class UnifiedModelTrainer(BaseTrainer):
         root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
         input_part = Part.input(
             root_ids,
-            primitive=inputs.primitives["text"],
+            primitives={"text": inputs.primitives["text"]},
             metadata=list(inputs.metadata) if inputs.metadata else None,
         )
         return (
@@ -348,6 +416,9 @@ class UnifiedModelTrainer(BaseTrainer):
         SILENTLY feed replica-0 rope to every sample (wrong gradient, no crash);
         make rope_cache a tuple-aware CONCAT field before relying on it.
         """
+        if self._single_engine:
+            return self.rollout.generate(sample)
+
         n = sample.parts[0].batch_size
         if self.dp <= 1 or n <= 1:
             return self._run_rollout_one(self.ar_rollouts[0], self.dit_rollouts[0], sample)
@@ -386,9 +457,9 @@ class UnifiedModelTrainer(BaseTrainer):
         input_part = sample.parts[0]
         ar_shell = sample.gen_part(ARSamplingParams)
         image_shell = sample.gen_part(DiffusionSamplingParams)
-        prompts = input_part.primitive
+        prompts = input_part.primitives.get("text")
         if not isinstance(prompts, Texts):
-            raise TypeError("UnifiedModelTrainer.run_rollout: input Part.primitive must be a Texts primitive.")
+            raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
         n_rec = int(ar_shell.sampling_params.samples_per_prompt)
         n_img = int(image_shell.sampling_params.samples_per_prompt)
         rid = int(self._dump_rollout_id)
@@ -398,7 +469,11 @@ class UnifiedModelTrainer(BaseTrainer):
         # slice's height/width, so ship the AR shell's params whole.
         ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
         n_ar = len(ar_texts.texts)
-        ar_input = Part.input([f"r{rid}:a{k}" for k in range(n_ar)], primitive=ar_texts, control=dict(input_part.control))
+        ar_input = Part.input(
+            [f"r{rid}:a{k}" for k in range(n_ar)],
+            primitives={"text": ar_texts},
+            control=dict(input_part.control),
+        )
         # The hi3_ar_recaption adapter (carries_target_size) reads the diffusion gen
         # Part's height/width for the recaption prompt, so the AR request carries a
         # params-only diffusion shell ahead of the AR frontier. Only the AR stage
@@ -412,28 +487,33 @@ class UnifiedModelTrainer(BaseTrainer):
         )
         ar_out = ar_engine.generate(ar_request)
         ar_gen = ar_out.parts[-1]
-        recaptions = ar_gen.primitive
+        recaptions = ar_gen.primitives.get("text")
         if not isinstance(recaptions, Texts) or len(recaptions.texts) != n_ar:
             got = len(recaptions.texts) if isinstance(recaptions, Texts) else type(recaptions).__name__
             raise RuntimeError(
                 f"UnifiedModelTrainer.run_rollout: AR engine must return {n_ar} decoded Texts (= P*N); got {got}."
             )
         # Fill the unified ar shell (carries the N-grouping lineage) by row order.
-        ar_part = ar_shell.fill(segment=ar_gen.segment, primitive=recaptions, conditions=dict(ar_gen.conditions))
+        ar_part = ar_shell.fill(
+            segment=ar_gen.segment,
+            primitives={"text": recaptions},
+            conditions=dict(ar_gen.conditions),
+        )
 
         # ── Level 2: DiT. P*N*M pre-expanded (original prompt + recaption cot_text),
         # re-rooted flat (1:1). The recaption rides as a chained cot_text input Part.
         dit_prompts = Texts(texts=[prompts.texts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
         dit_cot = Texts(texts=[recaptions.texts[i] for i in range(n_ar) for _ in range(n_img)])
-        n_total = len(dit_prompts.texts)
         # Re-root from the globally-unique image-shell lineage (flatten the path into a
         # legal root id) rather than replica-local ``d{k}``: the DiT engine derives the
         # x_T noise key from these ids, and ``d{k}`` restarts at 0 per dp>1 replica so
         # images on different replicas would collide on identical noise. The shell ids
         # are row-aligned with ``dit_prompts`` and the map-back is positional, so only
         # the noise key changes — restoring the pre-migration lineage-based key.
-        dit_input = Part.input([sid.replace("/", "_") for sid in image_shell.sample_ids], primitive=dit_prompts)
-        cot_input = dit_input.input_child(dit_cot)
+        dit_input = Part.input(
+            [sid.replace("/", "_") for sid in image_shell.sample_ids], primitives={"text": dit_prompts}
+        )
+        cot_input = dit_input.input_child(primitives={"text": dit_cot})
         dit_out = dit_engine.generate(
             Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params)
         )
@@ -445,7 +525,8 @@ class UnifiedModelTrainer(BaseTrainer):
             )
         image_part = image_shell.fill(
             segment=img_gen.segment,
-            primitive=img_gen.primitive,
+            primitives=dict(img_gen.primitives),
+            primitive_metadata=dict(img_gen.primitive_metadata),
             conditions=dict(img_gen.conditions),
             media_preview=img_gen.media_preview,
         )
@@ -475,33 +556,33 @@ class UnifiedModelTrainer(BaseTrainer):
         the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        # Colocate memory dance (150GB base can't coexist with an awake engine on
-        # the same card). Steady state on entry: base offloaded, engines asleep.
-        #   1. EXTRACT while engines ASLEEP + base ONLOADED — extract() runs a
-        #      train-mesh collective whose state_dict() gathers the full FSDP model
-        #      to GPU; an awake engine (~85GB) alongside the onloaded base
-        #      (~19GB/card) would OOM. extract() caches the adapter on rank 0
-        #      (nothing returned); offload the base again right after.
-        if sync_weights and self.weight_sync is not None:
-            if self._enable_fsdp_offload:
-                self.backend.onload()
-            self.weight_sync.extract()
-            if self._enable_fsdp_offload:
-                self.backend.offload()
-        #   2. Wake both engines (base on CPU → room; AR 0-3, DiT 4-7 disjoint),
-        #      then PUSH the cached adapter from rank 0 into each engine's
-        #      set_lora_from_tensors_copy (cross-process; engines are not siblings).
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.push()
-        #   3. Rollout (base offloaded), then sleep engines and onload the base
-        #      for the train backward.
-        sample = self.run_rollout(sample)
-        for _eng in self.ar_rollouts + self.dit_rollouts:
-            _eng.sleep()
-        if self._enable_fsdp_offload:
-            self.backend.onload()
+        if self._single_engine:
+            # Single-engine UniGRPO runs the Sample-native composed rollout
+            # directly. The trainside variant shares the live FSDP module, so it
+            # must not participate in the two-engine offload/sync choreography.
+            sample = self.run_rollout(sample)
+        else:
+            # Colocate memory dance (150GB base can't coexist with an awake engine
+            # on the same card). Steady state on entry: base offloaded, engines
+            # asleep. EXTRACT (base onloaded) -> wake engines -> PUSH adapter ->
+            # rollout (base offloaded) -> sleep engines -> onload base for backward.
+            if sync_weights and self.weight_sync is not None:
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.offload()
+            for _eng in self.ar_rollouts + self.dit_rollouts:
+                _eng.wake_up()
+            try:
+                if sync_weights and self.weight_sync is not None:
+                    self.weight_sync.push()
+                sample = self.run_rollout(sample)
+            finally:
+                for _eng in self.ar_rollouts + self.dit_rollouts:
+                    _eng.sleep()
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
 
         # Locate the two gen Parts by sampling-params type (the image Part is the
         # frontier of the unified [input, ar, image] lineage).
@@ -518,6 +599,8 @@ class UnifiedModelTrainer(BaseTrainer):
         img_part = sample.parts[img_idx]
         if img_part.rewards is not None:
             img_part.rewards = hydrate(img_part.rewards)
+        if isinstance(img_part.component_rewards, dict):
+            img_part.component_rewards = {name: hydrate(value) for name, value in img_part.component_rewards.items()}
 
         # 2. Credit-assign image reward up the lineage → fills the "ar" Part.
         sample = sample.propagate_rewards(op="mean")
@@ -533,10 +616,20 @@ class UnifiedModelTrainer(BaseTrainer):
         if self.dump_dir:
             self._dump_rollout(self._dump_rollout_id, sample)
 
-        # 4. Per-Part GRPO advantages (ar groups by prompt, image by recaption).
+        # 4. AR always groups by prompt. In single-engine M=1 mode the image
+        #    Part is 1:1 with the AR Part, so share the prompt-level advantage;
+        #    computing an image advantage by rewrite would produce size-1 groups.
         new_parts = list(sample.parts)
-        for idx in (ar_idx, img_idx):
-            new_parts[idx] = new_parts[idx].compute_advantages(normalize=True)
+        new_parts[ar_idx] = new_parts[ar_idx].compute_advantages(normalize=True)
+        if self._shared_advantage:
+            if new_parts[img_idx].batch_size != new_parts[ar_idx].batch_size:
+                raise ValueError(
+                    "UnifiedModelTrainer: shared M=1 advantage requires equal AR/image batch sizes; "
+                    f"got {new_parts[ar_idx].batch_size} and {new_parts[img_idx].batch_size}."
+                )
+            new_parts[img_idx] = dataclasses.replace(new_parts[img_idx], advantages=new_parts[ar_idx].advantages)
+        else:
+            new_parts[img_idx] = new_parts[img_idx].compute_advantages(normalize=True)
         sample = sample.with_parts(new_parts)
 
         # Captions for the image previews fall back to the frontier-aligned prompt
@@ -560,7 +653,7 @@ class UnifiedModelTrainer(BaseTrainer):
 
         # 6. Back to steady state (base on CPU) so the next rollout's engines
         #    have room to wake.
-        if self._enable_fsdp_offload:
+        if self._enable_fsdp_offload and not self._single_engine:
             self.backend.offload()
         return results, mean_reward
 
@@ -580,15 +673,17 @@ class UnifiedModelTrainer(BaseTrainer):
             out_dir = os.path.join(self.dump_dir, f"rollout_{rollout_id}")
             os.makedirs(out_dir, exist_ok=True)
 
-            prompts_obj = sample.parts[0].primitive
+            prompts_obj = sample.parts[0].primitives.get("text")
             prompts = list(prompts_obj.texts) if isinstance(prompts_obj, Texts) else []
 
             ar_part = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
-            ar_decoded = getattr(ar_part, "primitive", None) if ar_part is not None else None
+            ar_decoded = ar_part.primitives.get("text") if ar_part is not None else None
             ar_texts = list(ar_decoded.texts) if isinstance(ar_decoded, Texts) else []
 
-            image_part = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None)
-            img_decoded = getattr(image_part, "primitive", None) if image_part is not None else None
+            image_part = next(
+                (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
+            )
+            img_decoded = image_part.primitives.get("image") if image_part is not None else None
             sample_ids = list(image_part.sample_ids) if image_part is not None else []
             parent_ids = list(image_part.group_ids) if image_part is not None else []
 
@@ -638,6 +733,118 @@ class UnifiedModelTrainer(BaseTrainer):
         except Exception as exc:  # noqa: BLE001 — dump must never break training
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
+    def evaluate(self, step: int) -> float:
+        """Periodic eval on the eval set (no training); returns the mean image reward.
+
+        Mirrors :meth:`train_step`'s rollout+reward path but skips
+        credit-assign/advantage/backward: run the ``P→P*N→P*N*M`` fan-out through
+        :meth:`run_rollout` (works on both the single-engine trainside and the
+        two-engine HI3 path) at the deterministic best-quality setting (CFG at
+        ``eval_cfg_text_scale``, ``eta=eval_eta``) and score ONLY the image
+        track — the training reward plus the ``eval_rewards`` suites (see
+        :mod:`unirl.trainer.eval_suites`). Logs one ``eval/*`` row; returns
+        ``eval/reward``.
+
+        The two-engine path syncs the live adapter into the engines once per
+        eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
+        :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
+        so without this the engines would eval one update stale, and a
+        restored-checkpoint baseline eval would see fresh engine weights.
+        Pushed weights persist across sleep/wake cycles (as train_step relies
+        on), so the passes below just wake/sleep around each chunk's rollout.
+        Unlike train_step, eval never onloads the base after the extract: there
+        is no backward, so the FSDP state stays offloaded (the steady state)
+        throughout. The single-engine trainside path needs none of it (the
+        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
+        forced False).
+        """
+        # Override only the "diffusion" entry of the modality-keyed sampling dict.
+        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
+        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (HI3,
+        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs = dict(eta=self.eval_eta)
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH
+        # needs awake engines, so it rides one short wake/sleep cycle here).
+        if not self._single_engine and self.weight_sync is not None:
+            if self._enable_fsdp_offload:
+                self.backend.onload()
+            self.weight_sync.extract()
+            if self._enable_fsdp_offload:
+                self.backend.offload()
+            for eng in self.ar_rollouts + self.dit_rollouts:
+                eng.wake_up()
+            try:
+                self.weight_sync.push()
+            finally:
+                for eng in self.ar_rollouts + self.dit_rollouts:
+                    eng.sleep()
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        logger.info(
+            "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
+            step,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self,
+        data_source: Any,
+        num_prompts: int,
+        scorers: List[Tuple[str, Any]],
+        eval_sp: Dict[str, BaseSamplingParams],
+        step: int,
+    ) -> Dict[str, float]:
+        """One generate→score sweep over one eval set; returns each scorer's mean.
+
+        Chunked by ``self.batch_size`` (the un-expanded P-prompt req DP-splits,
+        so the chunk must be dp-divisible; ``batch_size`` is what training
+        runs). A ragged tail (``num_prompts`` not a multiple of ``batch_size``)
+        is floored off.
+        """
+        all_inputs = data_source.get_eval_samples(num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.batch_size)
+        usable = n_prompts - n_prompts % chunk or n_prompts
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
+        for start in range(0, usable, chunk):
+            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            request = self._build_request_sample(sub, step, sampling=eval_sp)
+            if self._single_engine:
+                generated = self.run_rollout(request)
+            else:
+                for eng in self.ar_rollouts + self.dit_rollouts:
+                    eng.wake_up()
+                try:
+                    generated = self.run_rollout(request)
+                finally:
+                    for eng in self.ar_rollouts + self.dit_rollouts:
+                        eng.sleep()
+            for name, reward in scorers:
+                scored = reward.score_and_attach(generated)
+                rewards = scored.parts[-1].rewards
+                if rewards is not None:
+                    r = hydrate(rewards).to(torch.float32)
+                    sums[name] += float(r.sum().item())
+                    counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+
     def train(
         self,
         *,
@@ -667,6 +874,8 @@ class UnifiedModelTrainer(BaseTrainer):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
+            if self.eval_interval > 0:
+                self.evaluate(start_rollout)  # baseline eval before any training
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 self._dump_rollout_id = rollout_id  # picked up by train_step's dump
@@ -695,6 +904,10 @@ class UnifiedModelTrainer(BaseTrainer):
                 # logp convention (temperature / top-k-p filtering / full-vs-renorm
                 # softmax) doesn't match vLLM's sampler.
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
+                # eval(k) BEFORE save(checkpoint-k) at the same step, so a
+                # resumed checkpoint re-runs the same eval (A/B consistency).
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )

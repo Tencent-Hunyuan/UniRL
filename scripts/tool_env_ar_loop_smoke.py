@@ -72,7 +72,7 @@ def main() -> int:
 
         ar = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=512, top_p=0.9, top_k=20)
         loop = AgentLoop(environment=env, sampling_params=ar, max_turns=4)
-        request = Sample.request(Part.input(["p0"], primitive=Texts(texts=[PROMPT])))
+        request = Sample.request(Part.input(["p0"], primitives={"text": Texts(texts=[PROMPT])}))
 
         _log("running the closed agentic loop (tool call -> observe -> answer) ...")
         out = loop.run(engine, request)
@@ -92,16 +92,16 @@ def main() -> int:
         # ---- assert the closed loop ----
         assert len(gens) >= 2, f"expected >=2 gen turns (tool call + answer); got {len(gens)}"
 
-        first_call = parse_tool_call(gens[0].primitive.texts[0])
+        first_call = parse_tool_call(gens[0].primitives["text"].texts[0])
         assert first_call is not None and first_call["name"] == "calculator", "turn 1 must call the calculator"
         _log(f"turn 1 tool call: {first_call}")
 
         tool_obs = [p for p in out.parts if p.resolved_role() == "tool"]
         assert tool_obs, "no observation Part rendered as role 'tool'"
-        assert expected in tool_obs[0].primitive.texts[0], f"tool observation must carry {expected}"
-        _log(f"tool observation (role 'tool'): {tool_obs[0].primitive.texts[0]!r}")
+        assert expected in tool_obs[0].primitives["text"].texts[0], f"tool observation must carry {expected}"
+        _log(f"tool observation (role 'tool'): {tool_obs[0].primitives['text'].texts[0]!r}")
 
-        final = gens[-1].primitive.texts[0]
+        final = gens[-1].primitives["text"].texts[0]
         _log(f"final answer: {final[:300]!r}")
         assert parse_tool_call(final) is None, "the final turn must be an answer, not another tool call"
         assert expected in final.replace(",", ""), (

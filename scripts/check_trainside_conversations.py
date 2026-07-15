@@ -44,11 +44,12 @@ def _ar() -> ARSamplingParams:
 
 def check_single_turn_text() -> None:
     """No roles ⇒ a lone ``user`` message per sample (byte-identical to pre-fix shape)."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))  # no role
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})  # no role
     sample = Sample(parts=[inp, inp.fork(1, sampling_params=_ar())])
     msgs = build_text_messages(sample.text_conditioning())
     _check(
-        msgs == [
+        msgs
+        == [
             [{"role": "user", "content": "a cat"}],
             [{"role": "user", "content": "a dog"}],
         ],
@@ -59,7 +60,7 @@ def check_single_turn_text() -> None:
 def check_no_dexpand_text() -> None:
     """THE trainside contract: every frontier sample gets its own conversation — NO
     de-expand (the sglang wire would collapse to 2 + fan out n; trainside keeps 4)."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["x", "y"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["x", "y"])})
     sample = Sample(parts=[inp, inp.fork(2, sampling_params=_ar())])  # 2 prompts x branch 2
     msgs = build_text_messages(sample.text_conditioning())
     _check(len(msgs) == 4, f"no de-expand: 2 prompts x branch 2 -> 4 conversations, got {len(msgs)}")
@@ -71,7 +72,7 @@ def check_no_dexpand_text() -> None:
 
 def check_system_rule() -> None:
     """Config ``system_instruction`` prepended iff no explicit ``system`` turn."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["q"]))
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["q"])})
     sample = Sample(parts=[inp, inp.fork(1, sampling_params=_ar())])
     msgs = build_text_messages(sample.text_conditioning(), "BE NICE")
     _check(
@@ -79,8 +80,8 @@ def check_system_rule() -> None:
         "config system_instruction prepended when no system turn",
     )
 
-    sys_in = Part.input(["s0"], primitive=Texts(texts=["SYS"]), role="system")
-    usr = sys_in.input_child(Texts(texts=["q"]), role="user")
+    sys_in = Part.input(["s0"], primitives={"text": Texts(texts=["SYS"])}, role="system")
+    usr = sys_in.input_child({"text": Texts(texts=["q"])}, role="user")
     sample2 = Sample(parts=[sys_in, usr, usr.fork(1, sampling_params=_ar())])
     msgs2 = build_text_messages(sample2.text_conditioning(), "CONFIG SYS")
     _check([m["role"] for m in msgs2[0]] == ["system", "user"], "explicit system turn rendered")
@@ -89,17 +90,20 @@ def check_system_rule() -> None:
 
 def check_multi_turn_order() -> None:
     """user → assistant → tool renders three messages per sample, in lineage order."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["what is 2+2?"]), role="user")
-    asst = inp.fork(1, sampling_params=_ar()).fill(primitive=Texts(texts=["let me compute"]))
-    tool = asst.input_child(Texts(texts=["4"]), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["what is 2+2?"])}, role="user")
+    asst = inp.fork(1, sampling_params=_ar()).fill(primitives={"text": Texts(texts=["let me compute"])})
+    tool = asst.input_child({"text": Texts(texts=["4"])}, role="tool")
     sample = Sample(parts=[inp, asst, tool, tool.fork(1, sampling_params=_ar())])
     msgs = build_text_messages(sample.text_conditioning())
     _check(
-        msgs == [[
-            {"role": "user", "content": "what is 2+2?"},
-            {"role": "assistant", "content": "let me compute"},
-            {"role": "tool", "content": "4"},
-        ]],
+        msgs
+        == [
+            [
+                {"role": "user", "content": "what is 2+2?"},
+                {"role": "assistant", "content": "let me compute"},
+                {"role": "tool", "content": "4"},
+            ]
+        ],
         "multi-turn conversation in lineage order",
     )
 
@@ -107,8 +111,8 @@ def check_multi_turn_order() -> None:
 def check_vlm_fusion_inline_pil() -> None:
     """it2i [text(user), image(user)] fuses into one user message; image block BEFORE
     text, with the PIL inlined (the trainside processor format)."""
-    text = Part.input(["p0"], primitive=Texts(texts=["edit"]), role="user")
-    img = text.input_child(_images(1), role="user")
+    text = Part.input(["p0"], primitives={"text": Texts(texts=["edit"])}, role="user")
+    img = text.input_child({"image": _images(1)}, role="user")
     sample = Sample.request(text, img).fork(1, sampling_params=_ar())
     turns, _ = sample.vision_conditioning()
     msgs = build_vision_messages(turns)
@@ -121,8 +125,8 @@ def check_vlm_fusion_inline_pil() -> None:
 
 def check_no_dexpand_vlm() -> None:
     """VLM also keeps one conversation per frontier row (no de-expand)."""
-    text = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]), role="user")
-    img = text.input_child(_images(2), role="user")
+    text = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])}, role="user")
+    img = text.input_child({"image": _images(2)}, role="user")
     sample = Sample.request(text, img).fork(2, sampling_params=_ar())
     turns, _ = sample.vision_conditioning()
     msgs = build_vision_messages(turns)

@@ -68,13 +68,17 @@ def main() -> int:
         # Stop right after the tool call so the model can't hallucinate its own tool response;
         # parse_tool_call's balanced-brace fallback recovers the stop-trimmed </tool_call>.
         request = Sample.request(
-            Part.input(["p0"], primitive=Texts(texts=[PROMPT]), control={"ar": {"stop": ["</tool_call>"]}})
+            Part.input(
+                ["p0"],
+                primitives={"text": Texts(texts=[PROMPT])},
+                control={"ar": {"stop": ["</tool_call>"]}},
+            )
         )
         ar = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=512, top_p=0.9, top_k=20)
 
         _log("generating turn 0 (the model should call the calculator) ...")
         out = engine.generate(request.fork(1, sampling_params=ar))
-        text = out.parts[-1].primitive.texts[0]
+        text = out.parts[-1].primitives["text"].texts[0]
         _log(f"raw model output:\n{text!r}")
 
         # ---- assert the model emitted a parseable calculator tool call ----

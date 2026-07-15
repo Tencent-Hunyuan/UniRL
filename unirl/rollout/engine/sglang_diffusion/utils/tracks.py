@@ -24,9 +24,9 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, Video, Videos
+from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
-from unirl.types.trajectory_store import compute_trajectory_positions
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def derive_timestep_alignment(
         f"SGLang trajectory length {traj_len} != expected_sigmas length {expected_len}. "
         f"Modern SGLang prepends initial latents at "
         f"sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py so "
-        f"trajectory carries T+1 latents; expected_sigmas (from req.sigmas) is T+1 "
+        f"trajectory carries T+1 latents; expected_sigmas (from sampling_params.sigmas) is T+1 "
         f"too. Upgrade SGLang or fix the sampler to emit a T+1 trajectory.",
     )
     expected_cpu = expected_sigmas.detach().to(torch.float32).cpu()
@@ -242,7 +242,8 @@ def stack_decoded_images(
     Image-output adapters may opt into squeezing a singleton temporal axis
     ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
     run through the legacy image path should disable this so a true single-frame
-    video is dropped like any other 4-D video sample.
+    video is dropped like any other 4-D video sample. Multi-frame 4-D samples are
+    dropped with a warning either way (no Videos packing on the image track).
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -268,6 +269,37 @@ def stack_decoded_images(
     if not per_sample_tensors:
         return None
     return Images(pixels=torch.stack(per_sample_tensors, dim=0))
+
+
+def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
+    """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch.
+
+    The video counterpart of :func:`stack_decoded_images`. ``decode_sample``
+    returns canonical channels-first video ``[C, T, H, W]`` (see
+    :func:`unirl.rollout.engine.sglang_diffusion.utils.tensors.normalize_media`);
+    the :class:`~unirl.types.primitives.Video` primitive — and the video reward
+    consumer (``video_pickscore``, which permutes ``frames[T,C,H,W] → [C,T,H,W]``)
+    — want frame-major ``[T, C, H, W]``, so we permute before packing.
+    ``Videos.from_list`` concatenates along T and lets the Batch framework
+    compute the per-sample ``cu_frames`` offsets. Each result carries exactly
+    one decoded sample (mirrors :func:`stack_decoded_images`'s one-per-result
+    contract). Returns ``None`` when no recognizable video was produced.
+    """
+    videos: List[Video] = []
+    for result in results:
+        canonical = decode_sample(result.samples)
+        if canonical is None:
+            continue
+        if canonical.dim() != 4:
+            raise RuntimeError(
+                f"stack_decoded_videos: expected 4-D canonical video [C, T, H, W]; "
+                f"got rank {canonical.dim()}, shape {tuple(canonical.shape)}."
+            )
+        frames = canonical.permute(1, 0, 2, 3).contiguous().to(torch.float32)  # [T, C, H, W]
+        videos.append(Video(frames=frames))
+    if not videos:
+        return None
+    return Videos.from_list(videos)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +333,12 @@ def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
     return torch.cat(padded, dim=0)
 
 
-def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+def _aligned_mask(
+    mask_list: List[torch.Tensor],
+    embeds_cat: Optional[torch.Tensor],
+    *,
+    allow_pad: bool = False,
+) -> Optional[torch.Tensor]:
     """Fuse + mount an attention mask only when it aligns with the fused embeds.
 
     The engine emits the model's embeds-aligned ``prompt_embeds_mask`` (the mask the
@@ -311,22 +348,44 @@ def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tens
     dropped (SD3's ``predict_noise`` ignores the mask — dropping a mismatched mask
     is the safe, correct result and avoids padding the embeds up to a spurious
     length, the historic ~68x LoRA-gradient dilution).
+
+    For Qwen-Image-Edit-Plus the text encoder emits prompt_embeds that include
+    image-placeholder tokens (longer than the text-only attention mask). The
+    extra positions are all valid (image tokens the DiT attends to), so pad the
+    mask with ones up to the embeds seq-len instead of dropping it.
     """
     if not mask_list or embeds_cat is None:
         return None
     mask_cat = _cat_padded_rows(mask_list)
-    if int(mask_cat.shape[1]) != int(embeds_cat.shape[1]):
+    mask_seq = int(mask_cat.shape[1])
+    embeds_seq = int(embeds_cat.shape[1])
+    if mask_seq == embeds_seq:
+        return mask_cat
+    if mask_seq > embeds_seq:
         logger.debug(
             "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
-            int(mask_cat.shape[1]),
-            int(embeds_cat.shape[1]),
+            mask_seq,
+            embeds_seq,
         )
         return None
-    return mask_cat
+    # mask_seq < embeds_seq: pad with ones only when the adapter opts in
+    # (Edit-Plus prompt_embeds carry image-token slots beyond the text mask).
+    if not allow_pad:
+        logger.debug(
+            "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
+            mask_seq,
+            embeds_seq,
+        )
+        return None
+    batch = mask_cat.shape[0]
+    pad = torch.ones((batch, embeds_seq - mask_seq), dtype=mask_cat.dtype, device=mask_cat.device)
+    return torch.cat([mask_cat, pad], dim=1)
 
 
 def fuse_text_conditions(
     results: Sequence[RawResult],
+    *,
+    allow_mask_pad: bool = False,
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
     """Fuse per-result encoder outputs into ``text`` + optional ``negative_text``.
 
@@ -375,11 +434,12 @@ def fuse_text_conditions(
             neg_mask_list.append(neg_mask.detach().cpu())
 
     embeds_cat = _cat_padded_rows(prompt_embeds_list) if prompt_embeds_list else None
+
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
             pooled=torch.cat(pooled_list, dim=0) if pooled_list else None,
-            attn_mask=_aligned_mask(mask_list, embeds_cat),
+            attn_mask=_aligned_mask(mask_list, embeds_cat, allow_pad=allow_mask_pad),
         )
         if embeds_cat is not None
         else None
@@ -390,7 +450,7 @@ def fuse_text_conditions(
         TextEmbedCondition(
             embeds=neg_embeds_cat,
             pooled=torch.cat(neg_pooled_list, dim=0) if neg_pooled_list else None,
-            attn_mask=_aligned_mask(neg_mask_list, neg_embeds_cat),
+            attn_mask=_aligned_mask(neg_mask_list, neg_embeds_cat, allow_pad=allow_mask_pad),
         )
         if neg_embeds_cat is not None
         else None
@@ -403,5 +463,6 @@ __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
     "stack_decoded_images",
+    "stack_decoded_videos",
     "fuse_text_conditions",
 ]

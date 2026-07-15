@@ -70,11 +70,11 @@ class _CounterTool(StatefulTool):
 
 
 def _request(sid: str) -> Sample:
-    return Sample.request(Part.input([sid], primitive=Texts(texts=["prompt"])))
+    return Sample.request(Part.input([sid], primitives={"text": Texts(texts=["prompt"])}))
 
 
 def _turn(sample: Sample, body: str = _CALL) -> Sample:
-    return sample.fork(1, sampling_params=_SP).with_filled_frontier(primitive=Texts(texts=[body]))
+    return sample.fork(1, sampling_params=_SP).with_filled_frontier(primitives={"text": Texts(texts=[body])})
 
 
 def test_reset_mints_and_starts_session():

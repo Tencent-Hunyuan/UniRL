@@ -30,18 +30,21 @@ def pack_initial_noise_extra_args(
       noise on CPU-fp32. The noise key is derived from the gen Part's lineage
       (OD-2): the parent (group) id under ``init_same_noise`` so siblings share
       x_T, else the per-sample id.
+    - ``disable_driver_xt=True`` → pack neither transport; the worker owns x_T.
 
     Batch-dim mismatches indicate an upstream slicing bug — fail fast here
     instead of silently mis-slicing inside the worker.
     """
-    n_prompts = len(gen_part.sample_ids)
+    n_samples = len(gen_part.sample_ids)
+    if bool(getattr(diff_params, "disable_driver_xt", False)):
+        return
     seg = gen_part.segment
     initial_latents = getattr(seg, "initial_latents", None) if seg is not None else None
     if initial_latents is not None:
-        if int(initial_latents.shape[0]) != n_prompts:
+        if int(initial_latents.shape[0]) != n_samples:
             raise RuntimeError(
                 f"{caller}: initial_latents.shape[0]={int(initial_latents.shape[0])} "
-                f"!= prompt count {n_prompts} after sharding."
+                f"!= diffusion sample count {n_samples} after sharding."
             )
         # Tensor stays on whatever device the caller left it (typically CPU);
         # the worker pipeline does the device move inside ``prepare_latents``.

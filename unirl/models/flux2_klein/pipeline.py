@@ -68,7 +68,7 @@ class Flux2KleinPipeline(Pipeline):
 
     - ``segment: LatentSegment`` (patchified spatial shape
       ``[B, K, 128, H_pat, W_pat]``).
-    - ``primitive: Images`` — the decoded images.
+    - ``primitives["image"]: Images`` — the decoded images.
 
     ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
     deferred; the canonical Klein recipe runs at ``guidance_scale=1.0`` with no
@@ -206,49 +206,36 @@ class Flux2KleinPipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def _conditions_for(
+    def build_conditions(
         self,
         texts: Texts,
-        params: "Flux2KleinDiffusionParams",
-        source_image: Optional[Images] = None,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
     ) -> Flux2KleinConditions:
-        """Encode prompts (+ optional image-edit source) → :class:`Flux2KleinConditions`.
-        Shared by rollout-``generate`` and trainer-side replay (re-encode), so both
-        build conditions identically.
+        """Encode prompts (+ optional CFG negatives) into ``Flux2KleinConditions``.
 
         CFG empty negative: Klein's canonical training-script setting is
         ``guidance_scale=1.0`` (the script literally hardcodes it; see
         ``main_flux_bundle/reproduce_scripts/train_grpo_flux2_klein9b_sglang_multinode.sh``).
         When CFG is OFF, no negative branch is needed and we leave
-        ``negative_text=None`` so the transformer runs only the conditional forward.
-        When a downstream user opts in to ``guidance_scale > 1`` without supplying
-        ``negative_text``, default to an empty string (the Qwen3 chat-template
-        tokenizer is robust to ``""``: no chat-template prefix is stripped, so the
-        resulting embedding is well-defined). User-supplied negatives are deferred.
+        ``negative_text=None`` so the transformer runs only the
+        conditional forward. When a downstream user opts in to
+        ``guidance_scale > 1`` without supplying ``negative_text``,
+        default to an empty string (the Qwen3 chat-template tokenizer
+        is robust to ``""``: no chat-template prefix is stripped, so
+        the resulting embedding is well-defined).
         """
-        text_cond = self.text_embed.embed(texts)
-        negatives = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        klein_conds = Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
-
-        # Image-edit conditioning: when the request carries a source image (chained
-        # off the prompt via Part.input_child, role="condition" in the data),
-        # VAE-encode it into packed condition tokens + RoPE ids and attach to the
-        # conditions. Flux2KleinDiffusionStep concatenates these onto the noise
-        # sequence so the transformer actually sees the source. Without this the
-        # edit is text-only (the bug this fixes: edited images ignored the source).
-        if isinstance(source_image, Images):
-            if int(source_image.pixels.shape[0]) != len(texts.texts):
-                raise ValueError(
-                    f"Flux2KleinPipeline.generate: image count {int(source_image.pixels.shape[0])} "
-                    f"!= text count {len(texts.texts)}"
-                )
-            image_tokens, image_ids = self.vae_encode.encode(
-                source_image, height=int(params.height), width=int(params.width)
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"Flux2KleinPipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
-            klein_conds.image_latent = image_tokens
-            klein_conds.image_latent_ids = image_ids
-        return klein_conds
+        text_cond = self.text_embed.embed(texts)
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
         """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part.
@@ -290,7 +277,23 @@ class Flux2KleinPipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        klein_conds = self._conditions_for(texts, params, source_image)
+        klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        # Image-edit encoding depends on the output grid, so attach it after the
+        # public text-only condition builder.
+        if source_image is not None:
+            if source_image.pixels is None or int(source_image.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"Flux2KleinPipeline.generate: image count "
+                    f"{None if source_image.pixels is None else int(source_image.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_tokens, image_ids = self.vae_encode.encode(
+                source_image,
+                height=int(params.height),
+                width=int(params.width),
+            )
+            klein_conds.image_latent = image_tokens
+            klein_conds.image_latent_ids = image_ids
         schedule = sampling.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -304,7 +307,7 @@ class Flux2KleinPipeline(Pipeline):
 
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=latent_seg, primitive=decoded, conditions=klein_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"image": decoded}, conditions=klein_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

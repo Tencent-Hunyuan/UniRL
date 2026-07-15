@@ -133,7 +133,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     # Detokenize back to Texts for downstream reward / display consumption.
     decoded_texts = pipeline._detokenize_text_segment(text_seg)
 
-    filled = frontier.fill(segment=text_seg, primitive=decoded_texts, conditions=ar_conds.to_dict())
+    filled = frontier.fill(segment=text_seg, primitives={"text": decoded_texts}, conditions=ar_conds.to_dict())
     return sample.with_parts([*sample.parts[:-1], filled])
 
 

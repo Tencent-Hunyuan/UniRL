@@ -23,7 +23,7 @@ Three layers, all owned by this module:
    is what lets sglang / vllm-omni engines compute σ without holding the
    model in memory.
 
-3. **Glue** — :func:`ensure_req_sigmas` validates a request and pins the gen Part's
+3. **Glue** — :func:`ensure_sample_sigmas` validates a Sample and pins the gen Part's
    ``policy.compute_sigma(...)`` σ onto the gen Part's ``DiffusionSamplingParams.sigmas`` (every rollout
    engine calls it at the top of its ``generate``).
 
@@ -34,7 +34,7 @@ Naming convention (a symbol's name tells you its layer):
   per-model μ; ``compute_sigma`` → the full per-request σ).
 - free ``get_sigma_schedule`` / ``calculate_dynamic_mu`` are **stateless
   math primitives** — fully-resolved scalars in, no policy state.
-- ``ensure_req_sigmas`` is **request glue** — it operates on a request-shaped object (duck-typed).
+- ``ensure_sample_sigmas`` is **Sample glue** — it locates the diffusion gen Part.
 
 Ownership map (kept explicit so reading the code doesn't require
 following six getattr chains)::
@@ -465,33 +465,34 @@ class FlowMatchSchedulePolicy:
 
 
 # ===========================================================================
-# Layer 3 — request glue (pin σ onto a request-shaped object)
+# Layer 3 — Sample glue (pin σ onto a diffusion gen Part)
 # ===========================================================================
 
 
-def ensure_req_sigmas(req: Any, policy: FlowMatchSchedulePolicy) -> None:
-    """Compute and pin the σ schedule onto ``req.sigmas``.
+def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
+    """Compute and pin σ onto a Sample's diffusion generation parameters.
 
-    Every rollout engine calls this once at the top of ``generate(req)``.
-
-    ``req`` must expose ``req.sigmas`` (read/write) and
-    ``req.sampling_params`` with diffusion params containing
-    ``num_inference_steps`` / ``height`` / ``width`` keys.
+    AR-only Samples are a no-op. A diffusion Sample must carry
+    ``DiffusionSamplingParams`` with ``num_inference_steps`` / ``height`` /
+    ``width``.
 
     All three keys are **required** —  silent ``height=1024`` /
     ``width=1024`` defaults would mis-derive μ for dynamic-shift models
     when the request actually rendered at a different resolution
     (e.g. WAN T2V at 480×832). The driver always sets all three at request
-    construction (the trainer's ``_build_req``); absence means a wiring bug.
+    construction; absence means a wiring bug.
     """
-    if req.sigmas is not None:
+    # Local import avoids making the low-level SDE math module eagerly import
+    # the complete rollout type graph.
+    from unirl.types.sampling import DiffusionSamplingParams
+
+    gen_part = sample.gen_part_or_none(DiffusionSamplingParams)
+    if gen_part is None:
         return
-    diffusion = req.sampling_params.get("diffusion")
-    if diffusion is None:
-        raise ValueError(
-            "ensure_req_sigmas: req.sampling_params must contain diffusion params for σ schedule computation."
-        )
-    req.sigmas = policy.compute_sigma(
+    diffusion = gen_part.sampling_params
+    if diffusion.sigmas is not None:
+        return
+    diffusion.sigmas = policy.compute_sigma(
         num_inference_steps=int(diffusion.num_inference_steps),
         height=int(diffusion.height),
         width=int(diffusion.width),
@@ -501,8 +502,8 @@ def ensure_req_sigmas(req: Any, policy: FlowMatchSchedulePolicy) -> None:
 __all__ = [
     # Layer 2 — the per-model schedule object (engines build it; models subclass)
     "FlowMatchSchedulePolicy",
-    # Layer 3 — request glue (rollout engines call this)
-    "ensure_req_sigmas",
+    # Layer 3 — Sample glue (rollout engines call this)
+    "ensure_sample_sigmas",
     # Layer 1 — stateless math primitives (used directly by tests / advanced callers)
     "get_sigma_schedule",
     "calculate_dynamic_mu",

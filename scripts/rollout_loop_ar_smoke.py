@@ -56,7 +56,9 @@ class FixedTurnsEnv:
 
 def build_request(n: int) -> Tuple[Sample, ARSamplingParams]:
     prompts = ["The capital of France is", "Two plus two equals"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts), control={})
+    input_part = Part.input(
+        [f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)}, control={}
+    )
     ar_params = ARSamplingParams(samples_per_prompt=n, temperature=0.7, max_new_tokens=48, top_p=0.9, top_k=20)
     return Sample.request(input_part), ar_params
 
@@ -95,10 +97,12 @@ def main() -> int:
         assert len(gen.sample_ids) == 2 * n, f"expected {2 * n} samples; got {len(gen.sample_ids)}"
         assert all(parent_id(s) in input_ids for s in gen.sample_ids), "gen ids must be children of the prompts"
         assert isinstance(gen.segment, TextSegment), f"segment must be TextSegment; got {type(gen.segment)}"
-        assert isinstance(gen.primitive, Texts) and len(gen.primitive.texts) == 2 * n, "decoded Texts missing/wrong"
+        assert isinstance(gen.primitives.get("text"), Texts) and len(gen.primitives["text"].texts) == 2 * n, (
+            "decoded Texts missing/wrong"
+        )
         assert len(out.gen_parts()) == 1 and out.gen_parts()[0] is gen, "gen_parts must be exactly the AR gen Part"
         _log(f"PRIMARY PASS: env-driven single-turn loop produced {2 * n} Qwen completions via the real engine")
-        for i, t in enumerate(gen.primitive.texts):
+        for i, t in enumerate(gen.primitives["text"].texts):
             _log(f"  sample[{i}] id={gen.sample_ids[i]} text={t[:80]!r}")
 
         # ---- SECONDARY (informational): 2-turn loop, gen -> observation -> gen (real agentic shape) ----

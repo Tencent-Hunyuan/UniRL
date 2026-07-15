@@ -14,11 +14,39 @@ from typing import Any, Dict, List
 import torch
 
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
-from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
+from unirl.rollout.engine.vllm_omni.adapters.dit import (
+    DitInputAdapter,
+    DitOutputAdapter,
+    _grouped_texts_from_sample,
+    _negative_prompt_from_params,
+)
+from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
 from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
+
+
+class Sd3InputAdapter(DitInputAdapter):
+    """SD3 request builder using vLLM-Omni's native multi-output prompt shape."""
+
+    def build_prompts(self, sample: Sample) -> List[Any]:
+        grouped_texts, _ = _grouped_texts_from_sample(
+            sample,
+            caller=f"{self.modality}.build_prompts",
+        )
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        negative_prompt = _negative_prompt_from_params(diff_params, default="")
+        return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
+
+    def build_sampling(self, sample: Sample) -> List[StageSampling]:
+        _, spp = _grouped_texts_from_sample(
+            sample,
+            caller=f"{self.modality}.build_sampling",
+        )
+        sampling = super().build_sampling(sample)
+        sampling[0].kwargs["num_outputs_per_prompt"] = spp
+        return sampling
 
 
 class Sd3OutputAdapter(DitOutputAdapter):
@@ -32,7 +60,6 @@ class Sd3OutputAdapter(DitOutputAdapter):
         padding to ``max_sequence_length`` is fixed), so a plain dim-0 concat
         suffices.
         """
-        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
@@ -48,11 +75,29 @@ class Sd3OutputAdapter(DitOutputAdapter):
                 "stage YAML)."
             )
 
-        text_cond = TextEmbedCondition(
-            embeds=torch.cat([c["prompt_embeds"] for c in captures], dim=0),
-            pooled=torch.cat([c["pooled_prompt_embeds"] for c in captures], dim=0),
-            attn_mask=None,  # SD3 uses fixed-length T5 padding; no attn mask needed
-        )
+        embeds = torch.cat([c["prompt_embeds"] for c in captures], dim=0)
+        pooled = torch.cat([c["pooled_prompt_embeds"] for c in captures], dim=0)
+        segment_batch = 0
+        for diff_out in diff_outputs:
+            traj = getattr(diff_out, "trajectory_latents", None)
+            if traj is not None:
+                segment_batch += int(traj.shape[0])
+        if segment_batch:
+            capture_batch = int(embeds.shape[0])
+            if segment_batch % capture_batch != 0:
+                raise RuntimeError(
+                    f"SD3 text_capture batch {capture_batch} does not divide trajectory batch {segment_batch}."
+                )
+            factor = segment_batch // capture_batch
+            if factor > 1:
+                embeds = embeds.repeat_interleave(factor, dim=0)
+                pooled = pooled.repeat_interleave(factor, dim=0)
+        n_samples = len(sample.gen_part(DiffusionSamplingParams).sample_ids)
+        if int(embeds.shape[0]) != n_samples:
+            raise RuntimeError(
+                f"SD3 text condition batch {int(embeds.shape[0])} != diffusion sample count {n_samples}."
+            )
+        text_cond = TextEmbedCondition(embeds=embeds, pooled=pooled, attn_mask=None)
         return {"text": text_cond}
 
 
@@ -68,7 +113,7 @@ class Sd3T2iAdapter(ModelAdapter):
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = DitInputAdapter(self.modality)
+        self.input_adapter = Sd3InputAdapter(self.modality)
         self.output_adapter = Sd3OutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
@@ -84,4 +129,4 @@ class Sd3T2iAdapter(ModelAdapter):
         return self.output_adapter.build(sample, per_request)
 
 
-__all__ = ["Sd3OutputAdapter", "Sd3T2iAdapter"]
+__all__ = ["Sd3InputAdapter", "Sd3OutputAdapter", "Sd3T2iAdapter"]

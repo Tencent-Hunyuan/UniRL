@@ -48,12 +48,11 @@ class SD3Pipeline(Pipeline):
     and fills the frontier Part:
 
     - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitive: Images`` — the decoded images.
+    - ``primitives["image"]: Images`` — the decoded images.
 
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
-    replay build conditions through one shared path. User-supplied negative
-    prompts are deferred (single-input request); CFG uses a synthesized empty
-    negative.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay.
+    Sample generation uses the model's default CFG negative; direct callers can
+    pass explicit negatives through :meth:`build_conditions`.
     """
 
     def __init__(
@@ -68,6 +67,7 @@ class SD3Pipeline(Pipeline):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -80,6 +80,7 @@ class SD3Pipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else SD3VAEDecodeStage(bundle)
@@ -120,27 +121,30 @@ class SD3Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
 
-    def _conditions_for(self, texts: Texts, params: DiffusionSamplingParams) -> SD3Conditions:
-        """Encode prompts → :class:`SD3Conditions`. Shared by rollout-``generate``
-        and trainer-side replay (re-encode), so both build conditions identically.
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> SD3Conditions:
+        """Encode prompts (+ optional CFG negatives) into ``SD3Conditions``.
 
-        CFG empty negative: SD3 upstream (diffusers v0.37.1
-        ``pipeline_stable_diffusion_3.py:466-467``) auto-defaults to ``""`` (empty
-        string) when CFG is enabled and no negative is passed. Without this default
-        the SD3 diffusion step would fall back to a zero-init negative-condition
-        path that doesn't match what the model was trained against; the
-        rollout/replay log-prob ratio drifts away from 1.0 in GRPO.
-
-        SD3's three text encoders (CLIP + CLIP + T5) tokenize ``""`` cleanly —
-        unlike Qwen-Image, there's no chat-template + prefix-strip that would
-        degenerate the embedding. Hence ``""`` here vs Qwen's ``" "``; both are the
-        model's canonical empty-negative per its upstream pipeline. (User-supplied
-        negatives are deferred — a single-input request carries only the positive.)
+        Shared by :meth:`generate` and the ReFL draft path (``draft_generate``).
+        Applies SD3's empty-negative default (diffusers parity) when CFG is on and
+        no negative was supplied — see the rationale quoted in :meth:`generate`.
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"SD3Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
-        negatives = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return SD3Conditions(text=text_cond, negative_text=negative_text_cond)
 
@@ -179,7 +183,7 @@ class SD3Pipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        sd3_conds = self._conditions_for(texts, params)
+        sd3_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -194,7 +198,7 @@ class SD3Pipeline(Pipeline):
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay: Part.conditions is the train stack's source in prepare_segment
         # (matches every sibling pipeline + the SD3 sglang_diffusion adapter).
-        filled = frontier.fill(segment=latent_seg, primitive=images, conditions=sd3_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=sd3_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

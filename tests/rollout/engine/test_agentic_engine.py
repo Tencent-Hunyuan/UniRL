@@ -117,7 +117,7 @@ def _make_engine(
 
 def _req(root_id: str) -> Sample:
     """A single-trajectory request: ``[input(1)]`` rooted at a slash-free id."""
-    return Sample.request(Part.input([root_id], primitive=Texts(texts=[f"prompt-{root_id}"])))
+    return Sample.request(Part.input([root_id], primitives={"text": Texts(texts=[f"prompt-{root_id}"])}))
 
 
 def _wait_until(predicate, timeout_s: float = 5.0) -> None:

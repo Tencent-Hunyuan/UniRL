@@ -48,6 +48,44 @@ class _DiffrlPatchedTarget:
         self._target = target
 
     def __call__(self, *args, **kwargs):
+        # SGLang scheduler subprocesses inherit train-side NCCL env vars from
+        # Ray/FSDP. Clear those single-process-incompatible knobs before the
+        # scheduler bootstraps its own NCCL group. Also pre-import the LoRA
+        # pipeline so its TOKENIZERS_PARALLELISM putenv happens before NCCL
+        # background threads can race with later environment writes.
+        import os as _os
+
+        # PRECONDITION: this scrub assumes the scheduler subprocess hosts a
+        # single-process NCCL world (num_gpus=1 / tp_size=1 — the only
+        # validated colocate topology). Deployments that need these knobs
+        # inside the subprocess (engine TP>1, multi-NIC hosts pinning
+        # NCCL_SOCKET_IFNAME) can set UNIRL_SGLANG_KEEP_NCCL_ENV=1 to skip it.
+        if _os.environ.get("UNIRL_SGLANG_KEEP_NCCL_ENV") not in ("1", "true"):
+            # NCCL_TOPO_FILE is the actual deadlock trigger, but only when it
+            # dangles (a /proc/self/fd/NNN path of the dead parent). A real,
+            # readable topo file is a legitimate host-level setting — keep it.
+            _topo = _os.environ.get("NCCL_TOPO_FILE")
+            if _topo is not None and not _os.path.exists(_topo):
+                _os.environ.pop("NCCL_TOPO_FILE", None)
+            for _k in (
+                "NCCL_SOCKET_IFNAME",
+                "NCCL_BUFFSIZE",
+                "NCCL_NET_FORCE_FLUSH",
+                "NCCL_NVLSTREE_MAX_CHUNKSIZE",
+                "NCCL_NVLS_CHUNKSIZE",
+                "NCCL_P2P_NET_CHUNKSIZE",
+                "NCCL_TUNER_PLUGIN",
+            ):
+                _os.environ.pop(_k, None)
+
+        # Pre-import to run lora_pipeline's module-level putenv before NCCL
+        # background threads start.
+        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        try:
+            import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
+        except Exception:
+            pass
+
         SglangDiffusionHijack.hijack()
         return self._target(*args, **kwargs)
 
@@ -153,6 +191,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
+            patch_safe_unpickler,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_sampling_io import (
             patch_sampling_io,
         )
@@ -168,6 +209,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_srt import patch_srt
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
+        )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
+            patch_wan_scheduler,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_weights_updater import (
             patch_weights_updater,
@@ -198,5 +242,7 @@ class SglangDiffusionHijack:
             patch_dance,
             patch_set_timesteps,
             patch_vae_decode_safe,
+            patch_wan_scheduler,
+            patch_safe_unpickler,
         ):
             _safe_apply(patch)

@@ -184,7 +184,7 @@ class Qwen3Pipeline(Pipeline):
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay: Part.conditions is the train stack's source (GRPO re-types them via
         # conditions_cls.from_dict in compute_loss_and_backward).
-        filled = frontier.fill(segment=segment, primitive=decoded, conditions=conds.to_dict())
+        filled = frontier.fill(segment=segment, primitives={"text": decoded}, conditions=conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
     def _detokenize(self, segment) -> Texts:

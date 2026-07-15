@@ -10,18 +10,18 @@ attached to the frontier Part, under DP-sharded distributed dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import primitive_modality_key
+from unirl.types.primitives import Images, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Primitive, Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
 
-from .base import RewardBackend
+from .base import DifferentiableReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +43,22 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     for prim in sample.conditioning():
         primitives[primitive_modality_key(prim)] = prim  # nearest ancestor wins (last)
 
-    generated_kind = primitive_modality_key(frontier.primitive)
-    if generated_kind != preferred_input_kind:
+    if preferred_input_kind not in frontier.primitives:
         raise ValueError(
             f"Reward backend consumes {preferred_input_kind!r} but the frontier Part generated "
-            f"{generated_kind!r}; check the recipe's reward/model pairing."
+            f"{sorted(frontier.primitives)!r}; check the recipe's reward/model pairing."
         )
 
     metadata = sample.root_metadata(-1)
+    generated = dict(frontier.primitives)
+    audio_sample_rate: Optional[int] = None
+    audio_metadata = frontier.primitive_metadata.get("audio", {})
+    if "audio" in generated and audio_metadata.get("sample_rate") is not None:
+        audio_sample_rate = int(audio_metadata["sample_rate"])
     return RewardRequest(
         primitives=primitives,
-        generated={preferred_input_kind: frontier.primitive},
+        generated=generated,
+        audio_sample_rate=audio_sample_rate,
         prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),
         group_ids=list(frontier.group_ids),
@@ -106,9 +111,28 @@ class RewardService(Remote):
         return self.backend.compute_rewards(request)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def score_differentiable(self, *, images: Images, prompts: Texts) -> torch.Tensor:
+        """ReFL scoring: score grad-carrying ``images`` (pixels ``[B, C, H, W]`` in
+        ``[0, 1]``) against ``prompts`` and return a ``[B]`` reward tensor with
+        ``grad_fn`` intact.
+
+        Deliberately bypasses :meth:`score_and_attach` / ``RewardRequest.images``
+        (those go through ``tensor_frame_to_pil`` + ``torch.tensor(...)``, which
+        detach). Under ``enable_grad()`` the framework marks ``images.pixels`` as a
+        grad leaf and chains the returned reward's grad back to it. The backend must
+        satisfy the :class:`~unirl.reward.base.DifferentiableReward` Protocol.
+        """
+        if not isinstance(self.backend, DifferentiableReward):
+            raise TypeError(
+                f"RewardService.score_differentiable: backend "
+                f"{type(self.backend).__name__} is not a DifferentiableReward — ReFL "
+                f"needs a differentiable in-process reward (e.g. pickscore/clip/hpsv2)."
+            )
+        return self.backend.compute_rewards_differentiable(images.pixels, list(prompts.texts))
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def score_and_attach(self, sample: Sample) -> Sample:
-        """Score the frontier (last) Part's generated media; return the Sample with
-        rewards attached on that Part.
+        """Score the frontier (last) Part's generated media and return the updated Sample.
 
         The frontier is the generated output; its :meth:`Sample.conditioning` is the
         input context and :meth:`Sample.root_metadata` the per-sample spec — both
@@ -126,8 +150,8 @@ class RewardService(Remote):
         frontier = sample.parts[-1]
         if frontier.rewards is not None:
             raise RuntimeError("Actor-side reward compute does not accept precomputed rewards on the frontier Part.")
-        if frontier.primitive is None:
-            raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitive to score.")
+        if not frontier.primitives:
+            raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
         request = _build_reward_request(sample, self.preferred_input_kind)
         reward_response = self.compute_rewards(request)

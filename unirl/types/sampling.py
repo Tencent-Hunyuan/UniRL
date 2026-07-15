@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
 
 from unirl.config.require import require
 
@@ -78,6 +78,24 @@ def is_forward_process(sde_indices: Optional[Sequence[int]]) -> bool:
     return not sde_indices
 
 
+def compute_trajectory_positions(sde_indices: Set[int], num_steps: int) -> List[int]:
+    """Return sorted positions needed for ``(x_t, x_{t+1})`` pairs at SDE boundaries.
+
+    For each SDE step index ``i`` in *sde_indices*, both position ``i`` and
+    ``i + 1`` are required.  Results are clamped to ``[0, num_steps]``.
+
+    >>> compute_trajectory_positions({0, 2, 4}, 5)
+    [0, 1, 2, 3, 4, 5]
+    >>> compute_trajectory_positions({3}, 5)
+    [3, 4]
+    """
+    positions: Set[int] = set()
+    for i in sde_indices:
+        positions.add(max(0, min(i, num_steps)))
+        positions.add(max(0, min(i + 1, num_steps)))
+    return sorted(positions)
+
+
 @dataclass
 class DiffusionSamplingParams(BaseSamplingParams):
     """Canonical diffusion sampling params — single source of truth.
@@ -128,6 +146,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     taylor_cache_order: Optional[int] = None
     distilled_guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
+    strength: Optional[float] = None
 
     # --- backward compat (removed once all consumers migrate) ---
     num_samples_per_prompt: int = 1

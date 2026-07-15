@@ -38,7 +38,9 @@ def _log(msg: str) -> None:
 def build_request_sample(n: int) -> Sample:
     """2 prompts, ``n`` completions each: ``[input, ar gen-shell]`` (P*n samples)."""
     prompts = ["The capital of France is", "Two plus two equals"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts), control={})
+    input_part = Part.input(
+        [f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)}, control={}
+    )
     ar_params = ARSamplingParams(samples_per_prompt=n, temperature=0.7, max_new_tokens=48, top_p=0.9, top_k=20)
     return Sample.request(input_part).fork(n, sampling_params=ar_params)
 
@@ -85,13 +87,17 @@ def main() -> int:
         assert gen.segment.lengths is not None and int(gen.segment.lengths.numel()) == n_expect, (
             "TextSegment.lengths missing or wrong count"
         )
-        assert isinstance(gen.primitive, Texts), f"decoded primitive must be Texts; got {type(gen.primitive)}"
-        assert len(gen.primitive.texts) == n_expect, f"expected {n_expect} decoded texts; got {len(gen.primitive.texts)}"
+        assert isinstance(gen.primitives.get("text"), Texts), (
+            f"decoded text primitive must be Texts; got {type(gen.primitives.get('text'))}"
+        )
+        assert len(gen.primitives["text"].texts) == n_expect, (
+            f"expected {n_expect} decoded texts; got {len(gen.primitives['text'].texts)}"
+        )
         assert gen.conditions, "replay conditions empty (expected 'prompt')"
 
         toks = [int(x) for x in gen.segment.lengths.tolist()]
         _log(f"PASS: {n_expect} completions; token counts={toks}; conditions={sorted(gen.conditions.keys())}")
-        for i, t in enumerate(gen.primitive.texts):
+        for i, t in enumerate(gen.primitives["text"].texts):
             _log(f"  sample[{i}] id={gen.sample_ids[i]} text={t[:80]!r}")
         _log("AR ROLLOUT SMOKE PASSED ✅  (TextSegment + decoded Texts + conditions; path ids preserved)")
         return 0

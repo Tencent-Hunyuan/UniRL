@@ -113,10 +113,10 @@ class TextLMAdapter(ModelAdapter):
         )
 
     def extract_prompts(self, sample: Sample) -> List[str]:
-        text_primitive = sample.parts[0].primitive
+        text_primitive = sample.parts[0].primitives.get("text")
         require(
             text_primitive is not None and isinstance(text_primitive, Texts),
-            f"{type(self).__name__} requires the input Part.primitive: Texts",
+            f"{type(self).__name__} requires the input Part.primitives['text']: Texts",
         )
         return list(text_primitive.texts)
 
@@ -186,7 +186,7 @@ class TextLMAdapter(ModelAdapter):
 
         filled = gen_part.fill(
             segment=self.build_segment(sample, prepared, raw),
-            primitive=self.build_decoded(sample, prepared, raw),
+            primitives={"text": self.build_decoded(sample, prepared, raw)},
             conditions=self.build_conditions(sample, prepared, raw),
             status=self.build_status(raw),
         )

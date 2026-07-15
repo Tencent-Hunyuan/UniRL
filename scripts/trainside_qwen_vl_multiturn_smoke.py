@@ -48,10 +48,10 @@ def _red_image(h: int = 448, w: int = 448) -> Images:
 
 
 def build_multiturn_vlm_sample() -> Sample:
-    text = Part.input(["p0"], primitive=Texts(texts=[_USER]), role="user", control={})
-    img = text.input_child(_red_image(), role="user")
-    asst = img.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=[_ASSISTANT]))
-    tool = asst.input_child(Texts(texts=[_TOOL]), role="tool")
+    text = Part.input(["p0"], primitives={"text": Texts(texts=[_USER])}, role="user", control={})
+    img = text.input_child({"image": _red_image()}, role="user")
+    asst = img.fork(1, sampling_params=ARSamplingParams()).fill(primitives={"text": Texts(texts=[_ASSISTANT])})
+    tool = asst.input_child({"text": Texts(texts=[_TOOL])}, role="tool")
     ar_params = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=32, top_p=0.9, top_k=20)
     return Sample(parts=[text, img, asst, tool, tool.fork(1, sampling_params=ar_params)])
 
@@ -80,7 +80,9 @@ def main() -> int:
         out = engine.generate(sample)
         gen = out.parts[-1]
         assert gen.conditions and "prompt" in gen.conditions, "no stored prompt conditions"
-        assert gen.conditions.get("pixel_values") is not None, "pixel_values DROPPED — image not carried into conditions"
+        assert gen.conditions.get("pixel_values") is not None, (
+            "pixel_values DROPPED — image not carried into conditions"
+        )
         assert gen.conditions.get("image_grid_thw") is not None, "image_grid_thw missing from conditions"
 
         tok = pipeline.bundle.processor.tokenizer
@@ -99,7 +101,7 @@ def main() -> int:
             "turns out of lineage order in the encoded prompt"
         )
         _log("VLM MULTI-TURN ENCODE PASS: image + user → assistant → tool all carried ✓")
-        _log(f"completion: {gen.primitive.texts[0]!r}")
+        _log(f"completion: {gen.primitives['text'].texts[0]!r}")
 
         # ---- replay self-consistency on the multi-turn VLM conditions ----
         temperature = float(gen.sampling_params.temperature)

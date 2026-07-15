@@ -1,6 +1,6 @@
 ---
 name: add-model-bundle
-description: Add or update UniRL model package support. Use when adding diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, RolloutReq/RolloutResp plumbing, or multimodal text/image/video conditioning.
+description: Add or update UniRL model package support. Use when adding diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, Sample/Part plumbing, or multimodal text/image/video/audio conditioning.
 ---
 
 # Add Model Bundle
@@ -20,7 +20,7 @@ When adding a diffusion or autoregressive model, first inspect `unirl/models/REA
 
 The current architecture is a typed pipeline:
 
-`EncodeStage[P, C]` / `EmbedStage[P, C]` convert primitives to conditions, `DiffusionStage[C]` / `ARStage[C]` produce segments, `DecodeStage[S, P]` decodes segments, and `Pipeline.generate(req: RolloutReq) -> RolloutResp` composes the stages.
+`EncodeStage[P, C]` / `EmbedStage[P, C]` convert primitives to conditions, `DiffusionStage[C]` / `ARStage[C]` produce segments, `DecodeStage[S, P]` decodes segments, and `Pipeline.generate(sample: Sample) -> Sample` fills pre-forked generation Parts.
 
 `Bundle` in `unirl/models/types/bundle.py` is an intentionally empty `Remote` subclass. Concrete bundles are plain weight holders; LoRA injection, FSDP wrapping, adapter switching, offload, and autocast lifecycle are owned outside the bundle.
 
@@ -36,8 +36,8 @@ The current architecture is a typed pipeline:
 8. Add `<Model>DiffusionStage(DiffusionStage[<Model>Conditions])`. It owns latent initialization when supported by the package, the diffusion loop, trajectory storage, replay, precision policy, and `trainable_module()` when training-side injection needs the trainable root. Declare `_no_split_modules` on the stage when diffusers modules need FSDP wrapping hints.
 9. For AR models, add `<Model>ARStep` and `<Model>ARStage(ARStage[<Model>Conditions])` instead of diffusion step/stage classes. Follow `unirl/models/qwen3/ar.py` for packed `TextSegment` generation and replay.
 10. In `vae.py` or equivalent, implement `DecodeStage[LatentSegment, Images | Videos]` and any required `EncodeStage[Images | Videos, ImageLatentCondition]`. Apply the model's VAE scale, shift, dtype, layout, frame, and clamp conventions.
-11. In `pipeline.py`, implement `<Model>Pipeline(Pipeline)` with `from_config(...)` and `generate(req)`. Validate required primitives and sampling params, require `req.sigmas` for diffusion pipelines, call stages in order, and return `RolloutResp(tracks={...})` with `RolloutTrack(sample_ids, parent_ids, conditions, segment, decoded)`.
-12. Add `latent_shape(cls, *, model_config, sampling_spec)` when the driver should precompute `request_conditions["initial_latents"]` for deterministic group noise or resume behavior.
+11. In `pipeline.py`, implement `<Model>Pipeline(Pipeline)` with `from_config(...)` and `generate(sample)`. Read raw inputs through `sample.conditioning()`, read sampling params from the typed generation Part, require `params.sigmas` for diffusion, call stages in order, and fill that Part with `segment`, modality-keyed `primitives`, and `conditions`.
+12. Add `latent_shape(cls, *, model_config, sampling_spec)` when the driver should author a deterministic initial-noise recipe on the generation Part for group noise or resume behavior.
 13. Update the package `__init__.py` to import and export public symbols from `config.py`, `bundle.py`, `pipeline.py`, and condition classes so importing `unirl.models.<model_name>` re-exports them.
 14. Add at least one recipe YAML under `examples/<domain>/` (the v2 config dir, grouped by trainer domain) and document external checkpoint requirements there or in launcher environment docs.
 
@@ -93,7 +93,7 @@ Single-transformer bundles whose aux are separate eager modules need none of tha
 
 ## Conditions And Field Kinds
 
-`<Model>Conditions(Batch)` is the typed container passed to diffusion or AR stages and serialized through `RolloutResp.tracks[<slot>].conditions`. It owns conditioning slots only. Latents live in `LatentSegment`; sigma schedules live in `RolloutReq.sigmas` and segment metadata.
+`<Model>Conditions(Batch)` is the typed container passed to diffusion or AR stages and serialized through `Part.conditions`. It owns conditioning slots only. Latents live in `LatentSegment`; sigma schedules live in the generation Part's `DiffusionSamplingParams.sigmas` and segment metadata.
 
 Use field kinds from `unirl/distributed/tensor/batch.py`:
 
@@ -124,11 +124,11 @@ CFG belongs in the diffusion step, with the pipeline and embed stages preparing 
 
 `<Model>DiffusionStage.diffuse(...)` owns the rollout loop and `LatentSegment` assembly:
 
-- Use `schedule=req.sigmas` passed by the pipeline; diffusion pipelines should raise if `req.sigmas is None`.
-- Do not build sigma schedules inside the pipeline or stage. Hosting engines pin schedules with `unirl.sde.runtime.ensure_req_sigmas(req, policy)` before calling `generate(req)`.
+- Use `schedule=params.sigmas` from the generation Part; diffusion pipelines should raise if it is `None`.
+- Do not build sigma schedules inside the pipeline or stage. Hosting engines pin schedules onto the Sample before calling `generate(sample)`.
 - Validate schedule length against the requested step count.
 - Initialize latents from request-provided `initial_latents` when the package supports deterministic driver-side noise; otherwise call the repository noise helper used by the closest template.
-- Store trajectories at `compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
+- Store trajectories at `unirl.types.sampling.compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
 - Keep direct transformer calls inside `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
 - Implement `replay(...)` to recompute log-probs and previous-sample means from stored `LatentSegment` transitions for training.
 - Implement `predict_noise_at_step(conditions, *, sample, sigma, params)` for forward-process algorithms such as DiffusionNFT; it should delegate to the same `predict_noise(...)` path so CFG and guidance behavior match `diffuse(...)` and `replay(...)`.
@@ -150,7 +150,7 @@ Prefer small CPU tests with fakes or monkeypatches rather than loading real chec
 
 - `tests/models/test_<model>_conditions.py`: `from_dict` / `to_dict` round trips, optional slots, wrong-typed slot errors, and missing required slot errors. Follow `tests/models/test_sd3_conditions.py` and `tests/models/test_hunyuan_image3_conditions.py`.
 - `tests/models/test_<model>_diffusion_step_<topic>.py`: CFG batching, timestep scaling, masks, vision kwargs, and private transformer kwargs using fakes. Follow the WAN21 diffusion-step tests.
-- `tests/models/test_<model>_pipeline.py` when pipeline wiring changed: construct fake stages, call `generate(req)`, and assert `RolloutResp.tracks[...]` keys, conditions, segment, decoded payloads, and `req.sigmas` validation.
+- `tests/models/test_<model>_pipeline.py` when pipeline wiring changed: construct fake stages, call `generate(sample)`, and assert lineage preservation, generation-Part conditions/segment/primitives, and pinned-sigma validation.
 - AR models: add or adapt `tests/test_qwen3_ar_stage.py`-style tests for generation and replay alignment.
 - Shared condition or stage behavior: update `tests/types/test_conditions.py` or `tests/models/test_stages.py` only when shared contracts changed.
 - Config registration and instantiation: use the patterns in `tests/config/test_config_registration.py` and `tests/config/test_config_instantiate.py` when adding Hydra config behavior.
@@ -167,12 +167,12 @@ Adjust the command to real files before running. If the model is AR-only or pipe
 
 - `<Model>PipelineConfig` is a plain `@dataclass`; recipes reference it (and `<Model>Pipeline.from_config`) by `_target_`.
 - The package `__init__.py` re-exports the config / pipeline classes.
-- `Pipeline.generate(req)` validates required primitives, stage params, negative prompt batch sizes, and `req.sigmas` for diffusion.
-- `RolloutResp.tracks` use the intended output key, such as `"image"`, `"video"`, or `"text"`, and include `conditions`, `segment`, and decoded primitives when available.
+- `Pipeline.generate(sample)` validates required conditioning primitives, typed generation params, negative prompt batch sizes, and pinned sigmas for diffusion.
+- Filled generation Parts use canonical primitive keys such as `"image"`, `"video"`, `"audio"`, or `"text"`, and include conditions and a segment when available.
 - `<Model>Conditions.from_dict` and `to_dict` are symmetric and fail loudly for wrong or missing required slots.
 - Per-sample tensors use `FieldKind.CONCAT`; shared metadata uses `FieldKind.SHARED`.
 - The diffusion stage owns loop bookkeeping, trajectory storage, replay, and precision casts; the diffusion step owns transformer calls and CFG math.
-- The sigma schedule is consumed from `req.sigmas`; it is not rebuilt in the model package.
+- The sigma schedule is consumed from the generation Part's params; it is not rebuilt in the model package.
 - Bundle loading normalizes dtype/device, freezes auxiliary modules, and keeps trainable module naming compatible with `weight_sync_param_name_prefix`.
 - LoRA target modules are explicit for production models; `None` is only used deliberately.
 - Recipe YAML exists under `examples/<domain>/` (the v2 config dir, grouped by trainer domain) and documents required checkpoints or environment variables.

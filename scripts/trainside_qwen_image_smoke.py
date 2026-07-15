@@ -62,7 +62,7 @@ def build_request_sample() -> Sample:
     pipeline synthesizes the ``" "`` empty-negative only when guidance > 1).
     """
     prompts = ["a photo of a red apple on a wooden table", "an astronaut riding a horse on the moon"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts))
+    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)})
     diff_params = DiffusionSamplingParams(
         num_inference_steps=4,
         guidance_scale=1.0,  # CFG off
@@ -110,10 +110,15 @@ def main() -> int:
         assert isinstance(gen.segment, LatentSegment), f"segment must be LatentSegment; got {type(gen.segment)}"
         assert gen.segment.latents is not None, "LatentSegment.latents is None (no trajectory captured)"
         assert gen.segment.sde_logp is not None, "LatentSegment.sde_logp is None (no rollout logp to compare)"
-        assert isinstance(gen.primitive, Images) and len(gen.primitive) == 2, "decoded Images (2) expected"
+        assert isinstance(gen.primitives.get("image"), Images) and len(gen.primitives["image"]) == 2, (
+            "decoded Images (2) expected"
+        )
         assert not gen.conditions, "trainside path must leave Part.conditions empty (replay re-encodes)"
         assert gen.sampling_params.sigmas is not None, "engine must have pinned σ onto the gen params"
-        _log(f"rollout PASS: latents={tuple(gen.segment.latents.shape)} images={len(gen.primitive)} conditions empty ✓")
+        _log(
+            f"rollout PASS: latents={tuple(gen.segment.latents.shape)} "
+            f"images={len(gen.primitives['image'])} conditions empty ✓"
+        )
 
         # ---- replay: re-encode conditions, reproduce sde_logp (ratio ≈ 1) ----
         _log("re-encoding conditions from the filled Sample and replaying the diffusion stage ...")
@@ -124,7 +129,10 @@ def main() -> int:
         model.eval()
         try:
             with torch.no_grad():
-                conds = pipeline._conditions_for(texts, params)
+                conds = pipeline.build_conditions(
+                    texts,
+                    guidance_scale=float(params.guidance_scale),
+                )
                 result = pipeline.diffusion.replay(conds, segment=gen.segment, params=params)
         finally:
             model.train(was_training)

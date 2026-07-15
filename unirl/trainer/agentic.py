@@ -130,7 +130,7 @@ class AgenticTrainer(ARTrainer):
         root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
         text = Part.input(
             root_ids,
-            primitive=inputs.primitives["text"],
+            primitives={"text": inputs.primitives["text"]},
             metadata=list(inputs.metadata) if inputs.metadata else None,
             control={"ar": {"stop": list(self._stop)}},
         )
@@ -199,7 +199,7 @@ class AgenticTrainer(ARTrainer):
             adv_i = float(advantages[i].item())
             for gp in tr.gen_parts():
                 gp = _part_with_field(gp, "advantages", torch.full((gp.batch_size,), adv_i, dtype=torch.float32))
-                gp = _part_with_field(gp, "primitive", None)  # free decoded text before train
+                gp = _part_with_field(gp, "primitives", {})  # free decoded text before train
                 # Drop any per-trajectory env reward: it rides only the TERMINAL turn (a
                 # TensorRef on 1 of the trajectory's k gen parts), so concatenating turns
                 # would leave a short, misaligned rewards field that breaks DP scatter.
@@ -272,12 +272,13 @@ class AgenticTrainer(ARTrainer):
         group_ids: List[str] = []
         for tr in trajs:
             root_id = tr.parts[0].sample_ids[0]
-            q_prim = tr.parts[0].primitive
+            q_prim = tr.parts[0].primitives.get("text")
             questions.append(q_prim.texts[0] if (q_prim is not None and q_prim.texts) else "")
             gens = tr.gen_parts()
             term = ""
-            if gens and gens[-1].primitive is not None and gens[-1].primitive.texts:
-                term = gens[-1].primitive.texts[0]
+            terminal_text = gens[-1].primitives.get("text") if gens else None
+            if isinstance(terminal_text, Texts) and terminal_text.texts:
+                term = terminal_text.texts[0]
             predictions.append(_extract_answer(term))
             answers.append(gt_by_root.get(root_id))
             group_ids.append(root_id)
@@ -286,13 +287,13 @@ class AgenticTrainer(ARTrainer):
         ar_sp = self.sampling_params.get("ar")
         score_in = Part.input(
             [f"score{rollout_id}:{i}" for i in range(m)],
-            primitive=Texts(texts=list(questions)),
+            primitives={"text": Texts(texts=list(questions))},
             metadata=[{"answer": a} for a in answers],
         )
         scoring = (
             Sample.request(score_in)
             .fork(1, sampling_params=ar_sp)  # frontier is a gen Part (reward/adv panels read gen_parts)
-            .with_filled_frontier(primitive=Texts(texts=list(predictions)))
+            .with_filled_frontier(primitives={"text": Texts(texts=list(predictions))})
         )
         scoring = self.reward.score_and_attach(scoring)
         rewards = hydrate(scoring.parts[-1].rewards).to(torch.float32)
@@ -307,11 +308,13 @@ class AgenticTrainer(ARTrainer):
         no scoring sample — so it works for both the answer-graded and env-sourced paths."""
         m = len(trajs)
         ar_sp = self.sampling_params.get("ar")
-        log_in = Part.input([f"log{rollout_id}:{i}" for i in range(m)], primitive=Texts(texts=[""] * m))
+        log_in = Part.input(
+            [f"log{rollout_id}:{i}" for i in range(m)], primitives={"text": Texts(texts=[""] * m)}
+        )
         log_sample = (
             Sample.request(log_in)
             .fork(1, sampling_params=ar_sp)
-            .with_filled_frontier(primitive=Texts(texts=[""] * m))
+            .with_filled_frontier(primitives={"text": Texts(texts=[""] * m)})
         )
         frontier = _part_with_field(log_sample.parts[-1], "rewards", rewards.to(torch.float32))
         frontier = _part_with_field(frontier, "advantages", advantages.to(torch.float32))

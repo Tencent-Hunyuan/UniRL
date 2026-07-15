@@ -34,7 +34,7 @@ class FakeEngine:
 
     def generate(self, sample: Sample) -> Sample:
         shell = sample.parts[-1]
-        filled = shell.fill(primitive=Texts(texts=[f"gen::{sid}" for sid in shell.sample_ids]))
+        filled = shell.fill(primitives={"text": Texts(texts=[f"gen::{sid}" for sid in shell.sample_ids])})
         return sample.with_parts([*sample.parts[:-1], filled])
 
 
@@ -51,7 +51,7 @@ class MarkerFakeEngine:
         emit = self.calls < self.marker_turns
         self.calls += 1
         body = "<call>tool</call>" if emit else "final"
-        filled = shell.fill(primitive=Texts(texts=[f"{body}::{sid}" for sid in shell.sample_ids]))
+        filled = shell.fill(primitives={"text": Texts(texts=[f"{body}::{sid}" for sid in shell.sample_ids])})
         return sample.with_parts([*sample.parts[:-1], filled])
 
 
@@ -80,7 +80,7 @@ class MarkerEnv:
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
         frontier = sample.parts[-1]
-        if not any("<call>" in t for t in frontier.primitive.texts):
+        if not any("<call>" in t for t in frontier.primitives["text"].texts):
             return None, True, {}  # no tool call -> trajectory done
         ids = frontier.sample_ids
         return Texts(texts=[f"<tool_response>ok</tool_response>::{sid}" for sid in ids]), False, {}
@@ -88,7 +88,7 @@ class MarkerEnv:
 
 def _request(prompts: List[str]) -> Sample:
     ids = [f"p{i}" for i in range(len(prompts))]
-    return Sample.request(Part.input(ids, primitive=Texts(texts=prompts)))
+    return Sample.request(Part.input(ids, primitives={"text": Texts(texts=prompts)}))
 
 
 def check_grpo_fanout_and_turns() -> None:
@@ -153,7 +153,7 @@ def check_tool_call_driven_termination() -> None:
     _check(
         len(out.gen_parts()) == 3, f"loop should run 3 gen turns (2 with <call> + 1 final); got {len(out.gen_parts())}"
     )
-    _check("final" in out.parts[-1].primitive.texts[0], "final gen Part has no tool call (loop stopped there)")
+    _check("final" in out.parts[-1].primitives["text"].texts[0], "final gen Part has no tool call (loop stopped there)")
     _check(len(out.parts) == 6, f"[input, gen, obs, gen, obs, gen]; got {len(out.parts)}")
 
 

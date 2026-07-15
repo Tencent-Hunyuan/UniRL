@@ -256,7 +256,7 @@ class AlfworldEnv:
         control["alfworld"] = {"episode_id": eid}
         new_root = Part.input(
             [sid],
-            primitive=Texts(texts=[self._format(obs, info, first=True)]),
+            primitives={"text": Texts(texts=[self._format(obs, info, first=True)])},
             metadata=root.metadata,
             control=control,
         )
@@ -272,7 +272,7 @@ class AlfworldEnv:
         if ep is None:  # lost/expired episode — terminate this trajectory cleanly
             return None, True, {"reward": 0.0}
 
-        frontier = sample.parts[-1].primitive
+        frontier = sample.parts[-1].primitives.get("text")
         raw = _parse_action(frontier.texts[0] if isinstance(frontier, Texts) and frontier.texts else "")
         action = _match_admissible(raw, ep.admissible)
         try:

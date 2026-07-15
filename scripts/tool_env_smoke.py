@@ -44,13 +44,13 @@ class ScriptedEngine:
         shell = sample.parts[-1]
         body = self.bodies[min(self.calls, len(self.bodies) - 1)]
         self.calls += 1
-        filled = shell.fill(primitive=Texts(texts=[body for _ in shell.sample_ids]))
+        filled = shell.fill(primitives={"text": Texts(texts=[body for _ in shell.sample_ids])})
         return sample.with_parts([*sample.parts[:-1], filled])
 
 
 def _request(prompts: List[str]) -> Sample:
     ids = [f"p{i}" for i in range(len(prompts))]
-    return Sample.request(Part.input(ids, primitive=Texts(texts=prompts)))
+    return Sample.request(Part.input(ids, primitives={"text": Texts(texts=prompts)}))
 
 
 def _loop(env: ToolEnvironment) -> AgentLoop:
@@ -65,8 +65,14 @@ def check_tool_call_driven_termination() -> None:
     _check(len(out.gen_parts()) == 2, f"1 call + 1 final -> 2 gen turns; got {len(out.gen_parts())}")
     obs = out.parts[2]
     _check(obs.sampling_params is None, "the middle Part is a mask-0 observation (not trained)")
-    _check("7006652" in obs.primitive.texts[0], f"observation carries the tool result; got {obs.primitive.texts[0]!r}")
-    _check(parse_tool_call(out.parts[-1].primitive.texts[0]) is None, "final gen has no tool call (loop stopped there)")
+    _check(
+        "7006652" in obs.primitives["text"].texts[0],
+        f"observation carries the tool result; got {obs.primitives['text'].texts[0]!r}",
+    )
+    _check(
+        parse_tool_call(out.parts[-1].primitives["text"].texts[0]) is None,
+        "final gen has no tool call (loop stopped there)",
+    )
 
 
 def check_multi_tool_turns() -> None:
@@ -77,7 +83,10 @@ def check_multi_tool_turns() -> None:
     _check(len(out.gen_parts()) == 4, f"3 calls + final -> 4 gens; got {len(out.gen_parts())}")
     obs_parts = [p for p in out.parts if p.sampling_params is None and not p.is_root]
     _check(len(obs_parts) == 3, f"3 observation Parts; got {len(obs_parts)}")
-    _check(all("7006652" in p.primitive.texts[0] for p in obs_parts), "each observation carries the calculator result")
+    _check(
+        all("7006652" in p.primitives["text"].texts[0] for p in obs_parts),
+        "each observation carries the calculator result",
+    )
 
 
 def check_immediate_final() -> None:
@@ -98,7 +107,10 @@ def check_unknown_tool_error_obs() -> None:
     out = _loop(ToolEnvironment([CalculatorTool()])).run(ScriptedEngine([UNKNOWN, FINAL]), _request(["q"]))
     obs = out.parts[2]
     _check(obs.sampling_params is None, "observation Part follows the unknown-tool call")
-    _check("Error: unknown tool" in obs.primitive.texts[0], f"unknown tool -> error obs; got {obs.primitive.texts[0]!r}")
+    _check(
+        "Error: unknown tool" in obs.primitives["text"].texts[0],
+        f"unknown tool -> error obs; got {obs.primitives['text'].texts[0]!r}",
+    )
     _check(len(out.gen_parts()) == 2, "loop continues past the error, then the final -> 2 gens")
 
 
@@ -111,7 +123,9 @@ def check_parse_tool_call() -> None:
     as_string = '<tool_call>{"name": "calculator", "arguments": "{\\"expression\\": \\"3*3\\"}"}</tool_call>'
     _check(parse_tool_call(as_string) == {"name": "calculator", "arguments": {"expression": "3*3"}}, "args-as-string")
     trimmed = '<tool_call>{"name": "calculator", "arguments": {"expression": "7*6"}}'  # no </tool_call>
-    _check(parse_tool_call(trimmed) == {"name": "calculator", "arguments": {"expression": "7*6"}}, "stop-trimmed recover")
+    _check(
+        parse_tool_call(trimmed) == {"name": "calculator", "arguments": {"expression": "7*6"}}, "stop-trimmed recover"
+    )
     two = valid + ' <tool_call>{"name": "calculator", "arguments": {"expression": "9*9"}}</tool_call>'
     _check(parse_tool_call(two)["arguments"]["expression"] == "9*9", "last tool call wins")
 
@@ -148,8 +162,12 @@ def check_observation_role_is_tool() -> None:
     template wraps it as <tool_response>; the generation is 'assistant' and the prompt is 'user'."""
     out = _loop(ToolEnvironment([CalculatorTool()])).run(ScriptedEngine([TOOLCALL, FINAL]), _request(["1234*5678?"]))
     _check(out.parts[0].resolved_role() == "user", f"prompt renders as 'user'; got {out.parts[0].resolved_role()!r}")
-    _check(out.parts[1].resolved_role() == "assistant", f"gen renders as 'assistant'; got {out.parts[1].resolved_role()!r}")
-    _check(out.parts[2].resolved_role() == "tool", f"observation renders as 'tool'; got {out.parts[2].resolved_role()!r}")
+    _check(
+        out.parts[1].resolved_role() == "assistant", f"gen renders as 'assistant'; got {out.parts[1].resolved_role()!r}"
+    )
+    _check(
+        out.parts[2].resolved_role() == "tool", f"observation renders as 'tool'; got {out.parts[2].resolved_role()!r}"
+    )
 
 
 _CHECKS: Tuple[Callable[[], None], ...] = (

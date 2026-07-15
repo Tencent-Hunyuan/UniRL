@@ -35,8 +35,8 @@ from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
+from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.sample import Sample
-from unirl.types.sampling import DiffusionSamplingParams
 
 
 class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
@@ -94,7 +94,7 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
 
-        # σ schedule policy comes from the adapter; ``ensure_req_sigmas``
+        # σ schedule policy comes from the adapter; ``ensure_sample_sigmas``
         # consumes it in ``generate`` (gated on the adapter's needs_sigmas).
         self.schedule_policy = self.adapter.schedule_policy()
 
@@ -152,22 +152,10 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
         """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``.
 
-        Sample-shaped analogue of ``ensure_req_sigmas``: σ is the single source
-        of truth, computed from the model-owned schedule policy applied to the
-        request's (T, H, W). Shared across the part's samples (one params
-        object). Idempotent — a pre-pinned σ is left as-is.
+        σ is computed from the model-owned schedule policy and shared across the
+        Part's samples. Idempotent — a pre-pinned σ is left as-is.
         """
-        gen_part = sample.gen_part_or_none(DiffusionSamplingParams)
-        if gen_part is None:
-            return
-        diffusion = gen_part.sampling_params
-        if diffusion.sigmas is not None:
-            return
-        diffusion.sigmas = self.schedule_policy.compute_sigma(
-            num_inference_steps=int(diffusion.num_inference_steps),
-            height=int(diffusion.height),
-            width=int(diffusion.width),
-        )
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flag lives here; decorators re-applied

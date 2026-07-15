@@ -46,13 +46,20 @@ def build_request_sample() -> Sample:
     prompts = ["a fluffy cat sitting on a sofa", "a beautiful sunset over the ocean"]
     input_part = Part.input(
         [f"p{i}" for i in range(len(prompts))],
-        primitive=Texts(texts=prompts),
+        primitives={"text": Texts(texts=prompts)},
         control={"ar": {}, "chat": {}},
     )
     ar_params = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=32, top_p=0.9, top_k=20)
     diff_params = DiffusionSamplingParams(
-        num_inference_steps=4, guidance_scale=1.0, height=512, width=512,
-        eta=0.7, samples_per_prompt=1, seed=42, init_same_noise=False, sde_indices=None,
+        num_inference_steps=4,
+        guidance_scale=1.0,
+        height=512,
+        width=512,
+        eta=0.7,
+        samples_per_prompt=1,
+        seed=42,
+        init_same_noise=False,
+        sde_indices=None,
     )
     return Sample.request(input_part).fork(1, sampling_params=ar_params).fork(1, sampling_params=diff_params)
 
@@ -66,8 +73,13 @@ def main() -> int:
     _log(f"torch {torch.__version__} cuda={torch.version.cuda}; ar={qwen} diffusion={sd3}")
 
     ar_config = SGLangEngineConfig(
-        pretrained_model_ckpt_path=qwen, backend="native", tp_size=1,
-        max_new_tokens=32, temperature=0.7, top_p=0.9, concurrency=8,
+        pretrained_model_ckpt_path=qwen,
+        backend="native",
+        tp_size=1,
+        max_new_tokens=32,
+        temperature=0.7,
+        top_p=0.9,
+        concurrency=8,
         # Colocate: AR (Qwen3) + diffusion (SD3.5) share ONE GPU. Cap the sglang
         # KV reservation (default 0.88 ≈ 85 GiB) so SD3.5 fits alongside — this
         # is the engine_kwargs the colocate recipes set; nothing Sample-specific.
@@ -85,8 +97,10 @@ def main() -> int:
         _log("constructing ComposedRolloutEngine (boots AR sglang + diffusion sglang_diffusion) ...")
         engine = ComposedRolloutEngine(config, device=torch.device("cuda:0"), rank=0, model_config=model_config)
         sample = build_request_sample()
-        _log(f"request: {len(sample.parts)} parts; "
-             f"ar ids={list(sample.parts[1].sample_ids)} diffusion ids={list(sample.parts[2].sample_ids)}")
+        _log(
+            f"request: {len(sample.parts)} parts; "
+            f"ar ids={list(sample.parts[1].sample_ids)} diffusion ids={list(sample.parts[2].sample_ids)}"
+        )
 
         _log("calling engine.generate(sample) — AR rewrite → diffusion render ...")
         out = engine.generate(sample)
@@ -99,15 +113,23 @@ def main() -> int:
         assert list(diff.sample_ids) == ["p0/0/0", "p1/0/0"], f"diffusion ids: {list(diff.sample_ids)}"
         # ar Part filled
         assert isinstance(ar.segment, TextSegment), f"ar segment must be TextSegment; got {type(ar.segment)}"
-        assert isinstance(ar.primitive, Texts) and len(ar.primitive.texts) == 2, "ar decoded Texts wrong"
+        assert isinstance(ar.primitives.get("text"), Texts) and len(ar.primitives["text"].texts) == 2, (
+            "ar decoded Texts wrong"
+        )
         # diffusion Part filled
-        assert isinstance(diff.segment, LatentSegment), f"diffusion segment must be LatentSegment; got {type(diff.segment)}"
+        assert isinstance(diff.segment, LatentSegment), (
+            f"diffusion segment must be LatentSegment; got {type(diff.segment)}"
+        )
         assert diff.segment.latents is not None, "diffusion LatentSegment.latents is None"
-        assert isinstance(diff.primitive, Images) and len(diff.primitive) == 2, "diffusion decoded Images wrong"
+        assert isinstance(diff.primitives.get("image"), Images) and len(diff.primitives["image"]) == 2, (
+            "diffusion decoded Images wrong"
+        )
 
-        _log(f"PASS: ar texts (PE)={[t[:50] for t in ar.primitive.texts]}")
-        _log(f"PASS: diffusion latents={tuple(diff.segment.latents.shape)} images={len(diff.primitive)} "
-             f"conditions={sorted(diff.conditions.keys())}")
+        _log(f"PASS: ar texts (PE)={[t[:50] for t in ar.primitives['text'].texts]}")
+        _log(
+            f"PASS: diffusion latents={tuple(diff.segment.latents.shape)} images={len(diff.primitives['image'])} "
+            f"conditions={sorted(diff.conditions.keys())}"
+        )
         _log("COMPOSED ROLLOUT SMOKE PASSED ✅  (3-part [input, ar, diffusion] chain filled; lineage preserved)")
         return 0
     except Exception:

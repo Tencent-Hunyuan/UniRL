@@ -176,7 +176,7 @@ class FakeEngine(BaseSingleTurnRolloutEngine):
     def _build_inputs(sample: Sample) -> Tuple[List[Dict[str, Any]], int]:
         """Adapter-like build_inputs: one ``/generate``-shaped payload per prompt,
         carrying ``n`` = the per-prompt fan-out (gen rows / #prompts)."""
-        prompts = list(sample.parts[0].primitive.texts)
+        prompts = list(sample.parts[0].primitives["text"].texts)
         n = sample.parts[-1].batch_size // len(prompts)
         wire = [{"text": p, "sampling_params": {"n": n}} for p in prompts]
         return wire, n
@@ -186,7 +186,7 @@ class FakeEngine(BaseSingleTurnRolloutEngine):
         """Adapter-like build_response: row ``j`` of the gen Part <- ``raw[j]``
         (prompt-major / group-by-parent), filling only the tensor-free primitive."""
         gen_part = sample.parts[-1]
-        filled = gen_part.fill(primitive=Texts(texts=[r.text for r in raw]))
+        filled = gen_part.fill(primitives={"text": Texts(texts=[r.text for r in raw])})
         return Sample(parts=[*sample.parts[:-1], filled])
 
     # ---- control plane: sync verbs forwarded to the backend ----
@@ -218,7 +218,7 @@ def build_request_batch(*, P: int, n: int) -> Sample:
     """
     ids = [f"p{i}" for i in range(P)]
     prompts = [f"prompt-{i}" for i in range(P)]
-    head = Part.input(ids, primitive=Texts(texts=prompts))
+    head = Part.input(ids, primitives={"text": Texts(texts=prompts)})
     request = Sample.request(head)
     return request.fork(n, sampling_params=ARSamplingParams(samples_per_prompt=n))
 

@@ -92,7 +92,14 @@ class LTX2VAEEncodeStage:
 
 
 class LTX2AudioDecodeStage:
-    """Decode audio latents → waveform via audio VAE + vocoder (LTX-2.3)."""
+    """Decode packed audio latents → waveform via audio VAE + vocoder (LTX-2.3).
+
+    Mirrors diffusers ``LTX2Pipeline`` audio decode (and Flow-Factory's
+    ``decode_latents`` audio branch): the operation order is
+    **denormalize → unpack → audio_vae.decode → vocoder** — note that unlike
+    video, audio is denormalized while still PACKED ``[B, S, D]`` and only then
+    unpacked to the spectrogram layout ``[B, C, L, M]``.
+    """
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         if bundle.audio_vae is None or bundle.vocoder is None:
@@ -101,20 +108,54 @@ class LTX2AudioDecodeStage:
         self.vocoder = bundle.vocoder
         self.dtype = bundle.dtype
 
+    @staticmethod
+    def _denormalize_audio_latents(
+        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
+    ) -> torch.Tensor:
+        """Inverse of the audio VAE normalization, on the packed ``[B, S, D]``
+        latent (verbatim from diffusers ``_denormalize_audio_latents``)."""
+        latents_mean = latents_mean.to(latents.device, latents.dtype)
+        latents_std = latents_std.to(latents.device, latents.dtype)
+        return latents * latents_std + latents_mean
+
+    @staticmethod
+    def _unpack_audio_latents(latents: torch.Tensor, latent_length: int, num_mel_bins: int) -> torch.Tensor:
+        """Packed ``[B, L, C*M]`` → spectrogram ``[B, C, L, M]`` (verbatim from
+        diffusers ``_unpack_audio_latents``, default no-patch path: implicit
+        ``patch_size = M``, ``patch_size_t = 1``)."""
+        return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
+
     @torch.no_grad()
-    def decode(self, audio_latents: torch.Tensor) -> torch.Tensor:
-        """Decode audio latents → waveform.
+    def decode(self, audio_latents: torch.Tensor, *, audio_latent_length: int) -> torch.Tensor:
+        """Decode packed audio latents → waveform.
 
         Args:
-            audio_latents: Audio latent tensor from the diffusion stage.
+            audio_latents: Packed audio latents ``[B, S, D]`` (the clean
+                final-step audio from the diffusion stage's ``aux_latents``).
+            audio_latent_length: Number of audio LATENT frames ``L`` (so the
+                unpack can recover ``[B, C, L, M]``).
 
         Returns:
-            Audio waveform tensor.
+            Waveform tensor from the vocoder.
         """
-        # Audio VAE decode → mel spectrogram
-        mel = self.audio_vae.decode(audio_latents.to(self.audio_vae.dtype)).sample
-        # Vocoder → waveform
-        waveform = self.vocoder(mel)
+        # M = latent mel bins = mel_bins // mel_compression_ratio.
+        mel_bins = int(getattr(self.audio_vae.config, "mel_bins", 64))
+        mel_compression = int(getattr(self.audio_vae, "mel_compression_ratio", 4))
+        latent_mel_bins = mel_bins // mel_compression
+
+        # 1. Denormalize FIRST (on the packed latent), then unpack — order
+        #    differs from video (which unpacks first).
+        aud = self._denormalize_audio_latents(
+            audio_latents.float(), self.audio_vae.latents_mean, self.audio_vae.latents_std
+        )
+        # 2. Unpack: [B, L, C*M] -> [B, C, L, M]
+        aud = self._unpack_audio_latents(aud, audio_latent_length, num_mel_bins=latent_mel_bins)
+        # 3. Audio VAE decode -> mel spectrogram (fp32: BigVGAN vocoder uses
+        #    snake activation + Kaiser sinc filters that overflow in bf16).
+        aud = aud.to(torch.float32)
+        mel = self.audio_vae.to(torch.float32).decode(aud, return_dict=False)[0]
+        # 4. Vocoder -> waveform (fp32 for numerical stability)
+        waveform = self.vocoder.to(torch.float32)(mel)
         return waveform
 
 

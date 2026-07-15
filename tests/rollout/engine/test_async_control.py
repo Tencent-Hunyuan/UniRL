@@ -60,8 +60,8 @@ def test_controls_interleave_with_inflight_generate_and_abort_releases():
 
     assert not worker.is_alive()  # the generate completed after the abort released it
     out = result["out"]
-    assert out.parts[-1].primitive is not None
-    assert len(out.parts[-1].primitive.texts) == 2
+    assert "text" in out.parts[-1].primitives
+    assert len(out.parts[-1].primitives["text"].texts) == 2
 
     engine.shutdown()
 
@@ -95,7 +95,7 @@ def test_concurrent_callers_overlap_and_finish_by_speed():
     engine = FakeEngine(concurrency=8)
     batch = build_request_batch(P=2, n=1)
     slow_group, fast_group = batch.split()
-    prompts = list(batch.parts[0].primitive.texts)
+    prompts = list(batch.parts[0].primitives["text"].texts)
     engine._backend.delay_for = {prompts[0]: 0.25, prompts[1]: 0.0}  # slow first prompt
 
     finished: list = []
@@ -132,7 +132,7 @@ def test_concurrent_callers_overlap_and_finish_by_speed():
 
 def test_part_weight_version_defaults_to_none():
     """A freshly built input Part and a forked gen shell carry no weight version."""
-    head = Part.input(["p0"], primitive=Texts(texts=["hello"]))
+    head = Part.input(["p0"], primitives={"text": Texts(texts=["hello"])})
     assert head.weight_version is None
     shell = head.fork(2, sampling_params=ARSamplingParams(samples_per_prompt=2))
     assert shell.weight_version is None

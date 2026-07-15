@@ -52,7 +52,9 @@ def _log(msg: str) -> None:
 def build_request_sample(n: int) -> Sample:
     """2 prompts, ``n`` completions each: ``[input, ar gen-shell]`` (P*n samples)."""
     prompts = ["Describe a sunny beach in one sentence.", "What is two plus two?"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts), control={})
+    input_part = Part.input(
+        [f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)}, control={}
+    )
     ar_params = ARSamplingParams(samples_per_prompt=n, temperature=0.7, max_new_tokens=48, top_p=0.9, top_k=20)
     return Sample.request(input_part).fork(n, sampling_params=ar_params)
 
@@ -86,7 +88,7 @@ def main() -> int:
         assert len(gen.sample_ids) == n_expect, f"expected {n_expect} samples; got {len(gen.sample_ids)}"
         assert isinstance(gen.segment, TextSegment), f"segment must be TextSegment; got {type(gen.segment)}"
         assert gen.segment.log_probs is not None, "TextSegment.log_probs is None (no rollout logp recorded)"
-        assert isinstance(gen.primitive, Texts) and len(gen.primitive.texts) == n_expect, (
+        assert isinstance(gen.primitives.get("text"), Texts) and len(gen.primitives["text"].texts) == n_expect, (
             f"expected {n_expect} decoded texts"
         )
         assert gen.conditions, "trainside path stores Part.conditions for replay (re-typed via from_dict)"
@@ -115,20 +117,26 @@ def main() -> int:
         # PRIMARY invariant: replay deterministic at fixed weights → ratio 1.
         sc = rollout_replay_logp_absdiff(new2, new1)
         sc_mean, sc_max = sc["rollout_replay_logp_absdiff_mean"], sc["rollout_replay_logp_absdiff_max"]
-        _log(f"replay self-consistency (old_logp_source=replay ⇒ ratio 1): mean|Δlogp|={sc_mean:.3e} max={sc_max:.3e} (threshold mean<{_SELF_CONSIST_MAX})")
+        _log(
+            f"replay self-consistency (old_logp_source=replay ⇒ ratio 1): mean|Δlogp|={sc_mean:.3e} max={sc_max:.3e} (threshold mean<{_SELF_CONSIST_MAX})"
+        )
         assert sc_mean < _SELF_CONSIST_MAX, f"replay non-deterministic at fixed weights: mean|Δlogp|={sc_mean:.3e}"
 
         # INFORMATIONAL: autoregress(bf16) vs replay(fp32) rollout-fidelity gap.
         old = gen.segment.log_probs.to(device=new1.device, dtype=new1.dtype)
         rg = rollout_replay_logp_absdiff(new1, old)
         rg_mean, rg_max = rg["rollout_replay_logp_absdiff_mean"], rg["rollout_replay_logp_absdiff_max"]
-        _log(f"[informational] autoregress(bf16)→replay(fp32) rollout-fidelity gap: mean|Δlogp|={rg_mean:.3e} max={rg_max:.3e} (expected ~5; NOT a ratio≈1 check)")
+        _log(
+            f"[informational] autoregress(bf16)→replay(fp32) rollout-fidelity gap: mean|Δlogp|={rg_mean:.3e} max={rg_max:.3e} (expected ~5; NOT a ratio≈1 check)"
+        )
         assert rg_mean < _ROLLOUT_GAP_SANITY_MAX, (
             f"autoregress↔replay gap {rg_mean:.3e} exceeds catastrophe guard {_ROLLOUT_GAP_SANITY_MAX} "
             f"— likely an alignment/conditions break, not precision"
         )
 
-        _log("TRAINSIDE QWEN-VL SMOKE PASSED ✅  (rollout fills the Sample; replay deterministic — old_logp_source=replay ratio≈1)")
+        _log(
+            "TRAINSIDE QWEN-VL SMOKE PASSED ✅  (rollout fills the Sample; replay deterministic — old_logp_source=replay ratio≈1)"
+        )
         return 0
     except Exception:
         _log("TRAINSIDE QWEN-VL SMOKE FAILED ❌")

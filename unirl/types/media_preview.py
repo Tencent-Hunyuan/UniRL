@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from unirl.distributed.tensor.batch import Batch, concat_field
-from unirl.types.primitives import Images, Videos
+from unirl.types.primitives import Audios, Images, Videos
 
 if TYPE_CHECKING:
     from unirl.types.sample import Part
@@ -54,6 +54,13 @@ class MediaPreview(Batch):
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
+    # Per-sample audio waveforms (mono [L] float32 CPU tensors) for muxing into
+    # the mp4 upload. Parallel to ``videos`` — same length. ``None``/empty for
+    # non-audio tracks.
+    audios: List[Any] = concat_field(default_factory=list)
+    # Source sample rate of the waveforms in ``audios``. Batch-shared (one rate
+    # per preview). None when audios is empty.
+    audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
 
@@ -62,6 +69,7 @@ class MediaPreview(Batch):
         for name, val in (
             ("images", self.images),
             ("videos", self.videos),
+            ("audios", self.audios),
             ("prompts", self.prompts),
             ("rewards", self.rewards),
         ):
@@ -142,21 +150,23 @@ def build_media_preview_for_part(
 
     Two parallel modality paths:
 
-    - **Image path** (``isinstance(part.primitive, Images)``): unbinds
+    - **Image path** (``isinstance(part.primitives["image"], Images)``): unbinds
       ``Images.pixels`` along batch dim into per-sample 3D ``[C, H, W]``
       tensors and converts each to PIL via ``tensor_frame_to_pil`` (the
       wandb boundary). Slices to the first 3 channels first — drops
       alpha / model-specific 4th channel so wandb gets RGB.
-    - **Video path** (``isinstance(part.primitive, Videos)``): reads
+    - **Video path** (``isinstance(part.primitives["video"], Videos)``): reads
       per-sample 4D ``[C, T, H, W]`` CPU ``float32`` tensors via
       ``Videos.to_list()`` + ``permute(1, 0, 2, 3)``; keeps them raw,
       NOT pre-built ``wandb.Video`` (encoding is owned by
       ``UniRLWandBLogger.log_generated_media``).
 
-    Returns ``None`` when the Part's ``primitive`` is neither ``Images``
-    nor ``Videos`` (e.g. text track) or when nothing is selected.
+    Returns ``None`` when the Part's primitive map contains neither ``Images``
+    nor ``Videos`` (e.g. a text Part) or when nothing is selected.
     """
-    decoded = part.primitive
+    decoded = part.primitives.get("image")
+    if decoded is None:
+        decoded = part.primitives.get("video")
     if not isinstance(decoded, (Images, Videos)):
         return None
     limit = max(1, int(max_items))
@@ -218,11 +228,33 @@ def build_media_preview_for_part(
     if not selected_indices:
         return None
 
+    # T2AV: extract per-sample audio waveforms for muxing into the mp4 upload.
+    audios_out: List[Any] = []
+    audio_sr: Optional[int] = None
+    decoded_audio = part.primitives.get("audio")
+    if isinstance(decoded_audio, Audios):
+        from unirl.distributed.tensor import hydrate, map_tree
+
+        decoded_audio = map_tree(decoded_audio, hydrate)
+        audio_list = decoded_audio.to_list()
+        for idx in selected_indices:
+            if idx < len(audio_list):
+                audios_out.append(audio_list[idx].waveform.detach().cpu().float())
+            else:
+                audios_out.append(None)
+        audio_sr = part.primitive_metadata.get("audio", {}).get("sample_rate")
+        # Drop audio if none of the selected samples have it
+        if all(a is None for a in audios_out):
+            audios_out = []
+            audio_sr = None
+
     prompts_out = [str(prompt_texts[i]) if i < len(prompt_texts) else "" for i in selected_indices]
     reward_values = [float(rewards_flat[i]) if i < len(rewards_flat) else 0.0 for i in selected_indices]
     return MediaPreview(
         images=images,
         videos=videos,
+        audios=audios_out,
+        audio_sample_rate=int(audio_sr) if audio_sr is not None else None,
         prompts=prompts_out,
         rewards=reward_values,
     )

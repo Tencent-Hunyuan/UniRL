@@ -61,7 +61,7 @@ def _roles(turns: List[Turn]) -> List[str]:
 def check_single_turn_backward_compat() -> None:
     """No roles set ⇒ derivation reproduces today's single-`user`-turn shape, and
     ``conditioning()`` stays the role-stripped view of ``turns()`` (behavior-preserving)."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))  # no role set
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})  # no role set
     sample = Sample(parts=[inp, inp.fork(1, sampling_params=_diff())])
 
     ts = sample.turns()
@@ -81,8 +81,8 @@ def check_single_turn_backward_compat() -> None:
 def check_vlm_turns() -> None:
     """A text + image trajectory renders as two `user` turns; vision_conditioning
     returns the turns + a 1-element image collection; text_conditioning rejects it."""
-    text = Part.input(["p0", "p1"], primitive=Texts(texts=["edit the cat", "edit the dog"]), role="user")
-    img_in = text.input_child(_images(2), role="user")
+    text = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["edit the cat", "edit the dog"])}, role="user")
+    img_in = text.input_child({"image": _images(2)}, role="user")
     sample = Sample.request(text, img_in).fork(1, sampling_params=_diff())
 
     ts, images = sample.vision_conditioning()
@@ -98,8 +98,10 @@ def check_vlm_turns() -> None:
 def check_recaption_turns() -> None:
     """The unified two-text recaption is a 2-turn conversation: [user prompt,
     assistant recaption] — the assistant role DERIVED from the gen part's params."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]), role="user")
-    ar = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=["a fluffy cat", "a happy dog"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])}, role="user")
+    ar = inp.fork(1, sampling_params=ARSamplingParams()).fill(
+        primitives={"text": Texts(texts=["a fluffy cat", "a happy dog"])}
+    )
     sample = Sample(parts=[inp, ar, ar.fork(1, sampling_params=_diff())])
 
     ts = sample.text_conditioning()
@@ -112,9 +114,9 @@ def check_recaption_turns() -> None:
 
 def check_agent_text_turns() -> None:
     """A user → assistant → tool agent trajectory renders 3 role-tagged text turns."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["what is 2+2?"]), role="user")
-    asst = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=["let me compute"]))
-    tool = asst.input_child(Texts(texts=["4"]), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["what is 2+2?"])}, role="user")
+    asst = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitives={"text": Texts(texts=["let me compute"])})
+    tool = asst.input_child({"text": Texts(texts=["4"])}, role="tool")
     gen = tool.fork(1, sampling_params=ARSamplingParams())
     sample = Sample(parts=[inp, asst, tool, gen])
 
@@ -129,8 +131,8 @@ def check_agent_text_turns() -> None:
 def check_frontier_alignment() -> None:
     """Every turn's content is frontier-aligned: a branch>1 fan-out expands each
     ancestor to one row per gen sample (the per-sample conversation)."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["look", "see"]), role="user")
-    img = inp.input_child(_images(2), role="user")
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["look", "see"])}, role="user")
+    img = inp.input_child({"image": _images(2)}, role="user")
     sample = Sample.request(inp, img).fork(2, sampling_params=_diff())  # 2 prompts x branch 2 = 4
 
     n = sample.parts[-1].batch_size
@@ -144,15 +146,15 @@ def check_frontier_alignment() -> None:
 def check_fail_loud() -> None:
     """The renderers fail loud on what their consumer cannot ingest."""
     # text + image + video: text_conditioning rejects non-text; vision rejects the extra modality.
-    inp = Part.input(["p0"], primitive=Texts(texts=["q"]), role="user")
-    img = inp.input_child(_images(1), role="user")
-    vid = img.input_child(_videos(1), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["q"])}, role="user")
+    img = inp.input_child({"image": _images(1)}, role="user")
+    vid = img.input_child({"video": _videos(1)}, role="tool")
     mixed = Sample.request(inp, img, vid).fork(1, sampling_params=_diff())
     _expect_raises(mixed.text_conditioning, ValueError, "text_conditioning rejects image/video turns")
     _expect_raises(mixed.vision_conditioning, ValueError, "vision_conditioning rejects an extra (video) modality")
 
     # text-only trajectory: vision_conditioning rejects a no-image request.
-    text_inp = Part.input(["p0"], primitive=Texts(texts=["q"]), role="user")
+    text_inp = Part.input(["p0"], primitives={"text": Texts(texts=["q"])}, role="user")
     text_only = Sample(parts=[text_inp, text_inp.fork(1, sampling_params=ARSamplingParams())])
     _expect_raises(text_only.vision_conditioning, ValueError, "vision_conditioning rejects a no-image trajectory")
 
@@ -160,20 +162,23 @@ def check_fail_loud() -> None:
 def check_writeback_preserves_intermediates() -> None:
     """``with_filled_frontier`` / ``replace_frontier`` preserve EVERY intermediate
     part (the sglang_diffusion part-drop bug) and ``reward_compute_s``."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]), role="user")
-    ar = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=["r0", "r1"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])}, role="user")
+    ar = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitives={"text": Texts(texts=["r0", "r1"])})
     gen = ar.fork(1, sampling_params=_diff())
     sample = Sample(parts=[inp, ar, gen], reward_compute_s=1.5)
 
-    seg, dec = SimpleNamespace(tag="seg"), SimpleNamespace(tag="dec")
-    out = sample.with_filled_frontier(segment=seg, primitive=dec)
+    seg, dec = SimpleNamespace(tag="seg"), _images(2)
+    out = sample.with_filled_frontier(segment=seg, primitives={"image": dec})
     _check(len(out.parts) == 3, "with_filled_frontier preserves the part count (no drop)")
     _check(out.parts[0] is inp and out.parts[1] is ar, "intermediate parts preserved (the dropped-part bug)")
-    _check(out.parts[-1].segment is seg and out.parts[-1].primitive is dec, "frontier filled with outputs")
+    _check(
+        out.parts[-1].segment is seg and out.parts[-1].primitives["image"] is dec,
+        "frontier filled with outputs",
+    )
     _check(out.parts[-1].sampling_params is gen.sampling_params, "frontier sampling_params preserved through fill")
     _check(out.reward_compute_s == 1.5, "with_filled_frontier preserves reward_compute_s")
 
-    new_gen = gen.fill(primitive=Texts(texts=["x", "y"]))
+    new_gen = gen.fill(primitives={"text": Texts(texts=["x", "y"])})
     out2 = sample.replace_frontier(new_gen)
     _check(
         out2.parts[0] is inp and out2.parts[1] is ar and out2.parts[-1] is new_gen,

@@ -19,6 +19,7 @@ sibling stages), matching the SD3 convention of one-package-per-model.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 from unirl.models.types.pipeline import Pipeline
@@ -28,7 +29,6 @@ from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.text_embed import WAN21TextEmbedStage
 from unirl.models.wan21.vae import WAN21VAEDecodeStage
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
-from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
@@ -48,7 +48,7 @@ class WAN22Pipeline(Pipeline):
     — via ``sample.conditioning()`` and fills the frontier Part:
 
     - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitive: Videos`` — the decoded videos.
+    - ``primitives["video"]: Videos`` — the decoded videos.
 
     ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied text negatives are
     deferred; CFG uses a synthesized empty negative. ``DiffusionSamplingParams``
@@ -152,57 +152,36 @@ class WAN22Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def _conditions_for(
-        self, texts: Texts, params: DiffusionSamplingParams, images_prim: Optional[Images] = None
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
     ) -> WAN21Conditions:
-        """Encode prompts (+ optional i2v first-frame image) → :class:`WAN21Conditions`.
-        Shared by rollout-``generate`` and trainer-side replay (re-encode).
+        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``.
 
-        CFG empty negative: same rationale as WAN21Pipeline (see that
-        method's comment) — WAN training encodes an empty-string
-        negative when none is supplied. WAN22 routes CFG by sigma /
-        ``guidance_scale_2`` so we trigger the empty-negative encoding
-        whenever either branch's effective guidance is > 1.
+        Builds only the text-conditioning slots (``text`` / ``negative_text``);
+        the optional ``image_latent`` / ``image_embed`` slots are left ``None``
+        and attached by :meth:`generate` when an input image is supplied.
+
+        CFG empty negative: same rationale as WAN21Pipeline — WAN training
+        encodes an empty-string negative when none is supplied. WAN22 routes
+        CFG by sigma / ``guidance_scale_2``, so :meth:`generate` passes the
+        **effective** guidance (``max(guidance_scale, guidance_scale_2)``) here;
+        gating on ``> 1.0`` then reproduces WAN22's two-branch ``cfg_active``
+        trigger exactly.
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"WAN22Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
-        primary_g = float(params.guidance_scale)
-        low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
-        cfg_active = max(primary_g, low_g) > 1.0
-        negatives = Texts(texts=[""] * len(texts.texts)) if cfg_active else None
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-
-        image_latent_cond: Optional[ImageLatentCondition] = None
-        image_embed_cond: Optional[ImageEmbedCondition] = None
-        if images_prim is not None:
-            if not isinstance(images_prim, Images):
-                raise TypeError(
-                    f"WAN22Pipeline.generate: i2v image must be Images, got {type(images_prim).__name__}"
-                )
-            if int(images_prim.pixels.shape[0]) != len(texts.texts):
-                raise ValueError(
-                    f"WAN22Pipeline.generate: image count {images_prim.pixels.shape[0]} "
-                    f"!= text count {len(texts.texts)}"
-                )
-            image_latent_cond = WAN21ImageLatentEncodeStage(
-                self.bundle,
-                num_frames=int(params.num_frames),
-                height=int(params.height),
-                width=int(params.width),
-            ).encode(images_prim)
-            # CLIP-vision branch fires only on bundles that actually
-            # loaded a vision tower. WAN 2.2's mainstream checkpoints
-            # set ``image_dim == 0`` and skip this; left in place so a
-            # future 2.2 variant with ``image_dim > 0`` (if it ever
-            # ships) wires up automatically without a pipeline change.
-            if getattr(self.bundle, "uses_clip_vision", False):
-                image_embed_cond = WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
-
-        return WAN21Conditions(
-            text=text_cond,
-            negative_text=negative_text_cond,
-            image_latent=image_latent_cond,
-            image_embed=image_embed_cond,
-        )
+        return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
         """Run WAN 2.2 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part.
@@ -236,7 +215,37 @@ class WAN22Pipeline(Pipeline):
             )
         images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
 
-        wan_conds = self._conditions_for(texts, params, images_prim)
+        primary_g = float(params.guidance_scale)
+        low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
+        effective_guidance = max(primary_g, low_g)
+        wan_conds = self.build_conditions(texts, guidance_scale=effective_guidance)
+
+        # Image conditioning depends on diffusion geometry and is attached after
+        # the public text-only condition builder.
+        if images_prim is not None:
+            if images_prim.pixels is None or int(images_prim.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"WAN22Pipeline.generate: image count "
+                    f"{None if images_prim.pixels is None else int(images_prim.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_latent = WAN21ImageLatentEncodeStage(
+                self.bundle,
+                num_frames=int(params.num_frames),
+                height=int(params.height),
+                width=int(params.width),
+            ).encode(images_prim)
+            image_embed = (
+                WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
+                if getattr(self.bundle, "uses_clip_vision", False)
+                else None
+            )
+            wan_conds = dataclasses.replace(
+                wan_conds,
+                image_latent=image_latent,
+                image_embed=image_embed,
+            )
+
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -250,7 +259,7 @@ class WAN22Pipeline(Pipeline):
 
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=latent_seg, primitive=videos, conditions=wan_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=wan_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

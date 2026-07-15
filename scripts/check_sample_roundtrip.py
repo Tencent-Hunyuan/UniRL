@@ -47,7 +47,7 @@ def _expect_raises(fn: Callable[[], object], exc: type, msg: str) -> None:
 
 def _two_stage_sample() -> Tuple[Sample, Part, Part, Part]:
     """``[input(P=2), ar(P*N, N=1), image(P*N*M, M=1)]`` — the HI3 t2i shape."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})
     ar_shell = inp.fork(1, sampling_params=ARSamplingParams())
     img_shell = ar_shell.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     return Sample(parts=[inp, ar_shell, img_shell]), inp, ar_shell, img_shell
@@ -69,7 +69,7 @@ def check_assemble_sample() -> None:
     """``assemble_sample`` fills the right gen Parts (by params type), preserves ids."""
     sample, inp, _ar_shell, _img_shell = _two_stage_sample()
     ar_seg, img_seg = SimpleNamespace(tag="ar_seg"), SimpleNamespace(tag="img_seg")
-    ar_dec, img_dec = Texts(texts=["pe0", "pe1"]), SimpleNamespace(tag="img_dec")
+    ar_dec, img_dec = Texts(texts=["pe0", "pe1"]), _images(2)
     cond = {"text": SimpleNamespace(tag="cond")}
 
     out = assemble_sample(
@@ -81,8 +81,14 @@ def check_assemble_sample() -> None:
     _check(len(out.parts) == 3, "assemble_sample must preserve the part count")
     out_inp, out_ar, out_img = out.parts
     _check(out_inp is inp, "the input Part passes through unchanged")
-    _check(out_ar.segment is ar_seg and out_ar.primitive is ar_dec, "ar Part filled by the 'ar' track")
-    _check(out_img.segment is img_seg and out_img.primitive is img_dec, "image Part filled by the 'image' track")
+    _check(
+        out_ar.segment is ar_seg and out_ar.primitives["text"] is ar_dec,
+        "ar Part filled by the 'ar' track",
+    )
+    _check(
+        out_img.segment is img_seg and out_img.primitives["image"] is img_dec,
+        "image Part filled by the 'image' track",
+    )
     _check(out_ar.conditions == cond and out_img.conditions == cond, "conditions replicate onto every filled Part")
     _check(list(out_ar.sample_ids) == ["p0/0", "p1/0"], "ar path ids preserved")
     _check(list(out_img.sample_ids) == ["p0/0/0", "p1/0/0"], "image path ids preserved")
@@ -90,7 +96,7 @@ def check_assemble_sample() -> None:
     _check(isinstance(out_img.sampling_params, DiffusionSamplingParams), "image sampling_params preserved through fill")
 
     # Single-DiT shape ``[input, image]``: only the diffusion Part is targeted.
-    inp_s = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    inp_s = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     img_s = inp_s.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     single = Sample(parts=[inp_s, img_s])
     out2 = assemble_sample(
@@ -122,7 +128,7 @@ def check_sigma_roundtrip() -> None:
 def check_noise_key_lineage() -> None:
     """OD-2: the x_T noise key is the gen Part's lineage — group id (shared) vs
     sample id (per-sample), both derived from the path-id fork."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["x"]))
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["x"])})
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(2, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     _check(
@@ -156,8 +162,8 @@ def check_multi_input_image_chain() -> None:
     """IT2I-shaped multi-input ``[text, image_input, ar_gen, image_gen]`` via Part.input_child:
     chains a valid Sample, the helpers route past the image input, conditioning() surfaces both
     primitives, and assemble_sample fills the right gen Parts."""
-    text = Part.input(["p0", "p1"], primitive=Texts(texts=["edit the cat", "edit the dog"]))
-    image_in = text.input_child(_images(2))
+    text = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["edit the cat", "edit the dog"])})
+    image_in = text.input_child({"image": _images(2)})
     sample = (
         Sample.request(text, image_in)
         .fork(1, sampling_params=ARSamplingParams())
@@ -175,7 +181,7 @@ def check_multi_input_image_chain() -> None:
     out = assemble_sample(
         sample,
         segments_for_track={"ar": SimpleNamespace(tag="ar"), "image": SimpleNamespace(tag="img")},
-        decoded_for_track={"ar": Texts(texts=["r0", "r1"]), "image": SimpleNamespace(tag="dec")},
+        decoded_for_track={"ar": Texts(texts=["r0", "r1"]), "image": _images(2)},
         conditions={"fused": SimpleNamespace(tag="cond")},
     )
     _check(out.parts[0] is sample.parts[0] and out.parts[1] is sample.parts[1], "input Parts pass through unchanged")
@@ -186,8 +192,8 @@ def check_multi_input_image_chain() -> None:
 def check_cot_text_chain() -> None:
     """dit_recaption-shaped ``[text, cot_text_input, image_gen]``: the chained recaption
     is the second text turn of ``text_conditioning()`` (1:1 with prompts by lineage)."""
-    text = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
-    cot_in = text.input_child(Texts(texts=["a fluffy ginger cat", "a happy golden dog"]))
+    text = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})
+    cot_in = text.input_child({"text": Texts(texts=["a fluffy ginger cat", "a happy golden dog"])})
     sample = Sample.request(text, cot_in).fork(
         1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256)
     )
@@ -205,7 +211,7 @@ def check_root_group_ids() -> None:
     labels stay group-by-parent contiguous, matching what
     ``Part.compute_advantages(group_layer=0)`` groups by."""
     # P=2 prompts, N=2 AR children each, M=1 image each → [input, ar(4), image(4)].
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     sample = Sample(parts=[inp, ar, img])
@@ -222,7 +228,7 @@ def check_gen_part_accessors() -> None:
     ``sampling_params`` TYPE (the migration's part-location convention; mirrors
     the engine-side ``ar_gen_part``/``diffusion_gen_part``). ``with_parts`` swaps
     parts while preserving ``reward_compute_s``."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     sample = Sample(parts=[inp, ar, img], reward_compute_s=1.5)
@@ -255,7 +261,7 @@ def check_sample_dp_chunk() -> None:
     rollout-request fix), not by the ``parts`` list — the inherited ``Batch.slice``
     would slice the length-3 parts list and hand every DP rank the full Sample.
     Reuses the tree-correct ``split``/``concat``."""
-    inp = Part.input([f"p{i}" for i in range(4)], primitive=Texts(texts=[f"prompt {i}" for i in range(4)]))
+    inp = Part.input([f"p{i}" for i in range(4)], primitives={"text": Texts(texts=[f"prompt {i}" for i in range(4)])})
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     sample = Sample(parts=[inp, ar, img], reward_compute_s=2.0)
@@ -284,7 +290,10 @@ def check_unified_dit_noise_ids_unique() -> None:
     """The unified DiT sub-request re-roots from the globally-unique image-shell
     lineage (flatten ``/``), so the engine-derived x_T key stays unique across dp>1
     replicas; the replica-local ``d{k}`` scheme collides (each shard restarts at 0)."""
-    inp = Part.input([f"r0:p{i}" for i in range(4)], primitive=Texts(texts=[f"prompt {i}" for i in range(4)]))
+    inp = Part.input(
+        [f"r0:p{i}" for i in range(4)],
+        primitives={"text": Texts(texts=[f"prompt {i}" for i in range(4)])},
+    )
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     shards = Sample(parts=[inp, ar, img]).chunk(2)  # dp=2 — what run_rollout does
@@ -301,7 +310,7 @@ def check_group_layer_advantages() -> None:
     under ``scope="group"``, ``group_layer`` selects the lineage layer whose
     ancestor id labels the GRPO groups: ``None`` (default) = immediate parent,
     ``0`` = root prompt (PE ``diffusion_group_scope='prompt'``)."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     ar = inp.fork(2, sampling_params=ARSamplingParams())
     img = ar.fork(2, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     image = _part_with_field(img, "rewards", torch.arange(8, dtype=torch.float32))  # 8 = P*N*M
@@ -323,9 +332,7 @@ def check_group_layer_advantages() -> None:
     expected_global = (rewards - rewards.mean()) / (rewards.std() + 1e-8)  # unbiased std — historical parity
     _check(torch.allclose(a_global.advantages, expected_global), "scope='global' batch z-scores with unbiased std")
 
-    _expect_raises(
-        lambda: image.compute_advantages(group_layer=5), ValueError, "out-of-range group_layer must raise"
-    )
+    _expect_raises(lambda: image.compute_advantages(group_layer=5), ValueError, "out-of-range group_layer must raise")
     _expect_raises(
         lambda: image.compute_advantages(group_layer=-1),
         ValueError,
@@ -339,7 +346,7 @@ def check_rollout_metric_naming() -> None:
     panels correlate."""
     from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     ar = _part_with_field(
         inp.fork(2, sampling_params=ARSamplingParams()), "rewards", torch.arange(4, dtype=torch.float32)
     )
@@ -373,7 +380,7 @@ def check_noise_recipe_from_sample() -> None:
     """``NoiseRecipe.from_sample`` keys the x_T on the gen Part's lineage
     (sample_ids, or group_ids under ``init_same_noise``) and reads seed + shape off
     its ``DiffusionSamplingParams`` — parity with the engines' ``_resolve_initial_noise``."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     img = inp.fork(
         2,
         sampling_params=DiffusionSamplingParams(
@@ -414,16 +421,16 @@ def check_generate_fills_frontier() -> None:
     ``[input, filled-gen]`` — ids + sampling_params preserved, conditions left empty
     (the trainside re-encode path). Mirrors the Sample reconstruction in
     ``SD3Pipeline.generate`` / ``Qwen3Pipeline.generate`` with fake payloads."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     shell = inp.fork(1, sampling_params=DiffusionSamplingParams(num_inference_steps=4, height=256, width=256))
     sample = Sample(parts=[inp, shell])
-    seg, dec = SimpleNamespace(tag="latent_seg"), SimpleNamespace(tag="images")
-    filled = sample.parts[-1].fill(segment=seg, primitive=dec)
+    seg, dec = SimpleNamespace(tag="latent_seg"), _images(2)
+    filled = sample.parts[-1].fill(segment=seg, primitives={"image": dec})
     out = Sample(parts=[*sample.parts[:-1], filled])
     _check(len(out.parts) == 2, "generate returns [input, gen]")
     _check(out.parts[0] is inp, "input Part passes through unchanged")
     gen = out.parts[-1]
-    _check(gen.segment is seg and gen.primitive is dec, "frontier filled with segment + decoded")
+    _check(gen.segment is seg and gen.primitives["image"] is dec, "frontier filled with segment + decoded")
     _check(list(gen.sample_ids) == ["p0/0", "p1/0"], "frontier path ids preserved")
     _check(gen.conditions == {}, "conditions left empty (replay re-encodes)")
     _check(isinstance(gen.sampling_params, DiffusionSamplingParams), "sampling_params preserved through fill")

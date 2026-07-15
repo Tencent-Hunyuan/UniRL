@@ -31,13 +31,13 @@ def test_generate_fills_group_by_parent_order():
 
     # Frontier gen Part filled for all P*n rows.
     gen = out.parts[-1]
-    assert gen.primitive is not None
-    assert len(gen.primitive.texts) == P * n
+    assert "text" in gen.primitives
+    assert len(gen.primitives["text"].texts) == P * n
 
     # Explicit group-by-parent expected order: prompt-major, sibling-contiguous.
-    prompts = list(batch.parts[0].primitive.texts)
+    prompts = list(batch.parts[0].primitives["text"].texts)
     expected = [raw_text_for(p, k) for p in prompts for k in range(n)]
-    assert gen.primitive.texts == expected
+    assert gen.primitives["text"].texts == expected
 
     engine.shutdown()
 
@@ -51,7 +51,7 @@ def test_backend_sees_per_prompt_wire_in_batch_order():
 
     engine.generate(batch)
 
-    prompts = list(batch.parts[0].primitive.texts)
+    prompts = list(batch.parts[0].primitives["text"].texts)
     assert [c["text"] for c in engine._backend.calls] == prompts
     assert len(engine._backend.calls) == P  # one payload per group/prompt
     assert all(c["sampling_params"]["n"] == n for c in engine._backend.calls)
@@ -102,7 +102,7 @@ def test_shared_semaphore_bounds_concurrent_caller_threads():
         t.join(timeout=5)
 
     assert engine._backend.peak == C
-    assert all(r is not None and r.parts[-1].primitive is not None for r in results)
+    assert all(r is not None and bool(r.parts[-1].primitives) for r in results)
     engine.shutdown()
 
 

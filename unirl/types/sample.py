@@ -43,8 +43,13 @@ logger = logging.getLogger(__name__)
 
 # A Part's content in raw/primitive form (text / image / …) — the counterpart of
 # the encoded ``segment``: given content on an input Part, decoded output on a
-# generation Part. One value (a Part is single-modality).
+# generation Part. A generation may expose more than one jointly-produced
+# modality (LTX-2 text-to-audio-video is the first such case), so raw content is
+# keyed by modality on the Part.
 Primitive = Union[Texts, Images, Videos, Audios]
+PrimitiveMap = Dict[str, Primitive]
+PrimitiveMetadata = Dict[str, Dict[str, Any]]
+PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio")
 
 # The conversation roles a turn can carry when a trajectory is rendered for an
 # LLM/VLM consumer (see :meth:`Sample.turns` and the ``*_conditioning`` renderers).
@@ -69,21 +74,26 @@ class Turn:
 
 @dataclass
 class Part(Batch):
-    """One rollout slice — a single modality.
+    """One rollout slice in a Sample lineage.
 
     A node in a :class:`Sample`'s positional chain: its parent is the preceding
     entry in ``Sample.parts`` (index ``i-1``). Each sample's parent *within* that
     preceding part is recovered from its id path (``parent_id(sample_ids[i])``,
     located by id; see :mod:`unirl.types.sample_id`) — there is no stored parent
     index; :attr:`is_root` marks the chain head. ``segment`` holds the encoded
-    payload, ``primitive`` the same content in raw form. Conditioning is collected
+    payload, ``primitives`` its decoded/raw content keyed by modality. Conditioning is collected
     from the prefix (:meth:`Sample.conditioning`), not stored.
     """
 
     sample_ids: List[str] = concat_field(default_factory=list)
 
     segment: Optional[Segment] = field(kind=FieldKind.CONCAT, default=None)
-    primitive: Optional[Primitive] = field(kind=FieldKind.CONCAT, default=None)
+    primitives: PrimitiveMap = field(kind=FieldKind.CONCAT, default_factory=dict)
+    # Shared metadata for decoded primitive modalities. Keep this separate from
+    # ``metadata`` below: that field is per-example dataset/reward metadata,
+    # whereas e.g. an audio sample rate is one output-format property shared by
+    # every row in the Part.
+    primitive_metadata: PrimitiveMetadata = shared_field(default_factory=dict)
     # Encoded conditioning produced for this part, kept for trainer-side replay —
     # the carrier for what the old ``RolloutTrack.conditions`` held. Per-sample
     # (CONCAT); defaults to ``{}`` so an unpopulated part is an empty dict, not None.
@@ -111,20 +121,63 @@ class Part(Batch):
     # ``None`` means "not stamped / not applicable" (e.g. train-side sampling).
     weight_version: Optional[int] = shared_field(default=None)
 
+    def __post_init__(self) -> None:
+        expected_batch = len(self.sample_ids)
+        for key, primitive in self.primitives.items():
+            actual_key = primitive_modality_key(primitive)
+            if key != actual_key:
+                raise ValueError(
+                    f"Part.primitives[{key!r}] contains {type(primitive).__name__}, "
+                    f"whose canonical modality key is {actual_key!r}."
+                )
+            if len(primitive) != expected_batch:
+                raise ValueError(
+                    f"Part.primitives[{key!r}] batch {len(primitive)} != sample_ids count {expected_batch}."
+                )
+
+        extra_metadata = sorted(set(self.primitive_metadata) - set(self.primitives))
+        if extra_metadata:
+            raise ValueError(f"Part.primitive_metadata has entries for absent primitive modalities: {extra_metadata}.")
+        invalid_metadata = [key for key, value in self.primitive_metadata.items() if not isinstance(value, dict)]
+        if invalid_metadata:
+            raise TypeError(
+                f"Part.primitive_metadata values must be dictionaries; invalid modalities: {sorted(invalid_metadata)}."
+            )
+        audio_meta = self.primitive_metadata.get("audio")
+        if audio_meta is not None and "sample_rate" in audio_meta:
+            sample_rate = audio_meta["sample_rate"]
+            if not isinstance(sample_rate, int) or sample_rate <= 0:
+                raise ValueError(
+                    f"Part.primitive_metadata['audio']['sample_rate'] must be a positive int, got {sample_rate!r}."
+                )
+
+    @classmethod
+    def concat(cls, items: Sequence["Part"]) -> "Part":
+        """Concat batch rows while requiring identical shared primitive metadata."""
+        if items:
+            expected = items[0].primitive_metadata
+            mismatched = [i for i, item in enumerate(items[1:], start=1) if item.primitive_metadata != expected]
+            if mismatched:
+                raise ValueError(
+                    "Part.concat: primitive_metadata must be identical across shards; "
+                    f"mismatched item indices {mismatched}."
+                )
+        return super().concat(items)
+
     @classmethod
     def input(
         cls,
         sample_ids: List[str],
         segment: Optional[Segment] = None,
         *,
-        primitive: Optional[Primitive] = None,
+        primitives: Optional[PrimitiveMap] = None,
         control: Optional[Dict[str, Any]] = None,
         metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
         role: Optional[str] = None,
     ) -> "Part":
         """Build a turn-0 input Part (the prompt, a root; untrained).
 
-        ``segment`` is the encoded prompt; ``primitive`` optionally carries the same
+        ``segment`` is the encoded prompt; ``primitives`` optionally carries the same
         content in raw form (what :meth:`Sample.conditioning` surfaces). Always a
         root — its ids carry no lineage segment, so they must not contain the ``/``
         path delimiter (this is the boundary where driver-supplied ids enter).
@@ -137,20 +190,20 @@ class Part(Batch):
         return cls(
             sample_ids=list(sample_ids),
             segment=segment,
-            primitive=primitive,
+            primitives=dict(primitives or {}),
             control=dict(control) if control else {},
             metadata=list(metadata) if metadata else [],
             role=role,
         )
 
-    def input_child(self, primitive: Primitive, *, role: Optional[str] = None) -> "Part":
-        """A branch-1 *input* child carrying an extra conditioning modality.
+    def input_child(self, primitives: PrimitiveMap, *, role: Optional[str] = None) -> "Part":
+        """A branch-1 *input* child carrying additional conditioning primitives.
 
-        Multi-input multimodal (e.g. image+text → image): a Part is
-        single-modality, so a second input rides as a chained input Part — one
-        child per parent sample (ids extended by ``/0``), ``sampling_params``
-        left None (it generates nothing). Chaining keeps only the head a root,
-        so the request stays a valid :class:`Sample` and
+        Multi-input multimodal (e.g. image+text → image) usually puts each
+        conversation turn in a chained input Part. One child is created per
+        parent sample (ids extended by ``/0``), with ``sampling_params`` left
+        None because it generates nothing. Chaining keeps only the head a root,
+        so the Sample stays valid and
         :meth:`Sample.conditioning` surfaces every input primitive in turn order
         (root → …). See ``docs/rollout-sample-refactor.md`` §3.
         """
@@ -158,7 +211,7 @@ class Part(Batch):
             raise ValueError("Part.input_child: parent has no sample_ids")
         return Part(
             sample_ids=[child_id(pid, 0) for pid in self.sample_ids],
-            primitive=primitive,
+            primitives=dict(primitives),
             role=role,
         )
 
@@ -256,7 +309,8 @@ class Part(Batch):
         self,
         *,
         segment: Optional[Segment] = None,
-        primitive: Optional[Primitive] = None,
+        primitives: Optional[PrimitiveMap] = None,
+        primitive_metadata: Optional[PrimitiveMetadata] = None,
         conditions: Optional[Dict[str, Condition]] = None,
         media_preview: Optional[MediaPreview] = None,
         status: Optional[torch.Tensor] = None,
@@ -272,7 +326,8 @@ class Part(Batch):
         kwargs: Dict[str, Any] = {f.name: getattr(self, f.name) for f in dc_fields(self)}
         for name, value in (
             ("segment", segment),
-            ("primitive", primitive),
+            ("primitives", primitives),
+            ("primitive_metadata", primitive_metadata),
             ("conditions", conditions),
             ("media_preview", media_preview),
             ("status", status),
@@ -413,8 +468,8 @@ class Sample(Batch):
         Multi-input multimodal chains the extra inputs off the head via
         :meth:`Part.input_child` so only the head is a root, e.g.::
 
-            text = Part.input(ids, primitive=Texts(...))
-            Sample.request(text, text.input_child(Images(...)))  # image+text
+            text = Part.input(ids, primitives={"text": Texts(...)})
+            Sample.request(text, text.input_child({"image": Images(...)}))  # image+text
 
         :meth:`Sample.conditioning` then surfaces both primitives (text, image)
         in turn order for the gen step. See ``docs/rollout-sample-refactor.md`` §3.
@@ -591,7 +646,7 @@ class Sample(Batch):
         """
         if not self.parts:
             raise ValueError("Sample.observe: no parts to observe from (empty Sample)")
-        obs_part = self.parts[-1].input_child(observation, role=role)
+        obs_part = self.parts[-1].input_child({primitive_modality_key(observation): observation}, role=role)
         return type(self)(parts=[*self.parts, obs_part], reward_compute_s=self.reward_compute_s)
 
     def propagate_rewards(self, op: Literal["mean", "max", "sum"] = "mean") -> "Sample":
@@ -643,8 +698,8 @@ class Sample(Batch):
 
         Ancestors are walked by id: ``active_ids`` are the ancestor ids aligned to
         the frontier's samples, climbed one level per step via ``parent_id``; each
-        level's rows are looked up by id (position-independent). Undecoded ancestors
-        (``primitive is None``) are skipped; for a non-frontier part's turns
+        level's rows are looked up by id (position-independent). Ancestors with
+        no populated ``primitives`` are skipped; for a non-frontier part's turns
         (replay), call this on ``parts[:i+1]``."""
         if not self.parts:
             return []
@@ -663,8 +718,15 @@ class Sample(Batch):
                 raise ValueError(
                     f"Sample.turns: ancestor id {e.args[0]!r} not found in part {anc}; lineage chain is malformed."
                 ) from None
-            if part.primitive is not None:
-                content = part.primitive.select(torch.tensor(rows, dtype=torch.long))
+            # The ancestor walk runs newest -> oldest and the final reverse below
+            # restores chronological order. Append a multi-primitive Part in
+            # reverse canonical modality order so its modalities remain canonical
+            # after that final reversal.
+            for key in reversed(PRIMITIVE_MODALITY_ORDER):
+                primitive = part.primitives.get(key)
+                if primitive is None:
+                    continue
+                content = primitive.select(torch.tensor(rows, dtype=torch.long))
                 out.append(Turn(role=part.resolved_role(), content=content))
             if part.is_root:
                 break
@@ -675,7 +737,7 @@ class Sample(Batch):
 
     def conditioning(self) -> List[Primitive]:
         """Conditioning primitives for generating the frontier (last) part: each
-        ancestor's ``primitive`` (raw text/image), row-aligned to the frontier's
+        ancestor's raw primitives, row-aligned to the frontier's
         samples, in chronological order (root → frontier-parent). The role-stripped
         view of :meth:`turns` — the bare-primitive escape unified models consume
         (replay: call on ``parts[:i+1]``)."""
@@ -709,7 +771,7 @@ class Sample(Batch):
         """Whether any non-frontier Part carries an ``Images`` primitive — the
         boolean replacement for the retired ``image_input_part`` reject/require
         guards."""
-        return any(isinstance(p.primitive, Images) for p in self.parts[:-1])
+        return any("image" in p.primitives for p in self.parts[:-1])
 
     def replace_frontier(self, part: Part) -> "Sample":
         """Swap the frontier (last) part, preserving the chain (``parts[:-1]``) and
@@ -719,7 +781,7 @@ class Sample(Batch):
 
     def with_filled_frontier(self, **fill_kwargs: Any) -> "Sample":
         """Fill the frontier gen shell with generation outputs, chain preserved —
-        ``with_filled_frontier(segment=…, primitive=…, conditions=…)``."""
+        ``with_filled_frontier(segment=…, primitives=…, conditions=…)``."""
         return self.replace_frontier(self.parts[-1].fill(**fill_kwargs))
 
 
@@ -727,6 +789,9 @@ __all__ = [
     "Sample",
     "Part",
     "Primitive",
+    "PrimitiveMap",
+    "PrimitiveMetadata",
+    "PRIMITIVE_MODALITY_ORDER",
     "Turn",
     "TURN_ROLES",
 ]

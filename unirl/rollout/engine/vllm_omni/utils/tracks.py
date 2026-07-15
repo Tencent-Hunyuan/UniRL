@@ -15,7 +15,7 @@ import torch
 
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions import Condition
-from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
+from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos, primitive_modality_key
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments import Segment
@@ -180,7 +180,7 @@ def build_image_segment(
     - ``sigmas`` from ``trajectory_timesteps`` — the field name reads
       "timesteps" but the ``RL*Pipeline.forward`` overwrites its contents with
       the true [0, 1] σ schedule (``[T+1]``); do not "fix" the misnomer.
-      Verified against ``expected_sigmas`` (the engine-pinned ``req.sigmas``)
+      Verified against ``expected_sigmas`` (the engine-pinned diffusion params)
       via :func:`verify_engine_used_sigmas` so a broken wire surfaces here.
     - ``sde_logp`` from ``trajectory_log_probs`` ``[B, K]`` (K = SDE-gated
       step count; can be < T for sparse SDE, 0 for NFT/forward-process).
@@ -201,7 +201,7 @@ def build_image_segment(
     traj_log_probs: Optional[torch.Tensor] = torch.cat(per_log_probs, dim=0) if per_log_probs else None
     head = diff_outputs[0]
     seg_sigmas = getattr(head, "trajectory_timesteps", None)
-    # Engine→worker→response σ contract: the engine pinned ``req.sigmas``
+    # Engine→worker→response σ contract: the engine pinned ``sampling_params.sigmas``
     # before dispatch, the worker consumed it via ``set_timesteps(sigmas=...)``
     # and echoed the same values back. Assert equality so a broken wire
     # surfaces immediately rather than silently de-syncing replay.
@@ -419,7 +419,7 @@ def assemble_sample(
     """Fill the request ``Sample``'s gen ``Part``s with the per-track outputs.
 
     One filled Part per ``segments_for_track`` key, each carrying its own
-    segment + decoded primitive (or ``None``). ``conditions`` were resp-wide in
+    segment + decoded primitive map. ``conditions`` were resp-wide in
     the legacy shape; keep that behavior by replicating onto every filled Part
     (the legacy single-image-track replay is the only consumer today). The
     input Part and any untouched gen Part pass through unchanged.
@@ -427,12 +427,14 @@ def assemble_sample(
     new_parts = list(sample.parts)
     for track_name, segment in segments_for_track.items():
         idx = _gen_part_index_for_track(sample, track_name)
+        decoded = decoded_for_track.get(track_name)
+        primitives = {primitive_modality_key(decoded): decoded} if decoded is not None else {}
         new_parts[idx] = new_parts[idx].fill(
             segment=segment,
-            primitive=decoded_for_track.get(track_name),
+            primitives=primitives,
             conditions=dict(conditions),
         )
-    return Sample(parts=new_parts)
+    return sample.with_parts(new_parts)
 
 
 __all__ = [

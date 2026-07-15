@@ -19,7 +19,7 @@ from unirl.models.types.ar import ARStage
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
-from unirl.sde.runtime import FlowMatchSchedulePolicy
+from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.sample import Part, Sample
 
 Stage = Union[DiffusionStage, ARStage]
@@ -149,19 +149,10 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
         """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
 
-        Sample-shaped analogue of ``ensure_req_sigmas``: σ is the single source of
-        truth, computed from the model-owned schedule policy applied to the gen
-        part's (T, H, W). Shared across the part's samples (one params object). Only
-        reached when a diffusion stage is present (``schedule_policy is not None``).
+        Shared across the part's samples (one params object). Only reached when a
+        diffusion stage is present (``schedule_policy is not None``).
         """
-        diffusion = sample.parts[-1].sampling_params
-        if diffusion is None or diffusion.sigmas is not None:
-            return
-        diffusion.sigmas = self.schedule_policy.compute_sigma(
-            num_inference_steps=int(diffusion.num_inference_steps),
-            height=int(diffusion.height),
-            width=int(diffusion.width),
-        )
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
     def shutdown(self) -> None:
         with self._shutdown_lock:

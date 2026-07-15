@@ -101,18 +101,20 @@ def _t2i_sample(n_prompts: int = 2, branch: int = 2, metadata: Optional[list] = 
     """``[root(P), image(P*branch)]`` with the image Part filled — a scorable T2I Sample."""
     root = Part.input(
         [f"p{i}" for i in range(n_prompts)],
-        primitive=Texts(texts=[f"prompt {i}" for i in range(n_prompts)]),
+        primitives={"text": Texts(texts=[f"prompt {i}" for i in range(n_prompts)])},
         metadata=metadata,
     )
-    image = root.fork(branch, sampling_params=_diff_params()).fill(primitive=_images(n_prompts * branch))
+    image = root.fork(branch, sampling_params=_diff_params()).fill(primitives={"image": _images(n_prompts * branch)})
     return Sample(parts=[root, image], reward_compute_s=1.5)
 
 
 def _pe_sample() -> Sample:
     """``[root(orig text), ar(rewrite text), image]`` — both ancestor texts populated."""
-    root = Part.input(["p0"], primitive=Texts(texts=["original prompt"]))
-    ar = root.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=["the rewritten prompt"]))
-    image = ar.fork(1, sampling_params=_diff_params()).fill(primitive=_images(1))
+    root = Part.input(["p0"], primitives={"text": Texts(texts=["original prompt"])})
+    ar = root.fork(1, sampling_params=ARSamplingParams()).fill(
+        primitives={"text": Texts(texts=["the rewritten prompt"])}
+    )
+    image = ar.fork(1, sampling_params=_diff_params()).fill(primitives={"image": _images(1)})
     return Sample(parts=[root, ar, image])
 
 
@@ -127,7 +129,7 @@ def check_root_metadata() -> None:
     """``Sample.root_metadata`` projects the root prompt's metadata onto a descendant
     Part's rows (lineage walk); a metadata-free root yields all-None."""
     md = [{"vqa": "cat"}, {"vqa": "dog"}]
-    root = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]), metadata=md)
+    root = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])}, metadata=md)
     ar = root.fork(2, sampling_params=ARSamplingParams())
     image = ar.fork(1, sampling_params=_diff_params())
     sample = Sample(parts=[root, ar, image])
@@ -140,14 +142,14 @@ def check_root_metadata() -> None:
     _check(sample.root_metadata(-1) == sample.root_metadata(2), "default part_index=-1 is the frontier")
     _check(sample.root_metadata(0) == md, "root part: metadata is itself (one per prompt)")
 
-    no_md_root = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    no_md_root = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     no_md = Sample(parts=[no_md_root, no_md_root.fork(2, sampling_params=_diff_params())])
     _check(no_md.root_metadata(-1) == [None, None, None, None], "metadata-free root -> all-None, frontier length")
 
 
 def check_build_reward_request() -> None:
     """``_build_reward_request`` keys conditioning into ``primitives`` (nearest ancestor
-    wins), pairs the frontier ``primitive`` as ``generated``, aligns root metadata, and
+    wins), pairs the frontier ``primitives`` map as ``generated``, aligns root metadata, and
     guards the backend/frontier modality match."""
     # T2I: single text ancestor, row-aligned to the 4 images; metadata expands per image.
     sample = _t2i_sample(n_prompts=2, branch=2, metadata=[{"m": 0}, {"m": 1}])
@@ -162,12 +164,16 @@ def check_build_reward_request() -> None:
     _check(list(req.sample_ids) == list(sample.parts[-1].sample_ids), "sample_ids come from the frontier")
 
     # Modality guard: a text-consuming backend on an image frontier must fail loud.
-    _expect_raises(lambda: _build_reward_request(sample, "text"), ValueError, "backend/frontier modality mismatch raises")
+    _expect_raises(
+        lambda: _build_reward_request(sample, "text"), ValueError, "backend/frontier modality mismatch raises"
+    )
 
     # PE: two text ancestors (original + rewrite) — the NEAREST (rewrite) wins the slot.
     pe = _pe_sample()
     pe_req = _build_reward_request(pe, "image")
-    _check(list(pe_req.primitives["text"].texts) == ["the rewritten prompt"], "caption = nearest text ancestor (rewrite)")
+    _check(
+        list(pe_req.primitives["text"].texts) == ["the rewritten prompt"], "caption = nearest text ancestor (rewrite)"
+    )
 
 
 def check_score_and_attach_t2i() -> None:
@@ -179,9 +185,13 @@ def check_score_and_attach_t2i() -> None:
 
     out = service.score_and_attach(sample)
     frontier = out.parts[-1]
-    _check(frontier.rewards is not None and torch.allclose(frontier.rewards, torch.tensor([0.1, 0.2, 0.3, 0.4])), "rewards on frontier")
     _check(
-        frontier.component_rewards is not None and torch.allclose(frontier.component_rewards["clip"], torch.tensor([1.0, 2.0, 3.0, 4.0])),
+        frontier.rewards is not None and torch.allclose(frontier.rewards, torch.tensor([0.1, 0.2, 0.3, 0.4])),
+        "rewards on frontier",
+    )
+    _check(
+        frontier.component_rewards is not None
+        and torch.allclose(frontier.component_rewards["clip"], torch.tensor([1.0, 2.0, 3.0, 4.0])),
         "component_rewards on frontier",
     )
     _check(out.parts[0] is sample.parts[0], "input Part passes through unchanged")
@@ -192,9 +202,9 @@ def check_score_and_attach_t2i() -> None:
 def check_score_and_attach_ar_truncation() -> None:
     """AR truncation shaping fires only on an AR frontier: a sample that hit
     ``max_new_tokens`` is zeroed under ``truncated_reward='zero'`` and kept under 'keep'."""
-    root = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]))
+    root = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])})
     ar = root.fork(1, sampling_params=ARSamplingParams(max_new_tokens=10)).fill(
-        primitive=Texts(texts=["o0", "o1"]),
+        primitives={"text": Texts(texts=["o0", "o1"])},
         segment=SimpleNamespace(lengths=torch.tensor([10, 5])),  # sample 0 hit the cap
     )
     sample = Sample(parts=[root, ar])
@@ -215,9 +225,9 @@ def check_score_and_attach_guards() -> None:
     scored = scored.with_parts([scored.parts[0], _part_with_field(scored.parts[-1], "rewards", torch.zeros(4))])
     _expect_raises(lambda: service.score_and_attach(scored), RuntimeError, "precomputed rewards on frontier must raise")
 
-    root = Part.input(["p0"], primitive=Texts(texts=["x"]))
-    unfilled = Sample(parts=[root, root.fork(1, sampling_params=_diff_params())])  # gen shell, primitive=None
-    _expect_raises(lambda: service.score_and_attach(unfilled), ValueError, "unfilled frontier (primitive None) must raise")
+    root = Part.input(["p0"], primitives={"text": Texts(texts=["x"])})
+    unfilled = Sample(parts=[root, root.fork(1, sampling_params=_diff_params())])  # empty primitive map
+    _expect_raises(lambda: service.score_and_attach(unfilled), ValueError, "unfilled frontier must raise")
 
     failing = RewardService(_StubBackend("image", rewards=[0.0, 0.0, 0.0, 0.0], successes=[True, False, True, True]))
     _expect_raises(lambda: failing.score_and_attach(_t2i_sample()), RuntimeError, "a flagged failure must raise")

@@ -53,8 +53,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
     require(
         isinstance(images, Images),
-        f"HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in "
-        f"sample.conditioning(), found none",
+        "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
     schedule = params.sigmas.to(pipeline.bundle.device)
@@ -115,5 +114,5 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
     edited = pipeline.vae_decode.decode(latent_seg)
 
-    filled = frontier.fill(segment=latent_seg, primitive=edited, conditions=diff_conds.to_dict())
+    filled = frontier.fill(segment=latent_seg, primitives={"image": edited}, conditions=diff_conds.to_dict())
     return sample.with_parts([*sample.parts[:-1], filled])

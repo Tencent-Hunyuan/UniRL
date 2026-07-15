@@ -119,7 +119,8 @@ class AsyncARTrainer(ARTrainer):
         normalize_adv_by_std: bool = True,
         balance_shards: bool = False,
         eval_interval: int = 0,
-        eval_num_prompts: int = 60,
+        eval_num_prompts: int = -1,
+        eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
         # ---- async knobs ----
@@ -138,7 +139,9 @@ class AsyncARTrainer(ARTrainer):
         self.normalize_adv_by_std = normalize_adv_by_std
         self.balance_shards = bool(balance_shards)
         self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
+        _num = int(eval_num_prompts)
+        self.eval_num_prompts = -1 if _num < 0 else _num
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
         self.data_source = instantiate(data_source_cfg)

@@ -22,11 +22,13 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     # the retired RolloutReq / RolloutResp / RolloutTrack triplet).
     "Sample": ("unirl.types.sample", "Sample"),
     "Part": ("unirl.types.sample", "Part"),
+    "Primitive": ("unirl.types.sample", "Primitive"),
+    "PrimitiveMap": ("unirl.types.sample", "PrimitiveMap"),
+    "PrimitiveMetadata": ("unirl.types.sample", "PrimitiveMetadata"),
     "ARSamplingParams": ("unirl.types.sampling", "ARSamplingParams"),
     "BaseSamplingParams": ("unirl.types.sampling", "BaseSamplingParams"),
     "DiffusionSamplingParams": ("unirl.types.sampling", "DiffusionSamplingParams"),
     "total_samples_per_prompt": ("unirl.types.sampling", "total_samples_per_prompt"),
-    "TrajectoryStore": ("unirl.types.trajectory_store", "TrajectoryStore"),
 }
 
 __all__ = list(_LAZY_ATTRS.keys())

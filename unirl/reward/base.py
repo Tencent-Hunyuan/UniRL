@@ -9,8 +9,12 @@ holds exactly one of them.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, List, Optional, Protocol, runtime_checkable
 
 from unirl.types.reward import RewardRequest, RewardResponse
+
+if TYPE_CHECKING:
+    import torch
 
 
 class RewardBackend(ABC):
@@ -61,6 +65,31 @@ class RewardBackend(ABC):
         """Optional lifecycle hook: terminal cleanup."""
 
 
+@runtime_checkable
+class DifferentiableReward(Protocol):
+    """Optional capability: in-process ``nn.Module`` rewards that return a
+    grad-carrying score tensor for ReFL (direct differentiable-reward backprop).
+
+    Deliberately NOT part of :class:`RewardBackend` — remote/HTTP and scalar-only
+    backends can never satisfy it (autograd can't cross a process or a wire). A
+    scorer that wraps a differentiable model (pickscore / clip / hps / aesthetic /
+    image_reward) declares the capability simply by defining
+    ``compute_rewards_differentiable``; the reward role detects it via
+    ``isinstance(backend, DifferentiableReward)``. Mirrors the optional-capability
+    ``LatentShapeProvider`` Protocol in ``unirl.models.types.pipeline``.
+    """
+
+    def compute_rewards_differentiable(
+        self,
+        images_tensor: "torch.Tensor",
+        prompts: List[str],
+        records: Optional[List[dict]] = None,
+    ) -> "torch.Tensor":
+        """Score a grad-carrying image tensor ``[B, C, H, W]`` in ``[0, 1]`` →
+        ``[B]`` reward tensor with ``grad_fn`` intact (no ``no_grad``/``.item()``)."""
+        ...
+
+
 class BaseRewardComponentSpec(ABC):
     """Marker base for every reward backend spec.
 
@@ -75,5 +104,6 @@ class BaseRewardComponentSpec(ABC):
 
 __all__ = [
     "BaseRewardComponentSpec",
+    "DifferentiableReward",
     "RewardBackend",
 ]

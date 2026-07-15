@@ -34,7 +34,7 @@ def _log(msg: str) -> None:
 
 def build_request_sample() -> Sample:
     prompts = ["a photo of a red apple on a wooden table", "an astronaut riding a horse on the moon"]
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=prompts))
+    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitives={"text": Texts(texts=prompts)})
     diff_params = DiffusionSamplingParams(
         num_inference_steps=4,
         guidance_scale=1.0,  # CFG off → no negative prompt / neg-embed plumbing
@@ -76,13 +76,17 @@ def main() -> int:
         assert list(gen.sample_ids) == list(gen_in.sample_ids), "gen ids changed"
         assert isinstance(gen.segment, LatentSegment), f"segment must be LatentSegment; got {type(gen.segment)}"
         assert gen.segment.latents is not None, "LatentSegment.latents is None"
-        assert isinstance(gen.primitive, Images), f"decoded primitive must be Images; got {type(gen.primitive)}"
-        assert len(gen.primitive) == 2, f"expected 2 images; got {len(gen.primitive)}"
+        assert isinstance(gen.primitives.get("image"), Images), (
+            f"decoded image primitive must be Images; got {type(gen.primitives.get('image'))}"
+        )
+        assert len(gen.primitives["image"]) == 2, f"expected 2 images; got {len(gen.primitives['image'])}"
         assert gen.conditions, "replay conditions empty"
 
         lat = gen.segment.latents
-        _log(f"PASS: latents shape={tuple(lat.shape)} dtype={lat.dtype}; images={len(gen.primitive)} "
-             f"conditions={sorted(gen.conditions.keys())}")
+        _log(
+            f"PASS: latents shape={tuple(lat.shape)} dtype={lat.dtype}; images={len(gen.primitives['image'])} "
+            f"conditions={sorted(gen.conditions.keys())}"
+        )
         _log("SD3-SGLANG ROLLOUT SMOKE PASSED ✅  (σ-verified; Sample filled correctly)")
         return 0
     except Exception:

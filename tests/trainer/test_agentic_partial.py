@@ -9,7 +9,7 @@ covered by the GPU speed comparison.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List
 
 import pytest
 

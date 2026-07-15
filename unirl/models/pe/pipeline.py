@@ -51,9 +51,9 @@ class PEPipeline(Pipeline):
     fills both gen Parts:
 
     - ``ar_part`` (from the LLM child): ``segment=TextSegment``,
-      ``primitive=Texts`` (the rewritten prompts, marker-extracted).
+      ``primitives['text']=Texts`` (the rewritten prompts, marker-extracted).
     - ``diffusion_part`` (from the diffusion child): ``segment=LatentSegment``,
-      ``primitive=Images``, ``conditions`` carried from the child for replay.
+      ``primitives['image']=Images``, ``conditions`` carried from the child for replay.
 
     Lineage is positional (parent = preceding part), so GRPO groups by prompt on
     the ar Part and by rewrite on the diffusion Part. ``ar_part.conditions`` is left
@@ -146,10 +146,10 @@ class PEPipeline(Pipeline):
         P = len(input_part.sample_ids)
         if P == 0:
             raise ValueError("PEPipeline.generate: empty Sample")
-        prompts = input_part.primitive
+        prompts = input_part.primitives.get("text")
         if not isinstance(prompts, Texts):
             raise TypeError(
-                f"PEPipeline.generate: input Part.primitive must be Texts; "
+                f"PEPipeline.generate: input Part.primitives['text'] must be Texts; "
                 f"got {type(prompts).__name__ if prompts is not None else 'None'}"
             )
         if len(ar_shell.sample_ids) % P != 0:
@@ -167,7 +167,7 @@ class PEPipeline(Pipeline):
         # prompts + ar_shell; control['chat'] carries the (optional) pe_instruction.
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
-            primitive=prompts,
+            primitives={"text": prompts},
             control=self._ar_control(input_part.control or {}),
         )
         ar_out = self.llm_pipeline.generate(Sample(parts=[ar_input, ar_shell]))
@@ -176,10 +176,10 @@ class PEPipeline(Pipeline):
             raise RuntimeError(
                 f"PEPipeline.generate: LLM child returned {len(ar_part.sample_ids)} samples; expected P*N={P * N}"
             )
-        rewritten = ar_part.primitive
+        rewritten = ar_part.primitives.get("text")
         if not isinstance(rewritten, Texts) or len(rewritten.texts) != P * N:
             raise RuntimeError(
-                "PEPipeline.generate: LLM child must emit Texts on the ar Part primitive "
+                "PEPipeline.generate: LLM child must emit Texts in ar Part primitives['text'] "
                 f"(expected {P * N}, got {len(rewritten.texts) if isinstance(rewritten, Texts) else 'None'})"
             )
 
@@ -188,14 +188,14 @@ class PEPipeline(Pipeline):
         # cleaned rewrite; off-format / empty outputs fall back to the user prompt.
         # Rewrite onto the ar Part's primitive so wandb / logging see the same text.
         rewritten = self._extract_pe(rewritten, prompts, N)
-        ar_part = ar_part.fill(primitive=rewritten)
+        ar_part = ar_part.fill(primitives={"text": rewritten})
 
         # ── Level 2: P*N → P*N*M images. The PE ids ("p0/0") are non-root, so they
         # can't be a child Sample's root input. Re-root the PE prompts onto fresh
         # ids, fork the diffusion shell off them (preserving sampling params + x_T
         # segment), generate, then map outputs back onto our lineage-correct
         # diff_shell (row order matches: both group-by-parent, branch=M).
-        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitive=rewritten)
+        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives={"text": rewritten})
         diff_child_shell = pe_input.fork(
             M,
             sampling_params=diff_shell.sampling_params,
@@ -210,7 +210,8 @@ class PEPipeline(Pipeline):
             )
         diffusion_part = diff_shell.fill(
             segment=diff_child.segment,
-            primitive=diff_child.primitive,
+            primitives=dict(diff_child.primitives),
+            primitive_metadata=dict(diff_child.primitive_metadata),
             conditions=dict(diff_child.conditions),
             media_preview=diff_child.media_preview,
         )

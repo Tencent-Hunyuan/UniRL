@@ -73,5 +73,5 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
     images = pipeline.vae_decode.decode(latent_seg)
 
-    filled = frontier.fill(segment=latent_seg, primitive=images, conditions=diff_conds.to_dict())
+    filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=diff_conds.to_dict())
     return sample.with_parts([*sample.parts[:-1], filled])

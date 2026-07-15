@@ -62,12 +62,13 @@ def check_unique_group_indices() -> None:
 def check_single_turn_text() -> None:
     """No roles set ⇒ each prompt renders a lone ``user`` message (byte-identical to
     the pre-gap-C hardcoded shape); fan-out de-expands to P unique conversations."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["a cat", "a dog"]))  # no role
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a cat", "a dog"])})  # no role
     sample = Sample(parts=[inp, inp.fork(2, sampling_params=_ar())])  # branch 2
     convs, k = build_text_conversations(sample)
     _check(k == 2, "k == fork branch (2)")
     _check(
-        convs == [
+        convs
+        == [
             [{"role": "user", "content": "a cat"}],
             [{"role": "user", "content": "a dog"}],
         ],
@@ -78,7 +79,7 @@ def check_single_turn_text() -> None:
 def check_single_turn_system_rule() -> None:
     """Config ``system_instruction`` is prepended only when no explicit ``system``
     turn exists; an explicit system turn wins."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["q"]))
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["q"])})
     sample = Sample(parts=[inp, inp.fork(1, sampling_params=_ar())])
     convs, _ = build_text_conversations(sample, "BE NICE")
     _check(
@@ -86,8 +87,8 @@ def check_single_turn_system_rule() -> None:
         "config system_instruction prepended when no system turn",
     )
 
-    sys_in = Part.input(["s0"], primitive=Texts(texts=["SYS"]), role="system")
-    usr = sys_in.input_child(Texts(texts=["q"]), role="user")
+    sys_in = Part.input(["s0"], primitives={"text": Texts(texts=["SYS"])}, role="system")
+    usr = sys_in.input_child({"text": Texts(texts=["q"])}, role="user")
     sample2 = Sample(parts=[sys_in, usr, usr.fork(1, sampling_params=_ar())])
     convs2, _ = build_text_conversations(sample2, "CONFIG SYS")
     _check([m["role"] for m in convs2[0]] == ["system", "user"], "explicit system turn rendered")
@@ -96,18 +97,21 @@ def check_single_turn_system_rule() -> None:
 
 def check_multi_turn_text_order() -> None:
     """user → assistant → tool renders three messages in lineage order."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["what is 2+2?"]), role="user")
-    asst = inp.fork(1, sampling_params=_ar()).fill(primitive=Texts(texts=["let me compute"]))
-    tool = asst.input_child(Texts(texts=["4"]), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["what is 2+2?"])}, role="user")
+    asst = inp.fork(1, sampling_params=_ar()).fill(primitives={"text": Texts(texts=["let me compute"])})
+    tool = asst.input_child({"text": Texts(texts=["4"])}, role="tool")
     sample = Sample(parts=[inp, asst, tool, tool.fork(1, sampling_params=_ar())])
     convs, k = build_text_conversations(sample)
     _check(k == 1, "branch-1 chain -> k=1")
     _check(
-        convs == [[
-            {"role": "user", "content": "what is 2+2?"},
-            {"role": "assistant", "content": "let me compute"},
-            {"role": "tool", "content": "4"},
-        ]],
+        convs
+        == [
+            [
+                {"role": "user", "content": "what is 2+2?"},
+                {"role": "assistant", "content": "let me compute"},
+                {"role": "tool", "content": "4"},
+            ]
+        ],
         "multi-turn conversation in lineage order",
     )
 
@@ -115,9 +119,9 @@ def check_multi_turn_text_order() -> None:
 def check_multi_turn_dexpand_fanout() -> None:
     """A final-turn branch>1 over a multi-turn prefix collapses to one conversation
     (the shared prefix), ``k`` = the final branch."""
-    inp = Part.input(["p0"], primitive=Texts(texts=["q"]), role="user")
-    asst = inp.fork(1, sampling_params=_ar()).fill(primitive=Texts(texts=["a"]))
-    tool = asst.input_child(Texts(texts=["t"]), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=["q"])}, role="user")
+    asst = inp.fork(1, sampling_params=_ar()).fill(primitives={"text": Texts(texts=["a"])})
+    tool = asst.input_child({"text": Texts(texts=["t"])}, role="tool")
     sample = Sample(parts=[inp, asst, tool, tool.fork(3, sampling_params=_ar())])
     convs, k = build_text_conversations(sample)
     _check(k == 3, "k == final fork branch (3)")
@@ -127,7 +131,7 @@ def check_multi_turn_dexpand_fanout() -> None:
 
 def check_two_prompt_fanout() -> None:
     """Two prompts × branch 2 → two conversations, representatives in group order."""
-    inp = Part.input(["p0", "p1"], primitive=Texts(texts=["x", "y"]), role="user")
+    inp = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["x", "y"])}, role="user")
     sample = Sample(parts=[inp, inp.fork(2, sampling_params=_ar())])
     convs, k = build_text_conversations(sample)
     _check(k == 2 and len(convs) == 2, "2 prompts x branch 2 -> 2 convs, k=2")
@@ -137,8 +141,8 @@ def check_two_prompt_fanout() -> None:
 def check_vlm_fusion() -> None:
     """it2i [text(user), image(user)] fuses into one user message with the image
     block BEFORE the text block — byte-identical to ``encode_mm``."""
-    text = Part.input(["p0"], primitive=Texts(texts=["edit"]), role="user")
-    img = text.input_child(_images(1), role="user")
+    text = Part.input(["p0"], primitives={"text": Texts(texts=["edit"])}, role="user")
+    img = text.input_child({"image": _images(1)}, role="user")
     sample = Sample.request(text, img).fork(1, sampling_params=_ar())
     convs, images_list, k = build_vision_conversations(sample)
     _check(k == 1, "branch-1 -> k=1")
@@ -151,8 +155,8 @@ def check_vlm_fusion() -> None:
 
 def check_vlm_dexpand() -> None:
     """Two image+text prompts × branch 2 → two conversations + two image bundles."""
-    text = Part.input(["p0", "p1"], primitive=Texts(texts=["a", "b"]), role="user")
-    img = text.input_child(_images(2), role="user")
+    text = Part.input(["p0", "p1"], primitives={"text": Texts(texts=["a", "b"])}, role="user")
+    img = text.input_child({"image": _images(2)}, role="user")
     sample = Sample.request(text, img).fork(2, sampling_params=_ar())
     convs, images_list, k = build_vision_conversations(sample)
     _check(k == 2 and len(convs) == 2 and len(images_list) == 2, "2 prompts x branch 2 -> 2 convs/images, k=2")

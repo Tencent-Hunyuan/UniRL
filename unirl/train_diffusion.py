@@ -37,6 +37,7 @@ def main(cfg: DictConfig) -> None:
         logging_cfg=cfg.get("logging"),
         layout=cfg.get("layout", "colocate"),
         train_fraction=cfg.get("train_fraction", 0.5),
+        reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
@@ -45,6 +46,7 @@ def main(cfg: DictConfig) -> None:
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
         eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        eval_rewards_cfg=cfg.get("eval_rewards"),
         stage_config=cfg.get("stage_config"),
     )
     trainer.train(

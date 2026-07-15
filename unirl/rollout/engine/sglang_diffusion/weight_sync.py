@@ -141,15 +141,27 @@ class WeightSync:
         would strand one GPU-resident adapter copy (~34 MB/sync measured).
         """
         # Canonical wire keys are "<pipeline_prefix><module>.lora_A.weight"; SGLang's
-        # lora_layers dict is keyed from inside the transformer, so strip the prefix
-        # and inject ".alpha" keys (scale = alpha/rank).
+        # lora_layers dict is keyed from inside the transformer, so strip the prefix.
+        # We do NOT inject per-layer ".alpha" keys anymore (no peft_config here): the
+        # LoRA scale is delivered adapter-wide via ``lora_alpha`` below, which needs
+        # no per-layer name alignment and so is robust to param renaming.
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
-            peft_config=peft_config,
         )
         nickname = adapter_name
-        self._backend.set_lora(lora_nickname=nickname, lora_tensors=stripped)
+        # Adapter-level LoRA alpha (one value for the whole adapter). The engine
+        # stores it once and uses it as the scale source (alpha / rank) for every
+        # layer via _apply_lora_to_layers. Harmless on an older fork whose set_lora
+        # ignores the kwarg (the backend then forwards lora_alpha=None).
+        adapter_alpha = None
+        if peft_config is not None:
+            adapter_alpha = peft_config.get("lora_alpha")
+        self._backend.set_lora(
+            lora_nickname=nickname,
+            lora_tensors=stripped,
+            lora_alpha=(float(adapter_alpha) if adapter_alpha is not None else None),
+        )
         self._active_adapter = nickname
         self._lora_loaded = True
 

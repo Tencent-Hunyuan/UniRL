@@ -15,7 +15,7 @@ import needed, so this module is import-safe on any interpreter).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Union
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -24,3 +24,8 @@ class SetLoraFromTensorsReq:
     lora_tensors: dict  # dict[str, torch.Tensor]
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
+    # Optional adapter-level LoRA alpha (one value for the whole adapter), forwarded
+    # to the fork's ``LoRAPipeline.set_lora(lora_alpha=...)``. Supplies the scale
+    # (alpha / rank) for layers whose per-layer ``<layer>.alpha`` key was stranded by
+    # param renaming. ``None`` leaves the pipeline on its existing per-layer path.
+    lora_alpha: Optional[float] = None

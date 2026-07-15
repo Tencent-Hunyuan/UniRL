@@ -34,6 +34,7 @@ from unirl.rollout.engine.sglang_diffusion.config import (
 )
 from unirl.rollout.engine.sglang_diffusion.weight_sync import WeightSync
 from unirl.sde.noise import generate_latents
+from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sample import Part, Sample
 from unirl.utils.dtypes import parse_torch_dtype
@@ -170,18 +171,10 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
         """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
 
-        Sample-shaped analogue of ``ensure_req_sigmas``: σ is the single source of
-        truth, computed from the model-owned schedule policy applied to the
-        request's (T, H, W). Shared across the part's samples (one params object).
+        σ is the single source of truth, computed from the model-owned schedule
+        policy and shared across the part's samples (one params object).
         """
-        diffusion = sample.parts[-1].sampling_params
-        if diffusion is None or diffusion.sigmas is not None:
-            return
-        diffusion.sigmas = self.schedule_policy.compute_sigma(
-            num_inference_steps=int(diffusion.num_inference_steps),
-            height=int(diffusion.height),
-            width=int(diffusion.width),
-        )
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
     def _generate_batch(self, sample: Sample) -> Sample:
         initial_noise = self._resolve_initial_noise(sample)
@@ -192,13 +185,16 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
     def _resolve_initial_noise(self, sample: Sample) -> Optional[torch.Tensor]:
         """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic.
 
-        The x_T noise key is derived from the lineage path (OD-2): the parent
+        ``disable_driver_xt`` returns ``None`` before every recipe/fallback path.
+        Otherwise, the x_T noise key is derived from the lineage path (OD-2): the parent
         (group) id under ``init_same_noise`` so siblings share x_T, else the
         per-sample id. ``initial_latents`` (img2img) rides on the gen part's
         ``LatentSegment`` shell; the regen shape on ``init_noise_latent_shape``.
         """
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
+        if diffusion is not None and bool(getattr(diffusion, "disable_driver_xt", False)):
+            return None
         recipe = NoiseRecipe.from_sample(sample)
         xt = recipe.resolve()
         if xt is not None:

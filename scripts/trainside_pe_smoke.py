@@ -61,7 +61,7 @@ def build_request_sample() -> Sample:
     prompts = ["a cat", "a dog"]
     input_part = Part.input(
         [f"p{i}" for i in range(len(prompts))],
-        primitive=Texts(texts=prompts),
+        primitives={"text": Texts(texts=prompts)},
         control={"ar": {}, "chat": {}},
     )
     ar_params = ARSamplingParams(samples_per_prompt=2, temperature=0.7, max_new_tokens=32, top_p=0.9, top_k=20)
@@ -109,18 +109,21 @@ def main() -> int:
         assert len(out.parts) == 3, f"expected [input, ar, diffusion]; got {len(out.parts)} parts"
         ar_part, diff_part = out.parts[1], out.parts[2]
         assert isinstance(ar_part.segment, TextSegment), f"ar segment must be TextSegment; got {type(ar_part.segment)}"
-        assert isinstance(ar_part.primitive, Texts) and len(ar_part.primitive.texts) == 4, (
+        assert isinstance(ar_part.primitives.get("text"), Texts) and len(ar_part.primitives["text"].texts) == 4, (
             "ar Part must carry 4 (=P*N) rewritten Texts"
         )
         assert isinstance(diff_part.segment, LatentSegment), (
             f"diffusion segment must be LatentSegment; got {type(diff_part.segment)}"
         )
-        assert isinstance(diff_part.primitive, Images) and len(diff_part.primitive) == 4, (
+        assert isinstance(diff_part.primitives.get("image"), Images) and len(diff_part.primitives["image"]) == 4, (
             "diffusion Part must carry 4 (=P*N*M) decoded Images"
         )
         # lineage: diffusion ids descend from ar ids descend from prompt ids
         assert len(diff_part.sample_ids) == 4, f"expected 4 diffusion samples; got {len(diff_part.sample_ids)}"
-        _log(f"rollout PASS: ar={len(ar_part.primitive.texts)} rewrites, diffusion={len(diff_part.primitive)} images ✓")
+        _log(
+            f"rollout PASS: ar={len(ar_part.primitives['text'].texts)} rewrites, "
+            f"diffusion={len(diff_part.primitives['image'])} images ✓"
+        )
 
         _log("TRAINSIDE PE SMOKE PASSED ✅  (3-part Sample chain filled by in-process child pipelines)")
         return 0

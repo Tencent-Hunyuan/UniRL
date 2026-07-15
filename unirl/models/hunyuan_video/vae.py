@@ -18,6 +18,8 @@ HunyuanVideo-1.0 VAE config:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -33,8 +35,15 @@ class HunyuanVideoVAEDecodeStage(DecodeStage[LatentSegment, Videos]):
     def __init__(self, bundle: HunyuanVideoBundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Videos:
-        """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
+        """Decode the final-step latents in *s* into a packed ``Videos`` payload.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
+        """
         if s.latents is None:
             raise ValueError("HunyuanVideoVAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 6:
@@ -52,9 +61,17 @@ class HunyuanVideoVAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         vae = self.bundle.vae
         scaling_factor = float(getattr(vae.config, "scaling_factor", 0.476986))
 
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32) / scaling_factor
-            decoded = vae.to(torch.float32).decode(latents_f32, return_dict=False)[0]
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32) / scaling_factor
+            return vae.to(torch.float32).decode(latents_f32, return_dict=False)[0]
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
 
         # Decoded layout: [B, C, T_dec, H_dec, W_dec] in [-1, 1].
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)

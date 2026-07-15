@@ -18,6 +18,8 @@ ControlNet lands.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -33,13 +35,19 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
     def __init__(self, bundle: ZImageBundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Images:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
         """Decode the final-step latents in *s* into pixel images.
 
         Reads ``s.latents[:, -1]`` (the final stored position, which is
         ``T`` — the clean latent ``x_0`` in spatial shape
         ``[B, C, H, W]``). VAE forward runs in fp32; output is clamped to
         ``[0, 1]`` before being wrapped in ``Images``.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("ZImageVAEDecodeStage.decode: segment.latents is None")
@@ -51,11 +59,20 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
         scaling_factor = self.bundle.vae.config.scaling_factor
         shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32) / scaling_factor
+
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32) / scaling_factor
             if shift_factor is not None:
                 latents_f32 = latents_f32 + float(shift_factor)
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
+            return self.bundle.vae.to(torch.float32).decode(latents_f32).sample
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)
 

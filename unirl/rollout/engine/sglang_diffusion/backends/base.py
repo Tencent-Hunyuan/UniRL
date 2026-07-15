@@ -115,7 +115,13 @@ class Backend(Protocol):
     ) -> None: ...
     def destroy_weights_group(self, *, group_name: str) -> None: ...
     def set_lora(
-        self, *, lora_nickname: str, lora_tensors: Dict[str, Any], target: str = "all", strength: float = 1.0
+        self,
+        *,
+        lora_nickname: str,
+        lora_tensors: Dict[str, Any],
+        target: str = "all",
+        strength: float = 1.0,
+        lora_alpha: Optional[float] = None,
     ) -> None: ...
     def weights_checksum(self, *, module_names: List[str]) -> dict: ...
 

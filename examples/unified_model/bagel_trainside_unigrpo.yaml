@@ -1,0 +1,245 @@
+# @package _global_
+# BAGEL-7B-MoT x UniGRPO (Prompt -> Thinking -> Image), single-model TRAINSIDE,
+# full fine-tuning.
+#
+# Reproduces UniGRPO on BAGEL within the framework's unified-model mode: ONE shared
+# MoT transformer drives both halves on the SAME weights -- the AR (und/text
+# experts) generates the reasoning "thinking" text, then the diffusion (gen/image
+# experts) renders an image conditioned on prompt+thinking. Trained jointly by GRPO
+# (text) + BagelFlowUniGRPO (flow + velocity-MSE): two backward -> one optimizer
+# step (UnifiedModelTrainStack).
+#
+# Single-engine (M=1) mode of UnifiedModelTrainer: one TRAINSIDE rollout on the
+# shared BagelUniPipeline (samples the live FSDP modules -> no weight sync, no base
+# offload). The single `rollout:` block (vs HI3's ar_rollout/dit_rollout) selects
+# this mode; BagelUniPipeline fans P -> P*N -> P*N*M (M=1) internally and returns
+# the {"ar","image"} 2-track resp.
+#
+# Key UniGRPO alignment:
+#   - N = ar.samples_per_prompt = G (group of thinking chains); M = 1 image/chain.
+#   - image SHARES the AR's prompt-level advantage (UnifiedModelTrainer M=1 path).
+#   - no CFG during training (cfg_*_scale = 1 -> single-forward).
+#   - velocity-MSE regularization (mse_weight) replaces the latent-KL; text KL = 0.
+#   - per-expert LR in one optimizer: reasoning(und) 1e-6, denoising(gen) 3e-5.
+#   - GRPO-Guard RatioNorm on the off-policy PPO update(s).
+#
+# Full fine-tuning: the MoT decoder experts are trained directly (no LoRA). FSDP
+# shards params + grads + optimizer states across all ranks.
+#
+# NOTE (rebased onto main): the rollout is per-sample navit bs=1 (the branch's
+# pack-B / forward_batch_size rollout packing is dropped here — it conflicts with
+# main's KV-in-conditions diffusion design; re-add as a follow-up if rollout
+# throughput matters). With bs=1 the rollout and replay geometry match, so the
+# image side uses old_logp_source=rollout (the on-policy ratio is 1 without a
+# pre-update replay).
+#
+# Launch (multi-node; the launcher sets num_devices = NUM_NODES * GPUS_PER_NODE):
+#   PYTHONPATH=$PWD python -m unirl.train_unified_model \
+#     --config-name unified_model/bagel_trainside_unigrpo
+
+num_devices: 32               # DP world size (the multinode launcher overrides this)
+batch_size: 32                # P prompts/rollout; MUST be divisible by num_devices (DP_SCATTER)
+num_rollouts: 2000
+weight_sync_interval: 1       # no-op trainside (rollout shares the live FSDP modules)
+enable_fsdp_offload: false    # trainside: forced false by the trainer anyway
+
+# Checkpointing. save_interval=N saves every N rollouts (step = rollout_id + 1).
+# save_mode=full is REQUIRED for full fine-tuning (there are no LoRA keys to save).
+save_interval: 100
+save_dir: ${oc.env:CKPT_DIR,outputs}/${oc.env:WANDB_RUN_NAME,bagel-unigrpo}/checkpoints
+save_mode: full
+
+logging:
+  report_to_wandb: ${oc.env:REPORT_TO_WANDB,false}
+  project_name: ${oc.env:WANDB_PROJECT,bagel-unigrpo}
+  run_name: ${oc.env:WANDB_RUN_NAME,null}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [bagel, unigrpo, trainside, unified-model, fullft]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,/root/BAGEL-7B-MoT}
+    # bf16 base load. Under full FT the trainable decoder blocks are upcast to the
+    # fp32 master (backend.fsdp_cfg.master_dtype) while the all-gathered COMPUTE
+    # copy stays bf16 (MixedPrecisionPolicy) -- forward math (and the on-policy
+    # ratio) is unchanged; only the optimizer accumulation gains precision.
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1)
+    logprob_precision: fp32
+    shift: 3.0
+    # Full fine-tuning: the bundle unfreezes the Qwen2MoTDecoderLayer blocks (und +
+    # gen experts) when use_lora=false; no LoRA adapters are injected.
+    use_lora: false
+
+pipeline:
+  # Unified reasoning->image pipeline: exposes .ar (BagelARStage) + .diffusion on
+  # the SHARED bundle (the trainer injects bundle=). Fans P -> P*N -> P*N*M (M=1)
+  # internally and returns the {"ar","image"} 2-track resp.
+  _target_: unirl.models.bagel.pipeline.BagelUniPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16                  # COMPUTE dtype (all-gather + forward/backward)
+    master_dtype: fp32                 # full FT: every block param is trainable and
+                                       # uniformly upcast to fp32 -> a real fp32 master
+                                       # (a bf16 master would lose the und 1e-6 LR to rounding)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true     # 7B + thinking + 25-step diffuse/replay: required
+    use_torch_compile: false
+    # Vendored BAGEL code calls embed_tokens / lm_head / forward_inference outside a
+    # root forward, which is incompatible with a root fully_shard group owning those
+    # params. embed/norm/lm_head stay frozen under full FT, so they sit outside every
+    # group with no grad.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6              # reasoning (und/text) experts: smaller LR
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+    # Per-expert LR: image (gen) experts train faster. Params whose name contains
+    # "moe_gen" use the LR below; everything else (und experts) uses learning_rate.
+    param_group_lrs:
+      moe_gen: 3.0e-5                  # denoising (gen/image) experts: larger LR
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  # No lora_cfg: full fine-tuning trains every requires_grad param of the wrapped
+  # transformer (the decoder blocks the bundle unfroze).
+
+# Single TRAINSIDE rollout (the M=1 / UniGRPO mode). stage_attrs eval-scopes BOTH
+# trainable stages (the same shared transformer). Per-sample navit bs=1.
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion, ar]
+
+# Local reward: PickScore (CLIP-ViT-H image-text alignment), an in-process scorer
+# colocated on every train Worker -- no reward service / REWARD_SERVICE_URL needed.
+# It scores each image against its ORIGINAL prompt (no per-image vqa_list/metadata;
+# UnifiedModelTrainer.train_step already tolerates empty metadata for pickscore
+# prompts). Weights load from the HF cache (set HF_HOME to a shared, pre-warmed dir).
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+# Two algorithms over the ONE shared pipeline (ar -> pipeline.ar, image ->
+# pipeline.diffusion). UnifiedModelTrainer reads algorithm.ar / algorithm.image.
+algorithm:
+  ar:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2                 # text/LLM trust region
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  image:
+    _target_: unirl.algorithms.bagel_flow_unigrpo.BagelFlowUniGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-6                 # flow trust region (clip range)
+    clip_schedule: constant
+    # Rollout anchor: μ_old (sde_means) and π_old (sde_logp) are the rollout's own
+    # per-SDE-step recordings. Valid because the rollout is per-sample navit bs=1 — the
+    # same geometry as the bs=1 train replay — so on-policy μ_old == μ_θ → ratio = 1.
+    # (Replay anchor would only be needed if rollout ran a different geometry, e.g. pack-B.)
+    old_logp_source: rollout
+    mse_weight: 1.5e-5                 # velocity-MSE weight (replaces the latent KL)
+    # GRPO-Guard RatioNorm: per-SDE-step normalize the flow ratio (it is otherwise
+    # left-shifted, mean < 1, so clipping never engages). Only bites on the off-policy
+    # update(s), i.e. needs num_updates_per_batch >= 2. μ_old comes from segment.sde_means
+    # as recorded by the rollout (bs=1, matching the bs=1 replay geometry).
+    ratio_norm: true
+    grad_reweight: false              # GRPO-Guard's optional 2nd part (x 1/dt); off by default
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelDiffusionConditions
+    params: ${sampling.diffusion}
+
+# One stack: single backend + both algorithms. num_updates_per_batch=2 = 2 PPO
+# epochs: split each per-GPU shard into 2 disjoint mini-batches, freeze both pi_old
+# anchors once, and run one optimizer step per mini-batch -- the 2nd step is
+# off-policy so clip_range / RatioNorm actually engage. The shard size must be
+# divisible by num_updates_per_batch.
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # pickscore prompts: one prompt per line (.txt). The prompt feeds generation
+      # and is scored 1:1 against the rendered image by the PickScore reward (no
+      # per-image metadata; the data source carries none, which train_step allows).
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Modality-keyed sampling (PR #70): per prompt -> N=G thinking chains
+# (temperature-sampled), each -> M=1 image. AR GRPO groups by prompt over the G
+# chains; the image shares that advantage (M=1). Defaults: G=24, 25 steps,
+# shift=3, eta(noise)=0.8.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 24            # G thinking chains per prompt
+    temperature: 1.0                  # thinking-chain sampling temperature
+    max_new_tokens: 1024
+  diffusion:
+    _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+    samples_per_prompt: 1             # M=1 image per chain
+    num_inference_steps: 25           # diffusion timesteps
+    guidance_scale: 1.0
+    cfg_text_scale: 1.0               # cfg=1 -> single forward (no CFG during training)
+    cfg_img_scale: 1.0
+    cfg_interval: [0.0, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: global
+    eta: 0.8                          # SDE noise level
+    height: 512                       # 512 keeps the train backward within memory (1024 = full res)
+    width: 512
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    # SDE window: 3 SDE steps in the early/high-noise window (first ~0.2 of the 25
+    # steps). Scattered (not contiguous); a contiguous window is a follow-up if
+    # strict parity is needed.
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      timestep_fraction: [0.0, 0.2]
+      num_sde_steps: 3

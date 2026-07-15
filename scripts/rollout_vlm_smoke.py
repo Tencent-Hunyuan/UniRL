@@ -37,9 +37,9 @@ def _log(msg: str) -> None:
 
 def build_request_sample() -> Sample:
     """A 1-prompt image+text request: ``[text_input, image_input, ar_gen]`` via input_child."""
-    text = Part.input(["p0"], primitive=Texts(texts=["Describe this image in one short sentence."]))
+    text = Part.input(["p0"], primitives={"text": Texts(texts=["Describe this image in one short sentence."])})
     # One synthetic 224x224 RGB image (content irrelevant — this validates the path, not accuracy).
-    image_in = text.input_child(Images.from_list([Image(pixels=torch.rand(3, 224, 224))]))
+    image_in = text.input_child({"image": Images.from_list([Image(pixels=torch.rand(3, 224, 224))])})
     ar_params = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=48, top_p=0.9, top_k=20)
     return Sample.request(text, image_in).fork(1, sampling_params=ar_params)
 
@@ -68,8 +68,10 @@ def main() -> int:
         _log("constructing SGLangRolloutEngine (vlm; boots sglang + loads Qwen2.5-VL) ...")
         engine = SGLangRolloutEngine(config, rank=0)
         sample = build_request_sample()
-        _log(f"request: {len(sample.parts)} parts; image input ids={list(sample.parts[1].sample_ids)} "
-             f"gen ids={list(sample.parts[-1].sample_ids)}")
+        _log(
+            f"request: {len(sample.parts)} parts; image input ids={list(sample.parts[1].sample_ids)} "
+            f"gen ids={list(sample.parts[-1].sample_ids)}"
+        )
 
         _log("calling engine.generate(sample) ...")
         out = engine.generate(sample)
@@ -78,14 +80,16 @@ def main() -> int:
         assert len(out.parts) == 3, f"expected [text, image, ar]; got {len(out.parts)} parts"
         gen = out.parts[-1]
         assert isinstance(gen.segment, TextSegment), f"segment must be TextSegment; got {type(gen.segment)}"
-        assert isinstance(gen.primitive, Texts) and len(gen.primitive.texts) == 1, "decoded Texts wrong"
+        assert isinstance(gen.primitives.get("text"), Texts) and len(gen.primitives["text"].texts) == 1, (
+            "decoded Texts wrong"
+        )
         assert gen.conditions, "replay conditions empty"
         # The multimodal replay conditions must carry the vision tensors.
         assert "pixel_values" in gen.conditions and "image_grid_thw" in gen.conditions, (
             f"VLM conditions must carry pixel_values + image_grid_thw; got {sorted(gen.conditions.keys())}"
         )
 
-        _log(f"PASS: decoded={gen.primitive.texts[0][:100]!r}")
+        _log(f"PASS: decoded={gen.primitives['text'].texts[0][:100]!r}")
         _log(f"PASS: conditions={sorted(gen.conditions.keys())} (multimodal vision tensors present)")
         _log("VLM MULTI-INPUT ROLLOUT SMOKE PASSED ✅  (image+text Sample → TextSegment + pixel_values)")
         return 0

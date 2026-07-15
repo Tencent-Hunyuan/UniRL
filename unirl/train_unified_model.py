@@ -27,8 +27,9 @@ def main(cfg: DictConfig) -> None:
         bundle_cfg=cfg.bundle,
         pipeline_cfg=cfg.pipeline,
         backend_cfg=cfg.backend,
-        ar_rollout_cfg=cfg.ar_rollout,
-        dit_rollout_cfg=cfg.dit_rollout,
+        ar_rollout_cfg=cfg.get("ar_rollout"),
+        dit_rollout_cfg=cfg.get("dit_rollout"),
+        rollout_cfg=cfg.get("rollout"),
         reward_cfg=cfg.reward,
         ar_algorithm_cfg=cfg.algorithm.ar,
         image_algorithm_cfg=cfg.algorithm.image,
@@ -39,6 +40,11 @@ def main(cfg: DictConfig) -> None:
         dump_dir=cfg.get("dump_dir"),
         logging_cfg=cfg.get("logging"),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
+        eval_interval=cfg.get("eval_interval", 0),
+        eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
+        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
+        eval_eta=float(cfg.get("eval_eta", 0.0)),
+        eval_rewards_cfg=cfg.get("eval_rewards"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

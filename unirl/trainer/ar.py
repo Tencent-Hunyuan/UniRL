@@ -23,7 +23,7 @@ class ARTrainer(BaseTrainer):
     """Autoregressive (VLM / LLM) RL trainer: rollout + train colocated.
 
     Sibling of :class:`~unirl.trainer.diffusion.DiffusionTrainer` for the
-    AR path. Structurally identical except ``_build_req`` carries **no SDE step
+    AR path. Structurally identical except ``_build_request_sample`` carries **no SDE step
     scheduling** — that is diffusion-only (``DiffusionSamplingParams`` owns
     ``scheduler`` / ``sde_indices`` / ``resolve_sde_indices``), and
     ``ARSamplingParams`` has none of it. Keeping the AR trainer separate means
@@ -54,7 +54,8 @@ class ARTrainer(BaseTrainer):
         normalize_adv_by_std: bool = True,
         balance_shards: bool = False,
         eval_interval: int = 0,
-        eval_num_prompts: int = 60,
+        eval_num_prompts: int = -1,
+        eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
     ) -> None:
@@ -74,8 +75,17 @@ class ARTrainer(BaseTrainer):
         self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
         # AIME-style periodic eval — avg@k accuracy on the eval prompt set
         # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
+        # ``eval_num_prompts`` sentinel:
+        #   -1 (default, or any negative)  → full eval set
+        #    0                             → yield nothing (explicit skip)
+        #    N > 0                         → cap: score first N prompts
+        # ``eval_batch_size`` (default 8) is the iteration batch size, decoupled
+        # from the eval-set size (mirrors verl's ``data.val_batch_size``). Bounds
+        # peak GPU memory during eval-time rollout.
         self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
+        _num = int(eval_num_prompts)
+        self.eval_num_prompts = -1 if _num < 0 else _num
+        self.eval_batch_size = max(1, int(eval_batch_size))
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
@@ -124,16 +134,24 @@ class ARTrainer(BaseTrainer):
         passes its own); ``None`` uses ``self.sampling_params``.
         """
         sp = sampling if sampling is not None else self.sampling_params
+        unsupported = set(inputs.primitives) - {"text", "image", "video"}
+        if unsupported:
+            raise ValueError(
+                f"ARTrainer._build_request_sample: unsupported input primitive keys: {sorted(unsupported)}"
+            )
         root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
         text = Part.input(
             root_ids,
-            primitive=inputs.primitives["text"],
+            primitives={"text": inputs.primitives["text"]},
             metadata=list(inputs.metadata) if inputs.metadata else None,
         )
         input_parts = [text]
-        image_prim = inputs.primitives.get("image")
-        if image_prim is not None:
-            input_parts.append(text.input_child(image_prim))
+        parent = text
+        for key in ("image", "video"):
+            primitive = inputs.primitives.get(key)
+            if primitive is not None:
+                parent = parent.input_child(primitives={key: primitive})
+                input_parts.append(parent)
         return Sample.request(*input_parts).fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
 
     def train_step(
@@ -167,10 +185,10 @@ class ARTrainer(BaseTrainer):
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
             part.rewards = hydrate(part.rewards)
+            if isinstance(part.component_rewards, dict):
+                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            part = part.compute_advantages(
-                normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
-            )
+            part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
             sample = sample.with_parts([*sample.parts[:-1], part])
 
         self._dump_rollout_samples(sample, rollout_id)
@@ -191,44 +209,66 @@ class ARTrainer(BaseTrainer):
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
-        """Periodic eval — ``avg@k`` accuracy on the eval prompt set (no training).
+        """Periodic eval — ``avg@k`` accuracy on the eval prompt set.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
-        advantage/backward: pull ``eval_num_prompts`` eval prompts
-        (``run.eval_data_path``), expand each to ``eval_samples_per_prompt``
-        siblings, generate at ``eval_temperature``, score, and log the mean
-        reward (= avg@k accuracy since reward is 0/1) under ``eval/*``. Returns it.
+        advantage/backward: iterate up to ``eval_num_prompts`` prompts from
+        ``run.eval_data_path`` in ``eval_batch_size``-sized batches, expand
+        each prompt to ``eval_samples_per_prompt`` siblings, generate at
+        ``eval_temperature``, score, and log the mean reward under both
+        ``eval/acc`` (= avg@k accuracy, since the MC reward is 0/1) and
+        ``eval/reward`` (shares the eval axis with the other trainers).
+        Returns it.
+
+        ``eval_num_prompts=-1`` (default) evaluates the full eval set;
+        ``eval_num_prompts=0`` yields no batches (explicit skip). See the
+        sentinel table on :meth:`~unirl.data.data_source.MultimodalRLDataSource.iter_eval_batches`.
         """
         import dataclasses
 
-        eval_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
         eval_ar = dataclasses.replace(
             self.sampling_params.get("ar"),
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        sample = self._build_request_sample(eval_inputs, rollout_id, sampling=eval_sp)
-        self.rollout.wake_up()
-        if self.weight_sync is not None:
-            self.weight_sync.sync()
-        sample = self.rollout.generate(sample)
-        self.rollout.sleep()
+        eval_batches = self.data_source.iter_eval_batches(
+            self.eval_batch_size,
+            eval_num_prompts=self.eval_num_prompts,
+        )
+        reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        sample = self.reward.score_and_attach(sample)
-        part = sample.parts[-1]
-        acc = 0.0
-        if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
-            acc = float(part.rewards.to(torch.float32).mean().item())
+        self.rollout.wake_up()
+        try:
+            if self.weight_sync is not None:
+                self.weight_sync.sync()
+            for eval_inputs in eval_batches:
+                batch_n += 1
+                prompt_n += len(eval_inputs.sample_ids)
+                sample = self._build_request_sample(eval_inputs, rollout_id, sampling=eval_sp)
+                generated = self.rollout.generate(sample)
+                scored = self.reward.score_and_attach(generated)
+                rewards = scored.parts[-1].rewards
+                if rewards is not None:
+                    rewards = hydrate(rewards).to(torch.float32)
+                    reward_sum += float(rewards.sum().item())
+                    reward_n += int(rewards.numel())
+        finally:
+            self.rollout.sleep()
+
+        acc = reward_sum / max(1, reward_n)
         logger.info(
-            "EVAL rollout %d  eval_acc(avg@%d over %d prompts)=%.4f",
+            "EVAL rollout %d  eval_acc(avg@%d over %d prompts, %d batches of <=%d)=%.4f",
             rollout_id + 1,
             self.eval_samples_per_prompt,
-            self.eval_num_prompts,
+            prompt_n,
+            batch_n,
+            self.eval_batch_size,
             acc,
         )
-        self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc})
+        # MC reward is 0/1 so mean reward == accuracy; also emit it as `reward`
+        # so this run shares the eval/reward axis with the other trainers.
+        self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
 
     def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
@@ -255,7 +295,7 @@ class ARTrainer(BaseTrainer):
             cond = sample.conditioning()
             prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
             part = sample.parts[-1]
-            outputs = getattr(part.primitive, "texts", None) or []
+            outputs = getattr(part.primitives.get("text"), "texts", None) or []
             rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")

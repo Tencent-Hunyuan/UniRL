@@ -37,11 +37,11 @@ stay swappable by `_target_`.
   `colocate` builds train + rollout as siblings on one slab; `separate` opens two
   disjoint `placement` slabs and runs a one-time cross-slab handshake for weight sync.
 - **The loop** (`train_step`) is the conductor sequence, one rollout per call:
-  `wake_up` → (sync the fresh adapter, if due) → `rollout.generate(req)` →
-  `reward.score_and_attach(track)` → `track.compute_advantages(...)` → drop the
-  reward-only decoded media → `stack.train_track(track)`. The driver first builds the
-  typed `RolloutReq` (expanding each prompt into an N-sample GRPO group, authoring the
-  `x_T` recipe, resolving the step scheduler's `sde_indices`).
+  `wake_up` → (sync the fresh adapter, if due) → `rollout.generate(sample)` →
+  `reward.score_and_attach(sample)` → `part.compute_advantages(...)` → drop the
+  reward-only decoded media → `stack.train_track(part)`. The driver first builds a
+  request `Sample`, forks its generation Part into the N-sample GRPO group, authors
+  the `x_T` recipe, and resolves the step scheduler's `sde_indices`.
 
 The four trainers are three shapes:
 
@@ -58,7 +58,7 @@ matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 ## Checkpointing
 
 Available for the single-backend trainers (`DiffusionTrainer`, `ARTrainer`,
-`UnifiedModelTrainer`); `PETrainer` is not wired. A checkpoint bundles the
+`UnifiedModelTrainer`) and for both trained sides of `PETrainer`. A checkpoint bundles the
 model state (`save_mode=auto`: LoRA-only when LoRA is active, otherwise full;
 `save_mode=full`: frozen base + LoRA adapters; `save_mode=adapter`: LoRA keys
 only — MBs instead of GBs), the optimizer state (gathered full via DCP — not

@@ -61,7 +61,7 @@ class HunyuanVideoPipeline(Pipeline):
     frontier Part:
 
     - ``segment: LatentSegment`` (6D video) — the denoising trajectory.
-    - ``primitive: Videos`` — the decoded videos.
+    - ``primitives["video"]: Videos`` — the decoded videos.
 
     ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). No CFG negative branch (T2V).
     """
@@ -180,13 +180,26 @@ class HunyuanVideoPipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def _conditions_for(self, texts: Texts) -> HunyuanVideoConditions:
-        """Encode prompts via LLaMA + CLIP → :class:`HunyuanVideoConditions`. Shared
-        by rollout-``generate`` and trainer-side replay (re-encode), so both build
-        conditions identically. No negative branch (HunyuanVideo-1.0 T2V)."""
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> HunyuanVideoConditions:
+        """Encode prompts (LLaMA + CLIP) into ``HunyuanVideoConditions``.
+
+        HunyuanVideo-1.0 uses guidance embedding (``guidance_embeds=True``)
+        instead of classifier-free guidance — there is NO negative branch,
+        so ``negatives`` / ``guidance_scale`` are accepted for signature
+        parity with the other families but unused here.
+        """
         text_llama = self.text_embed.embed_llama(texts)
         pooled_clip = self.text_embed.embed_clip(texts)
-        return HunyuanVideoConditions(text_llama=text_llama, pooled_clip=pooled_clip)
+        return HunyuanVideoConditions(
+            text_llama=text_llama,
+            pooled_clip=pooled_clip,
+        )
 
     def generate(self, sample: Sample) -> Sample:
         """Run HunyuanVideo-1.0 T2V end-to-end, filling the frontier (pre-forked) gen Part.
@@ -217,7 +230,7 @@ class HunyuanVideoPipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        hv_conds = self._conditions_for(texts)
+        hv_conds = self.build_conditions(texts)
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -229,7 +242,7 @@ class HunyuanVideoPipeline(Pipeline):
 
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=latent_seg, primitive=videos, conditions=hv_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=hv_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

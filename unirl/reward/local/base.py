@@ -75,6 +75,11 @@ class LocalRewardBackend(RewardBackend):
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         """Compute per-sample rewards."""
 
+    # Differentiable scoring (ReFL) is an OPTIONAL capability, not part of this
+    # base: scorers that wrap a differentiable nn.Module define
+    # ``compute_rewards_differentiable`` and thereby satisfy the
+    # ``unirl.reward.base.DifferentiableReward`` Protocol (e.g. PickScore).
+
     def is_available(self) -> bool:
         return self._is_loaded
 

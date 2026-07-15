@@ -16,8 +16,8 @@ pytest.importorskip("torch")
 import torch  # noqa: E402
 
 from unirl.rollout.engine.agentic.engine import AgenticRolloutEngine  # noqa: E402
-from unirl.trainer.agentic_env import AgenticEnvTrainer  # noqa: E402
 from unirl.trainer.agentic import AgenticTrainer  # noqa: E402
+from unirl.trainer.agentic_env import AgenticEnvTrainer  # noqa: E402
 from unirl.types.primitives import Texts  # noqa: E402
 from unirl.types.sample import Part, Sample  # noqa: E402
 from unirl.types.sampling import ARSamplingParams  # noqa: E402
@@ -28,9 +28,9 @@ _SP = ARSamplingParams(samples_per_prompt=1, temperature=1.0, top_p=1.0, top_k=0
 def _traj(sid: str, answer: str = "a") -> Sample:
     """A minimal one-turn trajectory: input root + one filled gen Part."""
     return (
-        Sample.request(Part.input([sid], primitive=Texts(texts=["q"])))
+        Sample.request(Part.input([sid], primitives={"text": Texts(texts=["q"])}))
         .fork(1, sampling_params=_SP)
-        .with_filled_frontier(primitive=Texts(texts=[answer]))
+        .with_filled_frontier(primitives={"text": Texts(texts=[answer])})
     )
 
 
@@ -50,7 +50,7 @@ def test_attach_env_reward_none_is_noop():
 
 def test_attach_env_reward_no_gen_parts_is_noop():
     # input-only sample (reset failed before any generation) — must not raise
-    s = Sample.request(Part.input(["r0"], primitive=Texts(texts=["q"])))
+    s = Sample.request(Part.input(["r0"], primitives={"text": Texts(texts=["q"])}))
     out = AgenticRolloutEngine._attach_env_reward(s, 1.0)
     assert out.parts == s.parts
 

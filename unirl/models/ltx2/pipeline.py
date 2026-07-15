@@ -18,7 +18,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Audio, Audios, Images, Texts
 from unirl.types.sample import Sample
 
 from .bundle import LTX2Bundle
@@ -29,10 +29,10 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage
+from .diffusion import LTX2DiffusionStage, audio_latent_shape
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
-from .vae import LTX2VAEDecodeStage, LTX2VAEEncodeStage
+from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +55,14 @@ class LTX2Pipeline(Pipeline):
         vae_decode: LTX2VAEDecodeStage,
         vae_encode: Optional[LTX2VAEEncodeStage],
         config: LTX2PipelineConfig,
+        audio_decode: Optional[LTX2AudioDecodeStage] = None,
     ) -> None:
         self.bundle = bundle
         self.text_embed = text_embed
         self.diffusion = diffusion
         self.vae_decode = vae_decode
         self.vae_encode = vae_encode
+        self.audio_decode = audio_decode
         self.config = config
         # Exposed for the hosting engine (TrainsideRolloutEngine reads
         # ``pipeline.shift`` to build a FlowMatchSchedulePolicy at startup) —
@@ -100,9 +102,13 @@ class LTX2Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            audio_joint_sde=config.audio_joint_sde,
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
+        # Audio decode is only meaningful for LTX-2.3 T2AV (bundle has audio_vae
+        # + vocoder). For T2V it stays None and the audio path is never taken.
+        audio_decode = LTX2AudioDecodeStage(bundle) if bundle.has_audio else None
 
         return cls(
             bundle=bundle,
@@ -111,6 +117,7 @@ class LTX2Pipeline(Pipeline):
             vae_decode=vae_decode,
             vae_encode=vae_encode,
             config=config,
+            audio_decode=audio_decode,
         )
 
     def build_schedule_policy(self):
@@ -197,18 +204,30 @@ class LTX2Pipeline(Pipeline):
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         return latents * std / float(vae.config.scaling_factor) + mean
 
-    def _conditions_for(self, texts: Texts, params) -> LTX2Conditions:
-        """Encode prompts → :class:`LTX2Conditions`. Shared by rollout-``generate``
-        and trainer-side replay (re-encode), so both build conditions identically.
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> LTX2Conditions:
+        """Encode prompts and optional CFG negatives into ``LTX2Conditions``.
 
         CFG empty-negative: LTX-2's diffusers pipeline defaults negative_prompt to
         ``""`` when guidance is on, so the model sees its trained unconditional
         embedding. Without this, predict_noise would skip the CFG branch entirely
         (negative_text is None) and guidance_scale would be a silent no-op.
-        User-supplied negatives are deferred (single-input request).
+        The Sample path intentionally carries no negative prompt; direct callers
+        such as ReFL can supply one through this public builder.
         """
-        neg = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
-        embed_result = self.text_embed.encode(texts, negative_texts=neg)
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"LTX2Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        embed_result = self.text_embed.encode(texts, negative_texts=negatives)
         return LTX2Conditions.from_dict(embed_result)
 
     def generate(self, sample: Sample) -> Sample:
@@ -246,10 +265,10 @@ class LTX2Pipeline(Pipeline):
             )
 
         # 1-2. Text embedding → conditions (shared re-encode path).
-        conditions = self._conditions_for(texts, params)
+        conditions = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
 
         # 3. Sigma schedule: engine-pinned σ on the gen part wins; else fall back to
-        # the configured schedule (parity with the prior req.sigmas-or-compute path).
+        # the configured schedule (parity with the prior pinned-or-compute path).
         sigmas = get_sigma_schedule(
             num_steps=int(params.num_inference_steps),
             shift=self.config.shift,
@@ -269,7 +288,8 @@ class LTX2Pipeline(Pipeline):
         # denormalized before VAE decode (step 6). ``resolve()`` returns None only
         # under DISABLE_DRIVER_XT — then the recipe shape is None too and we cannot
         # draw video noise without a shape, so that path is unsupported here.
-        latents_5d = NoiseRecipe.from_sample(sample).resolve(device=self.bundle.device)
+        video_recipe = NoiseRecipe.from_sample(sample)
+        latents_5d = video_recipe.resolve(device=self.bundle.device)
         if latents_5d is None:
             raise ValueError(
                 "LTX2Pipeline.generate: no initial latents. The driver x_T recipe "
@@ -280,6 +300,13 @@ class LTX2Pipeline(Pipeline):
         patch_size, patch_size_t = self._patch_sizes()
         initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
+        # Audio x_T: an ``::audio``-salted sibling of the SAME video recipe
+        # (driver-authoritative, independent but reproducible) instead of a bare
+        # randn inside the stage.
+        initial_audio_latents = video_recipe.resolve(
+            device=self.bundle.device, salt="audio", latent_shape=audio_latent_shape(params)
+        )
+
         # 5. Diffusion loop
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
         segment = self.diffusion.generate(
@@ -287,6 +314,7 @@ class LTX2Pipeline(Pipeline):
             params=params,
             sigmas=sigmas,
             initial_latents=initial_latents,
+            initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
         )
 
@@ -299,10 +327,48 @@ class LTX2Pipeline(Pipeline):
         unpacked = self._denormalize_latents(unpacked)
         decoded = self.vae_decode.decode(unpacked)  # → varlen-packed Videos
 
-        # 7. Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=segment, primitive=decoded, conditions=conditions.to_dict())
-        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
+        # 6b. LTX-2.3 T2AV: decode the jointly-generated audio. The audio latent
+        # trajectory rides on ``segment.aux_latents`` (same sparse indices as
+        # the video latents), so the clean final-step audio is at step T. Decode
+        # it to a waveform and carry it as a parallel ``Audios`` on the Part so
+        # the reward service can feed audio scorers (CLAP / ImageBind) alongside
+        # the video. T2V (no audio_decode) skips this entirely.
+        decoded_audio = None
+        audio_sample_rate = None
+        if self.audio_decode is not None and segment.aux_latents is not None:
+            from .diffusion import _LTX2_FRAME_RATE, _audio_num_frames
+
+            audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+            final_audio = segment.aux_latents_at(int(params.num_inference_steps))
+            waveforms = self.audio_decode.decode(final_audio, audio_latent_length=audio_t)
+            # vocoder output: (B, C, L) or (B, L); package one Audio per sample.
+            wf = waveforms.detach().float().cpu()
+            # Store one mono ``[L]`` waveform per sample so ``Audios`` packs
+            # cleanly along its varlen L axis and ``to_list`` recovers ``[L]``.
+            audio_list = []
+            for i in range(int(wf.shape[0])):
+                w = wf[i]
+                if w.ndim == 2:
+                    w = w.mean(dim=0) if w.shape[0] <= w.shape[1] else w.mean(dim=1)
+                audio_list.append(Audio(waveform=w.reshape(-1)))
+            decoded_audio = Audios.from_list(audio_list)
+            audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
+
+        # 7. Video and audio are one joint generation and therefore occupy one
+        # frontier Part. Keep their row alignment in the modality-keyed map and
+        # store the audio rate as shared modality metadata.
+        primitives = {"video": decoded}
+        primitive_metadata = {}
+        if decoded_audio is not None:
+            primitives["audio"] = decoded_audio
+            primitive_metadata["audio"] = {"sample_rate": audio_sample_rate}
+        filled = frontier.fill(
+            segment=segment,
+            primitives=primitives,
+            primitive_metadata=primitive_metadata,
+            conditions=conditions.to_dict(),
+        )
+        return sample.replace_frontier(filled)
 
 
 __all__ = ["LTX2Pipeline"]

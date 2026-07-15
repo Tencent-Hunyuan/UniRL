@@ -43,8 +43,8 @@ def _log(msg: str) -> None:
 
 def build_request_sample() -> Sample:
     """A 1-prompt IT2I request ``[text, image_input, ar_gen, image_gen]`` via input_child."""
-    text = Part.input(["p0"], primitive=Texts(texts=["Make the cat wear a small red hat."]), control={})
-    image_in = text.input_child(Images.from_list([Image(pixels=torch.rand(3, _HW, _HW))]))
+    text = Part.input(["p0"], primitives={"text": Texts(texts=["Make the cat wear a small red hat."])}, control={})
+    image_in = text.input_child({"image": Images.from_list([Image(pixels=torch.rand(3, _HW, _HW))])})
     ar_params = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=64, top_p=0.9, top_k=20)
     diff_params = DiffusionSamplingParams(
         num_inference_steps=4,
@@ -68,9 +68,7 @@ def main() -> int:
     _log(f"torch {torch.__version__} cuda={torch.version.cuda} device_count={torch.cuda.device_count()}")
     _log(f"model_path={model_path}")
 
-    model_config = HunyuanImage3PipelineConfig(
-        pretrained_model_ckpt_path=model_path, model_precision="bf16", shift=3.0
-    )
+    model_config = HunyuanImage3PipelineConfig(pretrained_model_ckpt_path=model_path, model_precision="bf16", shift=3.0)
     engine_config = VLLMOmniEngineConfig(
         model_path=model_path,
         modality="hi3_it2i",
@@ -82,9 +80,11 @@ def main() -> int:
         _log("constructing VLLMOmniRolloutEngine (hi3_it2i; boots HI3 80B across 8 GPUs) ...")
         engine = VLLMOmniRolloutEngine(engine_config, device=torch.device("cuda:0"), rank=0, model_config=model_config)
         sample = build_request_sample()
-        _log(f"request: {len(sample.parts)} parts; "
-             f"image input ids={list(sample.parts[1].sample_ids)} ar ids={list(sample.parts[2].sample_ids)} "
-             f"image gen ids={list(sample.parts[3].sample_ids)}")
+        _log(
+            f"request: {len(sample.parts)} parts; "
+            f"image input ids={list(sample.parts[1].sample_ids)} ar ids={list(sample.parts[2].sample_ids)} "
+            f"image gen ids={list(sample.parts[3].sample_ids)}"
+        )
 
         _log("calling engine.generate(sample) — AR recaption (text+image) → DiT edited image ...")
         out = engine.generate(sample)
@@ -99,11 +99,16 @@ def main() -> int:
         # Edited-image Part filled
         assert isinstance(img.segment, LatentSegment), f"image segment must be LatentSegment; got {type(img.segment)}"
         assert img.segment.latents is not None, "image LatentSegment.latents is None"
-        assert isinstance(img.primitive, Images) and len(img.primitive) == 1, "edited image decoded wrong"
+        assert isinstance(img.primitives.get("image"), Images) and len(img.primitives["image"]) == 1, (
+            "edited image decoded wrong"
+        )
         assert img.conditions, "image replay conditions empty (expected the fused HI3 conditions)"
 
         _log(f"PASS: edited-image latents={tuple(img.segment.latents.shape)} dtype={img.segment.latents.dtype}")
-        _log(f"PASS: ar recaption decoded={(ar.primitive.texts[0][:80] if isinstance(ar.primitive, Texts) else None)!r}")
+        _log(
+            f"PASS: ar recaption decoded="
+            f"{(ar.primitives['text'].texts[0][:80] if isinstance(ar.primitives.get('text'), Texts) else None)!r}"
+        )
         _log(f"PASS: image conditions={sorted(img.conditions.keys())}")
         _log("HI3 IT2I ROLLOUT SMOKE PASSED ✅  (image+text → AR recaption → edited image; chain filled)")
         return 0

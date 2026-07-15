@@ -37,8 +37,12 @@ class ImageAdapter(ModelAdapter):
     track_name: str = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
-    #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are images.
+    #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are squeezed to
+    #: images. Legacy image-path video families set this False (drop 4-D instead).
     squeeze_single_frame_4d: bool = True
+    #: Whether to pad (not drop) the attention mask when shorter than embeds.
+    #: Only Edit-Plus sets this (its embeds carry image-token slots). Default False.
+    pad_mask_to_embeds: bool = False
 
     # ------------------------------------------------------------------ #
     # Request side
@@ -47,8 +51,8 @@ class ImageAdapter(ModelAdapter):
     def build_inputs(self, sample: Sample, *, initial_noise: Any) -> Dict[str, Any]:
         """Sealed template: validate, then merge the stage payloads in layer order.
 
-        Reads the request off the ``Sample``: the input ``Part``'s ``primitive``
-        (prompts) and the frontier gen ``Part``'s ``sampling_params`` (the
+        Reads the request off the ``Sample``: the input ``Part``'s text
+        ``primitives`` entry and the frontier gen ``Part``'s ``sampling_params`` (the
         ``DiffusionSamplingParams``, σ pinned on ``.sigmas`` by the engine).
         Override the ``build_prompts`` / ``build_sampling`` stages, not this
         method — the validation gates, engine pins, noise wiring, and SDE-kernel
@@ -58,13 +62,13 @@ class ImageAdapter(ModelAdapter):
         """
         input_part, gen_part = sample.parts[0], sample.parts[-1]
         # ---- sealed validation (fail-fast gates survive any stage override) ----
-        text_prim = input_part.primitive
+        text_prim = input_part.primitives.get("text")
         if not isinstance(text_prim, Texts):
             raise TypeError(
-                f"build_inputs: input Part.primitive must be Texts; got "
+                f"build_inputs: input Part.primitives['text'] must be Texts; got "
                 f"{type(text_prim).__name__ if text_prim is not None else 'None'}"
             )
-        require(bool(text_prim.texts), "build_inputs: input Part.primitive must be non-empty")
+        require(bool(text_prim.texts), "build_inputs: input Part.primitives['text'] must be non-empty")
         require(bool(gen_part.sample_ids), "build_inputs: gen Part has no samples")
 
         diffusion = gen_part.sampling_params
@@ -139,15 +143,21 @@ class ImageAdapter(ModelAdapter):
             if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
-        if initial_noise is not None:
-            kwargs["initial_noise"] = initial_noise
         # Per-step SDE noise key. Keyed on sample_ids (unique per sample) so each
         # sample explores its own per-step SDE noise; the fork keyed on group_ids
         # (same-group samples shared per-step noise). x_T is already per-sample
-        # via the initial_noise injection above, so within-group diversity does
-        # not depend on this; it is a secondary exploration knob.
-        if gen_part.sample_ids:
-            kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
+        # via the initial_noise injection below, so within-group diversity does
+        # not depend on this; it is a secondary exploration knob. GATED on
+        # ``initial_noise``: the driver controls x_T and per-step seeds together
+        # (both are the per-sample group K-vectors the grouped-forward slice patch
+        # must split per output). With DISABLE_DRIVER_XT (initial_noise None) the
+        # engine draws BOTH itself — shipping per-sample ``denoise_seeds`` then
+        # leaves a K-length generator list against a batch_size=1 expanded Req
+        # ("Generator list must have the same length as batch size").
+        if initial_noise is not None:
+            kwargs["initial_noise"] = initial_noise
+            if gen_part.sample_ids:
+                kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
 
         # Layer 4: the upstream rollout machinery is ALWAYS on — the patched
         # stack returns the per-output-sliced T+1 trajectory + σ echo ONLY via
@@ -168,6 +178,12 @@ class ImageAdapter(ModelAdapter):
         # forward process). Mirrors the legacy engine's ``_to_sglang_kwargs``.
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
+        # ``r.trajectory_latents`` (consumed by tracks.py) is set from
+        # ``ctx.trajectory_latents``, which ``_record_trajectory`` only fills when
+        # ``return_trajectory_latents`` is True (it defaults False in rollout_api).
+        # The base DenoisingStage path apparently has it on; LTX-2's custom denoising
+        # leaves it off, so request it explicitly.
+        kwargs["return_trajectory_latents"] = True
         if is_forward_process(sde_indices):
             kwargs["rollout_sde_type"] = "ode"
             kwargs["rollout_noise_level"] = float(diffusion.eta)
@@ -265,7 +281,8 @@ class ImageAdapter(ModelAdapter):
 
         # Fill the frontier gen Part; ``with_filled_frontier`` preserves every
         # preceding part (the prompt head and any chained inputs).
-        return sample.with_filled_frontier(segment=segment, primitive=decoded, conditions=conditions)
+        primitives = {self.track_name: decoded} if decoded is not None else {}
+        return sample.with_filled_frontier(segment=segment, primitives=primitives, conditions=conditions)
 
     # ------------------------------------------------------------------ #
     # Overridable conversion steps (defaults delegate to utils)
@@ -307,7 +324,7 @@ class ImageAdapter(ModelAdapter):
         return utils.stack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        text_cond, neg_text_cond = utils.fuse_text_conditions(results)
+        text_cond, neg_text_cond = utils.fuse_text_conditions(results, allow_mask_pad=self.pad_mask_to_embeds)
         out: Dict[str, Any] = {}
         if text_cond is not None:
             out["text"] = text_cond

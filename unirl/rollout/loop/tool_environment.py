@@ -157,13 +157,13 @@ class ToolEnvironment:
         control = dict(root.control or {})
         control["tool_sessions"] = sessions
         # ``_part_with_field`` swaps only ``control`` — preserving the encoded prompt
-        # (``primitive``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
+        # (``primitives``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
         return Sample.request(_part_with_field(root, "control", control))
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
         """Consume the frontier action; return ``(observation, done, info)``.
 
-        Reads ``sample.parts[-1].primitive.texts`` (one text per frontier sample), executes any tool
+        Reads ``sample.parts[-1].primitives['text'].texts`` (one text per frontier sample), executes any tool
         call per row, and returns a row-aligned :class:`Texts` observation. ``done`` once no row
         called a tool, or at ``max_turns``.
 
@@ -172,7 +172,7 @@ class ToolEnvironment:
         instance counter, so concurrent trajectories sharing one env don't clobber it.
         """
         turn = len(sample.gen_parts())
-        frontier = sample.parts[-1].primitive
+        frontier = sample.parts[-1].primitives.get("text")
         if not isinstance(frontier, Texts):
             raise TypeError(
                 f"ToolEnvironment.step expects a Texts frontier primitive; got {type(frontier).__name__}"

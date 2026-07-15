@@ -50,11 +50,15 @@ def _env(monkeypatch, solve_on: str = "win", max_steps: int = 5) -> AlfworldEnv:
 
 
 def _request(sid: str, game_index: int) -> Sample:
-    return Sample.request(Part.input([sid], primitive=Texts(texts=["ignored"]), metadata=[{"game_index": game_index}]))
+    return Sample.request(
+        Part.input([sid], primitives={"text": Texts(texts=["ignored"])}, metadata=[{"game_index": game_index}])
+    )
 
 
 def _turn(sample: Sample, action_text: str) -> Sample:
-    return sample.fork(1, sampling_params=_SP).with_filled_frontier(primitive=Texts(texts=[action_text]))
+    return sample.fork(1, sampling_params=_SP).with_filled_frontier(
+        primitives={"text": Texts(texts=[action_text])}
+    )
 
 
 def test_parse_action():
@@ -77,7 +81,7 @@ def test_reset_builds_react_prompt_and_episode(monkeypatch):
     s = env.reset(_request("r0:g0", 0))
     root = s.parts[0]
     assert root.sample_ids[0] == "r0:g0"
-    text = root.primitive.texts[0]
+    text = root.primitives["text"].texts[0]
     assert "Action:" in text and "mug 1" in text and "Admissible actions:" in text
     assert (root.control or {}).get("alfworld", {}).get("episode_id")
     assert len(env._episodes) == 1

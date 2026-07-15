@@ -212,6 +212,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     ar_idx = sample.gen_part_index(ARSamplingParams)
     image_idx = sample.gen_part_index(DiffusionSamplingParams)
     new_parts = list(sample.parts)
-    new_parts[ar_idx] = ar_part.fill(segment=text_seg, primitive=Texts(texts=cots), conditions=ar_conds.to_dict())
-    new_parts[image_idx] = image_part.fill(segment=latent_seg, primitive=images, conditions=diff_conds.to_dict())
+    new_parts[ar_idx] = ar_part.fill(
+        segment=text_seg, primitives={"text": Texts(texts=cots)}, conditions=ar_conds.to_dict()
+    )
+    new_parts[image_idx] = image_part.fill(
+        segment=latent_seg, primitives={"image": images}, conditions=diff_conds.to_dict()
+    )
     return sample.with_parts(new_parts)

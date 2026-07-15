@@ -33,7 +33,7 @@ See the module-level RISKS docstring at the bottom for upstream gaps.
 
 from __future__ import annotations
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -395,8 +395,13 @@ def _set_lora_from_tensors(
     lora_tensors: dict,
     target: Union[str, List[str]] = "all",
     strength: Union[float, List[float]] = 1.0,
+    lora_alpha: Optional[float] = None,
 ):
-    """Set LoRA adapter from in-memory tensors."""
+    """Set LoRA adapter from in-memory tensors.
+
+    ``lora_alpha`` (optional) is forwarded to the fork's ``set_lora`` as an
+    adapter-level alpha; ``None`` leaves the pipeline on its per-layer path.
+    """
     from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -408,6 +413,7 @@ def _set_lora_from_tensors(
         target=target,
         strength=strength,
         lora_tensors=lora_tensors,
+        lora_alpha=lora_alpha,
     )
     return OutputBatch()
 

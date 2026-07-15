@@ -30,10 +30,10 @@ ANSWER = "7006652"
 
 def _sample_at_turn(root: str, n_turns: int, body: str = TOOLCALL) -> Sample:
     """A trajectory with ``n_turns`` filled gen Parts (frontier carries ``body``)."""
-    s = Sample.request(Part.input([root], primitive=Texts(texts=[f"prompt-{root}"])))
+    s = Sample.request(Part.input([root], primitives={"text": Texts(texts=[f"prompt-{root}"])}))
     for i in range(n_turns):
         s = s.fork(1, sampling_params=ARSamplingParams(samples_per_prompt=1))
-        s = s.with_filled_frontier(primitive=Texts(texts=[body]))
+        s = s.with_filled_frontier(primitives={"text": Texts(texts=[body])})
         if i < n_turns - 1:
             s = s.observe(Texts(texts=[f"obs{i}"]))
     return s

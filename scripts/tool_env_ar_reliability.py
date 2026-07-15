@@ -48,10 +48,15 @@ EXPRS = [
 ]
 # Chained tasks — may induce 3+ turns (the model calls the tool more than once).
 CHAINED = [
-    ("First multiply 123 by 456, then add 7890 to that result. Use the calculator for each step, "
-     "then give the final number.", "123 * 456 + 7890"),
-    ("Compute 5000 minus 1234, then multiply the result by 6, using the calculator. State the final "
-     "number.", "(5000 - 1234) * 6"),
+    (
+        "First multiply 123 by 456, then add 7890 to that result. Use the calculator for each step, "
+        "then give the final number.",
+        "123 * 456 + 7890",
+    ),
+    (
+        "Compute 5000 minus 1234, then multiply the result by 6, using the calculator. State the final number.",
+        "(5000 - 1234) * 6",
+    ),
 ]
 
 
@@ -60,7 +65,7 @@ def _log(msg: str) -> None:
 
 
 def _request(prompt: str) -> Sample:
-    return Sample.request(Part.input(["p0"], primitive=Texts(texts=[prompt])))
+    return Sample.request(Part.input(["p0"], primitives={"text": Texts(texts=[prompt])}))
 
 
 def _norm(s: str) -> str:
@@ -70,8 +75,8 @@ def _norm(s: str) -> str:
 def evaluate(out, expected):
     """One record per sibling: did it call the tool (turn 1), is its final answer correct, #turns."""
     gens = out.gen_parts()
-    first_texts = gens[0].primitive.texts
-    final_texts = gens[-1].primitive.texts
+    first_texts = gens[0].primitives["text"].texts
+    final_texts = gens[-1].primitives["text"].texts
     n = len(final_texts)
     recs = []
     for i in range(n):
@@ -79,9 +84,7 @@ def evaluate(out, expected):
         final = final_texts[i] if i < len(final_texts) else ""
         call = parse_tool_call(first)
         called = call is not None and call.get("name") == "calculator"
-        recs.append(
-            {"called": called, "correct": _norm(expected) in _norm(final), "turns": len(gens), "final": final}
-        )
+        recs.append({"called": called, "correct": _norm(expected) in _norm(final), "turns": len(gens), "final": final})
     return recs
 
 
@@ -94,7 +97,10 @@ def main() -> int:
     _log(f"torch {torch.__version__} cuda={torch.version.cuda}; model={model_path}; n={n}")
 
     calc = CalculatorTool()
-    suite = [(f"Compute {e} using the calculator tool, then state the final number.", e, calc.execute({"expression": e})) for e in EXPRS]
+    suite = [
+        (f"Compute {e} using the calculator tool, then state the final number.", e, calc.execute({"expression": e}))
+        for e in EXPRS
+    ]
     suite += [(prompt, e, calc.execute({"expression": e})) for prompt, e in CHAINED]
 
     schemas = ToolEnvironment([calc]).tool_schemas()
@@ -156,8 +162,10 @@ def main() -> int:
         loop_ok = called / total >= 0.90
         e2e_ok = correct / total >= 0.85
         verdict = "RELIABLE ✅" if (loop_ok and e2e_ok) else "REVIEW ⚠️"
-        _log(f"VERDICT: {verdict}  (loop bar >=90% tool-call: {'ok' if loop_ok else 'MISS'}; "
-             f"e2e bar >=85% correct: {'ok' if e2e_ok else 'MISS'})")
+        _log(
+            f"VERDICT: {verdict}  (loop bar >=90% tool-call: {'ok' if loop_ok else 'MISS'}; "
+            f"e2e bar >=85% correct: {'ok' if e2e_ok else 'MISS'})"
+        )
         return 0
     except Exception:
         _log("RELIABILITY SUITE CRASHED ❌")

@@ -59,12 +59,11 @@ class QwenImagePipeline(Pipeline):
     and fills the frontier Part:
 
     - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitive: Images`` — the decoded images.
+    - ``primitives["image"]: Images`` — the decoded images.
 
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``).conditioning()`` via :meth:`_conditions_for`, so rollout and
-    replay build conditions through one shared path. User-supplied negative
-    prompts are deferred (single-input request); CFG uses a synthesized empty
-    negative.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay.
+    Sample generation uses the model's default CFG negative; direct callers can
+    pass explicit negatives through :meth:`build_conditions`.
     """
 
     def __init__(
@@ -204,9 +203,14 @@ class QwenImagePipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def _conditions_for(self, texts: Texts, params: DiffusionSamplingParams) -> QwenImageConditions:
-        """Encode prompts → :class:`QwenImageConditions`. Shared by rollout-``generate``
-        and trainer-side replay (re-encode), so both build conditions identically.
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> QwenImageConditions:
+        """Encode prompts (+ optional CFG negatives) into ``QwenImageConditions``.
 
         CFG empty negative: Qwen-Image upstream (diffusers v0.37.1
         ``QwenImagePipeline`` docstring at ``pipeline_qwenimage.py:509``)
@@ -223,19 +227,20 @@ class QwenImagePipeline(Pipeline):
         text encoder doesn't run a 34-token prefix strip, so ``""``
         is safe there. The empty-negative value is a per-model
         property, not a framework knob — hence hardcoded per pipeline.
-        (User-supplied negatives are deferred — a single-input request
-        carries only the positive.)
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"QwenImagePipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         if self.text_embed is None:
             raise RuntimeError(
-                "QwenImagePipeline.generate: no text_embed stage "
-                "(load_text_encoder=False). The trainer-side pipeline cannot "
-                "encode prompts in this configuration — separate-engine "
-                "recipes encode in the rollout engine; trainside rollout "
-                "requires load_text_encoder=True."
+                "QwenImagePipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
-        negatives = Texts(texts=[" "] * len(texts.texts)) if float(params.guidance_scale) > 1.0 else None
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[" "] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return QwenImageConditions(text=text_cond, negative_text=negative_text_cond)
 
@@ -268,7 +273,7 @@ class QwenImagePipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        qwen_conds = self._conditions_for(texts, params)
+        qwen_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -283,7 +288,7 @@ class QwenImagePipeline(Pipeline):
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay: Part.conditions is the train stack's source (FlowGRPO re-types them
         # via conditions_cls.from_dict in prepare_segment / compute_loss_and_backward).
-        filled = frontier.fill(segment=latent_seg, primitive=images, conditions=qwen_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=qwen_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

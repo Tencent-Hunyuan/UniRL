@@ -42,9 +42,9 @@ def _log(msg: str) -> None:
 
 def build_multiturn_sample() -> Sample:
     """A 3-turn trajectory ``[user, assistant, tool]`` + a frontier gen shell."""
-    inp = Part.input(["p0"], primitive=Texts(texts=[_USER]), role="user", control={})
-    asst = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitive=Texts(texts=[_ASSISTANT]))
-    tool = asst.input_child(Texts(texts=[_TOOL]), role="tool")
+    inp = Part.input(["p0"], primitives={"text": Texts(texts=[_USER])}, role="user", control={})
+    asst = inp.fork(1, sampling_params=ARSamplingParams()).fill(primitives={"text": Texts(texts=[_ASSISTANT])})
+    tool = asst.input_child({"text": Texts(texts=[_TOOL])}, role="tool")
     ar_params = ARSamplingParams(samples_per_prompt=1, temperature=0.7, max_new_tokens=32, top_p=0.9, top_k=20)
     return Sample(parts=[inp, asst, tool, tool.fork(1, sampling_params=ar_params)])
 
@@ -106,7 +106,7 @@ def main() -> int:
             "turns out of lineage order in the encoded prompt"
         )
         _log("MULTI-TURN ENCODE PASS: sglang prompt carries user → assistant → tool ✓")
-        _log(f"completion: {gen.primitive.texts[0]!r}")
+        _log(f"completion: {gen.primitives['text'].texts[0]!r}")
         _log("SGLANG MULTI-TURN SMOKE PASSED ✅  (the engine conditions on the full trajectory)")
         return 0
     except Exception:

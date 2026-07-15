@@ -32,6 +32,8 @@ and tests.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 
 from unirl.models.types.codec import DecodeStage
@@ -54,13 +56,19 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
     def __init__(self, bundle: Flux2KleinBundle) -> None:
         self.bundle = bundle
 
-    def decode(self, s: LatentSegment) -> Images:
+    def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
         """Decode the final-step patchified latents in *s* into pixel images.
 
         Reads ``s.latents[:, -1]`` (``[B, 128, H_pat, W_pat]`` — the
         clean patchified latent ``x_0`` at position ``T``), runs the
         Klein VAE chain (BN denormalize → unpatchify → decode), and
         normalizes pixels to ``[0, 1]``.
+
+        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
+        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
+        flows from the reward through the frozen VAE into ``clean``; the VAE has no
+        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
+        (grad only) recomputes the decode in backward to trade compute for memory.
         """
         if s.latents is None:
             raise ValueError("Flux2KleinVAEDecodeStage.decode: segment.latents is None")
@@ -72,12 +80,21 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         clean = s.latents[:, -1]  # [B, 128, H_pat, W_pat]
 
         vae = self.bundle.vae
-        with torch.no_grad():
-            latents_f32 = clean.to(dtype=torch.float32)
+
+        def _decode(lat: torch.Tensor) -> torch.Tensor:
+            latents_f32 = lat.to(dtype=torch.float32)
             vae_f32 = vae.to(torch.float32)
             denorm = denormalize_patchified_latents(latents_f32, vae_f32)
             unpatched = unpatchify_latents(denorm)
-            decoded = vae_f32.decode(unpatched, return_dict=False)[0]
+            return vae_f32.decode(unpatched, return_dict=False)[0]
+
+        with nullcontext() if grad else torch.no_grad():
+            if grad and activation_checkpoint and clean.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+
+                decoded = checkpoint(_decode, clean, use_reentrant=False)
+            else:
+                decoded = _decode(clean)
 
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)

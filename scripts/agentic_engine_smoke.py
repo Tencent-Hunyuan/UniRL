@@ -25,11 +25,11 @@ from collections import Counter
 import torch
 
 from unirl.distributed.group.device_pool import DevicePool
-from unirl.rollout.engine.agentic import AgenticRolloutEngine, AgenticRolloutEngineConfig
-from unirl.rollout.engine.sglang.config import SGLangEngineConfig
 from unirl.distributed.tensor import TensorRef
 from unirl.distributed.tensor.ref import hydrate
 from unirl.distributed.utils import collect_leaves
+from unirl.rollout.engine.agentic import AgenticRolloutEngine, AgenticRolloutEngineConfig
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig
 from unirl.rollout.loop import CalculatorTool, ToolEnvironment
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
@@ -107,9 +107,7 @@ def main() -> int:
     engine = None
     try:
         _log(f"creating a {num_gpus}-worker agentic slab (each builds its own inner SGLang) ...")
-        engine = pool.create_remote(
-            AgenticRolloutEngine, device_ids=list(range(num_gpus)), init_kwargs={"config": cfg}
-        )
+        engine = pool.create_remote(AgenticRolloutEngine, device_ids=list(range(num_gpus)), init_kwargs={"config": cfg})
         # Wire rank 0 with its sibling handles (the NCCLWeightSync set_rollout_targets shape).
         engine.set_workers(engine.workers, engine.role_name)
 
@@ -119,7 +117,11 @@ def main() -> int:
         ids = [pid for pid, _, _ in PROMPTS]
         prompts = [text for _, text, _ in PROMPTS]
         batch = Sample.request(
-            Part.input(ids, primitive=Texts(texts=prompts), control={"ar": {"stop": ["</tool_call>"]}})
+            Part.input(
+                ids,
+                primitives={"text": Texts(texts=prompts)},
+                control={"ar": {"stop": ["</tool_call>"]}},
+            )
         )
 
         P = len(PROMPTS)
@@ -148,7 +150,12 @@ def main() -> int:
                 continue
             trajs = [s for s in out if s.parts[0].sample_ids[0] == pid]
             rendered = [
-                " ".join(txt for p in s.parts if isinstance(p.primitive, Texts) for txt in p.primitive.texts)
+                " ".join(
+                    txt
+                    for p in s.parts
+                    if isinstance(p.primitives.get("text"), Texts)
+                    for txt in p.primitives["text"].texts
+                )
                 for s in trajs
             ]
             hit = any(expected in r for r in rendered)

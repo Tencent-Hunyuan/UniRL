@@ -667,7 +667,7 @@ class Hi3I2tAdapter(ModelAdapter):
     stage_yaml = "hunyuan_image3_i2t.yaml"
     stage_yaml_source = "upstream"
     #: AR-only requests carry ``ARSamplingParams`` with no diffusion sub-block
-    #: — ``ensure_req_sigmas`` would raise on them.
+    #: — they have no diffusion Part for ``ensure_sample_sigmas`` to pin.
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True

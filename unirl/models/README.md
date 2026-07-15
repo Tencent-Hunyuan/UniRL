@@ -42,21 +42,23 @@ A model package bridges three concerns through one shared bundle:
   loaded by `from_config`. No lifecycle logic. The biggest models (HunyuanImage3,
   Bagel) add a `from_meta_config` + `materialize()` path so each rank loads only its
   shard of the large transformer; SD3 / Qwen3 load eagerly.
-- **Pipeline** (`pipeline.py`) — the generate entrypoint (`generate(req) -> resp`):
-  it reads `req.primitives` / `sampling_params` / `sigmas`, builds the model's typed
-  `Conditions`, runs the stage, and packs one or more `RolloutTrack`s.
+- **Pipeline** (`pipeline.py`) — the endomorphic generate entrypoint
+  (`generate(sample) -> sample`): it reads ancestor primitives through
+  `sample.conditioning()`, reads sampling params from a pre-forked generation
+  Part, builds typed `Conditions`, runs the stage, and fills that Part.
 - **Stages** (`diffusion.py` / `ar.py`) — the trainable units. `DiffusionStage`
   exposes `diffuse` (rollout), `replay` (train), and `predict_noise_at_step` (DiffusionNFT);
   `ARStage` exposes `autoregress` and `replay`. Each exposes `trainable_module()`,
   returning the `nn.Module` the FSDP backend wraps and engines eval-scope.
 - **Conditions** (`conditions.py`) — typed `Batch` subclasses with
   `from_dict`/`to_dict`, so the pipeline works in typed form internally but stores
-  the generic `Dict[str, Condition]` shape on the track.
+  the generic `Dict[str, Condition]` shape on the generated Part.
 
 The **bundle is shared, not duplicated**: the trainer builds it once and injects it
 into both sides, so replay reads exactly the weights training updates — hence
 pipelines offer a bundle-injected constructor alongside the self-loading
-`from_config`. σ is engine-pinned: a diffusion pipeline reads `req.sigmas` verbatim
+`from_config`. σ is engine-pinned: a diffusion pipeline reads the generation
+Part's `DiffusionSamplingParams.sigmas` verbatim
 and raises if it's `None` — it doesn't compute σ at generate time. Diffusion
 pipelines also implement `latent_shape()` so the trainer can author the
 byte-identical `x_T` recipe.
@@ -78,7 +80,7 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 - **Share one bundle.** For colocate/trainside runs the pipeline must be built from
   the *injected* bundle (not `from_config`), or replay reads a stale second copy of
   the weights.
-- **σ is engine-pinned** — a diffusion pipeline reads `req.sigmas` and raises if
+- **σ is engine-pinned** — a diffusion pipeline reads the generation Part's sigmas and raises if
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.

@@ -63,7 +63,7 @@ class ZImagePipeline(Pipeline):
     frontier Part:
 
     - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitive: Images`` — the decoded images.
+    - ``primitives["image"]: Images`` — the decoded images.
 
     ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
     deferred; CFG uses a synthesized empty negative.
@@ -170,20 +170,30 @@ class ZImagePipeline(Pipeline):
 
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
 
-    def _conditions_for(self, texts: Texts, params: DiffusionSamplingParams) -> ZImageConditions:
-        """Encode prompts → :class:`ZImageConditions`. Shared by rollout-``generate``
-        and trainer-side replay (re-encode), so both build conditions identically.
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> ZImageConditions:
+        """Encode prompts (+ optional CFG negatives) into ``ZImageConditions``.
 
         CFG empty negative: Z-Image upstream (diffusers ``ZImagePipeline``
         ``encode_prompt``) defaults to ``""`` (empty string) when CFG is
         enabled and no negative is passed. Z-Image gates CFG on
         ``guidance_scale > 0`` (Turbo runs with 0 → CFG off). The Qwen3
         chat template tokenizes ``""`` cleanly, so no ``" "`` workaround is
-        needed (unlike Qwen-Image). User-supplied negatives are deferred
-        (single-input request carries only the positive).
+        needed (unlike Qwen-Image).
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"ZImagePipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
-        negatives = Texts(texts=[""] * len(texts.texts)) if float(params.guidance_scale) > 0.0 else None
+        if negatives is None and float(guidance_scale) > 0.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return ZImageConditions(text=text_cond, negative_text=negative_text_cond)
 
@@ -219,7 +229,7 @@ class ZImagePipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        z_conds = self._conditions_for(texts, params)
+        z_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
@@ -231,7 +241,7 @@ class ZImagePipeline(Pipeline):
 
         # Fill the frontier shell, carrying the encoded conditions for trainer-side
         # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
-        filled = frontier.fill(segment=latent_seg, primitive=images, conditions=z_conds.to_dict())
+        filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=z_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

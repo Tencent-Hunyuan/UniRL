@@ -58,10 +58,10 @@ def _prim(p: Optional[Primitive]) -> str:
 
 def _kind(part: Part) -> str:
     if part.sampling_params is not None:
-        return "GEN"          # carries sampling_params -> trainable, loss-mask 1
+        return "GEN"  # carries sampling_params -> trainable, loss-mask 1
     if part.is_root:
-        return "INPUT"        # the root prompt
-    return "OBS"              # observation re-entry (Sample.observe) -> mask 0
+        return "INPUT"  # the root prompt
+    return "OBS"  # observation re-entry (Sample.observe) -> mask 0
 
 
 def dump(sample: Sample, title: str) -> None:
@@ -74,7 +74,8 @@ def dump(sample: Sample, title: str) -> None:
         ids = str(list(part.sample_ids))
         if len(ids) > 26:
             ids = ids[:23] + "..."
-        tprint(f"  {i:>2}  {_kind(part):<5} {mask:<4} {ids:<26} {_prim(part.primitive)}")
+        content = ", ".join(f"{modality}={_prim(primitive)}" for modality, primitive in part.primitives.items())
+        tprint(f"  {i:>2}  {_kind(part):<5} {mask:<4} {ids:<26} {content}")
 
 
 def show_real_output(out: Sample, scenario: str) -> None:
@@ -84,7 +85,7 @@ def show_real_output(out: Sample, scenario: str) -> None:
         if part.sampling_params is None:
             continue
         for j, sid in enumerate(part.sample_ids):
-            txt = part.primitive.texts[j] if isinstance(part.primitive, Texts) else "<non-text>"
+            txt = part.primitives["text"].texts[j] if isinstance(part.primitives.get("text"), Texts) else "<non-text>"
             tprint(f"    part[{i}] id={sid}")
             tprint(f"        {txt!r}")
 
@@ -151,7 +152,11 @@ class TracingEnv:
 
 
 def build_request(prompts, n: int) -> Tuple[Sample, ARSamplingParams]:
-    input_part = Part.input([f"p{i}" for i in range(len(prompts))], primitive=Texts(texts=list(prompts)), control={})
+    input_part = Part.input(
+        [f"p{i}" for i in range(len(prompts))],
+        primitives={"text": Texts(texts=list(prompts))},
+        control={},
+    )
     ar = ARSamplingParams(samples_per_prompt=n, temperature=0.7, max_new_tokens=48, top_p=0.9, top_k=20)
     return Sample.request(input_part), ar
 

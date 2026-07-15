@@ -134,6 +134,14 @@ class BaseTrainer:
 
         install_phase_timing(self)
 
+        # verl-parity memory monitoring (perf/max_memory_* + [mem] boundary
+        # lines). Only constructed here — the collaborators to wrap don't exist
+        # until the subclass __init__ finishes, so install() runs in _init_wandb.
+        # None when disabled (logging.memory.enabled=false / UNIRL_MEM_MONITOR=0).
+        from unirl.utils.memory_monitor import install_memory_monitoring
+
+        self._memory_monitor = install_memory_monitoring(self)
+
     # ---- transport buffer reclaim (shared by all v2 trainers) --------------
 
     def _install_train_step_reset_hook(self) -> None:
@@ -225,6 +233,12 @@ class BaseTrainer:
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
 
+        # Every trainer calls _init_wandb at the top of train(): the subclass
+        # __init__ has finished (collaborators exist) and the live logger is in
+        # place — wrap the hand-off boundaries with memory probes here, once.
+        if self._memory_monitor is not None:
+            self._memory_monitor.install(self)
+
     def _drop_decoded(
         self,
         sample: Any,
@@ -241,16 +255,17 @@ class BaseTrainer:
         1. **Media logging (driver-side).** When the logger wants media this
            rollout (``UniRLWandBLogger.should_log_media``), take each gen Part's
            inbound ``media_preview`` or build one from the still-live
-           ``primitive`` (``build_media_preview_for_part`` hydrates a single DP
+           ``primitives`` (``build_media_preview_for_part`` hydrates a single DP
            shard), cap to ``media_max_items``, and upload it at the same
            ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step` uses,
            so the panels align. Captions default to the frontier-aligned prompt
            texts (``Sample.conditioning``).
-        2. **Free the per-rollout payloads.** ``primitive`` (generated
-           Images/Videos/Texts) is consumed upstream by reward scoring and never
+        2. **Free the per-rollout payloads.** ``primitives`` (generated
+           Images/Videos/Texts/Audios) is consumed upstream by reward scoring and never
            read by training (which uses only segment/conditions/advantages);
-           ``media_preview`` was just uploaded (or skipped off-cadence). Nulling
-           both on each gen Part before ``train_track`` releases the driver-held
+           ``media_preview`` was just uploaded (or skipped off-cadence). Clearing
+           the primitive map, its metadata, and the preview before ``train_track``
+           releases the driver-held
            TensorStore handles before the optimizer-step memory peak.
 
         Call after scoring / advantages (and any decoded-reading debug dump),
@@ -273,7 +288,7 @@ class BaseTrainer:
             for part in gen_parts:
                 name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
                 preview = part.media_preview
-                if preview is None and part.primitive is not None:
+                if preview is None and part.primitives:
                     # default_prompts is frontier-aligned (Sample.conditioning), so caption
                     # only the frontier gen Part; a non-frontier image Part (none today — the
                     # non-frontier AR Part is text → returns None) would otherwise be paired
@@ -292,7 +307,8 @@ class BaseTrainer:
                 wb.log_generated_media(rollout_id + 1, preview, key=key)
 
         for part in gen_parts:
-            part.primitive = None
+            part.primitives = {}
+            part.primitive_metadata = {}
             part.media_preview = None
 
     def _finish_wandb(self) -> None:
@@ -329,7 +345,13 @@ class BaseTrainer:
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        # Checkpoint saving gathers a full state_dict — a memory spike worth
+        # bracketing (the one hand-off boundary outside the per-step phases).
+        if self._memory_monitor is not None:
+            self._memory_monitor.boundary("ckpt_save:begin", self.backend)
         self.backend.save(path, step=step, mode=save_mode)
+        if self._memory_monitor is not None:
+            self._memory_monitor.boundary("ckpt_save:end", self.backend)
         # Driver-owned state rides beside the worker-written checkpoint.pt:
         # the wandb run id + train/ step axis let a resume append to the SAME
         # wandb run instead of starting a fresh, misaligned one.

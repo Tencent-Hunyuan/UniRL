@@ -207,10 +207,10 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
 
         P = len(input_part.sample_ids)
         require(P > 0, "ComposedRolloutEngine.generate: empty Sample")
-        text_primitive = input_part.primitive
+        text_primitive = input_part.primitives.get("text")
         require(
             isinstance(text_primitive, Texts),
-            "ComposedRolloutEngine.generate: input Part.primitive must be Texts",
+            "ComposedRolloutEngine.generate: input Part.primitives['text'] must be Texts",
         )
         require(
             len(ar_shell.sample_ids) % P == 0,
@@ -234,7 +234,7 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         # ``Qwen3Pipeline`` reads "chat").
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
-            primitive=text_primitive,
+            primitives={"text": text_primitive},
             control=self._ar_control(input_part.control or {}),
         )
         ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
@@ -245,15 +245,15 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         )
 
         # PE extraction: clean the AR text the diffusion child conditions on
-        # (rewritten onto the ar Part's primitive so wandb / logging see it too).
-        pe_texts = ar_part.primitive
+        # (rewritten onto the AR Part's text primitive so logging sees it too).
+        pe_texts = ar_part.primitives.get("text")
         require(
             isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
             f"ComposedRolloutEngine: AR Part decoded missing or wrong length "
             f"(expected {P * N}, got {len(pe_texts.texts) if isinstance(pe_texts, Texts) else 'None'})",
         )
         pe_texts = self._extract_pe(pe_texts, text_primitive, N)
-        ar_part = ar_part.fill(primitive=pe_texts)
+        ar_part = ar_part.fill(primitives={"text": pe_texts})
 
         # ── Stage 1 → Stage 2 transition ────────────────────────────
         self._ar.sleep()
@@ -268,7 +268,7 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         # group-by-parent, branch=M, same parent order).
         pe_input = Part.input(
             sample_ids=[f"pe{k}" for k in range(P * N)],
-            primitive=pe_texts,
+            primitives={"text": pe_texts},
         )
         diff_child_shell = pe_input.fork(
             M,
@@ -286,7 +286,8 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         # owns no weights, so it propagates the child's stamp rather than its own 0.
         diffusion_part = diffusion_shell.fill(
             segment=diff_child.segment,
-            primitive=diff_child.primitive,
+            primitives=dict(diff_child.primitives),
+            primitive_metadata=dict(diff_child.primitive_metadata),
             conditions=dict(diff_child.conditions),
             media_preview=diff_child.media_preview,
             weight_version=diff_child.weight_version,
