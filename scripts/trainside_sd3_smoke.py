@@ -2,13 +2,12 @@
 """Trainside rollout+replay smoke for the Sample → Sample SD3 pipeline (LIN-479).
 
 Loads the IN-PROCESS SD3 pipeline, wraps it in a ``TrainsideRolloutEngine``,
-builds a request ``Sample`` by hand, runs ``generate`` (rollout) — then
-RE-ENCODES conditions from the filled Sample and runs the diffusion stage's
-``replay``, asserting the replayed SDE log-probs reproduce the rollout's stored
-``sde_logp`` (ratio ≈ 1). That shared-bundle invariant — rollout and replay over
-the same weights agree — is the correctness bar for the model bundle. Conditions
-are NOT cached on the Part (the trainside path leaves ``Part.conditions`` empty),
-so this also exercises the re-encode path end to end.
+builds a request ``Sample`` by hand, runs ``generate`` (rollout), reconstructs
+the typed SD3 conditions carried by the filled ``Part``, and runs the diffusion
+stage's ``replay``. It asserts that the replayed SDE log-probs reproduce the
+rollout's stored ``sde_logp`` (ratio ≈ 1). That shared-bundle invariant — rollout
+and replay over the same weights and captured conditions agree — is the
+correctness bar for the model bundle.
 
 No external inference server (the trainside engine runs the pipeline's own stages
 in-process), no training loop, no reward. Run on a GPU pod (1 free GPU), torch venv:
@@ -28,6 +27,7 @@ import traceback
 import torch
 
 from unirl.algorithms.base import rollout_replay_logp_absdiff
+from unirl.models.sd3.conditions import SD3Conditions
 from unirl.models.sd3.config import SD3PipelineConfig
 from unirl.models.sd3.pipeline import SD3Pipeline
 from unirl.rollout.engine.trainside.engine import TrainsideRolloutEngine
@@ -106,26 +106,22 @@ def main() -> int:
         assert isinstance(gen.primitives.get("image"), Images) and len(gen.primitives["image"]) == 2, (
             "decoded Images (2) expected"
         )
-        assert not gen.conditions, "trainside path must leave Part.conditions empty (replay re-encodes)"
+        assert gen.conditions, "trainside path must carry replay conditions on the filled Part"
         assert gen.sampling_params.sigmas is not None, "engine must have pinned σ onto the gen params"
         _log(
             f"rollout PASS: latents={tuple(gen.segment.latents.shape)} "
-            f"images={len(gen.primitives['image'])} conditions empty ✓"
+            f"images={len(gen.primitives['image'])} conditions={sorted(gen.conditions)}"
         )
 
-        # ---- replay: re-encode conditions, reproduce sde_logp (ratio ≈ 1) ----
-        _log("re-encoding conditions from the filled Sample and replaying the diffusion stage ...")
+        # ---- replay: use the captured conditions, reproduce sde_logp (ratio ≈ 1) ----
+        _log("reconstructing captured conditions and replaying the diffusion stage ...")
         params = gen.sampling_params
-        texts = out.conditioning()[0]
+        conds = SD3Conditions.from_dict(gen.conditions)
         model = pipeline.diffusion.trainable_module()
         was_training = model.training
         model.eval()
         try:
             with torch.no_grad():
-                conds = pipeline.build_conditions(
-                    texts,
-                    guidance_scale=float(params.guidance_scale),
-                )
                 result = pipeline.diffusion.replay(conds, segment=gen.segment, params=params)
         finally:
             model.train(was_training)
@@ -141,7 +137,7 @@ def main() -> int:
         _log(f"ratio≈1 check: mean|Δlogp|={mean:.3e} max|Δlogp|={mx:.3e} (threshold mean<{_ABSDIFF_MEAN_MAX})")
         assert mean < _ABSDIFF_MEAN_MAX, f"rollout↔replay logp drift too large: mean|Δlogp|={mean:.3e}"
 
-        _log("TRAINSIDE SD3 SMOKE PASSED ✅  (rollout filled the Sample; replay re-encode reproduces sde_logp)")
+        _log("TRAINSIDE SD3 SMOKE PASSED ✅  (captured Sample conditions reproduce rollout sde_logp)")
         return 0
     except Exception:
         _log("TRAINSIDE SD3 SMOKE FAILED ❌")
