@@ -53,6 +53,10 @@ pipeline:
   # Native Stage 0 runs BAGEL's inference dispatch. The grad-capable inference
   # replay avoids the known forward_train vs forward_inference ratio offset.
   replay_mode: inference
+  # Collapse scheduler chunk boundaries during trainer replay. Token order and
+  # causal semantics are unchanged, while decoder/FSDP traversals no longer
+  # scale with vLLM's internal 64-token emission chunks.
+  t2ti_replay_chunk_mode: collapsed
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32

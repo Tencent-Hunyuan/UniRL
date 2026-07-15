@@ -37,6 +37,7 @@ def _resolve_launcher_profile(profile: str) -> subprocess.CompletedProcess[str]:
 def _assert_strict_t2ti_contract(cfg, *, expected_pairs: int) -> None:
     assert cfg.weight_sync_interval == 1
     assert cfg.rollout.config.modality == "bagel_t2ti"
+    assert cfg.pipeline.t2ti_replay_chunk_mode == "collapsed"
     assert list(cfg.sync.stage_ids) == [0, 1]
     assert cfg.sampling.diffusion.samples_per_prompt == 1
     assert cfg.batch_size * cfg.sampling.ar.samples_per_prompt == expected_pairs
