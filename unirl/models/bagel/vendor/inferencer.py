@@ -177,7 +177,10 @@ class InterleaveInferencer:
         latent = latent.reshape(1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
-        # UniRL may load the VAE in bf16; decode in fp32 like BagelVAEDecodeStage.
+        # UniRL may load the VAE in bf16, so this standalone reference path
+        # decodes in fp32. Unlike BagelVAEDecodeStage, it restores the loaded
+        # dtype because its encode path uses the VAE directly and does not cast
+        # encode I/O at the boundary.
         orig_dtype = next(self.vae_model.parameters()).dtype
         image = self.vae_model.to(torch.float32).decode(latent.float())
         if orig_dtype != torch.float32:
