@@ -119,6 +119,16 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
+    if activation_checkpointing:
+        from torch.distributed._composable import checkpoint
+
+        # Compose checkpointing before FSDP2 so backward recomputation enters
+        # the module normally and runs FSDP's pre-forward unshard hook. Calling
+        # a captured ``forward`` directly after resharding leaves DTensor
+        # parameters mixed with regular activation tensors during recompute.
+        for layer in block_instances:
+            checkpoint(layer)
+
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
@@ -175,21 +185,6 @@ def fsdp_wrap(
         fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
         for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
             cur.set_modules_to_forward_prefetch([nxt])
-
-    if activation_checkpointing:
-        from torch.utils import checkpoint as _ckpt
-
-        def _make_ckpt_forward(orig_fwd: object) -> object:
-            def wrapped(*args: object, **kwargs: object) -> object:
-                def fn(*a: object) -> object:
-                    return orig_fwd(*a, **kwargs)
-
-                return _ckpt.checkpoint(fn, *args, use_reentrant=False)
-
-            return wrapped
-
-        for layer in block_instances:
-            layer.forward = _make_ckpt_forward(layer.forward)
 
     if use_torch_compile:
         for layer in block_instances:
