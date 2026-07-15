@@ -14,6 +14,7 @@ from unirl.distributed.weight_sync.full.cpu_staged import (
 from unirl.rollout.engine.vllm_omni.backends.native import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
 from unirl.trainer.unified_model import UnifiedModelTrainer
+from unirl.utils.scheduler_utils import AllSDEScheduler
 
 
 class _Task:
@@ -456,10 +457,18 @@ def test_bagel_stage_yaml_uses_vllm_omni_020_flat_extension_keys() -> None:
     assert cfg.stages[1].custom_pipeline_args.pipeline_class.endswith("RLBagelPipeline")
 
 
-def test_bagel_recipe_uses_inference_replay_and_trainable_checksum() -> None:
+def test_bagel_recipe_uses_inference_replay_and_trainable_checksum(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REPORT_TO_WANDB", "false")
     cfg = OmegaConf.load("examples/unified_model/bagel_vllmomni_t2ti.yaml")
     assert cfg.num_devices == 1
     assert cfg.devices_per_node == 1
+    assert cfg.logging.report_to_wandb is False
     assert cfg.pipeline.replay_mode == "inference"
     assert cfg.sync.load_plan == BAGEL_VLLM_OMNI_020_LOAD_PLAN
     assert cfg.sync.verify_names == ["language_model.model.layers.0.input_layernorm_moe_gen.weight"]
+    scheduler = AllSDEScheduler(
+        num_timesteps=cfg.sampling.diffusion.scheduler.num_timesteps,
+        timestep_fraction=cfg.sampling.diffusion.scheduler.timestep_fraction,
+        num_sde_steps=cfg.sampling.diffusion.scheduler.num_sde_steps,
+    )
+    assert scheduler.get_sde_indices(step=0) == {0, 1}

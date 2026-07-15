@@ -40,7 +40,7 @@ save_dir: ${oc.env:CKPT_DIR,outputs}/${oc.env:WANDB_RUN_NAME,bagel-vllmomni-t2ti
 save_mode: full
 
 logging:
-  report_to_wandb: ${oc.env:REPORT_TO_WANDB,false}
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
   project_name: ${oc.env:WANDB_PROJECT,bagel-unigrpo}
   run_name: ${oc.env:WANDB_RUN_NAME,null}
   entity: ${oc.env:WANDB_ENTITY,null}
@@ -202,7 +202,9 @@ sampling:
       _target_: unirl.utils.scheduler_utils.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
       timestep_fraction: [0.0, 0.2]
-      num_sde_steps: 3
+      # int(14 * 0.2) exposes indices {0, 1}; keep the sparse sample count
+      # within that two-step pool so the default recipe composes as written.
+      num_sde_steps: 2
 
 # Full MoT snapshot -> both native Omni stages. `name_remap` converts the bare
 # Qwen2ForCausalLM state dict to BAGEL checkpoint keys; each upstream stage
