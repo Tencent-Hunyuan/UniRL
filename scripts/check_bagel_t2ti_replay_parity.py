@@ -237,6 +237,8 @@ def main() -> None:
     parser.add_argument("--min-cache-cosine", type=float, default=0.9999)
     parser.add_argument("--max-velocity-rel-l2", type=float, default=5.0e-3)
     parser.add_argument("--min-velocity-cosine", type=float, default=0.9999)
+    parser.add_argument("--max-transition-mean-rel-l2", type=float, default=5.0e-3)
+    parser.add_argument("--min-transition-mean-cosine", type=float, default=0.9999)
     parser.add_argument("--max-grad-rel-l2", type=float, default=1.0e-2)
     parser.add_argument("--min-grad-cosine", type=float, default=0.999)
     parser.add_argument("--max-log-prob-abs", type=float, default=1.0e-3)
@@ -285,6 +287,8 @@ def main() -> None:
         and cache_metrics.cosine >= args.min_cache_cosine
         and velocity_metrics.rel_l2 <= args.max_velocity_rel_l2
         and velocity_metrics.cosine >= args.min_velocity_cosine
+        and mean_metrics.rel_l2 <= args.max_transition_mean_rel_l2
+        and mean_metrics.cosine >= args.min_transition_mean_cosine
         and gradient_metrics.rel_l2 <= args.max_grad_rel_l2
         and gradient_metrics.cosine >= args.min_grad_cosine
         and log_prob_abs <= args.max_log_prob_abs
@@ -299,6 +303,17 @@ def main() -> None:
         "speedup": exact.seconds / max(collapsed.seconds, 1.0e-12),
         "exact_peak_gib": exact.peak_gib,
         "collapsed_peak_gib": collapsed.peak_gib,
+        "thresholds": {
+            "max_cache_rel_l2": args.max_cache_rel_l2,
+            "min_cache_cosine": args.min_cache_cosine,
+            "max_velocity_rel_l2": args.max_velocity_rel_l2,
+            "min_velocity_cosine": args.min_velocity_cosine,
+            "max_transition_mean_rel_l2": args.max_transition_mean_rel_l2,
+            "min_transition_mean_cosine": args.min_transition_mean_cosine,
+            "max_grad_rel_l2": args.max_grad_rel_l2,
+            "min_grad_cosine": args.min_grad_cosine,
+            "max_log_prob_abs": args.max_log_prob_abs,
+        },
         "cache": asdict(cache_metrics),
         "velocity": asdict(velocity_metrics),
         "transition_mean": asdict(mean_metrics),
