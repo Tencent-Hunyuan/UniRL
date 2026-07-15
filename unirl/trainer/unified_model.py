@@ -197,6 +197,12 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        rollout_engine_cfg = rollout_cfg.get("config") if rollout_cfg is not None else None
+        self._strict_bagel_t2ti = bool(
+            rollout_engine_cfg is not None and rollout_engine_cfg.get("modality") == "bagel_t2ti"
+        )
+        if self._strict_bagel_t2ti:
+            self._validate_bagel_t2ti_contract(self.sampling_params, sync_cfg)
         # Driver-authored x_T recipe for native BAGEL T2TI. Keep one base key
         # per source prompt; the adapter either shares it across N thoughts or
         # expands it to /aN/i0 according to init_same_noise.
@@ -409,6 +415,44 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.weight_sync.set_rollout_targets(
                     [(eng.role_name, eng.workers) for eng in self.ar_rollouts + self.dit_rollouts]
                 )
+
+    @staticmethod
+    def _validate_bagel_t2ti_contract(
+        sampling_params: Dict[str, BaseSamplingParams],
+        sync_cfg: Optional[DictConfig],
+    ) -> None:
+        """Reject BAGEL settings that cannot represent on-policy P*N*1 training."""
+        ar_params = sampling_params.get("ar")
+        diff_params = sampling_params.get("diffusion")
+        n_thoughts = int(getattr(ar_params, "samples_per_prompt", 0))
+        n_images = int(getattr(diff_params, "samples_per_prompt", 0))
+        if n_thoughts < 2:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires ar.samples_per_prompt >= 2; "
+                "N=1 produces zero prompt-group advantages."
+            )
+        if n_images != 1:
+            raise ValueError(
+                f"UnifiedModelTrainer: bagel_t2ti requires diffusion.samples_per_prompt == 1; got {n_images}."
+            )
+        if sync_cfg is None:
+            raise ValueError(
+                "UnifiedModelTrainer: external bagel_t2ti requires strict full-weight sync to both Omni stages."
+            )
+        sync_target = str(sync_cfg.get("_target_", ""))
+        if not sync_target.endswith("CPUStagedFullWeightSync"):
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires CPUStagedFullWeightSync; "
+                f"got {sync_target or '<missing target>'}."
+            )
+        if sync_cfg.get("load_plan") != "bagel_vllm_omni_0_20":
+            raise ValueError("UnifiedModelTrainer: bagel_t2ti requires sync.load_plan='bagel_vllm_omni_0_20'.")
+        stage_ids = {int(stage_id) for stage_id in sync_cfg.get("stage_ids", ())}
+        if stage_ids != {0, 1}:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires sync.stage_ids to contain exactly {0, 1}; "
+                f"got {sorted(stage_ids)}."
+            )
 
     def _wire_engine(self, cfg: DictConfig, *, anchor_device: int) -> Any:
         """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker.
@@ -973,6 +1017,19 @@ class UnifiedModelTrainer(BaseTrainer):
         except Exception as exc:  # noqa: BLE001 — dump must never break training
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
+    def _eval_sampling_params(self) -> Dict[str, BaseSamplingParams]:
+        """Build eval params, making deterministic eta=0 an explicit ODE rollout."""
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs: Dict[str, Any] = {"eta": self.eval_eta}
+        if "cfg_text_scale" in {field.name for field in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        if self.eval_eta <= 1e-7:
+            replace_kwargs.update(scheduler=None, sde_indices=[])
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        return {**self.sampling_params, "diffusion": eval_diffusion}
+
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward.
 
@@ -991,18 +1048,7 @@ class UnifiedModelTrainer(BaseTrainer):
         leaves FSDP offloaded because eval has no backward. The trainside path
         needs none of it because it shares the live FSDP modules.
         """
-        # Override only the "diffusion" entry of the modality-keyed sampling dict.
-        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
-        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (HI3,
-        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(eta=self.eval_eta)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        eval_sp = self._eval_sampling_params()
         # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH
         # needs awake engines, so it rides one short wake/sleep cycle here).
         if not self._single_engine and self.weight_sync is not None:
@@ -1140,8 +1186,15 @@ class UnifiedModelTrainer(BaseTrainer):
         directory and RESUME from its saved step — ``num_rollouts`` is the TOTAL
         budget.
         """
+        if self._strict_bagel_t2ti and int(weight_sync_interval) != 1:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires weight_sync_interval=1 so every rollout uses "
+                "the current trainer policy; skipped syncs invalidate the replay old-policy anchor."
+            )
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        if load_dir and self._strict_bagel_t2ti:
+            self.image_algorithm.load_reference_checkpoint(os.path.abspath(load_dir))
         resumed = bool(load_dir)
         # Fast-forward the data stream to the resume point — exact when
         # run.seed is set (deterministic shuffle); with seed=null the stream
@@ -1184,9 +1237,11 @@ class UnifiedModelTrainer(BaseTrainer):
                 # resumed checkpoint re-runs the same eval (A/B consistency).
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id + 1)
-                self.maybe_save_checkpoint(
+                checkpoint_path = self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+                if checkpoint_path is not None and self._strict_bagel_t2ti:
+                    self.image_algorithm.save_reference_checkpoint(checkpoint_path)
         finally:
             self._finish_wandb()
 

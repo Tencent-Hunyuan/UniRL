@@ -50,6 +50,7 @@ from unirl.models.bagel.conditions import (
     BagelThinkKVReplaySpec,
 )
 from unirl.models.bagel.diffusion import BagelDiffusionParams
+from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (
@@ -494,6 +495,86 @@ def _validate_t2ti_ar_logprobs(ar_output: OmniRawResult, *, request_index: int) 
             )
 
 
+def _validate_t2ti_image_trajectories(
+    image_outputs: Sequence[OmniRawResult],
+    *,
+    expected_sigmas: torch.Tensor | None,
+    expected_sde_indices: Sequence[int],
+) -> None:
+    """Require one aligned Stage-1 trajectory and image for every thought."""
+    reference: tuple[torch.Size, torch.Size, torch.Tensor, tuple[int, ...]] | None = None
+    expected_sde = tuple(int(index) for index in expected_sde_indices)
+    for request_index, output in enumerate(image_outputs):
+        images = getattr(output, "images", None) or []
+        if len(images) != 1:
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} returned {len(images)} images; expected exactly one."
+            )
+
+        latents = getattr(output, "trajectory_latents", None)
+        log_probs = getattr(output, "trajectory_log_probs", None)
+        sigmas = getattr(output, "trajectory_timesteps", None)
+        if not torch.is_tensor(latents) or latents.ndim < 3 or int(latents.shape[0]) != 1:
+            shape = None if not torch.is_tensor(latents) else tuple(latents.shape)
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} must return trajectory_latents "
+                f"with batch size 1; got {shape}."
+            )
+        if not torch.is_tensor(log_probs) or log_probs.ndim != 2 or int(log_probs.shape[0]) != 1:
+            shape = None if not torch.is_tensor(log_probs) else tuple(log_probs.shape)
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} must return trajectory_log_probs "
+                f"with shape [1, K], including [1, 0] for an ODE-only rollout; got {shape}."
+            )
+        if not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+            shape = None if not torch.is_tensor(sigmas) else tuple(sigmas.shape)
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} must return a 1-D trajectory_timesteps; got {shape}."
+            )
+        if int(latents.shape[1]) != int(sigmas.numel()):
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} returned {int(latents.shape[1])} latent positions "
+                f"for {int(sigmas.numel())} sigma positions."
+            )
+        if not torch.isfinite(latents).all() or not torch.isfinite(log_probs).all() or not torch.isfinite(sigmas).all():
+            raise RuntimeError(f"bagel_t2ti: Stage-1 request {request_index} returned a non-finite trajectory value.")
+
+        verify_engine_used_sigmas(
+            sigmas, expected=expected_sigmas, engine_name=f"vllm-omni bagel_t2ti[{request_index}]"
+        )
+        custom_output = getattr(output, "custom_output", None)
+        if not isinstance(custom_output, Mapping) or "sde_step_indices" not in custom_output:
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} omitted custom_output['sde_step_indices']."
+            )
+        sde_indices = tuple(int(index) for index in custom_output["sde_step_indices"])
+        if sde_indices != expected_sde:
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} used SDE indices {sde_indices}; expected {expected_sde}."
+            )
+        if int(log_probs.shape[1]) != len(sde_indices):
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} returned {int(log_probs.shape[1])} log-probs "
+                f"for {len(sde_indices)} SDE indices."
+            )
+
+        current = (latents.shape, log_probs.shape, sigmas.detach().cpu(), sde_indices)
+        if reference is None:
+            reference = current
+            continue
+        ref_latent_shape, ref_logp_shape, ref_sigmas, ref_sde_indices = reference
+        if current[0] != ref_latent_shape or current[1] != ref_logp_shape:
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} trajectory shapes "
+                f"{tuple(current[0])}/{tuple(current[1])} differ from request 0 "
+                f"{tuple(ref_latent_shape)}/{tuple(ref_logp_shape)}."
+            )
+        if current[3] != ref_sde_indices or not torch.equal(current[2], ref_sigmas):
+            raise RuntimeError(
+                f"bagel_t2ti: Stage-1 request {request_index} trajectory schedule differs from request 0."
+            )
+
+
 class BagelT2TIOutputAdapter:
     """Response side: independent AR and image tracks joined 1:1 by lineage."""
 
@@ -508,6 +589,12 @@ class BagelT2TIOutputAdapter:
 
         stage_pairs = [_require_t2ti_stage_pair(outputs, request_index=i) for i, outputs in enumerate(per_request)]
         image_outputs = [pair[1] for pair in stage_pairs]
+        rollout_id = int((req.stage_config or {}).get("rollout_id", 0))
+        _validate_t2ti_image_trajectories(
+            image_outputs,
+            expected_sigmas=req.sigmas,
+            expected_sde_indices=diff_params.resolve_sde_indices(rollout_id),
+        )
 
         image_shape = (int(diff_params.height), int(diff_params.width))
         replay_specs: List[BagelThinkKVReplaySpec] = []
@@ -542,6 +629,14 @@ class BagelT2TIOutputAdapter:
             modality=self.modality,
         )
         image_decoded = pils_to_images(pil_images)
+        if image_segment.latents is None or int(image_segment.latents.shape[0]) != expected:
+            actual = None if image_segment.latents is None else int(image_segment.latents.shape[0])
+            raise RuntimeError(f"bagel_t2ti: image trajectory batch has {actual} rows; expected P*N={expected}.")
+        if int(image_decoded.pixels.shape[0]) != expected:
+            raise RuntimeError(
+                f"bagel_t2ti: decoded image batch has {int(image_decoded.pixels.shape[0])} rows; "
+                f"expected P*N={expected}."
+            )
 
         ar_conditions = BagelARConditions(prompt_splits=prompt_splits)
         image_conditions = BagelT2TIDiffusionConditions(replay_specs=replay_specs)
@@ -637,8 +732,11 @@ class BagelT2TIAdapter(ModelAdapter):
         ar_params, diff_params = _t2ti_params(req)
         n_ar = int(ar_params.samples_per_prompt)
         n_images = int(diff_params.samples_per_prompt)
-        if n_ar < 1:
-            raise ValueError(f"bagel_t2ti requires ar.samples_per_prompt >= 1; got {n_ar}.")
+        if n_ar < 2:
+            raise ValueError(
+                f"bagel_t2ti training requires ar.samples_per_prompt >= 2 so prompt-group advantages are nonzero; "
+                f"got {n_ar}."
+            )
         if n_images != 1:
             raise ValueError(
                 f"bagel_t2ti currently requires diffusion.samples_per_prompt == 1 (UniGRPO strict M=1); got {n_images}."

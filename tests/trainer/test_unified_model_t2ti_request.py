@@ -5,6 +5,7 @@ from unirl.trainer.unified_model import UnifiedModelTrainer
 from unirl.types.primitives import Texts
 from unirl.types.prompts import RolloutInputs
 from unirl.types.sampling import ARSamplingParams
+from unirl.utils.scheduler_utils import AllSDEScheduler
 
 
 def test_unified_request_authors_prompt_level_bagel_noise_recipe() -> None:
@@ -56,3 +57,23 @@ def test_unified_request_can_disable_driver_authored_noise() -> None:
     assert req.stage_config == {"rollout_id": 4}
     assert req.init_noise_group_ids == []
     assert req.init_noise_latent_shape is None
+
+
+def test_deterministic_eval_clears_training_sde_schedule() -> None:
+    trainer = object.__new__(UnifiedModelTrainer)
+    trainer.eval_eta = 0.0
+    trainer.eval_cfg_text_scale = 1.0
+    trainer.sampling_params = {
+        "ar": ARSamplingParams(samples_per_prompt=2),
+        "diffusion": BagelDiffusionParams(
+            num_inference_steps=4,
+            eta=0.8,
+            scheduler=AllSDEScheduler(4, timestep_fraction=[0.0, 0.5], num_sde_steps=1),
+        ),
+    }
+
+    eval_params = trainer._eval_sampling_params()
+
+    assert eval_params["diffusion"].eta == 0.0
+    assert eval_params["diffusion"].scheduler is None
+    assert eval_params["diffusion"].sde_indices == []

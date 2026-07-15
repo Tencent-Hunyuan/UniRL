@@ -160,7 +160,7 @@ def test_init_same_noise_shares_only_xt_across_thought_branches() -> None:
     [
         (_request(["x"], n_images=2), "samples_per_prompt == 1"),
         (_request(["x"], cfg_text=2.0), "CFG scales == 1"),
-        (_request(["x"], n_ar=0), "ar.samples_per_prompt >= 1"),
+        (_request(["x"], n_ar=1), "ar.samples_per_prompt >= 2"),
     ],
 )
 def test_strict_unigrpo_validation(req: RolloutReq, match: str) -> None:
@@ -217,6 +217,33 @@ def _raw_pair(index: int, *, include_replay: bool = True):
         custom_output=custom_output,
     )
     return [ar_output, image_output]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda output: setattr(output, "trajectory_latents", None), "trajectory_latents"),
+        (lambda output: setattr(output, "trajectory_log_probs", None), "trajectory_log_probs"),
+        (lambda output: setattr(output, "trajectory_timesteps", torch.tensor([1.0, 0.5, 0.0])), "sigmas"),
+        (lambda output: output.custom_output.__setitem__("sde_step_indices", [1]), "SDE indices"),
+        (lambda output: setattr(output, "images", [object(), object()]), "expected one"),
+    ],
+)
+def test_output_rejects_misaligned_image_trajectory(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate,
+    match: str,
+) -> None:
+    req = _request(["one prompt"], n_ar=2)
+    per_request = [_raw_pair(0), _raw_pair(1)]
+    mutate(per_request[1][1])
+    monkeypatch.setattr(
+        "unirl.rollout.engine.vllm_omni.adapters.bagel.pils_to_images",
+        lambda images: Images(pixels=torch.zeros(len(images), 3, 8, 8)),
+    )
+
+    with pytest.raises(RuntimeError, match=match):
+        _adapter().build_response(req, per_request)
 
 
 def test_output_builds_linked_tracks_and_native_replay_conditions(monkeypatch: pytest.MonkeyPatch) -> None:

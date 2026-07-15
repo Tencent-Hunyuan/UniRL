@@ -22,11 +22,13 @@ inherited GRPO log-prob replay; fusing them is a follow-up.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
 
 import torch
 
+from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
@@ -113,10 +115,10 @@ class BagelFlowUniGRPO(FlowGRPO):
         self.anchor_fields = ("sde_logp", "sde_means") if self.ratio_norm else ("sde_logp",)
         # Full-FT v_ref: a frozen bf16 snapshot of the base (pre-training) weights, captured
         # lazily on the first v_ref swap (before the first optimizer step) from each trainable
-        # param's local shard, keyed by param id, and swapped in per step via in-place copy.
+        # param's local shard, keyed by stable parameter name, and swapped in per step via in-place copy.
         # Stays None under LoRA (v_ref = adapters off) or mse_weight=0 (no MSE). See
         # _reference_weights.
-        self._ref_snapshot: Optional[Dict[int, torch.Tensor]] = None
+        self._ref_snapshot: Optional[Dict[str, torch.Tensor]] = None
 
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
@@ -134,6 +136,73 @@ class BagelFlowUniGRPO(FlowGRPO):
         """
         return None
 
+    def _full_ft_reference_params(self) -> List[tuple[str, torch.nn.Parameter]]:
+        transformer = self.stage.model.transformer
+        return [(name, param) for name, param in transformer.named_parameters() if param.requires_grad]
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def save_reference_checkpoint(self, path: str) -> None:
+        """Persist the immutable full-FT MSE reference beside a trainer checkpoint."""
+        transformer = self.stage.model.transformer
+        if self.mse_weight <= 0.0 or self._has_lora(transformer):
+            return
+        if self._ref_snapshot is None:
+            raise RuntimeError("BagelFlowUniGRPO.save_reference_checkpoint: the base reference has not been captured.")
+        rank = int(getattr(self.rank_info, "rank", 0))
+        world_size = int(getattr(self.rank_info, "world_size", 1))
+        os.makedirs(path, exist_ok=True)
+        torch.save(
+            {
+                "format_version": 1,
+                "world_size": world_size,
+                "rank": rank,
+                "tensors": {name: tensor.detach().cpu() for name, tensor in self._ref_snapshot.items()},
+            },
+            os.path.join(path, f"bagel_image_reference_rank{rank:05d}.pt"),
+        )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def load_reference_checkpoint(self, path: str) -> None:
+        """Restore the original full-FT MSE reference before resumed training."""
+        transformer = self.stage.model.transformer
+        if self.mse_weight <= 0.0 or self._has_lora(transformer):
+            return
+        rank = int(getattr(self.rank_info, "rank", 0))
+        world_size = int(getattr(self.rank_info, "world_size", 1))
+        snapshot_path = os.path.join(path, f"bagel_image_reference_rank{rank:05d}.pt")
+        if not os.path.isfile(snapshot_path):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: checkpoint is missing the immutable base reference "
+                f"for rank {rank}: {snapshot_path}."
+            )
+        payload = torch.load(snapshot_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("BagelFlowUniGRPO.load_reference_checkpoint: malformed reference payload.")
+        if (
+            int(payload.get("format_version", -1)) != 1
+            or int(payload.get("world_size", -1)) != world_size
+            or int(payload.get("rank", -1)) != rank
+        ):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: reference topology/version does not match "
+                f"rank {rank}/{world_size}."
+            )
+        tensors = payload.get("tensors")
+        if not isinstance(tensors, Mapping) or not all(torch.is_tensor(tensor) for tensor in tensors.values()):
+            raise RuntimeError("BagelFlowUniGRPO.load_reference_checkpoint: malformed reference tensor payload.")
+        expected_names = {name for name, _ in self._full_ft_reference_params()}
+        actual_names = {str(name) for name in tensors}
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            extra = sorted(actual_names - expected_names)
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: reference parameter names do not match the model; "
+                f"missing={missing[:5]}, extra={extra[:5]}."
+            )
+        self._ref_snapshot = {
+            str(name): tensor.detach().to(dtype=torch.bfloat16).clone() for name, tensor in tensors.items()
+        }
+
     @contextmanager
     def _reference_weights(self, transformer: Any) -> Iterator[None]:
         """Swap the frozen base weights into the trainable params for a v_ref forward.
@@ -149,7 +218,8 @@ class BagelFlowUniGRPO(FlowGRPO):
         subsequent step sees, so the copy sizes always match (a pre-loop snapshot would be
         sharded while the swap site, right after the v_theta forward, is unsharded → size
         mismatch). Stored as bf16 (the forward computes in bf16; halves the ~3.5→1.75
-        GiB/GPU footprint) keyed by param id.
+        GiB/GPU footprint) keyed by stable parameter name. A resumed run loads
+        that same snapshot from the checkpoint instead of recapturing tuned weights.
 
         Per step: stash each live local shard, copy the base in (cast to the live fp32
         master dtype), run the (no_grad) v_ref forward, then copy the trained weights back
@@ -159,7 +229,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         """
         from unirl.train.ema import local_view
 
-        live = [p for p in transformer.parameters() if p.requires_grad]
+        live = [(name, param) for name, param in transformer.named_parameters() if param.requires_grad]
         if not live:
             raise RuntimeError(
                 "BagelFlowUniGRPO: mse_weight > 0 with no LoRA and no trainable params to snapshot "
@@ -167,18 +237,35 @@ class BagelFlowUniGRPO(FlowGRPO):
                 "(use_lora=false unfreezes the decoder blocks) or set mse_weight=0."
             )
         if self._ref_snapshot is None:
-            self._ref_snapshot = {id(p): local_view(p).detach().to(dtype=torch.bfloat16).clone() for p in live}
+            self._ref_snapshot = {
+                name: local_view(param).detach().to(dtype=torch.bfloat16).clone() for name, param in live
+            }
 
-        stash: List[torch.Tensor] = []
-        for p in live:
-            lv = local_view(p)
-            stash.append(lv.detach().clone())
-            lv.copy_(self._ref_snapshot[id(p)])
+        prepared: List[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
+        for name, param in live:
+            lv = local_view(param)
+            reference = self._ref_snapshot.get(name)
+            if reference is None or reference.shape != lv.shape:
+                shape = None if reference is None else tuple(reference.shape)
+                raise RuntimeError(
+                    "BagelFlowUniGRPO: persisted base reference is incompatible with the live parameter "
+                    f"{name!r}: reference shape={shape}, live shape={tuple(lv.shape)}. "
+                    "Resume with the same FSDP topology used to save the checkpoint."
+                )
+            prepared.append((name, param, reference))
+
+        stash: List[tuple[torch.nn.Parameter, torch.Tensor]] = []
         try:
+            with torch.no_grad():
+                for _, param, reference in prepared:
+                    lv = local_view(param)
+                    stash.append((param, lv.detach().clone()))
+                    lv.copy_(reference)
             yield
         finally:
-            for p, saved in zip(live, stash):
-                local_view(p).copy_(saved)
+            with torch.no_grad():
+                for param, saved in stash:
+                    local_view(param).copy_(saved)
 
     def prepare_segment(
         self,

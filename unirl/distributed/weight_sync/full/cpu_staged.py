@@ -92,6 +92,11 @@ class CPUStagedFullWeightSync(FullWeightSync):
                 "CPUStagedFullWeightSync.load_plan must be null or "
                 f"{BAGEL_VLLM_OMNI_020_LOAD_PLAN!r}; got {load_plan!r}."
             )
+        if load_plan == BAGEL_VLLM_OMNI_020_LOAD_PLAN and set(selected) != {0, 1}:
+            raise ValueError(
+                f"{BAGEL_VLLM_OMNI_020_LOAD_PLAN} requires stage_ids to contain exactly Stage 0 and Stage 1; "
+                f"got {selected}."
+            )
 
         self._rollout = rollout
         self._stage_ids = selected

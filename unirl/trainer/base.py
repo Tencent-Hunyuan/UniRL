@@ -312,7 +312,7 @@ class BaseTrainer:
         save_interval: int,
         save_dir: Optional[str],
         save_mode: str = "auto",
-    ) -> None:
+    ) -> Optional[str]:
         """Save every ``save_interval`` rollouts (and on the last one).
 
         ``save_interval <= 0`` disables saving. Writes the backend state to
@@ -320,14 +320,15 @@ class BaseTrainer:
         to ``./checkpoints``; ``save_mode="auto"`` keeps only LoRA keys when
         LoRA is active and writes full checkpoints otherwise).
         Paths resolve to absolute here, on the driver — the backend runs in
-        Ray workers whose CWD differs from the driver's.
+        Ray workers whose CWD differs from the driver's. Returns the absolute
+        checkpoint directory when a save occurs, otherwise ``None``.
         """
         if save_interval <= 0:
-            return
+            return None
         step = rollout_id + 1
         # Save on the interval, and always on the final rollout.
         if step % save_interval != 0 and step < num_rollouts:
-            return
+            return None
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
@@ -343,6 +344,7 @@ class BaseTrainer:
         # wandb run instead of starting a fresh, misaligned one.
         with open(os.path.join(path, "trainer_state.json"), "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        return path
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from.

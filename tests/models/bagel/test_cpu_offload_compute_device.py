@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,59 @@ def test_unigrpo_mse_uses_bundle_compute_device_when_fsdp_shards_are_on_cpu() ->
     assert next(stage.model.transformer.parameters()).device.type == "cpu"
     assert stage.captured_device == execution_device
     assert stage.context_grad_enabled is False
+
+
+def test_unigrpo_full_ft_reference_survives_checkpoint_resume(tmp_path: Path) -> None:
+    def make_algorithm(transformer: nn.Module) -> BagelFlowUniGRPO:
+        stage = SimpleNamespace(model=SimpleNamespace(transformer=transformer))
+        algorithm = BagelFlowUniGRPO(params=object(), stage=stage, mse_weight=1.0)
+        algorithm.rank_info = SimpleNamespace(rank=0, world_size=1)
+        return algorithm
+
+    original = nn.Linear(2, 2)
+    with torch.no_grad():
+        original.weight.fill_(1.0)
+        original.bias.fill_(2.0)
+    algorithm = make_algorithm(original)
+    with algorithm._reference_weights(original):
+        pass
+
+    with torch.no_grad():
+        original.weight.fill_(3.0)
+        original.bias.fill_(4.0)
+    tuned_state = {name: tensor.detach().clone() for name, tensor in original.state_dict().items()}
+    algorithm.save_reference_checkpoint(str(tmp_path))
+
+    resumed_model = nn.Linear(2, 2)
+    resumed_model.load_state_dict(tuned_state)
+    resumed = make_algorithm(resumed_model)
+    resumed.load_reference_checkpoint(str(tmp_path))
+
+    with resumed._reference_weights(resumed_model):
+        assert torch.equal(resumed_model.weight, torch.ones_like(resumed_model.weight))
+        assert torch.equal(resumed_model.bias, torch.full_like(resumed_model.bias, 2.0))
+    assert torch.equal(resumed_model.weight, torch.full_like(resumed_model.weight, 3.0))
+    assert torch.equal(resumed_model.bias, torch.full_like(resumed_model.bias, 4.0))
+
+
+def test_unigrpo_rejects_bad_reference_without_mutating_live_weights() -> None:
+    transformer = nn.Linear(2, 2)
+    stage = SimpleNamespace(model=SimpleNamespace(transformer=transformer))
+    algorithm = BagelFlowUniGRPO(params=object(), stage=stage, mse_weight=1.0)
+    with algorithm._reference_weights(transformer):
+        pass
+
+    with torch.no_grad():
+        transformer.weight.fill_(3.0)
+        transformer.bias.fill_(4.0)
+    algorithm._ref_snapshot["bias"] = torch.zeros(3, dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="incompatible with the live parameter"):
+        with algorithm._reference_weights(transformer):
+            pass
+
+    assert torch.equal(transformer.weight, torch.full_like(transformer.weight, 3.0))
+    assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 4.0))
 
 
 def test_prompt_prefill_moves_vendor_cpu_tensors_to_compute_device() -> None:

@@ -13,6 +13,7 @@ from unirl.distributed.weight_sync.full.cpu_staged import (
 )
 from unirl.rollout.engine.vllm_omni.backends.native import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
+from unirl.trainer.base import build_sampling_dict
 from unirl.trainer.unified_model import UnifiedModelTrainer
 from unirl.utils.scheduler_utils import AllSDEScheduler
 
@@ -466,9 +467,48 @@ def test_bagel_recipe_uses_inference_replay_and_trainable_checksum(monkeypatch: 
     assert cfg.pipeline.replay_mode == "inference"
     assert cfg.sync.load_plan == BAGEL_VLLM_OMNI_020_LOAD_PLAN
     assert cfg.sync.verify_names == ["language_model.model.layers.0.input_layernorm_moe_gen.weight"]
+    UnifiedModelTrainer._validate_bagel_t2ti_contract(build_sampling_dict(cfg.sampling), cfg.sync)
     scheduler = AllSDEScheduler(
         num_timesteps=cfg.sampling.diffusion.scheduler.num_timesteps,
         timestep_fraction=cfg.sampling.diffusion.scheduler.timestep_fraction,
         num_sde_steps=cfg.sampling.diffusion.scheduler.num_sde_steps,
     )
     assert scheduler.get_sde_indices(step=0) == {0, 1}
+
+
+def test_bagel_load_plan_requires_both_native_stages() -> None:
+    backend = SimpleNamespace(rollout_adapter_name="default", model=torch.nn.Linear(1, 1))
+    with pytest.raises(ValueError, match="exactly Stage 0 and Stage 1"):
+        CPUStagedFullWeightSync(
+            backend=backend,
+            rollout=SimpleNamespace(),
+            stage_ids=[0],
+            verify_names=["language_model.model.layers.0.input_layernorm_moe_gen.weight"],
+            load_plan=BAGEL_VLLM_OMNI_020_LOAD_PLAN,
+        )
+
+
+def test_bagel_trainer_contract_rejects_missing_or_partial_sync() -> None:
+    sampling = {
+        "ar": SimpleNamespace(samples_per_prompt=4),
+        "diffusion": SimpleNamespace(samples_per_prompt=1),
+    }
+    with pytest.raises(ValueError, match="strict full-weight sync"):
+        UnifiedModelTrainer._validate_bagel_t2ti_contract(sampling, None)
+
+    sync_cfg = OmegaConf.create(
+        {
+            "_target_": "unirl.distributed.weight_sync.full.CPUStagedFullWeightSync",
+            "load_plan": BAGEL_VLLM_OMNI_020_LOAD_PLAN,
+            "stage_ids": [0],
+        }
+    )
+    with pytest.raises(ValueError, match=r"exactly \{0, 1\}"):
+        UnifiedModelTrainer._validate_bagel_t2ti_contract(sampling, sync_cfg)
+
+
+def test_bagel_trainer_rejects_skipped_weight_sync() -> None:
+    trainer = object.__new__(UnifiedModelTrainer)
+    trainer._strict_bagel_t2ti = True
+    with pytest.raises(ValueError, match="weight_sync_interval=1"):
+        trainer.train(num_rollouts=1, weight_sync_interval=2)
