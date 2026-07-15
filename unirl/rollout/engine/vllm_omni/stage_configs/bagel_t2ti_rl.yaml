@@ -15,13 +15,16 @@ stages:
   - stage_id: 0
     # UniRL fans out N thoughts as independent prompt-major requests, so this
     # stage never needs the stock BAGEL deployment's three concurrent 32k
-    # multimodal sequences. Keeping one bounded sequence also prevents vLLM's
-    # multimodal profiling cache from starving the KV cache when both BAGEL
-    # stages share one GPU. vLLM 0.20 registers a maximum BAGEL multimodal item
-    # of 8625 tokens even for this text-only path, so use the next 1k boundary.
-    max_model_len: 9216
-    max_num_batched_tokens: 9216
+    # multimodal sequences. The adapter rejects image inputs, so explicitly
+    # disable both BAGEL multimodal input classes; otherwise vLLM profiles a
+    # worst-case img2img item and leaves no memory for the AR KV cache when the
+    # two stages share one GPU.
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
     max_num_seqs: 1
+    limit_mm_per_prompt:
+      image: 0
+      img2img: 0
     gpu_memory_utilization: 0.45
     devices: "0"
     default_sampling_params:
