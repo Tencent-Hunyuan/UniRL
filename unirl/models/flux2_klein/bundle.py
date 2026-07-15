@@ -44,7 +44,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Flux2KleinPipelineConfig
@@ -193,17 +193,21 @@ class Flux2KleinBundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         # --- Transformer (9B) ---
+        meta_init_state = None
         if config.meta_init_transformer:
             # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
             # no per-rank weight allocation; the backend materializes + loads
-            # from the stashed dir after sharding. The guidance-embedder quirk
-            # (see module docstring) is handled by a deferred zero-init of the
-            # checkpoint-absent params, since to_empty leaves them as garbage
-            # (not meta) — _materialize_meta_tensors wouldn't catch them.
+            # from the stashed dir after sharding. build_meta_init_transformer
+            # keeps init-computed non-persistent buffers real and captures them
+            # into meta_init_state (stashed on the bundle below). The guidance-
+            # embedder quirk (see module docstring) is handled separately by a
+            # deferred zero-init of the checkpoint-absent params, since to_empty
+            # leaves them as garbage (not meta) — _materialize_meta_tensors
+            # wouldn't catch them.
             transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
-            with torch.device("meta"):
-                transformer = Flux2Transformer2DModel.from_config(transformer_config)
-            transformer = finalize_meta_init(transformer, dtype=dtype)
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: Flux2Transformer2DModel.from_config(transformer_config), dtype=dtype
+            )
             _stamp_zero_checkpoint_absent_params(transformer, os.path.join(path, "transformer"))
         else:
             transformer = Flux2Transformer2DModel.from_pretrained(
@@ -254,6 +258,8 @@ class Flux2KleinBundle(Bundle):
         if config.meta_init_transformer:
             # Consumed by the backend's post-shard weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 
