@@ -13,8 +13,14 @@ enable_prefix_caching: false
 
 stages:
   - stage_id: 0
-    max_num_batched_tokens: 32768
-    max_num_seqs: 3
+    # UniRL fans out N thoughts as independent prompt-major requests, so this
+    # stage never needs the stock BAGEL deployment's three concurrent 32k
+    # multimodal sequences. Keeping one 8k sequence also prevents vLLM's
+    # multimodal profiling cache from starving the KV cache when both BAGEL
+    # stages share one GPU.
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    max_num_seqs: 1
     gpu_memory_utilization: 0.45
     devices: "0"
     default_sampling_params:
