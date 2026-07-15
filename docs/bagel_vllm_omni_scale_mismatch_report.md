@@ -19,20 +19,28 @@ This exposed two separate problems:
    `P=1, N=4, M=1, U=1` run. Its timing is useful for diagnosing the bug, but it
    is not a production throughput measurement.
 
-No post-fix GPU timing is available yet. All improvements below are expected
-complexity reductions until the verification gates are completed.
+A post-fix one-rollout smoke completed on one H20 with the same incident
+geometry. The all-at-once collapsed candidate reduced train time to 485.0 s,
+from 1501-1528 s, while preserving a finite loss and optimizer step. That is a
+3.1x measured improvement, but it is not the production disposition: the
+captured-trace exact-versus-collapsed parity gate failed, so the production and
+smoke recipes still select `exact` replay.
 
 ## Observed Impact
 
-The affected W&B run showed the following phase times. No run URL or credential
-is included here.
+The affected run and the post-fix candidate smoke used `P=1, N=4, M=1, U=1`,
+AR max 64, four diffusion steps, one SDE step, and one-GPU FSDP CPU offload.
+This makes the train-phase comparison like-for-like. The runs are
+[incident `87xh7jqr`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/87xh7jqr)
+and [candidate `8rdz7bqo`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/8rdz7bqo).
 
-| Phase | Observed wall time |
-| --- | ---: |
-| train | 1501-1528 s |
-| native generate | 6.6 s |
-| reward | 14.3 s |
-| weight-sync/offload lifecycle | about 110-120 s |
+| Phase | Incident | Candidate smoke |
+| --- | ---: | ---: |
+| train | 1501-1528 s | 485.035 s |
+| native generate | 6.6 s | 9.585 s |
+| reward | 14.3 s | 17.286 s |
+| total measured step | not recovered | 518.141 s |
+| Omni sleep / wake | included in lifecycle estimate | 2.661 s / 1.755 s |
 
 The train phase dominated the iteration. A 30-second `py-spy` sample remained
 inside `prepare_segment -> replay -> _build_contexts_from_replay ->
@@ -45,6 +53,13 @@ The worker exceeded 300 GB RSS. About 63% of its pages were on NUMA node 1 while
 GPU 0 was attached to NUMA node 0. That locality mismatch increased host-to-GPU
 latency, but it was secondary: even ideal NUMA placement would still execute the
 same excessive number of decoder traversals.
+
+The candidate still reached roughly 299 GiB RSS and a sampled 90,199 MiB of
+device memory during single-tensor Adam. `py-spy` showed the post-fix train phase
+progress through RatioNorm backward, FSDP `foreach_reduce`, and then
+`_single_tensor_adam`; it no longer remained in the per-token context rebuild.
+The remaining 485 s is therefore the expected cost of the one-GPU CPU-offloaded
+smoke geometry, not evidence that the original replay multiplier survived.
 
 ## Scale Mismatch
 
@@ -160,28 +175,40 @@ calls are not known to be required.
 ### 1. Parity-gated collapsed replay
 
 T2TI replay now accepts `exact|collapsed`, validates the mode, and keeps `exact`
-as the default. `collapsed` validates every captured chunk, concatenates the same
-ordered `cache_input_ids`, and performs one causal prefill while preserving the
-KV-length and rope postconditions
+as the low-level and recipe default. The current `collapsed` candidate validates
+every captured chunk, preserves the native initial prefill, concatenates the same
+ordered decode-tail IDs, and performs one causal decode update while preserving
+the KV-length and rope postconditions
 ([implementation](../unirl/models/bagel/rl_ops.py#L92-L107),
 [rebuild](../unirl/models/bagel/rl_ops.py#L285-L346),
 [stage wiring](../unirl/models/bagel/diffusion.py#L261-L281)). Unit tests prove
-one fake-model prefill instead of three in the fixture, with equal final cache and
+two fake-model calls instead of three in the fixture, with equal final cache and
 embedding gradients
 ([tests](../tests/models/bagel/test_t2ti_replay.py#L143-L223)).
 
-For the incident geometry, setting `C_i: 64 -> 1` changes expected invocation
-counts from 788 initial / 1056 including recomputation to 32 initial / 48
-including recomputation. That is a count reduction, not a measured 22x wall-time
-speedup. Token and attention FLOPs remain sequence-length dependent. Collapsed
-mode must remain opt-in until real BAGEL parity passes.
+For the incident geometry, setting `C_i: 64 -> 2` changes expected invocation
+counts from 788 initial / 1056 including recomputation to 44 initial / 64
+including recomputation. That is a 16.5x count reduction, not a wall-time claim;
+token and attention FLOPs remain sequence-length dependent. The measured 485 s
+smoke used the earlier one-call candidate (`C_i: 64 -> 1`) and therefore does not
+certify the current two-call implementation.
+
+The real captured-trace gate rejected both candidates. For the one-call version,
+cache relative L2 was 0.01290, velocity relative L2 was 0.00744, and selected
+decoder-gradient relative L2/cosine were 0.05721/0.99836. Preserving the initial
+prefill improved cache relative L2 to 0.00863, but velocity remained 0.00745 and
+gradient relative L2/cosine became 0.06546/0.99796. The unchanged limits are
+0.005 for cache/velocity relative L2 and 0.01/0.999 for gradient relative
+L2/cosine. `collapsed` therefore remains explicit experimental behavior; neither
+shipped recipe enables it.
 
 ### 2. Once-per-update reference swap
 
 The unified stack now supplies all image micro-batches at each optimizer-update
-boundary
-([stack hook](../unirl/train/unified_model_stack.py#L272-L289),
-[call site](../unirl/train/unified_model_stack.py#L353-L365)). BAGEL builds their
+boundary immediately before image backward
+([stack hook](../unirl/train/unified_model_stack.py#L251-L252),
+[cleanup](../unirl/train/unified_model_stack.py#L285-L306),
+[call site](../unirl/train/unified_model_stack.py#L376-L380)). BAGEL builds their
 detached MSE contexts first and computes all reference velocities inside one
 `_reference_weights` scope
 ([`prepare_update_batch`](../unirl/algorithms/bagel_flow_unigrpo.py#L314-L391)).
@@ -200,28 +227,43 @@ GPU-resident FSDP placement. The named smoke profile owns one-GPU CPU offload an
 reduced `P/N/U` settings. Composition and launcher-profile tests prevent the
 smoke geometry from silently becoming the production recipe
 ([profile tests](../tests/rollout/vllm_omni/test_bagel_scale_profiles.py#L34-L88)).
+Both profiles declare `t2ti_replay_chunk_mode: exact`; a missing schema key in the
+first post-fix launch caused Hydra to reject the override before model startup,
+and the profile test now covers the declared/inherited value. That launch error
+was a validation wiring omission, not a cause of the original 25-minute phase.
 
-## Verification Gates
+## Verification Status
 
-The changes are not performance-complete until all of the following pass:
+| Gate | Status | Evidence / remaining work |
+| --- | --- | --- |
+| Unit and config regression | passed | 88 passed, 2 skipped; replay, lifecycle, scale-profile, and strict-contract coverage |
+| One-H20 end-to-end smoke | passed for functionality | exit 0, four images, finite losses, optimizer step, 485.035 s train |
+| Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
+| Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
+| Reference-hoist parity | unit-tested, not GPU-instrumented | lifecycle/error cleanup is covered; `N -> U` swap counts and full gradient parity still need instrumentation |
+| 32-device production | not run | scale is encoded, but exact replay's variable native chunk counts must be made collective-safe before launch |
+| Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
 
-1. **Real-model replay parity:** on fixed Stage-0 traces, compare exact versus
-   collapsed per-layer K/V tensors, final KV length/ropes, Stage-1 velocity,
-   transition mean, log-prob, RatioNorm loss, and gradient norm/cosine. Run both
-   CPU-offloaded smoke and GPU-resident FSDP geometry.
-2. **Reference-hoist parity:** compare per-sample `v_ref`, MSE, total loss, and
-   gradients against the former per-micro path. Instrument `_reference_weights`
-   entries and require `N -> U`; verify update 1 observes weights after update 0.
-3. **Invocation profiling:** count text-prefill, velocity, FSDP pre-forward, and
-   checkpoint recomputation calls. For the incident fixture, collapsed replay
-   should produce the 32/48 counts above.
-4. **Memory and locality:** record RSS and PSS around reference snapshot, stash,
-   restore, and optimizer step; record `numastat`, CPU affinity, GPU topology,
-   host-to-device bandwidth, and GPU-idle samples. NUMA tuning follows work
-   elimination, not vice versa.
-5. **End-to-end timing:** rerun the one-GPU smoke and then the 32-device
-   production profile. Report measured phase times and peak memory separately;
-   do not infer production throughput from the feasibility run.
+The standalone checker does compare per-layer K/V, Stage-1 velocity, transition
+mean, log-prob, and representative decoder gradients with fixed stochastic
+inputs. It does not certify RatioNorm loss, the full gradient vector, CPU-offload
+geometry, or distributed FSDP ordering.
 
-Until these gates pass, the incident is diagnosed and the asymptotic work is
-reduced in code, but no GPU speedup or production stability result is claimed.
+## Disposition
+
+The incident root cause and the recipe scale mismatch are confirmed. The code
+now separates production from smoke geometry, hoists the full-FT reference swap,
+captures replay metadata, and includes a measurable fast-path experiment. The
+fast path produced a real 3.1x one-H20 train-time improvement, but it changed bf16
+flash-attention numerics beyond the preset parity budget. It is not enabled by
+default.
+
+The next production-safe optimization should preserve exact chunk math while
+removing duplicate reconstruction: phase image training per optimizer update so
+RatioNorm builds each exact grad context once, retains detached K/V views after
+backward, performs one batched reference swap, and reuses those views for MSE.
+That removes one exact prefix reconstruction per image without changing cache
+geometry. Separately, distributed exact replay needs collective-count balancing
+or a validated FSDP policy that tolerates variable native completion lengths.
+Only after those two items pass should the 32-device `P=32, N=24, M=1, U=2`
+learning run be used to judge throughput and reward growth.

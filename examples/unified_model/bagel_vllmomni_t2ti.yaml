@@ -53,10 +53,9 @@ pipeline:
   # Native Stage 0 runs BAGEL's inference dispatch. The grad-capable inference
   # replay avoids the known forward_train vs forward_inference ratio offset.
   replay_mode: inference
-  # Preserve the native prefill boundary and collapse the decode tail during
-  # trainer replay. Token order and causal semantics are unchanged, while
-  # decoder/FSDP traversals no longer scale with per-token scheduler chunks.
-  t2ti_replay_chunk_mode: collapsed
+  # Exact replay remains the production default until the captured-trace
+  # cache/velocity/gradient gate approves a faster chunk geometry.
+  t2ti_replay_chunk_mode: exact
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
