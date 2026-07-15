@@ -297,7 +297,7 @@ def main() -> None:
         "passed": passed,
         "captured_tokens": spec.kv_length,
         "exact_calls": len(spec.chunks()),
-        "collapsed_calls": 1,
+        "collapsed_calls": min(2, len(spec.chunks())),
         "exact_seconds": exact.seconds,
         "collapsed_seconds": collapsed.seconds,
         "speedup": exact.seconds / max(collapsed.seconds, 1.0e-12),

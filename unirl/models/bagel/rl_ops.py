@@ -95,9 +95,9 @@ T2TI_REPLAY_CHUNK_MODES = ("exact", "collapsed")
 def validate_t2ti_replay_chunk_mode(mode: Any) -> str:
     """Return a normalized T2TI cache-replay mode or raise.
 
-    ``exact`` preserves the Stage-0 scheduler boundaries. ``collapsed`` is an
-    explicit parity-gated fast path that replays the same token IDs in one causal
-    prefill. The latter changes kernel geometry, so callers must opt into it.
+    ``exact`` preserves the Stage-0 scheduler boundaries. ``collapsed`` preserves
+    the initial prefill boundary and coalesces the decode tail into one causal
+    update. The latter changes decode-kernel geometry, so callers must opt into it.
     """
     normalized = str(mode).strip().lower()
     require(
@@ -296,8 +296,8 @@ def rebuild_text_context_from_chunks(
     ``chunks`` are captured at the vLLM Stage-0 runner boundary, after prompt
     tokenization and scheduling. ``chunk_mode="exact"`` preserves that native
     prefill/decode call structure. The explicit ``"collapsed"`` fast path keeps
-    the same ordered token IDs but sends them through one causal prefill. No cache
-    tensor crosses the rollout boundary; this function creates a fresh
+    the native initial prefill and sends the same ordered decode IDs through one
+    causal update. No cache tensor crosses the rollout boundary; this function creates a fresh
     ``NaiveCache`` on the trainer and lets autograd connect every reconstructed K/V
     tensor to the current policy weights.
 
@@ -310,8 +310,11 @@ def rebuild_text_context_from_chunks(
     replay_chunks = tuple(tuple(int(token) for token in chunk) for chunk in chunks)
     for index, chunk in enumerate(replay_chunks):
         require(bool(chunk), f"rebuild_text_context_from_chunks: chunk {index} is empty.")
-    if chunk_mode == "collapsed":
-        replay_chunks = (tuple(token for chunk in replay_chunks for token in chunk),)
+    if chunk_mode == "collapsed" and len(replay_chunks) > 1:
+        replay_chunks = (
+            replay_chunks[0],
+            tuple(token for chunk in replay_chunks[1:] for token in chunk),
+        )
     expected_kv_length = int(expected_kv_length)
     expected_ropes = tuple(int(x) for x in expected_ropes)
     require(bool(expected_ropes), "rebuild_text_context_from_chunks: expected_ropes must be non-empty.")

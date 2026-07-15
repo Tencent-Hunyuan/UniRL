@@ -168,7 +168,7 @@ def test_rebuild_text_context_replays_exact_chunks_with_gradients():
     assert not model.language_model.training
 
 
-def test_collapsed_replay_matches_exact_cache_and_gradients_with_one_prefill():
+def test_collapsed_replay_matches_exact_cache_and_gradients_with_prefill_boundary():
     exact = _FakeBagel()
     collapsed = _FakeBagel()
     collapsed.load_state_dict(exact.state_dict())
@@ -190,7 +190,7 @@ def test_collapsed_replay_matches_exact_cache_and_gradients_with_one_prefill():
     )
 
     assert exact.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
-    assert collapsed.calls == [([11, 12, 13, 14], [0, 1, 2, 3])]
+    assert collapsed.calls == [([11, 12], [0, 1]), ([13, 14], [2, 3])]
     exact_cache = exact_context["past_key_values"].key_cache[0]
     collapsed_cache = collapsed_context["past_key_values"].key_cache[0]
     torch.testing.assert_close(collapsed_cache, exact_cache)
@@ -216,7 +216,7 @@ def test_diffusion_stage_applies_collapsed_replay_mode():
     gen, cfg_text, cfg_img, image_shape = stage._build_contexts_from_replay(conditions)
 
     assert stage.t2ti_replay_chunk_mode == "collapsed"
-    assert model.calls == [([11, 12, 13, 14], [0, 1, 2, 3])]
+    assert model.calls == [([11, 12], [0, 1]), ([13, 14], [2, 3])]
     assert gen["kv_lens"] == [4]
     assert cfg_text["kv_lens"] == [0]
     assert cfg_img is gen
