@@ -12,29 +12,30 @@ paging.
 
 This exposed two separate problems:
 
-1. **A real replay-complexity bug:** inference decode chunk boundaries were used
-   as trainer forward boundaries.
+1. **A replay-complexity bottleneck:** the trainer independently rebuilt the
+   exact incremental Stage-0 context in three image-loss paths, turning native
+   decode scheduling into repeated FSDP execution geometry.
 2. **A scale-profile mismatch:** the feasibility profile replaced the intended
    `P=32, N=24, M=1, U=2` distributed run with a one-GPU, CPU-offloaded
    `P=1, N=4, M=1, U=1` run. Its timing is useful for diagnosing the bug, but it
    is not a production throughput measurement.
 
-A post-fix one-rollout smoke completed on one H20 with the same incident
-geometry. The all-at-once collapsed candidate reduced train time to 485.0 s,
-from 1501-1528 s, while preserving a finite loss and optimizer step. That is a
-3.1x measured improvement, but it is not the production disposition: the
-captured-trace exact-versus-collapsed parity gate failed, so the production and
-smoke recipes still select `exact` replay.
+A combined experimental one-rollout build completed on one H20 with the same
+incident geometry. It included the one-call collapsed candidate, the
+once-per-update reference swap, and the other lifecycle fixes, and measured
+485.0 s of train time versus 1501-1528 s. That is a 3.09-3.15x matched-geometry
+result, not an ablation of any one change. The exact-versus-collapsed parity gate
+subsequently failed, so the production and smoke recipes still select `exact`.
 
 ## Observed Impact
 
-The affected run and the post-fix candidate smoke used `P=1, N=4, M=1, U=1`,
+The affected run and the combined experimental smoke used `P=1, N=4, M=1, U=1`,
 AR max 64, four diffusion steps, one SDE step, and one-GPU FSDP CPU offload.
 This makes the train-phase comparison like-for-like. The runs are
 [incident `87xh7jqr`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/87xh7jqr)
 and [candidate `8rdz7bqo`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/8rdz7bqo).
 
-| Phase | Incident | Candidate smoke |
+| Phase | Incident | Combined experimental smoke |
 | --- | ---: | ---: |
 | train | 1501-1528 s | 485.035 s |
 | native generate | 6.6 s | 9.585 s |
@@ -55,11 +56,11 @@ latency, but it was secondary: even ideal NUMA placement would still execute the
 same excessive number of decoder traversals.
 
 The candidate still reached roughly 299 GiB RSS and a sampled 90,199 MiB of
-device memory during single-tensor Adam. `py-spy` showed the post-fix train phase
+device memory during single-tensor Adam. `py-spy` showed the experimental train phase
 progress through RatioNorm backward, FSDP `foreach_reduce`, and then
 `_single_tensor_adam`; it no longer remained in the per-token context rebuild.
-The remaining 485 s is therefore the expected cost of the one-GPU CPU-offloaded
-smoke geometry, not evidence that the original replay multiplier survived.
+Those samples identify substantial remaining CPU-offload/optimizer cost, but do
+not prove the residual 485 s is irreducible or free of other bottlenecks.
 
 ## Scale Mismatch
 
@@ -146,11 +147,12 @@ claim that every invocation has identical FLOPs; sequence lengths differ.
 
 ## Root Cause And Amplifiers
 
-**Root cause:** exact inference scheduler chunking was treated as required
-trainer execution geometry. For decode, that made each new token trigger a new
-full FSDP-wrapped decoder traversal, and T2TI rebuilt the result in three loss
-paths. Exact token order and final KV geometry are required; 64 separate trainer
-calls are not known to be required.
+**Root cause:** exact incremental Stage-0 reconstruction was repeated in the
+image anchor, ratio, and MSE paths while every decoder block was FSDP-wrapped and
+CPU-offloaded. For decode, each captured token therefore triggered another full
+FSDP traversal in each path. The native boundaries cannot yet be labeled
+removable: both tested coalescing geometries exceeded the numerical parity
+budget.
 
 **Amplifiers:**
 
@@ -172,7 +174,7 @@ calls are not known to be required.
 
 ## Implemented Remedies
 
-### 1. Parity-gated collapsed replay
+### 1. Experimental collapsed replay
 
 T2TI replay now accepts `exact|collapsed`, validates the mode, and keeps `exact`
 as the low-level and recipe default. The current `collapsed` candidate validates
@@ -227,7 +229,7 @@ GPU-resident FSDP placement. The named smoke profile owns one-GPU CPU offload an
 reduced `P/N/U` settings. Composition and launcher-profile tests prevent the
 smoke geometry from silently becoming the production recipe
 ([profile tests](../tests/rollout/vllm_omni/test_bagel_scale_profiles.py#L34-L88)).
-Both profiles declare `t2ti_replay_chunk_mode: exact`; a missing schema key in the
+Both profiles resolve to `t2ti_replay_chunk_mode: exact`; a missing schema key in the
 first post-fix launch caused Hydra to reject the override before model startup,
 and the profile test now covers the declared/inherited value. That launch error
 was a validation wiring omission, not a cause of the original 25-minute phase.
@@ -237,7 +239,7 @@ was a validation wiring omission, not a cause of the original 25-minute phase.
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
 | Unit and config regression | passed | 88 passed, 2 skipped; replay, lifecycle, scale-profile, and strict-contract coverage |
-| One-H20 end-to-end smoke | passed for functionality | exit 0, four images, finite losses, optimizer step, 485.035 s train |
+| One-H20 end-to-end smoke | mechanical execution completed | exit 0, four images, finite losses, optimizer step, 485.035 s train; tested replay mode failed numerical parity |
 | Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
 | Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
 | Reference-hoist parity | unit-tested, not GPU-instrumented | lifecycle/error cleanup is covered; `N -> U` swap counts and full gradient parity still need instrumentation |
@@ -251,12 +253,13 @@ geometry, or distributed FSDP ordering.
 
 ## Disposition
 
-The incident root cause and the recipe scale mismatch are confirmed. The code
+The incident bottleneck and the recipe scale mismatch are confirmed. The code
 now separates production from smoke geometry, hoists the full-FT reference swap,
 captures replay metadata, and includes a measurable fast-path experiment. The
-fast path produced a real 3.1x one-H20 train-time improvement, but it changed bf16
-flash-attention numerics beyond the preset parity budget. It is not enabled by
-default.
+combined experimental build measured 3.09-3.15x faster in one matched-geometry
+comparison, but both collapsed candidates changed replay outputs beyond the
+preset parity budget. The fast path is not enabled by default, and the exact
+production replay multiplier remains unresolved.
 
 The next production-safe optimization should preserve exact chunk math while
 removing duplicate reconstruction: phase image training per optimizer update so
