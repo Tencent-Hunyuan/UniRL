@@ -76,7 +76,7 @@ class _MutatingCacheUpdate(nn.Module):
 
     def forward(self, values, past_key_values, expected_length):
         self.calls += 1
-        updated_cache = past_key_values.fork()
+        updated_cache = past_key_values.fork() if torch.is_grad_enabled() else past_key_values
         values = torch.sin(values)
         previous = updated_cache.key_cache[0]
         actual_length = 0 if previous is None else int(previous.shape[0])
@@ -86,6 +86,17 @@ class _MutatingCacheUpdate(nn.Module):
         updated_cache.key_cache[0] = merged
         updated_cache.value_cache[0] = merged
         return merged, updated_cache
+
+
+def test_cache_update_preserves_no_grad_in_place_contract():
+    update = _MutatingCacheUpdate()
+    cache = NaiveCache(1)
+
+    with torch.no_grad():
+        _, updated = update(torch.ones(1, 4), cache, 0)
+
+    assert updated is cache
+    assert cache.key_cache[0] is not None
 
 
 class _FakeLanguageModel(nn.Module):

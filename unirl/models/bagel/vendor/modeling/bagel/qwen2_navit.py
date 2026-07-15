@@ -330,7 +330,7 @@ class PackedAttention(Qwen2Attention):
     ):
         # Checkpoint recompute must see the pre-update cache captured by the
         # decoder block, so mutate a shallow cache fork instead of its input.
-        if update_past_key_values and past_key_values is not None:
+        if update_past_key_values and past_key_values is not None and torch.is_grad_enabled():
             past_key_values = past_key_values.fork()
 
         packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
@@ -524,7 +524,7 @@ class PackedAttentionMoT(Qwen2Attention):
     ):
         # See PackedAttention.forward_inference: the cache container is mutable,
         # while activation-checkpoint inputs must remain stable until backward.
-        if update_past_key_values and past_key_values is not None:
+        if update_past_key_values and past_key_values is not None and torch.is_grad_enabled():
             past_key_values = past_key_values.fork()
 
         if mode == 'und':

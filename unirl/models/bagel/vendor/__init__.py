@@ -27,10 +27,11 @@ compatibility/grad fixes below:
   being modified inplace"). It is fine under ``no_grad`` (rollout / the diffuse↔replay
   ratio test), so only RL training trips it. The edit writes into a fresh
   ``torch.zeros_like`` tensor instead — mathematically identical, just grad-safe
-  (mirrors flow_grpo's identical fix). Second, inference cache updates shallow-fork
-  the ``NaiveCache`` container before replacing the current layer's K/V tensors.
-  This keeps activation-checkpoint inputs immutable until backward recomputation
-  while preserving the returned cache contents. Both edits are marked inline.
+  (mirrors flow_grpo's identical fix). Second, grad-enabled inference cache updates
+  shallow-fork the ``NaiveCache`` container before replacing the current layer's
+  K/V tensors. This keeps activation-checkpoint inputs immutable until backward
+  recomputation while preserving no-grad inference's original in-place cache
+  contract. Both edits are marked inline.
 - transformers 5 compatibility edit in ``modeling/{qwen2,bagel}/qwen2*.py``:
   ``PretrainedConfig`` no longer guarantees generation token-id attributes such as
   ``pad_token_id``. BAGEL's upstream config omitted that field and transformers 4
