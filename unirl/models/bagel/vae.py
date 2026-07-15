@@ -155,8 +155,6 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             # (per-image independent; cat keeps the [N, 3, H, W] order).
             return torch.cat([vae_fp32.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
 
-        vae = self.bundle.vae
-        orig_dtype = next(vae.parameters()).dtype
         with nullcontext() if grad else torch.no_grad():
             if grad and activation_checkpoint and clean.requires_grad:
                 from torch.utils.checkpoint import checkpoint
@@ -164,13 +162,13 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
                 decoded = _decode(clean)
-        # Restore the VAE's loaded dtype: the image-edit path also ENCODES the
-        # source with this shared VAE on the next rollout, and a left-over fp32
-        # cast would make encode emit fp32 latents that mismatch the bf16 vae2llm.
-        # (Under activation_checkpoint the backward recompute re-casts to fp32;
-        # the restore still holds for the grad=False rollout/eval path it guards.)
-        if orig_dtype != torch.float32:
-            vae.to(orig_dtype)
+        # Framework convention (qwen_image / sd3 / flux2_klein): the VAE stays fp32
+        # after the first decode — the .to(float32) above is a one-time lazy upcast,
+        # a no-op on later calls. The shared encode path is dtype-safe regardless:
+        # pipeline.py casts encode inputs/outputs at the vendor boundary, so the
+        # downstream bf16 vae2llm is unaffected. (This also removes the old restore's
+        # leak, where an activation_checkpoint backward recompute re-cast the VAE to
+        # fp32 after the restore had run.)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Move to CPU before returning: decoded pixels are only ever consumed as
         # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow
