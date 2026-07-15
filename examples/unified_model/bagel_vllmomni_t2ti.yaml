@@ -28,6 +28,7 @@
 #     --config-name unified_model/bagel_vllmomni_t2ti
 
 num_devices: 1
+devices_per_node: 1
 batch_size: 1
 num_rollouts: 2000
 weight_sync_interval: 1

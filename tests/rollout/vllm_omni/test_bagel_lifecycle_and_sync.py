@@ -452,6 +452,8 @@ def test_bagel_stage_yaml_uses_vllm_omni_020_flat_extension_keys() -> None:
 
 def test_bagel_recipe_uses_inference_replay_and_trainable_checksum() -> None:
     cfg = OmegaConf.load("examples/unified_model/bagel_vllmomni_t2ti.yaml")
+    assert cfg.num_devices == 1
+    assert cfg.devices_per_node == 1
     assert cfg.pipeline.replay_mode == "inference"
     assert cfg.sync.load_plan == BAGEL_VLLM_OMNI_020_LOAD_PLAN
     assert cfg.sync.verify_names == ["language_model.model.layers.0.input_layernorm_moe_gen.weight"]
