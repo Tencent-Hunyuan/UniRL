@@ -621,6 +621,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
 
         gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        collective_pad_zero = gen.get("collective_pad_zero")
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -655,6 +656,11 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
                 prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)  # [1, S']
+        if collective_pad_zero is not None:
+            # The value is exactly zero. Its graph carries discarded decoder
+            # traversals so shorter native traces mirror the longest rank's
+            # FSDP forward/backward collective sequence.
+            log_probs_t = log_probs_t + collective_pad_zero.to(dtype=log_probs_t.dtype)
         means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)  # [1, S', seq, C]
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 

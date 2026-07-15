@@ -282,6 +282,77 @@ def prefill_text_split(
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
 
 
+def _distributed_replay_chunk_target(local_count: int, *, device: torch.device) -> int:
+    """Return the largest exact-replay traversal count in the DP world.
+
+    The BAGEL production recipe is pure data parallelism (SP=1), so the default
+    process group is also the FSDP group. A sequence-parallel rollout would need
+    to synchronize on its data-parallel mesh instead.
+    """
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return int(local_count)
+    count = torch.tensor([int(local_count)], dtype=torch.int64, device=device)
+    dist.all_reduce(count, op=dist.ReduceOp.MAX)
+    return int(count.item())
+
+
+def _cache_update_dependency_zero(cache: Any) -> torch.Tensor:
+    """Build an exact zero whose graph touches the newest K/V from every layer."""
+    dependencies: List[torch.Tensor] = []
+    for store in (cache.key_cache, cache.value_cache):
+        for layer_idx in sorted(store):
+            value = store[layer_idx]
+            if value is not None and value.numel() > 0:
+                dependencies.append(value[-1].reshape(-1)[0].float())
+    require(bool(dependencies), "BAGEL collective replay padding produced no cache tensors.")
+    return torch.stack(dependencies).sum() * 0.0
+
+
+def _pad_text_context_traversals(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    count: int,
+    token_id: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Issue discarded decoder traversals so every FSDP rank has equal depth."""
+    if int(count) <= 0:
+        return None
+
+    # A growing dummy KV continuation retains every copied prefix and becomes
+    # quadratic for long thinking traces. Use a one-token hidden-state chain with
+    # no cache instead. The zero dependency on the semantic terminal cache makes
+    # this a suffix of the real autograd graph, which preserves FSDP2's backward
+    # hook order; the real context itself is never mutated or returned advanced.
+    lm = model.language_model
+    token_ids = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+    hidden = lm.model.embed_tokens(token_ids)
+    if torch.is_grad_enabled():
+        hidden = hidden + _cache_update_dependency_zero(ctx["past_key_values"]).to(dtype=hidden.dtype)
+
+    query_lens = torch.ones(1, dtype=torch.int, device=device)
+    position_ids = torch.zeros(1, dtype=torch.long, device=device)
+    query_indexes = torch.zeros(1, dtype=torch.long, device=device)
+    for _ in range(int(count)):
+        output = lm.forward_inference(
+            packed_query_sequence=hidden,
+            query_lens=query_lens,
+            packed_query_position_ids=position_ids,
+            packed_query_indexes=query_indexes,
+            past_key_values=None,
+            key_values_lens=None,
+            packed_key_value_indexes=None,
+            update_past_key_values=False,
+            is_causal=True,
+            mode="und",
+        )
+        hidden = output.packed_query_sequence
+    return hidden.float().reshape(-1)[0] * 0.0 if torch.is_grad_enabled() else None
+
+
 def rebuild_text_context_from_chunks(
     model: Any,
     *,
@@ -290,6 +361,7 @@ def rebuild_text_context_from_chunks(
     expected_ropes: Sequence[int],
     device: torch.device,
     chunk_mode: str = "exact",
+    collective_target_chunks: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Rebuild a grad-capable BAGEL context from native cache-input tokens.
 
@@ -299,7 +371,10 @@ def rebuild_text_context_from_chunks(
     the native initial prefill and sends the same ordered decode IDs through one
     causal update. No cache tensor crosses the rollout boundary; this function creates a fresh
     ``NaiveCache`` on the trainer and lets autograd connect every reconstructed K/V
-    tensor to the current policy weights.
+    tensor to the current policy weights. In exact mode, pure-DP workers agree on
+    the largest per-sample chunk count before the first decoder call. Shorter
+    traces issue discarded, graph-connected decoder traversals so FSDP2 sees the
+    same forward and backward collective depth on every rank.
 
     The MoT inference kernels dispatch on ``module.training``.  Keep the language
     model in ``eval`` for grad-enabled replay, matching :func:`forward_flow`; do not
@@ -327,10 +402,36 @@ def rebuild_text_context_from_chunks(
 
     try:
         require_inference_dispatch(model)
+        target_chunks = len(replay_chunks)
+        if chunk_mode == "exact":
+            # Agree before the first decoder call. Computing this after the real
+            # trace would already let unequal ranks desynchronize all-gathers.
+            target_chunks = (
+                _distributed_replay_chunk_target(len(replay_chunks), device=device)
+                if collective_target_chunks is None
+                else int(collective_target_chunks)
+            )
+            require(
+                target_chunks >= len(replay_chunks),
+                "rebuild_text_context_from_chunks: collective target cannot be shorter than the real trace: "
+                f"{target_chunks} < {len(replay_chunks)}.",
+            )
+
         ctx = init_und_context(model)
         for chunk in replay_chunks:
             token_ids = torch.as_tensor(chunk, dtype=torch.long)
             ctx = prefill_text_split(model, ctx, text_ids=token_ids, device=device)
+
+        if chunk_mode == "exact":
+            dependency_zero = _pad_text_context_traversals(
+                model,
+                ctx,
+                count=target_chunks - len(replay_chunks),
+                token_id=replay_chunks[-1][-1],
+                device=device,
+            )
+            if dependency_zero is not None:
+                ctx["collective_pad_zero"] = dependency_zero
 
         actual_kv_length = int(ctx["kv_lens"][0])
         actual_ropes = tuple(int(x) for x in ctx["ropes"])

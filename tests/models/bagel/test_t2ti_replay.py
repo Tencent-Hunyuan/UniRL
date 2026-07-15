@@ -104,6 +104,34 @@ class _FakeLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = _FakeLMModel()
+        self.dummy_calls = 0
+
+    def forward_inference(
+        self,
+        packed_query_sequence,
+        query_lens,
+        packed_query_position_ids,
+        packed_query_indexes,
+        past_key_values=None,
+        key_values_lens=None,
+        packed_key_value_indexes=None,
+        update_past_key_values=False,
+        is_causal=True,
+        mode="und",
+    ):
+        del (
+            query_lens,
+            packed_query_position_ids,
+            packed_query_indexes,
+            past_key_values,
+            key_values_lens,
+            packed_key_value_indexes,
+            update_past_key_values,
+            is_causal,
+            mode,
+        )
+        self.dummy_calls += 1
+        return SimpleNamespace(packed_query_sequence=torch.cos(packed_query_sequence), past_key_values=None)
 
 
 class _FakeBagel(nn.Module):
@@ -166,6 +194,77 @@ def test_rebuild_text_context_replays_exact_chunks_with_gradients():
     # Grad-enabled inference replay intentionally remains in eval dispatch
     # through the later checkpoint recomputation/backward.
     assert not model.language_model.training
+
+
+def test_exact_replay_pads_collective_depth_without_advancing_real_cache():
+    model = _FakeBagel()
+    reference = _FakeBagel()
+    reference.load_state_dict(model.state_dict())
+
+    context = rebuild_text_context_from_chunks(
+        model,
+        chunks=((11, 12), (13,), (14,)),
+        expected_kv_length=4,
+        expected_ropes=(4,),
+        device=torch.device("cpu"),
+        collective_target_chunks=5,
+    )
+    reference_context = rebuild_text_context_from_chunks(
+        reference,
+        chunks=((11, 12), (13,), (14,)),
+        expected_kv_length=4,
+        expected_ropes=(4,),
+        device=torch.device("cpu"),
+        collective_target_chunks=3,
+    )
+
+    assert model.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
+    assert model.language_model.dummy_calls == 2
+    assert context["kv_lens"] == [4]
+    assert context["ropes"] == [4]
+    assert context["past_key_values"].key_cache[0].shape[0] == 4
+    assert context["collective_pad_zero"].item() == 0.0
+
+    (context["past_key_values"].key_cache[0].sum() + context["collective_pad_zero"]).backward()
+    reference_context["past_key_values"].key_cache[0].sum().backward()
+    assert model.language_model.model.embed_tokens.weight.grad is not None
+    torch.testing.assert_close(
+        model.language_model.model.embed_tokens.weight.grad,
+        reference.language_model.model.embed_tokens.weight.grad,
+    )
+
+
+def test_exact_replay_pads_no_grad_collective_depth_without_zero_graph():
+    model = _FakeBagel()
+
+    with torch.no_grad():
+        context = rebuild_text_context_from_chunks(
+            model,
+            chunks=((11, 12), (13,), (14,)),
+            expected_kv_length=4,
+            expected_ropes=(4,),
+            device=torch.device("cpu"),
+            collective_target_chunks=5,
+        )
+
+    assert model.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
+    assert model.language_model.dummy_calls == 2
+    assert context["kv_lens"] == [4]
+    assert context["ropes"] == [4]
+    assert context["past_key_values"].key_cache[0].shape[0] == 4
+    assert "collective_pad_zero" not in context
+
+
+def test_exact_replay_rejects_collective_target_shorter_than_trace():
+    with pytest.raises(ValueError, match="collective target cannot be shorter"):
+        rebuild_text_context_from_chunks(
+            _FakeBagel(),
+            chunks=((11, 12), (13,), (14,)),
+            expected_kv_length=4,
+            expected_ropes=(4,),
+            device=torch.device("cpu"),
+            collective_target_chunks=2,
+        )
 
 
 def test_collapsed_replay_matches_exact_cache_and_gradients_with_prefill_boundary():

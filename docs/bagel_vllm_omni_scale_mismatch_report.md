@@ -20,6 +20,12 @@ This exposed two separate problems:
    `P=1, N=4, M=1, U=1` run. Its timing is useful for diagnosing the bug, but it
    is not a production throughput measurement.
 
+A later one-node run retained global `P=32, N=24, M=1, U=2` on eight H20s and
+disabled both persistent and lifecycle FSDP offload. Native vLLM-Omni rollout
+completed all 768 T2TI samples, but training deadlocked when ranks with different
+exact replay depths entered different FSDP2 collectives. That is a separate
+distributed-ordering defect from the original one-GPU paging bottleneck.
+
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
 once-per-update reference swap, and the other lifecycle fixes, and measured
@@ -86,6 +92,33 @@ much slower per model invocation than the intended GPU-resident FSDP run. On the
 other hand, production has 24 local thought/image samples per DP rank and longer
 thinking limits, so exact per-token replay would still scale poorly even after
 removing CPU offload.
+
+## Distributed Exact-Replay Deadlock
+
+The one-node batch-32 run (`mclck3gt`) used eight data-parallel H20 workers, so
+each rank received 96 of the 768 paired thought/image samples. Two disjoint
+optimizer updates then contained 48 samples per rank. The launch resolved
+`batch_size=32`, `samples_per_prompt=24`, `samples_per_prompt(image)=1`, and
+`num_updates_per_batch=2`; the deadlock was not a silent batch-size override.
+
+Captured thinking traces contained roughly 138-706 Stage-0 scheduler chunks per
+sample. During the no-grad old-policy preparation, faster ranks completed their
+96 exact reconstructions and entered update work while a slower rank was still
+at sample 83. Every exact chunk invokes all 28 FSDP-wrapped decoder blocks. With
+`reshard_after_forward=true`, the fast rank eventually issued backward-side
+FSDP collectives while the slow rank was still issuing forward all-gathers. The
+collective order no longer matched, and all ranks stopped making progress.
+
+This diagnosis is based on rank progress, stable GPU allocations, low-power
+100%-utilization stalls, and native stacks showing seven ranks synchronized from
+forward-side CUDA operations while one rank was inside autograd. The run was
+then stopped intentionally. It produced no optimizer metric and did not OOM.
+
+Setting `reshard_after_forward=false` alone is not a sufficient repair. An
+adversarial two-rank FSDP2 test still deadlocked when one rank's backward
+reduce-scatter met the other rank's pre-backward all-gather. The exact path must
+make repeated-module traversal counts equal across ranks, not merely retain
+unsharded parameters after forward.
 
 ## Traversal Accounting
 
@@ -234,16 +267,41 @@ first post-fix launch caused Hydra to reject the override before model startup,
 and the profile test now covers the declared/inherited value. That launch error
 was a validation wiring omission, not a cause of the original 25-minute phase.
 
+### 4. Collective-safe exact replay
+
+Before the first exact decoder traversal for each sample, every pure-DP trainer
+rank now all-reduces its local chunk count with `MAX`. A rank with `C` real
+chunks and collective target `T` executes the real reconstruction followed by
+`T-C` discarded decoder traversals. The returned KV cache, length, and rope
+position remain those of the real trace.
+
+The discarded traversals form a sequential, no-cache one-token hidden-state
+chain. Its input carries an exact-zero dependency on the real terminal K/V and
+its final exact zero is added to the replay log-prob. This preserves the required
+forward and reverse autograd traversal order while contributing zero to the
+objective and zero to semantic gradients. It also avoids a growing dummy KV
+continuation, whose retained graph would scale as `O(D*prefix + D^2)` for `D`
+padding calls.
+
+The synchronization deliberately targets the current `fsdp_mode=full`, `SP=1`
+recipe, where the default process group is the FSDP data-parallel world. It does
+not claim HSDP, tensor/sequence-parallel, Ulysses, or expert-parallel support;
+those layouts need their exact shard group and may impose activation-shape
+collectives that a one-token dummy cannot satisfy.
+
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | 88 passed, 2 skipped; replay, lifecycle, scale-profile, and strict-contract coverage |
+| Unit and config regression | passed | focused replay/lifecycle/scale suite passes; exact padding covers grad and no-grad paths, semantic-cache preservation, and gradient parity |
+| Two-rank FSDP2 ordering | passed on CPU/Gloo | unequal real depths, dependent bounded padding, activation checkpointing, `reshard_after_forward=true`, repeated image calls, and RatioNorm-like loss completed with equal peer gradients and matched an unsharded reference |
 | One-H20 end-to-end smoke | mechanical execution completed | exit 0, four images, finite losses, optimizer step, 485.035 s train; tested replay mode failed numerical parity |
 | Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
 | Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
 | Reference-hoist parity | unit-tested, not GPU-instrumented | lifecycle/error cleanup is covered; `N -> U` swap counts and full gradient parity still need instrumentation |
-| 32-device production | not run | scale is encoded, but exact replay's variable native chunk counts must be made collective-safe before launch |
+| Eight-H20 global batch 32 before balancing | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
+| Eight-H20 global batch 32 after balancing | pending | requires Torch 2.11/CUDA/NCCL validation of the new collective-safe exact replay |
+| 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; validate the one-node batch-32 run first |
 | Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
 
 The standalone checker does compare per-layer K/V, Stage-1 velocity, transition
@@ -255,18 +313,20 @@ geometry, or distributed FSDP ordering.
 
 The incident bottleneck and the recipe scale mismatch are confirmed. The code
 now separates production from smoke geometry, hoists the full-FT reference swap,
-captures replay metadata, and includes a measurable fast-path experiment. The
+captures replay metadata, collectively balances exact replay traversal depth,
+and includes a measurable fast-path experiment. The
 combined experimental build measured 3.09-3.15x faster in one matched-geometry
 comparison, but both collapsed candidates changed replay outputs beyond the
 preset parity budget. The fast path is not enabled by default, and the exact
-production replay multiplier remains unresolved.
+production replay multiplier remains a throughput cost even though its FSDP
+ordering now has an implementation-level repair.
 
 The next production-safe optimization should preserve exact chunk math while
 removing duplicate reconstruction: phase image training per optimizer update so
 RatioNorm builds each exact grad context once, retains detached K/V views after
 backward, performs one batched reference swap, and reuses those views for MSE.
 That removes one exact prefix reconstruction per image without changing cache
-geometry. Separately, distributed exact replay needs collective-count balancing
-or a validated FSDP policy that tolerates variable native completion lengths.
-Only after those two items pass should the 32-device `P=32, N=24, M=1, U=2`
-learning run be used to judge throughput and reward growth.
+geometry. The collective-count balancing repair must first pass the eight-H20
+Torch 2.11/CUDA/NCCL run. Only after that and the duplicate-reconstruction work
+should the 32-device `P=32, N=24, M=1, U=2` learning run be used to judge
+throughput and reward growth.
