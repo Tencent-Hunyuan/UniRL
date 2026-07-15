@@ -22,6 +22,11 @@ stages:
     max_model_len: 8192
     max_num_batched_tokens: 8192
     max_num_seqs: 1
+    # The co-located DiT is already resident when vLLM profiles free memory,
+    # which makes a fractional KV budget collapse to zero. One GiB holds more
+    # than one full 8k BAGEL KV sequence; let vLLM allocate that cache directly.
+    kv_cache_memory_bytes: 1073741824
+    enforce_eager: true
     limit_mm_per_prompt:
       image: 0
       img2img: 0

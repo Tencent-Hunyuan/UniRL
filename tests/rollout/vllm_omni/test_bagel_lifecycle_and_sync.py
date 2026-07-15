@@ -449,6 +449,8 @@ def test_bagel_stage_yaml_uses_vllm_omni_020_flat_extension_keys() -> None:
     assert cfg.stages[0].max_model_len == 8192
     assert cfg.stages[0].max_num_batched_tokens == 8192
     assert cfg.stages[0].max_num_seqs == 1
+    assert cfg.stages[0].kv_cache_memory_bytes == 1024**3
+    assert cfg.stages[0].enforce_eager is True
     assert dict(cfg.stages[0].limit_mm_per_prompt) == {"image": 0, "img2img": 0}
     assert cfg.stages[0].worker_extension_cls.endswith("BagelARWeightSyncExtension")
     assert cfg.stages[1].custom_pipeline_args.pipeline_class.endswith("RLBagelPipeline")
