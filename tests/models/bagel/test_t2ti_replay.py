@@ -9,7 +9,8 @@ from unirl.models.bagel.conditions import (
     BagelT2TIDiffusionConditions,
     BagelThinkKVReplaySpec,
 )
-from unirl.models.bagel.rl_ops import rebuild_text_context_from_chunks
+from unirl.models.bagel.diffusion import BagelDiffusionStage
+from unirl.models.bagel.rl_ops import rebuild_text_context_from_chunks, validate_t2ti_replay_chunk_mode
 
 
 def _payload(**overrides):
@@ -165,3 +166,101 @@ def test_rebuild_text_context_replays_exact_chunks_with_gradients():
     # Grad-enabled inference replay intentionally remains in eval dispatch
     # through the later checkpoint recomputation/backward.
     assert not model.language_model.training
+
+
+def test_collapsed_replay_matches_exact_cache_and_gradients_with_one_prefill():
+    exact = _FakeBagel()
+    collapsed = _FakeBagel()
+    collapsed.load_state_dict(exact.state_dict())
+
+    exact_context = rebuild_text_context_from_chunks(
+        exact,
+        chunks=((11, 12), (13,), (14,)),
+        expected_kv_length=4,
+        expected_ropes=(4,),
+        device=torch.device("cpu"),
+    )
+    collapsed_context = rebuild_text_context_from_chunks(
+        collapsed,
+        chunks=((11, 12), (13,), (14,)),
+        expected_kv_length=4,
+        expected_ropes=(4,),
+        device=torch.device("cpu"),
+        chunk_mode="collapsed",
+    )
+
+    assert exact.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
+    assert collapsed.calls == [([11, 12, 13, 14], [0, 1, 2, 3])]
+    exact_cache = exact_context["past_key_values"].key_cache[0]
+    collapsed_cache = collapsed_context["past_key_values"].key_cache[0]
+    torch.testing.assert_close(collapsed_cache, exact_cache)
+    assert exact_context["kv_lens"] == collapsed_context["kv_lens"] == [4]
+    assert exact_context["ropes"] == collapsed_context["ropes"] == [4]
+
+    exact_cache.square().sum().backward()
+    collapsed_cache.square().sum().backward()
+    torch.testing.assert_close(
+        collapsed.language_model.model.embed_tokens.weight.grad,
+        exact.language_model.model.embed_tokens.weight.grad,
+    )
+
+
+def test_diffusion_stage_applies_collapsed_replay_mode():
+    model = _FakeBagel()
+    stage = BagelDiffusionStage(
+        model=SimpleNamespace(model=model, device="cpu"),
+        t2ti_replay_chunk_mode="collapsed",
+    )
+    conditions = BagelT2TIDiffusionConditions.for_sample(BagelThinkKVReplaySpec.from_custom_output(_payload()))
+
+    gen, cfg_text, cfg_img, image_shape = stage._build_contexts_from_replay(conditions)
+
+    assert stage.t2ti_replay_chunk_mode == "collapsed"
+    assert model.calls == [([11, 12, 13, 14], [0, 1, 2, 3])]
+    assert gen["kv_lens"] == [4]
+    assert cfg_text["kv_lens"] == [0]
+    assert cfg_img is gen
+    assert image_shape == (512, 384)
+
+
+def test_replay_chunk_mode_normalizes_explicit_opt_in():
+    assert validate_t2ti_replay_chunk_mode(" COLLAPSED ") == "collapsed"
+
+
+@pytest.mark.parametrize("mode", ["unknown", "", None])
+def test_replay_chunk_mode_rejects_unknown_values(mode):
+    with pytest.raises(ValueError, match="must be one of"):
+        validate_t2ti_replay_chunk_mode(mode)
+
+
+@pytest.mark.parametrize("chunk_mode", ["exact", "collapsed"])
+@pytest.mark.parametrize(
+    ("expected_kv_length", "expected_ropes", "message"),
+    [
+        (3, (4,), "KV length"),
+        (4, (3,), "ropes"),
+    ],
+)
+def test_replay_modes_preserve_geometry_validation(chunk_mode, expected_kv_length, expected_ropes, message):
+    with pytest.raises(ValueError, match=message):
+        rebuild_text_context_from_chunks(
+            _FakeBagel(),
+            chunks=((11, 12), (13,), (14,)),
+            expected_kv_length=expected_kv_length,
+            expected_ropes=expected_ropes,
+            device=torch.device("cpu"),
+            chunk_mode=chunk_mode,
+        )
+
+
+@pytest.mark.parametrize("chunk_mode", ["exact", "collapsed"])
+def test_replay_modes_reject_empty_captured_chunks(chunk_mode):
+    with pytest.raises(ValueError, match="chunk 1 is empty"):
+        rebuild_text_context_from_chunks(
+            _FakeBagel(),
+            chunks=((11, 12), (), (14,)),
+            expected_kv_length=3,
+            expected_ropes=(3,),
+            device=torch.device("cpu"),
+            chunk_mode=chunk_mode,
+        )

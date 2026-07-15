@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
@@ -381,6 +381,10 @@ class StageAlgorithm(Remote, ABC):
     # (:meth:`recomputes_anchor`), the train stack re-slices and reassembles
     # exactly these fields at train-time geometry — it never hardcodes them.
     anchor_fields: Tuple[str, ...] = ()
+    # Opt-in for the exact-geometry preparation/finalization pass around each
+    # optimizer update. False avoids duplicate Batch slicing for algorithms that
+    # use only the regular compute hook.
+    prepares_update_batch: bool = False
 
     def recomputes_anchor(self) -> bool:
         """Whether the anchor must be recomputed at the EXACT ``(mini, micro)``
@@ -427,6 +431,31 @@ class StageAlgorithm(Remote, ABC):
                 slot. Implementations may mutate field defaults that were
                 left ``None`` by the rollout (lazy initialization); they
                 must NOT mutate fields that the rollout already populated.
+        """
+        return None
+
+    def prepare_update_batch(
+        self,
+        *,
+        micro_batches: Sequence[Tuple[Mapping[str, "Condition"], "Segment"]],
+    ) -> None:
+        """Optional hook run once before each optimizer update.
+
+        ``micro_batches`` has the exact geometry and order that
+        :meth:`compute_loss_and_backward` will consume for this algorithm in the
+        upcoming update. Most algorithms need no preparation. Reference-policy
+        algorithms may use the hook to batch detached work that would otherwise
+        be repeated once per micro-batch, provided they preserve the policy state
+        at this update boundary.
+        """
+        return None
+
+    def finish_update_batch(self, *, succeeded: bool) -> None:
+        """Release state created by :meth:`prepare_update_batch`.
+
+        Called in a train-stack ``finally`` block. Implementations must clear
+        transient state on both success and failure; they may validate complete
+        consumption when ``succeeded`` is true.
         """
         return None
 

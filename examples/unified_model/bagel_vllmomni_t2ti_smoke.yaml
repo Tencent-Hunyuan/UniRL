@@ -1,0 +1,47 @@
+# @package _global_
+# Single-GPU functional smoke profile for native BAGEL T2TI vLLM-Omni.
+#
+# This composes the production recipe and changes only scale and device-memory
+# placement. It preserves the previously validated P=1, N=4, M=1 settings and
+# CPU-offloaded full-FT path for an 80GB-class GPU. Use this for contract and
+# end-to-end functional checks, not as the production UniGRPO recipe.
+#
+# Launch:
+#   scripts/launch_bagel_vllmomni_t2ti.sh --profile smoke
+
+defaults:
+  - /unified_model/bagel_vllmomni_t2ti
+  - _self_
+
+num_devices: 1
+devices_per_node: 1
+batch_size: 1
+enable_fsdp_offload: true
+
+logging:
+  tags: [bagel, unigrpo, t2ti, vllm-omni, fullft, smoke, cpu-offload]
+
+backend:
+  fsdp_cfg:
+    cpu_offload: true
+
+reward:
+  backend:
+    base_device: cpu
+    config:
+      batch_size: 2
+      device: cpu
+
+stack:
+  # Keep the functional smoke bounded to one replay/update pass.
+  num_updates_per_batch: 1
+
+sampling:
+  ar:
+    samples_per_prompt: 4
+    max_new_tokens: 512
+  diffusion:
+    samples_per_prompt: 1
+    num_inference_steps: 14
+    scheduler:
+      num_sde_steps: 2

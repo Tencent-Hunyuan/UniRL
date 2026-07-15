@@ -239,35 +239,71 @@ class UnifiedModelTrainStack(Remote):
         slices → shared optimizer_step → stamp grad_norm / lr onto each track's result.
         """
         self.fsdp_backend.zero_grad()
-        results: Dict[str, TrainStepResult] = {}
-        any_backward = False
-        for name in self.algorithms:
-            partial, has_backward = self._backward_track(
-                name, tracks[name], slices_by_track[name], training_progress=training_progress
-            )
-            results[name] = partial
-            any_backward = any_backward or has_backward
+        succeeded = False
+        try:
+            results: Dict[str, TrainStepResult] = {}
+            any_backward = False
+            for name, algorithm in self.algorithms.items():
+                # Prepare immediately before this algorithm's forward/backward.
+                # BAGEL image reference KVs therefore do not occupy GPU memory
+                # during the preceding AR backward, and every reference swap is
+                # complete before its own activation-checkpointed graph exists.
+                if algorithm.prepares_update_batch:
+                    self._prepare_update_batch(name, tracks[name], slices_by_track[name])
+                partial, has_backward = self._backward_track(
+                    name, tracks[name], slices_by_track[name], training_progress=training_progress
+                )
+                results[name] = partial
+                any_backward = any_backward or has_backward
 
-        if any_backward:
-            # Multi-update only: the prior update's forward/backward churn fragments the
-            # CUDA pool, so this step's clip_grad_norm NCCL all_reduce can fail to find a
-            # contiguous buffer (OOM with free-but-fragmented memory — exactly the
-            # num_updates_per_batch>1 optimizer-step OOM). Returning the freed activation
-            # blocks to the driver first defragments. Gated on >1 so the single-update
-            # path (and the LoRA recipe) pays nothing.
-            if self.num_updates_per_batch > 1 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
-        else:
-            grad_norm = 0.0
-            logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
+            if any_backward:
+                # Multi-update only: the prior update's forward/backward churn fragments the
+                # CUDA pool, so this step's clip_grad_norm NCCL all_reduce can fail to find a
+                # contiguous buffer (OOM with free-but-fragmented memory — exactly the
+                # num_updates_per_batch>1 optimizer-step OOM). Returning the freed activation
+                # blocks to the driver first defragments. Gated on >1 so the single-update
+                # path (and the LoRA recipe) pays nothing.
+                if self.num_updates_per_batch > 1 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+            else:
+                grad_norm = 0.0
+                logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
 
-        lr = self._current_lr()
-        for name, r in list(results.items()):
-            results[name] = TrainStepResult(
-                loss=r.loss, grad_norm=grad_norm, lr=lr, has_backward=r.has_backward, micros=r.micros, metrics=r.metrics
-            )
-        return results
+            lr = self._current_lr()
+            for name, result in list(results.items()):
+                results[name] = TrainStepResult(
+                    loss=result.loss,
+                    grad_norm=grad_norm,
+                    lr=lr,
+                    has_backward=result.has_backward,
+                    micros=result.micros,
+                    metrics=result.metrics,
+                )
+            succeeded = True
+            return results
+        finally:
+            for algorithm in self.algorithms.values():
+                if algorithm.prepares_update_batch:
+                    algorithm.finish_update_batch(succeeded=succeeded)
+
+    def _prepare_update_batch(
+        self,
+        name: str,
+        track: RolloutTrack,
+        micro_slices: List[Tuple[int, int]],
+    ) -> None:
+        """Run one algorithm's detached preparation at update geometry."""
+        micro_batches = []
+        for start, end in micro_slices:
+            micro = track.slice(start, end)
+            if micro.segment is None:
+                raise RuntimeError(
+                    f"UnifiedModelTrainStack._prepare_update_batch: track {name!r} "
+                    "produced a micro-batch with segment=None."
+                )
+            micro_batches.append((micro.conditions, micro.segment))
+        self.algorithms[name].prepare_update_batch(micro_batches=micro_batches)
 
     def on_rollout_end(self) -> None:
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""

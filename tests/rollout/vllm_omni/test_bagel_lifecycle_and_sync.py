@@ -461,8 +461,9 @@ def test_bagel_stage_yaml_uses_vllm_omni_020_flat_extension_keys() -> None:
 def test_bagel_recipe_uses_inference_replay_and_trainable_checksum(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REPORT_TO_WANDB", "false")
     cfg = OmegaConf.load("examples/unified_model/bagel_vllmomni_t2ti.yaml")
-    assert cfg.num_devices == 1
-    assert cfg.devices_per_node == 1
+    assert cfg.num_devices == 32
+    assert cfg.devices_per_node == 8
+    assert cfg.batch_size == 32
     assert cfg.logging.report_to_wandb is False
     assert cfg.pipeline.replay_mode == "inference"
     assert cfg.sync.load_plan == BAGEL_VLLM_OMNI_020_LOAD_PLAN
@@ -473,7 +474,7 @@ def test_bagel_recipe_uses_inference_replay_and_trainable_checksum(monkeypatch: 
         timestep_fraction=cfg.sampling.diffusion.scheduler.timestep_fraction,
         num_sde_steps=cfg.sampling.diffusion.scheduler.num_sde_steps,
     )
-    assert scheduler.get_sde_indices(step=0) == {0, 1}
+    assert scheduler.get_sde_indices(step=0) == {2, 3, 4}
 
 
 def test_bagel_load_plan_requires_both_native_stages() -> None:

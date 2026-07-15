@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -148,6 +149,90 @@ def test_unigrpo_rejects_bad_reference_without_mutating_live_weights() -> None:
 
     assert torch.equal(transformer.weight, torch.full_like(transformer.weight, 3.0))
     assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 4.0))
+
+
+def test_unigrpo_full_ft_reference_swap_is_hoisted_once_per_optimizer_update() -> None:
+    class FakeStage:
+        def __init__(self) -> None:
+            transformer = nn.Linear(1, 1, bias=False)
+            with torch.no_grad():
+                transformer.weight.fill_(1.0)
+            self.model = SimpleNamespace(device=torch.device("cpu"), transformer=transformer)
+            self.context_weights: list[float] = []
+            self.velocity_calls = 0
+
+        def build_forward_kwargs(self, conditions, *, params, device):
+            del params, device
+            weight = self.model.transformer.weight.detach().clone()
+            self.context_weights.append(float(weight.item()))
+            return {"context_weight": weight, "sample_id": conditions["sample_id"]}
+
+        def predict_velocity_at(self, forward_kwargs, *, sample, sigma, params):
+            del sigma, params
+            self.velocity_calls += 1
+            # The detached context term makes it observable that update 2 was
+            # prepared after update 1's weight change.
+            return self.model.transformer(sample) + 0.1 * forward_kwargs["context_weight"]
+
+    def segment(value: float):
+        return make_image_segment(
+            latents=torch.tensor([[[[value]], [[value + 0.5]]]], dtype=torch.float32),
+            sigmas=torch.tensor([1.0, 0.0]),
+            indices=torch.tensor([0, 1], dtype=torch.long),
+            sde_indices=torch.tensor([0], dtype=torch.long),
+        )
+
+    stage = FakeStage()
+    algorithm = BagelFlowUniGRPO(
+        params=object(),
+        stage=stage,
+        mse_weight=1.0,
+        ratio_norm=True,
+    )
+    algorithm._ratio_norm_surrogate = lambda **_kwargs: AlgorithmStepResult(
+        loss=0.0,
+        metrics={},
+        num_steps_or_tokens=1,
+        has_backward=True,
+    )
+
+    reference_swaps = 0
+    original_reference_weights = algorithm._reference_weights
+
+    @contextmanager
+    def counted_reference_weights(transformer):
+        nonlocal reference_swaps
+        reference_swaps += 1
+        with original_reference_weights(transformer):
+            yield
+
+    algorithm._reference_weights = counted_reference_weights
+
+    updates = [
+        [({"sample_id": 0}, segment(1.0)), ({"sample_id": 1}, segment(2.0))],
+        [({"sample_id": 2}, segment(3.0)), ({"sample_id": 3}, segment(4.0))],
+    ]
+    for update_index, micro_batches in enumerate(updates):
+        if update_index == 1:
+            # Simulate the first optimizer update before preparing the second.
+            stage.model.transformer.weight.grad = None
+            with torch.no_grad():
+                stage.model.transformer.weight.fill_(2.0)
+        algorithm.prepare_update_batch(micro_batches=micro_batches)
+        assert stage.context_weights[-2:] == [float(update_index + 1)] * 2
+        for conditions, micro_segment in micro_batches:
+            algorithm.compute_loss_and_backward(
+                conditions=conditions,
+                segment=micro_segment,
+                advantages=torch.ones(1),
+                training_progress=0.0,
+                loss_scale=0.5,
+            )
+
+    assert reference_swaps == 2
+    assert stage.velocity_calls == 8  # four detached v_ref + four grad-enabled v_theta
+    assert algorithm._prepared_mse_batches is None
+    assert stage.model.transformer.weight.grad is not None
 
 
 def test_prompt_prefill_moves_vendor_cpu_tensors_to_compute_device() -> None:

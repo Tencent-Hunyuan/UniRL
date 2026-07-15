@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
@@ -40,6 +41,15 @@ from .base import (
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
+
+
+@dataclass
+class _PreparedMSEBatch:
+    """Detached MSE inputs prepared at one optimizer-update boundary."""
+
+    target_steps: Tuple[int, ...]
+    forward_kwargs: Dict[str, Any]
+    reference_velocities: List[torch.Tensor]
 
 
 @contextmanager
@@ -76,6 +86,8 @@ def _disable_lora(module: Any) -> Iterator[bool]:
 
 class BagelFlowUniGRPO(FlowGRPO):
     """FlowGRPO with UniGRPO's velocity-MSE regularization (BAGEL image side)."""
+
+    prepares_update_batch = True
 
     def __init__(
         self,
@@ -119,6 +131,10 @@ class BagelFlowUniGRPO(FlowGRPO):
         # Stays None under LoRA (v_ref = adapters off) or mse_weight=0 (no MSE). See
         # _reference_weights.
         self._ref_snapshot: Optional[Dict[str, torch.Tensor]] = None
+        # Set by prepare_update_batch and consumed in the exact micro-batch order
+        # supplied by UnifiedModelTrainStack. None keeps direct algorithm callers
+        # on the legacy per-micro fallback.
+        self._prepared_mse_batches: Optional[List[Optional[_PreparedMSEBatch]]] = None
 
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
@@ -221,11 +237,13 @@ class BagelFlowUniGRPO(FlowGRPO):
         GiB/GPU footprint) keyed by stable parameter name. A resumed run loads
         that same snapshot from the checkpoint instead of recapturing tuned weights.
 
-        Per step: stash each live local shard, copy the base in (cast to the live fp32
-        master dtype), run the (no_grad) v_ref forward, then copy the trained weights back
+        Per scope: stash each live local shard, copy the base in (cast to the live fp32
+        master dtype), run the no-grad v_ref forward(s), then copy the trained weights back
         before any backward — so v_theta's autograd graph (recomputed under activation
-        checkpointing at the post-loop backward) reads the trained weights. In-place
-        copy+restore is autograd-safe here (verified on a 2-GPU backward repro).
+        checkpointing at the post-loop backward) reads the trained weights. The unified
+        stack opens one scope per optimizer update; direct callers retain a per-micro
+        fallback. In-place copy+restore is autograd-safe here (verified on a 2-GPU
+        backward repro).
         """
         from unirl.train.ema import local_view
 
@@ -297,6 +315,117 @@ class BagelFlowUniGRPO(FlowGRPO):
         segment.sde_logp = result.log_probs.detach().cpu()
         segment.sde_means = result.prev_sample_means.detach().cpu()
 
+    def prepare_update_batch(
+        self,
+        *,
+        micro_batches: Sequence[Tuple[Mapping[str, Condition], LatentSegment]],
+    ) -> None:
+        """Prepare all detached MSE references under one weight swap per update.
+
+        BAGEL image replay is constrained to one sample per micro-batch. The old
+        path stashed, replaced, and restored every trainable full-FT shard for
+        each sample. Here all current-policy text contexts are built first, then
+        every ``v_ref`` is evaluated inside one reference-weight scope. The
+        contexts and detached reference velocities are consumed later in the
+        same order by :meth:`compute_loss_and_backward`.
+
+        This hook runs once per optimizer update rather than once per rollout:
+        under ``num_updates_per_batch > 1`` the later update therefore rebuilds
+        its detached context after the preceding optimizer step, preserving the
+        prior policy-state semantics.
+        """
+        if self._prepared_mse_batches:
+            raise RuntimeError(
+                "BagelFlowUniGRPO.prepare_update_batch: the previous update left "
+                f"{len(self._prepared_mse_batches)} unconsumed MSE micro-batches."
+            )
+        if self.mse_weight <= 0.0:
+            self._prepared_mse_batches = None
+            return
+
+        # The expensive operation is the full-FT local-shard stash/copy/restore.
+        # LoRA's adapter toggle is cheap and retains no fp32 model-sized stash, so
+        # keep its established per-micro path and avoid retaining a whole update's
+        # contexts.
+        transformer = self.stage.model.transformer
+        if self._has_lora(transformer):
+            self._prepared_mse_batches = None
+            return
+
+        entries: List[Optional[_PreparedMSEBatch]] = [None] * len(micro_batches)
+        pending: List[Tuple[int, LatentSegment, Tuple[int, ...], Dict[str, Any], torch.device]] = []
+        for index, (conditions, segment) in enumerate(micro_batches):
+            if int(segment.batch_size) != 1:
+                raise ValueError(
+                    "BagelFlowUniGRPO.prepare_update_batch requires one image per micro-batch "
+                    f"(BAGEL navit bs=1); got batch_size={segment.batch_size}."
+                )
+            target_steps = tuple(self._resolve_target_steps(segment))
+            if not target_steps or segment.sigmas is None:
+                continue
+            typed_conds = typed_conditions(conditions, self.conditions_cls)
+            device = torch.device(self.stage.model.device)
+            with torch.no_grad():
+                forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            pending.append((index, segment, target_steps, forward_kwargs, device))
+
+        if pending:
+            with torch.no_grad():
+                with self._reference_weights(transformer):
+                    for index, segment, target_steps, forward_kwargs, device in pending:
+                        schedule = segment.sigmas.to(device)
+                        v_refs = [
+                            self.stage.predict_velocity_at(
+                                forward_kwargs,
+                                sample=segment.latents_at(step_idx)[0].to(device),
+                                sigma=schedule[step_idx],
+                                params=self.params,
+                            ).detach()
+                            for step_idx in target_steps
+                        ]
+                        entries[index] = _PreparedMSEBatch(
+                            target_steps=target_steps,
+                            forward_kwargs=forward_kwargs,
+                            reference_velocities=v_refs,
+                        )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self._prepared_mse_batches = entries
+
+    def _take_prepared_mse(self, target_steps: Sequence[int]) -> Optional[_PreparedMSEBatch]:
+        """Consume one prepared entry, or return None for direct-call fallback."""
+        queue = self._prepared_mse_batches
+        if queue is None:
+            return None
+        if not queue:
+            raise RuntimeError("BagelFlowUniGRPO: prepared MSE micro-batch queue was exhausted early.")
+        prepared = queue.pop(0)
+        if not queue:
+            # Restore the documented direct-call fallback immediately after the
+            # last stacked micro-batch releases its cached context/reference.
+            self._prepared_mse_batches = None
+        if prepared is None:
+            if target_steps:
+                raise RuntimeError("BagelFlowUniGRPO: missing prepared MSE data for a trainable micro-batch.")
+            return None
+        if prepared.target_steps != tuple(int(step) for step in target_steps):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared MSE step indices do not match the consumed micro-batch: "
+                f"prepared={prepared.target_steps}, current={tuple(target_steps)}."
+            )
+        return prepared
+
+    def finish_update_batch(self, *, succeeded: bool) -> None:
+        """Release prepared KV/reference tensors, including failed updates."""
+        remaining = len(self._prepared_mse_batches or ())
+        self._prepared_mse_batches = None
+        if succeeded and remaining:
+            raise RuntimeError(
+                "BagelFlowUniGRPO.finish_update_batch: optimizer update completed with "
+                f"{remaining} unconsumed prepared MSE micro-batches."
+            )
+
     def compute_loss_and_backward(
         self,
         *,
@@ -306,6 +435,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
+        target_steps = self._resolve_target_steps(segment) if self.mse_weight > 0.0 else []
+        prepared_mse = self._take_prepared_mse(target_steps) if self.mse_weight > 0.0 else None
+
         # 1. Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the
         #    plain FlowGRPO ratio with the per-step normalized one when enabled;
         #    otherwise the inherited FlowGRPO surrogate.
@@ -327,73 +459,54 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         if self.mse_weight <= 0.0 or not result.has_backward:
             return result
-        target_steps = self._resolve_target_steps(segment)
         if not target_steps or segment.sigmas is None:
             return result
 
         # 2. Velocity-MSE regularizer toward the LoRA-disabled base, at the SDE
         #    steps. Separate backward -> grads accumulate into the same step.
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
         # FSDP2 CPUOffloadPolicy keeps the decoder's parameter shards on CPU;
         # BAGEL's bundle device is the execution device used by the live
         # embeddings, heads, and FSDP all-gathers.
         device = torch.device(self.stage.model.device)
         schedule = segment.sigmas.to(device)
-        # Rebuild the conditioning KV contexts from text ONCE (the und-path prefill)
-        # and reuse the resulting forward kwargs across every SDE step and both
-        # v_theta / v_ref. The conditions now carry only text (see
-        # BagelDiffusionConditions), and the context is a detached constant, so one
-        # build serves all steps. Built here (outside the _disable_lora scope) it is
-        # the LoRA-on context; v_ref then runs the velocity forward with LoRA disabled
-        # over that same context — matching the prior behavior, where v_ref reused the
-        # rollout (LoRA-on) context with a base velocity forward.
+        # Reuse one detached conditioning context across every SDE step and both
+        # v_theta / v_ref. Unified full-FT training prepares it before this call;
+        # direct callers and LoRA build it in the fallback below. In either case it
+        # is built at the live policy weights before entering the reference scope.
         # The surrogate replay above already trains through the reconstructed
         # T2TI text cache. Keep the MSE context detached: full-FT v_ref swaps
         # parameter shards in place, and mutating them after a grad-carrying
         # context prefill would invalidate autograd's version counters.
-        with torch.no_grad():
-            forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
-        transformer = self.stage.model.transformer
-        # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen bf16 snapshot of
-        # the base weights, captured lazily on the first _reference_weights swap (= the
-        # pre-trained base, before the first optimizer step). Both yield the pre-trained
-        # reference velocity over the prebuilt context.
-        full_ft_ref = not self._has_lora(transformer)
-        # Compute ALL v_ref FIRST, under a SINGLE base-weight swap, storing only the
-        # detached velocity tensors (tiny [seq,C] each — no autograd graphs). Then run the
-        # v_theta forwards (grad-on) against those constants. This keeps the expensive
-        # base-weight swap (a full fp32 master-sized stash under full FT) OUT of the window
-        # where the N retained v_theta graphs + activations are live — the peak that OOM'd
-        # a per-step swap. v_ref is a detached constant either way (it is `.detach()`ed into
-        # the MSE), so hoisting it changes nothing numerically.
-        with torch.no_grad():
-            if full_ft_ref:
-                ref_ctx = self._reference_weights(transformer)
-            else:
-                ref_ctx = _disable_lora(transformer)
-            with ref_ctx as disabled:
-                if not full_ft_ref and not disabled:
-                    raise RuntimeError(
-                        "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
-                        "to disable nor trainable params to snapshot as v_ref on "
-                        "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
-                        "or set mse_weight=0."
-                    )
-                v_refs = [
-                    self.stage.predict_velocity_at(
-                        forward_kwargs,
-                        sample=segment.latents_at(s)[0].to(device),
-                        sigma=schedule[s],
-                        params=self.params,
-                    ).detach()
-                    for s in target_steps
-                ]
-        # Return the freed stash + v_ref activation blocks to the driver before the v_theta
-        # graphs build, so this step's peak does not carry both (mirrors the train stack's
-        # post-churn defrag under num_updates_per_batch>1). Full-FT only — the LoRA path's
-        # v_ref leaves no stash to reclaim.
-        if full_ft_ref and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if prepared_mse is not None:
+            forward_kwargs = prepared_mse.forward_kwargs
+            v_refs = prepared_mse.reference_velocities
+        else:
+            typed_conds = typed_conditions(conditions, self.conditions_cls)
+            with torch.no_grad():
+                forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            transformer = self.stage.model.transformer
+            full_ft_ref = not self._has_lora(transformer)
+            with torch.no_grad():
+                ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+                with ref_ctx as disabled:
+                    if not full_ft_ref and not disabled:
+                        raise RuntimeError(
+                            "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
+                            "to disable nor trainable params to snapshot as v_ref on "
+                            "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
+                            "or set mse_weight=0."
+                        )
+                    v_refs = [
+                        self.stage.predict_velocity_at(
+                            forward_kwargs,
+                            sample=segment.latents_at(step_idx)[0].to(device),
+                            sigma=schedule[step_idx],
+                            params=self.params,
+                        ).detach()
+                        for step_idx in target_steps
+                    ]
+            if full_ft_ref and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         mse_terms: List[torch.Tensor] = []
         for step_idx, v_ref in zip(target_steps, v_refs):

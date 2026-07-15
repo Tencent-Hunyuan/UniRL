@@ -267,6 +267,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
+        t2ti_replay_chunk_mode: str = "exact",
     ) -> None:
         # ``model`` is the bundle (kept name-compatible with the other stages so
         # the pipeline / FSDPPolicy treat it uniformly). The Bagel nn.Module is
@@ -277,6 +278,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.t2ti_replay_chunk_mode = rl_ops.validate_t2ti_replay_chunk_mode(t2ti_replay_chunk_mode)
 
     # ------------------------------------------------------------------
     # Helpers (navit adapter)
@@ -334,14 +336,15 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
     def _build_contexts_from_replay(
         self, conditions: BagelT2TIDiffusionConditions
     ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
-        """Rebuild Stage-0's exact transferred text cache with autograd enabled.
+        """Rebuild Stage-0's transferred text cache with autograd enabled.
 
         Native ``bagel_think`` sends KV tensors directly from the AR worker to
         the diffusion worker.  Replay must not transport those tensors to the
-        trainer, so it re-executes the exact cache-input token chunks captured at
-        Stage 0.  The outer caller owns the grad scope: loss replay therefore
-        differentiates through this prefill, while old-logp preparation remains
-        grad-free under its existing ``torch.no_grad`` scope.
+        trainer, so it re-executes the cache-input tokens captured at Stage 0.
+        Exact mode preserves scheduler chunk boundaries; collapsed mode uses one
+        causal prefill over the same tokens. The outer caller owns the grad scope:
+        loss replay therefore differentiates through this prefill, while old-logp
+        preparation remains grad-free under its existing ``torch.no_grad`` scope.
 
         BAGEL's native text2img transfer contract uses an empty text-CFG cache
         and reuses the positive cache for image-CFG when no companion branches
@@ -356,6 +359,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
                 expected_kv_length=spec.kv_length,
                 expected_ropes=spec.ropes,
                 device=device,
+                chunk_mode=self.t2ti_replay_chunk_mode,
             )
         cfg_text = rl_ops.init_und_context(self.model.model)
         cfg_img = gen
@@ -366,8 +370,9 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
 
         Three sources, transparently:
 
-        - **native T2TI replay recipe**: rebuild the exact transferred cache
-          from captured cache-input IDs and scheduler chunk boundaries.
+        - **native T2TI replay recipe**: rebuild the transferred cache from
+          captured cache-input IDs, preserving or collapsing scheduler chunk
+          boundaries according to ``t2ti_replay_chunk_mode``.
 
         - **opaque contexts present** (trainside / colocate): return them directly
           via :meth:`BagelDiffusionConditions.single`.

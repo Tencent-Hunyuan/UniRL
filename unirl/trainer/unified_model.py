@@ -970,6 +970,8 @@ class UnifiedModelTrainer(BaseTrainer):
             img_decoded = getattr(image_track, "decoded", None) if image_track is not None else None
             sample_ids = list(image_track.sample_ids) if image_track is not None else []
             parent_ids = list(image_track.parent_ids) if (image_track is not None and image_track.parent_ids) else []
+            replay_conditions = image_track.conditions.get("bagel_t2ti") if image_track is not None else None
+            replay_specs = list(getattr(replay_conditions, "replay_specs", ()))
 
             rewards = None
             if image_track is not None and image_track.rewards is not None:
@@ -1008,6 +1010,10 @@ class UnifiedModelTrainer(BaseTrainer):
                                 "ar_text_fed_to_dit": ar_texts[a_idx] if a_idx < len(ar_texts) else None,
                                 "image_reward": rewards[k] if (rewards is not None and k < len(rewards)) else None,
                                 "image_file": f"img_{k}.png" if k < n_imgs else None,
+                                # Metadata only (token IDs + scheduler boundaries),
+                                # never KV tensors. This makes exact/collapsed
+                                # real-trace parity reproducible from a debug dump.
+                                "t2ti_replay": dataclasses.asdict(replay_specs[k]) if k < len(replay_specs) else None,
                             },
                             ensure_ascii=False,
                         )
