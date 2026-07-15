@@ -55,6 +55,12 @@ class NaiveCache:
         self.key_cache = {index: None for index in range(num_layers)}
         self.value_cache = {index: None for index in range(num_layers)}
 
+    def fork(self):
+        cache = type(self)(len(self.key_cache))
+        cache.key_cache = self.key_cache.copy()
+        cache.value_cache = self.value_cache.copy()
+        return cache
+
 
 class _FakeLMModel(nn.Module):
     def __init__(self):
@@ -70,14 +76,16 @@ class _MutatingCacheUpdate(nn.Module):
 
     def forward(self, values, past_key_values, expected_length):
         self.calls += 1
-        previous = past_key_values.key_cache[0]
+        updated_cache = past_key_values.fork()
+        values = torch.sin(values)
+        previous = updated_cache.key_cache[0]
         actual_length = 0 if previous is None else int(previous.shape[0])
         if actual_length != int(expected_length):
             raise RuntimeError(f"cache advanced before recompute: {actual_length} != {expected_length}")
         merged = values if previous is None else torch.cat((previous, values), dim=0)
-        past_key_values.key_cache[0] = merged
-        past_key_values.value_cache[0] = merged
-        return merged
+        updated_cache.key_cache[0] = merged
+        updated_cache.value_cache[0] = merged
+        return merged, updated_cache
 
 
 class _FakeLanguageModel(nn.Module):
@@ -112,7 +120,7 @@ class _FakeBagel(nn.Module):
             )
         )
         values = self.language_model.model.embed_tokens(packed_text_ids)
-        self.language_model.model.cache_update(
+        _, past_key_values = self.language_model.model.cache_update(
             values,
             past_key_values,
             int(key_values_lens[0]),
@@ -141,7 +149,7 @@ def test_rebuild_text_context_replays_exact_chunks_with_gradients():
     assert context["past_key_values"].key_cache[0].requires_grad
     context["past_key_values"].key_cache[0].sum().backward()
     assert model.language_model.model.embed_tokens.weight.grad is not None
-    assert model.language_model.model.cache_update.calls == 3
+    assert model.language_model.model.cache_update.calls == 6
     assert checkpoint.state(model.language_model.model.cache_update).enable_hook
     # Grad-enabled inference replay intentionally remains in eval dispatch
     # through the later checkpoint recomputation/backward.
