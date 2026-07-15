@@ -5,7 +5,7 @@ num_devices: 8
 batch_size: 8
 num_rollouts: 1000
 save_interval: 100
-save_dir: ${oc.env:OUTPUT_DIR,outputs/wan22_face_refl}
+save_dir: ${oc.env:OUTPUT_DIR,outputs/wan22_i2v_face_refl}
 
 roles:
   - name: actor
@@ -110,8 +110,8 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH,/path/to/wan22_face_refl_prompts.jsonl}
-      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,/path/to/wan22_face_refl_prompts.jsonl}}
+      data_path: ${oc.env:DATA_PATH,/path/to/wan22_i2v_face_refl_prompts.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,/path/to/wan22_i2v_face_refl_prompts.jsonl}}
       seed: 42
       shuffle: false
     algorithm:
@@ -137,7 +137,7 @@ sampling:
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
   project_name: ${oc.env:WANDB_PROJECT,unirl-refl}
-  run_name: ${oc.env:WANDB_RUN_NAME,wan22_face_refl}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_i2v_face_refl}
   tags: ["wan22", "i2v", "refl", "face", "recipe"]
   log_media: false
   metric_prefix: refl_recipe/
