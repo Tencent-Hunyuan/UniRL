@@ -424,7 +424,13 @@ def _require_t2ti_stage_pair(
     return ar_outputs[0], image_outputs[0]
 
 
-def _ar_replay_prompt_ids(ar_output: OmniRawResult, spec: BagelThinkKVReplaySpec, *, request_index: int) -> List[int]:
+def _ar_replay_prompt_ids(
+    ar_output: OmniRawResult,
+    spec: BagelThinkKVReplaySpec,
+    *,
+    request_index: int,
+    excluded_tail_input_ids: Sequence[int] = (),
+) -> List[int]:
     """Validate native cache provenance and remove the single AR start BOS."""
     raw_prompt_ids = getattr(ar_output, "prompt_token_ids", None)
     if raw_prompt_ids is None:
@@ -456,6 +462,12 @@ def _ar_replay_prompt_ids(ar_output: OmniRawResult, spec: BagelThinkKVReplaySpec
         raise RuntimeError(
             f"bagel_t2ti: Stage-0 request {request_index} transferred completion tokens "
             "must equal sampled token_ids[:-1] at the final computed-token boundary."
+        )
+    excluded_tail = tuple(int(token) for token in excluded_tail_input_ids)
+    if excluded_tail and excluded_tail != sampled_ids[-1:]:
+        raise RuntimeError(
+            f"bagel_t2ti: Stage-0 request {request_index} excluded async tail does not equal "
+            "the final emitted token_id."
         )
 
     # The exact prompt renderer appends one <|im_start|>. BagelARStage.replay
@@ -608,13 +620,20 @@ class BagelT2TIOutputAdapter:
                     f"custom_output[{BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT!r}] for request {i}."
                 )
             spec = BagelThinkKVReplaySpec.from_custom_output(custom_output)
+            replay_payload = custom_output[BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT]
+            excluded_tail_input_ids = replay_payload.get("excluded_tail_input_ids", ())
             if spec.image_shape != image_shape:
                 raise RuntimeError(
                     f"bagel_t2ti: replay image_shape={spec.image_shape} for request {i} does not match "
                     f"the requested shape {image_shape}."
                 )
             replay_specs.append(spec)
-            prompt_ids = _ar_replay_prompt_ids(ar_output, spec, request_index=i)
+            prompt_ids = _ar_replay_prompt_ids(
+                ar_output,
+                spec,
+                request_index=i,
+                excluded_tail_input_ids=excluded_tail_input_ids,
+            )
             prompt_splits.append([{"kind": "text", "ids": torch.tensor(prompt_ids, dtype=torch.long)}])
 
         ar_segment = build_ar_segment(per_request)

@@ -34,6 +34,8 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
+from unirl.rollout.engine.vllm_omni.patches.bagel_kv_replay import finalize_bagel_kv_replay_trace
+
 
 class OmniTensorLoRARequest(OmniLoRARequest):
     peft_config: dict = field(default=None)
@@ -161,30 +163,20 @@ def patch_bagel_kv_replay_trace() -> None:
         if not chunks:
             raise RuntimeError(f"BAGEL KV replay trace for request {req_id!r} is empty.")
         chunks.sort(key=lambda item: int(item[0]))
-        cache_ids_tensor = torch.cat([chunk for _, chunk in chunks], dim=0)
-        cache_input_ids = [int(token) for token in cache_ids_tensor.to(device="cpu").tolist()]
         kv_length = int(num_computed_tokens)
-        if len(cache_input_ids) != kv_length:
-            raise RuntimeError(
-                "BAGEL KV replay trace length does not match the transferred cache length; "
-                "prefix caching must be disabled: "
-                f"request={req_id!r}, captured={len(cache_input_ids)}, transferred={kv_length}."
-            )
-
-        chunk_offsets = [0]
-        for _, chunk in chunks:
-            chunk_offsets.append(chunk_offsets[-1] + int(chunk.numel()))
+        cache_ids_tensor = torch.cat([chunk for _, chunk in chunks], dim=0)
+        trace_metadata = finalize_bagel_kv_replay_trace(
+            chunk_records=[(int(start), int(chunk.numel())) for start, chunk in chunks],
+            captured_input_ids=cache_ids_tensor.to(device="cpu").tolist(),
+            kv_length=kv_length,
+            request_id=str(req_id),
+        )
 
         metadata = dict(model_metadata or {})
-        raw_ropes = metadata.get("ropes") or [kv_length]
-        ropes = [int(value.item()) if isinstance(value, torch.Tensor) else int(value) for value in raw_ropes]
-        metadata["ropes"] = ropes
-        metadata[_BAGEL_KV_REPLAY_TRACE_KEY] = {
-            "cache_input_ids": cache_input_ids,
-            "chunk_offsets": chunk_offsets,
-            "kv_length": kv_length,
-            "ropes": ropes,
-        }
+        # Text-only T2TI advances RoPE once per committed KV row. Upstream may
+        # report the async lookahead boundary, so normalize to the transfer.
+        metadata["ropes"] = list(trace_metadata["ropes"])
+        metadata[_BAGEL_KV_REPLAY_TRACE_KEY] = trace_metadata
         return metadata
 
     prepare_runner_inputs._unirl_bagel_kv_replay_trace = True  # type: ignore[attr-defined]

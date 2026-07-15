@@ -240,13 +240,14 @@ class RLBagelPipeline(BagelPipeline):
                 f"RLBagelPipeline: native T2TI KV replay trace must be a mapping; got {type(trace).__name__}."
             )
 
-        required = {"cache_input_ids", "chunk_offsets", "kv_length", "ropes"}
+        required = {"cache_input_ids", "chunk_offsets", "excluded_tail_input_ids", "kv_length", "ropes"}
         missing = sorted(required - set(trace))
         if missing:
             raise RuntimeError(f"RLBagelPipeline: native T2TI KV replay trace is missing fields {missing}.")
 
         cache_input_ids = [int(token) for token in trace["cache_input_ids"]]
         chunk_offsets = [int(offset) for offset in trace["chunk_offsets"]]
+        excluded_tail_input_ids = [int(token) for token in trace["excluded_tail_input_ids"]]
         kv_length = int(trace["kv_length"])
         stage0_ropes = [int(rope) for rope in trace["ropes"]]
         if not cache_input_ids or len(cache_input_ids) != kv_length:
@@ -266,6 +267,11 @@ class RLBagelPipeline(BagelPipeline):
             )
         if not stage0_ropes:
             raise RuntimeError("RLBagelPipeline: Stage-0 T2TI ropes must be non-empty.")
+        if len(excluded_tail_input_ids) > 1 or any(token < 0 for token in excluded_tail_input_ids):
+            raise RuntimeError(
+                "RLBagelPipeline: Stage-0 excluded async tail must contain at most one non-negative token; "
+                f"got {excluded_tail_input_ids!r}."
+            )
 
         injected_kv = getattr(sp, "past_key_values", None)
         try:
@@ -300,6 +306,7 @@ class RLBagelPipeline(BagelPipeline):
         return {
             "cache_input_ids": cache_input_ids,
             "chunk_offsets": chunk_offsets,
+            "excluded_tail_input_ids": excluded_tail_input_ids,
             "kv_length": kv_length,
             "ropes": stage0_ropes,
             "received_kv_length": received_kv_length,

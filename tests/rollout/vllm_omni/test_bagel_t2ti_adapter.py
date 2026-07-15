@@ -197,6 +197,7 @@ def _raw_pair(index: int, *, include_replay: bool = True):
         # Scheduler chunking splits the prompt; the adapter must validate the
         # full trace prefix rather than assuming chunk 0 is the whole prompt.
         "chunk_offsets": [0, 2, 5],
+        "excluded_tail_input_ids": sampled_ids[-1:],
         "kv_length": 5,
         "ropes": [5],
         "received_kv_length": 5,
@@ -250,6 +251,9 @@ def test_output_builds_linked_tracks_and_native_replay_conditions(monkeypatch: p
     req = _request(["one prompt"], n_ar=2)
     adapter = _adapter()
     per_request = [_raw_pair(0), _raw_pair(1)]
+    # Length-capped or synchronous requests can reach the exact boundary
+    # without exposing an async tail token.
+    per_request[1][1].custom_output[BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT]["excluded_tail_input_ids"] = []
 
     # torchvision is intentionally not a dependency of this CPU contract test.
     monkeypatch.setattr(
@@ -305,6 +309,15 @@ def test_output_rejects_incomplete_native_kv_boundary() -> None:
     payload["received_kv_length"] = 4
     payload["received_ropes"] = [4]
     with pytest.raises(RuntimeError, match=r"sampled token_ids\[:-1\]"):
+        _adapter().build_response(req, [pair])
+
+
+def test_output_rejects_mismatched_excluded_async_tail() -> None:
+    req = _request(["one prompt"], n_ar=1)
+    pair = _raw_pair(0)
+    payload = pair[1].custom_output[BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT]
+    payload["excluded_tail_input_ids"] = [123]
+    with pytest.raises(RuntimeError, match="excluded async tail"):
         _adapter().build_response(req, [pair])
 
 
