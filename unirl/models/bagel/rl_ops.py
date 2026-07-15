@@ -63,6 +63,7 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -116,6 +117,36 @@ def _raw(fn: Callable) -> Callable:
 def _raw_forward_flow(model: Any):
     """The undecorated ``Bagel._forward_flow`` (bypasses upstream ``@torch.no_grad``)."""
     return _raw(type(model)._forward_flow)
+
+
+@contextmanager
+def _suspend_checkpoint_for_cache_update(module: Any):
+    """Run a mutating KV-cache forward without composable checkpoint hooks.
+
+    BAGEL cache-update forwards mutate the ``NaiveCache`` object passed to every
+    decoder block. Activation-checkpoint recomputation happens later, after that
+    same object has advanced, so replaying the block would combine stale indexes
+    with the newer cache length. Keep normal autograd activations only for these
+    short cache-update calls; the large scoring and diffusion forwards remain
+    checkpointed.
+    """
+    if not torch.is_grad_enabled() or not isinstance(module, torch.nn.Module):
+        yield
+        return
+
+    from torch.distributed._composable import checkpoint as composable_checkpoint
+
+    suspended = []
+    for child in module.modules():
+        state = composable_checkpoint.state(child)
+        if state is not None and state.enable_hook:
+            state.enable_hook = False
+            suspended.append(state)
+    try:
+        yield
+    finally:
+        for state in suspended:
+            state.enable_hook = True
 
 
 def forward_flow(model: Any, **kwargs: Any) -> Any:
@@ -243,7 +274,8 @@ def prefill_prompt_text(
         new_token_ids=new_token_ids,
     )
     generation_input = _to_device(generation_input, device)
-    past = model.forward_cache_update_text(ctx["past_key_values"], **generation_input)
+    with _suspend_checkpoint_for_cache_update(getattr(model, "language_model", None)):
+        past = model.forward_cache_update_text(ctx["past_key_values"], **generation_input)
     return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
 
 
@@ -258,7 +290,8 @@ def prefill_text_split(
     """
     kv_len, rope = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
     gi = _to_device(_pack_text_ids(text_ids, kv_len=kv_len, rope_start=rope), device)
-    past = _raw(type(model).forward_cache_update_text)(model, ctx["past_key_values"], **gi)
+    with _suspend_checkpoint_for_cache_update(model.language_model):
+        past = _raw(type(model).forward_cache_update_text)(model, ctx["past_key_values"], **gi)
     n = int(text_ids.numel())
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
 
@@ -349,7 +382,8 @@ def prefill_vit_split(
         new_token_ids=new_token_ids,
     )
     gi = _to_device(gi, device)
-    past = _raw(type(model).forward_cache_update_vit)(model, ctx["past_key_values"], **gi)
+    with _suspend_checkpoint_for_cache_update(model.language_model):
+        past = _raw(type(model).forward_cache_update_vit)(model, ctx["past_key_values"], **gi)
     return {"kv_lens": newlens, "ropes": new_rope, "past_key_values": past}
 
 

@@ -60,6 +60,24 @@ class _FakeLMModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.embed_tokens = nn.Embedding(32, 4)
+        self.cache_update = _MutatingCacheUpdate()
+
+
+class _MutatingCacheUpdate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, values, past_key_values, expected_length):
+        self.calls += 1
+        previous = past_key_values.key_cache[0]
+        actual_length = 0 if previous is None else int(previous.shape[0])
+        if actual_length != int(expected_length):
+            raise RuntimeError(f"cache advanced before recompute: {actual_length} != {expected_length}")
+        merged = values if previous is None else torch.cat((previous, values), dim=0)
+        past_key_values.key_cache[0] = merged
+        past_key_values.value_cache[0] = merged
+        return merged
 
 
 class _FakeLanguageModel(nn.Module):
@@ -86,7 +104,7 @@ class _FakeBagel(nn.Module):
         packed_key_value_indexes,
         key_values_lens,
     ):
-        del text_token_lens, packed_text_indexes, packed_key_value_indexes, key_values_lens
+        del text_token_lens, packed_text_indexes, packed_key_value_indexes
         self.calls.append(
             (
                 packed_text_ids.detach().cpu().tolist(),
@@ -94,16 +112,20 @@ class _FakeBagel(nn.Module):
             )
         )
         values = self.language_model.model.embed_tokens(packed_text_ids)
-        previous = past_key_values.key_cache[0]
-        merged = values if previous is None else torch.cat((previous, values), dim=0)
-        past_key_values.key_cache[0] = merged
-        past_key_values.value_cache[0] = merged
+        self.language_model.model.cache_update(
+            values,
+            past_key_values,
+            int(key_values_lens[0]),
+        )
         return past_key_values
 
 
 def test_rebuild_text_context_replays_exact_chunks_with_gradients():
+    from torch.distributed._composable import checkpoint
+
     model = _FakeBagel()
     model.language_model.train()
+    checkpoint(model.language_model.model.cache_update)
 
     context = rebuild_text_context_from_chunks(
         model,
@@ -119,6 +141,8 @@ def test_rebuild_text_context_replays_exact_chunks_with_gradients():
     assert context["past_key_values"].key_cache[0].requires_grad
     context["past_key_values"].key_cache[0].sum().backward()
     assert model.language_model.model.embed_tokens.weight.grad is not None
+    assert model.language_model.model.cache_update.calls == 3
+    assert checkpoint.state(model.language_model.model.cache_update).enable_hook
     # Grad-enabled inference replay intentionally remains in eval dispatch
     # through the later checkpoint recomputation/backward.
     assert not model.language_model.training
