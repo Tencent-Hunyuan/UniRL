@@ -151,7 +151,7 @@ class BucketedIPCReceiveMixin:
             logger.debug("%s: bucket loaded (%d tensors)", type(self).__name__, len(weights))
             self._diffrl_load_weights(weights)
 
-    def _diffrl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+    def _diffrl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> set[str]:
         """Forward weights to whichever loader the underlying worker exposes.
 
         - DiT worker (``DiffusionWorker`` base of ``CustomPipelineWorkerExtension``)
@@ -162,8 +162,8 @@ class BucketedIPCReceiveMixin:
         """
         loader = getattr(self, "load_weights", None)
         if callable(loader):
-            loader(weights)
-            return
+            loaded = loader(weights)
+            return {str(name) for name in (loaded or set())}
         runner = getattr(self, "model_runner", None)
         if runner is None:
             raise RuntimeError(f"{type(self).__name__}: no `load_weights` and no `model_runner`.")
@@ -171,8 +171,8 @@ class BucketedIPCReceiveMixin:
             obj = getattr(runner, attr, None)
             obj_loader = getattr(obj, "load_weights", None) if obj is not None else None
             if callable(obj_loader):
-                obj_loader(weights)
-                return
+                loaded = obj_loader(weights)
+                return {str(name) for name in (loaded or set())}
         raise RuntimeError(
             f"{type(self).__name__}: could not find a load_weights method on "
             f"self, model_runner.model, or model_runner.pipeline."
@@ -188,7 +188,7 @@ class BucketedIPCReceiveMixin:
         target_modules: Optional[list] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
-    ) -> None:
+    ) -> dict[str, object]:
         """Receive a SGLang-shape one-bag payload and load it.
 
         Picks ``serialized_named_tensors[self.local_rank]``, deserializes via
@@ -225,13 +225,18 @@ class BucketedIPCReceiveMixin:
             metadata=payload["metadata"],
         )
         named_tensors = bucket.reconstruct_tensors()
-        self._diffrl_load_weights(named_tensors)
+        loaded_names = self._diffrl_load_weights(named_tensors)
         logger.info(
             "%s: tensor-payload loaded (%d tensors, load_format=%r)",
             type(self).__name__,
             len(named_tensors),
             load_format,
         )
+        return {
+            "received_count": len(named_tensors),
+            "loaded_count": len(loaded_names),
+            "loaded_names": sorted(loaded_names),
+        }
 
     # ------------------------------------------------------------------
     # LoRA tensor-bag — driver-supplied dict reconstructed worker-side

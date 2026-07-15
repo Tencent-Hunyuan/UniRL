@@ -213,6 +213,11 @@ class BaseFSDP2Backend(Remote):
         # per-micro reshard/re-gather interacts badly with deferred sync.
         self._defer_grad_sync = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
         self._grad_sync_enabled = True
+        # FSDP2 CPUOffloadPolicy is a persistent training policy, not just the
+        # coarse colocate onload/offload switch below. Policy-aware lifecycle
+        # methods keep DTensor shards and optimizer state on CPU while moving
+        # only unsharded parameters needed by direct submodule calls.
+        self._persistent_cpu_offload = bool(fsdp_cfg.cpu_offload)
 
     # ------------------------------------------------------------------
     # Training step
@@ -602,6 +607,85 @@ class BaseFSDP2Backend(Remote):
     # Memory lifecycle
     # ------------------------------------------------------------------
 
+    def _move_unsharded_model_state(self, device: object) -> None:
+        """Move regular tensors while leaving FSDP DTensor shards untouched."""
+        from torch.distributed.tensor import DTensor
+
+        self.model._apply(lambda tensor: tensor if tensor.is_meta or isinstance(tensor, DTensor) else tensor.to(device))
+
+    def _move_bundle_module_state(self, device: object) -> None:
+        """Move every bundle-owned module without disturbing FSDP DTensor shards.
+
+        The backend's ``model`` may be only a nested trainable subtree. BAGEL,
+        for example, keeps its VAE and generation heads on the parent bundle;
+        those must leave the GPU before a colocated Omni engine wakes.
+        """
+        from torch.distributed.tensor import DTensor
+
+        candidates: List[nn.Module] = []
+        seen: set[int] = set()
+
+        def collect(value: object) -> None:
+            if isinstance(value, nn.Module):
+                if id(value) not in seen:
+                    seen.add(id(value))
+                    candidates.append(value)
+                return
+            if isinstance(value, dict):
+                for nested in value.values():
+                    collect(nested)
+            elif isinstance(value, (list, tuple, set)):
+                for nested in value:
+                    collect(nested)
+
+        for value in vars(self._bundle).values():
+            collect(value)
+
+        contained: set[int] = set()
+        for module in candidates:
+            contained.update(id(child) for child in module.modules() if child is not module)
+        roots = [module for module in candidates if id(module) not in contained]
+        if not roots:
+            roots = [self.model]
+
+        def move(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.is_meta or isinstance(tensor, DTensor):
+                return tensor
+            return tensor.to(device)
+
+        for module in roots:
+            module._apply(move)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def prepare_for_compute(self) -> None:
+        """Restore the training state needed by forward/backward.
+
+        With FSDP2 ``CPUOffloadPolicy``, block shards, gradients, and Adam state
+        intentionally remain on CPU. FSDP pages each block for compute; only
+        regular tensors outside the FSDP groups (for example BAGEL's frozen
+        embed/norm/lm_head under ``root_wrap=false``) need an explicit onload.
+        """
+        if not self._persistent_cpu_offload:
+            self._onload_model()
+            self._move_bundle_module_state(self._device)
+            move_optimizer_state(self.optimizer, self._device)
+            return
+
+        self._move_bundle_module_state(self._device)
+        move_optimizer_state(self.optimizer, "cpu")
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def prepare_for_rollout(self) -> None:
+        """Release trainer GPU state while preserving persistent CPU offload."""
+        if not self._persistent_cpu_offload:
+            self._offload_model()
+            self._move_bundle_module_state("cpu")
+            move_optimizer_state(self.optimizer, "cpu")
+        else:
+            self._move_bundle_module_state("cpu")
+            move_optimizer_state(self.optimizer, "cpu")
+        torch.cuda.empty_cache()
+
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload(self) -> None:
         """Move the train state (params + grads + optimizer) back to GPU.
@@ -610,6 +694,7 @@ class BaseFSDP2Backend(Remote):
         Inverse of :meth:`offload`; the colocate trainers call this before the
         train backward (gated by ``enable_fsdp_offload``)."""
         self._onload_model()
+        self._move_bundle_module_state(self._device)
         move_optimizer_state(self.optimizer, self._device)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -620,6 +705,7 @@ class BaseFSDP2Backend(Remote):
         engine fits. Driver-callable across all DP workers (each offloads its own
         FSDP shard). Gated by the trainer's ``enable_fsdp_offload``."""
         self._offload_model()
+        self._move_bundle_module_state("cpu")
         move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
 

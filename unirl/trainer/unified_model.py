@@ -56,11 +56,13 @@ import inspect
 import json
 import logging
 import os
+import sys
 import time
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from hydra.utils import instantiate
+from hydra.utils import get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
@@ -165,6 +167,8 @@ class UnifiedModelTrainer(BaseTrainer):
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        fsdp_cfg = backend_cfg.get("fsdp_cfg")
+        self._backend_persistent_cpu_offload = bool(fsdp_cfg is not None and fsdp_cfg.get("cpu_offload", False))
 
         # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
         # eval_interval=0 disables it. Scores only the image track, generated at
@@ -193,6 +197,17 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        # Driver-authored x_T recipe for native BAGEL T2TI. Keep one base key
+        # per source prompt; the adapter either shares it across N thoughts or
+        # expands it to /aN/i0 according to init_same_noise.
+        self._noise_latent_shape: Optional[List[int]] = (
+            None
+            if os.environ.get("DISABLE_DRIVER_XT")
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+            )
+        )
 
         # Set below from the `sync` block; None means no sync (e.g. trainside).
         self.weight_sync = None
@@ -233,6 +248,7 @@ class UnifiedModelTrainer(BaseTrainer):
             self._single_engine = rollout_cfg is not None
             self._shared_advantage = self._single_engine
             self._rollout_is_trainside = False
+            self._single_engine_staged_sync = False
             if self._single_engine:
                 self.dp = 1
                 self.ar_rollouts = []
@@ -245,7 +261,61 @@ class UnifiedModelTrainer(BaseTrainer):
                     self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
                     self._enable_fsdp_offload = False  # shares live FSDP modules
                 else:
+                    sync_role_cls = None
+                    if sync_cfg is not None:
+                        sync_role_cls = parse_hydra_cfg(sync_cfg)["role_cls"]
+                        self._single_engine_staged_sync = all(
+                            callable(getattr(sync_role_cls, method, None)) for method in ("extract", "push", "discard")
+                        )
+                        if self._enable_fsdp_offload and not self._single_engine_staged_sync:
+                            raise ValueError(
+                                "UnifiedModelTrainer: an offloaded external single engine "
+                                "requires a staged weight sync exposing extract(), push(), "
+                                "and discard(); use CPUStagedFullWeightSync. A one-shot "
+                                "sync would require the trainer and awake engine to coexist."
+                            )
+                        needs_cpu_policy = bool(
+                            getattr(
+                                sync_role_cls,
+                                "requires_persistent_cpu_offload_on_single_device",
+                                False,
+                            )
+                        )
+                        if needs_cpu_policy and self.pool.num_devices == 1 and not self._backend_persistent_cpu_offload:
+                            raise ValueError(
+                                "UnifiedModelTrainer: single-device staged full fine-tuning "
+                                "requires backend.fsdp_cfg.cpu_offload=true. Coarse engine/FSDP "
+                                "time-sharing alone is insufficient because fp32 masters and "
+                                "Adam state exceed one 80GB GPU."
+                            )
+                    # External single-engine mode time-shares one GPU with the
+                    # trainer. Boot only after FSDP has left the device, then
+                    # immediately sleep the engine to establish the steady state
+                    # expected by train_step/evaluate.
+                    if self._enable_fsdp_offload:
+                        self.backend.prepare_for_rollout()
                     self.rollout = remote(**rollout_parsed)
+                    try:
+                        self.rollout.sleep()
+                        if sync_cfg is not None:
+                            self.weight_sync = remote_hydra(
+                                sync_cfg,
+                                backend=self.backend,
+                                rollout=self.rollout,
+                            )
+                    except BaseException:
+                        # Construction has no enclosing rollout session yet. Do
+                        # an explicit best-effort release so a failed initial
+                        # sleep or sync constructor cannot orphan Omni pools.
+                        try:
+                            self.rollout.sleep()
+                        except BaseException as exc:
+                            logger.exception("Initial Omni cleanup sleep failed: %s", exc)
+                        try:
+                            self.rollout.shutdown()
+                        except BaseException as exc:
+                            logger.exception("Initial Omni shutdown failed: %s", exc)
+                        raise
                 return
 
             if ar_rollout_cfg is None or dit_rollout_cfg is None:
@@ -357,6 +427,121 @@ class UnifiedModelTrainer(BaseTrainer):
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
 
+    def _resolve_noise_latent_shape(
+        self,
+        *,
+        pipeline_cfg: DictConfig,
+        model_cfg: DictConfig,
+    ) -> Optional[List[int]]:
+        """Resolve the pipeline-owned packed x_T geometry without instantiation."""
+        target = getattr(pipeline_cfg, "_target_", None)
+        if not isinstance(target, str):
+            return None
+        resolved = get_object(target)
+        pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
+        latent_shape = getattr(pipeline_cls, "latent_shape", None)
+        if latent_shape is None:
+            return None
+        try:
+            shape = latent_shape(
+                model_config=model_cfg,
+                sampling_spec=self.sampling_params.get("diffusion"),
+            )
+        except NotImplementedError:
+            return None
+        return [int(value) for value in shape]
+
+    @contextmanager
+    def _external_single_engine_session(
+        self,
+        *,
+        sync_weights: bool,
+        onload_trainer_after: bool,
+    ):
+        """Wake one external engine under an exception-safe memory lifecycle.
+
+        Entry and exit steady state is engine-asleep.  For training, exit also
+        onloads the FSDP state so replay/backward can start immediately; eval
+        instead leaves FSDP offloaded because it has no backward pass.
+        """
+        if not self._single_engine or self._rollout_is_trainside:
+            raise RuntimeError("_external_single_engine_session is only valid for an external single engine.")
+
+        do_sync = bool(sync_weights and self.weight_sync is not None)
+        staged = bool(do_sync and self._single_engine_staged_sync)
+        cleanup_errors: List[Tuple[str, BaseException]] = []
+        try:
+            if staged:
+                if self._enable_fsdp_offload:
+                    self.backend.prepare_for_compute()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.prepare_for_rollout()
+
+            # Keep wake, push, and every generate call inside this try. Even a
+            # partially failed wake is followed by sleep in the finally block.
+            self.rollout.wake_up()
+            if do_sync:
+                if staged:
+                    self.weight_sync.push()
+                else:
+                    self.weight_sync.sync()
+            yield
+        finally:
+            active_error = sys.exc_info()[0] is not None
+            rollout_asleep = False
+            try:
+                self.rollout.sleep()
+                rollout_asleep = True
+            except BaseException as first_exc:
+                # Backend stage tracking retains only failed/possibly-awake
+                # stages, so one bounded retry completes transient ACK failures
+                # without re-sleeping stages that already succeeded.
+                try:
+                    self.rollout.sleep()
+                    rollout_asleep = True
+                    logger.warning("Recovered from initial rollout.sleep failure: %s", first_exc)
+                except BaseException as retry_exc:  # preserve the primary rollout failure
+                    cleanup_errors.append(("rollout.sleep", first_exc))
+                    cleanup_errors.append(("rollout.sleep retry", retry_exc))
+                    try:
+                        self.rollout.shutdown()
+                    except BaseException as shutdown_exc:
+                        cleanup_errors.append(("rollout.shutdown", shutdown_exc))
+
+            if staged:
+                try:
+                    # Idempotent after a successful push; essential if extract,
+                    # wake, or push failed with a CPU snapshot still pending.
+                    self.weight_sync.discard()
+                except BaseException as exc:
+                    cleanup_errors.append(("weight_sync.discard", exc))
+
+            # Never move trainer state back onto the GPU unless every Omni stage
+            # acknowledged sleep. A partial sleep plus FSDP onload can OOM before
+            # the original lifecycle error reaches the caller.
+            if self._enable_fsdp_offload and rollout_asleep:
+                try:
+                    if onload_trainer_after:
+                        self.backend.prepare_for_compute()
+                    else:
+                        self.backend.prepare_for_rollout()
+                except BaseException as exc:
+                    cleanup_errors.append(("backend lifecycle restore", exc))
+
+            if cleanup_errors:
+                if active_error:
+                    for action, exc in cleanup_errors:
+                        logger.exception(
+                            "External single-engine cleanup failed in %s: %s",
+                            action,
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                else:
+                    action, exc = cleanup_errors[0]
+                    raise RuntimeError(f"External single-engine cleanup failed in {action}.") from exc
+
     def _build_req(
         self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
     ) -> RolloutReq:
@@ -379,13 +564,20 @@ class UnifiedModelTrainer(BaseTrainer):
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         sampling_params = {**base, "diffusion": diffusion}
+        init_noise_group_ids: List[str] = []
+        if self._noise_latent_shape is not None:
+            source_ids = inputs.group_ids if bool(getattr(diff_params, "init_same_noise", False)) else inputs.sample_ids
+            init_noise_group_ids = [f"r{rollout_id}:{source_id}" for source_id in source_ids]
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
+            stage_config={"rollout_id": int(rollout_id)},
             sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
+            init_noise_group_ids=init_noise_group_ids,
+            init_noise_latent_shape=self._noise_latent_shape,
         )
 
     def run_rollout(self, req: RolloutReq) -> RolloutResp:
@@ -579,10 +771,20 @@ class UnifiedModelTrainer(BaseTrainer):
         the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        if self._single_engine:
-            # Trainside / single-engine (M=1): the rollout shares the live FSDP
-            # modules — no engine wake/sleep, no base offload, no weight sync.
+        if self._single_engine and self._rollout_is_trainside:
+            # Trainside (M=1): rollout shares the live FSDP modules, so there is
+            # no engine lifecycle or weight transfer.
             resp = self.run_rollout(req)
+        elif self._single_engine:
+            # External single-engine (BAGEL T2TI): entry is FSDP-offloaded and
+            # engine-asleep. A staged sync snapshots while asleep, then the
+            # session wakes/pushes/generates and ALWAYS sleeps/cleans up before
+            # onloading FSDP for replay and backward.
+            with self._external_single_engine_session(
+                sync_weights=sync_weights,
+                onload_trainer_after=True,
+            ):
+                resp = self.run_rollout(req)
         else:
             # Colocate memory dance (150GB base can't coexist with an awake engine
             # on the same card). Steady state on entry: base offloaded, engines
@@ -691,7 +893,10 @@ class UnifiedModelTrainer(BaseTrainer):
         # 6. Back to steady state (base on CPU) so the next rollout's engines
         #    have room to wake.
         if self._enable_fsdp_offload:
-            self.backend.offload()
+            if self._single_engine and not self._rollout_is_trainside:
+                self.backend.prepare_for_rollout()
+            else:
+                self.backend.offload()
         return results, mean_reward
 
     def _dump_rollout(self, rollout_id: int, req: RolloutReq, resp: Any) -> None:
@@ -780,18 +985,11 @@ class UnifiedModelTrainer(BaseTrainer):
         :mod:`unirl.trainer.eval_suites`). Logs one ``eval/*`` row; returns
         ``eval/reward``.
 
-        The two-engine path syncs the live adapter into the engines once per
-        eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
-        :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
-        so without this the engines would eval one update stale, and a
-        restored-checkpoint baseline eval would see fresh engine weights.
-        Pushed weights persist across sleep/wake cycles (as train_step relies
-        on), so the passes below just wake/sleep around each chunk's rollout.
-        Unlike train_step, eval never onloads the base after the extract: there
-        is no backward, so the FSDP state stays offloaded (the steady state)
-        throughout. The single-engine trainside path needs none of it (the
-        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
-        forced False).
+        External engines sync current weights once per eval. The single-engine
+        path uses the same staged extract → wake/push/generate → sleep lifecycle
+        as training, with exception-safe snapshot cleanup; unlike training, it
+        leaves FSDP offloaded because eval has no backward. The trainside path
+        needs none of it because it shares the live FSDP modules.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict.
         # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
@@ -818,13 +1016,38 @@ class UnifiedModelTrainer(BaseTrainer):
             self.weight_sync.push()
             for eng in self.ar_rollouts + self.dit_rollouts:
                 eng.sleep()
-        # Default pass: training reward + shared-set suites score the SAME images.
-        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
-        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
-        for suite in self._eval_suites:
-            if suite.data_source is not None:
-                n = suite.num_prompts or self.eval_num_prompts
-                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        single_session = (
+            self._external_single_engine_session(
+                sync_weights=True,
+                onload_trainer_after=False,
+            )
+            if self._single_engine and not self._rollout_is_trainside
+            else nullcontext()
+        )
+        with single_session:
+            # Default pass: training reward + shared-set suites score the SAME images.
+            scorers = [("reward", self.reward)] + [
+                (s.name, s.reward) for s in self._eval_suites if s.data_source is None
+            ]
+            metrics = self._eval_pass(
+                self.data_source,
+                self.eval_num_prompts,
+                scorers,
+                eval_sp,
+                step,
+            )
+            for suite in self._eval_suites:
+                if suite.data_source is not None:
+                    n = suite.num_prompts or self.eval_num_prompts
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                        )
+                    )
         logger.info(
             "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
             step,

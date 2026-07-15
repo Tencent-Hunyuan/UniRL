@@ -30,6 +30,7 @@ _LAZY_TARGETS = {
     "BucketedIPCReceiveMixin": ("ipc_receive_mixin", "BucketedIPCReceiveMixin"),
     "NcclBroadcastReceiveMixin": ("nccl_receive_mixin", "NcclBroadcastReceiveMixin"),
     "HI3ARWeightSyncExtension": ("ar_extension", "HI3ARWeightSyncExtension"),
+    "BagelARWeightSyncExtension": ("ar_extension", "BagelARWeightSyncExtension"),
     "DiTWeightSyncExtension": ("dit_extension", "DiTWeightSyncExtension"),
 }
 

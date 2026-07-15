@@ -63,11 +63,13 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+from unirl.config.require import require
 
 __all__ = [
     "decode_text",
@@ -75,8 +77,10 @@ __all__ = [
     "forward_flow",
     "init_und_context",
     "pack_und_forward_inputs",
+    "prefill_prompt_text",
     "prefill_text_split",
     "prefill_vit_split",
+    "rebuild_text_context_from_chunks",
     "require_inference_dispatch",
     "score_response",
     "score_response_with_prompt",
@@ -215,6 +219,34 @@ def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
 
 
+def prefill_prompt_text(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    prompt: str,
+    tokenizer: Any,
+    new_token_ids: Any,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Tokenize and prefill one prompt with every packed tensor on ``device``.
+
+    BAGEL's vendored ``prepare_prompts`` intentionally creates CPU tensors and
+    its reference inferencer relies on Accelerate hooks to move them. Training
+    removes those hooks before FSDP2 takes ownership, so trainside context
+    construction must make the transfer explicit.
+    """
+    generation_input, kv_lens, ropes = model.prepare_prompts(
+        curr_kvlens=ctx["kv_lens"],
+        curr_rope=ctx["ropes"],
+        prompts=[prompt],
+        tokenizer=tokenizer,
+        new_token_ids=new_token_ids,
+    )
+    generation_input = _to_device(generation_input, device)
+    past = model.forward_cache_update_text(ctx["past_key_values"], **generation_input)
+    return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+
+
 def prefill_text_split(
     model: Any, ctx: Dict[str, Any], *, text_ids: torch.Tensor, device: torch.device
 ) -> Dict[str, Any]:
@@ -229,6 +261,67 @@ def prefill_text_split(
     past = _raw(type(model).forward_cache_update_text)(model, ctx["past_key_values"], **gi)
     n = int(text_ids.numel())
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
+
+
+def rebuild_text_context_from_chunks(
+    model: Any,
+    *,
+    chunks: Sequence[Sequence[int]],
+    expected_kv_length: int,
+    expected_ropes: Sequence[int],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Rebuild a grad-capable BAGEL context from native cache-input chunks.
+
+    ``chunks`` are captured at the vLLM Stage-0 runner boundary, after prompt
+    tokenization and scheduling.  Replaying them separately preserves the exact
+    prefill/decode chunking that populated the transferred cache.  No cache tensor
+    crosses the rollout boundary; this function creates a fresh ``NaiveCache`` on
+    the trainer and lets autograd connect every reconstructed K/V tensor to the
+    current policy weights.
+
+    The MoT inference kernels dispatch on ``module.training``.  Keep the language
+    model in ``eval`` for grad-enabled replay, matching :func:`forward_flow`; do not
+    restore it until backward has consumed any activation-checkpoint recomputation.
+    """
+    require(bool(chunks), "rebuild_text_context_from_chunks: chunks must be non-empty.")
+    expected_kv_length = int(expected_kv_length)
+    expected_ropes = tuple(int(x) for x in expected_ropes)
+    require(bool(expected_ropes), "rebuild_text_context_from_chunks: expected_ropes must be non-empty.")
+
+    lm = model.language_model
+    was_training = bool(getattr(lm, "training", False))
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+
+    try:
+        require_inference_dispatch(model)
+        ctx = init_und_context(model)
+        for index, chunk in enumerate(chunks):
+            token_ids = torch.as_tensor(tuple(int(t) for t in chunk), dtype=torch.long)
+            require(
+                int(token_ids.numel()) > 0,
+                f"rebuild_text_context_from_chunks: chunk {index} is empty.",
+            )
+            ctx = prefill_text_split(model, ctx, text_ids=token_ids, device=device)
+
+        actual_kv_length = int(ctx["kv_lens"][0])
+        actual_ropes = tuple(int(x) for x in ctx["ropes"])
+        require(
+            actual_kv_length == expected_kv_length,
+            "rebuild_text_context_from_chunks: reconstructed KV length does not match native transfer metadata: "
+            f"{actual_kv_length} != {expected_kv_length}.",
+        )
+        require(
+            actual_ropes == expected_ropes,
+            "rebuild_text_context_from_chunks: reconstructed ropes do not match native transfer metadata: "
+            f"{actual_ropes!r} != {expected_ropes!r}.",
+        )
+        return ctx
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
 
 
 def prefill_vit_split(

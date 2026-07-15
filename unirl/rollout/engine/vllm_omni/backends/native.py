@@ -168,6 +168,10 @@ class VLLMOmniBackend:
         self._rt = runtime
         self._tokenizer = tokenizer
         self._tp_per_stage = dict(tp_per_stage)
+        # Omni boots every stage awake. Track successful per-stage lifecycle
+        # acknowledgements so a partial wake/sleep can be rolled back instead
+        # of being hidden behind the rollout engine's aggregate flag.
+        self._awake_stage_ids = set(self._tp_per_stage)
 
     # ------------------------------------------------------------------ #
     # Boot — the only place the runtime import / spawn / env override live
@@ -242,33 +246,47 @@ class VLLMOmniBackend:
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
         serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
+        omni = None
         try:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-            omni = rt["Omni"](
-                model=str(intent["model_path"]),
-                stage_configs_path=yaml_path,
-                **_assemble_omni_kwargs(intent),
+            try:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                omni = rt["Omni"](
+                    model=str(intent["model_path"]),
+                    stage_configs_path=yaml_path,
+                    **_assemble_omni_kwargs(intent),
+                )
+            finally:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    lock_file.close()
+
+            # Driver-side tokenizer for AR prompt-token construction (workers
+            # reload their own from the model path). Pure-DiT modalities skip it.
+            tokenizer = None
+            if intent.get("needs_driver_tokenizer"):
+                tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
+
+            return cls(
+                omni,
+                rt,
+                tokenizer=tokenizer,
+                # The runtime's own merged per-stage configs — authoritative,
+                # no YAML re-read.
+                tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
             )
-        finally:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
-
-        # Driver-side tokenizer for AR prompt-token construction (workers
-        # reload their own from the model path). Pure-DiT modalities skip it.
-        tokenizer = None
-        if intent.get("needs_driver_tokenizer"):
-            tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
-
-        return cls(
-            omni,
-            rt,
-            tokenizer=tokenizer,
-            # The runtime's own merged per-stage configs — authoritative,
-            # no YAML re-read.
-            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
-        )
+        except BaseException:
+            # Once Omni.__init__ returns, this layer owns its subprocess tree.
+            # Later tokenizer/topology/backend setup must not orphan it when
+            # construction fails before a Backend reaches the caller.
+            if omni is not None:
+                try:
+                    close = getattr(omni, "close", None)
+                    if callable(close):
+                        close()
+                except BaseException:
+                    logger.exception("Failed to close vLLM-Omni after backend construction failed.")
+            raise
 
     def _require_omni(self) -> Any:
         if self._omni is None:
@@ -375,31 +393,81 @@ class VLLMOmniBackend:
     # Memory / lifecycle / health
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _validate_lifecycle_acks(result: Any, *, stage_id: int, action: str) -> None:
+        leaves: List[Any] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    collect(item)
+            elif value is not None:
+                leaves.append(value)
+
+        collect(result)
+        if not leaves:
+            raise RuntimeError(f"vLLM-Omni stage {stage_id} returned no {action} acknowledgement.")
+        errors = []
+        for ack in leaves:
+            status = ack.get("status") if isinstance(ack, dict) else getattr(ack, "status", None)
+            if str(status).upper() != "SUCCESS":
+                message = ack.get("error_msg") if isinstance(ack, dict) else getattr(ack, "error_msg", None)
+                errors.append(message or repr(ack))
+        if errors:
+            raise RuntimeError(f"vLLM-Omni stage {stage_id} {action} failed: {errors}.")
+
+    def all_stages_sleeping(self) -> bool:
+        return not self._awake_stage_ids
+
     def sleep_task(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
+        """Sleep every stage still considered awake, completing all retries."""
         import uuid
 
         omni = self._require_omni()
-        for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="handle_sleep_task",
-                args=(self._rt["OmniSleepTask"](level=1, task_id=str(uuid.uuid4())),),
-                stage_ids=[int(sid)],
-            )
+        errors: List[tuple[int, BaseException]] = []
+        for sid in sorted(self._awake_stage_ids):
+            try:
+                result = omni.engine.collective_rpc(
+                    method="handle_sleep_task",
+                    args=(self._rt["OmniSleepTask"](level=1, task_id=str(uuid.uuid4())),),
+                    stage_ids=[int(sid)],
+                )
+                self._validate_lifecycle_acks(result, stage_id=sid, action="sleep")
+                self._awake_stage_ids.discard(sid)
+            except BaseException as exc:
+                # Keep the stage marked awake so a cleanup retry targets it.
+                errors.append((sid, exc))
+        if errors:
+            details = "; ".join(f"stage {sid}: {exc}" for sid, exc in errors)
+            raise RuntimeError(f"vLLM-Omni sleep did not complete for all stages ({details}).") from errors[0][1]
 
     def wake_task(self) -> None:
-        """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
+        """Wake every sleeping stage and preserve partial progress for cleanup."""
         import uuid
 
         import torch
 
         omni = self._require_omni()
-        for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="handle_wake_task",
-                args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
-                stage_ids=[int(sid)],
-            )
+        errors: List[tuple[int, BaseException]] = []
+        sleeping = [sid for sid in self._stage_ids() if sid not in self._awake_stage_ids]
+        for sid in sleeping:
+            try:
+                result = omni.engine.collective_rpc(
+                    method="handle_wake_task",
+                    args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
+                    stage_ids=[int(sid)],
+                )
+                self._validate_lifecycle_acks(result, stage_id=sid, action="wake")
+                self._awake_stage_ids.add(sid)
+            except BaseException as exc:
+                # The worker may have failed after remapping its pool but before
+                # emitting an ACK. Mark it awake conservatively so finally-sleep
+                # attempts to release it together with every acknowledged stage.
+                self._awake_stage_ids.add(sid)
+                errors.append((sid, exc))
+        if errors:
+            details = "; ".join(f"stage {sid}: {exc}" for sid, exc in errors)
+            raise RuntimeError(f"vLLM-Omni wake did not complete for all stages ({details}).") from errors[0][1]
         if torch.cuda.is_available():
             # Mirrors AsyncOmni.wake_up's synchronize(); ensures pool
             # restoration is visible before the next generate.
@@ -524,11 +592,14 @@ class VLLMOmniBackend:
         target_modules: Optional[List[str]],
         load_format: Optional[str],
         flush_cache: bool,
-    ) -> None:
-        """Fan a SGLang-shape tensor payload to per-stage workers.
+        stage_ids: Optional[List[int]],
+    ) -> Dict[int, Any]:
+        """Send a SGLang-shape tensor payload to selected stage workers.
 
         Pure dispatcher: each worker receives the full list and picks
-        ``[self.local_rank]`` in its receive-side handler.
+        ``[self.local_rank]`` in its receive-side handler. ``None`` preserves
+        the legacy all-stage fan-out; staged full-weight sync passes one stage
+        at a time so every consumer gets a fresh serialized tensor handle.
         """
         omni = self._require_omni()
         kwargs = {
@@ -537,13 +608,24 @@ class VLLMOmniBackend:
             "load_format": load_format,
             "flush_cache": bool(flush_cache),
         }
-        for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+        available = set(self._stage_ids())
+        selected = list(self._stage_ids()) if stage_ids is None else list(dict.fromkeys(int(s) for s in stage_ids))
+        invalid = [sid for sid in selected if sid not in available]
+        if invalid:
+            raise ValueError(
+                f"VLLMOmniBackend.update_from_tensor: invalid stage_ids={invalid}; available={sorted(available)}"
+            )
+        if not selected:
+            raise ValueError("VLLMOmniBackend.update_from_tensor: stage_ids must not be empty")
+        acknowledgements: Dict[int, Any] = {}
+        for sid in selected:
+            acknowledgements[sid] = omni.engine.collective_rpc(
                 method="update_weights_from_tensor",
                 args=(),
                 kwargs=kwargs,
                 stage_ids=[int(sid)],
             )
+        return acknowledgements
 
     # ------------------------------------------------------------------ #
     # LoRA tensor bag — two genuinely different transports

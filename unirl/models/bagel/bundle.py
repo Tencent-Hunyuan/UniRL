@@ -102,9 +102,9 @@ class BagelBundle(Bundle):
         LoRA injection run later in :class:`FSDPBackend`.
 
         Note: ``load_checkpoint_and_dispatch`` attaches accelerate device hooks.
-        For the dedicated FSDP path (Phase 6) those may need removal via
-        ``accelerate.hooks.remove_hook_from_module`` before ``fully_shard``; for
-        the standalone bundle smoke they are harmless.
+        The FSDP backend removes them recursively from the trainable language
+        model immediately before taking ownership; standalone bundle inference
+        retains them.
         """
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
@@ -154,8 +154,8 @@ class BagelBundle(Bundle):
         # flow_grpo/train_bagel.py) so the vendored inferencer / generate_image
         # path — which builds packed index tensors on CPU and calls submodule
         # forwards directly — has its inputs auto-moved to the model device.
-        # Phase 6 (UniRL FSDP) must remove these hooks before fully_shard
-        # (accelerate.hooks.remove_hook_from_module(model, recurse=True)).
+        # FSDPBackend removes the hooks from the trainable language-model subtree
+        # before fully_shard; the parent/frozen inference helpers retain theirs.
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_dir, "ema.safetensors"),

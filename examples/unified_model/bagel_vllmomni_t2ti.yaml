@@ -1,0 +1,221 @@
+# @package _global_
+# Experimental BAGEL-7B-MoT UniGRPO T2TI on one 80GB GPU.
+#
+# One external vLLM-Omni pipeline performs native thinking (Stage 0 AR) followed
+# by image generation (Stage 1 diffusion). The trainer full-finetunes the shared
+# MoT decoder and replays both returned tracks with one shared prompt-level
+# advantage. Strict initial scope:
+#   - one GPU, TP=1 on both Omni stages;
+#   - N thinking chains per prompt, exactly M=1 image per chain;
+#   - CFG=1 on every knob;
+#   - full weights, not LoRA.
+#
+# Memory contract: engine/FSDP time-sharing alone is NOT enough for full FT on
+# 80GB. `fsdp_cfg.cpu_offload=true` keeps wrapped fp32 block masters, gradients,
+# and Adam state on CPU during training; only frozen unsharded embed/norm/lm_head
+# tensors are moved to GPU for replay. CPUStagedFullWeightSync builds a bf16 CPU
+# snapshot while Omni sleeps, releases the trainer GPU state, then sends fresh
+# serialized buckets to Stage 0 and Stage 1 after wake. The trainer rejects this
+# single-device sync if persistent FSDP CPU offload is disabled.
+#
+# This trades GPU capacity for substantial host RAM and CPU optimizer time. Plan
+# for at least 192GB host RAM (model/Adam + sleeping engine + bf16 sync snapshot)
+# and fast local checkpoint storage. This recipe has not been performance-smoked
+# on every vLLM-Omni/BAGEL checkpoint combination.
+#
+# Launch:
+#   PYTHONPATH=$PWD python -m unirl.train_unified_model \
+#     --config-name unified_model/bagel_vllmomni_t2ti
+
+num_devices: 1
+batch_size: 1
+num_rollouts: 2000
+weight_sync_interval: 1
+enable_fsdp_offload: true
+eval_cfg_text_scale: 1.0
+
+save_interval: 0
+save_dir: ${oc.env:CKPT_DIR,outputs}/${oc.env:WANDB_RUN_NAME,bagel-vllmomni-t2ti}/checkpoints
+save_mode: full
+
+logging:
+  report_to_wandb: ${oc.env:REPORT_TO_WANDB,false}
+  project_name: ${oc.env:WANDB_PROJECT,bagel-unigrpo}
+  run_name: ${oc.env:WANDB_RUN_NAME,null}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [bagel, unigrpo, t2ti, vllm-omni, fullft, cpu-offload]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,/root/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    shift: 3.0
+    use_lora: false
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelUniPipeline
+  # Native Stage 0 runs BAGEL's inference dispatch. The grad-capable inference
+  # replay avoids the known forward_train vs forward_inference ratio offset.
+  replay_mode: inference
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    # Required for the one-GPU full-FT path. CPUOffloadPolicy pages wrapped
+    # decoder blocks for compute and keeps Adam state off GPU.
+    cpu_offload: true
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # BAGEL invokes embed_tokens/lm_head outside a root forward. They remain
+    # frozen regular tensors and use the policy-aware lifecycle in the backend.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+    param_group_lrs:
+      moe_gen: 3.0e-5
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+
+# One native two-stage engine. UnifiedModelTrainer detects that this rollout is
+# external, offloads the trainer before boot, and immediately sleeps Omni.
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:BAGEL_PATH,/root/BAGEL-7B-MoT}
+    modality: bagel_t2ti
+    enable_sleep_mode: true
+
+# PickScore runs on CPU so it does not overlap the sleeping/waking GPU budget.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 2
+      device: cpu
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR_ID,laion/CLIP-ViT-H-14-laion2B-s32B-b79K}
+      model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
+
+algorithm:
+  ar:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  image:
+    _target_: unirl.algorithms.bagel_flow_unigrpo.BagelFlowUniGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-6
+    clip_schedule: constant
+    # Rebuild the old-policy anchor trainer-side from native KV replay metadata;
+    # do not trust cross-runtime rollout means for the strict parity path.
+    old_logp_source: replay
+    mse_weight: 1.5e-5
+    ratio_norm: true
+    grad_reweight: false
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelT2TIDiffusionConditions
+    params: ${sampling.diffusion}
+
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 4
+    seed: 42
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 1024
+    max_new_tokens: 512
+  diffusion:
+    _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+    # Strict M=1; UnifiedModelTrainer copies AR advantages to the image track.
+    samples_per_prompt: 1
+    num_inference_steps: 14
+    guidance_scale: 1.0
+    cfg_text_scale: 1.0
+    cfg_img_scale: 1.0
+    cfg_interval: [0.0, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: global
+    eta: 0.8
+    height: 512
+    width: 512
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      timestep_fraction: [0.0, 0.2]
+      num_sde_steps: 3
+
+# Full MoT snapshot -> both native Omni stages. `name_remap` converts the bare
+# Qwen2ForCausalLM state dict to BAGEL checkpoint keys; each upstream stage
+# loader filters/packs the tensors it owns. The pinned load plan separates packed
+# q/k/v and gate/up shards, then requires every bucket's returned destination-name
+# set to match exactly on both stages. A shared TP-flat trainable decoder-block norm
+# is also hashed after the full push so stale or corrupted bytes fail before generation.
+sync:
+  _target_: unirl.distributed.weight_sync.full.CPUStagedFullWeightSync
+  bucket_size_mb: 256
+  flush_cache: true
+  wire_dtype: bf16
+  load_plan: bagel_vllm_omni_0_20
+  name_remap:
+    "*": "language_model.*"
+  stage_ids: [0, 1]
+  verify_names: [language_model.model.layers.0.input_layernorm_moe_gen.weight]

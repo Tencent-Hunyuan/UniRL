@@ -53,7 +53,9 @@ from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
 from . import rl_ops
-from .conditions import BagelDiffusionConditions
+from .conditions import BagelDiffusionConditions, BagelT2TIDiffusionConditions
+
+BagelStageConditions = BagelDiffusionConditions | BagelT2TIDiffusionConditions
 
 if TYPE_CHECKING:
     from .bundle import BagelBundle
@@ -240,7 +242,7 @@ class BagelDiffusionStep:
         )
 
 
-class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
+class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
     """Bagel rollout-level diffusion stage (trainside A1) — central-runtime, SD3-shaped.
 
     Owns the bundle, the per-step navit kernel, the SDE ``strategy``, and the
@@ -311,14 +313,61 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         cfg_img = deepcopy(gen)
         with torch.no_grad(), self._autocast_ctx(device):
             cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
-            gen = inf.update_context_text(clean_prompt, gen)
-            cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+            gen = rl_ops.prefill_prompt_text(
+                self.model.model,
+                gen,
+                prompt=clean_prompt,
+                tokenizer=self.model.tokenizer,
+                new_token_ids=self.model.new_token_ids,
+                device=device,
+            )
+            cfg_img = rl_ops.prefill_prompt_text(
+                self.model.model,
+                cfg_img,
+                prompt=clean_prompt,
+                tokenizer=self.model.tokenizer,
+                new_token_ids=self.model.new_token_ids,
+                device=device,
+            )
         return gen, cfg_text, cfg_img
 
-    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+    def _build_contexts_from_replay(
+        self, conditions: BagelT2TIDiffusionConditions
+    ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+        """Rebuild Stage-0's exact transferred text cache with autograd enabled.
+
+        Native ``bagel_think`` sends KV tensors directly from the AR worker to
+        the diffusion worker.  Replay must not transport those tensors to the
+        trainer, so it re-executes the exact cache-input token chunks captured at
+        Stage 0.  The outer caller owns the grad scope: loss replay therefore
+        differentiates through this prefill, while old-logp preparation remains
+        grad-free under its existing ``torch.no_grad`` scope.
+
+        BAGEL's native text2img transfer contract uses an empty text-CFG cache
+        and reuses the positive cache for image-CFG when no companion branches
+        were transferred (vllm-omni ``pipeline_bagel.py``).
+        """
+        spec = conditions.single_spec()
+        device = torch.device(self.model.device)
+        with self._autocast_ctx(device):
+            gen = rl_ops.rebuild_text_context_from_chunks(
+                self.model.model,
+                chunks=spec.chunks(),
+                expected_kv_length=spec.kv_length,
+                expected_ropes=spec.ropes,
+                device=device,
+            )
+        cfg_text = rl_ops.init_und_context(self.model.model)
+        cfg_img = gen
+        return gen, cfg_text, cfg_img, spec.image_shape
+
+    def _resolve_single(self, conditions: BagelStageConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
 
-        Two sources, transparently:
+        Three sources, transparently:
+
+        - **native T2TI replay recipe**: rebuild the exact transferred cache
+          from captured cache-input IDs and scheduler chunk boundaries.
 
         - **opaque contexts present** (trainside / colocate): return them directly
           via :meth:`BagelDiffusionConditions.single`.
@@ -326,6 +375,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
           contexts from the shipped prompt on this bundle (the und path is frozen
           → identical contexts), then return them.
         """
+        if isinstance(conditions, BagelT2TIDiffusionConditions):
+            return self._build_contexts_from_replay(conditions)
         if conditions.has_contexts():
             return conditions.single()
         prompt, image_shape = conditions.single_prompt()
@@ -420,7 +471,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def diffuse(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         schedule: torch.Tensor,
         params: BagelDiffusionParams,
@@ -532,7 +583,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def replay(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         segment: LatentSegment,
         params: BagelDiffusionParams,
@@ -608,7 +659,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def build_forward_kwargs(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         params: BagelDiffusionParams,
         device: torch.device,
@@ -661,7 +712,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def predict_noise_at_step(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,

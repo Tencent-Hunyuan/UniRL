@@ -283,7 +283,12 @@ def decoded_text_from_ar(per_request: Sequence[Sequence[Any]]) -> Texts:
 # --------------------------------------------------------------------------- #
 
 
-def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor]:
+def _flatten_logprobs(
+    logprobs: Any,
+    fallback_len: int,
+    *,
+    sampled_token_ids: Optional[Sequence[int]] = None,
+) -> Optional[torch.Tensor]:
     """Best-effort vLLM-logprob → ``[T]`` float tensor.
 
     vLLM ``CompletionOutput.logprobs`` is ``list[dict[token_id, Logprob]]`` of
@@ -295,7 +300,7 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
     if not isinstance(logprobs, Sequence) or len(logprobs) == 0:
         return None
     values: List[float] = []
-    for step in logprobs:
+    for step_idx, step in enumerate(logprobs):
         if step is None:
             values.append(0.0)
             continue
@@ -305,7 +310,23 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
             values.append(float(step.logprob))
             continue
         if isinstance(step, dict) and step:
-            entry = next(iter(step.values()))
+            entry = None
+            if sampled_token_ids is not None and step_idx < len(sampled_token_ids):
+                sampled_id = int(sampled_token_ids[step_idx])
+                entry = step.get(sampled_id)
+                if entry is None:
+                    # JSON-like fakes may stringify integer token-id keys.
+                    entry = step.get(str(sampled_id))
+                if entry is None:
+                    raise RuntimeError(
+                        "_flatten_logprobs: vLLM logprobs omitted the emitted "
+                        f"token id {sampled_id} at step {step_idx}; available keys="
+                        f"{list(step.keys())[:8]}."
+                    )
+            else:
+                # Backward-compatible fallback for callers that do not have the
+                # emitted token IDs. AR capture always supplies them below.
+                entry = next(iter(step.values()))
             values.append(float(getattr(entry, "logprob", entry)))
             continue
         values.append(0.0)
@@ -331,7 +352,11 @@ def _extract_completion(out: Any) -> Tuple[List[int], Optional[torch.Tensor]]:
         return [], None
     completion = completions[0]
     tokens = list(getattr(completion, "token_ids", []) or [])
-    logp = _flatten_logprobs(getattr(completion, "logprobs", None), fallback_len=len(tokens))
+    logp = _flatten_logprobs(
+        getattr(completion, "logprobs", None),
+        fallback_len=len(tokens),
+        sampled_token_ids=tokens,
+    )
     return tokens, logp
 
 

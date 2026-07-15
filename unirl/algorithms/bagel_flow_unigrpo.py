@@ -247,7 +247,10 @@ class BagelFlowUniGRPO(FlowGRPO):
         # 2. Velocity-MSE regularizer toward the LoRA-disabled base, at the SDE
         #    steps. Separate backward -> grads accumulate into the same step.
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        device = next(self.stage.model.transformer.parameters()).device
+        # FSDP2 CPUOffloadPolicy keeps the decoder's parameter shards on CPU;
+        # BAGEL's bundle device is the execution device used by the live
+        # embeddings, heads, and FSDP all-gathers.
+        device = torch.device(self.stage.model.device)
         schedule = segment.sigmas.to(device)
         # Rebuild the conditioning KV contexts from text ONCE (the und-path prefill)
         # and reuse the resulting forward kwargs across every SDE step and both
@@ -257,7 +260,12 @@ class BagelFlowUniGRPO(FlowGRPO):
         # the LoRA-on context; v_ref then runs the velocity forward with LoRA disabled
         # over that same context — matching the prior behavior, where v_ref reused the
         # rollout (LoRA-on) context with a base velocity forward.
-        forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+        # The surrogate replay above already trains through the reconstructed
+        # T2TI text cache. Keep the MSE context detached: full-FT v_ref swaps
+        # parameter shards in place, and mutating them after a grad-carrying
+        # context prefill would invalidate autograd's version counters.
+        with torch.no_grad():
+            forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
         transformer = self.stage.model.transformer
         # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen bf16 snapshot of
         # the base weights, captured lazily on the first _reference_weights swap (= the
