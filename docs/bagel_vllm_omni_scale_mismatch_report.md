@@ -186,9 +186,10 @@ H20 gate. Both persistent and lifecycle FSDP CPU offload remained disabled;
 FSDP parameters and shards stayed GPU-resident. At the r5 revision this was a
 launch override: the main production recipe still had
 `t2ti_flow_many_enabled=false` and reclaimed the image allocator cache at
-interval 1 with a 0 GiB free-memory floor. The guarded r7 candidate promotes
-flow-many and interval-4/floor-8 reclamation together; that combined default
-remains provisional until its capacity run completes.
+interval 1 with a 0 GiB free-memory floor. The guarded r7 candidate promoted
+flow-many and interval-4/floor-8 reclamation together but failed its physical
+margin gate. Revision `94d7e7b1` retains flow-many while tightening the r8
+capacity candidate to interval 2 and a 12 GiB floor.
 
 The W&B SDK returned eight complete rounds with these driver wall times:
 
@@ -480,6 +481,54 @@ not OOM, but it fails the predefined 2 GiB margin. The next capacity run must
 therefore retain train-phase optimizer parking while adding pressure-aware
 allocator collection; a less-frequent explicit cache cadence is acceptable
 only if that run also improves the physical margin.
+
+## R7 Interval-4 Capacity Rejection
+
+Run [`xm3gaxzk`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/xm3gaxzk), at
+code revision `094cfec0`, combined the validated r6 optimizer lifecycle with
+four changes: the flow-many gate became the candidate default, the immutable
+bf16 full-FT reference snapshot moved from GPU to CPU, the native allocator used
+`garbage_collection_threshold:0.8`, and image-micro reclamation changed to
+interval 4 with an 8 GiB driver-free floor. The exact pod environment used
+Torch 2.11.0+cu129, vLLM 0.20.0, and vLLM-Omni 0.20.0. The focused suite passed
+114 tests before launch, including the CUDA CPU-reference swap/restore contract.
+
+The round completed all 768 native samples, both optimizer updates, and the
+following all-rank Stage 0 and Stage 1 wake. Its reward payload was again exactly
+the r5/r6 round-one distribution: mean/std/min/max
+`0.776082218/0.083198704/0.537614286/0.969348431`, with zero zero-variance
+groups and finite ratios, losses, and gradients. Driver timing was:
+
+| Phase | R6 round 1 | R7 round 1 | R7 - R6 |
+| --- | ---: | ---: | ---: |
+| native generate | 818.554 s | 826.650 s | +8.096 s |
+| reward | 6.031 s | 6.423 s | +0.392 s |
+| train, both updates | 2,221.016 s | 2,266.778 s | +45.762 s (+2.1%) |
+| total round | 3,051.703 s | 3,105.671 s | +53.969 s (+1.8%) |
+
+Each update had 48 image-micro boundaries. Interval 4 made 12 explicit
+`empty_cache()` calls and skipped 36; no pressure call fired. Explicit reclaim
+time fell to 28.967 s and 30.685 s from r6's 121.641 s and 125.185 s. This did
+not reduce end-to-end training time. The image-backward timer includes both
+explicit reclamation and subsequent allocator/stream waits; its non-explicit
+portion rose enough to absorb the apparent saving. Cache-call time is therefore
+not removable wall-clock overhead at this workload.
+
+Moving the immutable reference snapshot to CPU reduced the maximum live
+allocation by exactly 3.039 GiB: r7 peaked at 71.226 GiB allocated versus
+74.265 GiB in r6. Reserved memory remained effectively unchanged at 91.076 GiB.
+The pressure checks reported 11.712 GiB and 11.708 GiB minimum free memory for
+the two updates, but those checks occur only after otherwise skipped boundaries;
+they cannot observe the lower in-flight micro peak.
+
+A separate persistent 10-second `nvidia-smi` trace collected 303 samples. Its
+worst free memory by rank was
+`926/890/2326/1158/2928/3608/3734/3690` MiB. Three of eight ranks violated the
+2 GiB gate, and the global worst reached 96,981/97,871 MiB, leaving only 890 MiB
+free. Several low-margin samples were sustained across ranks before reclamation,
+so this was not a single sampling artifact. Interval-4/floor-8 is rejected even
+though it completed without OOM. The next candidate limits the gap to one
+skipped boundary with interval 2 and raises the pressure floor to 12 GiB.
 
 ## Scale Mismatch
 
@@ -835,8 +884,8 @@ may retain more simultaneous activations. R5 explicitly enabled it and completed
 eight finite rounds with a worst PyTorch-reported peak of 86.420 GiB allocated
 and 91.076 GiB reserved. The external 97,249/97,871 MiB transient still leaves
 a narrow physical margin. Main therefore keeps
-`t2ti_flow_many_enabled=false`; candidate revision `094cfec0` enables it only
-as part of the pressure-guarded r7 capacity and performance gate.
+`t2ti_flow_many_enabled=false`; candidate revision `94d7e7b1` enables it only
+as part of the tighter pressure-guarded r8 capacity gate.
 
 ## Verification Status
 
@@ -858,7 +907,7 @@ as part of the pressure-guarded r7 capacity and performance gate.
 | Eight-H20 cache-faithful padding plus DP balancing | optimizer-0 gate passed; update 1 OOMed | `7d62ya97` completed optimizer 0 with no ordering failure, then fragmented at update-1 image micro 0; roughly three-hour first update remains unacceptable |
 | Eight-H20 layer-major batch 32 | full training round passed; next wake OOMed | `rqjoxria` completed all 768 native samples and both updates in 3,984.172 s total; the following Stage-1 wake failed while Adam and completed gradients were resident |
 | Post-r3 memory/lifecycle controls | eight-round H20 gate passed; ninth wake passed | r5 completed eight rounds, repeatedly cleared 48.620 GiB of gradients, parked/restored 97.239 GiB of optimizer state with no pending slot, and entered ninth generation |
-| Flow-many H20 gate | eight finite H20 rounds passed; guarded promotion under test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved worst PyTorch peak; main remains disabled while candidate `094cfec0` combines it with CPU reference storage and pressure-aware reclamation |
+| Flow-many H20 gate | eight finite H20 rounds passed; tighter guarded promotion under test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved worst PyTorch peak; r7 interval-4/floor-8 failed its physical gate, while r8 candidate `94d7e7b1` uses interval 2/floor 12 |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
 | Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
@@ -888,12 +937,12 @@ parameters/shards. It completed eight consecutive rounds in 50m25.4s to
 The explicit flow-many gate therefore proves repeatable execution on one 8xH20
 node. It does not remove the capacity risk: external sampling briefly left only
 622 MiB physical headroom. Main keeps flow-many false and image-micro cache
-reclamation at interval 1 with a 0 GiB floor. Candidate `094cfec0` instead uses
+reclamation at interval 1 with a 0 GiB floor. Rejected candidate `094cfec0` used
 flow-many, interval 4 with an 8 GiB pressure floor, allocator garbage collection,
-and an immutable CPU reference snapshot; both forms of FSDP CPU offload remain
-false in either configuration.
+and an immutable CPU reference snapshot. Candidate `94d7e7b1` tightens only the
+cadence/floor to 2/12; both forms of FSDP CPU offload remain false throughout.
 
-The next gates are the r7 guarded-cadence capacity/performance run, a longer run
+The next gates are the r8 guarded-cadence capacity run, a longer run
 for a meaningful reward trend, and the unmeasured 32-device scale.
 The eight-point reward slope and fit are materially stronger, but eight
 heterogeneous prompt batches still need additional rounds before the trend can
