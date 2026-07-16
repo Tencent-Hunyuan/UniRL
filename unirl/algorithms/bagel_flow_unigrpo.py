@@ -32,6 +32,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.bagel.rl_ops import move_replay_tree
 from unirl.models.types.replay_result import ReplayResult
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
@@ -56,6 +57,7 @@ class _PreparedMSEBatch:
     forward_kwargs: Dict[str, Any]
     reference_velocities: List[torch.Tensor]
     surrogate_result: Optional[AlgorithmStepResult] = None
+    staged_on_cpu: bool = False
 
 
 @dataclass
@@ -123,6 +125,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         reuse_ratio_context_for_mse: bool = False,
         context_gradient_mode: str = "full",
         lazy_first_update_anchor: bool = False,
+        stage_prepared_replay_to_cpu: bool = False,
     ) -> None:
         super().__init__(
             params=params,
@@ -143,6 +146,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         self.reuse_ratio_context_for_mse = bool(reuse_ratio_context_for_mse)
         self.context_gradient_mode = str(context_gradient_mode).strip().lower()
         self.lazy_first_update_anchor = bool(lazy_first_update_anchor)
+        self.stage_prepared_replay_to_cpu = bool(stage_prepared_replay_to_cpu)
         if self.context_gradient_mode not in _CONTEXT_GRADIENT_MODES:
             raise ValueError(
                 "BagelFlowUniGRPO.context_gradient_mode must be one of "
@@ -163,6 +167,11 @@ class BagelFlowUniGRPO(FlowGRPO):
             raise ValueError(
                 "lazy_first_update_anchor=True requires context_gradient_mode='stage_boundary', "
                 "ratio_norm=True, and old_logp_source='replay'."
+            )
+        if self.stage_prepared_replay_to_cpu and self.context_gradient_mode != "stage_boundary":
+            raise ValueError(
+                "stage_prepared_replay_to_cpu=True requires context_gradient_mode='stage_boundary' so only "
+                "graph-free native-boundary replay data is staged."
             )
         self.prepares_anchor_plan = self.lazy_first_update_anchor
         # Under old_logp_source="replay" the train stack recomputes these per 1-sample
@@ -578,12 +587,31 @@ class BagelFlowUniGRPO(FlowGRPO):
                             ).detach()
                             for step_idx in target_steps
                         ]
-                        entries[index] = _PreparedMSEBatch(
-                            target_steps=target_steps,
-                            forward_kwargs=forward_kwargs,
-                            reference_velocities=v_refs,
-                            surrogate_result=surrogate_result,
-                        )
+                        if self.stage_prepared_replay_to_cpu:
+                            staged_forward_kwargs, staged_v_refs = move_replay_tree(
+                                (forward_kwargs, v_refs),
+                                torch.device("cpu"),
+                            )
+                            entries[index] = _PreparedMSEBatch(
+                                target_steps=target_steps,
+                                forward_kwargs=staged_forward_kwargs,
+                                reference_velocities=staged_v_refs,
+                                surrogate_result=surrogate_result,
+                                staged_on_cpu=True,
+                            )
+                        else:
+                            entries[index] = _PreparedMSEBatch(
+                                target_steps=target_steps,
+                                forward_kwargs=forward_kwargs,
+                                reference_velocities=v_refs,
+                                surrogate_result=surrogate_result,
+                            )
+            # The pending tuples own the accelerator copies after CPU staging.
+            # Drop them before empty_cache so only the graph-free CPU queue
+            # survives into image backward. Loop locals retain the final entry.
+            pending.clear()
+            if self.stage_prepared_replay_to_cpu:
+                del forward_kwargs, v_refs
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -609,6 +637,18 @@ class BagelFlowUniGRPO(FlowGRPO):
             raise RuntimeError(
                 "BagelFlowUniGRPO: prepared MSE step indices do not match the consumed micro-batch: "
                 f"prepared={prepared.target_steps}, current={tuple(target_steps)}."
+            )
+        if prepared.staged_on_cpu:
+            forward_kwargs, reference_velocities = move_replay_tree(
+                (prepared.forward_kwargs, prepared.reference_velocities),
+                torch.device(self.stage.model.device),
+            )
+            prepared = _PreparedMSEBatch(
+                target_steps=prepared.target_steps,
+                forward_kwargs=forward_kwargs,
+                reference_velocities=reference_velocities,
+                surrogate_result=prepared.surrogate_result,
+                staged_on_cpu=False,
             )
         return prepared
 

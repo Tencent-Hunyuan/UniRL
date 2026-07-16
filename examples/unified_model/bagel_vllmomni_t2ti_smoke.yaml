@@ -32,6 +32,12 @@ reward:
       batch_size: 2
       device: cpu
 
+algorithm:
+  image:
+    # The one-update smoke has four micros and already exercises FSDP CPU
+    # offload. Keep the production-only prepared-data staging gate disabled.
+    stage_prepared_replay_to_cpu: false
+
 stack:
   # Keep the functional smoke bounded to one replay/update pass.
   num_updates_per_batch: 1

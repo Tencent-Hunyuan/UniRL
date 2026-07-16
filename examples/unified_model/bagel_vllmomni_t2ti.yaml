@@ -154,6 +154,11 @@ algorithm:
     # the same exact replay used for its current-policy loss (before optimizer 0);
     # only later updates need a separate eager pre-update anchor replay.
     lazy_first_update_anchor: true
+    # Prepared Stage-0 caches and frozen velocity targets are data, not FSDP
+    # state. Keep queued future image micros on CPU and synchronously hydrate
+    # only the micro being consumed. This does not move model parameters,
+    # gradients, optimizer state, or the rollout engine off GPU.
+    stage_prepared_replay_to_cpu: true
     # stage_boundary already performs detached context reuse; the older full-grad
     # phased-reuse path is mutually exclusive and remains disabled.
     reuse_ratio_context_for_mse: false

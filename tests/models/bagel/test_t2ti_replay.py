@@ -12,6 +12,7 @@ from unirl.models.bagel.conditions import (
 from unirl.models.bagel.diffusion import BagelDiffusionStage
 from unirl.models.bagel.rl_ops import (
     detach_replay_tree,
+    move_replay_tree,
     rebuild_text_context_from_chunks,
     validate_t2ti_replay_chunk_mode,
     validate_t2ti_replay_execution_order,
@@ -87,6 +88,42 @@ def test_detach_replay_tree_preserves_cache_aliases_without_cloning_storage():
     assert not detached["gen"].value_cache[0].requires_grad
     assert not detached["packed"].requires_grad
     assert cache.key_cache[0].requires_grad
+
+
+def test_move_replay_tree_preserves_aliases_dtype_and_owns_storage():
+    source = torch.tensor([2.0], dtype=torch.bfloat16, requires_grad=True)
+    shared = source * 3.0
+    cache = NaiveCache(1)
+    cache.key_cache[0] = shared
+    cache.value_cache[0] = shared
+    tree = {
+        "gen": cache,
+        "cfg_img": cache,
+        "packed": shared,
+        "nested": [shared, {"again": shared}],
+    }
+
+    moved = move_replay_tree(tree, torch.device("cpu"))
+
+    assert moved is not tree
+    assert moved["gen"] is moved["cfg_img"]
+    assert moved["gen"] is not cache
+    assert moved["gen"].key_cache[0] is moved["gen"].value_cache[0]
+    assert moved["gen"].key_cache[0] is moved["packed"]
+    assert moved["nested"][0] is moved["packed"]
+    assert moved["nested"][1]["again"] is moved["packed"]
+    assert moved["packed"].dtype == torch.bfloat16
+    assert moved["packed"].device.type == "cpu"
+    assert not moved["packed"].requires_grad
+    assert moved["packed"].data_ptr() != shared.data_ptr()
+
+    moved_value = moved["packed"].clone()
+    with torch.no_grad():
+        shared.add_(4.0)
+    assert torch.equal(moved["packed"], moved_value)
+    source_value = shared.clone()
+    moved["packed"].add_(7.0)
+    assert torch.equal(shared, source_value)
 
 
 def test_replay_exposes_a_detached_copy_of_its_exact_forward_kwargs():

@@ -79,6 +79,7 @@ __all__ = [
     "forward_flow",
     "init_und_context",
     "install_layer_major_replay_dispatch",
+    "move_replay_tree",
     "pack_und_forward_inputs",
     "prefill_prompt_text",
     "prefill_text_split",
@@ -483,6 +484,62 @@ def detach_replay_tree(value: Any, _memo: Optional[Dict[int, Any]] = None) -> An
             for layer_idx, tensor in source.items():
                 destination[layer_idx] = detach_replay_tree(tensor, memo) if tensor is not None else None
         return detached_cache
+    memo[object_id] = value
+    return value
+
+
+def move_replay_tree(
+    value: Any,
+    device: torch.device | str,
+    _memo: Optional[Dict[int, Any]] = None,
+) -> Any:
+    """Copy a detached BAGEL replay tree to ``device`` without losing aliases.
+
+    Prepared image replay contains ordinary containers and vendored
+    ``NaiveCache`` instances, including an intentional alias between the
+    positive ``gen`` and ``cfg_img`` caches. Copy every tensor leaf even when it
+    is already on the destination device so the moved tree owns independent
+    storage. This lets the prepared queue release its accelerator tree without
+    sharing mutable tensor storage with either the source or a later hydration.
+
+    The copy is synchronous by design: prepared CPU tensors are pageable, and a
+    completed copy gives the consumer an unambiguous lifetime boundary. Tensor
+    dtype and layout are preserved; every leaf is detached before transfer.
+    """
+    destination_device = torch.device(device)
+    memo = {} if _memo is None else _memo
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+    if torch.is_tensor(value):
+        moved = value.detach().to(device=destination_device, copy=True)
+        memo[object_id] = moved
+        return moved
+    if isinstance(value, dict):
+        moved_dict: Dict[Any, Any] = {}
+        memo[object_id] = moved_dict
+        moved_dict.update({key: move_replay_tree(item, destination_device, memo) for key, item in value.items()})
+        return moved_dict
+    if isinstance(value, list):
+        moved_list: List[Any] = []
+        memo[object_id] = moved_list
+        moved_list.extend(move_replay_tree(item, destination_device, memo) for item in value)
+        return moved_list
+    if isinstance(value, tuple):
+        moved_tuple = tuple(move_replay_tree(item, destination_device, memo) for item in value)
+        memo[object_id] = moved_tuple
+        return moved_tuple
+    if callable(getattr(value, "fork", None)) and hasattr(value, "key_cache") and hasattr(value, "value_cache"):
+        moved_cache = value.fork()
+        memo[object_id] = moved_cache
+        for store_name in ("key_cache", "value_cache"):
+            source = getattr(value, store_name)
+            destination = getattr(moved_cache, store_name)
+            for layer_idx, tensor in source.items():
+                destination[layer_idx] = (
+                    move_replay_tree(tensor, destination_device, memo) if tensor is not None else None
+                )
+        return moved_cache
     memo[object_id] = value
     return value
 

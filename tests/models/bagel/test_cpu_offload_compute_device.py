@@ -121,11 +121,21 @@ def _boundary_segment() -> object:
             },
             "old_logp_source='replay'",
         ),
+        (
+            {"stage_prepared_replay_to_cpu": True},
+            "requires context_gradient_mode='stage_boundary'",
+        ),
     ],
 )
 def test_stage_boundary_configuration_validation(kwargs, message) -> None:
     with pytest.raises(ValueError, match=message):
         BagelFlowUniGRPO(params=object(), stage=object(), **kwargs)
+
+
+def test_prepared_replay_cpu_staging_defaults_off() -> None:
+    algorithm = BagelFlowUniGRPO(params=object(), stage=object())
+
+    assert algorithm.stage_prepared_replay_to_cpu is False
 
 
 def test_ar_replay_uses_bundle_compute_device_when_fsdp_shards_are_on_cpu(
@@ -379,6 +389,126 @@ def test_stage_boundary_detaches_all_retained_forward_tree_leaves() -> None:
     assert transformer.policy_weight.grad is not None
 
 
+def test_prepared_replay_cpu_staging_hydrates_only_the_consumed_micro() -> None:
+    class Cache:
+        def __init__(self) -> None:
+            self.key_cache = {0: None}
+            self.value_cache = {0: None}
+
+        def fork(self):
+            cache = type(self)()
+            cache.key_cache = self.key_cache.copy()
+            cache.value_cache = self.value_cache.copy()
+            return cache
+
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+        stage_prepared_replay_to_cpu=True,
+    )
+    source_kwargs = []
+    micro_batches = []
+
+    def ordered_segment():
+        return make_image_segment(
+            latents=torch.tensor([[[[0.3]], [[0.2]]]], dtype=torch.float32),
+            sigmas=torch.tensor([0.8, 0.4], dtype=torch.float32),
+            indices=torch.tensor([0, 1], dtype=torch.long),
+            sde_indices=torch.tensor([1, 0], dtype=torch.long),
+            sde_logp=torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+            sde_means=torch.tensor([[[[0.0]], [[0.0]]]], dtype=torch.float32),
+        )
+
+    for index in range(2):
+        context = (transformer.context_weight * float(index + 1)).reshape(1)
+        cache_value = (transformer.context_weight * float(index + 3)).reshape(1)
+        cache = Cache()
+        cache.key_cache[0] = cache_value
+        cache.value_cache[0] = cache_value
+        kwargs = {
+            "context": context,
+            "past_key_values": cache,
+            "cfg_img_past_key_values": cache,
+        }
+        source_kwargs.append(kwargs)
+        micro_batches.append(({"forward_kwargs": kwargs}, ordered_segment(), torch.ones(1)))
+
+    algorithm.prepare_update_batch(
+        micro_batches=micro_batches,
+        training_progress=0.25,
+        loss_scale=0.5,
+    )
+    queue = algorithm._prepared_mse_batches
+    assert queue is not None
+    assert all(entry is not None and entry.staged_on_cpu for entry in queue)
+    current_staged = queue[0]
+    future_staged = queue[1]
+    assert current_staged is not None
+    assert future_staged is not None
+    current_staged_ptr = current_staged.forward_kwargs["context"].data_ptr()
+    future_staged_ptr = future_staged.forward_kwargs["context"].data_ptr()
+
+    current = algorithm._take_prepared_mse([1, 0])
+
+    assert current is not None
+    assert current.staged_on_cpu is False
+    assert current.forward_kwargs["context"].device.type == "cpu"
+    assert current.forward_kwargs["context"].dtype == source_kwargs[0]["context"].dtype
+    assert current.forward_kwargs["context"].data_ptr() != current_staged_ptr
+    assert not current.forward_kwargs["context"].requires_grad
+    assert current.forward_kwargs["past_key_values"] is current.forward_kwargs["cfg_img_past_key_values"]
+    assert [float(velocity) for velocity in current.reference_velocities] == pytest.approx(
+        [0.54, 0.61], rel=0.0, abs=3.0e-4
+    )
+    assert algorithm._prepared_mse_batches == [future_staged]
+    assert future_staged.forward_kwargs["context"].data_ptr() == future_staged_ptr
+    assert future_staged.staged_on_cpu
+
+    algorithm.finish_update_batch(succeeded=False)
+    assert algorithm._prepared_mse_batches is None
+
+
+def test_prepared_replay_cpu_staging_releases_queue_after_hydration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+        stage_prepared_replay_to_cpu=True,
+    )
+    micro_batches = [
+        ({"context_scale": 1.0}, _boundary_segment(), torch.ones(1)),
+        ({"context_scale": 2.0}, _boundary_segment(), torch.ones(1)),
+    ]
+    algorithm.prepare_update_batch(
+        micro_batches=micro_batches,
+        training_progress=0.25,
+        loss_scale=0.5,
+    )
+
+    def fail_hydration(*_args, **_kwargs):
+        raise RuntimeError("synthetic hydration failure")
+
+    monkeypatch.setattr("unirl.algorithms.bagel_flow_unigrpo.move_replay_tree", fail_hydration)
+    with pytest.raises(RuntimeError, match="synthetic hydration failure"):
+        algorithm._take_prepared_mse([0])
+
+    assert algorithm._prepared_mse_batches is not None
+    assert len(algorithm._prepared_mse_batches) == 1
+    algorithm.finish_update_batch(succeeded=False)
+    assert algorithm._prepared_mse_batches is None
+
+
 def test_stage_boundary_rejects_broadcastable_velocity_shapes() -> None:
     transformer = _BoundaryTransformer()
     stage = _BoundaryStage(transformer)
@@ -456,7 +586,7 @@ def test_stage_boundary_reuses_prepared_context_and_refreshes_next_update() -> N
 
 
 def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() -> None:
-    def run(*, lazy: bool):
+    def run(*, lazy: bool, stage_prepared_replay_to_cpu: bool = False):
         transformer = _BoundaryTransformer()
         stage = _BoundaryStage(transformer)
         algorithm = BagelFlowUniGRPO(
@@ -468,6 +598,7 @@ def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() 
             clip_range=0.1,
             context_gradient_mode="stage_boundary",
             lazy_first_update_anchor=lazy,
+            stage_prepared_replay_to_cpu=stage_prepared_replay_to_cpu,
         )
         conditions = {"context_scale": 1.5}
         segments = [_boundary_segment(), _boundary_segment()]
@@ -513,6 +644,10 @@ def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() 
 
     eager_stage, eager_results, eager_gradients = run(lazy=False)
     lazy_stage, lazy_results, lazy_gradients = run(lazy=True)
+    staged_lazy_stage, staged_lazy_results, staged_lazy_gradients = run(
+        lazy=True,
+        stage_prepared_replay_to_cpu=True,
+    )
 
     assert eager_stage.context_builds == 4  # two eager anchors + two current contexts
     assert lazy_stage.context_builds == 3  # update-1 anchor + two current contexts
@@ -523,6 +658,14 @@ def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() 
     assert all(torch.equal(lazy_grad, eager_grad) for lazy_grad, eager_grad in zip(lazy_gradients, eager_gradients))
     assert lazy_results[0].metrics["ratio_mean"] == pytest.approx(1.0)
     assert lazy_results[0].metrics["rn_delta_mu_sq_mean"] == pytest.approx(0.0)
+    assert staged_lazy_stage.context_builds == lazy_stage.context_builds
+    assert [result.loss for result in staged_lazy_results] == pytest.approx(
+        [result.loss for result in lazy_results], rel=0.0, abs=0.0
+    )
+    assert [result.metrics for result in staged_lazy_results] == [result.metrics for result in lazy_results]
+    assert all(
+        torch.equal(staged_grad, lazy_grad) for staged_grad, lazy_grad in zip(staged_lazy_gradients, lazy_gradients)
+    )
 
 
 def test_stage_boundary_direct_call_builds_one_shared_context() -> None:
