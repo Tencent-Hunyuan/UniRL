@@ -157,6 +157,14 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             cond_timestep = conditions.cond_timestep
             cond_vae_image_mask = fused.cond_vae_image_mask
             cond_vit_image_mask = fused.cond_vit_image_mask
+            # Cond-image analog of ``timesteps_index`` below: native passes
+            # ``output.cond_timestep_scatter_index`` (modeling:2842) so
+            # ``instantiate_continuous_tokens`` injects the cond <timestep>
+            # token's continuous embedding (t~=0 = clean source). None silently
+            # SKIPS the injection (modeling:2201 gates on the index, and
+            # ``_check_inputs`` — which demands it alongside cond_vae_images —
+            # is bypassed below), leaving the plain vocab embedding at that slot.
+            cond_timesteps_index = fused.cond_timestep_scatter_index
             # it2i source-image conditioning comes off _encode_cond_image on CPU
             # (or the VAE/ViT device), but the gen_image forward's timestep-embedder
             # / token-instantiate Linears live on ``sample.device``. Move the cond
@@ -176,12 +184,14 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             cond_vae_images = _to_dev(cond_vae_images)
             cond_vit_images = _to_dev(cond_vit_images)
             cond_timestep = _to_dev(cond_timestep)
+            cond_timesteps_index = _to_dev(cond_timesteps_index)
             cond_vae_image_mask = _to_dev(cond_vae_image_mask)
             cond_vit_image_mask = _to_dev(cond_vit_image_mask)
             vit_kwargs = _to_dev(vit_kwargs)
         else:
             cond_vae_images = None
             cond_timestep = None
+            cond_timesteps_index = None  # decode steps: the cond block lives in the KV cache
             cond_vae_image_mask = None
             cond_vit_images = None
             cond_vit_image_mask = None
@@ -289,7 +299,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             "cond_vae_images": cond_vae_images,
             "cond_vae_image_mask": cond_vae_image_mask,
             "cond_timesteps": cond_timestep,
-            "cond_timesteps_index": None,
+            "cond_timesteps_index": cond_timesteps_index,
             "cond_vit_images": cond_vit_images,
             "cond_vit_image_mask": cond_vit_image_mask,
             "cond_vit_image_kwargs": vit_kwargs,
