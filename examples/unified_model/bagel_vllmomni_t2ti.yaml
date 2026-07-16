@@ -10,9 +10,11 @@
 #   - CFG=1 on every knob;
 #   - full weights, not LoRA.
 #
-# Full-FT params, gradients, and optimizer state are FSDP-sharded on GPU. The
-# separate ``bagel_vllmomni_t2ti_smoke`` profile retains the one-GPU CPU-offload
-# path and reduced sampling settings used for functional validation.
+# Full-FT parameters and FSDP shards stay on GPU. At the external Omni rollout
+# boundary, completed gradients are cleared and only sharded Adam state is
+# parked on CPU, then restored after Omni sleeps. The separate
+# ``bagel_vllmomni_t2ti_smoke`` profile retains the one-GPU full CPU-offload path
+# and reduced sampling settings used for functional validation.
 #
 # Launch:
 #   scripts/launch_bagel_vllmomni_t2ti.sh --profile production
@@ -23,6 +25,10 @@ batch_size: 32
 num_rollouts: 2000
 weight_sync_interval: 1
 enable_fsdp_offload: false
+# The first rollout fits before Adam initializes; later wakes otherwise overlap
+# Omni with completed grads + Adam state and can OOM. This narrow lifecycle does
+# not move FSDP parameters/shards and requires backend.fsdp_cfg.cpu_offload=false.
+park_optimizer_state_during_rollout: true
 eval_cfg_text_scale: 1.0
 
 save_interval: 0
@@ -103,8 +109,8 @@ backend:
     warmup_steps: 0
     total_steps: 100000
 
-# One native two-stage engine. UnifiedModelTrainer detects that this rollout is
-# external, offloads the trainer before boot, and immediately sleeps Omni.
+# One native two-stage engine. UnifiedModelTrainer boots it once and immediately
+# sleeps Omni; subsequent wake/sleep sessions use the optimizer-only boundary.
 rollout:
   _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
   model_config: ${bundle.config}

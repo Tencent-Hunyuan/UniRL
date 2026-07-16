@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from typing import Dict, List, Literal, Optional
 
 import torch
@@ -225,6 +226,37 @@ class BaseFSDP2Backend(Remote):
 
     def zero_grad(self) -> None:
         self.optimizer.zero_grad()
+
+    @staticmethod
+    def _local_tensor_nbytes(tensor: torch.Tensor) -> int:
+        """Physical bytes owned by this rank for a Tensor or DTensor."""
+        local = tensor.to_local() if callable(getattr(tensor, "to_local", None)) else tensor
+        return int(local.numel()) * int(local.element_size())
+
+    def _optimizer_state_nbytes(self, *, device_type: Optional[str] = None) -> int:
+        total = 0
+        for state in self.optimizer.state.values():
+            for value in state.values():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                local = value.to_local() if callable(getattr(value, "to_local", None)) else value
+                if device_type is None or local.device.type == device_type:
+                    total += self._local_tensor_nbytes(value)
+        return total
+
+    def _optimizer_grad_nbytes(self, *, device_type: Optional[str] = None) -> int:
+        total = 0
+        seen: set[int] = set()
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                if id(parameter) in seen or parameter.grad is None:
+                    continue
+                seen.add(id(parameter))
+                grad = parameter.grad
+                local = grad.to_local() if callable(getattr(grad, "to_local", None)) else grad
+                if device_type is None or local.device.type == device_type:
+                    total += self._local_tensor_nbytes(grad)
+        return total
 
     def set_grad_sync(self, enable: bool) -> None:
         """Toggle the FSDP2 gradient reduce-scatter for no-sync accumulation.
@@ -655,6 +687,64 @@ class BaseFSDP2Backend(Remote):
 
         for module in roots:
             module._apply(move)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def park_optimizer_state_for_rollout(self) -> Dict[str, float]:
+        """Release completed grads and park only Adam state on CPU.
+
+        This is the narrow external-engine rollout boundary used when FSDP
+        parameters intentionally remain GPU-resident. It is idempotent: a
+        repeated call sees no completed gradients and no optimizer tensors on
+        the compute device. Unlike :meth:`prepare_for_rollout`, it never moves
+        model parameters, parameter shards, buffers, or bundle modules.
+        """
+        started = time.perf_counter()
+        compute_type = self._device.type
+        grad_bytes = self._optimizer_grad_nbytes(device_type=compute_type)
+        optimizer_bytes = self._optimizer_state_nbytes()
+        optimizer_device_bytes = self._optimizer_state_nbytes(device_type=compute_type)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        move_optimizer_state(self.optimizer, "cpu")
+        remaining_device_bytes = self._optimizer_state_nbytes(device_type=compute_type)
+        if compute_type != "cpu" and remaining_device_bytes:
+            raise RuntimeError(
+                f"{type(self).__name__}.park_optimizer_state_for_rollout: "
+                f"{remaining_device_bytes} optimizer-state bytes remain on {compute_type}."
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return {
+            "grad_bytes_cleared": float(grad_bytes),
+            "optimizer_state_bytes": float(optimizer_bytes),
+            "optimizer_state_bytes_parked": float(optimizer_device_bytes),
+            "optimizer_park_host_time_s": float(time.perf_counter() - started),
+        }
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def restore_optimizer_state_after_rollout(self) -> Dict[str, float]:
+        """Restore parked optimizer tensors after the external engine sleeps.
+
+        Re-running this method is harmless and leaves every optimizer tensor on
+        the backend compute device. Model parameters and FSDP shards are never
+        touched by either half of this lifecycle.
+        """
+        started = time.perf_counter()
+        cpu_bytes = self._optimizer_state_nbytes(device_type="cpu")
+        move_optimizer_state(self.optimizer, self._device)
+        restored_bytes = self._optimizer_state_nbytes(device_type=self._device.type)
+        total_bytes = self._optimizer_state_nbytes()
+        if self._device.type != "cpu" and restored_bytes != total_bytes:
+            raise RuntimeError(
+                f"{type(self).__name__}.restore_optimizer_state_after_rollout: "
+                f"restored {restored_bytes} of {total_bytes} optimizer-state bytes "
+                f"to {self._device}."
+            )
+        return {
+            "optimizer_state_bytes_restored": float(cpu_bytes),
+            "optimizer_restore_host_time_s": float(time.perf_counter() - started),
+        }
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def prepare_for_compute(self) -> None:

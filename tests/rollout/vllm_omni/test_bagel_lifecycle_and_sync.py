@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,7 @@ from unirl.distributed.weight_sync.full.cpu_staged import (
 from unirl.rollout.engine.vllm_omni.backends.native import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.engine import VLLMOmniRolloutEngine
 from unirl.trainer.base import build_sampling_dict
-from unirl.trainer.unified_model import UnifiedModelTrainer
+from unirl.trainer.unified_model import UnifiedModelTrainer, _reduce_rollout_boundary_metrics
 from unirl.utils.scheduler_utils import AllSDEScheduler
 
 
@@ -202,6 +203,177 @@ def test_transient_sleep_failure_retries_before_trainer_onload() -> None:
         pass
     assert trainer.rollout.sleep_calls == 2
     assert trainer.backend.calls == ["compute"]
+
+
+def test_optimizer_parking_orders_extract_park_wake_push_sleep_discard_restore() -> None:
+    events: list[str] = []
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+
+    class _Sync:
+        def extract(self) -> None:
+            events.append("extract")
+
+        def push(self) -> None:
+            events.append("push")
+
+        def discard(self) -> None:
+            events.append("discard")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            events.append("park")
+            return [
+                {
+                    "grad_bytes_cleared": 10.0,
+                    "optimizer_state_bytes_parked": 20.0,
+                    "optimizer_park_host_time_s": 1.0,
+                },
+                {
+                    "grad_bytes_cleared": 11.0,
+                    "optimizer_state_bytes_parked": 21.0,
+                    "optimizer_park_host_time_s": 2.0,
+                },
+            ]
+
+        def restore_optimizer_state_after_rollout(self):
+            events.append("restore")
+            return [
+                {"optimizer_state_bytes_restored": 20.0, "optimizer_restore_host_time_s": 3.0},
+                {"optimizer_state_bytes_restored": 21.0, "optimizer_restore_host_time_s": 2.5},
+            ]
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = True
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = True
+    trainer.weight_sync = _Sync()
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with trainer._external_single_engine_session(sync_weights=True, onload_trainer_after=True) as metrics:
+        events.append("generate")
+
+    assert events == ["extract", "park", "wake", "push", "generate", "sleep", "discard", "restore"]
+    assert metrics == {
+        "grad_bytes_cleared": 21.0,
+        "optimizer_state_bytes_parked": 41.0,
+        "optimizer_park_host_time_s": 2.0,
+        "optimizer_state_bytes_restored": 41.0,
+        "optimizer_restore_host_time_s": 3.0,
+    }
+
+
+@pytest.mark.parametrize("failure_at", ["wake", "generate"])
+def test_optimizer_parking_restores_after_rollout_failure(failure_at: str) -> None:
+    events: list[str] = []
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+            if failure_at == "wake":
+                raise RuntimeError("injected wake failure")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            events.append("park")
+            return {}
+
+        def restore_optimizer_state_after_rollout(self):
+            events.append("restore")
+            return {}
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = False
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = True
+    trainer.weight_sync = None
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_at} failure"):
+        with trainer._external_single_engine_session(sync_weights=False, onload_trainer_after=True):
+            events.append("generate")
+            if failure_at == "generate":
+                raise RuntimeError("injected generate failure")
+
+    expected = ["park", "wake", "sleep", "restore"]
+    if failure_at == "generate":
+        expected.insert(2, "generate")
+    assert events == expected
+
+
+def test_optimizer_parking_default_off_makes_no_backend_lifecycle_calls() -> None:
+    events: list[str] = []
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            raise AssertionError("default-off path must not park")
+
+        def restore_optimizer_state_after_rollout(self):
+            raise AssertionError("default-off path must not restore")
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = False
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = False
+    trainer.weight_sync = None
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with trainer._external_single_engine_session(sync_weights=False, onload_trainer_after=True) as metrics:
+        events.append("generate")
+    assert events == ["wake", "generate", "sleep"]
+    assert metrics == {}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"single_engine": False},
+        {"rollout_is_trainside": True},
+        {"enable_fsdp_offload": True},
+        {"backend_persistent_cpu_offload": True},
+    ],
+)
+def test_optimizer_parking_rejects_non_external_or_fsdp_offload_modes(kwargs) -> None:
+    contract = {
+        "enabled": True,
+        "single_engine": True,
+        "rollout_is_trainside": False,
+        "enable_fsdp_offload": False,
+        "backend_persistent_cpu_offload": False,
+        **kwargs,
+    }
+    with pytest.raises(ValueError):
+        UnifiedModelTrainer._validate_optimizer_state_parking_contract(**contract)
+
+
+def test_optimizer_parking_is_default_off_and_metric_reduction_is_empty_safe() -> None:
+    parameter = inspect.signature(UnifiedModelTrainer.__init__).parameters["park_optimizer_state_during_rollout"]
+    assert parameter.default is False
+    assert _reduce_rollout_boundary_metrics(None) == {}
 
 
 def test_vllm_omni_shutdown_is_driver_dispatchable() -> None:

@@ -17,6 +17,9 @@ num_devices: 1
 devices_per_node: 1
 batch_size: 1
 enable_fsdp_offload: true
+# Smoke keeps its existing whole-trainer CPU lifecycle; optimizer-only parking
+# is deliberately mutually exclusive with that mode.
+park_optimizer_state_during_rollout: false
 
 logging:
   tags: [bagel, unigrpo, t2ti, vllm-omni, fullft, smoke, cpu-offload]

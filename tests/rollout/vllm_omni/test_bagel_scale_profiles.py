@@ -55,6 +55,7 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     _assert_strict_t2ti_contract(cfg, expected_pairs=32 * 24)
     assert (cfg.num_devices, cfg.devices_per_node, cfg.batch_size) == (32, 8, 32)
     assert cfg.enable_fsdp_offload is False
+    assert cfg.park_optimizer_state_during_rollout is True
     assert cfg.backend.fsdp_cfg.cpu_offload is False
     assert cfg.algorithm.image.stage_prepared_replay_to_cpu is True
     assert cfg.sampling.ar.samples_per_prompt == 24
@@ -79,6 +80,7 @@ def test_single_gpu_smoke_profile_composes_reduced_overrides() -> None:
     _assert_strict_t2ti_contract(smoke, expected_pairs=4)
     assert (smoke.num_devices, smoke.devices_per_node, smoke.batch_size) == (1, 1, 1)
     assert smoke.enable_fsdp_offload is True
+    assert smoke.park_optimizer_state_during_rollout is False
     assert smoke.backend.fsdp_cfg.cpu_offload is True
     assert smoke.sampling.ar.samples_per_prompt == 4
     assert smoke.sampling.diffusion.samples_per_prompt == 1
