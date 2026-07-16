@@ -348,6 +348,45 @@ def test_optimizer_parking_default_off_makes_no_backend_lifecycle_calls() -> Non
     assert metrics == {}
 
 
+def test_failed_rollout_sleep_never_restores_parked_optimizer_onto_gpu() -> None:
+    events: list[str] = []
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+            raise RuntimeError("injected partial sleep")
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            events.append("park")
+            return {}
+
+        def restore_optimizer_state_after_rollout(self):
+            raise AssertionError("optimizer state must stay on CPU while Omni may be awake")
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = False
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = True
+    trainer.weight_sync = None
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with pytest.raises(RuntimeError, match="cleanup failed in rollout.sleep"):
+        with trainer._external_single_engine_session(sync_weights=False, onload_trainer_after=True):
+            pass
+
+    assert events == ["park", "wake", "sleep", "sleep", "shutdown"]
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [

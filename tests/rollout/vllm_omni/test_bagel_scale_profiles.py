@@ -5,6 +5,7 @@ from pathlib import Path
 
 from hydra import compose, initialize_config_dir
 
+import unirl.train_unified_model as train_entrypoint
 from unirl.trainer.base import build_sampling_dict
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
@@ -117,3 +118,20 @@ def test_launcher_resolves_explicit_scale_profiles() -> None:
     assert smoke.stdout.strip() == "unified_model/bagel_vllmomni_t2ti_smoke"
     assert invalid.returncode == 2
     assert "expected production or smoke" in invalid.stderr
+
+
+def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:
+    cfg = _compose("bagel_vllmomni_t2ti")
+    captured = {}
+
+    class _Trainer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def train(self, **_kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(train_entrypoint, "UnifiedModelTrainer", _Trainer)
+    train_entrypoint.main.__wrapped__(cfg)
+
+    assert captured["park_optimizer_state_during_rollout"] is True
