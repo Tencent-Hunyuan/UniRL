@@ -80,32 +80,6 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
     return n
 
 
-def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Module:
-    """Cast a meta-built transformer to ``dtype`` and no-op its ``init_weights``.
-
-    On meta the cast is metadata-only (``to_empty`` later materializes in
-    ``dtype``); the no-op stops VeOmni's ``parallelize`` from re-initializing
-    after ``to_empty``. Warns if non-persistent buffers are still on meta (built
-    under ``torch.device("meta")`` instead of :func:`build_meta_init_transformer`)
-    — ``to_empty`` leaves those garbage and they cannot be recovered.
-
-    ``nn.Module.to`` is in place; callers rebind by convention.
-    """
-    transformer = transformer.to(dtype)
-    transformer.init_weights = lambda: None
-    non_persistent = set(n for n, _ in transformer.named_buffers()) - set(transformer.state_dict())
-    on_meta = sorted(n for n, b in transformer.named_buffers() if n in non_persistent and b.is_meta)
-    if on_meta:
-        logger.warning(
-            "finalize_meta_init: %d non-persistent buffer(s) on META, unrecoverable "
-            "after to_empty: %s. Build via build_meta_init_transformer and stash its "
-            "capture on bundle._meta_init_state.",
-            len(on_meta),
-            on_meta[:8],
-        )
-    return transformer
-
-
 def build_meta_init_transformer(
     factory: Callable[[], nn.Module],
     *,
@@ -115,7 +89,9 @@ def build_meta_init_transformer(
 
     Builds under ``init_empty_weights(include_buffers=False)`` (parameters on
     meta, buffers / ``__dict__`` tensors real on CPU), captures that state before
-    the dtype cast, then finalizes.
+    the dtype cast, then finalizes: the cast is metadata-only on meta (``to_empty``
+    later materializes in ``dtype``) and ``init_weights`` is stamped to a no-op so
+    VeOmni's ``parallelize`` does not re-initialize after ``to_empty``.
 
     Returns ``(transformer, captured)``. **Stash** ``captured`` on the bundle as
     ``bundle._meta_init_state``; ``load_trainable_weights`` restores it after the
@@ -126,13 +102,13 @@ def build_meta_init_transformer(
     with init_empty_weights(include_buffers=False):
         transformer = factory()
     captured = capture_init_state(transformer)
-    transformer = finalize_meta_init(transformer, dtype=dtype)
+    transformer = transformer.to(dtype)
+    transformer.init_weights = lambda: None
     return transformer, captured
 
 
 __all__ = [
     "capture_init_state",
     "restore_init_state",
-    "finalize_meta_init",
     "build_meta_init_transformer",
 ]
