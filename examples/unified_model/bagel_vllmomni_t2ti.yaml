@@ -61,9 +61,9 @@ pipeline:
   # unshard/reshard and makes collective order independent of trace depth.
   t2ti_replay_execution_order: layer_major
   # Traverse each FSDP decoder layer once for all SDE velocity streams. This is
-  # exact at CFG=1 but can retain more live activations, so keep it independently
-  # switchable for H20 peak-memory A/B testing.
-  t2ti_flow_many_enabled: true
+  # exact at CFG=1 but can retain more live activations. Keep production disabled
+  # until an explicit H20 peak-memory A/B run establishes sufficient headroom.
+  t2ti_flow_many_enabled: false
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
