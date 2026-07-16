@@ -195,10 +195,11 @@ stack:
   # and live gradients. cuda_peak_* counters reset per update;
   # cuda_train_window_peak_* also covers hydration, full anchor, and all updates.
   empty_cache_after_image_micro: true
-  # Reclaim at a bounded cadence, or sooner when driver-visible free memory falls
-  # below the H20 safety floor. The final micro is always reclaimed.
-  image_micro_empty_cache_interval: 2
-  image_micro_empty_cache_min_free_gb: 12.0
+  # Reclaim after every replay micro. External 2-second sampling showed that
+  # even one skipped boundary can leave less than the required 2 GiB H20 margin;
+  # interval 1 therefore remains the conservative production capacity policy.
+  image_micro_empty_cache_interval: 1
+  image_micro_empty_cache_min_free_gb: 0.0
   empty_cache_after_optimizer: true
   cuda_peak_telemetry: true
 

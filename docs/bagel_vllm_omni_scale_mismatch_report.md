@@ -538,7 +538,7 @@ so this was not a single sampling artifact. Interval-4/floor-8 is rejected even
 though it completed without OOM. The next candidate limits the gap to one
 skipped boundary with interval 2 and raises the pressure floor to 12 GiB.
 
-## R8 Safe Cadence Gate
+## R8 Interval-2 Cadence Gate
 
 Run [`2zjw6fcj`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/2zjw6fcj), at
 code revision `94d7e7b1`, changed only the rejected r7 cadence and pressure
@@ -584,8 +584,21 @@ in 6.862886 s and 3.782373 s, with zero pending restore slots. The
 pre/post-restore/post-step live
 allocations were 21.781755/33.936906/33.936906 GiB. After the summary, all eight
 AR and diffusion workers passed the next wake barrier and native round-two
-generation began. This passes the first safe-cadence round and next-wake gate;
-the second round remains the repeated post-Adam acceptance check before merge.
+generation began. This passes the first-round lifecycle and next-wake gate; the
+second round remains live and its complete lifecycle result is not yet
+available.
+
+The first-round 10-second trace was not fine-grained enough to establish the
+physical-memory gate. During round two, a persistent 2-second trace at
+`/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-guarded2-94d7e7b1-r8-gpu2s-round2.log`
+observed GPU 0/1 using 97,121/97,243 of 97,871 MiB at 06:12:26, leaving only
+750/628 MiB free. At 06:12:36, GPUs 2--7 used approximately
+96,105--96,167 MiB, leaving 1,704--1,766 MiB free. Every rank therefore crossed
+below the required 2 GiB margin, and the global worst was 628 MiB. Interval 2
+with a 12 GiB boundary floor is rejected even if the still-running second round
+finishes, because the boundary check cannot observe the next micro's in-flight
+peak. The conservative r9 candidate restores interval 1 and floor 0, so every
+image replay micro performs explicit cache reclamation.
 
 ## Scale Mismatch
 
@@ -966,8 +979,8 @@ as part of the tighter pressure-guarded r8 capacity gate.
 | Post-r3 memory/lifecycle controls | eight-round H20 gate passed; ninth wake passed | r5 completed eight rounds, repeatedly cleared 48.620 GiB of gradients, parked/restored 97.239 GiB of optimizer state with no pending slot, and entered ninth generation |
 | Train-phase optimizer parking | functional two-round gate passed; physical gate failed | r6 restored exactly 97.239 GiB with zero pending slots through inherited and ordinary updates and crossed the third wake; external sampling still fell to 610 MiB free |
 | Interval-4/floor-8 cadence | **rejected** | r7 completed and crossed the next wake, but 3/8 ranks fell below 2 GiB free, worst 890 MiB; 75% fewer cache calls did not reduce train wall time |
-| Interval-2/floor-12 cadence | first round and next wake passed; repeat in progress | r8 trained in 2,217.634 s with 7,586 MiB worst external free memory, exact reward parity, finite updates, and zero optimizer restore slots pending |
-| Flow-many H20 gate | eight finite H20 rounds passed; safe guarded promotion under repeat test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved; r8 candidate `94d7e7b1` combines flow-many with the safe interval-2/floor-12 policy |
+| Interval-2/floor-12 cadence | **rejected** | r8's first round and next wake passed, but a 2-second round-two trace found all ranks below 2 GiB free and a 628 MiB global minimum; round two remains live |
+| Flow-many H20 gate | eight finite H20 rounds passed; conservative promotion pending repeat test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved; r9 retains flow-many and restores per-micro interval-1/floor-0 reclamation |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
 | Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
@@ -996,16 +1009,20 @@ parameters/shards. It completed eight consecutive rounds in 50m25.4s to
 4.3%, and the ninth Omni wake succeeded after optimizer-only boundary parking.
 The explicit flow-many gate therefore proves repeatable execution on one 8xH20
 node. It does not remove the capacity risk: external sampling briefly left only
-622 MiB physical headroom. Main keeps flow-many false and image-micro cache
-reclamation at interval 1 with a 0 GiB floor. Rejected candidate `094cfec0` used
+622 MiB physical headroom. Rejected candidate `094cfec0` used
 flow-many, interval 4 with an 8 GiB pressure floor, allocator garbage collection,
 and an immutable CPU reference snapshot. Candidate `94d7e7b1` tightens only the
 cadence/floor to 2/12. Its first round matched baseline train time while retaining
-7.408 GiB external headroom and crossing the next wake; both forms of FSDP CPU
-offload remain false throughout.
+7.408 GiB headroom in a 10-second trace and crossed the next wake, but a 2-second
+round-two trace later found only 628 MiB free. It is rejected. The conservative
+r9 candidate retains flow-many, the immutable CPU bf16 reference, allocator
+garbage collection, and train/rollout optimizer parking while restoring
+per-micro interval-1/floor-0 reclamation. Both forms of FSDP CPU offload remain
+false throughout.
 
-The immediate gate is r8's second complete round. Remaining broader gates are a
-longer reward series and the unmeasured 32-device scale.
+The immediate gate is repeated r9 execution with the 2 GiB physical-memory
+margin. Remaining broader gates are a longer reward series and the unmeasured
+32-device scale.
 The eight-point reward slope and fit are materially stronger, but eight
 heterogeneous prompt batches still need additional rounds before the trend can
 be called sustained growth.
