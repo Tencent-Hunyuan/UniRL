@@ -927,6 +927,8 @@ def test_unigrpo_full_ft_reference_survives_checkpoint_resume(tmp_path: Path) ->
     algorithm = make_algorithm(original)
     with algorithm._reference_weights(original):
         pass
+    assert algorithm._ref_snapshot is not None
+    assert all(tensor.device.type == "cpu" for tensor in algorithm._ref_snapshot.values())
 
     with torch.no_grad():
         original.weight.fill_(3.0)
@@ -938,6 +940,8 @@ def test_unigrpo_full_ft_reference_survives_checkpoint_resume(tmp_path: Path) ->
     resumed_model.load_state_dict(tuned_state)
     resumed = make_algorithm(resumed_model)
     resumed.load_reference_checkpoint(str(tmp_path))
+    assert resumed._ref_snapshot is not None
+    assert all(tensor.device.type == "cpu" for tensor in resumed._ref_snapshot.values())
 
     with resumed._reference_weights(resumed_model):
         assert torch.equal(resumed_model.weight, torch.ones_like(resumed_model.weight))
@@ -960,9 +964,15 @@ def test_unigrpo_fresh_full_ft_reference_stays_on_cpu() -> None:
 
     assert algorithm._ref_snapshot is not None
     assert all(tensor.device.type == "cpu" for tensor in algorithm._ref_snapshot.values())
+    assert all(tensor.dtype == torch.bfloat16 for tensor in algorithm._ref_snapshot.values())
     with torch.no_grad():
         transformer.weight.fill_(3.0)
         transformer.bias.fill_(4.0)
+    assert torch.equal(algorithm._ref_snapshot["weight"], torch.ones_like(algorithm._ref_snapshot["weight"]))
+    assert torch.equal(
+        algorithm._ref_snapshot["bias"],
+        torch.full_like(algorithm._ref_snapshot["bias"], 2.0),
+    )
 
     with algorithm._reference_weights(transformer):
         assert torch.equal(transformer.weight, torch.ones_like(transformer.weight))

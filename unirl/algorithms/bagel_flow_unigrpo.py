@@ -344,7 +344,7 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         if self._ref_snapshot is None:
             self._ref_snapshot = {
-                name: local_view(param).detach().to(device="cpu", dtype=torch.bfloat16).clone()
+                name: local_view(param).detach().to(device="cpu", dtype=torch.bfloat16, copy=True)
                 for name, param in live
             }
 
