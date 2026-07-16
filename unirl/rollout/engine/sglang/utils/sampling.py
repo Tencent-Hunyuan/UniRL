@@ -57,7 +57,7 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
     else:
         n = int(ar.samples_per_prompt if ar is not None else stage_ar.get("n", 1))
 
-    raw_top_k = int(ar.top_k if ar is not None else config.top_k)
+    raw_top_k = ar.top_k if ar is not None else config.top_k
     block: Dict[str, Any] = {
         "temperature": float(ar.temperature if ar is not None else config.temperature),
         "max_new_tokens": int(ar.max_new_tokens if ar is not None else config.max_new_tokens),
