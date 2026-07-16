@@ -71,8 +71,8 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     assert cfg.reward.backend.config.batch_size == 8
     assert cfg.stack.num_updates_per_batch == 2
     assert cfg.stack.empty_cache_after_image_micro is True
-    assert cfg.stack.image_micro_empty_cache_interval == 4
-    assert cfg.stack.image_micro_empty_cache_min_free_gb == 8.0
+    assert cfg.stack.image_micro_empty_cache_interval == 2
+    assert cfg.stack.image_micro_empty_cache_min_free_gb == 12.0
     assert cfg.stack.empty_cache_after_optimizer is True
     assert cfg.stack.cuda_peak_telemetry is True
 

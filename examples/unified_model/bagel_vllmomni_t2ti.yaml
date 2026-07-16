@@ -197,8 +197,8 @@ stack:
   empty_cache_after_image_micro: true
   # Reclaim at a bounded cadence, or sooner when driver-visible free memory falls
   # below the H20 safety floor. The final micro is always reclaimed.
-  image_micro_empty_cache_interval: 4
-  image_micro_empty_cache_min_free_gb: 8.0
+  image_micro_empty_cache_interval: 2
+  image_micro_empty_cache_min_free_gb: 12.0
   empty_cache_after_optimizer: true
   cuda_peak_telemetry: true
 
