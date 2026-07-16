@@ -34,9 +34,10 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -51,6 +52,11 @@ from unirl.types.rollout_resp import RolloutTrack
 from unirl.utils.misc import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_record(profiler: Any, name: str):
+    """Return a named profiler scope when whole-train profiling is active."""
+    return profiler.record(name) if profiler is not None else nullcontext()
 
 
 class UnifiedModelTrainStack(Remote):
@@ -234,11 +240,15 @@ class UnifiedModelTrainStack(Remote):
         slices_by_track: Dict[str, List[Tuple[int, int]]],
         *,
         training_progress: float,
+        update_index: int = 0,
+        profiler: Any = None,
+        anchor_image_host_time_s: Optional[float] = None,
     ) -> Dict[str, TrainStepResult]:
         """One optimizer step: zero_grad → backward BOTH tracks over their mini-batch
         slices → shared optimizer_step → stamp grad_norm / lr onto each track's result.
         """
         self.fsdp_backend.zero_grad()
+        phase_times: Dict[str, float] = {}
         succeeded = False
         try:
             results: Dict[str, TrainStepResult] = {}
@@ -249,15 +259,23 @@ class UnifiedModelTrainStack(Remote):
                 # during the preceding AR backward, and every reference swap is
                 # complete before its own activation-checkpointed graph exists.
                 if algorithm.prepares_update_batch:
-                    self._prepare_update_batch(
-                        name,
-                        tracks[name],
-                        slices_by_track[name],
-                        training_progress=training_progress,
+                    started = time.perf_counter()
+                    with _profile_record(profiler, f"update_{update_index}/{name}_prepare_reference"):
+                        self._prepare_update_batch(
+                            name,
+                            tracks[name],
+                            slices_by_track[name],
+                            training_progress=training_progress,
+                        )
+                    if name == "image":
+                        phase_times["image_prepare_reference_host_time_s"] = time.perf_counter() - started
+                started = time.perf_counter()
+                phase_name = "image_ratio_mse_backward" if name == "image" else f"{name}_backward"
+                with _profile_record(profiler, f"update_{update_index}/{phase_name}"):
+                    partial, has_backward = self._backward_track(
+                        name, tracks[name], slices_by_track[name], training_progress=training_progress
                     )
-                partial, has_backward = self._backward_track(
-                    name, tracks[name], slices_by_track[name], training_progress=training_progress
-                )
+                phase_times[f"{phase_name}_host_time_s"] = time.perf_counter() - started
                 results[name] = partial
                 any_backward = any_backward or has_backward
 
@@ -268,22 +286,41 @@ class UnifiedModelTrainStack(Remote):
                 # num_updates_per_batch>1 optimizer-step OOM). Returning the freed activation
                 # blocks to the driver first defragments. Gated on >1 so the single-update
                 # path (and the LoRA recipe) pays nothing.
-                if self.num_updates_per_batch > 1 and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+                with _profile_record(profiler, f"update_{update_index}/optimizer"):
+                    empty_cache_started = time.perf_counter()
+                    if self.num_updates_per_batch > 1 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    phase_times["pre_optimizer_empty_cache_host_time_s"] = time.perf_counter() - empty_cache_started
+                    optimizer_started = time.perf_counter()
+                    grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+                    phase_times["optimizer_host_time_s"] = time.perf_counter() - optimizer_started
             else:
                 grad_norm = 0.0
                 logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
 
             lr = self._current_lr()
             for name, result in list(results.items()):
+                metrics = dict(result.metrics)
+                if name == "ar" and "ar_backward_host_time_s" in phase_times:
+                    metrics["ar_backward_host_time_s"] = phase_times["ar_backward_host_time_s"]
+                if name == "image":
+                    for metric_name in (
+                        "image_prepare_reference_host_time_s",
+                        "image_ratio_mse_backward_host_time_s",
+                        "pre_optimizer_empty_cache_host_time_s",
+                        "optimizer_host_time_s",
+                    ):
+                        if metric_name in phase_times:
+                            metrics[metric_name] = phase_times[metric_name]
+                    if anchor_image_host_time_s is not None:
+                        metrics["anchor_image_host_time_s"] = float(anchor_image_host_time_s)
                 results[name] = TrainStepResult(
                     loss=result.loss,
                     grad_norm=grad_norm,
                     lr=lr,
                     has_backward=result.has_backward,
                     micros=result.micros,
-                    metrics=result.metrics,
+                    metrics=metrics,
                 )
             succeeded = True
             return results
@@ -388,8 +425,13 @@ class UnifiedModelTrainStack(Remote):
         with profiler.record("train_track") if profiler is not None else nullcontext():
             tracks = {"ar": ar_track, "image": image_track}
             # Freeze each track's π_old anchor once, before the multi-update loop.
+            anchor_image_host_time_s: Optional[float] = None
             for name in self.algorithms:
-                self.prepare_segment(name, tracks[name])
+                started = time.perf_counter()
+                with _profile_record(profiler, f"anchor_{name}"):
+                    self.prepare_segment(name, tracks[name])
+                if name == "image":
+                    anchor_image_host_time_s = time.perf_counter() - started
 
             # N optimizer steps over disjoint mini-batches (each track sliced by the same
             # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
@@ -400,7 +442,14 @@ class UnifiedModelTrainStack(Remote):
             for u in range(self.num_updates_per_batch):
                 slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
                 per_update.append(
-                    self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress))
+                    self._train_one_step(
+                        tracks,
+                        slices_by_track,
+                        training_progress=float(training_progress),
+                        update_index=u,
+                        profiler=profiler,
+                        anchor_image_host_time_s=anchor_image_host_time_s if u == 0 else None,
+                    )
                 )
         if profiler is not None:
             profiler.step()

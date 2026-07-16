@@ -144,6 +144,26 @@ def _bagel_t2ti_replay_permutation(
     return torch.tensor(permutation, dtype=torch.long)
 
 
+def _bagel_t2ti_replay_depth_metrics(depths: List[int]) -> Dict[str, float]:
+    """Summarize native Stage-0 scheduler depth without retaining a histogram."""
+    if not depths:
+        return {}
+    ordered = sorted(int(depth) for depth in depths)
+
+    def percentile(fraction: float) -> float:
+        index = round((len(ordered) - 1) * float(fraction))
+        return float(ordered[index])
+
+    return {
+        "bagel_t2ti_replay_depth_min": float(ordered[0]),
+        "bagel_t2ti_replay_depth_mean": float(sum(ordered) / len(ordered)),
+        "bagel_t2ti_replay_depth_p50": percentile(0.50),
+        "bagel_t2ti_replay_depth_p90": percentile(0.90),
+        "bagel_t2ti_replay_depth_p99": percentile(0.99),
+        "bagel_t2ti_replay_depth_max": float(ordered[-1]),
+    }
+
+
 def deep_hydrate(obj: Any) -> Any:
     """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place.
 
@@ -979,6 +999,7 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id=rollout_id,
             media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
         )
+        extra_metrics: Dict[str, float] = {"sync_weights": float(bool(sync_weights))}
         if self._strict_bagel_t2ti:
             ar_track = resp.tracks[AR_TRACK]
             image_track = resp.tracks[IMAGE_TRACK]
@@ -992,14 +1013,15 @@ class UnifiedModelTrainer(BaseTrainer):
                     "BAGEL T2TI replay balancing requires positional M=1 lineage: "
                     "image parent_ids must equal AR sample_ids."
                 )
+            replay_specs = BagelT2TIDiffusionConditions.from_dict(image_track.conditions).replay_specs
+            depths = [len(spec.chunk_offsets) - 1 for spec in replay_specs]
+            extra_metrics.update(_bagel_t2ti_replay_depth_metrics(depths))
             permutation = _bagel_t2ti_replay_permutation(
                 image_track,
                 num_shards=self._train_dp_size,
                 num_updates=self._num_updates_per_batch,
             )
             if permutation is not None:
-                replay_specs = BagelT2TIDiffusionConditions.from_dict(image_track.conditions).replay_specs
-                depths = [len(spec.chunk_offsets) - 1 for spec in replay_specs]
                 shard_size = len(depths) // self._train_dp_size
 
                 def padded_work(order: List[int]) -> int:
@@ -1010,6 +1032,12 @@ class UnifiedModelTrainer(BaseTrainer):
 
                 original_work = padded_work(list(range(len(depths))))
                 balanced_work = padded_work(permutation.tolist())
+                extra_metrics.update(
+                    {
+                        "bagel_t2ti_replay_collective_work_original": float(original_work),
+                        "bagel_t2ti_replay_collective_work_balanced": float(balanced_work),
+                    }
+                )
                 logger.info(
                     "BAGEL T2TI replay balancing: collective traversal target %d -> %d (%.1f%% reduction)",
                     original_work,
@@ -1030,7 +1058,7 @@ class UnifiedModelTrainer(BaseTrainer):
             results,
             resp,
             step_time_s=time.perf_counter() - t0,
-            extra_metrics={"sync_weights": float(bool(sync_weights))},
+            extra_metrics=extra_metrics,
         )
 
         # 6. Back to steady state (base on CPU) so the next rollout's engines

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 
 import torch
@@ -12,6 +13,13 @@ from unirl.types.segments import make_image_segment
 
 def test_update_preparation_runs_immediately_before_its_backward() -> None:
     events: list[str] = []
+    profile_ranges: list[str] = []
+
+    class FakeProfiler:
+        @contextmanager
+        def record(self, name: str):
+            profile_ranges.append(name)
+            yield
 
     class FakeBackend:
         _device = torch.device("cpu")
@@ -80,7 +88,14 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
     tracks = {"ar": track("ar"), "image": track("image")}
     slices = {"ar": [(0, 1), (1, 2)], "image": [(0, 1), (1, 2)]}
 
-    stack._train_one_step(tracks, slices, training_progress=0.0)
+    results = stack._train_one_step(
+        tracks,
+        slices,
+        training_progress=0.0,
+        update_index=1,
+        profiler=FakeProfiler(),
+        anchor_image_host_time_s=7.5,
+    )
 
     assert events == [
         "zero_grad",
@@ -90,6 +105,92 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
         "optimizer_step",
         "finish_image_True",
     ]
+    assert profile_ranges == [
+        "update_1/ar_backward",
+        "update_1/image_prepare_reference",
+        "update_1/image_ratio_mse_backward",
+        "update_1/optimizer",
+    ]
+    assert set(results["ar"].metrics) == {"ar_backward_host_time_s"}
+    assert float(results["ar"].metrics["ar_backward_host_time_s"]) >= 0.0
+    assert set(results["image"].metrics) == {
+        "anchor_image_host_time_s",
+        "image_prepare_reference_host_time_s",
+        "image_ratio_mse_backward_host_time_s",
+        "pre_optimizer_empty_cache_host_time_s",
+        "optimizer_host_time_s",
+    }
+    assert results["image"].metrics["anchor_image_host_time_s"] == 7.5
+    assert float(results["image"].metrics["image_prepare_reference_host_time_s"]) >= 0.0
+    assert float(results["image"].metrics["image_ratio_mse_backward_host_time_s"]) >= 0.0
+    assert float(results["image"].metrics["pre_optimizer_empty_cache_host_time_s"]) >= 0.0
+    assert float(results["image"].metrics["optimizer_host_time_s"]) >= 0.0
+
+
+def test_train_track_attaches_anchor_timing_to_first_update_only(monkeypatch) -> None:
+    monkeypatch.delenv("UNIRL_PROFILE", raising=False)
+    prepare_calls: list[str] = []
+    update_calls: list[tuple[int, object, object]] = []
+
+    class FakeBackend:
+        _device = torch.device("cpu")
+
+        def on_rollout_end(self):
+            return None
+
+    def track(prefix: str) -> RolloutTrack:
+        return RolloutTrack(
+            sample_ids=[f"{prefix}-{i}" for i in range(4)],
+            conditions={},
+            segment=make_image_segment(latents=torch.zeros(4, 1, 1, 1)),
+            advantages=torch.ones(4),
+        )
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.fsdp_backend = FakeBackend()
+    stack.algorithms = {"ar": object(), "image": object()}
+    stack.micro_batch_size = 1
+    stack.num_updates_per_batch = 2
+
+    def fake_prepare(self, name, resp_track):
+        del self, resp_track
+        prepare_calls.append(name)
+
+    def fake_train_one_step(
+        self,
+        tracks,
+        slices_by_track,
+        *,
+        training_progress,
+        update_index,
+        profiler,
+        anchor_image_host_time_s,
+    ):
+        del self, tracks, slices_by_track, training_progress
+        update_calls.append((update_index, profiler, anchor_image_host_time_s))
+        return {
+            name: TrainStepResult(
+                loss=float(update_index),
+                grad_norm=0.5,
+                lr=1.0e-6,
+                has_backward=True,
+                micros=[],
+                metrics={"update": float(update_index)},
+            )
+            for name in ("ar", "image")
+        }
+
+    stack.prepare_segment = MethodType(fake_prepare, stack)
+    stack._train_one_step = MethodType(fake_train_one_step, stack)
+
+    stack.train_track(track("ar"), track("image"), training_progress=0.0)
+
+    assert prepare_calls == ["ar", "image"]
+    assert [update_index for update_index, _, _ in update_calls] == [0, 1]
+    assert all(profiler is None for _, profiler, _ in update_calls)
+    assert isinstance(update_calls[0][2], float)
+    assert float(update_calls[0][2]) >= 0.0
+    assert update_calls[1][2] is None
 
 
 def test_legacy_update_preparation_keeps_pair_only_api() -> None:

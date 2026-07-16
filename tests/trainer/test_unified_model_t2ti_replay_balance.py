@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from unirl.models.bagel.conditions import BagelT2TIDiffusionConditions, BagelThinkKVReplaySpec
-from unirl.trainer.unified_model import _bagel_t2ti_replay_permutation
+from unirl.trainer.unified_model import _bagel_t2ti_replay_depth_metrics, _bagel_t2ti_replay_permutation
 from unirl.types.rollout_resp import RolloutTrack
 
 
@@ -92,3 +92,15 @@ def test_bagel_t2ti_replay_permutation_skips_non_t2ti_track() -> None:
     track = RolloutTrack(sample_ids=["a", "b"], conditions={})
 
     assert _bagel_t2ti_replay_permutation(track, num_shards=2, num_updates=1) is None
+
+
+def test_bagel_t2ti_replay_depth_metrics_report_distribution() -> None:
+    assert _bagel_t2ti_replay_depth_metrics([]) == {}
+    assert _bagel_t2ti_replay_depth_metrics([1, 2, 3, 4, 100]) == {
+        "bagel_t2ti_replay_depth_min": 1.0,
+        "bagel_t2ti_replay_depth_mean": 22.0,
+        "bagel_t2ti_replay_depth_p50": 3.0,
+        "bagel_t2ti_replay_depth_p90": 100.0,
+        "bagel_t2ti_replay_depth_p99": 100.0,
+        "bagel_t2ti_replay_depth_max": 100.0,
+    }
