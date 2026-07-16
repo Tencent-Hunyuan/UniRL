@@ -204,6 +204,34 @@ class BagelFlowUniGRPO(FlowGRPO):
             return False
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
+    def _predict_velocities_at(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        samples: Sequence[torch.Tensor],
+        sigmas: Sequence[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Use BAGEL's layer-major multi-step API with a serial stage fallback."""
+        predict_many = getattr(self.stage, "predict_velocities_at", None)
+        if callable(predict_many):
+            return list(
+                predict_many(
+                    forward_kwargs,
+                    samples=samples,
+                    sigmas=sigmas,
+                    params=self.params,
+                )
+            )
+        return [
+            self.stage.predict_velocity_at(
+                forward_kwargs,
+                sample=sample,
+                sigma=sigma,
+                params=self.params,
+            )
+            for sample, sigma in zip(samples, sigmas)
+        ]
+
     def _snapshot_reference(self, transformer: Any) -> None:
         """Deprecated shim — the v_ref base snapshot is now captured lazily inside
         :meth:`_reference_weights` (at the swap site, so the shard state matches every
@@ -579,13 +607,12 @@ class BagelFlowUniGRPO(FlowGRPO):
                     for index, segment, target_steps, forward_kwargs, device, surrogate_result in pending:
                         schedule = segment.sigmas.to(device)
                         v_refs = [
-                            self.stage.predict_velocity_at(
+                            velocity.detach()
+                            for velocity in self._predict_velocities_at(
                                 forward_kwargs,
-                                sample=segment.latents_at(step_idx)[0].to(device),
-                                sigma=schedule[step_idx],
-                                params=self.params,
-                            ).detach()
-                            for step_idx in target_steps
+                                samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+                                sigmas=[schedule[step_idx] for step_idx in target_steps],
+                            )
                         ]
                         if self.stage_prepared_replay_to_cpu:
                             staged_forward_kwargs, staged_v_refs = move_replay_tree(
@@ -807,23 +834,21 @@ class BagelFlowUniGRPO(FlowGRPO):
                             "or set mse_weight=0."
                         )
                     v_refs = [
-                        self.stage.predict_velocity_at(
+                        velocity.detach()
+                        for velocity in self._predict_velocities_at(
                             forward_kwargs,
-                            sample=segment.latents_at(step_idx)[0].to(device),
-                            sigma=schedule[step_idx],
-                            params=self.params,
-                        ).detach()
-                        for step_idx in target_steps
+                            samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+                            sigmas=[schedule[step_idx] for step_idx in target_steps],
+                        )
                     ]
             if full_ft_ref and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        policy_velocities: List[torch.Tensor] = []
-        for step_idx, v_ref in zip(target_steps, v_refs):
-            x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C] (navit bs=1)
-            sigma = schedule[step_idx]
-            v_theta = self.stage.predict_velocity_at(forward_kwargs, sample=x_t, sigma=sigma, params=self.params)
-            policy_velocities.append(v_theta)
+        policy_velocities = self._predict_velocities_at(
+            forward_kwargs,
+            samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+            sigmas=[schedule[step_idx] for step_idx in target_steps],
+        )
 
         mse = self._velocity_mse(
             policy_velocities=policy_velocities,

@@ -9,6 +9,9 @@ two facts to UniRL's shared diffusion runtime — and nothing more:
 - :func:`forward_flow`           grad-capable velocity via the pristine
                                  ``Bagel._forward_flow`` (bypasses ``@torch.no_grad``
                                  through ``functools.wraps``' ``__wrapped__``).
+- :func:`forward_flow_many`      exact CFG=1 velocities for several independent
+                                 diffusion steps, traversed layer-major so one
+                                 wrapped decoder block serves every step.
 - :func:`disable_inference_cache` turns off TaylorSeer (per-step determinism for replay).
 
 AR (text-out) adapters — same philosophy, for ``BagelARStage``:
@@ -77,6 +80,7 @@ __all__ = [
     "detach_replay_tree",
     "disable_inference_cache",
     "forward_flow",
+    "forward_flow_many",
     "init_und_context",
     "install_layer_major_replay_dispatch",
     "move_replay_tree",
@@ -124,13 +128,38 @@ def validate_t2ti_replay_execution_order(order: Any) -> str:
 
 
 def _layer_major_replay_forward_dispatch(self: Any, *args: Any, **kwargs: Any) -> Any:
-    """Enter one wrapped decoder block and replay all native chunks inside it."""
+    """Enter one wrapped decoder block for one exact replay or flow stream set."""
     replay_chunks = kwargs.pop("_unirl_exact_replay_chunks", None)
-    if replay_chunks is None:
+    flow_streams = kwargs.pop("_unirl_exact_flow_streams", None)
+    require(
+        replay_chunks is None or flow_streams is None,
+        "BAGEL layer-major dispatch accepts only one exact replay mode per call.",
+    )
+    if replay_chunks is None and flow_streams is None:
         return self._unirl_original_forward(*args, **kwargs)
 
     require(not args, "BAGEL layer-major replay accepts keyword inputs only.")
     require(not bool(self.training), "BAGEL layer-major replay requires decoder layers in eval mode.")
+    if flow_streams is not None:
+        require(not kwargs, f"BAGEL layer-major flow received unexpected inputs: {sorted(kwargs)}.")
+        require(len(flow_streams) >= 2, "BAGEL layer-major flow requires at least two streams.")
+        outputs: List[Tuple[torch.Tensor, Any]] = []
+        for stream in flow_streams:
+            require(isinstance(stream, dict), "BAGEL layer-major flow streams must be dictionaries.")
+            stream_kwargs = dict(stream)
+            require(
+                stream_kwargs.get("update_past_key_values") is False,
+                "BAGEL layer-major flow requires read-only KV caches.",
+            )
+            require(stream_kwargs.get("mode") == "gen", "BAGEL layer-major flow requires gen mode.")
+            require(stream_kwargs.get("is_causal") is False, "BAGEL layer-major flow requires non-causal queries.")
+            input_cache = stream_kwargs.get("past_key_values")
+            require(input_cache is not None, "BAGEL layer-major flow requires a KV cache.")
+            hidden, cache = self.forward_inference(**stream_kwargs)
+            require(cache is input_cache, "BAGEL layer-major flow must not replace its read-only KV cache.")
+            outputs.append((hidden, cache))
+        return tuple(outputs)
+
     cache = kwargs.pop("past_key_values", None)
     require(cache is not None, "BAGEL layer-major replay requires a cache.")
     require(not kwargs, f"BAGEL layer-major replay received unexpected inputs: {sorted(kwargs)}.")
@@ -226,6 +255,186 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
         lm.eval()
     try:
         return _raw_forward_flow(model)(model, **kwargs)
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
+
+
+def _require_flow_many_geometry(
+    x_ts: Sequence[torch.Tensor],
+    timesteps: Sequence[torch.Tensor],
+    cfg_text_scales: Sequence[float],
+    cfg_img_scales: Sequence[float],
+) -> None:
+    """Validate the exact CFG=1 layer-major flow contract."""
+    stream_count = len(x_ts)
+    require(stream_count >= 2, "BAGEL forward_flow_many requires at least two streams.")
+    require(
+        len(timesteps) == len(cfg_text_scales) == len(cfg_img_scales) == stream_count,
+        "BAGEL forward_flow_many inputs must have the same stream count.",
+    )
+    require(
+        all(float(scale) == 1.0 for scale in cfg_text_scales) and all(float(scale) == 1.0 for scale in cfg_img_scales),
+        "BAGEL forward_flow_many currently supports CFG text/image scales exactly equal to 1.",
+    )
+    require(all(torch.is_tensor(x_t) for x_t in x_ts), "BAGEL forward_flow_many x_ts must be tensors.")
+    reference = x_ts[0]
+    require(reference.ndim == 2, "BAGEL forward_flow_many expects packed [seq, C] latent tensors.")
+    require(
+        all(
+            x_t.shape == reference.shape and x_t.dtype == reference.dtype and x_t.device == reference.device
+            for x_t in x_ts
+        ),
+        "BAGEL forward_flow_many requires equal latent shape, dtype, and device across streams.",
+    )
+    require(
+        len({bool(x_t.requires_grad) for x_t in x_ts}) == 1,
+        "BAGEL forward_flow_many does not allow mixed latent requires_grad states.",
+    )
+    for index, timestep in enumerate(timesteps):
+        require(torch.is_tensor(timestep), f"BAGEL forward_flow_many timestep {index} must be a tensor.")
+        require(
+            timestep.ndim == 1 and int(timestep.numel()) == int(reference.shape[0]),
+            f"BAGEL forward_flow_many timestep {index} must have one value per packed latent token.",
+        )
+        require(
+            timestep.device == reference.device,
+            f"BAGEL forward_flow_many timestep {index} must be on the latent device.",
+        )
+        require(
+            int(timestep.unique().numel()) == 1,
+            f"BAGEL forward_flow_many timestep {index} must contain one unique value.",
+        )
+
+
+def forward_flow_many(
+    model: Any,
+    *,
+    x_ts: Sequence[torch.Tensor],
+    timesteps: Sequence[torch.Tensor],
+    forward_kwargs: Dict[str, Any],
+    cfg_text_scales: Sequence[float],
+    cfg_img_scales: Sequence[float],
+) -> Tuple[torch.Tensor, ...]:
+    """Compute independent CFG=1 BAGEL velocities in one layer-major traversal.
+
+    This is the exact multi-step counterpart of :func:`forward_flow`. Every stream
+    retains BAGEL's native packed attention geometry and its own read-only KV-cache
+    view. Only the traversal order changes: instead of completing all decoder layers
+    for step 0 before step 1, each wrapped decoder layer processes every step while
+    its FSDP shard is resident. The special dispatch is permanent and falls through
+    for every ordinary model call.
+
+    CFG branches are intentionally excluded. A caller must fall back to serial
+    :func:`forward_flow` whenever either CFG scale is not exactly one.
+    """
+    x_ts = tuple(x_ts)
+    timesteps = tuple(timesteps)
+    cfg_text_scales = tuple(float(scale) for scale in cfg_text_scales)
+    cfg_img_scales = tuple(float(scale) for scale in cfg_img_scales)
+    _require_flow_many_geometry(x_ts, timesteps, cfg_text_scales, cfg_img_scales)
+
+    disable_inference_cache(model)
+    lm = model.language_model
+    lm_model = lm.model
+    require(
+        not bool(getattr(lm_model, "enable_taylorseer", False)),
+        "BAGEL forward_flow_many requires TaylorSeer to be disabled.",
+    )
+    layers = tuple(lm_model.layers)
+    require(bool(layers), "BAGEL forward_flow_many requires at least one decoder layer.")
+    require(
+        all(bool(getattr(layer, "_unirl_layer_major_replay_installed", False)) for layer in layers),
+        "BAGEL forward_flow_many requires the permanent layer-major dispatch on every decoder layer.",
+    )
+
+    required_keys = (
+        "packed_vae_token_indexes",
+        "packed_vae_position_ids",
+        "packed_text_ids",
+        "packed_text_indexes",
+        "packed_indexes",
+        "packed_position_ids",
+        "packed_seqlens",
+        "key_values_lens",
+        "past_key_values",
+        "packed_key_value_indexes",
+    )
+    missing = tuple(key for key in required_keys if key not in forward_kwargs)
+    require(not missing, f"BAGEL forward_flow_many missing forward inputs: {missing}.")
+
+    packed_vae_token_indexes = forward_kwargs["packed_vae_token_indexes"]
+    packed_vae_position_ids = forward_kwargs["packed_vae_position_ids"]
+    packed_text_ids = forward_kwargs["packed_text_ids"]
+    packed_text_indexes = forward_kwargs["packed_text_indexes"]
+    packed_indexes = forward_kwargs["packed_indexes"]
+    packed_position_ids = forward_kwargs["packed_position_ids"]
+    packed_seqlens = forward_kwargs["packed_seqlens"]
+    key_values_lens = forward_kwargs["key_values_lens"]
+    past_key_values = forward_kwargs["past_key_values"]
+    packed_key_value_indexes = forward_kwargs["packed_key_value_indexes"]
+
+    was_training = bool(lm.training)
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+    try:
+        require_inference_dispatch(model)
+        position_embeddings: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        hidden_streams: List[torch.Tensor] = []
+        for x_t, timestep in zip(x_ts, timesteps):
+            packed_text_embedding = lm_model.embed_tokens(packed_text_ids)
+            packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), model.hidden_size))
+            packed_sequence[packed_text_indexes] = packed_text_embedding
+            packed_pos_embed = model.latent_pos_embed(packed_vae_position_ids)
+            packed_timestep_embeds = model.time_embedder(timestep)
+            packed_latent = model.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+            if packed_latent.dtype != packed_sequence.dtype:
+                packed_latent = packed_latent.to(packed_sequence.dtype)
+            packed_sequence[packed_vae_token_indexes] = packed_latent
+            cos, sin = lm_model.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
+            position_embeddings.append((cos.squeeze(0), sin.squeeze(0)))
+            hidden_streams.append(packed_sequence)
+
+        extra_inputs: Dict[str, Any] = {}
+        if model.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+        caches: List[Any] = [past_key_values] * len(hidden_streams)
+        for layer in layers:
+            streams = tuple(
+                {
+                    "packed_query_sequence": hidden,
+                    "query_lens": packed_seqlens,
+                    "packed_query_position_embeddings": positions,
+                    "packed_query_indexes": packed_indexes,
+                    "past_key_values": cache,
+                    "key_values_lens": key_values_lens,
+                    "packed_key_value_indexes": packed_key_value_indexes,
+                    "update_past_key_values": False,
+                    "is_causal": False,
+                    **extra_inputs,
+                }
+                for hidden, positions, cache in zip(hidden_streams, position_embeddings, caches)
+            )
+            layer_outputs = layer(_unirl_exact_flow_streams=streams)
+            hidden_streams = [hidden for hidden, _cache in layer_outputs]
+            caches = [cache for _hidden, cache in layer_outputs]
+
+        velocities: List[torch.Tensor] = []
+        for hidden in hidden_streams:
+            if lm_model.use_moe:
+                normalized = torch.zeros_like(hidden)
+                normalized[packed_text_indexes] = lm_model.norm(hidden[packed_text_indexes])
+                normalized[packed_vae_token_indexes] = lm_model.norm_moe_gen(hidden[packed_vae_token_indexes])
+                hidden = normalized
+            else:
+                hidden = lm_model.norm(hidden)
+            velocities.append(model.llm2vae(hidden)[packed_vae_token_indexes])
+        return tuple(velocities)
     finally:
         if was_training and not grad_enabled:
             lm.train()

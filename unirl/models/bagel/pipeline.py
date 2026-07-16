@@ -109,6 +109,7 @@ class BagelPipeline(Pipeline):
         replay_mode: str = "train",
         t2ti_replay_chunk_mode: str = "exact",
         t2ti_replay_execution_order: str = "chunk_major",
+        t2ti_flow_many_enabled: bool = False,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
     ) -> None:
@@ -125,6 +126,7 @@ class BagelPipeline(Pipeline):
                 logprob_precision=logprob_precision,
                 t2ti_replay_chunk_mode=t2ti_replay_chunk_mode,
                 t2ti_replay_execution_order=t2ti_replay_execution_order,
+                t2ti_flow_many_enabled=t2ti_flow_many_enabled,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
