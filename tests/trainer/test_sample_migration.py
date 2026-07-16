@@ -210,6 +210,72 @@ def test_ar_evaluate_runs_all_batches_under_one_wake_sync_boundary() -> None:
     assert trainer.wandb_logger.logged == (5, {"acc": 2.0, "reward": 2.0})
 
 
+def test_ar_evaluate_pads_ragged_tail_without_counting_replicas(caplog) -> None:
+    caplog.set_level("INFO", logger="unirl.trainer.ar")
+    trainer = ARTrainer.__new__(ARTrainer)
+    trainer.sampling_params = {"ar": ARSamplingParams(samples_per_prompt=1)}
+    trainer.eval_samples_per_prompt = 2
+    trainer.eval_temperature = 0.5
+    trainer.eval_batch_size = 8
+    trainer.eval_num_prompts = 60
+
+    final_batch = RolloutInputs(
+        primitives={"text": Texts(texts=[f"prompt-{i}" for i in range(4)])},
+        sample_ids=[f"sample-{i}" for i in range(4)],
+        group_ids=[f"prompt-{i}" for i in range(4)],
+    )
+
+    class _DataSource:
+        def iter_eval_batches(self, batch_size: int, *, eval_num_prompts: int):
+            assert batch_size == 8
+            assert eval_num_prompts == 60
+            yield final_batch
+
+    class _Rollout:
+        dp_size = 8
+        dispatched: Sample | None = None
+
+        def wake_up(self) -> None:
+            pass
+
+        def sleep(self) -> None:
+            pass
+
+        def generate(self, sample: Sample) -> Sample:
+            self.dispatched = sample
+            n = sample.parts[-1].batch_size
+            return sample.with_filled_frontier(primitives={"text": Texts(texts=["answer"] * n)})
+
+    class _Logger:
+        logged = None
+
+        def log_eval(self, step: int, metrics) -> None:
+            self.logged = (step, metrics)
+
+    trainer.data_source = _DataSource()
+    trainer.rollout = _Rollout()
+    trainer.weight_sync = None
+    # Four real roots * two outputs score 1. Padding contributes eight 100s;
+    # including it would produce 50.5 instead of 1.0.
+    trainer.reward = _FixedReward([1.0] * 8 + [100.0] * 8)
+    trainer.reward.dp_size = 8
+    trainer.wandb_logger = _Logger()
+
+    accuracy = trainer.evaluate(rollout_id=2)
+
+    assert accuracy == 1.0
+    assert trainer.wandb_logger.logged == (3, {"acc": 1.0, "reward": 1.0})
+    dispatched = trainer.rollout.dispatched
+    assert dispatched is not None
+    assert dispatched.batch_size == 8
+    root_ids = dispatched.parts[0].sample_ids
+    assert len(set(root_ids)) == 8
+    assert root_ids[:4] == [f"r2:sample-{i}" for i in range(4)]
+    assert all("eval-pad" in sample_id for sample_id in root_ids[4:])
+    assert trainer.reward.inputs[0].batch_size == 8
+    assert "over 4 prompts" in caplog.text
+
+
 def test_unified_m1_copies_ar_advantages_to_image_part() -> None:
     ar_params = ARSamplingParams(samples_per_prompt=2)
     diffusion_params = DiffusionSamplingParams(samples_per_prompt=1)

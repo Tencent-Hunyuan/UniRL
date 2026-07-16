@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 import time
 from typing import Dict, Optional, Tuple
 
@@ -243,14 +244,25 @@ class ARTrainer(BaseTrainer):
             if self.weight_sync is not None:
                 self.weight_sync.sync()
             for eval_inputs in eval_batches:
+                real_prompt_n = len(eval_inputs.sample_ids)
                 batch_n += 1
-                prompt_n += len(eval_inputs.sample_ids)
-                sample = self._build_request_sample(eval_inputs, rollout_id, sampling=eval_sp)
+                prompt_n += real_prompt_n
+                dispatch_inputs = self._pad_eval_inputs(eval_inputs)
+                sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
                 generated = self.rollout.generate(sample)
                 scored = self.reward.score_and_attach(generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     rewards = hydrate(rewards).to(torch.float32)
+                    fanout = total_samples_per_prompt(eval_sp)
+                    expected_total = len(dispatch_inputs.sample_ids) * fanout
+                    if int(rewards.numel()) != expected_total:
+                        raise RuntimeError(
+                            f"ARTrainer.evaluate: reward count {int(rewards.numel())} != "
+                            f"dispatch prompts {len(dispatch_inputs.sample_ids)} * fanout {fanout} "
+                            f"({expected_total})."
+                        )
+                    rewards = rewards[: real_prompt_n * fanout]
                     reward_sum += float(rewards.sum().item())
                     reward_n += int(rewards.numel())
         finally:
@@ -270,6 +282,46 @@ class ARTrainer(BaseTrainer):
         # so this run shares the eval/reward axis with the other trainers.
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
+
+    def _pad_eval_inputs(self, inputs: RolloutInputs) -> RolloutInputs:
+        """Append replicated prompt rows until rollout and reward DP can shard.
+
+        Evaluation still reports only the original rows; the replicas exist solely
+        to satisfy ``DP_SCATTER``. Their ids are rewritten because Sample lineage
+        requires distinct root ids within one request.
+        """
+        n = len(inputs.sample_ids)
+        if n == 0:
+            return inputs
+        rollout_dp = max(1, int(getattr(self.rollout, "dp_size", 1)))
+        reward_dp = max(1, int(getattr(self.reward, "dp_size", 1)))
+        multiple = math.lcm(rollout_dp, reward_dp)
+        pad_n = (-n) % multiple
+        if pad_n == 0:
+            return inputs
+
+        pad = inputs.select(torch.full((pad_n,), n - 1, dtype=torch.long))
+        used_sample_ids = set(inputs.sample_ids)
+        padded_sample_ids = []
+        for i in range(pad_n):
+            candidate = f"{inputs.sample_ids[-1]}:eval-pad:{i}"
+            while candidate in used_sample_ids:
+                candidate += ":pad"
+            used_sample_ids.add(candidate)
+            padded_sample_ids.append(candidate)
+        pad.sample_ids = padded_sample_ids
+
+        if inputs.group_ids:
+            used_group_ids = set(inputs.group_ids)
+            padded_group_ids = []
+            for i in range(pad_n):
+                candidate = f"{inputs.group_ids[-1]}:eval-pad:{i}"
+                while candidate in used_group_ids:
+                    candidate += ":pad"
+                used_group_ids.add(candidate)
+                padded_group_ids.append(candidate)
+            pad.group_ids = padded_group_ids
+        return inputs.concat_with(pad)
 
     def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
         """Debug dump of the first N (prompt, output, reward) triples per rollout.
