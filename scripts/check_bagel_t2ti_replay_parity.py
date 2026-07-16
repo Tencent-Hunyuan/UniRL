@@ -8,9 +8,11 @@ import gc
 import json
 import math
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import torch
 
@@ -40,6 +42,29 @@ class ModeResult:
     peak_gib: float
 
 
+@contextmanager
+def _flash_attention_backward_mode(*, deterministic: bool) -> Iterator[None]:
+    """Make the parity gradient reproducible without changing training kernels."""
+    if not deterministic:
+        yield
+        return
+
+    from unirl.models.bagel.vendor.modeling.bagel import qwen2_navit
+
+    original = qwen2_navit.flash_attn_varlen_func
+
+    @wraps(original)
+    def deterministic_flash_attention(*args, **kwargs):
+        kwargs["deterministic"] = True
+        return original(*args, **kwargs)
+
+    qwen2_navit.flash_attn_varlen_func = deterministic_flash_attention
+    try:
+        yield
+    finally:
+        qwen2_navit.flash_attn_varlen_func = original
+
+
 def _metrics(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -> TensorMetrics:
     if len(left) != len(right):
         raise RuntimeError(f"tensor list length mismatch: {len(left)} != {len(right)}")
@@ -64,6 +89,10 @@ def _metrics(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -> Ten
         rel_l2=math.sqrt(diff_sq / max(left_sq, 1.0e-30)),
         cosine=dot / max(math.sqrt(left_sq * right_sq), 1.0e-30),
     )
+
+
+def _tensor_lists_equal(left: Sequence[torch.Tensor], right: Sequence[torch.Tensor]) -> bool:
+    return len(left) == len(right) and all(torch.equal(lhs, rhs) for lhs, rhs in zip(left, right))
 
 
 def _load_spec(path: Path, sample_index: int) -> BagelThinkKVReplaySpec:
@@ -250,6 +279,11 @@ def main() -> None:
         choices=("chunk_major", "layer_major"),
         default="chunk_major",
     )
+    parser.add_argument(
+        "--deterministic-flash-attn-backward",
+        action="store_true",
+        help="use FlashAttention's deterministic backward for parity measurement only",
+    )
     parser.add_argument("--max-cache-rel-l2", type=float, default=5.0e-3)
     parser.add_argument("--min-cache-cosine", type=float, default=0.9999)
     parser.add_argument("--max-velocity-rel-l2", type=float, default=5.0e-3)
@@ -275,33 +309,74 @@ def main() -> None:
     )
     bundle.model.requires_grad_(False)
     selected = _select_gradient_parameters(bundle.model)
-    reference = _run_mode(
-        bundle,
-        spec,
-        selected,
-        chunk_mode=args.reference_chunk_mode,
-        execution_order=args.reference_execution_order,
-        fixed_sample=None,
-        fixed_prev_sample=None,
-        device=device,
-    )
-    candidate = _run_mode(
-        bundle,
-        spec,
-        selected,
-        chunk_mode=args.candidate_chunk_mode,
-        execution_order=args.candidate_execution_order,
-        fixed_sample=reference.input_sample,
-        fixed_prev_sample=reference.prev_sample,
-        device=device,
-    )
+    with _flash_attention_backward_mode(deterministic=args.deterministic_flash_attn_backward):
+        reference = _run_mode(
+            bundle,
+            spec,
+            selected,
+            chunk_mode=args.reference_chunk_mode,
+            execution_order=args.reference_execution_order,
+            fixed_sample=None,
+            fixed_prev_sample=None,
+            device=device,
+        )
+        control = (
+            _run_mode(
+                bundle,
+                spec,
+                selected,
+                chunk_mode=args.reference_chunk_mode,
+                execution_order=args.reference_execution_order,
+                fixed_sample=reference.input_sample,
+                fixed_prev_sample=reference.prev_sample,
+                device=device,
+            )
+            if args.deterministic_flash_attn_backward
+            else None
+        )
+        candidate = _run_mode(
+            bundle,
+            spec,
+            selected,
+            chunk_mode=args.candidate_chunk_mode,
+            execution_order=args.candidate_execution_order,
+            fixed_sample=reference.input_sample,
+            fixed_prev_sample=reference.prev_sample,
+            device=device,
+        )
 
     cache_metrics = _metrics(reference.cache, candidate.cache)
     velocity_metrics = _metrics([reference.velocity], [candidate.velocity])
     mean_metrics = _metrics([reference.transition_mean], [candidate.transition_mean])
     gradient_metrics = _metrics(reference.gradients, candidate.gradients)
     log_prob_abs = float((reference.log_prob - candidate.log_prob).abs().item())
-    passed = (
+    control_valid = True
+    control_result = None
+    if control is not None:
+        control_cache_metrics = _metrics(reference.cache, control.cache)
+        control_velocity_metrics = _metrics([reference.velocity], [control.velocity])
+        control_mean_metrics = _metrics([reference.transition_mean], [control.transition_mean])
+        control_gradient_metrics = _metrics(reference.gradients, control.gradients)
+        control_log_prob_abs = float((reference.log_prob - control.log_prob).abs().item())
+        control_valid = (
+            _tensor_lists_equal(reference.cache, control.cache)
+            and torch.equal(reference.velocity, control.velocity)
+            and torch.equal(reference.transition_mean, control.transition_mean)
+            and torch.equal(reference.log_prob, control.log_prob)
+            and _tensor_lists_equal(reference.gradients, control.gradients)
+        )
+        control_result = {
+            "valid": control_valid,
+            "seconds": control.seconds,
+            "peak_gib": control.peak_gib,
+            "cache": asdict(control_cache_metrics),
+            "velocity": asdict(control_velocity_metrics),
+            "transition_mean": asdict(control_mean_metrics),
+            "log_prob_abs": control_log_prob_abs,
+            "decoder_gradients": asdict(control_gradient_metrics),
+        }
+
+    passed = control_valid and (
         cache_metrics.rel_l2 <= args.max_cache_rel_l2
         and cache_metrics.cosine >= args.min_cache_cosine
         and velocity_metrics.rel_l2 <= args.max_velocity_rel_l2
@@ -314,6 +389,8 @@ def main() -> None:
     )
     result = {
         "passed": passed,
+        "deterministic_flash_attn_backward": args.deterministic_flash_attn_backward,
+        "determinism_control": control_result,
         "captured_tokens": spec.kv_length,
         "captured_chunks": len(spec.chunks()),
         "reference": {
