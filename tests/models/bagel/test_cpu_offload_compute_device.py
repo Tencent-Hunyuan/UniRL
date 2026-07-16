@@ -12,6 +12,7 @@ from unirl.algorithms.bagel_flow_unigrpo import BagelFlowUniGRPO
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.models.bagel.ar import BagelARStage
 from unirl.models.bagel.conditions import BagelARConditions
+from unirl.models.bagel.diffusion import BagelDiffusionStage
 from unirl.models.bagel.rl_ops import prefill_prompt_text
 from unirl.models.types.replay_result import ReplayResult
 from unirl.types.segments import TextSegment, make_image_segment
@@ -25,6 +26,8 @@ class _BoundaryTransformer(nn.Module):
 
 
 class _BoundaryStage:
+    detach_forward_kwargs = staticmethod(BagelDiffusionStage.detach_forward_kwargs)
+
     def __init__(self, transformer: _BoundaryTransformer) -> None:
         self.model = SimpleNamespace(device=torch.device("cpu"), transformer=transformer)
         self.context_builds = 0
@@ -37,6 +40,8 @@ class _BoundaryStage:
     def build_forward_kwargs(self, conditions, *, params, device):
         del params, device
         self.context_builds += 1
+        if "forward_kwargs" in conditions:
+            return conditions["forward_kwargs"]
         scale = float(conditions.get("context_scale", 1.0))
         return {"context": self.model.transformer.context_weight * scale}
 
@@ -295,6 +300,98 @@ def test_stage_boundary_fused_ratio_mse_matches_separate_backward() -> None:
     assert fused_stage.replay_calls == separate_stage.replay_calls == 1
     assert fused_stage.predict_calls == 0
     assert separate_stage.predict_calls == 1
+
+
+def test_stage_boundary_detaches_all_retained_forward_tree_leaves() -> None:
+    class Cache:
+        def __init__(self) -> None:
+            self.key_cache = {0: None}
+            self.value_cache = {0: None}
+
+        def fork(self):
+            cache = type(self)()
+            cache.key_cache = self.key_cache.copy()
+            cache.value_cache = self.value_cache.copy()
+            return cache
+
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+    attached_context = transformer.context_weight * 1.5
+    attached_cache_value = transformer.context_weight.square().reshape(1)
+    cache = Cache()
+    cache.key_cache[0] = attached_cache_value
+    cache.value_cache[0] = attached_cache_value
+    forward_kwargs = {
+        "context": attached_context,
+        "past_key_values": cache,
+        "cfg_img_past_key_values": cache,
+    }
+    segment = _boundary_segment()
+    micro_batches = [({"forward_kwargs": forward_kwargs}, segment, torch.ones(1))]
+
+    algorithm.prepare_update_batch(
+        micro_batches=micro_batches,
+        training_progress=0.25,
+        loss_scale=1.0,
+    )
+    retained = algorithm._prepared_mse_batches[0].forward_kwargs
+
+    assert retained is not forward_kwargs
+    assert retained["context"].data_ptr() == attached_context.data_ptr()
+    assert not retained["context"].requires_grad
+    assert retained["past_key_values"] is retained["cfg_img_past_key_values"]
+    assert retained["past_key_values"] is not cache
+    assert retained["past_key_values"].key_cache[0].data_ptr() == attached_cache_value.data_ptr()
+    assert not retained["past_key_values"].key_cache[0].requires_grad
+    assert attached_context.requires_grad
+    assert attached_cache_value.requires_grad
+
+    result = algorithm.compute_loss_and_backward(
+        conditions=micro_batches[0][0],
+        segment=segment,
+        advantages=micro_batches[0][2],
+        training_progress=0.25,
+        loss_scale=1.0,
+    )
+
+    assert result.has_backward
+    assert transformer.context_weight.grad is None
+    assert transformer.policy_weight.grad is not None
+
+
+def test_stage_boundary_rejects_broadcastable_velocity_shapes() -> None:
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"shape mismatch at SDE step 0: policy=\(1, 1\), reference=\(1,\)",
+    ):
+        algorithm._stage_boundary_loss_and_backward(
+            segment=_boundary_segment(),
+            advantages=torch.ones(1),
+            training_progress=0.25,
+            loss_scale=1.0,
+            forward_kwargs={"context": transformer.context_weight.detach() * 1.5},
+            target_steps=[0],
+            reference_velocities=[torch.tensor([0.15], dtype=torch.float32)],
+        )
+
+    assert transformer.policy_weight.grad is None
 
 
 def test_stage_boundary_reuses_prepared_context_and_refreshes_next_update() -> None:

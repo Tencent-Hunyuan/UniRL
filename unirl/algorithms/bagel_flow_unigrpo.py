@@ -417,6 +417,10 @@ class BagelFlowUniGRPO(FlowGRPO):
             else:
                 with torch.no_grad():
                     forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            if self.context_gradient_mode == "stage_boundary":
+                # no_grad prevents new graph construction, but does not detach
+                # graph-bearing leaves supplied by an existing replay tree.
+                forward_kwargs = self.stage.detach_forward_kwargs(forward_kwargs)
             pending.append((index, segment, target_steps, forward_kwargs, device, surrogate_result))
 
         if pending:
@@ -508,6 +512,7 @@ class BagelFlowUniGRPO(FlowGRPO):
                         params=self.params,
                         device=device,
                     )
+                boundary_forward_kwargs = self.stage.detach_forward_kwargs(boundary_forward_kwargs)
 
         if needs_boundary_context:
             if not target_steps or segment.sigmas is None:
@@ -628,14 +633,18 @@ class BagelFlowUniGRPO(FlowGRPO):
             if full_ft_ref and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        mse_terms: List[torch.Tensor] = []
+        policy_velocities: List[torch.Tensor] = []
         for step_idx, v_ref in zip(target_steps, v_refs):
             x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C] (navit bs=1)
             sigma = schedule[step_idx]
             v_theta = self.stage.predict_velocity_at(forward_kwargs, sample=x_t, sigma=sigma, params=self.params)
-            mse_terms.append(((v_theta - v_ref) ** 2).mean())
+            policy_velocities.append(v_theta)
 
-        mse = torch.stack(mse_terms).mean()
+        mse = self._velocity_mse(
+            policy_velocities=policy_velocities,
+            reference_velocities=v_refs,
+            target_steps=target_steps,
+        )
         (self.mse_weight * mse * loss_scale).backward()
 
         mse_val = float(mse.detach().item())
@@ -649,6 +658,31 @@ class BagelFlowUniGRPO(FlowGRPO):
     # ------------------------------------------------------------------
     # GRPO-Guard RatioNorm surrogate
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _velocity_mse(
+        *,
+        policy_velocities: Sequence[torch.Tensor],
+        reference_velocities: Sequence[torch.Tensor],
+        target_steps: Sequence[int],
+    ) -> torch.Tensor:
+        """Compute velocity MSE after validating one exact-shaped pair per step."""
+        if len(policy_velocities) != len(reference_velocities) or len(policy_velocities) != len(target_steps):
+            raise RuntimeError(
+                "BAGEL velocity MSE count mismatch: "
+                f"policy={len(policy_velocities)}, reference={len(reference_velocities)}, "
+                f"steps={len(target_steps)}."
+            )
+        terms: List[torch.Tensor] = []
+        for step_idx, v_theta, v_ref in zip(target_steps, policy_velocities, reference_velocities):
+            if v_theta.shape != v_ref.shape:
+                raise RuntimeError(
+                    f"BAGEL velocity MSE shape mismatch at SDE step {int(step_idx)}: "
+                    f"policy={tuple(v_theta.shape)}, reference={tuple(v_ref.shape)}. "
+                    "Exact shape equality is required; broadcasting is not supported."
+                )
+            terms.append(((v_theta - v_ref) ** 2).mean())
+        return torch.stack(terms).mean()
 
     def _stage_boundary_loss_and_backward(
         self,
@@ -680,15 +714,11 @@ class BagelFlowUniGRPO(FlowGRPO):
         if self.mse_weight > 0.0:
             if reference_velocities is None:
                 raise RuntimeError("Stage-boundary velocity MSE requires prepared reference velocities.")
-            if len(policy_velocities) != len(reference_velocities) or len(policy_velocities) != len(target_steps):
-                raise RuntimeError(
-                    "Stage-boundary replay/reference velocity count mismatch: "
-                    f"policy={len(policy_velocities)}, reference={len(reference_velocities)}, "
-                    f"steps={len(target_steps)}."
-                )
-            mse = torch.stack(
-                [((v_theta - v_ref) ** 2).mean() for v_theta, v_ref in zip(policy_velocities, reference_velocities)]
-            ).mean()
+            mse = self._velocity_mse(
+                policy_velocities=policy_velocities,
+                reference_velocities=reference_velocities,
+                target_steps=target_steps,
+            )
 
         total_loss = policy_loss if mse is None else policy_loss + self.mse_weight * mse
         (total_loss * loss_scale).backward()

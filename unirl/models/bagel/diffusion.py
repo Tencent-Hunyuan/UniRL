@@ -629,7 +629,12 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
             params=params,
             step_indices=step_indices,
         )
-        return result, rl_ops.detach_replay_tree(forward_kwargs)
+        return result, self.detach_forward_kwargs(forward_kwargs)
+
+    @staticmethod
+    def detach_forward_kwargs(forward_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a graph-free BAGEL replay tree without cloning tensor storage."""
+        return rl_ops.detach_replay_tree(forward_kwargs)
 
     def replay_from_forward_kwargs(
         self,
