@@ -946,6 +946,31 @@ def test_unigrpo_full_ft_reference_survives_checkpoint_resume(tmp_path: Path) ->
     assert torch.equal(resumed_model.bias, torch.full_like(resumed_model.bias, 4.0))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the reference-placement contract.")
+def test_unigrpo_fresh_full_ft_reference_stays_on_cpu() -> None:
+    transformer = nn.Linear(2, 2, device="cuda")
+    with torch.no_grad():
+        transformer.weight.fill_(1.0)
+        transformer.bias.fill_(2.0)
+    stage = SimpleNamespace(model=SimpleNamespace(transformer=transformer))
+    algorithm = BagelFlowUniGRPO(params=object(), stage=stage, mse_weight=1.0)
+
+    with algorithm._reference_weights(transformer):
+        pass
+
+    assert algorithm._ref_snapshot is not None
+    assert all(tensor.device.type == "cpu" for tensor in algorithm._ref_snapshot.values())
+    with torch.no_grad():
+        transformer.weight.fill_(3.0)
+        transformer.bias.fill_(4.0)
+
+    with algorithm._reference_weights(transformer):
+        assert torch.equal(transformer.weight, torch.ones_like(transformer.weight))
+        assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 2.0))
+    assert torch.equal(transformer.weight, torch.full_like(transformer.weight, 3.0))
+    assert torch.equal(transformer.bias, torch.full_like(transformer.bias, 4.0))
+
+
 def test_unigrpo_rejects_bad_reference_without_mutating_live_weights() -> None:
     transformer = nn.Linear(2, 2)
     stage = SimpleNamespace(model=SimpleNamespace(transformer=transformer))

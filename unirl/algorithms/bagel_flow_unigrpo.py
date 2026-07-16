@@ -320,9 +320,10 @@ class BagelFlowUniGRPO(FlowGRPO):
         the first optimizer step) **at this swap site** — the same shard state every
         subsequent step sees, so the copy sizes always match (a pre-loop snapshot would be
         sharded while the swap site, right after the v_theta forward, is unsharded → size
-        mismatch). Stored as bf16 (the forward computes in bf16; halves the ~3.5→1.75
-        GiB/GPU footprint) keyed by stable parameter name. A resumed run loads
-        that same snapshot from the checkpoint instead of recapturing tuned weights.
+        mismatch). Stored as bf16 on CPU, keyed by stable parameter name. Keeping
+        this immutable reference off device removes a model-sized persistent GPU
+        allocation without moving live FSDP parameters or shards; a resumed run
+        already loads the same CPU representation from its checkpoint.
 
         Per scope: stash each live local shard, copy the base in (cast to the live fp32
         master dtype), run the no-grad v_ref forward(s), then copy the trained weights back
@@ -343,7 +344,8 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         if self._ref_snapshot is None:
             self._ref_snapshot = {
-                name: local_view(param).detach().to(dtype=torch.bfloat16).clone() for name, param in live
+                name: local_view(param).detach().to(device="cpu", dtype=torch.bfloat16).clone()
+                for name, param in live
             }
 
         prepared: List[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
