@@ -65,7 +65,12 @@ from unirl.types.segments.text import TextSegment
 from .ar import BagelARStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage
-from .rl_ops import _to_device, prefill_prompt_text, validate_t2ti_replay_chunk_mode
+from .rl_ops import (
+    _to_device,
+    prefill_prompt_text,
+    validate_t2ti_replay_chunk_mode,
+    validate_t2ti_replay_execution_order,
+)
 from .vae import BagelVAEDecodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
@@ -103,12 +108,14 @@ class BagelPipeline(Pipeline):
         shift: float = 3.0,
         replay_mode: str = "train",
         t2ti_replay_chunk_mode: str = "exact",
+        t2ti_replay_execution_order: str = "chunk_major",
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
         t2ti_replay_chunk_mode = validate_t2ti_replay_chunk_mode(t2ti_replay_chunk_mode)
+        t2ti_replay_execution_order = validate_t2ti_replay_execution_order(t2ti_replay_execution_order)
         if diffusion is None:
             diffusion = BagelDiffusionStage(
                 model=bundle,
@@ -117,6 +124,7 @@ class BagelPipeline(Pipeline):
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
                 t2ti_replay_chunk_mode=t2ti_replay_chunk_mode,
+                t2ti_replay_execution_order=t2ti_replay_execution_order,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)

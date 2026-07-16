@@ -249,7 +249,12 @@ class UnifiedModelTrainStack(Remote):
                 # during the preceding AR backward, and every reference swap is
                 # complete before its own activation-checkpointed graph exists.
                 if algorithm.prepares_update_batch:
-                    self._prepare_update_batch(name, tracks[name], slices_by_track[name])
+                    self._prepare_update_batch(
+                        name,
+                        tracks[name],
+                        slices_by_track[name],
+                        training_progress=training_progress,
+                    )
                 partial, has_backward = self._backward_track(
                     name, tracks[name], slices_by_track[name], training_progress=training_progress
                 )
@@ -292,8 +297,12 @@ class UnifiedModelTrainStack(Remote):
         name: str,
         track: RolloutTrack,
         micro_slices: List[Tuple[int, int]],
+        *,
+        training_progress: float,
     ) -> None:
         """Run one algorithm's detached preparation at update geometry."""
+        algorithm = self.algorithms[name]
+        phased = bool(getattr(algorithm, "prepares_phased_update_batch", False))
         micro_batches = []
         for start, end in micro_slices:
             micro = track.slice(start, end)
@@ -302,8 +311,23 @@ class UnifiedModelTrainStack(Remote):
                     f"UnifiedModelTrainStack._prepare_update_batch: track {name!r} "
                     "produced a micro-batch with segment=None."
                 )
-            micro_batches.append((micro.conditions, micro.segment))
-        self.algorithms[name].prepare_update_batch(micro_batches=micro_batches)
+            if phased and micro.advantages is None:
+                raise RuntimeError(
+                    f"UnifiedModelTrainStack._prepare_update_batch: track {name!r} "
+                    "produced a micro-batch with advantages=None."
+                )
+            if phased:
+                micro_batches.append((micro.conditions, micro.segment, micro.advantages))
+            else:
+                micro_batches.append((micro.conditions, micro.segment))
+        if phased:
+            algorithm.prepare_update_batch(
+                micro_batches=micro_batches,
+                training_progress=float(training_progress),
+                loss_scale=1.0 / len(micro_slices),
+            )
+        else:
+            algorithm.prepare_update_batch(micro_batches=micro_batches)
 
     def on_rollout_end(self) -> None:
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""

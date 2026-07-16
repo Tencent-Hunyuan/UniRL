@@ -63,6 +63,7 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
+from types import MethodType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -73,15 +74,18 @@ from unirl.config.require import require
 
 __all__ = [
     "decode_text",
+    "detach_replay_tree",
     "disable_inference_cache",
     "forward_flow",
     "init_und_context",
+    "install_layer_major_replay_dispatch",
     "pack_und_forward_inputs",
     "prefill_prompt_text",
     "prefill_text_split",
     "prefill_vit_split",
     "rebuild_text_context_from_chunks",
     "validate_t2ti_replay_chunk_mode",
+    "validate_t2ti_replay_execution_order",
     "require_inference_dispatch",
     "score_response",
     "score_response_with_prompt",
@@ -90,6 +94,7 @@ __all__ = [
 
 
 T2TI_REPLAY_CHUNK_MODES = ("exact", "collapsed")
+T2TI_REPLAY_EXECUTION_ORDERS = ("chunk_major", "layer_major")
 
 
 def validate_t2ti_replay_chunk_mode(mode: Any) -> str:
@@ -105,6 +110,59 @@ def validate_t2ti_replay_chunk_mode(mode: Any) -> str:
         f"Bagel T2TI replay chunk mode must be one of {T2TI_REPLAY_CHUNK_MODES}; got {mode!r}.",
     )
     return normalized
+
+
+def validate_t2ti_replay_execution_order(order: Any) -> str:
+    """Validate how the exact chunk/layer replay DAG is traversed."""
+    normalized = str(order).strip().lower()
+    require(
+        normalized in T2TI_REPLAY_EXECUTION_ORDERS,
+        f"Bagel T2TI replay execution order must be one of {T2TI_REPLAY_EXECUTION_ORDERS}; got {order!r}.",
+    )
+    return normalized
+
+
+def _layer_major_replay_forward_dispatch(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """Enter one wrapped decoder block and replay all native chunks inside it."""
+    replay_chunks = kwargs.pop("_unirl_exact_replay_chunks", None)
+    if replay_chunks is None:
+        return self._unirl_original_forward(*args, **kwargs)
+
+    require(not args, "BAGEL layer-major replay accepts keyword inputs only.")
+    require(not bool(self.training), "BAGEL layer-major replay requires decoder layers in eval mode.")
+    cache = kwargs.pop("past_key_values", None)
+    require(cache is not None, "BAGEL layer-major replay requires a cache.")
+    require(not kwargs, f"BAGEL layer-major replay received unexpected inputs: {sorted(kwargs)}.")
+    outputs: List[torch.Tensor] = []
+    for chunk in replay_chunks:
+        hidden, cache = self.forward_inference(past_key_values=cache, **chunk)
+        outputs.append(hidden)
+    return tuple(outputs), cache
+
+
+def install_layer_major_replay_dispatch(model: Any) -> None:
+    """Install the replay dispatch before Accelerate/checkpoint/FSDP wrapping.
+
+    The permanent instance dispatch falls through to the pristine bound
+    ``forward`` for every normal BAGEL call. The special replay entry is still a
+    single ``decoder_layer(...)`` invocation, so composable checkpointing and
+    FSDP wrap the whole native-chunk loop and unshard each block only once.
+    """
+    try:
+        layers = tuple(model.language_model.model.layers)
+    except AttributeError as exc:
+        raise ValueError("BAGEL layer-major replay could not find language_model.model.layers.") from exc
+    require(bool(layers), "BAGEL layer-major replay requires at least one decoder layer.")
+    for layer in layers:
+        if bool(getattr(layer, "_unirl_layer_major_replay_installed", False)):
+            continue
+        require(
+            callable(getattr(layer, "forward_inference", None)),
+            f"BAGEL layer-major replay requires forward_inference on {type(layer).__name__}.",
+        )
+        layer._unirl_original_forward = layer.forward
+        layer.forward = MethodType(_layer_major_replay_forward_dispatch, layer)
+        layer._unirl_layer_major_replay_installed = True
 
 
 def disable_inference_cache(model: Any) -> None:
@@ -282,6 +340,70 @@ def prefill_text_split(
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
 
 
+def _rebuild_text_context_layer_major(
+    model: Any,
+    *,
+    replay_chunks: Sequence[Sequence[int]],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Traverse the exact chunk/layer replay DAG with one wrapped call per layer."""
+    lm_model = model.language_model.model
+    layers = tuple(lm_model.layers)
+    require(bool(layers), "BAGEL layer-major replay requires decoder layers.")
+    require(
+        not bool(getattr(lm_model, "enable_taylorseer", False)),
+        "BAGEL layer-major exact replay requires TaylorSeer to be disabled.",
+    )
+    require(
+        all(bool(getattr(layer, "_unirl_layer_major_replay_installed", False)) for layer in layers),
+        "BAGEL layer-major replay dispatch was not installed before checkpoint/FSDP wrapping.",
+    )
+
+    ctx = init_und_context(model)
+    kv_len = int(ctx["kv_lens"][0])
+    rope = int(ctx["ropes"][0])
+    hidden_states: List[torch.Tensor] = []
+    chunk_inputs: List[Dict[str, Any]] = []
+    for chunk in replay_chunks:
+        token_ids = torch.as_tensor(chunk, dtype=torch.long)
+        generation_input = _to_device(_pack_text_ids(token_ids, kv_len=kv_len, rope_start=rope), device)
+        hidden = lm_model.embed_tokens(generation_input["packed_text_ids"])
+        cos, sin = lm_model.rotary_emb(hidden, generation_input["packed_text_position_ids"].unsqueeze(0))
+        hidden_states.append(hidden)
+        chunk_inputs.append(
+            {
+                "query_lens": generation_input["text_token_lens"],
+                "packed_query_position_embeddings": (cos.squeeze(0), sin.squeeze(0)),
+                "packed_query_indexes": generation_input["packed_text_indexes"],
+                "key_values_lens": generation_input["key_values_lens"],
+                "packed_key_value_indexes": generation_input["packed_key_value_indexes"],
+                "update_past_key_values": True,
+                "is_causal": True,
+                "mode": "und",
+            }
+        )
+        token_count = int(token_ids.numel())
+        kv_len += token_count
+        rope += token_count
+
+    cache = ctx["past_key_values"]
+    for layer in layers:
+        per_chunk = tuple(
+            {**static_inputs, "packed_query_sequence": hidden}
+            for hidden, static_inputs in zip(hidden_states, chunk_inputs)
+        )
+        hidden_states, cache = layer(
+            _unirl_exact_replay_chunks=per_chunk,
+            past_key_values=cache,
+        )
+        require(
+            len(hidden_states) == len(replay_chunks),
+            "BAGEL layer-major replay returned the wrong number of chunk hidden states.",
+        )
+
+    return {"kv_lens": [kv_len], "ropes": [rope], "past_key_values": cache}
+
+
 def _distributed_replay_chunk_target(local_count: int, *, device: torch.device) -> int:
     """Return the largest exact-replay traversal count in the DP world.
 
@@ -319,6 +441,50 @@ def _fork_cache_last_token(cache: Any) -> Any:
         for layer_idx, value in source.items():
             destination[layer_idx] = None if value is None else value[-1:]
     return trimmed
+
+
+def detach_replay_tree(value: Any, _memo: Optional[Dict[int, Any]] = None) -> Any:
+    """Detach a BAGEL replay input tree while preserving cache aliasing.
+
+    ``forward_kwargs`` contains ordinary tensor leaves plus vendored
+    ``NaiveCache`` objects. PyTorch's pytree helpers do not know how to traverse
+    that cache, so handle its K/V stores explicitly and memoize object identities:
+    BAGEL intentionally aliases the positive ``gen`` and ``cfg_img`` caches.
+    Storage is shared with the completed replay; no model-sized clone is made.
+    """
+    memo = {} if _memo is None else _memo
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+    if torch.is_tensor(value):
+        detached = value.detach()
+        memo[object_id] = detached
+        return detached
+    if isinstance(value, dict):
+        detached_dict: Dict[Any, Any] = {}
+        memo[object_id] = detached_dict
+        detached_dict.update({key: detach_replay_tree(item, memo) for key, item in value.items()})
+        return detached_dict
+    if isinstance(value, list):
+        detached_list: List[Any] = []
+        memo[object_id] = detached_list
+        detached_list.extend(detach_replay_tree(item, memo) for item in value)
+        return detached_list
+    if isinstance(value, tuple):
+        detached_tuple = tuple(detach_replay_tree(item, memo) for item in value)
+        memo[object_id] = detached_tuple
+        return detached_tuple
+    if callable(getattr(value, "fork", None)) and hasattr(value, "key_cache") and hasattr(value, "value_cache"):
+        detached_cache = value.fork()
+        memo[object_id] = detached_cache
+        for store_name in ("key_cache", "value_cache"):
+            source = getattr(value, store_name)
+            destination = getattr(detached_cache, store_name)
+            for layer_idx, tensor in source.items():
+                destination[layer_idx] = detach_replay_tree(tensor, memo) if tensor is not None else None
+        return detached_cache
+    memo[object_id] = value
+    return value
 
 
 def _pad_text_context_traversals(
@@ -368,13 +534,17 @@ def rebuild_text_context_from_chunks(
     expected_ropes: Sequence[int],
     device: torch.device,
     chunk_mode: str = "exact",
+    execution_order: str = "chunk_major",
     collective_target_chunks: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Rebuild a grad-capable BAGEL context from native cache-input tokens.
 
     ``chunks`` are captured at the vLLM Stage-0 runner boundary, after prompt
-    tokenization and scheduling. ``chunk_mode="exact"`` preserves that native
-    prefill/decode call structure. The explicit ``"collapsed"`` fast path keeps
+    tokenization and scheduling. ``chunk_mode="exact"`` preserves every native
+    prefill/decode attention call. ``execution_order="layer_major"`` traverses
+    the same two-dimensional chunk/layer DAG in the alternate topological order,
+    entering each wrapped decoder block once while its parameters are resident.
+    The explicit ``"collapsed"`` fast path keeps
     the native initial prefill and sends the same ordered decode IDs through one
     causal update. No cache tensor crosses the rollout boundary; this function creates a fresh
     ``NaiveCache`` on the trainer and lets autograd connect every reconstructed K/V
@@ -390,6 +560,15 @@ def rebuild_text_context_from_chunks(
     restore it until backward has consumed any activation-checkpoint recomputation.
     """
     chunk_mode = validate_t2ti_replay_chunk_mode(chunk_mode)
+    execution_order = validate_t2ti_replay_execution_order(execution_order)
+    require(
+        chunk_mode == "exact" or execution_order == "chunk_major",
+        "BAGEL collapsed replay only supports chunk_major execution.",
+    )
+    require(
+        collective_target_chunks is None or execution_order == "chunk_major",
+        "BAGEL layer_major replay has no collective padding target.",
+    )
     require(bool(chunks), "rebuild_text_context_from_chunks: chunks must be non-empty.")
     replay_chunks = tuple(tuple(int(token) for token in chunk) for chunk in chunks)
     for index, chunk in enumerate(replay_chunks):
@@ -412,7 +591,7 @@ def rebuild_text_context_from_chunks(
     try:
         require_inference_dispatch(model)
         target_chunks = len(replay_chunks)
-        if chunk_mode == "exact":
+        if chunk_mode == "exact" and execution_order == "chunk_major":
             # Agree before the first decoder call. Computing this after the real
             # trace would already let unequal ranks desynchronize all-gathers.
             target_chunks = (
@@ -425,13 +604,19 @@ def rebuild_text_context_from_chunks(
                 "rebuild_text_context_from_chunks: collective target cannot be shorter than the real trace: "
                 f"{target_chunks} < {len(replay_chunks)}.",
             )
+        if execution_order == "layer_major":
+            ctx = _rebuild_text_context_layer_major(
+                model,
+                replay_chunks=replay_chunks,
+                device=device,
+            )
+        else:
+            ctx = init_und_context(model)
+            for chunk in replay_chunks:
+                token_ids = torch.as_tensor(chunk, dtype=torch.long)
+                ctx = prefill_text_split(model, ctx, text_ids=token_ids, device=device)
 
-        ctx = init_und_context(model)
-        for chunk in replay_chunks:
-            token_ids = torch.as_tensor(chunk, dtype=torch.long)
-            ctx = prefill_text_split(model, ctx, text_ids=token_ids, device=device)
-
-        if chunk_mode == "exact":
+        if chunk_mode == "exact" and execution_order == "chunk_major":
             dependency_zero = _pad_text_context_traversals(
                 model,
                 ctx,

@@ -385,6 +385,11 @@ class StageAlgorithm(Remote, ABC):
     # optimizer update. False avoids duplicate Batch slicing for algorithms that
     # use only the regular compute hook.
     prepares_update_batch: bool = False
+    # Opt-in extension for algorithms that phase backward across the update.
+    # These receive advantages/progress/loss scale in addition to the legacy
+    # condition/segment pairs. Keeping this separate preserves compatibility for
+    # existing ``prepares_update_batch`` implementations.
+    prepares_phased_update_batch: bool = False
 
     def recomputes_anchor(self) -> bool:
         """Whether the anchor must be recomputed at the EXACT ``(mini, micro)``
@@ -446,7 +451,9 @@ class StageAlgorithm(Remote, ABC):
         upcoming update. Most algorithms need no preparation. Reference-policy
         algorithms may use the hook to batch detached work that would otherwise
         be repeated once per micro-batch, provided they preserve the policy state
-        at this update boundary.
+        at this update boundary. Algorithms opting into
+        ``prepares_phased_update_batch`` additionally receive each slice's
+        advantages plus ``training_progress`` and ``loss_scale``.
         """
         return None
 

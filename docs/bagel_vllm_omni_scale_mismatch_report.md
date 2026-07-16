@@ -33,8 +33,24 @@ per rank completed in lockstep, AR backward completed, and all 48 update-0 image
 references completed, but the first image RatioNorm backward deadlocked. Native
 stacks showed seven ranks recomputing BAGEL's cached attention branch while one
 rank recomputed the no-cache padding branch. The replacement repair therefore
-uses a bounded, cache-faithful continuation and is not considered production
-validated until the next CUDA/NCCL run reaches an optimizer step.
+uses a bounded, cache-faithful continuation. The next eight-H20 run (`7d62ya97`)
+crossed the first image backward and completed optimizer update 0 at 15:15:32
+SGT on 2026-07-16 with no OOM, NCCL, or fatal error. This validates the repaired
+collective ordering, but the first update still took roughly three hours, so it
+does not validate acceptable throughput. The same run later OOMed in update 1's
+first image backward: an FSDP2 pre-backward all-gather requested 130 MiB with
+41.25 MiB free while PyTorch held 5.01 GiB reserved but unallocated. The
+optimized relaunch therefore also defaults to expandable CUDA allocator
+segments; it still uses no persistent or lifecycle FSDP offload.
+
+The production recipe now selects a second exact execution order,
+`layer_major`. It preserves every native chunk's attention inputs and cache
+transition but traverses the equivalent `(layer, chunk)` dependency graph one
+decoder layer at a time. Each FSDP-wrapped block is entered once per sample and
+loops the native chunks while its parameters are resident. Unequal trace depths
+therefore change local inner work rather than the number or order of distributed
+wrapper collectives. This path has local bit-exact and CPU/Gloo FSDP2 parity;
+real BAGEL CUDA/NCCL and end-to-end timing remain deployment gates.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -141,6 +157,22 @@ An adversarial FSDP2/NCCL reproducer confirmed the same all-gather versus
 reduce-scatter mismatch. A barrier, disabling activation checkpointing, and
 `reshard_after_forward=false` did not repair it. Forward call count and cached
 autograd topology both have to match.
+
+Run [`7d62ya97`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/7d62ya97)
+used the cache-faithful topology on one 8xH20 node with global
+`P=32, N=24, M=1, U=2`, no persistent FSDP offload, and no lifecycle offload.
+All 768 vLLM-Omni KV/image outputs completed. The replay-depth permutation
+reduced the observed summed per-position target from 37,683 to 21,695. Every
+rank completed update-0 RatioNorm and MSE backwards, gradient clipping, and
+Adam, then entered update 1. The logger returns the two `U=2` updates together,
+so crossing optimizer 0 is a correctness signal rather than a W&B train metric.
+The run was still dominated by exact Stage-0 replay, demonstrating that bounded
+padding fixes ordering but retains excessive wrapped-layer entry cost. At
+15:47:44 SGT, update 1 image micro 0 then OOMed in FSDP2's pre-backward
+all-gather. The 130 MiB request saw only 41.25 MiB device-free even though the
+allocator reported 5.01 GiB reserved but unallocated; Ray subsequently exited
+all eight train actors. This was allocator fragmentation at the second-update
+peak, not an NCCL ordering failure.
 
 ## Traversal Accounting
 
@@ -335,23 +367,61 @@ the 768 global samples, and exact replay math are unchanged.
 
 An offline analysis of the captured 8x96 trace estimated that the summed
 per-position collective target falls from 50,030 to 29,507 replay traversals,
-1.752x to 1.034x the average real work. The new run logs the realized before and
-after target from its own 768 traces; the estimate is not a wall-time result.
+1.752x to 1.034x the average real work. Run `7d62ya97` then logged its own
+realized reduction from 37,683 to 21,695. Both are traversal accounting, not
+wall-time results.
+
+### 6. Layer-major exact replay
+
+Exact reconstruction forms a two-dimensional dependency graph. Node
+`(layer, chunk)` depends on `(layer - 1, chunk)` for its hidden state and on
+`(layer, chunk - 1)` for its cached K/V. Both chunk-major and layer-major orders
+are valid topological traversals. The new path constructs the same token IDs,
+position IDs, rope embeddings, query/key indexes, causal flag, and mutable cache
+updates for every original native chunk; it changes only the traversal order.
+
+The dispatch is installed on each vendored decoder layer before Accelerate
+device hooks, activation checkpointing, and FSDP2 wrapping. A normal layer call
+falls through to the original vendor `forward`. A replay call enters the wrapped
+layer once and invokes its `forward_inference` implementation directly for each
+native chunk while that layer is unsharded. The direct inner call intentionally
+does not recurse through `Module.__call__`, so it does not issue nested FSDP or
+checkpoint hooks. The outer call still owns both mechanisms.
+
+For the captured batch-32 trace, the depth-aware planner reduced one 96-sample
+pass to 21,695 full-decoder traversals per rank. With 28 decoder blocks this is
+607,460 wrapped block entries. Layer-major replay uses `96 * 28 = 2,688` wrapped
+entries for the same pass, while retaining the same 21,695 native inner
+block/chunk computations. This is a 226x reduction in wrapper entry and
+unshard/reshard count, not a 226x reduction in attention FLOPs and not yet a
+wall-time claim.
+
+Layer-major replay does not need distributed dummy traversals: every rank enters
+each wrapped block once per sample even when local chunk counts differ. The
+depth-aware ownership permutation remains useful because it balances the local
+inner compute duration between those synchronized outer entries. Cache-faithful
+padding remains available for the chunk-major exact path as a validated
+fallback.
 
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | 96 passed, 1 skipped in the focused BAGEL/Omni suite; cached padding covers grad/no-grad paths, bounded K/V, semantic-cache preservation, pairing, update membership, and gradient parity |
+| Unit and config regression | passed | 110 passed, 1 skipped in the focused BAGEL/Omni suite; coverage includes cached padding, layer-major cache/loss/full-gradient parity, Accelerate-hook restoration, profile wiring, phased-hook compatibility, pairing, and update membership |
 | Two-rank FSDP2 ordering | passed on CPU/Gloo | production replay helper, unequal 2-vs-5 real depths, three-layer K/V recurrence, activation checkpointing, `reshard_after_forward=true`, and a semantic image call completed and matched averaged unpadded gradients |
 | Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
+| Layer-major local exact parity | passed | production installer/helper are bit-exact against chunk-major for terminal K/V, downstream image output/loss, and every decoder gradient; wrapped calls fall from `chunks + image` to `replay + image` per layer |
+| Layer-major FSDP2 ordering | passed on CPU/Gloo | unequal 2-vs-5 depths with composable activation checkpointing and `reshard_after_forward=true` complete without padding and match independently averaged gradients |
+| Layer-major real BAGEL CUDA parity | pending | compare captured-trace K/V, velocity, log-prob, and gradients against chunk-major on one H20 before the optimized launch |
+| Layer-major CUDA/NCCL FSDP2 ordering | pending | run unequal-depth bf16-compute/fp32-master replay with activation checkpointing and `reshard_after_forward=true` on the pinned Torch 2.11/CUDA 12.9 stack |
 | One-H20 end-to-end smoke | mechanical execution completed | exit 0, four images, finite losses, optimizer step, 485.035 s train; tested replay mode failed numerical parity |
 | Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
 | Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
 | Reference-hoist parity | unit-tested, not GPU-instrumented | lifecycle/error cleanup is covered; `N -> U` swap counts and full gradient parity still need instrumentation |
 | Eight-H20 global batch 32 without padding | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
 | Eight-H20 count-equalized hidden padding | **failed** | all anchors, AR backward, and update-0 reference prep completed; cached-vs-no-cache topology deadlocked the first image backward (`uqem9ggy`) |
-| Eight-H20 cache-faithful padding plus DP balancing | pending | requires Torch 2.11/CUDA/NCCL validation through the first image backward and optimizer metric |
+| Eight-H20 cache-faithful padding plus DP balancing | optimizer-0 gate passed; update 1 OOMed | `7d62ya97` completed optimizer 0 with no ordering failure, then fragmented at update-1 image micro 0; roughly three-hour first update remains unacceptable |
+| Eight-H20 layer-major batch 32 | pending | deploy only after the two real-CUDA parity/order gates; compare first-optimizer wall time against `7d62ya97` |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; validate the one-node batch-32 run first |
 | Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
 
@@ -366,21 +436,27 @@ The incident bottleneck and the recipe scale mismatch are confirmed. The code
 now separates production from smoke geometry, hoists the full-FT reference swap,
 captures replay metadata, collectively balances exact replay traversal depth,
 uses cache-faithful bounded padding, redistributes replay depths without changing
-batch or update membership, and includes a measurable fast-path experiment. The
+batch or update membership, and can traverse exact replay layer-major. The
 combined experimental build measured 3.09-3.15x faster in one matched-geometry
 comparison, but both collapsed candidates changed replay outputs beyond the
-preset parity budget. The fast path is not enabled by default, and the exact
-production replay multiplier remains a throughput cost. The replacement FSDP
-ordering repair has passed focused CPU/Gloo and CUDA/NCCL adversarial tests but
-is not labeled end-to-end fixed until the batch-32 H20 run emits an optimizer
-metric.
+preset parity budget and remain disabled. Cache-faithful chunk-major replay has
+now passed a real eight-H20 optimizer gate, proving the distributed correctness
+repair, while also proving that its remaining wrapper multiplier is too slow.
 
-The next production-safe optimization should preserve exact chunk math while
-removing duplicate reconstruction: phase image training per optimizer update so
-RatioNorm builds each exact grad context once, retains detached K/V views after
-backward, performs one batched reference swap, and reuses those views for MSE.
-That removes one exact prefix reconstruction per image without changing cache
-geometry. The collective-count balancing repair must first pass the eight-H20
-Torch 2.11/CUDA/NCCL run. Only after that and the duplicate-reconstruction work
-should the 32-device `P=32, N=24, M=1, U=2` learning run be used to judge
-throughput and reward growth.
+The immediate production candidate is layer-major exact replay. It changes
+neither native chunk geometry nor logical `P/N/M/U` scale, removes collective
+padding, and targets the FSDP/checkpoint wrapper overhead exposed by the
+three-hour baseline. The first optimized launch deliberately keeps
+`reuse_ratio_context_for_mse=false`; phasing RatioNorm before the reference swap
+would retain image gradients beside the fp32 live-weight stash, and the baseline
+already fragmented at the second-update peak. The launcher defaults
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the optimized run, but
+does not use offload or reduce batch size. Context reuse is implemented as a
+separate follow-on optimization and remains disabled until an instrumented
+peak-memory gate passes.
+
+Before judging learning behavior, layer-major replay must pass real captured
+BAGEL/FlashAttention parity, unequal-depth CUDA/NCCL FSDP2 ordering, and the same
+one-node batch-32 first-optimizer timing gate. Only then should the 32-device
+`P=32, N=24, M=1, U=2` run be used to evaluate sustained throughput and reward
+growth.

@@ -56,6 +56,10 @@ pipeline:
   # Exact replay remains the production default until the captured-trace
   # cache/velocity/gradient gate approves a faster chunk geometry.
   t2ti_replay_chunk_mode: exact
+  # Preserve every native chunk attention call, but keep one FSDP block
+  # resident while that layer traverses all chunks. This removes per-token
+  # unshard/reshard and makes collective order independent of trace depth.
+  t2ti_replay_execution_order: layer_major
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
@@ -140,6 +144,10 @@ algorithm:
     mse_weight: 1.5e-5
     ratio_norm: true
     grad_reweight: false
+    # Keep disabled for the first layer-major H20 gate: phasing RatioNorm before
+    # the reference swap retains image gradients alongside the fp32 live-weight
+    # stash. Enable only after measuring that combined peak on the real FSDP model.
+    reuse_ratio_context_for_mse: false
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.bagel.conditions.BagelT2TIDiffusionConditions

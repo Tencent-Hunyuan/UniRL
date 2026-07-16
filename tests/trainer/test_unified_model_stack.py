@@ -30,10 +30,14 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
         def __init__(self, name: str, *, prepares_update_batch: bool) -> None:
             self.name = name
             self.prepares_update_batch = prepares_update_batch
+            self.prepares_phased_update_batch = prepares_update_batch
 
-        def prepare_update_batch(self, *, micro_batches):
+        def prepare_update_batch(self, *, micro_batches, training_progress, loss_scale):
             assert len(micro_batches) == 2
-            assert all(segment.batch_size == 1 for _, segment in micro_batches)
+            assert all(segment.batch_size == 1 for _, segment, _ in micro_batches)
+            assert all(torch.equal(advantages, torch.ones(1)) for _, _, advantages in micro_batches)
+            assert training_progress == 0.0
+            assert loss_scale == 0.5
             events.append(f"prepare_{self.name}")
 
         def finish_update_batch(self, *, succeeded):
@@ -88,6 +92,32 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
     ]
 
 
+def test_legacy_update_preparation_keeps_pair_only_api() -> None:
+    captured = []
+
+    class FakeAlgorithm:
+        prepares_update_batch = True
+        prepares_phased_update_batch = False
+
+        def prepare_update_batch(self, *, micro_batches):
+            captured.extend(micro_batches)
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.algorithms = {"image": FakeAlgorithm()}
+    track = RolloutTrack(
+        sample_ids=["image-0", "image-1"],
+        conditions={},
+        segment=make_image_segment(latents=torch.zeros(2, 1, 1, 1)),
+        advantages=torch.ones(2),
+    )
+
+    stack._prepare_update_batch("image", track, [(0, 1), (1, 2)], training_progress=0.5)
+
+    assert len(captured) == 2
+    assert all(len(micro_batch) == 2 for micro_batch in captured)
+    assert all(segment.batch_size == 1 for _, segment in captured)
+
+
 def test_failed_image_backward_finalizes_prepared_state() -> None:
     events: list[str] = []
 
@@ -100,8 +130,8 @@ def test_failed_image_backward_finalizes_prepared_state() -> None:
             self.name = name
             self.prepares_update_batch = prepares_update_batch
 
-        def prepare_update_batch(self, *, micro_batches):
-            del micro_batches
+        def prepare_update_batch(self, *, micro_batches, training_progress, loss_scale):
+            del micro_batches, training_progress, loss_scale
             events.append(f"prepare_{self.name}")
 
         def finish_update_batch(self, *, succeeded):
@@ -114,9 +144,11 @@ def test_failed_image_backward_finalizes_prepared_state() -> None:
         "image": FakeAlgorithm("image", prepares_update_batch=True),
     }
 
-    def fake_prepare(self, name, track, micro_slices):
+    def fake_prepare(self, name, track, micro_slices, *, training_progress):
         del track, micro_slices
-        self.algorithms[name].prepare_update_batch(micro_batches=[])
+        self.algorithms[name].prepare_update_batch(
+            micro_batches=[], training_progress=training_progress, loss_scale=1.0
+        )
 
     stack._prepare_update_batch = MethodType(fake_prepare, stack)
 

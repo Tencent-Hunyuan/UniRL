@@ -268,6 +268,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
         t2ti_replay_chunk_mode: str = "exact",
+        t2ti_replay_execution_order: str = "chunk_major",
     ) -> None:
         # ``model`` is the bundle (kept name-compatible with the other stages so
         # the pipeline / FSDPPolicy treat it uniformly). The Bagel nn.Module is
@@ -279,6 +280,9 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.t2ti_replay_chunk_mode = rl_ops.validate_t2ti_replay_chunk_mode(t2ti_replay_chunk_mode)
+        self.t2ti_replay_execution_order = rl_ops.validate_t2ti_replay_execution_order(t2ti_replay_execution_order)
+        if self.t2ti_replay_chunk_mode != "exact" and self.t2ti_replay_execution_order != "chunk_major":
+            raise ValueError("BAGEL collapsed replay only supports chunk_major execution.")
 
     # ------------------------------------------------------------------
     # Helpers (navit adapter)
@@ -360,6 +364,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
                 expected_ropes=spec.ropes,
                 device=device,
                 chunk_mode=self.t2ti_replay_chunk_mode,
+                execution_order=self.t2ti_replay_execution_order,
             )
         cfg_text = rl_ops.init_und_context(self.model.model)
         cfg_img = gen
@@ -594,6 +599,46 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
         params: BagelDiffusionParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
+        result, _ = self._replay_impl(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+        )
+        return result
+
+    def replay_with_detached_forward_kwargs(
+        self,
+        conditions: BagelStageConditions,
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> Tuple[ReplayResult, Dict[str, Any]]:
+        """Replay once and retain a graph-free view of its exact text context.
+
+        The returned kwargs share the replay's terminal K/V storage but every
+        tensor is detached from autograd. A phased UniGRPO update can therefore
+        finish the RatioNorm backward, swap reference weights, and reuse the
+        numerically identical context for velocity MSE without rebuilding the
+        Stage-0 prefix.
+        """
+        result, forward_kwargs = self._replay_impl(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+        )
+        return result, rl_ops.detach_replay_tree(forward_kwargs)
+
+    def _replay_impl(
+        self,
+        conditions: BagelStageConditions,
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> Tuple[ReplayResult, Dict[str, Any]]:
         """Recompute per-step log-probs over the SDE window (mirrors SD3 replay).
 
         Loops ``step.step_with_logp`` (``prev_sample`` = the stored next frame) over
@@ -662,7 +707,7 @@ class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
             # FSDP forward/backward collective sequence.
             log_probs_t = log_probs_t + collective_pad_zero.to(dtype=log_probs_t.dtype)
         means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)  # [1, S', seq, C]
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t), forward_kwargs
 
     # ------------------------------------------------------------------
     # Single-step velocity (forward-process algorithms: DiffusionNFT et al.)

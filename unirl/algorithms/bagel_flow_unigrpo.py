@@ -50,6 +50,7 @@ class _PreparedMSEBatch:
     target_steps: Tuple[int, ...]
     forward_kwargs: Dict[str, Any]
     reference_velocities: List[torch.Tensor]
+    surrogate_result: Optional[AlgorithmStepResult] = None
 
 
 @contextmanager
@@ -88,6 +89,7 @@ class BagelFlowUniGRPO(FlowGRPO):
     """FlowGRPO with UniGRPO's velocity-MSE regularization (BAGEL image side)."""
 
     prepares_update_batch = True
+    prepares_phased_update_batch = True
 
     def __init__(
         self,
@@ -103,6 +105,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         mse_weight: float = 0.0,
         ratio_norm: bool = False,
         grad_reweight: bool = False,
+        reuse_ratio_context_for_mse: bool = False,
     ) -> None:
         super().__init__(
             params=params,
@@ -120,6 +123,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         # mean<1). grad_reweight (×1/|dt|) is the optional 2nd component, off by default.
         self.ratio_norm = bool(ratio_norm)
         self.grad_reweight = bool(grad_reweight)
+        self.reuse_ratio_context_for_mse = bool(reuse_ratio_context_for_mse)
+        if self.reuse_ratio_context_for_mse and not self.ratio_norm:
+            raise ValueError("reuse_ratio_context_for_mse requires ratio_norm=True.")
         # Under old_logp_source="replay" the train stack recomputes these per 1-sample
         # micro-slice and cats them back (UnifiedModelTrainStack.prepare_segment). RatioNorm
         # needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp)
@@ -318,9 +324,11 @@ class BagelFlowUniGRPO(FlowGRPO):
     def prepare_update_batch(
         self,
         *,
-        micro_batches: Sequence[Tuple[Mapping[str, Condition], LatentSegment]],
+        micro_batches: Sequence[Tuple[Mapping[str, Condition], LatentSegment, torch.Tensor]],
+        training_progress: float,
+        loss_scale: float,
     ) -> None:
-        """Prepare all detached MSE references under one weight swap per update.
+        """Prepare detached MSE references under one weight swap per update.
 
         BAGEL image replay is constrained to one sample per micro-batch. The old
         path stashed, replaced, and restored every trainable full-FT shard for
@@ -329,12 +337,17 @@ class BagelFlowUniGRPO(FlowGRPO):
         contexts and detached reference velocities are consumed later in the
         same order by :meth:`compute_loss_and_backward`.
 
+        With ``reuse_ratio_context_for_mse``, the first phase runs each
+        RatioNorm replay and backward, then retains only graph-free terminal K/V
+        views. The reference and current-policy MSE phases reuse those exact
+        contexts, removing the otherwise duplicated exact Stage-0 reconstruction.
+
         This hook runs once per optimizer update rather than once per rollout:
         under ``num_updates_per_batch > 1`` the later update therefore rebuilds
         its detached context after the preceding optimizer step, preserving the
         prior policy-state semantics.
         """
-        if self._prepared_mse_batches:
+        if self._prepared_mse_batches is not None:
             raise RuntimeError(
                 "BagelFlowUniGRPO.prepare_update_batch: the previous update left "
                 f"{len(self._prepared_mse_batches)} unconsumed MSE micro-batches."
@@ -353,8 +366,17 @@ class BagelFlowUniGRPO(FlowGRPO):
             return
 
         entries: List[Optional[_PreparedMSEBatch]] = [None] * len(micro_batches)
-        pending: List[Tuple[int, LatentSegment, Tuple[int, ...], Dict[str, Any], torch.device]] = []
-        for index, (conditions, segment) in enumerate(micro_batches):
+        pending: List[
+            Tuple[
+                int,
+                LatentSegment,
+                Tuple[int, ...],
+                Dict[str, Any],
+                torch.device,
+                Optional[AlgorithmStepResult],
+            ]
+        ] = []
+        for index, (conditions, segment, advantages) in enumerate(micro_batches):
             if int(segment.batch_size) != 1:
                 raise ValueError(
                     "BagelFlowUniGRPO.prepare_update_batch requires one image per micro-batch "
@@ -365,14 +387,24 @@ class BagelFlowUniGRPO(FlowGRPO):
                 continue
             typed_conds = typed_conditions(conditions, self.conditions_cls)
             device = torch.device(self.stage.model.device)
-            with torch.no_grad():
-                forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
-            pending.append((index, segment, target_steps, forward_kwargs, device))
+            surrogate_result: Optional[AlgorithmStepResult] = None
+            if self.reuse_ratio_context_for_mse:
+                surrogate_result, forward_kwargs = self._ratio_norm_surrogate_with_context(
+                    conditions=conditions,
+                    segment=segment,
+                    advantages=advantages,
+                    training_progress=float(training_progress),
+                    loss_scale=float(loss_scale),
+                )
+            else:
+                with torch.no_grad():
+                    forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            pending.append((index, segment, target_steps, forward_kwargs, device, surrogate_result))
 
         if pending:
             with torch.no_grad():
                 with self._reference_weights(transformer):
-                    for index, segment, target_steps, forward_kwargs, device in pending:
+                    for index, segment, target_steps, forward_kwargs, device, surrogate_result in pending:
                         schedule = segment.sigmas.to(device)
                         v_refs = [
                             self.stage.predict_velocity_at(
@@ -387,6 +419,7 @@ class BagelFlowUniGRPO(FlowGRPO):
                             target_steps=target_steps,
                             forward_kwargs=forward_kwargs,
                             reference_velocities=v_refs,
+                            surrogate_result=surrogate_result,
                         )
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -441,7 +474,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         # 1. Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the
         #    plain FlowGRPO ratio with the per-step normalized one when enabled;
         #    otherwise the inherited FlowGRPO surrogate.
-        if self.ratio_norm:
+        if prepared_mse is not None and prepared_mse.surrogate_result is not None:
+            result = prepared_mse.surrogate_result
+        elif self.ratio_norm:
             result = self._ratio_norm_surrogate(
                 conditions=conditions,
                 segment=segment,
@@ -539,6 +574,47 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
+        result, _ = self._ratio_norm_surrogate_impl(
+            conditions=conditions,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            loss_scale=loss_scale,
+            retain_forward_kwargs=False,
+        )
+        return result
+
+    def _ratio_norm_surrogate_with_context(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+    ) -> Tuple[AlgorithmStepResult, Dict[str, Any]]:
+        result, forward_kwargs = self._ratio_norm_surrogate_impl(
+            conditions=conditions,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            loss_scale=loss_scale,
+            retain_forward_kwargs=True,
+        )
+        if forward_kwargs is None:
+            raise RuntimeError("RatioNorm context reuse requested but replay produced no forward kwargs.")
+        return result, forward_kwargs
+
+    def _ratio_norm_surrogate_impl(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+        retain_forward_kwargs: bool,
+    ) -> Tuple[AlgorithmStepResult, Optional[Dict[str, Any]]]:
         """FlowGRPO clipped surrogate with GRPO-Guard RatioNorm.
 
         The flow importance ratio is left-shifted (mean < 1) and step-inconsistent,
@@ -561,14 +637,23 @@ class BagelFlowUniGRPO(FlowGRPO):
         """
         target_steps = self._resolve_target_steps(segment)
         if not target_steps:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False), None
         if segment.sde_means is None:
             raise RuntimeError(
                 "BagelFlowUniGRPO(ratio_norm=True): segment.sde_means is None. RatioNorm needs the rollout "
                 "to store per-SDE-step μ_old; ensure BagelDiffusionStage.diffuse records sde_means."
             )
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+        forward_kwargs: Optional[Dict[str, Any]] = None
+        if retain_forward_kwargs:
+            replay, forward_kwargs = self.stage.replay_with_detached_forward_kwargs(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=target_steps,
+            )
+        else:
+            replay = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
         new_logp = replay.log_probs  # [1, S']
         mu_theta = replay.prev_sample_means  # [1, S', seq, C]
         if mu_theta is None:
@@ -621,11 +706,14 @@ class BagelFlowUniGRPO(FlowGRPO):
             "ratio_norm": 1.0,
             "grad_reweight": float(bool(self.grad_reweight)),
         }
-        return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
-            metrics=metrics,
-            num_steps_or_tokens=len(target_steps),
-            has_backward=True,
+        return (
+            AlgorithmStepResult(
+                loss=float(loss.detach().item()),
+                metrics=metrics,
+                num_steps_or_tokens=len(target_steps),
+                has_backward=True,
+            ),
+            forward_kwargs,
         )
 
     @staticmethod

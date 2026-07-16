@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real captured-trace gate for BAGEL T2TI exact versus collapsed replay."""
+"""Real captured-trace gate for BAGEL T2TI replay implementations."""
 
 from __future__ import annotations
 
@@ -112,7 +112,8 @@ def _run_mode(
     spec: BagelThinkKVReplaySpec,
     selected: Sequence[tuple[str, torch.nn.Parameter]],
     *,
-    mode: str,
+    chunk_mode: str,
+    execution_order: str,
     fixed_sample: torch.Tensor | None,
     fixed_prev_sample: torch.Tensor | None,
     device: torch.device,
@@ -125,7 +126,11 @@ def _run_mode(
     torch.cuda.synchronize(device)
     started = time.perf_counter()
 
-    stage = BagelDiffusionStage(model=bundle, t2ti_replay_chunk_mode=mode)
+    stage = BagelDiffusionStage(
+        model=bundle,
+        t2ti_replay_chunk_mode=chunk_mode,
+        t2ti_replay_execution_order=execution_order,
+    )
     params = BagelDiffusionParams(
         samples_per_prompt=1,
         num_inference_steps=2,
@@ -233,6 +238,18 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--samples-jsonl", type=Path, required=True)
     parser.add_argument("--sample-index", type=int, default=0)
+    parser.add_argument("--reference-chunk-mode", choices=("exact", "collapsed"), default="exact")
+    parser.add_argument(
+        "--reference-execution-order",
+        choices=("chunk_major", "layer_major"),
+        default="chunk_major",
+    )
+    parser.add_argument("--candidate-chunk-mode", choices=("exact", "collapsed"), default="collapsed")
+    parser.add_argument(
+        "--candidate-execution-order",
+        choices=("chunk_major", "layer_major"),
+        default="chunk_major",
+    )
     parser.add_argument("--max-cache-rel-l2", type=float, default=5.0e-3)
     parser.add_argument("--min-cache-cosine", type=float, default=0.9999)
     parser.add_argument("--max-velocity-rel-l2", type=float, default=5.0e-3)
@@ -258,30 +275,32 @@ def main() -> None:
     )
     bundle.model.requires_grad_(False)
     selected = _select_gradient_parameters(bundle.model)
-    exact = _run_mode(
+    reference = _run_mode(
         bundle,
         spec,
         selected,
-        mode="exact",
+        chunk_mode=args.reference_chunk_mode,
+        execution_order=args.reference_execution_order,
         fixed_sample=None,
         fixed_prev_sample=None,
         device=device,
     )
-    collapsed = _run_mode(
+    candidate = _run_mode(
         bundle,
         spec,
         selected,
-        mode="collapsed",
-        fixed_sample=exact.input_sample,
-        fixed_prev_sample=exact.prev_sample,
+        chunk_mode=args.candidate_chunk_mode,
+        execution_order=args.candidate_execution_order,
+        fixed_sample=reference.input_sample,
+        fixed_prev_sample=reference.prev_sample,
         device=device,
     )
 
-    cache_metrics = _metrics(exact.cache, collapsed.cache)
-    velocity_metrics = _metrics([exact.velocity], [collapsed.velocity])
-    mean_metrics = _metrics([exact.transition_mean], [collapsed.transition_mean])
-    gradient_metrics = _metrics(exact.gradients, collapsed.gradients)
-    log_prob_abs = float((exact.log_prob - collapsed.log_prob).abs().item())
+    cache_metrics = _metrics(reference.cache, candidate.cache)
+    velocity_metrics = _metrics([reference.velocity], [candidate.velocity])
+    mean_metrics = _metrics([reference.transition_mean], [candidate.transition_mean])
+    gradient_metrics = _metrics(reference.gradients, candidate.gradients)
+    log_prob_abs = float((reference.log_prob - candidate.log_prob).abs().item())
     passed = (
         cache_metrics.rel_l2 <= args.max_cache_rel_l2
         and cache_metrics.cosine >= args.min_cache_cosine
@@ -296,13 +315,20 @@ def main() -> None:
     result = {
         "passed": passed,
         "captured_tokens": spec.kv_length,
-        "exact_calls": len(spec.chunks()),
-        "collapsed_calls": min(2, len(spec.chunks())),
-        "exact_seconds": exact.seconds,
-        "collapsed_seconds": collapsed.seconds,
-        "speedup": exact.seconds / max(collapsed.seconds, 1.0e-12),
-        "exact_peak_gib": exact.peak_gib,
-        "collapsed_peak_gib": collapsed.peak_gib,
+        "captured_chunks": len(spec.chunks()),
+        "reference": {
+            "chunk_mode": args.reference_chunk_mode,
+            "execution_order": args.reference_execution_order,
+            "seconds": reference.seconds,
+            "peak_gib": reference.peak_gib,
+        },
+        "candidate": {
+            "chunk_mode": args.candidate_chunk_mode,
+            "execution_order": args.candidate_execution_order,
+            "seconds": candidate.seconds,
+            "peak_gib": candidate.peak_gib,
+        },
+        "speedup": reference.seconds / max(candidate.seconds, 1.0e-12),
         "thresholds": {
             "max_cache_rel_l2": args.max_cache_rel_l2,
             "min_cache_cosine": args.min_cache_cosine,
@@ -321,6 +347,22 @@ def main() -> None:
         "decoder_gradients": asdict(gradient_metrics),
         "gradient_parameters": [name for name, _ in selected],
     }
+    if (
+        args.reference_chunk_mode == "exact"
+        and args.reference_execution_order == "chunk_major"
+        and args.candidate_chunk_mode == "collapsed"
+        and args.candidate_execution_order == "chunk_major"
+    ):
+        result.update(
+            {
+                "exact_calls": len(spec.chunks()),
+                "collapsed_calls": min(2, len(spec.chunks())),
+                "exact_seconds": reference.seconds,
+                "collapsed_seconds": candidate.seconds,
+                "exact_peak_gib": reference.peak_gib,
+                "collapsed_peak_gib": candidate.peak_gib,
+            }
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     if not passed:
         raise SystemExit(1)

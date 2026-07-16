@@ -209,8 +209,14 @@ def test_unigrpo_full_ft_reference_swap_is_hoisted_once_per_optimizer_update() -
     algorithm._reference_weights = counted_reference_weights
 
     updates = [
-        [({"sample_id": 0}, segment(1.0)), ({"sample_id": 1}, segment(2.0))],
-        [({"sample_id": 2}, segment(3.0)), ({"sample_id": 3}, segment(4.0))],
+        [
+            ({"sample_id": 0}, segment(1.0), torch.ones(1)),
+            ({"sample_id": 1}, segment(2.0), torch.ones(1)),
+        ],
+        [
+            ({"sample_id": 2}, segment(3.0), torch.ones(1)),
+            ({"sample_id": 3}, segment(4.0), torch.ones(1)),
+        ],
     ]
     for update_index, micro_batches in enumerate(updates):
         if update_index == 1:
@@ -218,13 +224,13 @@ def test_unigrpo_full_ft_reference_swap_is_hoisted_once_per_optimizer_update() -
             stage.model.transformer.weight.grad = None
             with torch.no_grad():
                 stage.model.transformer.weight.fill_(2.0)
-        algorithm.prepare_update_batch(micro_batches=micro_batches)
+        algorithm.prepare_update_batch(micro_batches=micro_batches, training_progress=0.0, loss_scale=0.5)
         assert stage.context_weights[-2:] == [float(update_index + 1)] * 2
-        for conditions, micro_segment in micro_batches:
+        for conditions, micro_segment, advantages in micro_batches:
             algorithm.compute_loss_and_backward(
                 conditions=conditions,
                 segment=micro_segment,
-                advantages=torch.ones(1),
+                advantages=advantages,
                 training_progress=0.0,
                 loss_scale=0.5,
             )
@@ -233,6 +239,115 @@ def test_unigrpo_full_ft_reference_swap_is_hoisted_once_per_optimizer_update() -
     assert stage.velocity_calls == 8  # four detached v_ref + four grad-enabled v_theta
     assert algorithm._prepared_mse_batches is None
     assert stage.model.transformer.weight.grad is not None
+
+
+def test_unigrpo_reuses_ratio_context_without_changing_loss_or_gradient() -> None:
+    class FakeStage:
+        def __init__(self) -> None:
+            transformer = nn.Linear(1, 1, bias=False)
+            with torch.no_grad():
+                transformer.weight.fill_(1.0)
+            self.model = SimpleNamespace(device=torch.device("cpu"), transformer=transformer)
+            self.context_builds = 0
+            self.velocity_calls = 0
+
+        def build_forward_kwargs(self, conditions, *, params, device):
+            del params, device
+            self.context_builds += 1
+            return {
+                "context_weight": self.model.transformer.weight.detach().clone(),
+                "sample_id": conditions["sample_id"],
+            }
+
+        def predict_velocity_at(self, forward_kwargs, *, sample, sigma, params):
+            del sigma, params
+            self.velocity_calls += 1
+            return self.model.transformer(sample) + 0.1 * forward_kwargs["context_weight"]
+
+    def segment(value: float):
+        return make_image_segment(
+            latents=torch.tensor([[[[value]], [[value + 0.5]]]], dtype=torch.float32),
+            sigmas=torch.tensor([1.0, 0.0]),
+            indices=torch.tensor([0, 1], dtype=torch.long),
+            sde_indices=torch.tensor([0], dtype=torch.long),
+        )
+
+    def run(*, reuse: bool):
+        stage = FakeStage()
+        algorithm = BagelFlowUniGRPO(
+            params=object(),
+            stage=stage,
+            mse_weight=1.0,
+            ratio_norm=True,
+            reuse_ratio_context_for_mse=reuse,
+        )
+        # Capture the immutable base at weight=1, then emulate a tuned policy.
+        with algorithm._reference_weights(stage.model.transformer):
+            pass
+        with torch.no_grad():
+            stage.model.transformer.weight.fill_(2.0)
+
+        surrogate_calls = 0
+
+        def surrogate(*, conditions, loss_scale, **_kwargs):
+            nonlocal surrogate_calls
+            surrogate_calls += 1
+            context = stage.model.transformer.weight * float(conditions["sample_id"] + 1)
+            loss = context.square().mean()
+            (loss * loss_scale).backward()
+            return AlgorithmStepResult(
+                loss=float(loss.detach()),
+                metrics={"policy_loss": float(loss.detach())},
+                num_steps_or_tokens=1,
+                has_backward=True,
+            )
+
+        if reuse:
+
+            def surrogate_with_context(**kwargs):
+                result = surrogate(**kwargs)
+                forward_kwargs = {
+                    "context_weight": stage.model.transformer.weight.detach().clone(),
+                    "sample_id": kwargs["conditions"]["sample_id"],
+                }
+                return result, forward_kwargs
+
+            algorithm._ratio_norm_surrogate_with_context = surrogate_with_context
+        else:
+            algorithm._ratio_norm_surrogate = surrogate
+
+        micro_batches = [
+            ({"sample_id": 0}, segment(1.0), torch.ones(1)),
+            ({"sample_id": 1}, segment(2.0), torch.ones(1)),
+        ]
+        algorithm.prepare_update_batch(
+            micro_batches=micro_batches,
+            training_progress=0.25,
+            loss_scale=0.5,
+        )
+        results = [
+            algorithm.compute_loss_and_backward(
+                conditions=conditions,
+                segment=micro_segment,
+                advantages=advantages,
+                training_progress=0.25,
+                loss_scale=0.5,
+            )
+            for conditions, micro_segment, advantages in micro_batches
+        ]
+        return stage, algorithm, results, surrogate_calls, stage.model.transformer.weight.grad.detach().clone()
+
+    legacy_stage, legacy_algorithm, legacy_results, legacy_surrogates, legacy_grad = run(reuse=False)
+    reused_stage, reused_algorithm, reused_results, reused_surrogates, reused_grad = run(reuse=True)
+
+    assert legacy_surrogates == reused_surrogates == 2
+    assert legacy_stage.context_builds == 2
+    assert reused_stage.context_builds == 0
+    assert legacy_stage.velocity_calls == reused_stage.velocity_calls == 4
+    assert [result.loss for result in reused_results] == pytest.approx([result.loss for result in legacy_results])
+    assert torch.equal(reused_grad, legacy_grad)
+    assert legacy_algorithm._prepared_mse_batches is None
+    assert reused_algorithm._prepared_mse_batches is None
 
 
 def test_prompt_prefill_moves_vendor_cpu_tensors_to_compute_device() -> None:

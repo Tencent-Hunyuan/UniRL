@@ -30,6 +30,7 @@ from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import BagelPipelineConfig
+from .rl_ops import install_layer_major_replay_dispatch
 from .vendor.data.data_utils import add_special_tokens
 from .vendor.data.transforms import ImageTransform
 from .vendor.inferencer import InterleaveInferencer
@@ -147,6 +148,11 @@ class BagelBundle(Bundle):
             language_model = Qwen2ForCausalLM(llm_config)
             vit_model = SiglipVisionModel(vit_config) if config.enable_vit else None
             model = Bagel(language_model, vit_model, bagel_config)
+            # Install before Accelerate saves each block's original forward and
+            # before the train backend composes checkpoint/FSDP hooks. Normal
+            # calls fall through unchanged; exact layer-major replay enters each
+            # wrapped block once and loops native chunks inside that residency.
+            install_layer_major_replay_dispatch(model)
             if config.enable_vit:
                 model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 

@@ -10,7 +10,13 @@ from unirl.models.bagel.conditions import (
     BagelThinkKVReplaySpec,
 )
 from unirl.models.bagel.diffusion import BagelDiffusionStage
-from unirl.models.bagel.rl_ops import rebuild_text_context_from_chunks, validate_t2ti_replay_chunk_mode
+from unirl.models.bagel.rl_ops import (
+    detach_replay_tree,
+    rebuild_text_context_from_chunks,
+    validate_t2ti_replay_chunk_mode,
+    validate_t2ti_replay_execution_order,
+)
+from unirl.models.types.replay_result import ReplayResult
 
 
 def _payload(**overrides):
@@ -61,6 +67,44 @@ class NaiveCache:
         cache.key_cache = self.key_cache.copy()
         cache.value_cache = self.value_cache.copy()
         return cache
+
+
+def test_detach_replay_tree_preserves_cache_aliases_without_cloning_storage():
+    source = torch.tensor([2.0], requires_grad=True)
+    cache = NaiveCache(1)
+    cache.key_cache[0] = source * 3.0
+    cache.value_cache[0] = source * 5.0
+    tree = {"gen": cache, "cfg_img": cache, "packed": source * 7.0}
+
+    detached = detach_replay_tree(tree)
+
+    assert detached is not tree
+    assert detached["gen"] is detached["cfg_img"]
+    assert detached["gen"] is not cache
+    assert detached["gen"].key_cache[0].data_ptr() == cache.key_cache[0].data_ptr()
+    assert detached["gen"].value_cache[0].data_ptr() == cache.value_cache[0].data_ptr()
+    assert not detached["gen"].key_cache[0].requires_grad
+    assert not detached["gen"].value_cache[0].requires_grad
+    assert not detached["packed"].requires_grad
+    assert cache.key_cache[0].requires_grad
+
+
+def test_replay_exposes_a_detached_copy_of_its_exact_forward_kwargs():
+    source = torch.tensor([2.0], requires_grad=True)
+    cache = NaiveCache(1)
+    cache.key_cache[0] = source * 3.0
+    cache.value_cache[0] = source * 5.0
+    result = ReplayResult(log_probs=source.reshape(1, 1), prev_sample_means=source.reshape(1, 1, 1, 1))
+    stage = object.__new__(BagelDiffusionStage)
+    stage._replay_impl = lambda *_args, **_kwargs: (result, {"past_key_values": cache})
+
+    replay, forward_kwargs = stage.replay_with_detached_forward_kwargs(object(), segment=object(), params=object())
+
+    assert replay is result
+    assert not forward_kwargs["past_key_values"].key_cache[0].requires_grad
+    assert forward_kwargs["past_key_values"].key_cache[0].data_ptr() == cache.key_cache[0].data_ptr()
+    replay.log_probs.sum().backward()
+    assert torch.equal(source.grad, torch.ones_like(source))
 
 
 class _FakeLMModel(nn.Module):
@@ -356,10 +400,33 @@ def test_replay_chunk_mode_normalizes_explicit_opt_in():
     assert validate_t2ti_replay_chunk_mode(" COLLAPSED ") == "collapsed"
 
 
+def test_replay_execution_order_normalizes_layer_major():
+    assert validate_t2ti_replay_execution_order(" LAYER_MAJOR ") == "layer_major"
+
+
 @pytest.mark.parametrize("mode", ["unknown", "", None])
 def test_replay_chunk_mode_rejects_unknown_values(mode):
     with pytest.raises(ValueError, match="must be one of"):
         validate_t2ti_replay_chunk_mode(mode)
+
+
+@pytest.mark.parametrize("order", ["unknown", "", None])
+def test_replay_execution_order_rejects_unknown_values(order):
+    with pytest.raises(ValueError, match="must be one of"):
+        validate_t2ti_replay_execution_order(order)
+
+
+def test_collapsed_replay_rejects_layer_major_execution():
+    with pytest.raises(ValueError, match="collapsed replay only supports chunk_major"):
+        rebuild_text_context_from_chunks(
+            _FakeBagel(),
+            chunks=((11, 12), (13,)),
+            expected_kv_length=3,
+            expected_ropes=(3,),
+            device=torch.device("cpu"),
+            chunk_mode="collapsed",
+            execution_order="layer_major",
+        )
 
 
 @pytest.mark.parametrize("chunk_mode", ["exact", "collapsed"])
