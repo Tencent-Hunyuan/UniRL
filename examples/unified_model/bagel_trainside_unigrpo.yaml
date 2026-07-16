@@ -217,6 +217,7 @@ sampling:
     samples_per_prompt: 24            # G thinking chains per prompt
     temperature: 1.0                  # thinking-chain sampling temperature
     max_new_tokens: 1024
+    top_k: 1024
   diffusion:
     _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
     samples_per_prompt: 1             # M=1 image per chain
