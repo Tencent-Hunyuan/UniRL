@@ -25,7 +25,7 @@ import logging
 import math
 import os
 import time
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -179,6 +179,11 @@ class BaseFSDP2Backend(Remote):
         )
 
         self._optimizer_step_count: int = 0
+        # Populated only by the opt-in external-rollout boundary. Each entry
+        # records one optimizer-state slot that moved off its original compute
+        # device, so CPU-native state (notably non-capturable AdamW ``step``
+        # scalars) is never moved to CUDA during restore.
+        self._rollout_optimizer_state_restore_plan: Dict[Tuple[int, Any], Tuple[Dict[Any, Any], Any, torch.device]] = {}
         self._eval_ema_active: bool = False
         # Checkpoint storage backend ("torch" legacy single-file vs "dcp"
         # sharded). save honors this; load auto-detects the on-disk format.
@@ -243,6 +248,30 @@ class BaseFSDP2Backend(Remote):
                 if device_type is None or local.device.type == device_type:
                     total += self._local_tensor_nbytes(value)
         return total
+
+    def _is_compute_device(self, tensor: torch.Tensor) -> bool:
+        local = tensor.to_local() if callable(getattr(tensor, "to_local", None)) else tensor
+        compute = torch.device(self._device)
+        if compute.type == "cpu" or local.device.type != compute.type:
+            return False
+        return compute.index is None or local.device.index == compute.index
+
+    def _optimizer_state_compute_nbytes(self) -> int:
+        return sum(
+            self._local_tensor_nbytes(value)
+            for state in self.optimizer.state.values()
+            for value in state.values()
+            if isinstance(value, torch.Tensor) and self._is_compute_device(value)
+        )
+
+    def _optimizer_restore_plan(
+        self,
+    ) -> Dict[Tuple[int, Any], Tuple[Dict[Any, Any], Any, torch.device]]:
+        plan = getattr(self, "_rollout_optimizer_state_restore_plan", None)
+        if plan is None:
+            plan = {}
+            self._rollout_optimizer_state_restore_plan = plan
+        return plan
 
     def _optimizer_grad_nbytes(self, *, device_type: Optional[str] = None) -> int:
         total = 0
@@ -699,18 +728,34 @@ class BaseFSDP2Backend(Remote):
         model parameters, parameter shards, buffers, or bundle modules.
         """
         started = time.perf_counter()
-        compute_type = self._device.type
+        compute_type = torch.device(self._device).type
         grad_bytes = self._optimizer_grad_nbytes(device_type=compute_type)
         optimizer_bytes = self._optimizer_state_nbytes()
-        optimizer_device_bytes = self._optimizer_state_nbytes(device_type=compute_type)
 
         self.optimizer.zero_grad(set_to_none=True)
-        move_optimizer_state(self.optimizer, "cpu")
-        remaining_device_bytes = self._optimizer_state_nbytes(device_type=compute_type)
-        if compute_type != "cpu" and remaining_device_bytes:
+        plan = self._optimizer_restore_plan()
+        parked_bytes = 0
+        for state in self.optimizer.state.values():
+            for key, value in list(state.items()):
+                if not isinstance(value, torch.Tensor) or not self._is_compute_device(value):
+                    continue
+                slot = (id(state), key)
+                local = value.to_local() if callable(getattr(value, "to_local", None)) else value
+                original_device = torch.device(local.device)
+                # Record before the transfer. If .to() fails, cleanup restore
+                # sees the still-original tensor, consumes the entry, and is a
+                # safe no-op. If a later slot fails, earlier entries remain
+                # independently restorable.
+                if slot not in plan:
+                    plan[slot] = (state, key, original_device)
+                state[key] = value.to("cpu")
+                parked_bytes += self._local_tensor_nbytes(value)
+
+        remaining_device_bytes = self._optimizer_state_compute_nbytes()
+        if remaining_device_bytes:
             raise RuntimeError(
                 f"{type(self).__name__}.park_optimizer_state_for_rollout: "
-                f"{remaining_device_bytes} optimizer-state bytes remain on {compute_type}."
+                f"{remaining_device_bytes} optimizer-state bytes remain on {self._device}."
             )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -718,7 +763,7 @@ class BaseFSDP2Backend(Remote):
         return {
             "grad_bytes_cleared": float(grad_bytes),
             "optimizer_state_bytes": float(optimizer_bytes),
-            "optimizer_state_bytes_parked": float(optimizer_device_bytes),
+            "optimizer_state_bytes_parked": float(parked_bytes),
             "optimizer_park_host_time_s": float(time.perf_counter() - started),
         }
 
@@ -726,23 +771,36 @@ class BaseFSDP2Backend(Remote):
     def restore_optimizer_state_after_rollout(self) -> Dict[str, float]:
         """Restore parked optimizer tensors after the external engine sleeps.
 
-        Re-running this method is harmless and leaves every optimizer tensor on
-        the backend compute device. Model parameters and FSDP shards are never
-        touched by either half of this lifecycle.
+        Re-running this method is harmless. Only slots recorded by park are
+        restored to their exact original devices; CPU-native optimizer state
+        remains CPU-native. Model parameters and FSDP shards are never touched
+        by either half of this lifecycle.
         """
         started = time.perf_counter()
-        cpu_bytes = self._optimizer_state_nbytes(device_type="cpu")
-        move_optimizer_state(self.optimizer, self._device)
-        restored_bytes = self._optimizer_state_nbytes(device_type=self._device.type)
-        total_bytes = self._optimizer_state_nbytes()
-        if self._device.type != "cpu" and restored_bytes != total_bytes:
-            raise RuntimeError(
-                f"{type(self).__name__}.restore_optimizer_state_after_rollout: "
-                f"restored {restored_bytes} of {total_bytes} optimizer-state bytes "
-                f"to {self._device}."
-            )
+        plan = self._optimizer_restore_plan()
+        restored_bytes = 0
+        for slot, (state, key, original_device) in list(plan.items()):
+            value = state.get(key)
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"{type(self).__name__}.restore_optimizer_state_after_rollout: "
+                    f"optimizer-state slot {key!r} disappeared while parked."
+                )
+            local = value.to_local() if callable(getattr(value, "to_local", None)) else value
+            if local.device != original_device:
+                state[key] = value.to(original_device)
+                restored_bytes += self._local_tensor_nbytes(value)
+            restored = state[key]
+            restored_local = restored.to_local() if callable(getattr(restored, "to_local", None)) else restored
+            if restored_local.device != original_device:
+                raise RuntimeError(
+                    f"{type(self).__name__}.restore_optimizer_state_after_rollout: "
+                    f"state slot {key!r} restored to {restored_local.device}, expected {original_device}."
+                )
+            del plan[slot]
         return {
-            "optimizer_state_bytes_restored": float(cpu_bytes),
+            "optimizer_state_bytes_restored": float(restored_bytes),
+            "optimizer_state_restore_slots_pending": float(len(plan)),
             "optimizer_restore_host_time_s": float(time.perf_counter() - started),
         }
 
