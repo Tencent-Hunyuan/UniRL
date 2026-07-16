@@ -305,9 +305,20 @@ def _cache_update_dependency_zero(cache: Any) -> torch.Tensor:
         for layer_idx in sorted(store):
             value = store[layer_idx]
             if value is not None and value.numel() > 0:
-                dependencies.append(value[-1].reshape(-1)[0].float())
+                dependencies.append(value[-1].float().sum())
     require(bool(dependencies), "BAGEL collective replay padding produced no cache tensors.")
     return torch.stack(dependencies).sum() * 0.0
+
+
+def _fork_cache_last_token(cache: Any) -> Any:
+    """Fork a ``NaiveCache`` with one graph-connected K/V slot per layer."""
+    trimmed = cache.fork()
+    for store_name in ("key_cache", "value_cache"):
+        source = getattr(cache, store_name)
+        destination = getattr(trimmed, store_name)
+        for layer_idx, value in source.items():
+            destination[layer_idx] = None if value is None else value[-1:]
+    return trimmed
 
 
 def _pad_text_context_traversals(
@@ -318,39 +329,35 @@ def _pad_text_context_traversals(
     token_id: int,
     device: torch.device,
 ) -> Optional[torch.Tensor]:
-    """Issue discarded decoder traversals so every FSDP rank has equal depth."""
+    """Issue bounded cached traversals so every FSDP rank has equal depth."""
     if int(count) <= 0:
         return None
 
-    # A growing dummy KV continuation retains every copied prefix and becomes
-    # quadratic for long thinking traces. Use a one-token hidden-state chain with
-    # no cache instead. The zero dependency on the semantic terminal cache makes
-    # this a suffix of the real autograd graph, which preserves FSDP2's backward
-    # hook order; the real context itself is never mutated or returned advanced.
-    lm = model.language_model
+    # Keep the dummy suffix on the same cached update branch as the real trace.
+    # Trimming every layer back to its newest slot bounds each update to a 1+1
+    # attention geometry while preserving graph recurrence through the cache.
+    # ``fork`` and the K/V views also keep the semantic context untouched.
     token_ids = torch.tensor([int(token_id)], dtype=torch.long, device=device)
-    hidden = lm.model.embed_tokens(token_ids)
-    if torch.is_grad_enabled():
-        hidden = hidden + _cache_update_dependency_zero(ctx["past_key_values"]).to(dtype=hidden.dtype)
-
-    query_lens = torch.ones(1, dtype=torch.int, device=device)
-    position_ids = torch.zeros(1, dtype=torch.long, device=device)
-    query_indexes = torch.zeros(1, dtype=torch.long, device=device)
+    dummy_ctx = {
+        "kv_lens": [1],
+        "ropes": [int(x) for x in ctx["ropes"]],
+        "past_key_values": _fork_cache_last_token(ctx["past_key_values"]),
+    }
     for _ in range(int(count)):
-        output = lm.forward_inference(
-            packed_query_sequence=hidden,
-            query_lens=query_lens,
-            packed_query_position_ids=position_ids,
-            packed_query_indexes=query_indexes,
-            past_key_values=None,
-            key_values_lens=None,
-            packed_key_value_indexes=None,
-            update_past_key_values=False,
-            is_causal=True,
-            mode="und",
+        dummy_ctx = prefill_text_split(
+            model,
+            dummy_ctx,
+            text_ids=token_ids,
+            device=device,
         )
-        hidden = output.packed_query_sequence
-    return hidden.float().reshape(-1)[0] * 0.0 if torch.is_grad_enabled() else None
+        dummy_ctx = {
+            "kv_lens": [1],
+            "ropes": dummy_ctx["ropes"],
+            "past_key_values": _fork_cache_last_token(dummy_ctx["past_key_values"]),
+        }
+    if not torch.is_grad_enabled():
+        return None
+    return _cache_update_dependency_zero(dummy_ctx["past_key_values"])
 
 
 def rebuild_text_context_from_chunks(
@@ -373,8 +380,10 @@ def rebuild_text_context_from_chunks(
     ``NaiveCache`` on the trainer and lets autograd connect every reconstructed K/V
     tensor to the current policy weights. In exact mode, pure-DP workers agree on
     the largest per-sample chunk count before the first decoder call. Shorter
-    traces issue discarded, graph-connected decoder traversals so FSDP2 sees the
-    same forward and backward collective depth on every rank.
+    traces issue bounded, cache-faithful decoder traversals so FSDP2 sees the same
+    cached forward branch and backward collective depth on every rank. The dummy
+    cache retains only one graph-connected K/V slot per layer and never advances
+    the semantic context returned to the caller.
 
     The MoT inference kernels dispatch on ``module.training``.  Keep the language
     model in ``eval`` for grad-enabled replay, matching :func:`forward_flow`; do not

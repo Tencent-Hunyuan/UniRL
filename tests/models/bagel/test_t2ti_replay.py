@@ -74,19 +74,33 @@ class _MutatingCacheUpdate(nn.Module):
     def __init__(self):
         super().__init__()
         self.calls = 0
+        self.input_lengths = []
+        self.output_lengths = []
 
     def forward(self, values, past_key_values, expected_length):
         self.calls += 1
         updated_cache = past_key_values.fork() if torch.is_grad_enabled() else past_key_values
-        values = torch.sin(values)
-        previous = updated_cache.key_cache[0]
-        actual_length = 0 if previous is None else int(previous.shape[0])
-        if actual_length != int(expected_length):
-            raise RuntimeError(f"cache advanced before recompute: {actual_length} != {expected_length}")
-        merged = values if previous is None else torch.cat((previous, values), dim=0)
-        updated_cache.key_cache[0] = merged
-        updated_cache.value_cache[0] = merged
-        return merged, updated_cache
+        input_lengths = []
+        output_lengths = []
+        output = None
+        for layer_idx in sorted(updated_cache.key_cache):
+            key_values = torch.sin(values + layer_idx)
+            value_values = torch.cos(values + layer_idx)
+            previous_key = updated_cache.key_cache[layer_idx]
+            previous_value = updated_cache.value_cache[layer_idx]
+            actual_length = 0 if previous_key is None else int(previous_key.shape[0])
+            if actual_length != int(expected_length):
+                raise RuntimeError(f"cache advanced before recompute: {actual_length} != {expected_length}")
+            input_lengths.append(actual_length)
+            merged_key = key_values if previous_key is None else torch.cat((previous_key, key_values), dim=0)
+            merged_value = value_values if previous_value is None else torch.cat((previous_value, value_values), dim=0)
+            updated_cache.key_cache[layer_idx] = merged_key
+            updated_cache.value_cache[layer_idx] = merged_value
+            output_lengths.append(int(merged_key.shape[0]))
+            output = merged_key
+        self.input_lengths.append(tuple(input_lengths))
+        self.output_lengths.append(tuple(output_lengths))
+        return output, updated_cache
 
 
 def test_cache_update_preserves_no_grad_in_place_contract():
@@ -104,41 +118,13 @@ class _FakeLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = _FakeLMModel()
-        self.dummy_calls = 0
-
-    def forward_inference(
-        self,
-        packed_query_sequence,
-        query_lens,
-        packed_query_position_ids,
-        packed_query_indexes,
-        past_key_values=None,
-        key_values_lens=None,
-        packed_key_value_indexes=None,
-        update_past_key_values=False,
-        is_causal=True,
-        mode="und",
-    ):
-        del (
-            query_lens,
-            packed_query_position_ids,
-            packed_query_indexes,
-            past_key_values,
-            key_values_lens,
-            packed_key_value_indexes,
-            update_past_key_values,
-            is_causal,
-            mode,
-        )
-        self.dummy_calls += 1
-        return SimpleNamespace(packed_query_sequence=torch.cos(packed_query_sequence), past_key_values=None)
 
 
 class _FakeBagel(nn.Module):
     def __init__(self):
         super().__init__()
         self.language_model = _FakeLanguageModel()
-        self.config = SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=1))
+        self.config = SimpleNamespace(llm_config=SimpleNamespace(num_hidden_layers=2))
         self.calls = []
 
     @torch.no_grad()
@@ -218,12 +204,36 @@ def test_exact_replay_pads_collective_depth_without_advancing_real_cache():
         collective_target_chunks=3,
     )
 
-    assert model.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
-    assert model.language_model.dummy_calls == 2
+    assert model.calls == [
+        ([11, 12], [0, 1]),
+        ([13], [2]),
+        ([14], [3]),
+        ([14], [4]),
+        ([14], [5]),
+    ]
+    assert model.language_model.model.cache_update.input_lengths[:5] == [
+        (0, 0),
+        (2, 2),
+        (3, 3),
+        (1, 1),
+        (1, 1),
+    ]
+    assert model.language_model.model.cache_update.output_lengths[:5] == [
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (2, 2),
+        (2, 2),
+    ]
     assert context["kv_lens"] == [4]
     assert context["ropes"] == [4]
-    assert context["past_key_values"].key_cache[0].shape[0] == 4
     assert context["collective_pad_zero"].item() == 0.0
+    for store_name in ("key_cache", "value_cache"):
+        cache_store = getattr(context["past_key_values"], store_name)
+        reference_store = getattr(reference_context["past_key_values"], store_name)
+        for layer_idx in cache_store:
+            assert cache_store[layer_idx].shape[0] == 4
+            torch.testing.assert_close(cache_store[layer_idx], reference_store[layer_idx])
 
     (context["past_key_values"].key_cache[0].sum() + context["collective_pad_zero"]).backward()
     reference_context["past_key_values"].key_cache[0].sum().backward()
@@ -247,11 +257,31 @@ def test_exact_replay_pads_no_grad_collective_depth_without_zero_graph():
             collective_target_chunks=5,
         )
 
-    assert model.calls == [([11, 12], [0, 1]), ([13], [2]), ([14], [3])]
-    assert model.language_model.dummy_calls == 2
+    assert model.calls == [
+        ([11, 12], [0, 1]),
+        ([13], [2]),
+        ([14], [3]),
+        ([14], [4]),
+        ([14], [5]),
+    ]
+    assert model.language_model.model.cache_update.input_lengths == [
+        (0, 0),
+        (2, 2),
+        (3, 3),
+        (1, 1),
+        (1, 1),
+    ]
+    assert model.language_model.model.cache_update.output_lengths == [
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (2, 2),
+        (2, 2),
+    ]
     assert context["kv_lens"] == [4]
     assert context["ropes"] == [4]
-    assert context["past_key_values"].key_cache[0].shape[0] == 4
+    for store in (context["past_key_values"].key_cache, context["past_key_values"].value_cache):
+        assert all(value.shape[0] == 4 for value in store.values())
     assert "collective_pad_zero" not in context
 
 

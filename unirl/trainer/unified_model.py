@@ -68,6 +68,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
+from unirl.models.bagel.conditions import BagelT2TIDiffusionConditions
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.eval_suites import build_eval_suites
@@ -85,6 +86,62 @@ logger = logging.getLogger(__name__)
 # groups by prompt), "image" is its 1:1 child (LatentSegment).
 AR_TRACK = "ar"
 IMAGE_TRACK = "image"
+
+
+def _bagel_t2ti_replay_permutation(
+    track: RolloutTrack,
+    *,
+    num_shards: int,
+    num_updates: int,
+) -> Optional[torch.Tensor]:
+    """Plan equal-size DP shards with aligned exact-replay depths.
+
+    Each optimizer update keeps exactly the samples it owned before the
+    permutation. Within that membership, adjacent replay depths are distributed
+    one per rank so the per-position MAX used by collective padding stays close
+    to real work on every rank.
+    """
+    num_shards = int(num_shards)
+    num_updates = int(num_updates)
+    total = int(track.batch_size)
+    if num_shards <= 1 or num_updates <= 0 or total == 0 or total % num_shards != 0:
+        return None
+    shard_size = total // num_shards
+    if shard_size % num_updates != 0:
+        return None
+
+    try:
+        conditions = BagelT2TIDiffusionConditions.from_dict(track.conditions)
+    except ValueError:
+        return None
+    if conditions.batch_size != total:
+        return None
+
+    update_size = shard_size // num_updates
+    replay_depths = [len(spec.chunk_offsets) - 1 for spec in conditions.replay_specs]
+    planned: List[List[List[int]]] = [[[] for _ in range(num_updates)] for _ in range(num_shards)]
+
+    for update in range(num_updates):
+        members = [
+            rank * shard_size + update * update_size + offset
+            for rank in range(num_shards)
+            for offset in range(update_size)
+        ]
+        members.sort(key=lambda index: (-replay_depths[index], index))
+        loads = [0 for _ in range(num_shards)]
+        for start in range(0, len(members), num_shards):
+            bucket = members[start : start + num_shards]
+            ranks = sorted(range(num_shards), key=lambda rank: (loads[rank], rank))
+            for rank, index in zip(ranks, bucket):
+                planned[rank][update].append(index)
+                loads[rank] += replay_depths[index]
+
+    permutation = [
+        index for rank in range(num_shards) for update in range(num_updates) for index in planned[rank][update]
+    ]
+    if len(permutation) != total or len(set(permutation)) != total:
+        raise RuntimeError("BAGEL T2TI replay planner did not produce a complete permutation.")
+    return torch.tensor(permutation, dtype=torch.long)
 
 
 def deep_hydrate(obj: Any) -> Any:
@@ -163,6 +220,8 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
+        self._train_dp_size = int(self.pool.num_devices)
+        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         # Colocate memory dance: offload the FSDP train state (base + grads +
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
@@ -920,6 +979,41 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id=rollout_id,
             media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
         )
+        if self._strict_bagel_t2ti:
+            ar_track = resp.tracks[AR_TRACK]
+            image_track = resp.tracks[IMAGE_TRACK]
+            if ar_track.batch_size != image_track.batch_size:
+                raise RuntimeError(
+                    "BAGEL T2TI replay balancing requires 1:1 AR/image tracks; "
+                    f"got {ar_track.batch_size} and {image_track.batch_size}."
+                )
+            permutation = _bagel_t2ti_replay_permutation(
+                image_track,
+                num_shards=self._train_dp_size,
+                num_updates=self._num_updates_per_batch,
+            )
+            if permutation is not None:
+                replay_specs = BagelT2TIDiffusionConditions.from_dict(image_track.conditions).replay_specs
+                depths = [len(spec.chunk_offsets) - 1 for spec in replay_specs]
+                shard_size = len(depths) // self._train_dp_size
+
+                def padded_work(order: List[int]) -> int:
+                    return sum(
+                        max(depths[order[rank * shard_size + offset]] for rank in range(self._train_dp_size))
+                        for offset in range(shard_size)
+                    )
+
+                original_work = padded_work(list(range(len(depths))))
+                balanced_work = padded_work(permutation.tolist())
+                logger.info(
+                    "BAGEL T2TI replay balancing: collective traversal target %d -> %d (%.1f%% reduction)",
+                    original_work,
+                    balanced_work,
+                    100.0 * (original_work - balanced_work) / max(original_work, 1),
+                )
+                resp.tracks[AR_TRACK] = ar_track.select(permutation)
+                resp.tracks[IMAGE_TRACK] = image_track.select(permutation)
+
         # 5. Two backward (shared backbone) → one optimizer step.
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             resp.tracks[AR_TRACK],

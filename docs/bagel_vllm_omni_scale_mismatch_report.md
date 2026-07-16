@@ -26,6 +26,16 @@ completed all 768 T2TI samples, but training deadlocked when ranks with differen
 exact replay depths entered different FSDP2 collectives. That is a separate
 distributed-ordering defect from the original one-GPU paging bottleneck.
 
+An initial repair equalized the number of decoder calls with a graph-connected
+no-cache hidden-state chain. A second eight-H20 run (`uqem9ggy`) proved that
+call-count equality was necessary but insufficient: all 96 old-policy contexts
+per rank completed in lockstep, AR backward completed, and all 48 update-0 image
+references completed, but the first image RatioNorm backward deadlocked. Native
+stacks showed seven ranks recomputing BAGEL's cached attention branch while one
+rank recomputed the no-cache padding branch. The replacement repair therefore
+uses a bounded, cache-faithful continuation and is not considered production
+validated until the next CUDA/NCCL run reaches an optimizer step.
+
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
 once-per-update reference swap, and the other lifecycle fixes, and measured
@@ -119,6 +129,18 @@ adversarial two-rank FSDP2 test still deadlocked when one rank's backward
 reduce-scatter met the other rank's pre-backward all-gather. The exact path must
 make repeated-module traversal counts equal across ranks, not merely retain
 unsharded parameters after forward.
+
+The first count-equalized implementation also failed. In run `uqem9ggy`, all
+ranks crossed the previous rank-7 sample-83 boundary and completed the entire
+old-policy anchor. They then completed AR backward and update-0 reference
+preparation before allocations stopped changing during the first image
+backward. Native traces localized the mismatch to activation-checkpoint
+recomputation: seven ranks were in the cached branch around
+`qwen2_navit.py:580`, while one was in the no-cache branch around line 601.
+An adversarial FSDP2/NCCL reproducer confirmed the same all-gather versus
+reduce-scatter mismatch. A barrier, disabling activation checkpointing, and
+`reshard_after_forward=false` did not repair it. Forward call count and cached
+autograd topology both have to match.
 
 ## Traversal Accounting
 
@@ -267,7 +289,7 @@ first post-fix launch caused Hydra to reject the override before model startup,
 and the profile test now covers the declared/inherited value. That launch error
 was a validation wiring omission, not a cause of the original 25-minute phase.
 
-### 4. Collective-safe exact replay
+### 4. Cache-faithful collective padding
 
 Before the first exact decoder traversal for each sample, every pure-DP trainer
 rank now all-reduces its local chunk count with `MAX`. A rank with `C` real
@@ -275,13 +297,24 @@ chunks and collective target `T` executes the real reconstruction followed by
 `T-C` discarded decoder traversals. The returned KV cache, length, and rope
 position remain those of the real trace.
 
-The discarded traversals form a sequential, no-cache one-token hidden-state
-chain. Its input carries an exact-zero dependency on the real terminal K/V and
-its final exact zero is added to the replay log-prob. This preserves the required
-forward and reverse autograd traversal order while contributing zero to the
-objective and zero to semantic gradients. It also avoids a growing dummy KV
-continuation, whose retained graph would scale as `O(D*prefix + D^2)` for `D`
-padding calls.
+The discarded traversals now use the same cached
+`forward_cache_update_text(update_past_key_values=True)` path as real replay.
+The dummy context forks the real terminal `NaiveCache`, keeps the newest K/V
+slot from every layer, and executes a one-token cached update for each padding
+slot. After every call, the returned cache is forked and trimmed back to its
+newest slot. This preserves the per-layer cache recurrence and reverse FSDP hook
+order while bounding retained cache length at one token per layer instead of
+growing a full dummy prefix. The final exact zero touches terminal K/V from
+every layer and is added to the replay log-prob; the semantic cache returned to
+the image path is never mutated or advanced.
+
+The previous no-cache hidden chain has been removed. A production-path two-rank
+FSDP2 regression now uses fresh inputs per real chunk, three recurrent K/V
+layers, activation checkpointing, `reshard_after_forward=true`, unequal replay
+depths, and a semantic image traversal over the untouched real cache. The
+bounded cached repair completes and matches the independently averaged unpadded
+gradient exactly. Separate CUDA/NCCL adversarial tests passed depths 100 versus
+3 on two ranks and 30/3/4/5 on four ranks.
 
 The synchronization deliberately targets the current `fsdp_mode=full`, `SP=1`
 recipe, where the default process group is the FSDP data-parallel world. It does
@@ -289,18 +322,36 @@ not claim HSDP, tensor/sequence-parallel, Ulysses, or expert-parallel support;
 those layouts need their exact shard group and may impose activation-shape
 collectives that a one-token dummy cannot satisfy.
 
+### 5. Replay-depth-aware DP ownership
+
+The driver now applies one deterministic permutation to both 1:1 AR and image
+tracks before `DP_SCATTER`. For each optimizer update independently, it sorts
+samples by exact replay depth, groups adjacent depths in buckets of DP size, and
+assigns one sample from every bucket to each rank while balancing cumulative
+load. The output still has equal contiguous shards, preserves each update's
+original global membership, and keeps every AR/image row and advantage paired.
+It changes ownership and reduction order only; `P=32`, `N=24`, `M=1`, `U=2`,
+the 768 global samples, and exact replay math are unchanged.
+
+An offline analysis of the captured 8x96 trace estimated that the summed
+per-position collective target falls from 50,030 to 29,507 replay traversals,
+1.752x to 1.034x the average real work. The new run logs the realized before and
+after target from its own 768 traces; the estimate is not a wall-time result.
+
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | focused replay/lifecycle/scale suite passes; exact padding covers grad and no-grad paths, semantic-cache preservation, and gradient parity |
-| Two-rank FSDP2 ordering | passed on CPU/Gloo | unequal real depths, dependent bounded padding, activation checkpointing, `reshard_after_forward=true`, repeated image calls, and RatioNorm-like loss completed with equal peer gradients and matched an unsharded reference |
+| Unit and config regression | passed | 96 passed, 1 skipped in the focused BAGEL/Omni suite; cached padding covers grad/no-grad paths, bounded K/V, semantic-cache preservation, pairing, update membership, and gradient parity |
+| Two-rank FSDP2 ordering | passed on CPU/Gloo | production replay helper, unequal 2-vs-5 real depths, three-layer K/V recurrence, activation checkpointing, `reshard_after_forward=true`, and a semantic image call completed and matched averaged unpadded gradients |
+| Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
 | One-H20 end-to-end smoke | mechanical execution completed | exit 0, four images, finite losses, optimizer step, 485.035 s train; tested replay mode failed numerical parity |
 | Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
 | Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
 | Reference-hoist parity | unit-tested, not GPU-instrumented | lifecycle/error cleanup is covered; `N -> U` swap counts and full gradient parity still need instrumentation |
-| Eight-H20 global batch 32 before balancing | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
-| Eight-H20 global batch 32 after balancing | pending | requires Torch 2.11/CUDA/NCCL validation of the new collective-safe exact replay |
+| Eight-H20 global batch 32 without padding | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
+| Eight-H20 count-equalized hidden padding | **failed** | all anchors, AR backward, and update-0 reference prep completed; cached-vs-no-cache topology deadlocked the first image backward (`uqem9ggy`) |
+| Eight-H20 cache-faithful padding plus DP balancing | pending | requires Torch 2.11/CUDA/NCCL validation through the first image backward and optimizer metric |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; validate the one-node batch-32 run first |
 | Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
 
@@ -314,12 +365,15 @@ geometry, or distributed FSDP ordering.
 The incident bottleneck and the recipe scale mismatch are confirmed. The code
 now separates production from smoke geometry, hoists the full-FT reference swap,
 captures replay metadata, collectively balances exact replay traversal depth,
-and includes a measurable fast-path experiment. The
+uses cache-faithful bounded padding, redistributes replay depths without changing
+batch or update membership, and includes a measurable fast-path experiment. The
 combined experimental build measured 3.09-3.15x faster in one matched-geometry
 comparison, but both collapsed candidates changed replay outputs beyond the
 preset parity budget. The fast path is not enabled by default, and the exact
-production replay multiplier remains a throughput cost even though its FSDP
-ordering now has an implementation-level repair.
+production replay multiplier remains a throughput cost. The replacement FSDP
+ordering repair has passed focused CPU/Gloo and CUDA/NCCL adversarial tests but
+is not labeled end-to-end fixed until the batch-32 H20 run emits an optimizer
+metric.
 
 The next production-safe optimization should preserve exact chunk math while
 removing duplicate reconstruction: phase image training per optimizer update so
