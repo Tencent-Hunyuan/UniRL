@@ -79,8 +79,11 @@ def _boundary_segment() -> object:
         sigmas=torch.tensor([0.8, 0.4], dtype=torch.float32),
         indices=torch.tensor([0, 1], dtype=torch.long),
         sde_indices=torch.tensor([0], dtype=torch.long),
-        sde_logp=torch.tensor([[0.1]], dtype=torch.float32),
-        sde_means=torch.tensor([[[[0.2]]]], dtype=torch.float32),
+        # On-policy for context_scale=1.5: 0.7 * 0.3 + 0.4 * 1.5 = 0.81.
+        # Keeping the ratio inside the clip window makes the gradient-boundary
+        # assertion exercise the context path instead of a clipped constant.
+        sde_logp=torch.tensor([[0.81]], dtype=torch.float32),
+        sde_means=torch.tensor([[[[0.81]]]], dtype=torch.float32),
     )
 
 
