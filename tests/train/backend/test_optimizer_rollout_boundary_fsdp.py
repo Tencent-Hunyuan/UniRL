@@ -71,6 +71,7 @@ def _run_optimizer_boundary_fsdp_worker(
     try:
         from torch.distributed.device_mesh import init_device_mesh
         from torch.distributed.fsdp import fully_shard
+        from torch.distributed.tensor import DTensor
 
         device = torch.device("cuda", rank)
         torch.cuda.set_device(device)
@@ -112,12 +113,14 @@ def _run_optimizer_boundary_fsdp_worker(
         # This is torch 2.11 AdamW's non-capturable state layout: step is a
         # CPU-native scalar while both moment buffers follow the parameter.
         assert all(value.shape == () and _local_tensor(value).device.type == "cpu" for _, _, value in step_slots)
+        assert all(isinstance(value, DTensor) for _, _, value in moment_slots)
         assert all(_local_tensor(value).device == device for _, _, value in moment_slots)
         step_ids = tuple(id(value) for _, _, value in step_slots)
         step_values = tuple(value.item() for _, _, value in step_slots)
         moment_values = {
             (id(state), key): _local_tensor(value).detach().cpu().clone() for state, key, value in moment_slots
         }
+        moment_placements = {(id(state), key): tuple(value.placements) for state, key, value in moment_slots}
         expected_moment_bytes = _optimizer_state_local_nbytes(
             optimizer,
             keys={"exp_avg", "exp_avg_sq"},
@@ -133,6 +136,10 @@ def _run_optimizer_boundary_fsdp_worker(
         assert first_park["grad_bytes_cleared"] > 0
         assert first_park["optimizer_state_bytes_parked"] == expected_moment_bytes
         assert all(_local_tensor(state[key]).device.type == "cpu" for state, key, _value in moment_slots)
+        assert all(isinstance(state[key], DTensor) for state, key, _value in moment_slots)
+        assert all(
+            tuple(state[key].placements) == moment_placements[(id(state), key)] for state, key, _value in moment_slots
+        )
         assert tuple(id(state["step"]) for state, _, _ in step_slots) == step_ids
         assert all(state["step"].device.type == "cpu" for state, _, _ in step_slots)
 
@@ -153,6 +160,10 @@ def _run_optimizer_boundary_fsdp_worker(
         first_restore = backend.restore_optimizer_state_after_rollout()
         assert 0 < first_restore["optimizer_state_bytes_restored"] <= expected_moment_bytes
         assert all(_local_tensor(state[key]).device == device for state, key, _value in moment_slots)
+        assert all(isinstance(state[key], DTensor) for state, key, _value in moment_slots)
+        assert all(
+            tuple(state[key].placements) == moment_placements[(id(state), key)] for state, key, _value in moment_slots
+        )
         assert all(state["step"].device.type == "cpu" for state, _, _ in step_slots)
         repeated_restore = backend.restore_optimizer_state_after_rollout()
         assert repeated_restore["optimizer_state_bytes_restored"] == 0
@@ -174,8 +185,7 @@ def _run_optimizer_boundary_fsdp_worker(
         )
 
         # A real FSDP2 forward/backward and AdamW step is the final device-layout
-        # oracle. In particular, it fails if CPU-native steps were moved to CUDA
-        # or any moment was left parked.
+        # oracle after the explicit placement checks above.
         before_step = tuple(_local_tensor(parameter.detach()).clone() for parameter in model.parameters())
         _loss(model, rank=rank, phase=2, device=device).backward()
         optimizer.step()
