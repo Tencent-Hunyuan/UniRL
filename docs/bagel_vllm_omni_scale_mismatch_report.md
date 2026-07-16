@@ -55,8 +55,16 @@ loops the native chunks while its parameters are resident. Unequal trace depths
 therefore change local inner work rather than the number or order of distributed
 wrapper collectives. This path is bit-exact against chunk-major on the real
 BAGEL/FlashAttention H20 stack and has passed unequal-depth FSDP2 ordering on
-both CPU/Gloo and bf16-compute/fp32-master CUDA/NCCL. End-to-end batch-32 timing
-remains the deployment gate.
+both CPU/Gloo and bf16-compute/fp32-master CUDA/NCCL.
+
+The first layer-major eight-H20 run with the exact requested geometry
+(`P=32, N=24, M=1, U=2`) completed all 768 native vLLM-Omni samples and both
+optimizer updates in one round. W&B measured 3,148.119 s of training and
+3,984.172 s end to end. The next round did not start: after Adam state had been
+created and completed gradients remained resident, vLLM-Omni Stage 1 could not
+remap its sleeping `CuMemAllocator` pool. The run exited on the next wake with a
+CUDA OOM. This is a post-round trainer/rollout lifecycle overlap, not a failure
+of the completed replay/backward round.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -99,6 +107,63 @@ progress through RatioNorm backward, FSDP `foreach_reduce`, and then
 `_single_tensor_adam`; it no longer remained in the per-token context rebuild.
 Those samples identify substantial remaining CPU-offload/optimizer cost, but do
 not prove the residual 485 s is irreducible or free of other bottlenecks.
+
+## R3 Exact Batch-32 Result
+
+Run [`rqjoxria`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/rqjoxria), at
+code revision `6e39f70d`, used one node with eight H20s, exact layer-major
+replay, the native Stage-0-to-Stage-1 gradient boundary, no persistent FSDP CPU
+offload, and no whole-trainer lifecycle offload. Its resolved geometry was the
+requested global `P=32, N=24, M=1, U=2`: 32 prompt groups, 24 thoughts and one
+image per thought, 768 paired samples, and two disjoint optimizer updates.
+
+The W&B SDK returned one complete round with these driver wall times:
+
+| Phase | Seconds |
+| --- | ---: |
+| vLLM-Omni wake | 2.4502 |
+| native generate | 824.3466 |
+| vLLM-Omni sleep | 2.9709 |
+| reward | 6.2722 |
+| train, both updates | 3,148.1194 |
+| total round | 3,984.1721 |
+
+The round therefore took 66m24.2s, of which training took 52m28.1s and native
+generation took 13m44.3s. The training-phase diagnostics were:
+
+| Train phase | Update 0 | Update 1 |
+| --- | ---: | ---: |
+| AR backward | 30.8399 s | 31.0244 s |
+| eager image anchor | 742.7420 s | -- |
+| image context/reference preparation | 356.2396 s | 377.9501 s |
+| image RatioNorm + MSE backward | 692.0468 s | 842.8917 s |
+| pre-optimizer cache reclaim | 1.8565 s | 2.2655 s |
+| optimizer | 1.1571 s | 0.1573 s |
+
+These per-phase fields came from the r3 rank selected by the then-current DP
+collector; the later DP-critical-path maximum reduction was not in revision
+`6e39f70d`. The driver-level `train_time_s` and `step_time_s` above are the
+authoritative end-to-end intervals.
+
+The round was numerically finite. PickScore reward mean/std/min/max was
+`0.776082/0.083199/0.537614/0.969348`, with zero zero-variance prompt groups.
+Update-0 image ratios were exactly 1.0. Update-1 image ratio
+mean/std/min/max was
+`1.000000145/0.000001464/0.999998755/1.000001547`; shared gradient norms were
+`0.186666` and `0.180893`. Replay-depth ownership reduced the measured
+collective-work estimate from 37,683 to 21,695. The native trace depth had
+mean 216.766, min/median/p90/p99/max `19/190/332/577/1024`.
+
+External `nvidia-smi` sampling during image backward observed cyclic peaks on
+all cards rather than monotonic growth. The worst sample was 97,281 MiB used of
+97,871 MiB, only 590 MiB free. Both updates nevertheless completed. After the
+19:38:22 completion log, the next rollout tried to wake Stage 1 at about
+19:38:41 and failed while remapping the vLLM `CuMemAllocator` pool at
+`cumem_allocator.cpp:139`; the run exited 1. The first rollout had woken before
+Adam was initialized. At the second wake, FSDP parameters, newly created Adam
+state, and completed gradients overlapped the Stage-1 remap. This chronology
+and the later clean release to zero device memory identify a rollout-boundary
+footprint problem, not a leak or an OOM inside the completed training round.
 
 ## Scale Mismatch
 
@@ -409,6 +474,50 @@ inner compute duration between those synchronized outer entries. Cache-faithful
 padding remains available for the chunk-major exact path as a validated
 fallback.
 
+### 7. Post-r3 memory and replay controls
+
+R3 established the timing and memory baseline but ran revision `6e39f70d`; the
+following controls were implemented afterward and have not yet been validated
+by an r4 end-to-end run.
+
+**Lazy exact update-0 anchor.** Because the two updates consume disjoint
+mini-batches, update 0's exact current replay occurs at the same weights as its
+old-policy anchor. The trainer now detaches that replay's log-probability and
+transition mean for the update-0 anchor, while still eagerly computing all
+later-update anchors before optimizer 0. At the r3 geometry this changes eager
+anchor replays from 96 to 48 per rank and total Stage-0 context builds from 192
+to 144 per rank without accepting cross-runtime rollout means or changing the
+old-policy state.
+
+**Prepared replay-data staging.** Detached Stage-0 caches and frozen reference
+velocities queued for future image micros can now be staged on CPU and hydrated
+one micro at a time. These are graph-free replay inputs and targets. This path
+does not move FSDP parameters, gradients, optimizer state, or the rollout engine
+and is therefore distinct from model-state CPU offload.
+
+**Allocator reclamation and telemetry.** The production stack can return
+inactive cached blocks after each image micro and optimizer step, reset peak
+counters per update, and report peak allocated/reserved memory using a maximum
+over DP workers. This does not reduce the live tensor requirement; it addresses
+the observed sub-GiB fragmentation margin and makes the next H20 result
+measurable.
+
+**Optimizer-only rollout parking.** Before an external vLLM-Omni wake, the
+trainer now clears completed gradients and moves only sharded Adam state to CPU.
+Adam is restored only after every Omni stage acknowledges sleep. FSDP parameters
+and shards remain GPU-resident, and configuration validation requires both
+`enable_fsdp_offload=false` and `backend.fsdp_cfg.cpu_offload=false`. This narrow
+boundary directly targets the completed-gradients-plus-Adam overlap that caused
+r3's second Stage-1 wake OOM; it is not persistent or whole-trainer FSDP CPU
+offload.
+
+**Flow-many remains gated.** An exact CFG=1 implementation can traverse all
+selected SDE velocity streams inside one layer-major decoder pass, reducing
+wrapped-layer entries across anchor, reference, and policy velocity replay. It
+may retain more simultaneous activations, so the production profile keeps
+`t2ti_flow_many_enabled=false` until an instrumented r4 H20 memory and numerical
+gate passes. No r4 throughput or memory success is claimed here.
+
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
@@ -427,9 +536,11 @@ fallback.
 | Eight-H20 global batch 32 without padding | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
 | Eight-H20 count-equalized hidden padding | **failed** | all anchors, AR backward, and update-0 reference prep completed; cached-vs-no-cache topology deadlocked the first image backward (`uqem9ggy`) |
 | Eight-H20 cache-faithful padding plus DP balancing | optimizer-0 gate passed; update 1 OOMed | `7d62ya97` completed optimizer 0 with no ordering failure, then fragmented at update-1 image micro 0; roughly three-hour first update remains unacceptable |
-| Eight-H20 layer-major batch 32 | pending | both prerequisite CUDA gates passed; compare first-optimizer wall time and update-1 memory against `7d62ya97` |
-| 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; validate the one-node batch-32 run first |
-| Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
+| Eight-H20 layer-major batch 32 | full training round passed; next wake OOMed | `rqjoxria` completed all 768 native samples and both updates in 3,984.172 s total; the following Stage-1 wake failed while Adam and completed gradients were resident |
+| Post-r3 memory/lifecycle controls | unit/config covered; H20 pending | lazy update-0 anchor, prepared replay-data staging, allocator reclaim/telemetry, and optimizer-only rollout parking are implemented; r4 must pass the next wake and another round before they are accepted |
+| Flow-many H20 gate | disabled, pending r4 | exact CFG=1 implementation and focused parity/collective tests exist, but production remains `t2ti_flow_many_enabled=false` until peak memory is measured |
+| 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; first prove repeatable r4 rounds on the one-node batch-32 geometry |
+| Reward learning curve | not established | r3 produced one finite reward point (`0.776082` mean); one round cannot establish reward growth |
 
 The standalone checker does compare per-layer K/V, Stage-1 velocity, transition
 mean, log-prob, and representative decoder gradients with fixed stochastic
@@ -443,32 +554,24 @@ two-H20 FSDP2 gate covers collective topology with a production-shaped toy.
 ## Disposition
 
 The incident bottleneck and the recipe scale mismatch are confirmed. The code
-now separates production from smoke geometry, hoists the full-FT reference swap,
-captures replay metadata, collectively balances exact replay traversal depth,
-uses cache-faithful bounded padding, redistributes replay depths without changing
-batch or update membership, and can traverse exact replay layer-major. The
-combined experimental build measured 3.09-3.15x faster in one matched-geometry
-comparison, but both collapsed candidates changed replay outputs beyond the
-preset parity budget and remain disabled. Cache-faithful chunk-major replay has
-now passed a real eight-H20 optimizer gate, proving the distributed correctness
-repair, while also proving that its remaining wrapper multiplier is too slow.
+now separates production from smoke geometry, balances exact replay depth, and
+uses exact layer-major replay without changing native chunks or logical
+`P/N/M/U`. R3 proved that this path can complete one eight-H20 batch-32 training
+round: both optimizer updates finished in 52m28.1s and the whole round finished
+in 66m24.2s. That is materially below the prior roughly three-hour first-update
+baseline, but it is not yet sustained throughput: the next Stage-1 wake OOMed.
 
-The immediate production candidate is layer-major exact replay. It changes
-neither native chunk geometry nor logical `P/N/M/U` scale, removes collective
-padding, and targets the FSDP/checkpoint wrapper overhead exposed by the
-three-hour baseline. The first optimized launch deliberately keeps
-`reuse_ratio_context_for_mse=false`; phasing RatioNorm before the reference swap
-would retain image gradients beside the fp32 live-weight stash, and the baseline
-already fragmented at the second-update peak. The launcher defaults the train
-actor to `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the optimized
-run. Omni spawn descendants receive the remaining allocator options without
-expandable segments because its sleep-mode memory pool is incompatible with
-them. This does not use offload or reduce batch size. Context reuse is
-implemented as a separate follow-on optimization and remains disabled until an
-instrumented peak-memory gate passes.
+The current r4 candidate retains `P=32, N=24, M=1, U=2`, exact replay, and
+GPU-resident FSDP parameters/shards. It adds the exact lazy update-0 anchor,
+one-micro prepared replay-data staging, allocator reclamation/telemetry, and
+optimizer-only rollout parking. The last mechanism temporarily parks sharded
+Adam state and clears completed gradients; it does not enable persistent or
+lifecycle FSDP CPU offload. Flow-many is implemented but remains explicitly
+disabled pending the H20 peak-memory gate.
 
-Real captured BAGEL/FlashAttention parity and unequal-depth CUDA/NCCL FSDP2
-ordering now pass. The remaining gate is the same one-node batch-32 run through
-both optimizer updates with materially lower wall time and no fragmentation.
-Only then should the 32-device `P=32, N=24, M=1, U=2` run be used to evaluate
-sustained throughput and reward growth.
+The immediate acceptance test is an instrumented r4 run on the same one-node
+geometry through the second rollout wake and both subsequent updates, with no
+OOM, finite ratios/losses, and measured critical-path memory and wall time. No
+r4 success has been observed yet. A repeatable one-node result is required
+before scaling to 32 devices and collecting enough rounds to judge reward-curve
+growth.
