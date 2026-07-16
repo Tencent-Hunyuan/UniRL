@@ -273,11 +273,14 @@ def distributed(
     *,
     dispatch_mode: Dispatch = Dispatch.DP_SCATTER,
     execute_mode: Execute = Execute.ALL,
+    collect_fn: Optional[CollectFn] = None,
 ) -> Callable:
     """Declare SPMD dispatch/execute mode on a Role method.
 
     Handle scans for this attribute and auto-generates proxy methods.
-    Default dispatch mode is DP_SCATTER.
+    Default dispatch mode is DP_SCATTER. ``collect_fn`` can override the
+    dispatch mode's standard controller-side result collector for methods with
+    specialized reduction semantics.
 
     Usage:
         class DiffusionRemote(Remote):
@@ -301,6 +304,7 @@ def distributed(
             {
                 "dispatch_mode": dispatch_mode,
                 "execute_mode": execute_mode,
+                "collect_fn": collect_fn,
             },
         )
         return wrapper

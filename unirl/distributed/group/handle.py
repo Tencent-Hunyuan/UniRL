@@ -331,7 +331,7 @@ class Handle:
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]
             dispatch_fn = fns["dispatch_fn"]
-            collect_fn = fns["collect_fn"]
+            collect_fn = config.get("collect_fn") or fns["collect_fn"]
 
             if config["execute_mode"] == Execute.ALL:
                 execute_fn = self._execute_all

@@ -5,10 +5,123 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+from unirl.distributed.group.dispatch import DISTRIBUTED_CONFIG_ATTR
 from unirl.train.stack import TrainStepResult
-from unirl.train.unified_model_stack import UnifiedModelTrainStack
+from unirl.train.unified_model_stack import UnifiedModelTrainStack, _collect_unified_train_results
 from unirl.types.rollout_resp import RolloutTrack
 from unirl.types.segments import make_image_segment
+
+
+def _train_result(
+    *,
+    metrics: dict[str, float],
+    per_update: tuple[dict[str, float], ...] = (),
+) -> TrainStepResult:
+    return TrainStepResult(
+        loss=1.0,
+        grad_norm=0.5,
+        lr=1.0e-6,
+        has_backward=True,
+        micros=[],
+        metrics=metrics,
+        per_update=per_update,
+    )
+
+
+def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) -> None:
+    class Rank:
+        def __init__(self, *, sp_rank: int) -> None:
+            self.tp_rank = 0
+            self.is_pipeline_last_stage = True
+            self.sp_rank = sp_rank
+
+    class WorkerGroup:
+        # Two DP groups with two SP ranks each. Only ranks 0 and 2 are DP heads.
+        rank_infos = [Rank(sp_rank=0), Rank(sp_rank=1), Rank(sp_rank=0), Rank(sp_rank=1)]
+
+    rank_zero = {
+        "ar": _train_result(
+            metrics={"ar_backward_host_time_s": 3.0, "ratio_mean": 1.0},
+            per_update=(
+                {"ar_backward_host_time_s": 2.0, "loss": 10.0},
+                {"ar_backward_host_time_s": 4.0, "loss": 11.0},
+            ),
+        ),
+        "image": _train_result(
+            metrics={"optimizer_host_time_s": 6.0, "ratio_mean": 1.0},
+            per_update=(
+                {"optimizer_host_time_s": 5.0, "loss": 20.0},
+                {"optimizer_host_time_s": 7.0, "loss": 21.0},
+            ),
+        ),
+    }
+    other_dp_head = {
+        "ar": _train_result(
+            metrics={"ar_backward_host_time_s": 5.0, "ratio_mean": 9.0},
+            per_update=(
+                {"ar_backward_host_time_s": 8.0, "loss": 90.0},
+                {"ar_backward_host_time_s": 3.0, "loss": 91.0},
+            ),
+        ),
+        "image": _train_result(
+            metrics={"optimizer_host_time_s": 8.0, "ratio_mean": 9.0},
+            per_update=(
+                {"optimizer_host_time_s": 6.0, "loss": 92.0},
+                {"optimizer_host_time_s": 10.0, "loss": 93.0},
+            ),
+        ),
+    }
+    ignored_sp_rank = {
+        "ar": _train_result(metrics={"ar_backward_host_time_s": 1_000.0}),
+        "image": _train_result(metrics={"optimizer_host_time_s": 1_000.0}),
+    }
+
+    def fail_sync(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("controller reduction must not synchronize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", fail_sync)
+    collected = _collect_unified_train_results(
+        WorkerGroup(),
+        [rank_zero, ignored_sp_rank, other_dp_head, ignored_sp_rank],
+    )
+
+    assert collected["ar"].per_update == (
+        {"ar_backward_host_time_s": 8.0, "loss": 10.0},
+        {"ar_backward_host_time_s": 4.0, "loss": 11.0},
+    )
+    assert collected["ar"].metrics == {"ar_backward_host_time_s": 6.0, "ratio_mean": 1.0}
+    assert collected["image"].per_update == (
+        {"optimizer_host_time_s": 6.0, "loss": 20.0},
+        {"optimizer_host_time_s": 10.0, "loss": 21.0},
+    )
+    assert collected["image"].metrics == {"optimizer_host_time_s": 8.0, "ratio_mean": 1.0}
+
+
+def test_unified_train_collector_reduces_single_update_phase_times() -> None:
+    class Rank:
+        tp_rank = 0
+        is_pipeline_last_stage = True
+        sp_rank = 0
+
+    class WorkerGroup:
+        rank_infos = [Rank(), Rank()]
+
+    collected = _collect_unified_train_results(
+        WorkerGroup(),
+        [
+            {"image": _train_result(metrics={"anchor_image_host_time_s": 4.0, "ratio_mean": 1.0})},
+            {"image": _train_result(metrics={"anchor_image_host_time_s": 9.0, "ratio_mean": 2.0})},
+        ],
+    )
+
+    assert collected["image"].metrics == {"anchor_image_host_time_s": 9.0, "ratio_mean": 1.0}
+
+
+def test_unified_train_track_registers_critical_path_collector() -> None:
+    config = getattr(UnifiedModelTrainStack.train_track, DISTRIBUTED_CONFIG_ATTR)
+
+    assert config["collect_fn"] is _collect_unified_train_results
 
 
 def test_update_preparation_runs_immediately_before_its_backward() -> None:

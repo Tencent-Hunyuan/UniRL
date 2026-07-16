@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import torch
 
 from unirl.algorithms import AlgorithmStepResult, StageAlgorithm
-from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.distributed.group.dispatch import Dispatch, _collect_dp_merge, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult, _build_micro_batch_slices
@@ -52,6 +52,85 @@ from unirl.types.rollout_resp import RolloutTrack
 from unirl.utils.misc import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
+
+_PHASE_HOST_TIME_METRICS = frozenset(
+    {
+        "anchor_image_host_time_s",
+        "ar_backward_host_time_s",
+        "image_prepare_reference_host_time_s",
+        "image_ratio_mse_backward_host_time_s",
+        "pre_optimizer_empty_cache_host_time_s",
+        "optimizer_host_time_s",
+    }
+)
+
+
+def _max_phase_times(base: Mapping[str, object], peers: List[Mapping[str, object]]) -> Dict[str, object]:
+    """Copy ``base`` while reducing BAGEL host phase intervals over DP peers."""
+    reduced = dict(base)
+    for metric_name in _PHASE_HOST_TIME_METRICS:
+        values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
+        if values:
+            reduced[metric_name] = max(values)
+    return reduced
+
+
+def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
+    """Use DP critical-path maxima for BAGEL phase timings.
+
+    The standard DP collector intentionally selects scalar fields from the first
+    DP result. Keep that behavior for losses and algorithm metrics, but reduce the
+    diagnostic host timers across DP heads after every worker RPC has returned.
+    This is controller-only work: it adds neither a training collective nor a CUDA
+    synchronization.
+    """
+    collected = _collect_dp_merge(wg, results)
+    if collected is None or not isinstance(collected, dict):
+        return collected
+
+    dp_results = [
+        results[i]
+        for i in range(len(results))
+        if wg.rank_infos[i].tp_rank == 0
+        and wg.rank_infos[i].is_pipeline_last_stage
+        and wg.rank_infos[i].sp_rank == 0
+        and isinstance(results[i], dict)
+    ]
+    if len(dp_results) <= 1:
+        return collected
+
+    reduced: Dict[str, TrainStepResult] = {}
+    for track_name, base_result in collected.items():
+        peer_results = [result[track_name] for result in dp_results if track_name in result]
+        if not peer_results or not isinstance(base_result, TrainStepResult):
+            reduced[track_name] = base_result
+            continue
+
+        per_update = tuple(base_result.per_update)
+        if per_update:
+            reduced_updates = []
+            for update_index, base_metrics in enumerate(per_update):
+                peer_metrics = [
+                    peer.per_update[update_index] for peer in peer_results if update_index < len(peer.per_update)
+                ]
+                reduced_updates.append(_max_phase_times(base_metrics, peer_metrics))
+
+            summary_metrics = dict(base_result.metrics)
+            for metric_name in _PHASE_HOST_TIME_METRICS:
+                values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
+                if values:
+                    summary_metrics[metric_name] = sum(values) / len(values)
+            reduced[track_name] = replace(
+                base_result,
+                metrics=summary_metrics,
+                per_update=tuple(reduced_updates),
+            )
+        else:
+            reduced[track_name] = replace(
+                base_result,
+                metrics=_max_phase_times(base_result.metrics, [peer.metrics for peer in peer_results]),
+            )
+    return reduced
 
 
 def _profile_record(profiler: Any, name: str):
@@ -380,7 +459,7 @@ class UnifiedModelTrainStack(Remote):
             self._profiler_cache = cached
         return cached
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, collect_fn=_collect_unified_train_results)
     def train_track(
         self,
         ar_track: RolloutTrack,
