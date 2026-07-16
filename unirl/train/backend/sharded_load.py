@@ -60,17 +60,15 @@ def load_trainable_weights(
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
         load_sharded(model, weights_path, device=device, strict=False)
-        # Recover init-computed non-persistent state (RoPE inv_freq, sincos tables,
-        # …) clobbered by meta-init `to_empty` and not carried by the checkpoint.
-        # The bundle carries the capture (capture_init_state); restoring here — in
-        # the shared post-load path — is robust to the live trainer's Ray-actor
-        # boundaries where the model-bound deferred closure can be dropped. Without
-        # this the train model keeps garbage RoPE -> garbage replay log-probs ->
-        # the DRPO rollout/replay ratio collapses (~0.05) and nothing learns.
+        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
+        # tables, …) captured on the bundle before meta-init's `to_empty` clobbered
+        # them and not carried by the checkpoint. Restoring here — in the shared
+        # post-load path — is robust to the live trainer's Ray-actor boundaries where
+        # a model-bound deferred closure can be dropped. Without this the train model
+        # keeps garbage RoPE -> garbage replay log-probs -> the DRPO rollout/replay
+        # ratio collapses (~0.05) and nothing learns.
         from unirl.models.types.meta_init import restore_init_state
 
-        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
-        # tables, …) captured on the bundle before meta-init's to_empty clobbered them.
         n_recovered = restore_init_state(model, getattr(bundle, "_meta_init_state", None))
         # Re-establish TIED weights (lm_head <-> embed_tokens). For tie_word_embeddings
         # models, meta-init's to_empty breaks the tie and the checkpoint carries NO
