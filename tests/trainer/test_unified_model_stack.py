@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from inspect import signature
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -49,10 +50,25 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
             ),
         ),
         "image": _train_result(
-            metrics={"optimizer_host_time_s": 6.0, "ratio_mean": 1.0},
+            metrics={
+                "optimizer_host_time_s": 6.0,
+                "cuda_peak_allocated_gb": 91.0,
+                "cuda_peak_reserved_gb": 93.0,
+                "ratio_mean": 1.0,
+            },
             per_update=(
-                {"optimizer_host_time_s": 5.0, "loss": 20.0},
-                {"optimizer_host_time_s": 7.0, "loss": 21.0},
+                {
+                    "optimizer_host_time_s": 5.0,
+                    "cuda_peak_allocated_gb": 80.0,
+                    "cuda_peak_reserved_gb": 85.0,
+                    "loss": 20.0,
+                },
+                {
+                    "optimizer_host_time_s": 7.0,
+                    "cuda_peak_allocated_gb": 91.0,
+                    "cuda_peak_reserved_gb": 93.0,
+                    "loss": 21.0,
+                },
             ),
         ),
     }
@@ -65,10 +81,25 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
             ),
         ),
         "image": _train_result(
-            metrics={"optimizer_host_time_s": 8.0, "ratio_mean": 9.0},
+            metrics={
+                "optimizer_host_time_s": 8.0,
+                "cuda_peak_allocated_gb": 96.0,
+                "cuda_peak_reserved_gb": 97.0,
+                "ratio_mean": 9.0,
+            },
             per_update=(
-                {"optimizer_host_time_s": 6.0, "loss": 92.0},
-                {"optimizer_host_time_s": 10.0, "loss": 93.0},
+                {
+                    "optimizer_host_time_s": 6.0,
+                    "cuda_peak_allocated_gb": 96.0,
+                    "cuda_peak_reserved_gb": 97.0,
+                    "loss": 92.0,
+                },
+                {
+                    "optimizer_host_time_s": 10.0,
+                    "cuda_peak_allocated_gb": 89.0,
+                    "cuda_peak_reserved_gb": 94.0,
+                    "loss": 93.0,
+                },
             ),
         ),
     }
@@ -93,10 +124,25 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
     )
     assert collected["ar"].metrics == {"ar_backward_host_time_s": 6.0, "ratio_mean": 1.0}
     assert collected["image"].per_update == (
-        {"optimizer_host_time_s": 6.0, "loss": 20.0},
-        {"optimizer_host_time_s": 10.0, "loss": 21.0},
+        {
+            "optimizer_host_time_s": 6.0,
+            "cuda_peak_allocated_gb": 96.0,
+            "cuda_peak_reserved_gb": 97.0,
+            "loss": 20.0,
+        },
+        {
+            "optimizer_host_time_s": 10.0,
+            "cuda_peak_allocated_gb": 91.0,
+            "cuda_peak_reserved_gb": 94.0,
+            "loss": 21.0,
+        },
     )
-    assert collected["image"].metrics == {"optimizer_host_time_s": 8.0, "ratio_mean": 1.0}
+    assert collected["image"].metrics == {
+        "optimizer_host_time_s": 8.0,
+        "cuda_peak_allocated_gb": 96.0,
+        "cuda_peak_reserved_gb": 97.0,
+        "ratio_mean": 1.0,
+    }
 
 
 def test_unified_train_collector_reduces_single_update_phase_times() -> None:
@@ -111,12 +157,24 @@ def test_unified_train_collector_reduces_single_update_phase_times() -> None:
     collected = _collect_unified_train_results(
         WorkerGroup(),
         [
-            {"image": _train_result(metrics={"anchor_image_host_time_s": 4.0, "ratio_mean": 1.0})},
-            {"image": _train_result(metrics={"anchor_image_host_time_s": 9.0, "ratio_mean": 2.0})},
+            {
+                "image": _train_result(
+                    metrics={"anchor_image_host_time_s": 4.0, "cuda_peak_reserved_gb": 77.0, "ratio_mean": 1.0}
+                )
+            },
+            {
+                "image": _train_result(
+                    metrics={"anchor_image_host_time_s": 9.0, "cuda_peak_reserved_gb": 88.0, "ratio_mean": 2.0}
+                )
+            },
         ],
     )
 
-    assert collected["image"].metrics == {"anchor_image_host_time_s": 9.0, "ratio_mean": 1.0}
+    assert collected["image"].metrics == {
+        "anchor_image_host_time_s": 9.0,
+        "cuda_peak_reserved_gb": 88.0,
+        "ratio_mean": 1.0,
+    }
 
 
 def test_unified_train_track_registers_critical_path_collector() -> None:
@@ -125,7 +183,94 @@ def test_unified_train_track_registers_critical_path_collector() -> None:
     assert config["collect_fn"] is _collect_unified_train_results
 
 
-def test_update_preparation_runs_immediately_before_its_backward() -> None:
+def test_cuda_reclamation_and_peak_telemetry_default_off() -> None:
+    parameters = signature(UnifiedModelTrainStack.__init__).parameters
+
+    assert parameters["empty_cache_after_image_micro"].default is False
+    assert parameters["empty_cache_after_optimizer"].default is False
+    assert parameters["cuda_peak_telemetry"].default is False
+
+
+def test_image_micro_reclamation_runs_after_each_image_backward_only(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeAlgorithm:
+        def compute_loss_and_backward(self, **kwargs):
+            del kwargs
+            events.append("backward")
+            return SimpleNamespace(loss=1.0, metrics={}, num_steps_or_tokens=1, has_backward=True)
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.algorithms = {"ar": FakeAlgorithm(), "image": FakeAlgorithm()}
+    stack.empty_cache_after_image_micro = True
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    track = RolloutTrack(
+        sample_ids=["sample-0", "sample-1"],
+        conditions={},
+        segment=make_image_segment(latents=torch.zeros(2, 1, 1, 1)),
+        advantages=torch.ones(2),
+    )
+
+    image_result, _ = stack._backward_track("image", track, [(0, 1), (1, 2)], training_progress=0.0)
+    stack._backward_track("ar", track, [(0, 1), (1, 2)], training_progress=0.0)
+
+    assert events == ["backward", "empty_cache", "backward", "empty_cache", "backward", "backward"]
+    assert float(image_result.metrics["image_micro_empty_cache_host_time_s"]) >= 0.0
+
+
+def test_post_optimizer_reclamation_and_peak_telemetry(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeBackend:
+        optimizer = SimpleNamespace(param_groups=[{"lr": 1.0e-6}])
+        scheduler = None
+
+        def zero_grad(self):
+            events.append("zero_grad")
+
+        def optimizer_step(self, *, max_grad_norm):
+            assert max_grad_norm == 1.0
+            events.append("optimizer_step")
+            return 0.5
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.fsdp_backend = FakeBackend()
+    stack.algorithms = {
+        "ar": SimpleNamespace(prepares_update_batch=False),
+        "image": SimpleNamespace(prepares_update_batch=False),
+    }
+    stack.num_updates_per_batch = 1
+    stack.max_grad_norm = 1.0
+    stack.empty_cache_after_optimizer = True
+    stack.cuda_peak_telemetry = True
+
+    def fake_backward(self, name, resp_track, micro_slices, *, training_progress):
+        del self, resp_track, micro_slices, training_progress
+        events.append(f"backward_{name}")
+        return _train_result(metrics={}), True
+
+    stack._backward_track = MethodType(fake_backward, stack)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: events.append("reset_peak"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 80 * 2**30)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 91 * 2**30)
+
+    results = stack._train_one_step(
+        {"ar": object(), "image": object()},
+        {"ar": [(0, 1)], "image": [(0, 1)]},
+        training_progress=0.0,
+    )
+
+    assert events == ["reset_peak", "zero_grad", "backward_ar", "backward_image", "optimizer_step", "empty_cache"]
+    assert results["image"].metrics["cuda_peak_allocated_gb"] == 80.0
+    assert results["image"].metrics["cuda_peak_reserved_gb"] == 91.0
+    assert float(results["image"].metrics["post_optimizer_empty_cache_host_time_s"]) >= 0.0
+    assert "cuda_peak_allocated_gb" not in results["ar"].metrics
+
+
+def test_update_preparation_runs_immediately_before_its_backward(monkeypatch) -> None:
     events: list[str] = []
     profile_ranges: list[str] = []
 
@@ -181,8 +326,21 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
         "ar": FakeAlgorithm("ar", prepares_update_batch=False),
         "image": FakeAlgorithm("image", prepares_update_batch=True),
     }
+    stack.empty_cache_after_optimizer = False
+    stack.cuda_peak_telemetry = False
     stack.num_updates_per_batch = 1
     stack.max_grad_norm = 1.0
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "reset_peak_memory_stats",
+        lambda: (_ for _ in ()).throw(AssertionError("default-off telemetry must not reset CUDA peaks")),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: (_ for _ in ()).throw(AssertionError("default-off reclamation must not empty the CUDA cache")),
+    )
 
     def fake_backward(self, name, resp_track, micro_slices, *, training_progress):
         del self, resp_track, training_progress
@@ -413,6 +571,8 @@ def test_failed_image_backward_finalizes_prepared_state() -> None:
         "ar": FakeAlgorithm("ar", prepares_update_batch=False),
         "image": FakeAlgorithm("image", prepares_update_batch=True),
     }
+    stack.empty_cache_after_optimizer = False
+    stack.cuda_peak_telemetry = False
 
     def fake_prepare(self, name, track, micro_slices, *, training_progress, update_index):
         del track, micro_slices, update_index

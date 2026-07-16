@@ -65,6 +65,9 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     assert cfg.reward.backend.config.device == "auto"
     assert cfg.reward.backend.config.batch_size == 8
     assert cfg.stack.num_updates_per_batch == 2
+    assert cfg.stack.empty_cache_after_image_micro is True
+    assert cfg.stack.empty_cache_after_optimizer is True
+    assert cfg.stack.cuda_peak_telemetry is True
 
 
 def test_single_gpu_smoke_profile_composes_reduced_overrides() -> None:
@@ -85,6 +88,9 @@ def test_single_gpu_smoke_profile_composes_reduced_overrides() -> None:
     assert smoke.reward.backend.config.device == "cpu"
     assert smoke.reward.backend.config.batch_size == 2
     assert smoke.stack.num_updates_per_batch == 1
+    assert smoke.stack.empty_cache_after_image_micro is False
+    assert smoke.stack.empty_cache_after_optimizer is False
+    assert smoke.stack.cuda_peak_telemetry is False
 
     # Smoke changes capacity, not the native two-stage or strict-sync contract.
     assert smoke.rollout == production.rollout

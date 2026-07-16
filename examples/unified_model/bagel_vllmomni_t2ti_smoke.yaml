@@ -35,6 +35,11 @@ reward:
 stack:
   # Keep the functional smoke bounded to one replay/update pass.
   num_updates_per_batch: 1
+  # Production-only H20 reclamation controls; preserve the smoke's default-off
+  # behavior so its CPU-offload lifecycle remains the sole memory mechanism.
+  empty_cache_after_image_micro: false
+  empty_cache_after_optimizer: false
+  cuda_peak_telemetry: false
 
 sampling:
   ar:

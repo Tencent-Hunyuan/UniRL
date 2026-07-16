@@ -168,6 +168,12 @@ stack:
   max_grad_norm: 1.0
   # UniGRPO parity: the second disjoint mini-batch is off-policy after update 1.
   num_updates_per_batch: 2
+  # Exact replay has variable-length image micros. Return dead cached blocks at
+  # each image boundary and after the optimizer, while retaining full-FT shards,
+  # gradients, and optimizer state on GPU. Peak counters are reset per update.
+  empty_cache_after_image_micro: true
+  empty_cache_after_optimizer: true
+  cuda_peak_telemetry: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

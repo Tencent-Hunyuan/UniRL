@@ -59,16 +59,25 @@ _PHASE_HOST_TIME_METRICS = frozenset(
         "ar_backward_host_time_s",
         "image_prepare_reference_host_time_s",
         "image_ratio_mse_backward_host_time_s",
+        "image_micro_empty_cache_host_time_s",
         "pre_optimizer_empty_cache_host_time_s",
         "optimizer_host_time_s",
+        "post_optimizer_empty_cache_host_time_s",
     }
 )
+_CUDA_PEAK_METRICS = frozenset(
+    {
+        "cuda_peak_allocated_gb",
+        "cuda_peak_reserved_gb",
+    }
+)
+_DP_MAX_METRICS = _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS
 
 
-def _max_phase_times(base: Mapping[str, object], peers: List[Mapping[str, object]]) -> Dict[str, object]:
-    """Copy ``base`` while reducing BAGEL host phase intervals over DP peers."""
+def _max_dp_metrics(base: Mapping[str, object], peers: List[Mapping[str, object]]) -> Dict[str, object]:
+    """Copy ``base`` while reducing BAGEL critical-path diagnostics over DP peers."""
     reduced = dict(base)
-    for metric_name in _PHASE_HOST_TIME_METRICS:
+    for metric_name in _DP_MAX_METRICS:
         values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
         if values:
             reduced[metric_name] = max(values)
@@ -76,13 +85,13 @@ def _max_phase_times(base: Mapping[str, object], peers: List[Mapping[str, object
 
 
 def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
-    """Use DP critical-path maxima for BAGEL phase timings.
+    """Use DP critical-path maxima for BAGEL timings and CUDA peaks.
 
     The standard DP collector intentionally selects scalar fields from the first
     DP result. Keep that behavior for losses and algorithm metrics, but reduce the
-    diagnostic host timers across DP heads after every worker RPC has returned.
-    This is controller-only work: it adds neither a training collective nor a CUDA
-    synchronization.
+    diagnostic host timers and per-update allocator peaks across DP heads after
+    every worker RPC has returned. This is controller-only work: it adds neither a
+    training collective nor a CUDA synchronization.
     """
     collected = _collect_dp_merge(wg, results)
     if collected is None or not isinstance(collected, dict):
@@ -113,13 +122,17 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
                 peer_metrics = [
                     peer.per_update[update_index] for peer in peer_results if update_index < len(peer.per_update)
                 ]
-                reduced_updates.append(_max_phase_times(base_metrics, peer_metrics))
+                reduced_updates.append(_max_dp_metrics(base_metrics, peer_metrics))
 
             summary_metrics = dict(base_result.metrics)
             for metric_name in _PHASE_HOST_TIME_METRICS:
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = sum(values) / len(values)
+            for metric_name in _CUDA_PEAK_METRICS:
+                values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
+                if values:
+                    summary_metrics[metric_name] = max(values)
             reduced[track_name] = replace(
                 base_result,
                 metrics=summary_metrics,
@@ -128,7 +141,7 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
         else:
             reduced[track_name] = replace(
                 base_result,
-                metrics=_max_phase_times(base_result.metrics, [peer.metrics for peer in peer_results]),
+                metrics=_max_dp_metrics(base_result.metrics, [peer.metrics for peer in peer_results]),
             )
     return reduced
 
@@ -160,6 +173,9 @@ class UnifiedModelTrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        empty_cache_after_image_micro: bool = False,
+        empty_cache_after_optimizer: bool = False,
+        cuda_peak_telemetry: bool = False,
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -174,6 +190,9 @@ class UnifiedModelTrainStack(Remote):
         }
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
+        self.empty_cache_after_image_micro = bool(empty_cache_after_image_micro)
+        self.empty_cache_after_optimizer = bool(empty_cache_after_optimizer)
+        self.cuda_peak_telemetry = bool(cuda_peak_telemetry)
         # PPO-style multi-update: split each rollout shard into this many disjoint
         # mini-batches and run ONE optimizer step per mini-batch, with the π_old
         # anchor frozen once across all of them (prepare_segment). >1 makes the
@@ -308,6 +327,7 @@ class UnifiedModelTrainStack(Remote):
         micros: List[AlgorithmStepResult] = []
         total_loss = 0.0
         has_backward = False
+        image_micro_empty_cache_host_time_s = 0.0
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
         for start, end in micro_slices:
@@ -319,11 +339,20 @@ class UnifiedModelTrainStack(Remote):
                 training_progress=training_progress,
                 loss_scale=loss_scale,
             )
+            if name == "image" and self.empty_cache_after_image_micro and torch.cuda.is_available():
+                empty_cache_started = time.perf_counter()
+                torch.cuda.empty_cache()
+                image_micro_empty_cache_host_time_s += time.perf_counter() - empty_cache_started
             micros.append(result)
             total_loss += result.loss
             has_backward = has_backward or result.has_backward
 
         aggregated: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
+        if name == "image" and self.empty_cache_after_image_micro:
+            aggregated = {
+                **dict(aggregated),
+                "image_micro_empty_cache_host_time_s": image_micro_empty_cache_host_time_s,
+            }
         # grad_norm / lr are filled by ``_train_one_step`` after the shared optimizer step.
         partial = TrainStepResult(
             loss=total_loss,
@@ -348,6 +377,9 @@ class UnifiedModelTrainStack(Remote):
         """One optimizer step: zero_grad → backward BOTH tracks over their mini-batch
         slices → shared optimizer_step → stamp grad_norm / lr onto each track's result.
         """
+        cuda_peak_telemetry = self.cuda_peak_telemetry and torch.cuda.is_available()
+        if cuda_peak_telemetry:
+            torch.cuda.reset_peak_memory_stats()
         self.fsdp_backend.zero_grad()
         phase_times: Dict[str, float] = {}
         succeeded = False
@@ -396,9 +428,22 @@ class UnifiedModelTrainStack(Remote):
                     optimizer_started = time.perf_counter()
                     grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
                     phase_times["optimizer_host_time_s"] = time.perf_counter() - optimizer_started
+                    if self.empty_cache_after_optimizer and torch.cuda.is_available():
+                        empty_cache_started = time.perf_counter()
+                        torch.cuda.empty_cache()
+                        phase_times["post_optimizer_empty_cache_host_time_s"] = (
+                            time.perf_counter() - empty_cache_started
+                        )
             else:
                 grad_norm = 0.0
                 logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
+
+            cuda_peak_metrics: Dict[str, float] = {}
+            if cuda_peak_telemetry:
+                cuda_peak_metrics = {
+                    "cuda_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+                    "cuda_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
+                }
 
             lr = self._current_lr()
             for name, result in list(results.items()):
@@ -411,11 +456,13 @@ class UnifiedModelTrainStack(Remote):
                         "image_ratio_mse_backward_host_time_s",
                         "pre_optimizer_empty_cache_host_time_s",
                         "optimizer_host_time_s",
+                        "post_optimizer_empty_cache_host_time_s",
                     ):
                         if metric_name in phase_times:
                             metrics[metric_name] = phase_times[metric_name]
                     if anchor_image_host_time_s is not None:
                         metrics["anchor_image_host_time_s"] = float(anchor_image_host_time_s)
+                    metrics.update(cuda_peak_metrics)
                 results[name] = TrainStepResult(
                     loss=result.loss,
                     grad_norm=grad_norm,
