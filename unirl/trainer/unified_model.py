@@ -697,6 +697,23 @@ class UnifiedModelTrainer(BaseTrainer):
             return None
         return [int(value) for value in shape]
 
+    def _restore_optimizer_state_after_reclaim(self) -> Dict[str, float]:
+        """Reclaim cached CUDA blocks, restore Adam, and verify the plan drained."""
+        self.backend.reclaim_cuda_allocator()
+        report = _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
+        pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
+        if pending:
+            raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
+        return report
+
+    def _restore_deferred_train_optimizer_state(self) -> Dict[str, float]:
+        """Idempotently consume deferred optimizer ownership before driver work."""
+        if not bool(getattr(self, "_deferred_train_optimizer_restore", False)):
+            return {}
+        report = self._restore_optimizer_state_after_reclaim()
+        self._deferred_train_optimizer_restore = False
+        return report
+
     @contextmanager
     def _external_single_engine_session(
         self,
@@ -794,13 +811,16 @@ class UnifiedModelTrainer(BaseTrainer):
             # safe sleep, while a failed sleep leaves the state safely parked.
             if optimizer_park_attempted and rollout_asleep and not defer_restore_now:
                 try:
-                    boundary_metrics.update(
-                        _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
-                    )
+                    boundary_metrics.update(self._restore_optimizer_state_after_reclaim())
+                    self._deferred_train_optimizer_restore = False
                 except BaseException as exc:
+                    # The engine is safely asleep, so the next driver operation
+                    # may retry this idempotent restore before doing any work.
+                    self._deferred_train_optimizer_restore = True
                     cleanup_errors.append(("optimizer state restore", exc))
             elif defer_restore_now:
                 boundary_metrics.optimizer_restore_deferred = True
+                self._deferred_train_optimizer_restore = True
 
             # Never move trainer state back onto the GPU unless every Omni stage
             # acknowledged sleep. A partial sleep plus FSDP onload can OOM before
@@ -828,15 +848,24 @@ class UnifiedModelTrainer(BaseTrainer):
                     raise RuntimeError(f"External single-engine cleanup failed in {action}.") from exc
 
             if boundary_metrics:
-                logger.info(
-                    "External rollout optimizer boundary: cleared=%.3f GiB parked=%.3f GiB "
-                    "restored=%.3f GiB park=%.3fs restore=%.3fs",
-                    boundary_metrics.get("grad_bytes_cleared", 0.0) / 2**30,
-                    boundary_metrics.get("optimizer_state_bytes_parked", 0.0) / 2**30,
-                    boundary_metrics.get("optimizer_state_bytes_restored", 0.0) / 2**30,
-                    boundary_metrics.get("optimizer_park_host_time_s", 0.0),
-                    boundary_metrics.get("optimizer_restore_host_time_s", 0.0),
-                )
+                if boundary_metrics.optimizer_restore_deferred:
+                    logger.info(
+                        "External rollout optimizer boundary: cleared=%.3f GiB parked=%.3f GiB "
+                        "park=%.3fs restore=deferred",
+                        boundary_metrics.get("grad_bytes_cleared", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_parked", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_park_host_time_s", 0.0),
+                    )
+                else:
+                    logger.info(
+                        "External rollout optimizer boundary: cleared=%.3f GiB parked=%.3f GiB "
+                        "restored=%.3f GiB park=%.3fs restore=%.3fs",
+                        boundary_metrics.get("grad_bytes_cleared", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_parked", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_restored", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_park_host_time_s", 0.0),
+                        boundary_metrics.get("optimizer_restore_host_time_s", 0.0),
+                    )
 
     def _build_req(
         self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
@@ -1061,8 +1090,9 @@ class UnifiedModelTrainer(BaseTrainer):
         rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
         """Run one unified step and repair a deferred boundary on any failure."""
-        if bool(getattr(self, "_deferred_train_optimizer_restore", False)):
-            raise RuntimeError("A previous train step left deferred optimizer state pending restoration.")
+        # A transient restore failure from the prior call is retried before any
+        # new rollout or scoring work. Ownership clears only at zero pending slots.
+        self._restore_deferred_train_optimizer_state()
         try:
             return self._train_step_impl(
                 req,
@@ -1072,23 +1102,11 @@ class UnifiedModelTrainer(BaseTrainer):
             )
         except BaseException:
             if bool(getattr(self, "_deferred_train_optimizer_restore", False)):
-                cleanup_errors: List[Tuple[str, BaseException]] = []
                 try:
-                    self.backend.reclaim_cuda_allocator()
+                    self._restore_deferred_train_optimizer_state()
                 except BaseException as exc:
-                    cleanup_errors.append(("CUDA allocator reclaim", exc))
-                try:
-                    report = _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
-                    pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
-                    if pending:
-                        raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
-                    self._deferred_train_optimizer_restore = False
-                except BaseException as exc:
-                    cleanup_errors.append(("optimizer state restore", exc))
-                for action, exc in cleanup_errors:
                     logger.error(
-                        "Deferred train optimizer cleanup failed in %s: %s",
-                        action,
+                        "Deferred train optimizer cleanup failed: %s",
                         exc,
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
@@ -1404,6 +1422,7 @@ class UnifiedModelTrainer(BaseTrainer):
         leaves FSDP offloaded because eval has no backward. The trainside path
         needs none of it because it shares the live FSDP modules.
         """
+        self._restore_deferred_train_optimizer_state()
         eval_sp = self._eval_sampling_params()
         # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH
         # needs awake engines, so it rides one short wake/sleep cycle here).
@@ -1522,6 +1541,25 @@ class UnifiedModelTrainer(BaseTrainer):
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+        save_mode: str = "auto",
+    ) -> Optional[str]:
+        """Never expose a partially parked optimizer to checkpoint gathering."""
+        self._restore_deferred_train_optimizer_state()
+        return super().maybe_save_checkpoint(
+            rollout_id,
+            num_rollouts,
+            save_interval=save_interval,
+            save_dir=save_dir,
+            save_mode=save_mode,
+        )
 
     def train(
         self,

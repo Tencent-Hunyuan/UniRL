@@ -463,6 +463,50 @@ def test_peak_counter_reset_precedes_track_hydration_and_anchor(monkeypatch) -> 
     assert events[:5] == ["reset_peak", "hydrate_ar", "hydrate_image", "anchor_ar", "anchor_image"]
 
 
+def test_update_peaks_reset_per_step_while_train_window_keeps_anchor_and_all_updates() -> None:
+    events: list[str] = []
+    backend = _Backend(events)
+    stack = _stack(backend)
+    stack.cuda_peak_telemetry = True
+    stack._reset_cuda_peak_memory_stats = MethodType(lambda self: events.append("reset_peak"), stack)
+    update_peaks = iter(((60.0, 61.0), (70.0, 71.0)))
+    window_peaks = iter(((50.0, 51.0), (90.0, 91.0), (80.0, 81.0)))
+
+    def update_peak_metrics(self):
+        del self
+        allocated, reserved = next(update_peaks)
+        return {"cuda_peak_allocated_gb": allocated, "cuda_peak_reserved_gb": reserved}
+
+    def window_peak_metrics(self):
+        del self
+        allocated, reserved = next(window_peaks)
+        return {
+            "cuda_train_window_peak_allocated_gb": allocated,
+            "cuda_train_window_peak_reserved_gb": reserved,
+        }
+
+    stack._cuda_peak_memory_metrics = MethodType(update_peak_metrics, stack)
+    stack._cuda_train_window_peak_memory_metrics = MethodType(window_peak_metrics, stack)
+    stack._cuda_phase_memory_metrics = MethodType(lambda self, phase: {}, stack)
+
+    def prepare_anchor(self, name, track):
+        del self, track
+        events.append(f"anchor_{name}")
+
+    stack.prepare_segment = MethodType(prepare_anchor, stack)
+    _install_backward(stack, events)
+    results = stack.train_track(_track("ar", 4), _track("image", 4), training_progress=0.0)
+
+    assert [event for event in events if event == "reset_peak"] == ["reset_peak"] * 3
+    assert events[:3] == ["reset_peak", "anchor_ar", "anchor_image"]
+    assert [update["cuda_peak_reserved_gb"] for update in results["image"].per_update] == [61.0, 71.0]
+    assert "cuda_train_window_peak_reserved_gb" not in results["image"].per_update[0]
+    assert results["image"].per_update[1]["cuda_train_window_peak_reserved_gb"] == 91.0
+    assert results["image"].metrics["cuda_peak_reserved_gb"] == 71.0
+    assert results["image"].metrics["cuda_train_window_peak_allocated_gb"] == 90.0
+    assert results["image"].metrics["cuda_train_window_peak_reserved_gb"] == 91.0
+
+
 def test_anchor_failure_releases_anchor_state_before_restoring_inherited_optimizer() -> None:
     events: list[str] = []
     backend = _Backend(events)
@@ -503,7 +547,7 @@ def test_anchor_failure_releases_anchor_state_before_restoring_inherited_optimiz
     assert backend.parked is False
 
 
-def test_rollout_anchor_two_updates_and_next_boundary_share_one_parked_lifecycle() -> None:
+def test_rollout_anchor_two_updates_and_next_boundary_share_one_parked_lifecycle(caplog) -> None:
     events: list[str] = []
     backend = _Backend(events)
 
@@ -525,13 +569,16 @@ def test_rollout_anchor_two_updates_and_next_boundary_share_one_parked_lifecycle
     trainer.rollout = Rollout()
     trainer.backend = backend
 
-    with trainer._external_single_engine_session(
-        sync_weights=False,
-        onload_trainer_after=True,
-        defer_optimizer_restore=True,
-    ) as boundary:
-        events.append("generate")
+    with caplog.at_level("INFO"):
+        with trainer._external_single_engine_session(
+            sync_weights=False,
+            onload_trainer_after=True,
+            defer_optimizer_restore=True,
+        ) as boundary:
+            events.append("generate")
     assert boundary.optimizer_restore_deferred is True
+    assert "restore=deferred" in caplog.text
+    assert "restored=0.000" not in caplog.text
     assert backend.parked is True
 
     stack = _stack(backend)

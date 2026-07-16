@@ -241,6 +241,9 @@ def test_optimizer_parking_orders_extract_park_wake_push_sleep_discard_restore()
                 },
             ]
 
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
+
         def restore_optimizer_state_after_rollout(self):
             events.append("restore")
             return [
@@ -261,7 +264,7 @@ def test_optimizer_parking_orders_extract_park_wake_push_sleep_discard_restore()
     with trainer._external_single_engine_session(sync_weights=True, onload_trainer_after=True) as metrics:
         events.append("generate")
 
-    assert events == ["extract", "park", "wake", "push", "generate", "sleep", "discard", "restore"]
+    assert events == ["extract", "park", "wake", "push", "generate", "sleep", "discard", "reclaim", "restore"]
     assert metrics == {
         "grad_bytes_cleared": 21.0,
         "optimizer_state_bytes_parked": 41.0,
@@ -269,6 +272,52 @@ def test_optimizer_parking_orders_extract_park_wake_push_sleep_discard_restore()
         "optimizer_state_bytes_restored": 41.0,
         "optimizer_restore_host_time_s": 3.0,
     }
+
+
+def test_non_deferred_session_retries_pending_restore_before_later_driver_work() -> None:
+    events: list[str] = []
+    restore_calls = 0
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            events.append("park")
+            return {}
+
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
+
+        def restore_optimizer_state_after_rollout(self):
+            nonlocal restore_calls
+            events.append("restore")
+            restore_calls += 1
+            return {"optimizer_state_restore_slots_pending": float(restore_calls == 1)}
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = False
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = True
+    trainer._deferred_train_optimizer_restore = False
+    trainer.weight_sync = None
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with pytest.raises(RuntimeError, match="cleanup failed in optimizer state restore"):
+        with trainer._external_single_engine_session(sync_weights=False, onload_trainer_after=False):
+            events.append("evaluate")
+
+    assert trainer._deferred_train_optimizer_restore is True
+    trainer._restore_deferred_train_optimizer_state()
+    assert trainer._deferred_train_optimizer_restore is False
+    assert events == ["park", "wake", "evaluate", "sleep", "reclaim", "restore", "reclaim", "restore"]
 
 
 @pytest.mark.parametrize("failure_at", ["wake", "generate"])
@@ -288,6 +337,9 @@ def test_optimizer_parking_restores_after_rollout_failure(failure_at: str) -> No
         def park_optimizer_state_for_rollout(self):
             events.append("park")
             return {}
+
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
 
         def restore_optimizer_state_after_rollout(self):
             events.append("restore")
@@ -309,7 +361,7 @@ def test_optimizer_parking_restores_after_rollout_failure(failure_at: str) -> No
             if failure_at == "generate":
                 raise RuntimeError("injected generate failure")
 
-    expected = ["park", "wake", "sleep", "restore"]
+    expected = ["park", "wake", "sleep", "reclaim", "restore"]
     if failure_at == "generate":
         expected.insert(2, "generate")
     assert events == expected
@@ -329,6 +381,9 @@ def test_deferred_optimizer_handoff_restores_on_rollout_body_failure() -> None:
         def park_optimizer_state_for_rollout(self):
             events.append("park")
             return {}
+
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
 
         def restore_optimizer_state_after_rollout(self):
             events.append("restore")
@@ -355,7 +410,7 @@ def test_deferred_optimizer_handoff_restores_on_rollout_body_failure() -> None:
             raise RuntimeError("injected reward handoff failure")
 
     assert metrics.optimizer_restore_deferred is False
-    assert events == ["park", "wake", "generate", "sleep", "restore"]
+    assert events == ["park", "wake", "generate", "sleep", "reclaim", "restore"]
 
 
 def test_train_step_wrapper_restores_deferred_state_after_scoring_failure() -> None:
@@ -385,6 +440,79 @@ def test_train_step_wrapper_restores_deferred_state_after_scoring_failure() -> N
 
     assert events == ["score", "reclaim", "restore"]
     assert trainer._deferred_train_optimizer_restore is False
+
+
+@pytest.mark.parametrize("first_restore", ["raise", "pending"])
+def test_train_step_entry_retries_transient_deferred_restore(first_restore: str, caplog) -> None:
+    events: list[str] = []
+    restore_calls = 0
+    impl_calls = 0
+
+    class _Backend:
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
+
+        def restore_optimizer_state_after_rollout(self):
+            nonlocal restore_calls
+            events.append("restore")
+            restore_calls += 1
+            if restore_calls == 1 and first_restore == "raise":
+                raise RuntimeError("injected restore failure")
+            return {"optimizer_state_restore_slots_pending": float(restore_calls == 1 and first_restore == "pending")}
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._deferred_train_optimizer_restore = False
+    trainer.backend = _Backend()
+
+    def fail_then_succeed(self, *args, **kwargs):
+        nonlocal impl_calls
+        del args, kwargs
+        impl_calls += 1
+        if impl_calls == 1:
+            self._deferred_train_optimizer_restore = True
+            events.append("score")
+            raise RuntimeError("injected scoring failure")
+        events.append("next_train_step")
+        return {}, 0.0
+
+    trainer._train_step_impl = MethodType(fail_then_succeed, trainer)
+    with pytest.raises(RuntimeError, match="injected scoring failure"):
+        trainer.train_step(SimpleNamespace())
+
+    assert trainer._deferred_train_optimizer_restore is True
+    assert "Deferred train optimizer cleanup failed" in caplog.text
+    assert trainer.train_step(SimpleNamespace()) == ({}, 0.0)
+    assert trainer._deferred_train_optimizer_restore is False
+    assert events == ["score", "reclaim", "restore", "reclaim", "restore", "next_train_step"]
+
+
+def test_eval_and_checkpoint_entry_restore_deferred_state_before_driver_work() -> None:
+    events: list[str] = []
+
+    class _Backend:
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
+
+        def restore_optimizer_state_after_rollout(self):
+            events.append("restore")
+            return {"optimizer_state_restore_slots_pending": 0.0}
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer.backend = _Backend()
+    trainer._deferred_train_optimizer_restore = True
+
+    def stop_eval():
+        events.append("eval_start")
+        raise RuntimeError("stop after eval guard")
+
+    trainer._eval_sampling_params = stop_eval
+    with pytest.raises(RuntimeError, match="stop after eval guard"):
+        trainer.evaluate(0)
+    assert events == ["reclaim", "restore", "eval_start"]
+
+    trainer._deferred_train_optimizer_restore = True
+    assert trainer.maybe_save_checkpoint(0, 1, save_interval=0, save_dir=None) is None
+    assert events == ["reclaim", "restore", "eval_start", "reclaim", "restore"]
 
 
 def test_optimizer_parking_default_off_makes_no_backend_lifecycle_calls() -> None:

@@ -77,6 +77,12 @@ _CUDA_PEAK_METRICS = frozenset(
         "cuda_peak_reserved_gb",
     }
 )
+_CUDA_TRAIN_WINDOW_PEAK_METRICS = frozenset(
+    {
+        "cuda_train_window_peak_allocated_gb",
+        "cuda_train_window_peak_reserved_gb",
+    }
+)
 _CUDA_PHASE_MEMORY_METRICS = frozenset(
     {
         f"cuda_{phase}_{kind}_gb"
@@ -103,7 +109,11 @@ _TRAIN_OPTIMIZER_STATE_SUM_METRICS = frozenset(
 )
 _TRAIN_OPTIMIZER_STATE_MAX_METRICS = frozenset({"train_optimizer_state_restore_slots_pending"})
 _DP_MAX_METRICS = (
-    _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS | _CUDA_PHASE_MEMORY_METRICS | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
+    _PHASE_HOST_TIME_METRICS
+    | _CUDA_PEAK_METRICS
+    | _CUDA_TRAIN_WINDOW_PEAK_METRICS
+    | _CUDA_PHASE_MEMORY_METRICS
+    | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
 )
 _DP_MIN_METRICS = _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS
 _DP_SUM_METRICS = _TRAIN_OPTIMIZER_STATE_SUM_METRICS
@@ -150,9 +160,9 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
 
     The standard DP collector intentionally selects scalar fields from the first
     DP result. Keep that behavior for losses and algorithm metrics, but reduce the
-    diagnostic host timers and per-update allocator peaks across DP heads after
-    every worker RPC has returned. This is controller-only work: it adds neither a
-    training collective nor a CUDA synchronization.
+        diagnostic host timers plus per-update and whole-train allocator peaks
+        across DP heads after every worker RPC has returned. This is controller-only
+        work: it adds neither a training collective nor a CUDA synchronization.
     """
     collected = _collect_dp_merge(wg, results)
     if collected is None or not isinstance(collected, dict):
@@ -194,6 +204,10 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
                     summary_metrics[metric_name] = sum(values) / len(values)
             for metric_name in _CUDA_PEAK_METRICS | _CUDA_PHASE_MEMORY_METRICS | _TRAIN_OPTIMIZER_STATE_MAX_METRICS:
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
+                if values:
+                    summary_metrics[metric_name] = max(values)
+            for metric_name in _CUDA_TRAIN_WINDOW_PEAK_METRICS:
+                values = [float(peer.metrics[metric_name]) for peer in peer_results if metric_name in peer.metrics]
                 if values:
                     summary_metrics[metric_name] = max(values)
             for metric_name in _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS:
@@ -320,6 +334,14 @@ class UnifiedModelTrainStack(Remote):
         return {
             "cuda_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
             "cuda_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
+        }
+
+    def _cuda_train_window_peak_memory_metrics(self) -> Dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+        return {
+            "cuda_train_window_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+            "cuda_train_window_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
         }
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
@@ -532,7 +554,7 @@ class UnifiedModelTrainStack(Remote):
         if optimizer_state_already_parked and not park_optimizer:
             raise ValueError("optimizer_state_already_parked requires park_optimizer_state_during_train=true.")
         cuda_peak_telemetry = bool(getattr(self, "cuda_peak_telemetry", False))
-        if cuda_peak_telemetry and not park_optimizer:
+        if cuda_peak_telemetry:
             self._reset_cuda_peak_memory_stats()
         phase_times: Dict[str, float] = {}
         train_optimizer_metrics: Dict[str, float] = {}
@@ -800,10 +822,17 @@ class UnifiedModelTrainStack(Remote):
         park_optimizer = bool(getattr(self, "park_optimizer_state_during_train", False))
         if optimizer_state_already_parked and not park_optimizer:
             raise ValueError("optimizer_state_already_parked requires park_optimizer_state_during_train=true.")
-        # With train-phase parking, one counter window covers track hydration,
-        # full anchor preparation, and every update. Update-local resets would
-        # erase the anchor peak that this capacity gate needs to observe.
-        if park_optimizer and bool(getattr(self, "cuda_peak_telemetry", False)):
+        cuda_peak_telemetry = bool(getattr(self, "cuda_peak_telemetry", False))
+        train_window_peak_metrics: Dict[str, float] = {}
+
+        def record_train_window_peak() -> None:
+            for name, value in self._cuda_train_window_peak_memory_metrics().items():
+                train_window_peak_metrics[name] = max(train_window_peak_metrics.get(name, 0.0), value)
+
+        # This reset starts the whole-train window. Each update resets again for
+        # the established cuda_peak_* contract; snapshots on both sides of those
+        # resets preserve hydration + anchor + all update peaks under distinct names.
+        if cuda_peak_telemetry:
             self._reset_cuda_peak_memory_stats()
 
         # Move both tracks onto this worker's model device before any replay.
@@ -860,6 +889,8 @@ class UnifiedModelTrainStack(Remote):
 
                 per_update: List[Dict[str, TrainStepResult]] = []
                 for u in range(self.num_updates_per_batch):
+                    if cuda_peak_telemetry:
+                        record_train_window_peak()
                     slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
                     update_inherits_parked_state = bool(inherited_optimizer_state_pending and u == 0)
                     if update_inherits_parked_state:
@@ -878,6 +909,8 @@ class UnifiedModelTrainStack(Remote):
                             optimizer_state_already_parked=update_inherits_parked_state,
                         )
                     )
+                if cuda_peak_telemetry:
+                    record_train_window_peak()
                 train_succeeded = True
             finally:
                 if not optimizer_state_already_parked:
@@ -933,13 +966,31 @@ class UnifiedModelTrainStack(Remote):
         for name in self.algorithms:
             updates = [upd[name] for upd in per_update]
             aggregated = _aggregate_update_results(updates)
+            if name == "image" and cuda_peak_telemetry:
+                summary_metrics = dict(aggregated.metrics)
+                for metric_name in _CUDA_PEAK_METRICS:
+                    values = [float(update.metrics[metric_name]) for update in updates if metric_name in update.metrics]
+                    if values:
+                        summary_metrics[metric_name] = max(values)
+                summary_metrics.update(train_window_peak_metrics)
+                aggregated = replace(aggregated, metrics=summary_metrics)
             if len(updates) > 1:
+                update_metrics = [
+                    {
+                        **dict(result.metrics),
+                        "loss": float(result.loss),
+                        "grad_norm": float(result.grad_norm),
+                        "lr": float(result.lr),
+                    }
+                    for result in updates
+                ]
+                if name == "image" and train_window_peak_metrics:
+                    # The window is complete only after the final update. Attach
+                    # it there so per-update loggers emit one honest point.
+                    update_metrics[-1].update(train_window_peak_metrics)
                 aggregated = replace(
                     aggregated,
-                    per_update=tuple(
-                        {**dict(r.metrics), "loss": float(r.loss), "grad_norm": float(r.grad_norm), "lr": float(r.lr)}
-                        for r in updates
-                    ),
+                    per_update=tuple(update_metrics),
                 )
             results[name] = aggregated
         return results

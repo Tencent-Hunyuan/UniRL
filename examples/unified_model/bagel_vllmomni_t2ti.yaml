@@ -191,8 +191,9 @@ stack:
   # UniGRPO parity: the second disjoint mini-batch is off-policy after update 1.
   num_updates_per_batch: 2
   # Exact replay has variable-length image micros. Return dead cached blocks at
-  # each image boundary and after the optimizer, while retaining full-FT shards,
-  # gradients, and optimizer state on GPU. Peak counters are reset per update.
+  # each image boundary and after the optimizer while retaining full-FT shards
+  # and live gradients. cuda_peak_* counters reset per update;
+  # cuda_train_window_peak_* also covers hydration, full anchor, and all updates.
   empty_cache_after_image_micro: true
   # Interval 1 preserves the conservative per-micro behavior. A larger cadence
   # plus a nonzero driver-free floor is an opt-in H20 tuning knob and must be
