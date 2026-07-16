@@ -82,9 +82,7 @@ class Qwen3Bundle(Bundle):
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
             transformer, meta_init_state = build_meta_init_transformer(
-                lambda: AutoModelForCausalLM.from_config(
-                    hf_config, trust_remote_code=bool(config.trust_remote_code)
-                ),
+                lambda: AutoModelForCausalLM.from_config(hf_config, trust_remote_code=bool(config.trust_remote_code)),
                 dtype=dtype,
             )
         else:
