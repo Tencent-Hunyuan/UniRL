@@ -58,16 +58,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
 
     params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-    # The driver carries the deterministic x_T recipe on the request rather
-    # than mutating the shared sampling params. Attach those IDs to a
-    # request-local copy so the existing NoiseRecipe path in diffuse() consumes
-    # sampling.seed. With seed=None, preserve the engine-local RNG fallback.
-    recipe_ids = [str(noise_id) for noise_id in (getattr(req, "init_noise_group_ids", None) or [])]
-    if params.seed is not None and recipe_ids:
-        params = replace(
-            params,
-            noise_group_ids=recipe_ids,
-        )
+    # Driver-authored x_T: the trainer ships per-sample noise ids on the request
+    # (gated by ``HunyuanImage3Pipeline.latent_shape``). Attach them to a
+    # request-local params copy so diffuse()'s NoiseRecipe path regenerates the
+    # deterministic x_T at the snapped latent grid it computes itself (HI3's
+    # shape is not knowable driver-side). seed=None opts out -> engine RNG.
+    if params.seed is not None and req.init_noise_group_ids:
+        params = replace(params, noise_group_ids=list(req.init_noise_group_ids))
 
     if req.sigmas is None:
         raise ValueError(

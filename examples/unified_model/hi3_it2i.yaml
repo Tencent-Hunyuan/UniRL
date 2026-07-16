@@ -215,7 +215,8 @@ sampling:
   height: 1024
   width: 1024
   eta: 1.0                       # SDE exploration
-  seed: 42
+  seed: 42                       # base_seed of the driver-authored x_T recipe: x_T is deterministic
+                                 # per (seed, rollout_id, sample_id). seed=null -> engine RNG.
   init_same_noise: false         # per-sample x_T -> diverse GRPO groups
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
