@@ -179,6 +179,7 @@ class ARSamplingParams(BaseSamplingParams):
     temperature: float = 0.7
     max_new_tokens: int = 512
     top_p: float = 0.9
-    # Hugging Face convention: 0 disables top-k; engine adapters translate as needed.
+    # Canonical AR convention: 0 disables top-k filtering; adapters map it to
+    # each engine's sentinel (for example, SGLang -1).
     top_k: int = 0
     stop_token_id: int | None = None
