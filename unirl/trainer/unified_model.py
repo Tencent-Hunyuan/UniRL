@@ -987,6 +987,11 @@ class UnifiedModelTrainer(BaseTrainer):
                     "BAGEL T2TI replay balancing requires 1:1 AR/image tracks; "
                     f"got {ar_track.batch_size} and {image_track.batch_size}."
                 )
+            if image_track.parent_ids is None or list(image_track.parent_ids) != list(ar_track.sample_ids):
+                raise RuntimeError(
+                    "BAGEL T2TI replay balancing requires positional M=1 lineage: "
+                    "image parent_ids must equal AR sample_ids."
+                )
             permutation = _bagel_t2ti_replay_permutation(
                 image_track,
                 num_shards=self._train_dp_size,
