@@ -80,10 +80,13 @@ curve.
 The guarded r8 candidate then kept the same exact one-node workload while
 storing the immutable bf16 reference snapshot on CPU, parking Adam through
 replay, and using interval-2/floor-12 pressure reclamation. Its first round
-finished in 3,056.737 s total with 2,217.634 s in training, retained 7.408 GiB
-of externally sampled headroom, and passed the following all-rank Omni wake.
-This is safe baseline-speed execution, not a faster approximate replay path;
-the second round remains the repeated post-Adam gate.
+finished in 3,056.737 s total with 2,217.634 s in training and passed the
+following all-rank Omni wake, but a 2-second round-two trace later found only
+628 MiB physical headroom. R9c restored per-micro interval-1/floor-0
+reclamation, yet its update-0 trace still found only 854 MiB free.
+Both candidates are rejected. R10 retains the exact layer-major replay and all
+lifecycle controls while disabling flow-many to reduce simultaneous image
+activations; its repeated runtime and memory gates remain pending.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -585,8 +588,7 @@ pre/post-restore/post-step live
 allocations were 21.781755/33.936906/33.936906 GiB. After the summary, all eight
 AR and diffusion workers passed the next wake barrier and native round-two
 generation began. This passes the first-round lifecycle and next-wake gate; the
-second round remains live and its complete lifecycle result is not yet
-available.
+repeated physical-memory gate was not yet established.
 
 The first-round 10-second trace was not fine-grained enough to establish the
 physical-memory gate. During round two, a persistent 2-second trace at
@@ -595,10 +597,45 @@ observed GPU 0/1 using 97,121/97,243 of 97,871 MiB at 06:12:26, leaving only
 750/628 MiB free. At 06:12:36, GPUs 2--7 used approximately
 96,105--96,167 MiB, leaving 1,704--1,766 MiB free. Every rank therefore crossed
 below the required 2 GiB margin, and the global worst was 628 MiB. Interval 2
-with a 12 GiB boundary floor is rejected even if the still-running second round
-finishes, because the boundary check cannot observe the next micro's in-flight
-peak. The conservative r9 candidate restores interval 1 and floor 0, so every
-image replay micro performs explicit cache reclamation.
+with a 12 GiB boundary floor is rejected regardless of the second round's final
+lifecycle result, because the boundary check cannot observe the next micro's
+in-flight peak. The run was deliberately stopped during round two after this
+breach, with no complete round-two timing or W&B history row. The conservative
+r9c candidate restores interval 1 and floor 0, so every image replay micro
+performs explicit cache reclamation.
+
+## R9c Per-Micro Flow-Many Gate
+
+Run [`zom3ps4z`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/zom3ps4z), at
+revision `291d43b2`, retained the r8 workload and lifecycle controls while
+restoring interval-1/floor-0 reclamation. Its resolved Hydra configuration is
+preserved at `/root/unirl/outputs/2026-07-17/06-47-11/.hydra/config.yaml`.
+R9c completed all 768 native generations and entered round-one training with
+flow-many still enabled.
+
+At 07:24:56 during update 0 image backward, a direct `nvidia-smi` snapshot
+reported used memory of
+`95899/95895/96157/96273/96113/96121/96157/96201` MiB across GPUs 0--7 out of
+97,871 MiB. Free memory was therefore
+`1972/1976/1714/1598/1758/1750/1714/1670` MiB: all eight ranks violated the
+2 GiB gate, with a 1,598 MiB minimum on GPU 3 in this initial alert. The
+persistent 2-second trace at
+`/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-cache1-291d43b2-r9c-gpu2s.log`
+was continuous through the peak after its output buffer flushed. Its final
+per-rank training minima were
+`1754/1718/1714/1598/1758/1754/1718/854` MiB free, with the authoritative global
+minimum of 854 MiB on GPU 7 at 07:25:07. The run was deliberately stopped during
+update 1 after the update-0 violation, so it has no completed round or W&B
+history row.
+
+R9c proves that cache cadence is not the remaining cause: interval 1 reclaimed
+after every replay micro, but flow-many's in-flight activation set still crossed
+the margin. The r10 candidate changes only production
+`t2ti_flow_many_enabled` from true to false. It retains exact layer-major
+replay, interval-1/floor-0 reclamation, the CPU immutable bf16 reference,
+train/rollout optimizer parking, native allocator garbage collection, no FSDP
+offload, and global `P=32, N=24, M=1, U=2`, batch size 32. R10 must still prove
+the repeated runtime, numerical, lifecycle, and 2 GiB physical-memory gates.
 
 ## Scale Mismatch
 
@@ -947,21 +984,23 @@ r3's second Stage-1 wake OOM; it is not persistent or whole-trainer FSDP CPU
 offload. R5 repeatedly parked and restored exactly `104,410,005,504` bytes,
 completed eight training rounds, and crossed the ninth wake successfully.
 
-**Flow-many passed its isolated gate; combined promotion remains gated.** An exact CFG=1 implementation can traverse all
-selected SDE velocity streams inside one layer-major decoder pass, reducing
-wrapped-layer entries across anchor, reference, and policy velocity replay. It
-may retain more simultaneous activations. R5 explicitly enabled it and completed
-eight finite rounds with a worst PyTorch-reported peak of 86.420 GiB allocated
-and 91.076 GiB reserved. The external 97,249/97,871 MiB transient still leaves
-a narrow physical margin. Main therefore keeps
-`t2ti_flow_many_enabled=false`; candidate revision `94d7e7b1` enables it only
-as part of the tighter pressure-guarded r8 capacity gate.
+**Flow-many passed its isolated lifecycle gate but failed the physical-memory
+gate.** An exact CFG=1 implementation can traverse all selected SDE velocity
+streams inside one layer-major decoder pass, reducing wrapped-layer entries
+across anchor, reference, and policy velocity replay. It may retain more
+simultaneous activations. R5 explicitly enabled it and completed eight finite
+rounds with a worst PyTorch-reported peak of 86.420 GiB allocated and 91.076 GiB
+reserved, while external sampling left only 622 MiB free. R8's pressure guard
+still fell to 628 MiB free. R9c then paired flow-many with reclamation after
+every replay micro and still left only 854 MiB free in its final 2-second trace.
+Production therefore keeps `t2ti_flow_many_enabled=false`; r10 preserves exact
+layer-major replay while processing the velocity streams serially.
 
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | 110 passed, 1 skipped in the focused BAGEL/Omni suite; coverage includes cached padding, layer-major cache/loss/full-gradient parity, Accelerate-hook restoration, profile wiring, phased-hook compatibility, pairing, and update membership |
+| Unit and config regression | passed | current r10 profile and serial-flow dispatch: 6 passed; preserved lazy-anchor test: 1 passed; prior exact-pod suite: 114 passed; independent broad local suite: 110 passed, 4 skipped |
 | Two-rank FSDP2 ordering | passed on CPU/Gloo | production replay helper, unequal 2-vs-5 real depths, three-layer K/V recurrence, activation checkpointing, `reshard_after_forward=true`, and a semantic image call completed and matched averaged unpadded gradients |
 | Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
 | Layer-major local exact parity | passed | production installer/helper are bit-exact against chunk-major for terminal K/V, downstream image output/loss, and every decoder gradient; wrapped calls fall from `chunks + image` to `replay + image` per layer |
@@ -979,8 +1018,9 @@ as part of the tighter pressure-guarded r8 capacity gate.
 | Post-r3 memory/lifecycle controls | eight-round H20 gate passed; ninth wake passed | r5 completed eight rounds, repeatedly cleared 48.620 GiB of gradients, parked/restored 97.239 GiB of optimizer state with no pending slot, and entered ninth generation |
 | Train-phase optimizer parking | functional two-round gate passed; physical gate failed | r6 restored exactly 97.239 GiB with zero pending slots through inherited and ordinary updates and crossed the third wake; external sampling still fell to 610 MiB free |
 | Interval-4/floor-8 cadence | **rejected** | r7 completed and crossed the next wake, but 3/8 ranks fell below 2 GiB free, worst 890 MiB; 75% fewer cache calls did not reduce train wall time |
-| Interval-2/floor-12 cadence | **rejected** | r8's first round and next wake passed, but a 2-second round-two trace found all ranks below 2 GiB free and a 628 MiB global minimum; round two remains live |
-| Flow-many H20 gate | eight finite H20 rounds passed; conservative promotion pending repeat test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved; r9 retains flow-many and restores per-micro interval-1/floor-0 reclamation |
+| Interval-2/floor-12 cadence | **rejected** | r8's first round and next wake passed, but a 2-second round-two trace found all ranks below 2 GiB free and a 628 MiB global minimum; it was stopped during round two without another completed row |
+| Interval-1/floor-0 flow-many cadence | **rejected** | r9c completed 768 native generations, but its update-0 trace found all ranks below 2 GiB free, worst 854 MiB; it was stopped without a completed round |
+| Serial-flow H20 gate | pending | r10 keeps exact layer-major replay and per-micro reclamation while disabling flow-many; repeated runtime, numerical, lifecycle, and physical-memory evidence is not yet available |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
 | Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
@@ -1015,12 +1055,14 @@ and an immutable CPU reference snapshot. Candidate `94d7e7b1` tightens only the
 cadence/floor to 2/12. Its first round matched baseline train time while retaining
 7.408 GiB headroom in a 10-second trace and crossed the next wake, but a 2-second
 round-two trace later found only 628 MiB free. It is rejected. The conservative
-r9 candidate retains flow-many, the immutable CPU bf16 reference, allocator
-garbage collection, and train/rollout optimizer parking while restoring
-per-micro interval-1/floor-0 reclamation. Both forms of FSDP CPU offload remain
-false throughout.
+r9c candidate restored per-micro interval-1/floor-0 reclamation, but its final
+2-second update-0 trace reached only 854 MiB free. It is also rejected. R10
+retains the immutable CPU bf16 reference, allocator garbage collection,
+train/rollout optimizer parking, and per-micro reclamation while disabling
+flow-many to reduce the simultaneous activation set. Both forms of FSDP CPU
+offload remain false throughout.
 
-The immediate gate is repeated r9 execution with the 2 GiB physical-memory
+The immediate gate is repeated r10 execution with the 2 GiB physical-memory
 margin. Remaining broader gates are a longer reward series and the unmeasured
 32-device scale.
 The eight-point reward slope and fit are materially stronger, but eight

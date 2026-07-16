@@ -879,12 +879,7 @@ def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() 
     assert all(
         torch.equal(staged_grad, lazy_grad) for staged_grad, lazy_grad in zip(staged_lazy_gradients, lazy_gradients)
     )
-    assert (
-        eager_stage.predict_many_calls
-        == lazy_stage.predict_many_calls
-        == staged_lazy_stage.predict_many_calls
-        == 2
-    )
+    assert eager_stage.predict_many_calls == lazy_stage.predict_many_calls == staged_lazy_stage.predict_many_calls == 2
 
 
 def test_stage_boundary_direct_call_builds_one_shared_context() -> None:
