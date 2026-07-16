@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 from unirl.distributed.group.dispatch import DISTRIBUTED_CONFIG_ATTR
@@ -152,13 +153,15 @@ def test_update_preparation_runs_immediately_before_its_backward() -> None:
             self.name = name
             self.prepares_update_batch = prepares_update_batch
             self.prepares_phased_update_batch = prepares_update_batch
+            self.prepares_indexed_update_batch = prepares_update_batch
 
-        def prepare_update_batch(self, *, micro_batches, training_progress, loss_scale):
+        def prepare_update_batch(self, *, micro_batches, training_progress, loss_scale, update_index):
             assert len(micro_batches) == 2
             assert all(segment.batch_size == 1 for _, segment, _ in micro_batches)
             assert all(torch.equal(advantages, torch.ones(1)) for _, _, advantages in micro_batches)
             assert training_progress == 0.0
             assert loss_scale == 0.5
+            assert update_index == 1
             events.append(f"prepare_{self.name}")
 
         def finish_update_batch(self, *, succeeded):
@@ -306,6 +309,59 @@ def test_train_track_attaches_anchor_timing_to_first_update_only(monkeypatch) ->
     assert update_calls[1][2] is None
 
 
+def test_train_track_supplies_full_anchor_plan_and_finalizes_on_failure(monkeypatch) -> None:
+    monkeypatch.delenv("UNIRL_PROFILE", raising=False)
+    events: list[object] = []
+
+    class FakeBackend:
+        _device = torch.device("cpu")
+
+    class ImageAlgorithm:
+        prepares_anchor_plan = True
+
+        def prepare_anchor_batch(self, *, updates):
+            events.append(("anchor_plan", [[int(segment.batch_size) for _, segment in update] for update in updates]))
+
+        def finish_anchor_batch(self, *, succeeded):
+            events.append(("finish_anchor", succeeded))
+
+    def track(prefix: str) -> RolloutTrack:
+        return RolloutTrack(
+            sample_ids=[f"{prefix}-{i}" for i in range(4)],
+            conditions={},
+            segment=make_image_segment(latents=torch.zeros(4, 1, 1, 1)),
+            advantages=torch.ones(4),
+        )
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.fsdp_backend = FakeBackend()
+    stack.algorithms = {"ar": object(), "image": ImageAlgorithm()}
+    stack.micro_batch_size = 1
+    stack.num_updates_per_batch = 2
+
+    def fake_prepare(self, name, resp_track):
+        del self, resp_track
+        events.append(("prepare_segment", name))
+
+    def fail_first_update(self, *args, update_index, **kwargs):
+        del self, args, kwargs
+        events.append(("update", update_index))
+        raise RuntimeError("expected update failure")
+
+    stack.prepare_segment = MethodType(fake_prepare, stack)
+    stack._train_one_step = MethodType(fail_first_update, stack)
+
+    with pytest.raises(RuntimeError, match="expected update failure"):
+        stack.train_track(track("ar"), track("image"), training_progress=0.0)
+
+    assert events == [
+        ("prepare_segment", "ar"),
+        ("anchor_plan", [[1, 1], [1, 1]]),
+        ("update", 0),
+        ("finish_anchor", False),
+    ]
+
+
 def test_legacy_update_preparation_keeps_pair_only_api() -> None:
     captured = []
 
@@ -358,8 +414,8 @@ def test_failed_image_backward_finalizes_prepared_state() -> None:
         "image": FakeAlgorithm("image", prepares_update_batch=True),
     }
 
-    def fake_prepare(self, name, track, micro_slices, *, training_progress):
-        del track, micro_slices
+    def fake_prepare(self, name, track, micro_slices, *, training_progress, update_index):
+        del track, micro_slices, update_index
         self.algorithms[name].prepare_update_batch(
             micro_batches=[], training_progress=training_progress, loss_scale=1.0
         )

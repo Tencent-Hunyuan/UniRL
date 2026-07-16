@@ -32,6 +32,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.types.replay_result import ReplayResult
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
@@ -55,6 +56,15 @@ class _PreparedMSEBatch:
     forward_kwargs: Dict[str, Any]
     reference_velocities: List[torch.Tensor]
     surrogate_result: Optional[AlgorithmStepResult] = None
+
+
+@dataclass
+class _PreparedAnchor:
+    """One exact pre-update anchor, or an update-0 current-replay marker."""
+
+    target_steps: Tuple[int, ...]
+    replay: Optional[ReplayResult]
+    derive_from_current: bool
 
 
 @contextmanager
@@ -94,6 +104,7 @@ class BagelFlowUniGRPO(FlowGRPO):
 
     prepares_update_batch = True
     prepares_phased_update_batch = True
+    prepares_indexed_update_batch = True
 
     def __init__(
         self,
@@ -111,6 +122,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         grad_reweight: bool = False,
         reuse_ratio_context_for_mse: bool = False,
         context_gradient_mode: str = "full",
+        lazy_first_update_anchor: bool = False,
     ) -> None:
         super().__init__(
             params=params,
@@ -130,6 +142,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         self.grad_reweight = bool(grad_reweight)
         self.reuse_ratio_context_for_mse = bool(reuse_ratio_context_for_mse)
         self.context_gradient_mode = str(context_gradient_mode).strip().lower()
+        self.lazy_first_update_anchor = bool(lazy_first_update_anchor)
         if self.context_gradient_mode not in _CONTEXT_GRADIENT_MODES:
             raise ValueError(
                 "BagelFlowUniGRPO.context_gradient_mode must be one of "
@@ -144,6 +157,14 @@ class BagelFlowUniGRPO(FlowGRPO):
                 "context_gradient_mode='stage_boundary' already shares one detached context between "
                 "RatioNorm and MSE; reuse_ratio_context_for_mse must remain false."
             )
+        if self.lazy_first_update_anchor and (
+            self.context_gradient_mode != "stage_boundary" or not self.ratio_norm or self.old_logp_source != "replay"
+        ):
+            raise ValueError(
+                "lazy_first_update_anchor=True requires context_gradient_mode='stage_boundary', "
+                "ratio_norm=True, and old_logp_source='replay'."
+            )
+        self.prepares_anchor_plan = self.lazy_first_update_anchor
         # Under old_logp_source="replay" the train stack recomputes these per 1-sample
         # micro-slice and cats them back (UnifiedModelTrainStack.prepare_segment). RatioNorm
         # needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp)
@@ -159,6 +180,11 @@ class BagelFlowUniGRPO(FlowGRPO):
         # supplied by UnifiedModelTrainStack. None keeps direct algorithm callers
         # on the legacy per-micro fallback.
         self._prepared_mse_batches: Optional[List[Optional[_PreparedMSEBatch]]] = None
+        # Whole-rollout anchor plan. Update 0 uses its own exact current replay
+        # (before any optimizer step); later disjoint updates are replayed eagerly
+        # and held as small CPU log-prob/mean tensors.
+        self._prepared_anchor_updates: Optional[List[Tuple[int, List[_PreparedAnchor]]]] = None
+        self._active_anchor_entries: Optional[List[_PreparedAnchor]] = None
 
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
@@ -339,12 +365,126 @@ class BagelFlowUniGRPO(FlowGRPO):
         segment.sde_logp = result.log_probs.detach().cpu()
         segment.sde_means = result.prev_sample_means.detach().cpu()
 
+    def prepare_anchor_batch(
+        self,
+        *,
+        updates: Sequence[Sequence[Tuple[Mapping[str, Condition], LatentSegment]]],
+    ) -> None:
+        """Freeze only the anchors that precede a weight-changing update.
+
+        The unified stack partitions a rollout into disjoint optimizer updates.
+        Update 0 runs at the same pre-update weights as the eager anchor, so its
+        exact current replay can also serve as a detached old-policy anchor.
+        Every later update is still replayed here, before optimizer 0, and stored
+        on CPU. This preserves the policy state and exact bs=1 replay geometry
+        while removing one anchor replay for every update-0 sample.
+        """
+        if not self.lazy_first_update_anchor:
+            raise RuntimeError("prepare_anchor_batch requires lazy_first_update_anchor=True.")
+        if self._prepared_anchor_updates is not None or self._active_anchor_entries is not None:
+            raise RuntimeError("BagelFlowUniGRPO.prepare_anchor_batch: previous anchor state was not released.")
+        if not updates:
+            raise ValueError("BagelFlowUniGRPO.prepare_anchor_batch requires at least one optimizer update.")
+
+        prepared_updates: List[Tuple[int, List[_PreparedAnchor]]] = []
+        for update_index, micro_batches in enumerate(updates):
+            entries: List[_PreparedAnchor] = []
+            for conditions, segment in micro_batches:
+                if int(segment.batch_size) != 1:
+                    raise ValueError(
+                        "BagelFlowUniGRPO.prepare_anchor_batch requires one image per micro-batch "
+                        f"(BAGEL navit bs=1); got batch_size={segment.batch_size}."
+                    )
+                target_steps = tuple(self._resolve_target_steps(segment))
+                if update_index == 0 or not target_steps:
+                    entries.append(
+                        _PreparedAnchor(
+                            target_steps=target_steps,
+                            replay=None,
+                            derive_from_current=update_index == 0,
+                        )
+                    )
+                    continue
+
+                typed_conds = typed_conditions(conditions, self.conditions_cls)
+                with torch.no_grad():
+                    replay = self.stage.replay(
+                        typed_conds,
+                        segment=segment,
+                        params=self.params,
+                        step_indices=list(target_steps),
+                    )
+                if replay.prev_sample_means is None:
+                    raise RuntimeError(
+                        "BagelFlowUniGRPO.prepare_anchor_batch: exact anchor replay returned no prev_sample_means."
+                    )
+                entries.append(
+                    _PreparedAnchor(
+                        target_steps=target_steps,
+                        replay=ReplayResult(
+                            log_probs=replay.log_probs.detach().cpu(),
+                            prev_sample_means=replay.prev_sample_means.detach().cpu(),
+                        ),
+                        derive_from_current=False,
+                    )
+                )
+            prepared_updates.append((update_index, entries))
+        self._prepared_anchor_updates = prepared_updates
+
+    def _activate_anchor_update(self, *, update_index: int, expected_count: int) -> None:
+        if not self.lazy_first_update_anchor:
+            return
+        if self._active_anchor_entries is not None:
+            raise RuntimeError("BagelFlowUniGRPO: previous update left active anchor entries.")
+        updates = self._prepared_anchor_updates
+        if not updates:
+            raise RuntimeError("BagelFlowUniGRPO: no prepared anchor update is available.")
+        prepared_index, entries = updates.pop(0)
+        if prepared_index != int(update_index):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor update order mismatch: "
+                f"prepared={prepared_index}, requested={int(update_index)}."
+            )
+        if len(entries) != int(expected_count):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor micro-batch count mismatch: "
+                f"prepared={len(entries)}, requested={int(expected_count)}."
+            )
+        self._active_anchor_entries = entries
+
+    def _take_prepared_anchor(self, target_steps: Sequence[int]) -> Optional[_PreparedAnchor]:
+        if not self.lazy_first_update_anchor:
+            return None
+        entries = self._active_anchor_entries
+        if entries is None or not entries:
+            raise RuntimeError("BagelFlowUniGRPO: prepared anchor queue was exhausted early.")
+        prepared = entries.pop(0)
+        expected = tuple(int(step) for step in target_steps)
+        if prepared.target_steps != expected:
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor step indices do not match the consumed micro-batch: "
+                f"prepared={prepared.target_steps}, current={expected}."
+            )
+        return prepared
+
+    def finish_anchor_batch(self, *, succeeded: bool) -> None:
+        remaining_updates = len(self._prepared_anchor_updates or ())
+        remaining_active = len(self._active_anchor_entries or ())
+        self._prepared_anchor_updates = None
+        self._active_anchor_entries = None
+        if succeeded and (remaining_updates or remaining_active):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.finish_anchor_batch: training completed with unconsumed anchors: "
+                f"updates={remaining_updates}, active_entries={remaining_active}."
+            )
+
     def prepare_update_batch(
         self,
         *,
         micro_batches: Sequence[Tuple[Mapping[str, Condition], LatentSegment, torch.Tensor]],
         training_progress: float,
         loss_scale: float,
+        update_index: int = 0,
     ) -> None:
         """Prepare detached MSE references under one weight swap per update.
 
@@ -370,6 +510,7 @@ class BagelFlowUniGRPO(FlowGRPO):
                 "BagelFlowUniGRPO.prepare_update_batch: the previous update left "
                 f"{len(self._prepared_mse_batches)} unconsumed MSE micro-batches."
             )
+        self._activate_anchor_update(update_index=update_index, expected_count=len(micro_batches))
         if self.mse_weight <= 0.0:
             self._prepared_mse_batches = None
             return
@@ -474,11 +615,13 @@ class BagelFlowUniGRPO(FlowGRPO):
     def finish_update_batch(self, *, succeeded: bool) -> None:
         """Release prepared KV/reference tensors, including failed updates."""
         remaining = len(self._prepared_mse_batches or ())
+        remaining_anchors = len(self._active_anchor_entries or ())
         self._prepared_mse_batches = None
-        if succeeded and remaining:
+        self._active_anchor_entries = None
+        if succeeded and (remaining or remaining_anchors):
             raise RuntimeError(
-                "BagelFlowUniGRPO.finish_update_batch: optimizer update completed with "
-                f"{remaining} unconsumed prepared MSE micro-batches."
+                "BagelFlowUniGRPO.finish_update_batch: optimizer update completed with unconsumed state: "
+                f"mse_batches={remaining}, anchor_entries={remaining_anchors}."
             )
 
     def compute_loss_and_backward(
@@ -492,6 +635,7 @@ class BagelFlowUniGRPO(FlowGRPO):
     ) -> AlgorithmStepResult:
         needs_boundary_context = self.ratio_norm and self.context_gradient_mode == "stage_boundary"
         target_steps = self._resolve_target_steps(segment) if self.mse_weight > 0.0 or needs_boundary_context else []
+        prepared_anchor = self._take_prepared_anchor(target_steps)
         prepared_mse = self._take_prepared_mse(target_steps) if self.mse_weight > 0.0 else None
 
         # The native Stage 0 -> Stage 1 engine boundary transfers values, not an
@@ -559,6 +703,7 @@ class BagelFlowUniGRPO(FlowGRPO):
                 forward_kwargs=boundary_forward_kwargs,
                 target_steps=target_steps,
                 reference_velocities=v_refs,
+                prepared_anchor=prepared_anchor,
             )
 
         # 1. Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the
@@ -694,6 +839,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         forward_kwargs: Dict[str, Any],
         target_steps: List[int],
         reference_velocities: Optional[List[torch.Tensor]],
+        prepared_anchor: Optional[_PreparedAnchor] = None,
     ) -> AlgorithmStepResult:
         """Joint RatioNorm + velocity MSE at the detached native stage boundary."""
         replay, policy_velocities = self.stage.replay_from_forward_kwargs_with_velocities(
@@ -702,12 +848,18 @@ class BagelFlowUniGRPO(FlowGRPO):
             params=self.params,
             step_indices=target_steps,
         )
+        anchor_replay: Optional[ReplayResult] = None
+        if prepared_anchor is not None:
+            anchor_replay = replay if prepared_anchor.derive_from_current else prepared_anchor.replay
+            if anchor_replay is None:
+                raise RuntimeError("Prepared BAGEL anchor contains no replay values for a trainable micro-batch.")
         policy_loss, metrics = self._ratio_norm_loss(
             replay=replay,
             segment=segment,
             advantages=advantages,
             training_progress=training_progress,
             target_steps=target_steps,
+            anchor_replay=anchor_replay,
         )
 
         mse: Optional[torch.Tensor] = None
@@ -848,18 +1000,31 @@ class BagelFlowUniGRPO(FlowGRPO):
         advantages: torch.Tensor,
         training_progress: float,
         target_steps: List[int],
+        anchor_replay: Optional[ReplayResult] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Build the RatioNorm loss without choosing a backward schedule."""
         new_logp = replay.log_probs  # [1, S']
         mu_theta = replay.prev_sample_means  # [1, S', seq, C]
         if mu_theta is None:
             raise RuntimeError("BagelFlowUniGRPO(ratio_norm=True): stage.replay returned no prev_sample_means (μ_θ).")
-        old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
-        mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
-            dtype=mu_theta.dtype, device=mu_theta.device
-        )
+        if anchor_replay is None:
+            old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
+            mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
+                dtype=mu_theta.dtype, device=mu_theta.device
+            )
+        else:
+            if anchor_replay.prev_sample_means is None:
+                raise RuntimeError("Prepared BAGEL anchor replay returned no prev_sample_means (μ_old).")
+            old_logp = anchor_replay.log_probs.detach().to(dtype=new_logp.dtype, device=new_logp.device)
+            mu_old = anchor_replay.prev_sample_means.detach().to(dtype=mu_theta.dtype, device=mu_theta.device)
+            if old_logp.shape != new_logp.shape or mu_old.shape != mu_theta.shape:
+                raise RuntimeError(
+                    "Prepared BAGEL anchor shape mismatch: "
+                    f"old_logp={tuple(old_logp.shape)}, new_logp={tuple(new_logp.shape)}, "
+                    f"mu_old={tuple(mu_old.shape)}, mu_theta={tuple(mu_theta.shape)}."
+                )
         # std_var must use the same sigma_max as the SDE step that produced old/new log_probs
         # (diffuse/replay pass schedule[1]); otherwise the two disagree at the σ=1 step.
         sde_sigma_max = float(segment.sigmas[1]) if int(segment.sigmas.shape[0]) > 1 else float(segment.sigmas[0])

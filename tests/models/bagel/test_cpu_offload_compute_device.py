@@ -108,6 +108,19 @@ def _boundary_segment() -> object:
             },
             "already shares one detached context",
         ),
+        (
+            {"lazy_first_update_anchor": True, "ratio_norm": True},
+            "requires context_gradient_mode='stage_boundary'",
+        ),
+        (
+            {
+                "lazy_first_update_anchor": True,
+                "ratio_norm": True,
+                "context_gradient_mode": "stage_boundary",
+                "old_logp_source": "rollout",
+            },
+            "old_logp_source='replay'",
+        ),
     ],
 )
 def test_stage_boundary_configuration_validation(kwargs, message) -> None:
@@ -440,6 +453,76 @@ def test_stage_boundary_reuses_prepared_context_and_refreshes_next_update() -> N
     assert stage.context_builds == 2
     assert stage.replay_calls == 2
     assert stage.predict_calls == 2  # one frozen-reference velocity per update
+
+
+def test_lazy_first_update_anchor_matches_eager_anchor_and_removes_one_replay() -> None:
+    def run(*, lazy: bool):
+        transformer = _BoundaryTransformer()
+        stage = _BoundaryStage(transformer)
+        algorithm = BagelFlowUniGRPO(
+            params=SimpleNamespace(eta=0.8),
+            stage=stage,
+            old_logp_source="replay",
+            mse_weight=0.3,
+            ratio_norm=True,
+            clip_range=0.1,
+            context_gradient_mode="stage_boundary",
+            lazy_first_update_anchor=lazy,
+        )
+        conditions = {"context_scale": 1.5}
+        segments = [_boundary_segment(), _boundary_segment()]
+        updates = [[(conditions, segments[0])], [(conditions, segments[1])]]
+        if lazy:
+            # Native Omni emits a rollout log-prob but no trainer-runtime mean.
+            # The prepared anchor contract must not read either placeholder.
+            for segment in segments:
+                segment.sde_logp = torch.tensor([[-99.0]])
+                segment.sde_means = None
+            algorithm.prepare_anchor_batch(updates=updates)
+        else:
+            for update in updates:
+                for update_conditions, segment in update:
+                    algorithm.prepare_segment(conditions=update_conditions, segment=segment)
+
+        results = []
+        gradients = []
+        for update_index, ((update_conditions, segment),) in enumerate(updates):
+            algorithm.prepare_update_batch(
+                micro_batches=[(update_conditions, segment, torch.ones(1))],
+                training_progress=0.25,
+                loss_scale=1.0,
+                update_index=update_index,
+            )
+            result = algorithm.compute_loss_and_backward(
+                conditions=update_conditions,
+                segment=segment,
+                advantages=torch.ones(1),
+                training_progress=0.25,
+                loss_scale=1.0,
+            )
+            algorithm.finish_update_batch(succeeded=True)
+            results.append(result)
+            gradients.append(transformer.policy_weight.grad.detach().clone())
+            with torch.no_grad():
+                transformer.policy_weight.add_(transformer.policy_weight.grad, alpha=-0.01)
+            transformer.policy_weight.grad = None
+
+        if lazy:
+            algorithm.finish_anchor_batch(succeeded=True)
+        return stage, results, gradients
+
+    eager_stage, eager_results, eager_gradients = run(lazy=False)
+    lazy_stage, lazy_results, lazy_gradients = run(lazy=True)
+
+    assert eager_stage.context_builds == 4  # two eager anchors + two current contexts
+    assert lazy_stage.context_builds == 3  # update-1 anchor + two current contexts
+    assert [result.loss for result in lazy_results] == pytest.approx(
+        [result.loss for result in eager_results], rel=0.0, abs=0.0
+    )
+    assert [result.metrics for result in lazy_results] == [result.metrics for result in eager_results]
+    assert all(torch.equal(lazy_grad, eager_grad) for lazy_grad, eager_grad in zip(lazy_gradients, eager_gradients))
+    assert lazy_results[0].metrics["ratio_mean"] == pytest.approx(1.0)
+    assert lazy_results[0].metrics["rn_delta_mu_sq_mean"] == pytest.approx(0.0)
 
 
 def test_stage_boundary_direct_call_builds_one_shared_context() -> None:

@@ -390,6 +390,13 @@ class StageAlgorithm(Remote, ABC):
     # condition/segment pairs. Keeping this separate preserves compatibility for
     # existing ``prepares_update_batch`` implementations.
     prepares_phased_update_batch: bool = False
+    # Opt-in for algorithms that can prepare a frozen anchor over the complete
+    # optimizer-update partition. The unified stack supplies every update before
+    # the first optimizer step and owns failure-safe finalization.
+    prepares_anchor_plan: bool = False
+    # Opt-in extension for phased update preparation that also needs the update
+    # index. Kept separate so existing phased hooks retain their call signature.
+    prepares_indexed_update_batch: bool = False
 
     def recomputes_anchor(self) -> bool:
         """Whether the anchor must be recomputed at the EXACT ``(mini, micro)``
@@ -455,6 +462,24 @@ class StageAlgorithm(Remote, ABC):
         ``prepares_phased_update_batch`` additionally receive each slice's
         advantages plus ``training_progress`` and ``loss_scale``.
         """
+        return None
+
+    def prepare_anchor_batch(
+        self,
+        *,
+        updates: Sequence[Sequence[Tuple[Mapping[str, "Condition"], "Segment"]]],
+    ) -> None:
+        """Optionally freeze anchors using the complete disjoint-update plan.
+
+        Called before any optimizer step, at the same micro geometry later used
+        by training. Algorithms may defer the first update's anchor to its
+        current-policy replay because no weight update precedes it, while all
+        later updates must still be anchored eagerly here.
+        """
+        return None
+
+    def finish_anchor_batch(self, *, succeeded: bool) -> None:
+        """Release state created by :meth:`prepare_anchor_batch`."""
         return None
 
     def finish_update_batch(self, *, succeeded: bool) -> None:

@@ -255,6 +255,28 @@ class UnifiedModelTrainStack(Remote):
         for field, parts in collected.items():
             setattr(resp_track.segment, field, torch.cat(parts, dim=0))
 
+    def _prepare_anchor_batch(
+        self,
+        name: str,
+        track: RolloutTrack,
+        update_slices: List[List[Tuple[int, int]]],
+    ) -> None:
+        """Supply one algorithm the complete pre-optimizer update partition."""
+        algorithm = self.algorithms[name]
+        updates = []
+        for micro_slices in update_slices:
+            update = []
+            for start, end in micro_slices:
+                micro = track.slice(start, end)
+                if micro.segment is None:
+                    raise RuntimeError(
+                        f"UnifiedModelTrainStack._prepare_anchor_batch: track {name!r} "
+                        "produced a micro-batch with segment=None."
+                    )
+                update.append((micro.conditions, micro.segment))
+            updates.append(update)
+        algorithm.prepare_anchor_batch(updates=updates)
+
     def _backward_track(
         self,
         name: str,
@@ -345,6 +367,7 @@ class UnifiedModelTrainStack(Remote):
                             tracks[name],
                             slices_by_track[name],
                             training_progress=training_progress,
+                            update_index=update_index,
                         )
                     if name == "image":
                         phase_times["image_prepare_reference_host_time_s"] = time.perf_counter() - started
@@ -415,6 +438,7 @@ class UnifiedModelTrainStack(Remote):
         micro_slices: List[Tuple[int, int]],
         *,
         training_progress: float,
+        update_index: int = 0,
     ) -> None:
         """Run one algorithm's detached preparation at update geometry."""
         algorithm = self.algorithms[name]
@@ -437,11 +461,14 @@ class UnifiedModelTrainStack(Remote):
             else:
                 micro_batches.append((micro.conditions, micro.segment))
         if phased:
-            algorithm.prepare_update_batch(
-                micro_batches=micro_batches,
-                training_progress=float(training_progress),
-                loss_scale=1.0 / len(micro_slices),
-            )
+            kwargs = {
+                "micro_batches": micro_batches,
+                "training_progress": float(training_progress),
+                "loss_scale": 1.0 / len(micro_slices),
+            }
+            if bool(getattr(algorithm, "prepares_indexed_update_batch", False)):
+                kwargs["update_index"] = int(update_index)
+            algorithm.prepare_update_batch(**kwargs)
         else:
             algorithm.prepare_update_batch(micro_batches=micro_batches)
 
@@ -503,33 +530,49 @@ class UnifiedModelTrainStack(Remote):
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             tracks = {"ar": ar_track, "image": image_track}
-            # Freeze each track's π_old anchor once, before the multi-update loop.
-            anchor_image_host_time_s: Optional[float] = None
-            for name in self.algorithms:
-                started = time.perf_counter()
-                with _profile_record(profiler, f"anchor_{name}"):
-                    self.prepare_segment(name, tracks[name])
-                if name == "image":
-                    anchor_image_host_time_s = time.perf_counter() - started
-
             # N optimizer steps over disjoint mini-batches (each track sliced by the same
             # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
             steps_by_track = {
                 name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms
             }
-            per_update: List[Dict[str, TrainStepResult]] = []
-            for u in range(self.num_updates_per_batch):
-                slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
-                per_update.append(
-                    self._train_one_step(
-                        tracks,
-                        slices_by_track,
-                        training_progress=float(training_progress),
-                        update_index=u,
-                        profiler=profiler,
-                        anchor_image_host_time_s=anchor_image_host_time_s if u == 0 else None,
+            anchor_batch_algorithms = [
+                algorithm
+                for algorithm in self.algorithms.values()
+                if bool(getattr(algorithm, "prepares_anchor_plan", False))
+            ]
+            train_succeeded = False
+            try:
+                # Freeze each track's π_old anchor before the first optimizer step.
+                # An opt-in algorithm receives the full disjoint-update partition and
+                # may derive update 0's anchor lazily from its identical current replay.
+                anchor_image_host_time_s: Optional[float] = None
+                for name, algorithm in self.algorithms.items():
+                    started = time.perf_counter()
+                    with _profile_record(profiler, f"anchor_{name}"):
+                        if bool(getattr(algorithm, "prepares_anchor_plan", False)):
+                            self._prepare_anchor_batch(name, tracks[name], steps_by_track[name])
+                        else:
+                            self.prepare_segment(name, tracks[name])
+                    if name == "image":
+                        anchor_image_host_time_s = time.perf_counter() - started
+
+                per_update: List[Dict[str, TrainStepResult]] = []
+                for u in range(self.num_updates_per_batch):
+                    slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
+                    per_update.append(
+                        self._train_one_step(
+                            tracks,
+                            slices_by_track,
+                            training_progress=float(training_progress),
+                            update_index=u,
+                            profiler=profiler,
+                            anchor_image_host_time_s=anchor_image_host_time_s if u == 0 else None,
+                        )
                     )
-                )
+                train_succeeded = True
+            finally:
+                for algorithm in anchor_batch_algorithms:
+                    algorithm.finish_anchor_batch(succeeded=train_succeeded)
         if profiler is not None:
             profiler.step()
 

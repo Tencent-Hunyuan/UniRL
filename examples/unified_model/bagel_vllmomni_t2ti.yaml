@@ -150,6 +150,10 @@ algorithm:
     # with the shared advantage. RatioNorm and MSE then share this detached context
     # and the same policy velocities, removing duplicate image-policy forwards.
     context_gradient_mode: stage_boundary
+    # Updates are disjoint. Update 0 derives its detached old-policy anchor from
+    # the same exact replay used for its current-policy loss (before optimizer 0);
+    # only later updates need a separate eager pre-update anchor replay.
+    lazy_first_update_anchor: true
     # stage_boundary already performs detached context reuse; the older full-grad
     # phased-reuse path is mutually exclusive and remains disabled.
     reuse_ratio_context_for_mse: false

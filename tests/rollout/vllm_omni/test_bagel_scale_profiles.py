@@ -40,6 +40,7 @@ def _assert_strict_t2ti_contract(cfg, *, expected_pairs: int) -> None:
     assert cfg.pipeline.t2ti_replay_chunk_mode == "exact"
     assert cfg.pipeline.t2ti_replay_execution_order == "layer_major"
     assert cfg.algorithm.image.context_gradient_mode == "stage_boundary"
+    assert cfg.algorithm.image.lazy_first_update_anchor is True
     assert cfg.algorithm.image.reuse_ratio_context_for_mse is False
     assert list(cfg.sync.stage_ids) == [0, 1]
     assert cfg.sampling.diffusion.samples_per_prompt == 1
