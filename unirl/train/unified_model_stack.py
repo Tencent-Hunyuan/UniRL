@@ -14,9 +14,11 @@ two-algorithm case.  Sequencing per :meth:`train` call::
     prepare_segment(ar); prepare_segment(image)              # once: freeze both π_old anchors
     for u in range(num_updates_per_batch):                   # PPO-style mini-batches
         backend.zero_grad()
+        backend.park_optimizer_state_for_rollout()           # optional: Adam moments -> CPU
         for name in ("ar", "image"):
             for (start, end) in micro_slices(mini_batch_u):
                 algorithm[name].compute_loss_and_backward(loss_scale=1/N, ...)  # grads accumulate
+        backend.restore_optimizer_state_after_rollout()      # exact slot devices
         backend.optimizer_step(max_grad_norm=...)            # ONE step per mini-batch
     on_rollout_end()
     return {name: TrainStepResult, ...}                      # reduced across updates
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import time
 from contextlib import nullcontext
 from dataclasses import replace
@@ -62,6 +65,8 @@ _PHASE_HOST_TIME_METRICS = frozenset(
         "image_ratio_mse_backward_host_time_s",
         "image_micro_empty_cache_host_time_s",
         "pre_optimizer_empty_cache_host_time_s",
+        "train_optimizer_park_host_time_s",
+        "train_optimizer_restore_host_time_s",
         "optimizer_host_time_s",
         "post_optimizer_empty_cache_host_time_s",
     }
@@ -82,18 +87,28 @@ _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS = frozenset(
 _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS = frozenset({"image_micro_empty_cache_skip_count"})
 _IMAGE_MICRO_RECLAIM_COUNT_METRICS = _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS
 _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS = frozenset({"image_micro_empty_cache_min_free_gb"})
+_TRAIN_OPTIMIZER_STATE_SUM_METRICS = frozenset(
+    {
+        "train_optimizer_state_bytes",
+        "train_optimizer_state_bytes_parked",
+        "train_optimizer_state_bytes_restored",
+    }
+)
+_TRAIN_OPTIMIZER_STATE_MAX_METRICS = frozenset({"train_optimizer_state_restore_slots_pending"})
 _DP_MAX_METRICS = _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
 _DP_MIN_METRICS = _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS
+_DP_SUM_METRICS = _TRAIN_OPTIMIZER_STATE_SUM_METRICS
 
 
 def _max_dp_metrics(base: Mapping[str, object], peers: List[Mapping[str, object]]) -> Dict[str, object]:
     """Copy ``base`` while reducing BAGEL safety/critical-path diagnostics over DP peers.
 
-    Timings, allocator peaks, and reclaim counts use the worst-case maximum;
-    free-memory headroom uses the worst-case minimum.
+    Timings, allocator peaks, pending-slot counts, and reclaim counts use the
+    worst-case maximum; free-memory headroom uses the worst-case minimum;
+    optimizer-state bytes sum the physical shards owned by DP peers.
     """
     reduced = dict(base)
-    for metric_name in _DP_MAX_METRICS:
+    for metric_name in _DP_MAX_METRICS | _TRAIN_OPTIMIZER_STATE_MAX_METRICS:
         values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
         if values:
             reduced[metric_name] = max(values)
@@ -101,7 +116,24 @@ def _max_dp_metrics(base: Mapping[str, object], peers: List[Mapping[str, object]
         values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
         if values:
             reduced[metric_name] = min(values)
+    for metric_name in _DP_SUM_METRICS:
+        values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
+        if values:
+            reduced[metric_name] = sum(values)
     return reduced
+
+
+def _train_optimizer_metrics(report: Mapping[str, object]) -> Dict[str, float]:
+    """Namespace the existing backend park/restore report for train metrics."""
+    names = {
+        "optimizer_state_bytes": "train_optimizer_state_bytes",
+        "optimizer_state_bytes_parked": "train_optimizer_state_bytes_parked",
+        "optimizer_park_host_time_s": "train_optimizer_park_host_time_s",
+        "optimizer_state_bytes_restored": "train_optimizer_state_bytes_restored",
+        "optimizer_state_restore_slots_pending": "train_optimizer_state_restore_slots_pending",
+        "optimizer_restore_host_time_s": "train_optimizer_restore_host_time_s",
+    }
+    return {names[key]: float(value) for key, value in report.items() if key in names}
 
 
 def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
@@ -145,7 +177,12 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
                 reduced_updates.append(_max_dp_metrics(base_metrics, peer_metrics))
 
             summary_metrics = dict(base_result.metrics)
-            for metric_name in _PHASE_HOST_TIME_METRICS | _IMAGE_MICRO_RECLAIM_COUNT_METRICS:
+            for metric_name in (
+                _PHASE_HOST_TIME_METRICS
+                | _IMAGE_MICRO_RECLAIM_COUNT_METRICS
+                | _TRAIN_OPTIMIZER_STATE_SUM_METRICS
+                | _TRAIN_OPTIMIZER_STATE_MAX_METRICS
+            ):
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = sum(values) / len(values)
@@ -197,6 +234,7 @@ class UnifiedModelTrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        park_optimizer_state_during_train: bool = False,
         empty_cache_after_image_micro: bool = False,
         image_micro_empty_cache_interval: int = 1,
         image_micro_empty_cache_min_free_gb: float = 0.0,
@@ -216,6 +254,11 @@ class UnifiedModelTrainStack(Remote):
         }
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
+        self.park_optimizer_state_during_train = bool(park_optimizer_state_during_train)
+        if self.park_optimizer_state_during_train and bool(getattr(fsdp_backend, "_persistent_cpu_offload", False)):
+            raise ValueError(
+                "UnifiedModelTrainStack.park_optimizer_state_during_train requires backend.fsdp_cfg.cpu_offload=false."
+            )
         self.empty_cache_after_image_micro = bool(empty_cache_after_image_micro)
         self.image_micro_empty_cache_interval = _positive_int(
             name="UnifiedModelTrainStack.image_micro_empty_cache_interval",
@@ -463,8 +506,29 @@ class UnifiedModelTrainStack(Remote):
             torch.cuda.reset_peak_memory_stats()
         self.fsdp_backend.zero_grad()
         phase_times: Dict[str, float] = {}
+        train_optimizer_metrics: Dict[str, float] = {}
+        park_optimizer = bool(getattr(self, "park_optimizer_state_during_train", False))
+        optimizer_park_attempted = False
+        optimizer_restored = False
+
+        def restore_optimizer_state() -> None:
+            nonlocal optimizer_restored
+            if not optimizer_park_attempted or optimizer_restored:
+                return
+            report = self.fsdp_backend.restore_optimizer_state_after_rollout()
+            train_optimizer_metrics.update(_train_optimizer_metrics(report))
+            optimizer_restored = True
+
         succeeded = False
         try:
+            if park_optimizer:
+                # Reuse the rollout boundary's exact per-slot device plan. This
+                # second zero_grad is intentional: the backend primitive records
+                # before transfer and repairs a partially failed park in cleanup.
+                optimizer_park_attempted = True
+                report = self.fsdp_backend.park_optimizer_state_for_rollout()
+                train_optimizer_metrics.update(_train_optimizer_metrics(report))
+
             results: Dict[str, TrainStepResult] = {}
             any_backward = False
             for name, algorithm in self.algorithms.items():
@@ -506,6 +570,9 @@ class UnifiedModelTrainStack(Remote):
                     if self.num_updates_per_batch > 1 and torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     phase_times["pre_optimizer_empty_cache_host_time_s"] = time.perf_counter() - empty_cache_started
+                    # Adam moments are absent for forward/backward and return to
+                    # their exact original per-slot devices only for the step.
+                    restore_optimizer_state()
                     optimizer_started = time.perf_counter()
                     grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
                     phase_times["optimizer_host_time_s"] = time.perf_counter() - optimizer_started
@@ -516,6 +583,7 @@ class UnifiedModelTrainStack(Remote):
                             time.perf_counter() - empty_cache_started
                         )
             else:
+                restore_optimizer_state()
                 grad_norm = 0.0
                 logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
 
@@ -543,6 +611,7 @@ class UnifiedModelTrainStack(Remote):
                             metrics[metric_name] = phase_times[metric_name]
                     if anchor_image_host_time_s is not None:
                         metrics["anchor_image_host_time_s"] = float(anchor_image_host_time_s)
+                    metrics.update(train_optimizer_metrics)
                     metrics.update(cuda_peak_metrics)
                 results[name] = TrainStepResult(
                     loss=result.loss,
@@ -555,9 +624,48 @@ class UnifiedModelTrainStack(Remote):
             succeeded = True
             return results
         finally:
-            for algorithm in self.algorithms.values():
-                if algorithm.prepares_update_batch:
-                    algorithm.finish_update_batch(succeeded=succeeded)
+            if not optimizer_park_attempted:
+                # Preserve the historical default-off cleanup path exactly.
+                for algorithm in self.algorithms.values():
+                    if algorithm.prepares_update_batch:
+                        algorithm.finish_update_batch(succeeded=succeeded)
+            else:
+                active_error = sys.exc_info()[0] is not None
+                cleanup_errors: List[Tuple[str, BaseException]] = []
+                for algorithm in self.algorithms.values():
+                    if not algorithm.prepares_update_batch:
+                        continue
+                    try:
+                        algorithm.finish_update_batch(succeeded=succeeded)
+                    except BaseException as exc:
+                        cleanup_errors.append((f"{type(algorithm).__name__}.finish_update_batch", exc))
+
+                if not optimizer_restored:
+                    # A failed backward can leave sharded grads resident. Release
+                    # them before restoring Adam so error cleanup does not create a
+                    # transient memory peak, then retry the idempotent restore once.
+                    if not succeeded:
+                        try:
+                            self.fsdp_backend.zero_grad()
+                        except BaseException as exc:
+                            cleanup_errors.append(("optimizer gradient cleanup", exc))
+                    try:
+                        restore_optimizer_state()
+                    except BaseException as exc:
+                        cleanup_errors.append(("optimizer state restore", exc))
+
+                if cleanup_errors:
+                    if active_error:
+                        for action, exc in cleanup_errors:
+                            logger.error(
+                                "Unified train cleanup failed in %s: %s",
+                                action,
+                                exc,
+                                exc_info=(type(exc), exc, exc.__traceback__),
+                            )
+                    else:
+                        action, exc = cleanup_errors[0]
+                        raise RuntimeError(f"Unified train cleanup failed in {action}.") from exc
 
     def _prepare_update_batch(
         self,

@@ -412,7 +412,44 @@ def test_optimizer_parking_rejects_non_external_or_fsdp_offload_modes(kwargs) ->
 def test_optimizer_parking_is_default_off_and_metric_reduction_is_empty_safe() -> None:
     parameter = inspect.signature(UnifiedModelTrainer.__init__).parameters["park_optimizer_state_during_rollout"]
     assert parameter.default is False
+    train_parameter = inspect.signature(UnifiedModelTrainer.__init__).parameters["park_optimizer_state_during_train"]
+    assert train_parameter.default is False
     assert _reduce_rollout_boundary_metrics(None) == {}
+
+
+def test_train_optimizer_parking_requires_rollout_parking() -> None:
+    with pytest.raises(ValueError, match="park_optimizer_state_during_rollout=true"):
+        UnifiedModelTrainer._validate_train_optimizer_state_parking_contract(
+            enabled=True,
+            rollout_parking_enabled=False,
+            single_engine=True,
+            rollout_is_trainside=False,
+            enable_fsdp_offload=False,
+            backend_persistent_cpu_offload=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"single_engine": False},
+        {"rollout_is_trainside": True},
+        {"enable_fsdp_offload": True},
+        {"backend_persistent_cpu_offload": True},
+    ],
+)
+def test_train_optimizer_parking_reuses_external_boundary_contract(kwargs) -> None:
+    contract = {
+        "enabled": True,
+        "rollout_parking_enabled": True,
+        "single_engine": True,
+        "rollout_is_trainside": False,
+        "enable_fsdp_offload": False,
+        "backend_persistent_cpu_offload": False,
+        **kwargs,
+    }
+    with pytest.raises(ValueError):
+        UnifiedModelTrainer._validate_train_optimizer_state_parking_contract(**contract)
 
 
 def test_vllm_omni_shutdown_is_driver_dispatchable() -> None:

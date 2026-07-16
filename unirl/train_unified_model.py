@@ -41,6 +41,7 @@ def main(cfg: DictConfig) -> None:
         logging_cfg=cfg.get("logging"),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
         park_optimizer_state_during_rollout=cfg.get("park_optimizer_state_during_rollout", False),
+        park_optimizer_state_during_train=cfg.get("park_optimizer_state_during_train", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
         eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),

@@ -260,6 +260,7 @@ class UnifiedModelTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
         park_optimizer_state_during_rollout: bool = False,
+        park_optimizer_state_during_train: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = 32,
         eval_cfg_text_scale: float = 4.0,
@@ -275,6 +276,7 @@ class UnifiedModelTrainer(BaseTrainer):
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._park_optimizer_state_during_rollout = bool(park_optimizer_state_during_rollout)
+        self._park_optimizer_state_during_train = bool(park_optimizer_state_during_train)
         fsdp_cfg = backend_cfg.get("fsdp_cfg")
         self._backend_persistent_cpu_offload = bool(fsdp_cfg is not None and fsdp_cfg.get("cpu_offload", False))
 
@@ -351,6 +353,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 fsdp_backend=self.backend,
                 ar_algorithm=self.ar_algorithm,
                 image_algorithm=self.image_algorithm,
+                park_optimizer_state_during_train=self._park_optimizer_state_during_train,
             )
 
             # Rollout wiring. Single-engine (M=1 / UniGRPO — a trainside or single
@@ -373,6 +376,14 @@ class UnifiedModelTrainer(BaseTrainer):
                 self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
                 self._validate_optimizer_state_parking_contract(
                     enabled=self._park_optimizer_state_during_rollout,
+                    single_engine=True,
+                    rollout_is_trainside=self._rollout_is_trainside,
+                    enable_fsdp_offload=self._enable_fsdp_offload,
+                    backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+                )
+                self._validate_train_optimizer_state_parking_contract(
+                    enabled=self._park_optimizer_state_during_train,
+                    rollout_parking_enabled=self._park_optimizer_state_during_rollout,
                     single_engine=True,
                     rollout_is_trainside=self._rollout_is_trainside,
                     enable_fsdp_offload=self._enable_fsdp_offload,
@@ -441,6 +452,14 @@ class UnifiedModelTrainer(BaseTrainer):
 
             self._validate_optimizer_state_parking_contract(
                 enabled=self._park_optimizer_state_during_rollout,
+                single_engine=False,
+                rollout_is_trainside=False,
+                enable_fsdp_offload=self._enable_fsdp_offload,
+                backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+            )
+            self._validate_train_optimizer_state_parking_contract(
+                enabled=self._park_optimizer_state_during_train,
+                rollout_parking_enabled=self._park_optimizer_state_during_rollout,
                 single_engine=False,
                 rollout_is_trainside=False,
                 enable_fsdp_offload=self._enable_fsdp_offload,
@@ -602,6 +621,32 @@ class UnifiedModelTrainer(BaseTrainer):
             raise ValueError(
                 "UnifiedModelTrainer: optimizer-state parking requires backend.fsdp_cfg.cpu_offload=false."
             )
+
+    @staticmethod
+    def _validate_train_optimizer_state_parking_contract(
+        *,
+        enabled: bool,
+        rollout_parking_enabled: bool,
+        single_engine: bool,
+        rollout_is_trainside: bool,
+        enable_fsdp_offload: bool,
+        backend_persistent_cpu_offload: bool,
+    ) -> None:
+        """Limit train-phase parking to the proven external BAGEL lifecycle."""
+        if not enabled:
+            return
+        if not rollout_parking_enabled:
+            raise ValueError(
+                "UnifiedModelTrainer: park_optimizer_state_during_train requires "
+                "park_optimizer_state_during_rollout=true so Adam is also absent while Omni is awake."
+            )
+        UnifiedModelTrainer._validate_optimizer_state_parking_contract(
+            enabled=True,
+            single_engine=single_engine,
+            rollout_is_trainside=rollout_is_trainside,
+            enable_fsdp_offload=enable_fsdp_offload,
+            backend_persistent_cpu_offload=backend_persistent_cpu_offload,
+        )
 
     def _wire_engine(self, cfg: DictConfig, *, anchor_device: int) -> Any:
         """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker.
@@ -1449,6 +1494,7 @@ class UnifiedModelTrainer(BaseTrainer):
             num_rollouts=num_rollouts,
             extra={
                 "park_optimizer_state_during_rollout": self._park_optimizer_state_during_rollout,
+                "park_optimizer_state_during_train": self._park_optimizer_state_during_train,
             },
         )
         try:

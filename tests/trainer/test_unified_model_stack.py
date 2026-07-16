@@ -214,6 +214,7 @@ def test_cuda_reclamation_and_peak_telemetry_default_off() -> None:
     parameters = signature(UnifiedModelTrainStack.__init__).parameters
 
     assert parameters["empty_cache_after_image_micro"].default is False
+    assert parameters["park_optimizer_state_during_train"].default is False
     assert parameters["image_micro_empty_cache_interval"].default == 1
     assert parameters["image_micro_empty_cache_min_free_gb"].default == 0.0
     assert parameters["empty_cache_after_optimizer"].default is False

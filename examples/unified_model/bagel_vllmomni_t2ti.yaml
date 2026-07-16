@@ -29,6 +29,11 @@ enable_fsdp_offload: false
 # Omni with completed grads + Adam state and can OOM. This narrow lifecycle does
 # not move FSDP parameters/shards and requires backend.fsdp_cfg.cpu_offload=false.
 park_optimizer_state_during_rollout: true
+# Keep sharded Adam moments on CPU during each update's replay/backward, then
+# restore their exact original devices immediately before optimizer.step. The
+# moments remain resident after the step until the next update or rollout
+# boundary actually needs them parked again.
+park_optimizer_state_during_train: true
 eval_cfg_text_scale: 1.0
 
 save_interval: 0
