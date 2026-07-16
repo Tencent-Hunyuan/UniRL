@@ -40,7 +40,7 @@ def _assert_strict_t2ti_contract(cfg, *, expected_pairs: int) -> None:
     assert cfg.rollout.config.modality == "bagel_t2ti"
     assert cfg.pipeline.t2ti_replay_chunk_mode == "exact"
     assert cfg.pipeline.t2ti_replay_execution_order == "layer_major"
-    assert cfg.pipeline.t2ti_flow_many_enabled is False
+    assert cfg.pipeline.t2ti_flow_many_enabled is True
     assert cfg.algorithm.image.context_gradient_mode == "stage_boundary"
     assert cfg.algorithm.image.lazy_first_update_anchor is True
     assert cfg.algorithm.image.reuse_ratio_context_for_mse is False
@@ -71,8 +71,8 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     assert cfg.reward.backend.config.batch_size == 8
     assert cfg.stack.num_updates_per_batch == 2
     assert cfg.stack.empty_cache_after_image_micro is True
-    assert cfg.stack.image_micro_empty_cache_interval == 1
-    assert cfg.stack.image_micro_empty_cache_min_free_gb == 0.0
+    assert cfg.stack.image_micro_empty_cache_interval == 4
+    assert cfg.stack.image_micro_empty_cache_min_free_gb == 8.0
     assert cfg.stack.empty_cache_after_optimizer is True
     assert cfg.stack.cuda_peak_telemetry is True
 

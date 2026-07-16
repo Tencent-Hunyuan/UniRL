@@ -46,9 +46,10 @@ main() {
     export BAGEL_PATH="${BAGEL_PATH:-$root_dir/models/local/BAGEL-7B-MoT}"
     export PICKSCORE_PROCESSOR_ID="${PICKSCORE_PROCESSOR_ID:-$root_dir/models/local/CLIP-ViT-H-14-laion2B-s32B-b79K}"
     export PICKSCORE_MODEL_ID="${PICKSCORE_MODEL_ID:-$root_dir/models/local/PickScore_v1}"
-    # Update 1 can otherwise fail an FSDP all-gather with several GiB reserved
-    # but unusable in fixed allocator segments after the long replay backward.
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+    # Expandable segments avoid fixed-segment fragmentation. Proactive native
+    # allocator collection returns old unused blocks during long image micros,
+    # before a full sync-and-release cycle becomes necessary.
+    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.8}"
     export PYTHONPATH="$root_dir${PYTHONPATH:+:$PYTHONPATH}"
 
     local path

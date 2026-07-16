@@ -73,10 +73,10 @@ pipeline:
   # resident while that layer traverses all chunks. This removes per-token
   # unshard/reshard and makes collective order independent of trace depth.
   t2ti_replay_execution_order: layer_major
-  # Traverse each FSDP decoder layer once for all SDE velocity streams. This is
-  # exact at CFG=1 but can retain more live activations. Keep production disabled
-  # until an explicit H20 peak-memory A/B run establishes sufficient headroom.
-  t2ti_flow_many_enabled: false
+  # Traverse each FSDP decoder layer once for all SDE velocity streams. Real
+  # BAGEL bf16/H20 parity and repeated P=32,N=24,M=1,U=2 lifecycle gates passed
+  # for this exact layer-major execution order.
+  t2ti_flow_many_enabled: true
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
@@ -195,11 +195,10 @@ stack:
   # and live gradients. cuda_peak_* counters reset per update;
   # cuda_train_window_peak_* also covers hydration, full anchor, and all updates.
   empty_cache_after_image_micro: true
-  # Interval 1 preserves the conservative per-micro behavior. A larger cadence
-  # plus a nonzero driver-free floor is an opt-in H20 tuning knob and must be
-  # capacity-gated before changing this production default.
-  image_micro_empty_cache_interval: 1
-  image_micro_empty_cache_min_free_gb: 0.0
+  # Reclaim at a bounded cadence, or sooner when driver-visible free memory falls
+  # below the H20 safety floor. The final micro is always reclaimed.
+  image_micro_empty_cache_interval: 4
+  image_micro_empty_cache_min_free_gb: 8.0
   empty_cache_after_optimizer: true
   cuda_peak_telemetry: true
 

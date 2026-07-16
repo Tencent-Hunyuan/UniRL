@@ -48,6 +48,8 @@ stack:
   # Production-only H20 reclamation controls; preserve the smoke's default-off
   # behavior so its CPU-offload lifecycle remains the sole memory mechanism.
   empty_cache_after_image_micro: false
+  image_micro_empty_cache_interval: 1
+  image_micro_empty_cache_min_free_gb: 0.0
   empty_cache_after_optimizer: false
   cuda_peak_telemetry: false
 

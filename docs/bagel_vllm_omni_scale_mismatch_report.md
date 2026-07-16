@@ -368,6 +368,96 @@ from `0.772319019`. This is promising directional evidence, but one new high,
 six heterogeneous prompt batches, and the low fit are not enough to call a
 sustained learning curve.
 
+## R6 Train-Phase Optimizer Parking Gate
+
+Run [`0htre89s`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/0htre89s), at
+code revision `4bde6578`, adds train-phase optimizer-only parking to the exact
+r5 workload. It uses one node with eight H20s, global
+`P=32, N=24, M=1, U=2`, batch size 32, exact layer-major replay, and the same
+explicit flow-many H20 gate. Both `enable_fsdp_offload` and
+`backend.fsdp_cfg.cpu_offload` are false. FSDP parameters and shards remain on
+GPU; only sharded Adam moments move temporarily.
+
+Before launch, the exact pod environment passed 88 focused tests with zero
+skips or failures. A separately selected two-rank CUDA/NCCL test used Torch
+2.11.0+cu129 and composable FSDP2 on two H20s, parked/restored DTensor Adam
+moments, preserved parameter shard identity and placement, and completed
+another backward plus AdamW step. vLLM and vLLM-Omni were both 0.20.0. The
+resolved production override retained `N=24`, `M=1`, `U=2`, interval-1 cache
+reclamation, and a 0 GiB free-memory floor.
+
+The first r6 round completed all 768 native T2TI samples and both optimizer
+updates. Its reward/replay payload was bit-for-bit identical to r5 round one
+across every common rollout metric. Mean/std/min/max PickScore was
+`0.776082218/0.083198704/0.537614286/0.969348431`, with zero zero-variance
+prompt groups. Image ratios and losses remained within the existing numerical
+variation budget; all AR/image ratios, losses, and gradient norms were finite.
+
+| Phase | R5 round 1 | R6 round 1 | R6 - R5 |
+| --- | ---: | ---: | ---: |
+| native generate | 831.191 s | 818.554 s | -12.637 s |
+| reward | 6.477 s | 6.031 s | -0.446 s |
+| train, both updates | 2,266.816 s | 2,221.016 s | -45.800 s (-2.0%) |
+| total round | 3,109.997 s | 3,051.703 s | -58.294 s (-1.9%) |
+
+Update 0 had no pre-existing Adam moments, so its boundary and train restore
+correctly moved zero bytes. After optimizer 0 created Adam, update 1 parked and
+restored exactly `104,410,005,504` of `104,410,030,592` optimizer-state bytes,
+with zero restore slots pending. Parking took `6.861531` s and restoration took
+`2.419739` s. Immediately before restoration, the DP-critical-path allocator
+held 24.821 GiB allocated / 25.549 GiB reserved; restoration raised allocated
+memory to 36.976 GiB. The post-step allocation remained 36.976 GiB.
+
+| Allocator peak | R5 round 1 | R6 round 1 | Change |
+| --- | ---: | ---: | ---: |
+| update 0 allocated | 74.256 GiB | 74.256 GiB | 0 |
+| update 1 allocated | 86.420 GiB | 74.265 GiB | -12.155 GiB |
+| whole train window allocated | not recorded | 74.265 GiB | -- |
+| update 1 / train-window reserved | 91.072 GiB | 91.072 GiB | 0 |
+
+External 10-second `nvidia-smi` sampling observed a worst first-round transient
+of 95,499/97,871 MiB, leaving 2,372 MiB (2.316 GiB) physical headroom. This
+passes the predefined 2 GiB gate by only 324 MiB; allocator reservation still
+makes the physical gate materially tighter than the 12.155 GiB live-allocation
+reduction suggests.
+
+The second wake then passed on all eight AR and diffusion workers. After all
+768 second-round outputs completed and Omni slept, the boundary at 02:36:52 SGT
+cleared 48.620 GiB of completed gradients, parked 97.239 GiB of optimizer state
+in 6.594 s, and reported `restore=deferred`. Round-two replay started at roughly
+20 GiB/GPU. The inherited update-0 restore then moved exactly
+`104,410,005,504` bytes back to their recorded devices in 2.066108 s with zero
+pending slots. Update 1 independently parked and restored the same byte count
+in 5.152937 s and 2.436947 s, again with zero pending slots.
+
+| Phase | R5 round 2 | R6 round 2 | R6 - R5 |
+| --- | ---: | ---: | ---: |
+| native generate | 770.781 s | 753.311 s | -17.470 s |
+| reward | 4.886 s | 4.615 s | -0.271 s |
+| train, both updates | 2,244.161 s | 2,179.306 s | -64.854 s (-2.9%) |
+| total round | 3,170.273 s | 3,091.580 s | -78.693 s (-2.5%) |
+
+Round-two PickScore mean/std/min/max was
+`0.778377831/0.074940510/0.580103993/1.012753010`; all ratios, losses, and
+gradient norms remained finite. Update 0 and update 1 allocated peaks were
+74.256196 GiB and 74.254594 GiB, while both reserved peaks remained
+91.072266 GiB. The post-image pre-restore state fell to only
+24.820576 GiB allocated / 25.548828 GiB reserved; Adam restoration and the
+optimizer step raised it to 36.975728 GiB allocated / at most 37.488281 GiB
+reserved. These snapshots place the high-memory transient inside image replay,
+not optimizer restoration or stepping.
+
+After the round-two summary, all eight Stage 0 AR workers and all eight Stage 1
+diffusion workers acknowledged the third wake barrier, and native generation
+resumed. This completes the functional deferred-handoff acceptance gate across
+two rounds and the following rollout. It does not complete the physical-memory
+gate: an external sample during the final update-1 image micro reached
+97,261/97,871 MiB, leaving only 610 MiB free. The transient reclaimed and did
+not OOM, but it fails the predefined 2 GiB margin. The next capacity run must
+therefore retain train-phase optimizer parking while adding pressure-aware
+allocator collection; a less-frequent explicit cache cadence is acceptable
+only if that run also improves the physical margin.
+
 ## Scale Mismatch
 
 | Dimension | Intended production | Feasibility incident |
