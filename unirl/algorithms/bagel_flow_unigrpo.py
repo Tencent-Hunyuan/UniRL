@@ -15,9 +15,11 @@ Subclasses :class:`FlowGRPO`: the clipped surrogate is inherited; the MSE term
 adds its own backward into the same optimizer step. GRPO-Guard RatioNorm
 (per-SDE-step ratio normalization) is optional via ``ratio_norm=True``.
 
-Compute note: the MSE runs two extra velocity forwards per SDE step (``v_theta``
-with grad, ``v_ref`` with adapters off / base snapshot), separate from the
-inherited GRPO log-prob replay; fusing them is a follow-up.
+Compute note: the default ``context_gradient_mode="full"`` keeps the established
+separate RatioNorm and velocity-MSE backwards. The opt-in ``"stage_boundary"``
+mode shares one detached Stage-0 context and reuses replay's ``v_theta`` values
+for MSE, matching the native rollout boundary while avoiding duplicate policy
+forwards.
 """
 
 from __future__ import annotations
@@ -41,6 +43,8 @@ from .base import (
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
+
+_CONTEXT_GRADIENT_MODES = ("full", "stage_boundary")
 
 
 @dataclass
@@ -106,6 +110,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         ratio_norm: bool = False,
         grad_reweight: bool = False,
         reuse_ratio_context_for_mse: bool = False,
+        context_gradient_mode: str = "full",
     ) -> None:
         super().__init__(
             params=params,
@@ -124,8 +129,21 @@ class BagelFlowUniGRPO(FlowGRPO):
         self.ratio_norm = bool(ratio_norm)
         self.grad_reweight = bool(grad_reweight)
         self.reuse_ratio_context_for_mse = bool(reuse_ratio_context_for_mse)
+        self.context_gradient_mode = str(context_gradient_mode).strip().lower()
+        if self.context_gradient_mode not in _CONTEXT_GRADIENT_MODES:
+            raise ValueError(
+                "BagelFlowUniGRPO.context_gradient_mode must be one of "
+                f"{_CONTEXT_GRADIENT_MODES}; got {context_gradient_mode!r}."
+            )
+        if self.context_gradient_mode == "stage_boundary" and not self.ratio_norm:
+            raise ValueError("context_gradient_mode='stage_boundary' requires ratio_norm=True.")
         if self.reuse_ratio_context_for_mse and not self.ratio_norm:
             raise ValueError("reuse_ratio_context_for_mse requires ratio_norm=True.")
+        if self.context_gradient_mode == "stage_boundary" and self.reuse_ratio_context_for_mse:
+            raise ValueError(
+                "context_gradient_mode='stage_boundary' already shares one detached context between "
+                "RatioNorm and MSE; reuse_ratio_context_for_mse must remain false."
+            )
         # Under old_logp_source="replay" the train stack recomputes these per 1-sample
         # micro-slice and cats them back (UnifiedModelTrainStack.prepare_segment). RatioNorm
         # needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp)
@@ -468,8 +486,75 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        target_steps = self._resolve_target_steps(segment) if self.mse_weight > 0.0 else []
+        needs_boundary_context = self.ratio_norm and self.context_gradient_mode == "stage_boundary"
+        target_steps = self._resolve_target_steps(segment) if self.mse_weight > 0.0 or needs_boundary_context else []
         prepared_mse = self._take_prepared_mse(target_steps) if self.mse_weight > 0.0 else None
+
+        # The native Stage 0 -> Stage 1 engine boundary transfers values, not an
+        # autograd graph. In the opt-in stage-boundary mode, mirror that contract:
+        # use the exact current-policy context built under no_grad for both image
+        # losses. Unified training supplies it from prepare_update_batch; direct
+        # callers build it once here and retain the existing serial fallback.
+        boundary_forward_kwargs: Optional[Dict[str, Any]] = None
+        if needs_boundary_context and target_steps:
+            if prepared_mse is not None:
+                boundary_forward_kwargs = prepared_mse.forward_kwargs
+            else:
+                typed_conds = typed_conditions(conditions, self.conditions_cls)
+                device = torch.device(self.stage.model.device)
+                with torch.no_grad():
+                    boundary_forward_kwargs = self.stage.build_forward_kwargs(
+                        typed_conds,
+                        params=self.params,
+                        device=device,
+                    )
+
+        if needs_boundary_context:
+            if not target_steps or segment.sigmas is None:
+                return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            if boundary_forward_kwargs is None:
+                raise RuntimeError("Stage-boundary RatioNorm requires a prepared detached context.")
+
+            v_refs: Optional[List[torch.Tensor]] = None
+            if self.mse_weight > 0.0:
+                if prepared_mse is not None:
+                    v_refs = prepared_mse.reference_velocities
+                else:
+                    device = torch.device(self.stage.model.device)
+                    schedule = segment.sigmas.to(device)
+                    transformer = self.stage.model.transformer
+                    full_ft_ref = not self._has_lora(transformer)
+                    with torch.no_grad():
+                        ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+                        with ref_ctx as disabled:
+                            if not full_ft_ref and not disabled:
+                                raise RuntimeError(
+                                    "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
+                                    "to disable nor trainable params to snapshot as v_ref on "
+                                    "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
+                                    "or set mse_weight=0."
+                                )
+                            v_refs = [
+                                self.stage.predict_velocity_at(
+                                    boundary_forward_kwargs,
+                                    sample=segment.latents_at(step_idx)[0].to(device),
+                                    sigma=schedule[step_idx],
+                                    params=self.params,
+                                ).detach()
+                                for step_idx in target_steps
+                            ]
+                    if full_ft_ref and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            return self._stage_boundary_loss_and_backward(
+                segment=segment,
+                advantages=advantages,
+                training_progress=training_progress,
+                loss_scale=loss_scale,
+                forward_kwargs=boundary_forward_kwargs,
+                target_steps=target_steps,
+                reference_velocities=v_refs,
+            )
 
         # 1. Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the
         #    plain FlowGRPO ratio with the per-step normalized one when enabled;
@@ -565,6 +650,59 @@ class BagelFlowUniGRPO(FlowGRPO):
     # GRPO-Guard RatioNorm surrogate
     # ------------------------------------------------------------------
 
+    def _stage_boundary_loss_and_backward(
+        self,
+        *,
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+        forward_kwargs: Dict[str, Any],
+        target_steps: List[int],
+        reference_velocities: Optional[List[torch.Tensor]],
+    ) -> AlgorithmStepResult:
+        """Joint RatioNorm + velocity MSE at the detached native stage boundary."""
+        replay, policy_velocities = self.stage.replay_from_forward_kwargs_with_velocities(
+            forward_kwargs,
+            segment=segment,
+            params=self.params,
+            step_indices=target_steps,
+        )
+        policy_loss, metrics = self._ratio_norm_loss(
+            replay=replay,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            target_steps=target_steps,
+        )
+
+        mse: Optional[torch.Tensor] = None
+        if self.mse_weight > 0.0:
+            if reference_velocities is None:
+                raise RuntimeError("Stage-boundary velocity MSE requires prepared reference velocities.")
+            if len(policy_velocities) != len(reference_velocities) or len(policy_velocities) != len(target_steps):
+                raise RuntimeError(
+                    "Stage-boundary replay/reference velocity count mismatch: "
+                    f"policy={len(policy_velocities)}, reference={len(reference_velocities)}, "
+                    f"steps={len(target_steps)}."
+                )
+            mse = torch.stack(
+                [((v_theta - v_ref) ** 2).mean() for v_theta, v_ref in zip(policy_velocities, reference_velocities)]
+            ).mean()
+
+        total_loss = policy_loss if mse is None else policy_loss + self.mse_weight * mse
+        (total_loss * loss_scale).backward()
+
+        result_metrics = dict(metrics)
+        if mse is not None:
+            result_metrics.update(velocity_mse=float(mse.detach().item()), mse_weight=self.mse_weight)
+        return AlgorithmStepResult(
+            loss=float(total_loss.detach().item()),
+            metrics=result_metrics,
+            num_steps_or_tokens=len(target_steps),
+            has_backward=True,
+        )
+
     def _ratio_norm_surrogate(
         self,
         *,
@@ -654,6 +792,34 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         else:
             replay = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+        loss, metrics = self._ratio_norm_loss(
+            replay=replay,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            target_steps=target_steps,
+        )
+        (loss * loss_scale).backward()
+        return (
+            AlgorithmStepResult(
+                loss=float(loss.detach().item()),
+                metrics=metrics,
+                num_steps_or_tokens=len(target_steps),
+                has_backward=True,
+            ),
+            forward_kwargs,
+        )
+
+    def _ratio_norm_loss(
+        self,
+        *,
+        replay: Any,
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        target_steps: List[int],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Build the RatioNorm loss without choosing a backward schedule."""
         new_logp = replay.log_probs  # [1, S']
         mu_theta = replay.prev_sample_means  # [1, S', seq, C]
         if mu_theta is None:
@@ -693,7 +859,6 @@ class BagelFlowUniGRPO(FlowGRPO):
             loss = (loss_per_elem * weight).mean()
         else:
             loss = loss_per_elem.mean()
-        (loss * loss_scale).backward()
 
         with torch.no_grad():
             raw_ratio_mean = float(torch.exp(log_r).mean().item())
@@ -706,15 +871,7 @@ class BagelFlowUniGRPO(FlowGRPO):
             "ratio_norm": 1.0,
             "grad_reweight": float(bool(self.grad_reweight)),
         }
-        return (
-            AlgorithmStepResult(
-                loss=float(loss.detach().item()),
-                metrics=metrics,
-                num_steps_or_tokens=len(target_steps),
-                has_backward=True,
-            ),
-            forward_kwargs,
-        )
+        return loss, metrics
 
     @staticmethod
     def _sde_std_var(

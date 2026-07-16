@@ -13,7 +13,98 @@ from unirl.algorithms.base import AlgorithmStepResult
 from unirl.models.bagel.ar import BagelARStage
 from unirl.models.bagel.conditions import BagelARConditions
 from unirl.models.bagel.rl_ops import prefill_prompt_text
+from unirl.models.types.replay_result import ReplayResult
 from unirl.types.segments import TextSegment, make_image_segment
+
+
+class _BoundaryTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_weight = nn.Parameter(torch.tensor(0.4))
+        self.policy_weight = nn.Parameter(torch.tensor(0.7))
+
+
+class _BoundaryStage:
+    def __init__(self, transformer: _BoundaryTransformer) -> None:
+        self.model = SimpleNamespace(device=torch.device("cpu"), transformer=transformer)
+        self.context_builds = 0
+        self.replay_calls = 0
+        self.predict_calls = 0
+        self.replay_contexts: list[torch.Tensor] = []
+        self.predict_contexts: list[torch.Tensor] = []
+        self.last_velocity: torch.Tensor | None = None
+
+    def build_forward_kwargs(self, conditions, *, params, device):
+        del params, device
+        self.context_builds += 1
+        scale = float(conditions.get("context_scale", 1.0))
+        return {"context": self.model.transformer.context_weight * scale}
+
+    def _velocity(self, forward_kwargs, segment) -> torch.Tensor:
+        x_t = segment.latents_at(0)[0]
+        velocity = self.model.transformer.policy_weight * x_t + forward_kwargs["context"]
+        self.last_velocity = velocity
+        return velocity
+
+    @staticmethod
+    def _result(velocity: torch.Tensor) -> ReplayResult:
+        return ReplayResult(
+            log_probs=velocity.mean().reshape(1, 1),
+            prev_sample_means=velocity.reshape(1, 1, *velocity.shape),
+        )
+
+    def replay(self, conditions, *, segment, params, step_indices):
+        del params, step_indices
+        forward_kwargs = self.build_forward_kwargs(conditions, params=None, device=torch.device("cpu"))
+        velocity = self._velocity(forward_kwargs, segment)
+        return self._result(velocity)
+
+    def replay_from_forward_kwargs_with_velocities(self, forward_kwargs, *, segment, params, step_indices):
+        del params, step_indices
+        self.replay_calls += 1
+        self.replay_contexts.append(forward_kwargs["context"])
+        velocity = self._velocity(forward_kwargs, segment)
+        return self._result(velocity), [velocity]
+
+    def predict_velocity_at(self, forward_kwargs, *, sample, sigma, params):
+        del sigma, params
+        self.predict_calls += 1
+        self.predict_contexts.append(forward_kwargs["context"])
+        return self.model.transformer.policy_weight * sample + forward_kwargs["context"]
+
+
+def _boundary_segment() -> object:
+    return make_image_segment(
+        latents=torch.tensor([[[[0.3]], [[0.2]]]], dtype=torch.float32),
+        sigmas=torch.tensor([0.8, 0.4], dtype=torch.float32),
+        indices=torch.tensor([0, 1], dtype=torch.long),
+        sde_indices=torch.tensor([0], dtype=torch.long),
+        sde_logp=torch.tensor([[0.1]], dtype=torch.float32),
+        sde_means=torch.tensor([[[[0.2]]]], dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"context_gradient_mode": "unknown"}, "must be one of"),
+        (
+            {"context_gradient_mode": "stage_boundary", "ratio_norm": False},
+            "requires ratio_norm=True",
+        ),
+        (
+            {
+                "context_gradient_mode": "stage_boundary",
+                "ratio_norm": True,
+                "reuse_ratio_context_for_mse": True,
+            },
+            "already shares one detached context",
+        ),
+    ],
+)
+def test_stage_boundary_configuration_validation(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        BagelFlowUniGRPO(params=object(), stage=object(), **kwargs)
 
 
 def test_ar_replay_uses_bundle_compute_device_when_fsdp_shards_are_on_cpu(
@@ -96,6 +187,185 @@ def test_unigrpo_mse_uses_bundle_compute_device_when_fsdp_shards_are_on_cpu() ->
     assert next(stage.model.transformer.parameters()).device.type == "cpu"
     assert stage.captured_device == execution_device
     assert stage.context_grad_enabled is False
+
+
+def test_stage_boundary_preserves_forward_and_loss_but_stops_context_gradient() -> None:
+    def run(mode: str):
+        transformer = _BoundaryTransformer()
+        stage = _BoundaryStage(transformer)
+        algorithm = BagelFlowUniGRPO(
+            params=SimpleNamespace(eta=0.8),
+            stage=stage,
+            mse_weight=0.0,
+            ratio_norm=True,
+            context_gradient_mode=mode,
+        )
+        result = algorithm.compute_loss_and_backward(
+            conditions={"context_scale": 1.5},
+            segment=_boundary_segment(),
+            advantages=torch.ones(1),
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+        return result, stage, transformer
+
+    full_result, full_stage, full_transformer = run("full")
+    boundary_result, boundary_stage, boundary_transformer = run("stage_boundary")
+
+    assert torch.equal(full_stage.last_velocity, boundary_stage.last_velocity)
+    assert boundary_result.loss == pytest.approx(full_result.loss, rel=0.0, abs=0.0)
+    assert boundary_result.metrics == full_result.metrics
+    assert torch.equal(boundary_transformer.policy_weight.grad, full_transformer.policy_weight.grad)
+    assert full_transformer.context_weight.grad is not None
+    assert float(full_transformer.context_weight.grad.abs()) > 0.0
+    assert boundary_transformer.context_weight.grad is None
+    assert boundary_stage.context_builds == 1
+    assert boundary_stage.replay_calls == 1
+
+
+def test_stage_boundary_fused_ratio_mse_matches_separate_backward() -> None:
+    params = SimpleNamespace(eta=0.8)
+    segment = _boundary_segment()
+    advantages = torch.ones(1)
+    loss_scale = 0.5
+    mse_weight = 0.3
+    reference_velocity = torch.tensor([[0.15]], dtype=torch.float32)
+
+    fused_transformer = _BoundaryTransformer()
+    fused_stage = _BoundaryStage(fused_transformer)
+    fused = BagelFlowUniGRPO(
+        params=params,
+        stage=fused_stage,
+        mse_weight=mse_weight,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+    fused_context = {"context": fused_transformer.context_weight.detach() * 1.5}
+    fused_result = fused._stage_boundary_loss_and_backward(
+        segment=segment,
+        advantages=advantages,
+        training_progress=0.25,
+        loss_scale=loss_scale,
+        forward_kwargs=fused_context,
+        target_steps=[0],
+        reference_velocities=[reference_velocity],
+    )
+
+    separate_transformer = _BoundaryTransformer()
+    separate_stage = _BoundaryStage(separate_transformer)
+    separate = BagelFlowUniGRPO(
+        params=params,
+        stage=separate_stage,
+        mse_weight=mse_weight,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+    separate_context = {"context": separate_transformer.context_weight.detach() * 1.5}
+    replay, _ = separate_stage.replay_from_forward_kwargs_with_velocities(
+        separate_context,
+        segment=segment,
+        params=params,
+        step_indices=[0],
+    )
+    policy_loss, _ = separate._ratio_norm_loss(
+        replay=replay,
+        segment=segment,
+        advantages=advantages,
+        training_progress=0.25,
+        target_steps=[0],
+    )
+    (policy_loss * loss_scale).backward()
+    second_velocity = separate_stage.predict_velocity_at(
+        separate_context,
+        sample=segment.latents_at(0)[0],
+        sigma=segment.sigmas[0],
+        params=params,
+    )
+    separate_mse = ((second_velocity - reference_velocity) ** 2).mean()
+    (mse_weight * separate_mse * loss_scale).backward()
+    separate_total = float(policy_loss.detach()) + mse_weight * float(separate_mse.detach())
+
+    assert fused_result.loss == pytest.approx(separate_total, rel=1.0e-6, abs=1.0e-7)
+    assert torch.allclose(fused_transformer.policy_weight.grad, separate_transformer.policy_weight.grad)
+    assert fused_transformer.context_weight.grad is None
+    assert separate_transformer.context_weight.grad is None
+    assert fused_stage.replay_calls == separate_stage.replay_calls == 1
+    assert fused_stage.predict_calls == 0
+    assert separate_stage.predict_calls == 1
+
+
+def test_stage_boundary_reuses_prepared_context_and_refreshes_next_update() -> None:
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+
+    built_context_values = []
+    for update, context_value in enumerate((0.4, 0.9)):
+        transformer.context_weight.grad = None
+        transformer.policy_weight.grad = None
+        with torch.no_grad():
+            transformer.context_weight.fill_(context_value)
+            transformer.policy_weight.fill_(0.7 + 0.2 * update)
+        segment = _boundary_segment()
+        micro_batches = [({"context_scale": 1.0}, segment, torch.ones(1))]
+
+        algorithm.prepare_update_batch(
+            micro_batches=micro_batches,
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+        prepared_context = algorithm._prepared_mse_batches[0].forward_kwargs["context"]
+        built_context_values.append(float(prepared_context))
+        algorithm.compute_loss_and_backward(
+            conditions=micro_batches[0][0],
+            segment=segment,
+            advantages=micro_batches[0][2],
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+        algorithm.finish_update_batch(succeeded=True)
+
+        assert stage.predict_contexts[-1] is prepared_context
+        assert stage.replay_contexts[-1] is prepared_context
+        assert transformer.context_weight.grad is None
+        assert transformer.policy_weight.grad is not None
+
+    assert built_context_values == pytest.approx([0.4, 0.9])
+    assert stage.context_builds == 2
+    assert stage.replay_calls == 2
+    assert stage.predict_calls == 2  # one frozen-reference velocity per update
+
+
+def test_stage_boundary_direct_call_builds_one_shared_context() -> None:
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+    )
+
+    result = algorithm.compute_loss_and_backward(
+        conditions={"context_scale": 1.25},
+        segment=_boundary_segment(),
+        advantages=torch.ones(1),
+        training_progress=0.25,
+        loss_scale=1.0,
+    )
+
+    assert result.has_backward
+    assert stage.context_builds == 1
+    assert stage.replay_calls == 1
+    assert stage.predict_calls == 1  # reference only; policy velocity came from replay
+    assert stage.predict_contexts[0] is stage.replay_contexts[0]
 
 
 def test_unigrpo_full_ft_reference_survives_checkpoint_resume(tmp_path: Path) -> None:
