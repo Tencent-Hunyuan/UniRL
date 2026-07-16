@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -507,6 +508,205 @@ def test_prepared_replay_cpu_staging_releases_queue_after_hydration_failure(
     assert len(algorithm._prepared_mse_batches) == 1
     algorithm.finish_update_batch(succeeded=False)
     assert algorithm._prepared_mse_batches is None
+
+
+def test_prepared_replay_cpu_staging_restores_reference_weights_after_d2h_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = _BoundaryTransformer()
+    stage = _BoundaryStage(transformer)
+    algorithm = BagelFlowUniGRPO(
+        params=SimpleNamespace(eta=0.8),
+        stage=stage,
+        mse_weight=0.3,
+        ratio_norm=True,
+        context_gradient_mode="stage_boundary",
+        stage_prepared_replay_to_cpu=True,
+    )
+    with algorithm._reference_weights(transformer):
+        pass
+    with torch.no_grad():
+        transformer.context_weight.fill_(1.2)
+        transformer.policy_weight.fill_(1.4)
+    live_weights = {name: parameter.detach().clone() for name, parameter in transformer.named_parameters()}
+
+    def fail_staging(*_args, **_kwargs):
+        raise RuntimeError("synthetic D2H failure")
+
+    monkeypatch.setattr("unirl.algorithms.bagel_flow_unigrpo.move_replay_tree", fail_staging)
+    with pytest.raises(RuntimeError, match="synthetic D2H failure"):
+        algorithm.prepare_update_batch(
+            micro_batches=[({"context_scale": 1.0}, _boundary_segment(), torch.ones(1))],
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+
+    assert all(torch.equal(parameter, live_weights[name]) for name, parameter in transformer.named_parameters())
+    assert algorithm._prepared_mse_batches is None
+    algorithm.finish_update_batch(succeeded=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prepared_replay_cpu_staging_cuda_matches_resident_loss_and_gradient() -> None:
+    device = torch.device("cuda:0")
+
+    class CudaStage:
+        detach_forward_kwargs = staticmethod(BagelDiffusionStage.detach_forward_kwargs)
+
+        def __init__(self) -> None:
+            transformer = _BoundaryTransformer().to(device)
+            self.model = SimpleNamespace(device=device, transformer=transformer)
+
+        def build_forward_kwargs(self, conditions, *, params, device):
+            del params
+            scale = float(conditions.get("context_scale", 1.0))
+            return {"context": self.model.transformer.context_weight * scale + torch.zeros((), device=device)}
+
+        def predict_velocity_at(self, forward_kwargs, *, sample, sigma, params):
+            del sigma, params
+            sample = sample.to(device)
+            return self.model.transformer.policy_weight * sample + forward_kwargs["context"]
+
+        def replay_from_forward_kwargs_with_velocities(self, forward_kwargs, *, segment, params, step_indices):
+            del params, step_indices
+            velocity = self.predict_velocity_at(
+                forward_kwargs,
+                sample=segment.latents_at(0)[0],
+                sigma=segment.sigmas[0],
+                params=None,
+            )
+            replay = ReplayResult(
+                log_probs=velocity.mean().reshape(1, 1),
+                prev_sample_means=velocity.reshape(1, 1, *velocity.shape),
+            )
+            return replay, [velocity]
+
+    def run(*, staged: bool):
+        stage = CudaStage()
+        algorithm = BagelFlowUniGRPO(
+            params=SimpleNamespace(eta=0.8),
+            stage=stage,
+            mse_weight=0.3,
+            ratio_norm=True,
+            clip_range=0.1,
+            context_gradient_mode="stage_boundary",
+            stage_prepared_replay_to_cpu=staged,
+        )
+        segment = _boundary_segment()
+        conditions = {"context_scale": 1.5}
+        algorithm.prepare_update_batch(
+            micro_batches=[(conditions, segment, torch.ones(1))],
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+        result = algorithm.compute_loss_and_backward(
+            conditions=conditions,
+            segment=segment,
+            advantages=torch.ones(1),
+            training_progress=0.25,
+            loss_scale=1.0,
+        )
+        algorithm.finish_update_batch(succeeded=True)
+        gradients = {
+            name: parameter.grad.detach().cpu().clone()
+            for name, parameter in stage.model.transformer.named_parameters()
+            if parameter.grad is not None
+        }
+        return result, gradients
+
+    resident_result, resident_gradients = run(staged=False)
+    staged_result, staged_gradients = run(staged=True)
+
+    assert staged_result.loss == pytest.approx(resident_result.loss, rel=0.0, abs=0.0)
+    assert staged_result.metrics == resident_result.metrics
+    assert staged_gradients.keys() == resident_gradients.keys()
+    assert all(torch.equal(staged_gradients[name], resident_gradients[name]) for name in resident_gradients)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prepared_replay_cpu_staging_bounds_the_cuda_queue_to_one_micro() -> None:
+    device = torch.device("cuda:0")
+    tensor_elements = 1 << 20
+    num_micros = 4
+
+    class LargeStage:
+        detach_forward_kwargs = staticmethod(BagelDiffusionStage.detach_forward_kwargs)
+
+        def __init__(self) -> None:
+            self.model = SimpleNamespace(device=device, transformer=_BoundaryTransformer().to(device))
+
+        def build_forward_kwargs(self, conditions, *, params, device):
+            del params
+            return {
+                "context": torch.full(
+                    (tensor_elements,),
+                    float(conditions["value"]),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            }
+
+        def predict_velocity_at(self, forward_kwargs, *, sample, sigma, params):
+            del sample, sigma, params
+            weight = self.model.transformer.policy_weight.to(dtype=forward_kwargs["context"].dtype)
+            return forward_kwargs["context"] + weight
+
+    def make_algorithm(*, staged: bool):
+        stage = LargeStage()
+        algorithm = BagelFlowUniGRPO(
+            params=SimpleNamespace(eta=0.8),
+            stage=stage,
+            mse_weight=0.3,
+            ratio_norm=True,
+            context_gradient_mode="stage_boundary",
+            stage_prepared_replay_to_cpu=staged,
+        )
+        return stage, algorithm
+
+    micro_batches = [({"value": index + 1}, _boundary_segment(), torch.ones(1)) for index in range(num_micros)]
+
+    torch.cuda.empty_cache()
+    resident_stage, resident = make_algorithm(staged=False)
+    resident_baseline = torch.cuda.memory_allocated(device)
+    resident.prepare_update_batch(micro_batches=micro_batches, training_progress=0.25, loss_scale=0.25)
+    resident_queue_bytes = torch.cuda.memory_allocated(device) - resident_baseline
+    resident.finish_update_batch(succeeded=False)
+    del resident, resident_stage
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    staged_stage, staged = make_algorithm(staged=True)
+    staged_baseline = torch.cuda.memory_allocated(device)
+    staged.prepare_update_batch(micro_batches=micro_batches, training_progress=0.25, loss_scale=0.25)
+    staged_queue_bytes = torch.cuda.memory_allocated(device) - staged_baseline
+    assert staged._prepared_mse_batches is not None
+    assert all(
+        entry is not None
+        and entry.staged_on_cpu
+        and entry.forward_kwargs["context"].device.type == "cpu"
+        and all(velocity.device.type == "cpu" for velocity in entry.reference_velocities)
+        for entry in staged._prepared_mse_batches
+    )
+
+    idle_allocations = []
+    for _ in range(num_micros):
+        current = staged._take_prepared_mse([0])
+        assert current is not None
+        assert current.forward_kwargs["context"].device == device
+        del current
+        torch.cuda.synchronize(device)
+        gc.collect()
+        idle_allocations.append(torch.cuda.memory_allocated(device) - staged_baseline)
+    staged.finish_update_batch(succeeded=True)
+
+    bytes_per_tensor = tensor_elements * torch.tensor([], dtype=torch.bfloat16).element_size()
+    assert resident_queue_bytes >= (num_micros * 2 - 1) * bytes_per_tensor
+    assert staged_queue_bytes < bytes_per_tensor
+    assert max(idle_allocations) < bytes_per_tensor
+    assert resident_queue_bytes - staged_queue_bytes >= (num_micros * 2 - 2) * bytes_per_tensor
+    del staged, staged_stage
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def test_stage_boundary_rejects_broadcastable_velocity_shapes() -> None:
