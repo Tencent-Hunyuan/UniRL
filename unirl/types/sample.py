@@ -1,11 +1,11 @@
 """Sample + Part — the rollout endomorphism types (LIN-446).
 
-See ``docs/rollout-sample-refactor.md``. One recursive type for the rollout
+See ``unirl/types/README.md``. One recursive type for the rollout
 boundary (``step: Sample -> Sample``), replacing the ``RolloutReq → RolloutResp``
 pair. A ``Sample`` holds an ordered ``parts: List[Part]`` whose position *is* the
 lineage chain — a part's parent is the entry before it (index ``i-1``), so parts
 carry no name/key. Within a part, each sample's parent is recovered from its id
-path (``sample_ids``; see ``docs/sample-id-design.md`` and
+path (``sample_ids``; see ``unirl/types/README.md`` and
 :mod:`unirl.types.sample_id`), not a stored index. A *request* is a ``Sample`` with
 only input Part(s); ``fork``
 appends a generation shell and the fill step populates it. Conditioning is collected
@@ -205,7 +205,7 @@ class Part(Batch):
         None because it generates nothing. Chaining keeps only the head a root,
         so the Sample stays valid and
         :meth:`Sample.conditioning` surfaces every input primitive in turn order
-        (root → …). See ``docs/rollout-sample-refactor.md`` §3.
+        (root → …). See ``unirl/types/README.md``.
         """
         if not self.sample_ids:
             raise ValueError("Part.input_child: parent has no sample_ids")
@@ -472,7 +472,7 @@ class Sample(Batch):
             Sample.request(text, text.input_child({"image": Images(...)}))  # image+text
 
         :meth:`Sample.conditioning` then surfaces both primitives (text, image)
-        in turn order for the gen step. See ``docs/rollout-sample-refactor.md`` §3.
+        in turn order for the gen step. See ``unirl/types/README.md``.
         """
         return cls(parts=list(input_parts))
 
@@ -632,7 +632,7 @@ class Sample(Batch):
     def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
         """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
 
-        The world-response half of an agentic turn (``docs/agent-loop-design.md`` §4.3): the
+        The world-response half of an agentic turn (``unirl/rollout/loop/README.md``): the
         observation rides as a chained input Part — one child per frontier sample, ids
         extended by ``/0`` — carrying no ``sampling_params``. So it is excluded from
         :meth:`gen_parts` (never trained) and surfaced to the next turn by

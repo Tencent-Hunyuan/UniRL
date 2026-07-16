@@ -392,7 +392,10 @@ class ARTrainer(BaseTrainer):
         ``load_dir``: restore from a checkpoint directory and RESUME from its
         saved step — ``num_rollouts`` is the TOTAL budget.
 
-        Deferred: ``num_updates_per_batch`` multi-epoch replay, eval cadence.
+        Evaluation follows ``self.eval_interval``. Multiple optimizer updates
+        per rollout are configured on the train stack with
+        ``num_updates_per_batch``; the stack partitions its shard into disjoint
+        updates while keeping the pre-update policy anchor fixed.
         """
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)

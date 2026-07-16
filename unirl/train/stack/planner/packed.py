@@ -220,9 +220,7 @@ class TokenBudgetPlanner:
             raise ValueError(f"{type(self).__name__}.cost_model must be dense|sum, got {cost_model!r}")
         self.cost_model = str(cost_model)
 
-    def arrange(
-        self, part: Part, *, num_updates: int, micro_batch_size: int
-    ) -> Tuple[Part, Plan]:
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> Tuple[Part, Plan]:
         samples = _extract_samples(part)
         if samples is None:
             logger.warning(

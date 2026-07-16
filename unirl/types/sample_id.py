@@ -1,6 +1,6 @@
 """Sample-id path grammar — lineage encoded in the id (LIN-446).
 
-See ``docs/sample-id-design.md``. A sample id is a ``/``-delimited path: a root id
+See ``unirl/types/README.md``. A sample id is a ``/``-delimited path: a root id
 (no ``/``) plus one ``{branch}`` segment per fork — e.g. ``"p0/1/2"`` (root ``p0``;
 branch 1; then branch 2). The path *is* the lineage: a part's parent id is the child
 id with its last segment stripped, so lineage is recovered by id (position-

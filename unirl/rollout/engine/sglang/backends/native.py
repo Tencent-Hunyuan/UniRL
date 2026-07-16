@@ -155,9 +155,7 @@ class LoopThread:
             self._thread.join()  # loop died (run_forever raised); restart below
             self._thread = None
         if self._thread is None:
-            self._thread = threading.Thread(
-                target=self._loop.run_forever, name=f"{self._label} loop", daemon=True
-            )
+            self._thread = threading.Thread(target=self._loop.run_forever, name=f"{self._label} loop", daemon=True)
             self._thread.start()
 
     def _park_locked(self) -> None:

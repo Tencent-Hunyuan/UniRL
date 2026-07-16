@@ -1,6 +1,6 @@
 """Environment — the world side of an agent-loop turn (LIN-492).
 
-See ``docs/agent-loop-design.md``. A structural ``Protocol`` seam only; concrete
+See ``unirl/rollout/loop/README.md``. A structural ``Protocol`` seam only; concrete
 environments (tool / critic) are designed separately. The loop treats it as optional.
 """
 

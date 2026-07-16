@@ -7,7 +7,13 @@
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
 #   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
-#   train_unified_model                  examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
+#   train_unified_model        examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
+#   train_alfworld             examples/alfworld/ (barrier agentic environment training)
+#   train_partial_alfworld     examples/alfworld/ (colocated partial rollout)
+#   train_async_alfworld       examples/alfworld/ (disaggregated asynchronous rollout)
+#   train_deep_research        examples/deep_research/ (barrier agentic tool training)
+#   train_partial_deep_research examples/deep_research/ (colocated partial rollout)
+#   train_async_deep_research  examples/deep_research/ (disaggregated asynchronous rollout)
 #
 # The first positional arg is the examples/ config name, domain-qualified
 # (passed to Hydra as --config-name); any extra args are forwarded verbatim as Hydra overrides.
@@ -25,6 +31,7 @@
 #   REPORT_TO_WANDB=true bash examples/run_experiment_single_node.sh diffusion/qwen_image/qwen_image_trainside
 #   ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #   ENTRY=train_pe bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
+#   ENTRY=train_deep_research bash examples/run_experiment_single_node.sh deep_research/deep_research_calc_mathverify
 #
 set -euo pipefail
 

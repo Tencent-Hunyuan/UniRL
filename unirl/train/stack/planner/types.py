@@ -89,8 +89,6 @@ class MicroPlanner(Protocol):
     the algorithm precondition the grouping needs, checked once when the stack is built.
     """
 
-    def arrange(
-        self, part: Part, *, num_updates: int, micro_batch_size: int
-    ) -> Tuple[Part, Plan]: ...
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> Tuple[Part, Plan]: ...
 
     def validate(self, algorithm: StageAlgorithm) -> None: ...

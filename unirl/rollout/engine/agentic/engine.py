@@ -104,8 +104,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
                 except Exception as exc:
                     logger.warning("AgenticRolloutEngine invalid inner cleanup raised: %s", exc)
             raise ValueError(
-                "AgenticRolloutEngine inner must implement the single-turn engine contract; "
-                f"got {type(inner).__name__}"
+                f"AgenticRolloutEngine inner must implement the single-turn engine contract; got {type(inner).__name__}"
             )
         self._inner: BaseSingleTurnRolloutEngine = inner
 
@@ -315,9 +314,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         alone would swallow a dead thread's error and silently strand queued tasks
         where today's contract is a loud drain failure.
         """
-        with ThreadPoolExecutor(
-            max_workers=self._concurrency, thread_name_prefix="agentic-drain"
-        ) as pool:
+        with ThreadPoolExecutor(max_workers=self._concurrency, thread_name_prefix="agentic-drain") as pool:
             futures = [pool.submit(self._drain_worker, coordinator, role_name) for _ in range(self._concurrency)]
         for future in futures:
             future.result()

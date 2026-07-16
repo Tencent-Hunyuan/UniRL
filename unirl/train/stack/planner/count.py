@@ -42,9 +42,7 @@ class CountPlanner:
     algorithm precondition.
     """
 
-    def arrange(
-        self, part: Part, *, num_updates: int, micro_batch_size: int
-    ) -> tuple[Part, Plan]:
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> tuple[Part, Plan]:
         return part, _count_plan(
             total=int(part.batch_size),
             num_updates=num_updates,

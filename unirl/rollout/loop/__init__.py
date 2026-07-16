@@ -1,4 +1,4 @@
-"""Driver-side agent-loop package (LIN-492). See ``docs/agent-loop-design.md``.
+"""Driver-side agent-loop package (LIN-492). See ``unirl/rollout/loop/README.md``.
 
 One class per module: :class:`~unirl.rollout.loop.engine_port.RolloutEnginePort`,
 :class:`~unirl.rollout.loop.environment.Environment`,

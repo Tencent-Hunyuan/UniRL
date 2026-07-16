@@ -111,9 +111,7 @@ class SandboxTool(StatefulTool):
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Python source to execute."}
-                    },
+                    "properties": {"code": {"type": "string", "description": "Python source to execute."}},
                     "required": ["code"],
                 },
             },

@@ -2,7 +2,7 @@
 
 Turns the policy's ``<tool_call>{...}</tool_call>`` into a tool execution and feeds the result
 back as the next turn's observation, ending the episode when the model stops calling tools (it
-gave a final answer) or ``max_turns`` is hit. See ``docs/agent-loop-design.md`` and the
+gave a final answer) or ``max_turns`` is hit. See ``unirl/rollout/loop/README.md`` and the
 real-world references it mirrors (relax ``DeepeyesEnv``, slime ``Geo3kEnv``): the loop stays
 mechanical; the *decision* — parse → execute → done — lives here.
 
@@ -122,9 +122,7 @@ class ToolEnvironment:
             self._tools[tool.name] = tool
         # Tools that hold per-trajectory session state (LIN-533); the stateless path skips all
         # session plumbing whenever this list is empty (zero regression for calculator/search).
-        self._stateful_tools: List[StatefulTool] = [
-            t for t in self._tools.values() if isinstance(t, StatefulTool)
-        ]
+        self._stateful_tools: List[StatefulTool] = [t for t in self._tools.values() if isinstance(t, StatefulTool)]
         self.max_turns = max_turns
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
@@ -174,9 +172,7 @@ class ToolEnvironment:
         turn = len(sample.gen_parts())
         frontier = sample.parts[-1].primitives.get("text")
         if not isinstance(frontier, Texts):
-            raise TypeError(
-                f"ToolEnvironment.step expects a Texts frontier primitive; got {type(frontier).__name__}"
-            )
+            raise TypeError(f"ToolEnvironment.step expects a Texts frontier primitive; got {type(frontier).__name__}")
         texts = frontier.texts
 
         sessions = (sample.parts[0].control or {}).get("tool_sessions", {})

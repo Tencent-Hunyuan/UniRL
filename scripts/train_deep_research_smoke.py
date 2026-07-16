@@ -25,9 +25,7 @@ import sys
 
 # One trainer log line per rollout, e.g.
 #   rollout 9/30  reward=0.8750  loss=2.0012 gn=1.1480 lr=1.00e-06 ratio=1.0003±0.0078 ...
-_ROLLOUT_RE = re.compile(
-    r"rollout\s+\d+/\d+\s+reward=([\d.]+)\s+loss=([\d.eE+-]+).*?ratio=([\d.]+)"
-)
+_ROLLOUT_RE = re.compile(r"rollout\s+\d+/\d+\s+reward=([\d.]+)\s+loss=([\d.eE+-]+).*?ratio=([\d.]+)")
 
 
 def _log(msg: str) -> None:

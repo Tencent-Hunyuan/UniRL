@@ -1,6 +1,6 @@
 """RolloutEnginePort — the generation seam the agent loop calls (LIN-492).
 
-See ``docs/agent-loop-design.md``. A structural ``Protocol`` for a single-turn
+See ``unirl/rollout/loop/README.md``. A structural ``Protocol`` for a single-turn
 engine; ``BaseSingleTurnRolloutEngine`` is its nominal runtime counterpart.
 """
 

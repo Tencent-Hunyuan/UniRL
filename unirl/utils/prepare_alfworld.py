@@ -45,8 +45,7 @@ def main() -> None:
         games = [g for g in games if args.task_filter in g]
     if not games:
         raise SystemExit(
-            "No ALFWorld games found (check $ALFWORLD_DATA / --task-filter). "
-            "Run `alfworld-download` first."
+            "No ALFWorld games found (check $ALFWORLD_DATA / --task-filter). Run `alfworld-download` first."
         )
     if args.limit and args.limit < len(games):
         # Evenly spaced across the sorted games so a small fixed set spans task types

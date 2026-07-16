@@ -39,6 +39,10 @@ the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
 Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
 runtime loop, deployment modes, and module map.
 
+Agentic entrypoints extend the AR path with multi-turn tool or environment
+interaction. They preserve each turn as a `Sample` lineage and support barrier,
+colocated partial-rollout, and disaggregated asynchronous trainers.
+
 ## Team-Proposed Algorithms 🌟
 
 > **🌟 These algorithms are proposed by our team — the highlight of UniRL.** Each
@@ -101,6 +105,25 @@ Examples are self-contained YAML files selected with
 
 See [`examples/README.md`](examples/README.md) for the full launch guide, naming
 schema, and how to add a recipe.
+
+## Agentic Workflows 🤖
+
+The agentic rollout engine repeatedly performs model generation followed by a
+tool or environment step, returning a trajectory of `Sample` objects. Two
+workflow families are included:
+
+| Workflow | Entrypoints | Examples |
+|---|---|---|
+| ALFWorld environment interaction | `train_alfworld`, `train_partial_alfworld`, `train_async_alfworld` | [`examples/alfworld/`](examples/alfworld/) |
+| Deep-research tools and judging | `train_deep_research`, `train_partial_deep_research`, `train_async_deep_research` | [`examples/deep_research/`](examples/deep_research/) |
+
+The base entrypoint waits for a complete rollout batch. The `partial` variant
+keeps training and rollout colocated while carrying unfinished trajectories into
+later drains. The `async` variant places training and rollout on separate GPU
+slabs and overlaps their producer/consumer loops.
+
+See the [agent-loop guide](unirl/rollout/loop/README.md) for the environment,
+tool, trajectory, and partial-resume contracts.
 
 ## Getting Started ⚡
 

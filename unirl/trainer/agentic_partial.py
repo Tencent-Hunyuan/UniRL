@@ -70,9 +70,7 @@ class AgenticPartialTrainer(AgenticTrainer):
         # the commit-N picks the fastest from, leaving the slow tail to abort.
         self._oversample = int(oversample_batch_size) if oversample_batch_size else int(self.batch_size)
         if self._oversample < self.batch_size:
-            raise ValueError(
-                f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}"
-            )
+            raise ValueError(f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}")
         self._buffer_max_staleness = buffer_max_staleness
         self._tail_policy = str(tail_policy)
         if self._tail_policy not in ("carry", "drop"):
@@ -114,9 +112,7 @@ class AgenticPartialTrainer(AgenticTrainer):
         so the inherited answer-grader (`_rewards_and_groups`) works unchanged. The env-reward
         subclass ignores it."""
         roots = [tr.parts[0].sample_ids[0] for tr in trajs]
-        return Sample.request(
-            Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots])
-        )
+        return Sample.request(Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots]))
 
     def _collect_until(self, batch_size: int, rollout_id: int, stale: int) -> List[List[Sample]]:
         """Pump the in-flight drive until the buffer holds ``batch_size`` complete groups within
@@ -125,9 +121,7 @@ class AgenticPartialTrainer(AgenticTrainer):
         refills = 0
         while True:
             self._pump()
-            picked = self._buffer.drain_freshest(
-                batch_size, current_version=self._weight_version, max_staleness=stale
-            )
+            picked = self._buffer.drain_freshest(batch_size, current_version=self._weight_version, max_staleness=stale)
             if picked is not None:
                 return picked
             if self.rollout.drained()[0]:

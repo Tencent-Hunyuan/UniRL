@@ -92,9 +92,7 @@ def test_visit_summarizes(monkeypatch):
 
     monkeypatch.setattr(mod.requests, "get", lambda *a, **k: _Resp(text="LONG PAGE"))
     monkeypatch.setattr(mod.requests, "post", lambda *a, **k: _chat("SUMMARY"))
-    out = VisitTool(endpoint="http://judge/v1/chat/completions", model="m").execute(
-        {"url": "http://x", "goal": "g"}
-    )
+    out = VisitTool(endpoint="http://judge/v1/chat/completions", model="m").execute({"url": "http://x", "goal": "g"})
     assert "SUMMARY" in out
 
 

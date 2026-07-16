@@ -16,8 +16,8 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 `_target_` — not by import. As source, the package falls into four groups:
 
 - **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
-  `train_unified_model.py`) — one per domain. Each composes and validates the Hydra
-  recipe, then hands off to its trainer.
+  `train_unified_model.py`, plus the ALFWorld and deep-research agentic variants)
+  — each composes and validates a Hydra recipe, then hands off to its trainer.
 - **Orchestration** (`trainer/`) — the per-domain `<Domain>Trainer` owns GPU
   placement, builds the rollout and train workers, and runs the
   rollout→reward→advantage→train loop.
@@ -33,8 +33,8 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 
 | Path | Responsibility |
 |---|---|
-| `train_diffusion.py`, `train_ar.py`, `train_pe.py`, `train_unified_model.py` | Per-domain Hydra entrypoints |
-| `trainer/` | Per-domain training lifecycle (`base.py` + `diffusion`/`ar`/`pe`/`unified_model`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
+| `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and synchronous/partial/asynchronous agentic workflows |
+| `trainer/` | Training lifecycle (`base.py` plus domain and agentic trainers): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
 | `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
 | `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, composed) |
@@ -43,7 +43,7 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
 | `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
-| `types/` | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling |
+| [`types/`](types/README.md) | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling; includes the request/response migration guide |
 | `data/` | Data source and dataset readers |
 | `utils/` | Logging, dtype, media, timing, checkpoint, and misc helpers |
 
@@ -78,11 +78,18 @@ flows through them like this:
 7. Each train worker owns a model `Bundle`, an `FSDPBackend`, and one loss algorithm.
 8. Dedicated-rollout modes (separate / colocate) sync trainer weights back to the rollout workers.
 
+Agentic workflows extend step 3 into a trajectory: the coordinator repeatedly
+invokes a single-turn engine, executes tool or environment actions between turns,
+and returns `list[Sample]`. The agentic trainers then assemble the trainable turns
+before applying the same reward, advantage, and train-stack contracts.
+
 ## Deeper Module Docs
 
 - `trainer/README.md`: the orchestration hub — how a `<Domain>Trainer` places workers and drives the loop.
+- `types/README.md`: the `Sample` / `Part` contract and migration from the retired request/response API.
 - `config/README.md`: flat-recipe config — `require`/precision validators, `_target_` instantiation, cross-component contracts.
-- `rollout/README.md`: rollout modes, engines, request/response flow.
+- `rollout/README.md`: rollout modes, engines, and the `Sample` / `Part` generation flow.
+- `rollout/loop/README.md`: agent-loop environments, tools, trajectories, and partial-resume behavior.
 - `train/readme.md`: train stack, FSDP backend, injection, EMA shadow.
 - `algorithms/README.md`: per-track loss algorithms.
 - `reward/README.md`: reward backends and custom scorers.

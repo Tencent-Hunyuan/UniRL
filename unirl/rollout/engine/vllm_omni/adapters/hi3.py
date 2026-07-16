@@ -298,7 +298,7 @@ class Hi3InputAdapter:
         """The HI3 chat-templated per-prompt entries (+ the image gates).
 
         ``stage_config`` (the ``bot_task`` / ``sys_type`` routing) now rides
-        the input Part's ``control`` bag (docs/rollout-sample-refactor.md §4).
+        the input Part's ``control`` bag (see ``unirl/types/README.md``).
         """
         task, sys_type = self._resolve_task(sample.parts[0].control or {})
 

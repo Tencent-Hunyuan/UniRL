@@ -308,9 +308,7 @@ class AgenticTrainer(ARTrainer):
         no scoring sample — so it works for both the answer-graded and env-sourced paths."""
         m = len(trajs)
         ar_sp = self.sampling_params.get("ar")
-        log_in = Part.input(
-            [f"log{rollout_id}:{i}" for i in range(m)], primitives={"text": Texts(texts=[""] * m)}
-        )
+        log_in = Part.input([f"log{rollout_id}:{i}" for i in range(m)], primitives={"text": Texts(texts=[""] * m)})
         log_sample = (
             Sample.request(log_in)
             .fork(1, sampling_params=ar_sp)

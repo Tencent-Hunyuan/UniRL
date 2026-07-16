@@ -1,6 +1,6 @@
 """AgentLoop — a synchronous, environment-driven multi-turn rollout driver (LIN-492).
 
-See ``docs/agent-loop-design.md``. One generic loop runs multi-turn rollout over the existing
+See ``unirl/rollout/loop/README.md``. One generic loop runs multi-turn rollout over the existing
 synchronous rollout engine, threading state through the ``Sample``/``Part`` model. Each turn
 forks a continuation, the engine fills it, and the **environment** decides what happens next: it
 consumes the model's output (e.g. parses a tool call), returns an observation that re-enters the

@@ -65,10 +65,7 @@ def build_text_messages(
     cols = [t.content.texts for t in turns]
     prefix = _system_prefix(system_instruction, roles)
     n_rows = len(turns[0].content)
-    return [
-        prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))]
-        for row in range(n_rows)
-    ]
+    return [prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))] for row in range(n_rows)]
 
 
 def build_vision_messages(

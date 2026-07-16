@@ -216,9 +216,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
         # larger pool keeps the slab busy across more train steps between syncs.
         self._oversample = int(oversample_batch_size) if oversample_batch_size else self.batch_size
         if self._oversample < self.batch_size:
-            raise ValueError(
-                f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}"
-            )
+            raise ValueError(f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}")
 
         self._train_devices = int(round(self.num_devices * self._train_fraction))
         if self._train_devices <= 0 or self._train_devices >= self.num_devices:
@@ -349,9 +347,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
         # inherited answer-grader (_rewards_and_groups reads gt from sample.parts[0])
         # works unchanged. Built as ONE Part.input (no Part.concat of input Parts).
         roots = [tr.parts[0].sample_ids[0] for tr in trajs]
-        request = Sample.request(
-            Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots])
-        )
+        request = Sample.request(Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots]))
         rewards, group_ids = self._rewards_and_groups(request, trajs, rollout_id)
         finite = torch.isfinite(rewards)
         mean_reward = float(rewards[finite].mean().item()) if bool(finite.any()) else 0.0
@@ -454,7 +450,11 @@ class AsyncAgenticTrainer(AgenticTrainer):
                     self._pump()  # grab trajectories that completed DURING the quiesce (before submit resets)
                     if need_save:
                         self.maybe_save_checkpoint(
-                            rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                            rollout_id,
+                            num_rollouts,
+                            save_interval=save_interval,
+                            save_dir=save_dir,
+                            save_mode=save_mode,
                         )
                     if need_sync:
                         self.weight_sync.sync()

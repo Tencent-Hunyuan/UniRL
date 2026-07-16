@@ -29,7 +29,10 @@ class _FakeTW:
         self.closed = False
 
     def reset(self):
-        return (["You are in a room. There is a mug 1."], {"admissible_commands": [["look", "take mug 1", "win"]], "won": [False]})
+        return (
+            ["You are in a room. There is a mug 1."],
+            {"admissible_commands": [["look", "take mug 1", "win"]], "won": [False]},
+        )
 
     def step(self, actions):
         won = actions[0] == self.solve_on
@@ -56,9 +59,7 @@ def _request(sid: str, game_index: int) -> Sample:
 
 
 def _turn(sample: Sample, action_text: str) -> Sample:
-    return sample.fork(1, sampling_params=_SP).with_filled_frontier(
-        primitives={"text": Texts(texts=[action_text])}
-    )
+    return sample.fork(1, sampling_params=_SP).with_filled_frontier(primitives={"text": Texts(texts=[action_text])})
 
 
 def test_parse_action():
