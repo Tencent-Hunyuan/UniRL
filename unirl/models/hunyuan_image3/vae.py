@@ -84,8 +84,9 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 out = self.bundle.vae.to(torch.float32).decode(latents_f32)
             finally:
                 _dist.is_initialized = _orig_is_init
-            # HunyuanImage3's 3D-VAE .decode returns a raw Tensor; the diffusers
-            # convention (DecoderOutput.sample) is used by other VAEs. Accept both.
+            # AutoencoderKLConv3D.decode returns DecoderOutput(sample=...) on the
+            # normal path (autoencoder_kl_3d.py:825); the rank!=0 discard path and
+            # the _Dist variant return a bare tensor. Accept both.
             decoded = out.sample if hasattr(out, "sample") else out
             # decoded: [B, 3, T_out, H_out, W_out]; T_out is 1 for still images.
             if decoded.dim() == 5:

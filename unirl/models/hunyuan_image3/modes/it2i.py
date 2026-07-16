@@ -58,6 +58,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
 
     params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
+    require(
+        int(params.samples_per_prompt) <= 2,
+        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet — "
+        "the per-sample cond_vit lists (spatial_shapes / attn_mask) trip the dp>1 track merge above 2 "
+        "(see the pin in examples/unified_model/hi3_it2i.yaml; per-sample tensors are the tracked follow-up).",
+    )
     # Driver-authored x_T: the trainer ships per-sample noise ids on the request
     # (gated by ``HunyuanImage3Pipeline.latent_shape``). Attach them to a
     # request-local params copy so diffuse()'s NoiseRecipe path regenerates the

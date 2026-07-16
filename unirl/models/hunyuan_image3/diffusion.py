@@ -231,6 +231,18 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # is a CONCAT field, so under DP_SCATTER each rank already holds ONLY its
         # own rows — no replica-0 cross-feed.
         if fused.rope_cache is not None:
+            # Hit-precondition: the HF wrapper computes seqlen as
+            # ``input_ids.size(1)`` ONLY in train mode (modeling:2155-2159; eval
+            # uses max_position_embeddings) — in eval the seed silently MISSES
+            # and build_2d_rope rebuilds a wrong 1-D rope. TrainsideRolloutEngine
+            # eval()s only ``trainable_module()`` (the inner decoder), never this
+            # wrapper; fail loudly if that ever changes.
+            if not transformer.training:
+                raise RuntimeError(
+                    "HunyuanImage3 rope-cache seeding needs the HF wrapper in train mode "
+                    "(eval-mode seqlen=max_position_embeddings bypasses the seeded CachedRoPE). "
+                    "eval() the inner decoder (trainable_module()), not the wrapper."
+                )
             _cr = transformer.cached_rope
             # rope_cache is a stacked [B, 2, L, D] tensor (idx 0=cos, 1=sin).
             _rope = fused.rope_cache
