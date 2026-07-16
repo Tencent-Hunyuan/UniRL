@@ -67,14 +67,15 @@ CUDA OOM. This is a post-round trainer/rollout lifecycle overlap, not a failure
 of the completed replay/backward round.
 
 Run `5c4ftuky` subsequently completed the same exact one-node geometry with an
-explicit flow-many H20 gate. Six consecutive rounds completed in 3,109.997 s to
-3,205.266 s end to end, with 2,229.779 s to 2,266.816 s in training. Optimizer
-state was parked across every post-Adam rollout boundary, all six training
-rounds completed, and the seventh vLLM-Omni wake also succeeded. This is direct
-evidence against r3's trainer/rollout overlap and establishes stable repeated
-execution at this geometry. The sixth reward is a new run high and makes the
-short OLS slope positive, but the low fit and short series do not yet establish
-sustained growth.
+explicit flow-many H20 gate. Eight consecutive rounds completed in 3,025.419 s
+to 3,205.266 s end to end, with 2,170.322 s to 2,266.816 s in training.
+Optimizer state was parked across every post-Adam rollout boundary, all eight
+training rounds completed, and the ninth vLLM-Omni wake also succeeded. This is
+direct evidence against r3's trainer/rollout overlap and establishes stable
+repeated execution at this geometry. The eighth reward is a new run high; its
+stronger positive OLS slope and fit are materially stronger evidence of growth,
+but eight heterogeneous prompt batches still do not prove a sustained learning
+curve.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -182,12 +183,14 @@ code revision `a5052814`, used one node with eight H20s and the same exact
 global `P=32, N=24, M=1, U=2` geometry as r3. It retained exact layer-major
 replay and explicitly enabled `t2ti_flow_many_enabled=true` as an instrumented
 H20 gate. Both persistent and lifecycle FSDP CPU offload remained disabled;
-FSDP parameters and shards stayed GPU-resident. This launch override is not a
-production-default change: the production recipe still has
-`t2ti_flow_many_enabled=false` and conservatively reclaims the image allocator
-cache at interval 1 with a 0 GiB free-memory floor.
+FSDP parameters and shards stayed GPU-resident. At the r5 revision this was a
+launch override: the main production recipe still had
+`t2ti_flow_many_enabled=false` and reclaimed the image allocator cache at
+interval 1 with a 0 GiB free-memory floor. The guarded r7 candidate promotes
+flow-many and interval-4/floor-8 reclamation together; that combined default
+remains provisional until its capacity run completes.
 
-The W&B SDK returned six complete rounds with these driver wall times:
+The W&B SDK returned eight complete rounds with these driver wall times:
 
 | Round | Omni wake | Native generate | Omni sleep | Reward | Train, U=2 | Total |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -197,6 +200,8 @@ The W&B SDK returned six complete rounds with these driver wall times:
 | 4 | 2.323 s | 790.478 s | 3.288 s | 3.194 s | 2,258.074 s | 3,205.266 s |
 | 5 | 2.422 s | 782.669 s | 3.026 s | 3.257 s | 2,254.549 s | 3,201.919 s |
 | 6 | 2.329 s | 753.860 s | 3.259 s | 3.545 s | 2,248.575 s | 3,162.055 s |
+| 7 | 2.529993 s | 765.404003 s | 3.214928 s | 3.414764 s | 2,224.085030 s | 3,146.464511 s |
+| 8 | 2.417586 s | 696.329234 s | 2.891200 s | 3.366807 s | 2,170.321889 s | 3,025.418662 s |
 
 Round one took 51m50.0s, including 37m46.8s of training. Relative to r3, total
 time fell by 874.175 s (21.9%) and train time fell by 881.304 s (28.0%); native
@@ -206,10 +211,11 @@ the console's train-side markers spanned approximately 37m33s. Total wall time
 differed from round one by 1.9%, and SDK train time differed by 1.0%.
 Round three completed at 23:06:37 SGT in 52m08.3s, with 37m09.8s in the SDK
 train interval. Rounds four through six took 53m25.3s, 53m21.9s, and 52m42.1s;
-their train intervals were 37m38.1s, 37m34.5s, and 37m28.6s. Across all six
-rounds, total runtime averaged 3,162.966 s and stayed within a 95.269 s range
-(3.0% of the mean). Train time averaged 2,250.326 s and stayed within a 37.037 s
-range (1.6% of the mean).
+their train intervals were 37m38.1s, 37m34.5s, and 37m28.6s. Rounds seven and
+eight took 52m26.5s and 50m25.4s, with 37m04.1s and 36m10.3s in training.
+Across all eight rounds, total runtime averaged 3,143.709927 s and stayed within
+a 179.846936 s range (5.7% of the mean). Train time averaged 2,237.045115 s and
+stayed within a 96.493959 s range (4.3% of the mean).
 `perf/step_time_s` is the full summary-to-summary interval; the other phase
 timers are not an exhaustive partition. In rounds two and three, 145.179 s and
 149.461 s of driver and boundary work sit outside the named
@@ -269,9 +275,19 @@ The same DP-critical-path fields remained stable in rounds four through six:
 | 5 | 355.366 s | 702.820 s | 1,097.354 s | 215.611 s |
 | 6 | 342.387 s | 701.412 s | 1,109.231 s | 217.163 s |
 
-All six rounds used interval-1, floor-0 reclamation. Its roughly 215-217 s
-cost in the later rounds remains the clearest measured tuning opportunity, but
-the less-frequent adaptive cadence is not part of this run.
+Round eight remained in the same phase envelope:
+
+| Train phase | Update 0 | Update 1 |
+| --- | ---: | ---: |
+| eager image anchor | 320.368703 s | -- |
+| image context/reference preparation | 347.447203 s | 326.716544 s |
+| image RatioNorm + MSE backward | 543.227670 s | 540.227709 s |
+| per-image allocator cache reclaim | 107.629641 s | 105.768412 s |
+
+All eight rounds used interval-1, floor-0 reclamation. Round eight still spent
+213.398053 s reclaiming the image allocator cache. That remains the clearest
+measured tuning opportunity, but the less-frequent adaptive cadence is not part
+of this run.
 
 Peak telemetry used a maximum over the DP workers:
 
@@ -290,7 +306,7 @@ Peak telemetry used a maximum over the DP workers:
 | round 6, update 0 | 86.412889 GiB | 91.076172 GiB |
 | round 6, update 1 | 86.409110 GiB | 91.074219 GiB |
 
-All twelve updates completed without an image-backward OOM. An external
+All sixteen updates completed without an image-backward OOM. An external
 `nvidia-smi` sample at 23:59:01 SGT during round-four training caught a brief
 97,249 MiB allocation on a 97,871 MiB card, leaving only 622 MiB physical
 headroom before it reclaimed. This is not
@@ -299,8 +315,12 @@ sample includes all device consumers, while the PyTorch field covers its
 caching allocator. The transient reclaimed and training completed, but it
 leaves a narrow physical-memory margin.
 
+Round eight independently reached 97,209/97,871 MiB in external sampling,
+leaving 662 MiB free. That transient also reclaimed without an OOM; round four
+therefore remains the worst observed r5 point by 40 MiB.
+
 Each round contained 768 paired samples and 768 image groups. The first r5
-reward payload was bit-for-bit equal to r3 across all 37 common keys. The six
+reward payload was bit-for-bit equal to r3 across all 37 common keys. The eight
 PickScore distributions were:
 
 | Round | Mean | Std | Min | Max | Zero-variance groups |
@@ -311,6 +331,8 @@ PickScore distributions were:
 | 4 | 0.7715023 | 0.0676528 | 0.5432900 | 0.9643868 | 0 |
 | 5 | 0.7768663 | 0.0701084 | 0.5828760 | 0.9487386 | 0 |
 | 6 | 0.7892739 | 0.0611930 | 0.6080350 | 0.9461457 | 0 |
+| 7 | 0.7877357006 | 0.07368049 | 0.55046052 | 0.96853435 | 0 |
+| 8 | 0.8010604382 | 0.0599052645 | 0.6116608977 | 0.9546150565 | 0 |
 
 Round-one update-0 image ratios were exactly 1.0. Update-1 image ratio
 mean/std/min/max was
@@ -354,19 +376,20 @@ six repeated the same exact byte counts with zero pending restore slots. The
 round-six park/restore times were `6.115648448001593` s and
 `2.0091813639737666` s. After the round-six summary at 01:46:07 SGT, all eight
 AR and diffusion workers completed the seventh wake barrier at 01:46:30 and
-generation continued. This proves five complete post-Adam
-park/wake/sleep/restore round trips and entry through the sixth post-Adam wake
-without the r3 wake OOM.
+generation continued. Rounds seven and eight subsequently completed, and all
+ranks passed the ninth wake barrier and resumed native generation. This proves
+seven complete post-Adam park/wake/sleep/restore round trips and entry through
+the eighth post-Adam wake without the r3 wake OOM.
 
 The reward sequence was
 `0.7760822177 -> 0.7782931328 -> 0.7685885429 -> 0.7715022564 ->`
-`0.7768662572 -> 0.7892739177`. An OLS fit over rounds 1-6 has slope
-`+0.001845474` per round and `R^2=0.2348`; first-to-last increased by
-`0.013191700`. The last two-point moving average is `0.783070087`, up from
-`0.774184257`, and the last three-point moving average is `0.779214144`, up
-from `0.772319019`. This is promising directional evidence, but one new high,
-six heterogeneous prompt batches, and the low fit are not enough to call a
-sustained learning curve.
+`0.7768662572 -> 0.7892739177 -> 0.7877357006 -> 0.8010604382`. An OLS fit over
+rounds 1-8 has slope `+0.003446196516` per round and `R^2=0.61667938`;
+first-to-last increased by `0.0249782205`. The final two-point moving average is
+`0.7943980694`, and the final three-point moving average is `0.7926900188`.
+The new high, positive slope, and stronger fit are materially stronger evidence
+of growth. They do not, by themselves, prove a sustained learning curve beyond
+these eight heterogeneous prompt batches.
 
 ## R6 Train-Phase Optimizer Parking Gate
 
@@ -771,7 +794,7 @@ fallback.
 
 R3 established the timing and memory baseline but ran revision `6e39f70d`.
 The following controls were implemented afterward. R5 has now exercised them
-through six complete rounds and the seventh vLLM-Omni wake.
+through eight complete rounds and the ninth vLLM-Omni wake.
 
 **Lazy exact update-0 anchor.** Because the two updates consume disjoint
 mini-batches, update 0's exact current replay occurs at the same weights as its
@@ -803,16 +826,17 @@ and shards remain GPU-resident, and configuration validation requires both
 boundary directly targets the completed-gradients-plus-Adam overlap that caused
 r3's second Stage-1 wake OOM; it is not persistent or whole-trainer FSDP CPU
 offload. R5 repeatedly parked and restored exactly `104,410,005,504` bytes,
-completed six training rounds, and crossed the seventh wake successfully.
+completed eight training rounds, and crossed the ninth wake successfully.
 
-**Flow-many remains gated.** An exact CFG=1 implementation can traverse all
+**Flow-many passed its isolated gate; combined promotion remains gated.** An exact CFG=1 implementation can traverse all
 selected SDE velocity streams inside one layer-major decoder pass, reducing
 wrapped-layer entries across anchor, reference, and policy velocity replay. It
 may retain more simultaneous activations. R5 explicitly enabled it and completed
-six finite rounds with a worst PyTorch-reported peak of 86.420 GiB allocated
+eight finite rounds with a worst PyTorch-reported peak of 86.420 GiB allocated
 and 91.076 GiB reserved. The external 97,249/97,871 MiB transient still leaves
-a narrow physical margin, so the production profile keeps
-`t2ti_flow_many_enabled=false`.
+a narrow physical margin. Main therefore keeps
+`t2ti_flow_many_enabled=false`; candidate revision `094cfec0` enables it only
+as part of the pressure-guarded r7 capacity and performance gate.
 
 ## Verification Status
 
@@ -833,10 +857,10 @@ a narrow physical margin, so the production profile keeps
 | Eight-H20 count-equalized hidden padding | **failed** | all anchors, AR backward, and update-0 reference prep completed; cached-vs-no-cache topology deadlocked the first image backward (`uqem9ggy`) |
 | Eight-H20 cache-faithful padding plus DP balancing | optimizer-0 gate passed; update 1 OOMed | `7d62ya97` completed optimizer 0 with no ordering failure, then fragmented at update-1 image micro 0; roughly three-hour first update remains unacceptable |
 | Eight-H20 layer-major batch 32 | full training round passed; next wake OOMed | `rqjoxria` completed all 768 native samples and both updates in 3,984.172 s total; the following Stage-1 wake failed while Adam and completed gradients were resident |
-| Post-r3 memory/lifecycle controls | six-round H20 gate passed; seventh wake passed | r5 completed six rounds, repeatedly cleared 48.620 GiB of gradients, parked/restored 97.239 GiB of optimizer state with no pending slot, and entered seventh generation |
-| Flow-many H20 gate | six finite H20 rounds passed; production disabled | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved worst PyTorch peak; external sampling caught 97,249/97,871 MiB, so production remains `t2ti_flow_many_enabled=false` |
-| 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the six-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
-| Reward learning curve | promising, not yet sustained | six-point slope is `+0.001845/round` and recent moving averages rose, but `R^2=0.235` and only the latest point is a clear new high |
+| Post-r3 memory/lifecycle controls | eight-round H20 gate passed; ninth wake passed | r5 completed eight rounds, repeatedly cleared 48.620 GiB of gradients, parked/restored 97.239 GiB of optimizer state with no pending slot, and entered ninth generation |
+| Flow-many H20 gate | eight finite H20 rounds passed; guarded promotion under test | explicit r5 gate completed at 86.420 GiB allocated / 91.076 GiB reserved worst PyTorch peak; main remains disabled while candidate `094cfec0` combines it with CPU reference storage and pressure-aware reclamation |
+| 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
+| Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
 The standalone checker does compare per-layer K/V, Stage-1 velocity, transition
 mean, log-prob, and representative decoder gradients with fixed stochastic
@@ -858,16 +882,19 @@ in 66m24.2s. That is materially below the prior roughly three-hour first-update
 baseline, but it is not yet sustained throughput: the next Stage-1 wake OOMed.
 
 R5 retains `P=32, N=24, M=1, U=2`, exact replay, and GPU-resident FSDP
-parameters/shards. It completed six consecutive rounds in 51m50.0s to 53m25.3s.
-Total runtime stayed within 3.0% of its mean, train time stayed within 1.6%, and
-the seventh Omni wake succeeded after optimizer-only boundary parking. The
-explicit flow-many gate therefore proves repeatable execution on one 8xH20
+parameters/shards. It completed eight consecutive rounds in 50m25.4s to
+53m25.3s. Total runtime stayed within 5.7% of its mean, train time stayed within
+4.3%, and the ninth Omni wake succeeded after optimizer-only boundary parking.
+The explicit flow-many gate therefore proves repeatable execution on one 8xH20
 node. It does not remove the capacity risk: external sampling briefly left only
-622 MiB physical headroom. Production keeps flow-many false,
-image-micro cache reclamation at interval 1 with a 0 GiB floor, and both forms
-of FSDP CPU offload false.
+622 MiB physical headroom. Main keeps flow-many false and image-micro cache
+reclamation at interval 1 with a 0 GiB floor. Candidate `094cfec0` instead uses
+flow-many, interval 4 with an 8 GiB pressure floor, allocator garbage collection,
+and an immutable CPU reference snapshot; both forms of FSDP CPU offload remain
+false in either configuration.
 
-The next gates are a longer run for a meaningful reward trend, a capacity test
-for any less-frequent cache-reclaim cadence, and the unmeasured 32-device scale.
-The six-point reward direction is now positive, but the low-fit series still
-needs additional rounds before it can be called sustained growth.
+The next gates are the r7 guarded-cadence capacity/performance run, a longer run
+for a meaningful reward trend, and the unmeasured 32-device scale.
+The eight-point reward slope and fit are materially stronger, but eight
+heterogeneous prompt batches still need additional rounds before the trend can
+be called sustained growth.
