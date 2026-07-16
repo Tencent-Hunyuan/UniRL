@@ -32,10 +32,8 @@ turns span weight versions is correct per-token because each gen ``Part`` keeps 
 ``weight_version`` + logprobs).
 
 .. note::
-   The engine core (``submit``/``poll``/``abort``/``drained`` + turn-boundary
-   checkpoint/resume) is CPU-unit-tested, and :class:`_GroupAssembler` / :class:`_GroupBuffer`
-   below are too. The GPU integration (two-slab placement, NCCL sync, the train loop) is
-   faithful to ``AsyncARTrainer`` but requires a GPU run to validate end-to-end.
+   The GPU integration (two-slab placement, NCCL sync, and the train loop) follows
+   ``AsyncARTrainer`` and requires an end-to-end GPU run for validation.
 """
 
 from __future__ import annotations
@@ -61,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Producer-side bookkeeping (CPU; unit-tested in tests/trainer/)
+# Producer-side bookkeeping
 # --------------------------------------------------------------------------- #
 
 
