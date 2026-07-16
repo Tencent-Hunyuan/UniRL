@@ -49,8 +49,10 @@ transition but traverses the equivalent `(layer, chunk)` dependency graph one
 decoder layer at a time. Each FSDP-wrapped block is entered once per sample and
 loops the native chunks while its parameters are resident. Unequal trace depths
 therefore change local inner work rather than the number or order of distributed
-wrapper collectives. This path has local bit-exact and CPU/Gloo FSDP2 parity;
-real BAGEL CUDA/NCCL and end-to-end timing remain deployment gates.
+wrapper collectives. This path is bit-exact against chunk-major on the real
+BAGEL/FlashAttention H20 stack and has passed unequal-depth FSDP2 ordering on
+both CPU/Gloo and bf16-compute/fp32-master CUDA/NCCL. End-to-end batch-32 timing
+remains the deployment gate.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -412,8 +414,8 @@ fallback.
 | Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
 | Layer-major local exact parity | passed | production installer/helper are bit-exact against chunk-major for terminal K/V, downstream image output/loss, and every decoder gradient; wrapped calls fall from `chunks + image` to `replay + image` per layer |
 | Layer-major FSDP2 ordering | passed on CPU/Gloo | unequal 2-vs-5 depths with composable activation checkpointing and `reshard_after_forward=true` complete without padding and match independently averaged gradients |
-| Layer-major real BAGEL CUDA parity | pending | compare captured-trace K/V, velocity, log-prob, and gradients against chunk-major on one H20 before the optimized launch |
-| Layer-major CUDA/NCCL FSDP2 ordering | pending | run unequal-depth bf16-compute/fp32-master replay with activation checkpointing and `reshard_after_forward=true` on the pinned Torch 2.11/CUDA 12.9 stack |
+| Layer-major real BAGEL CUDA parity | passed bit-exact | captured 126-token/64-chunk trace on one H20; deterministic FlashAttention self-control and chunk-major-vs-layer-major K/V, velocity, transition mean, log-prob, and selected gradients all had zero difference |
+| Layer-major CUDA/NCCL FSDP2 ordering | passed | two H20s on Torch 2.11/CUDA 12.9, unequal 2-vs-5 depths, bf16 compute/fp32 masters, activation checkpointing, and `reshard_after_forward=true`; exit 0 in 13.66 s |
 | One-H20 end-to-end smoke | mechanical execution completed | exit 0, four images, finite losses, optimizer step, 485.035 s train; tested replay mode failed numerical parity |
 | Captured exact/collapsed kernel parity | **failed** | both one-call and prefill-preserving two-call candidates exceeded cache, velocity, and gradient limits |
 | Full RatioNorm/FSDP parity | not run | the standalone checker uses one captured sample, an unwrapped CUDA LoRA bundle, selected gradients, and a synthetic objective |
@@ -421,14 +423,18 @@ fallback.
 | Eight-H20 global batch 32 without padding | **failed** | all 768 rollouts completed; variable exact replay depths deadlocked FSDP training before the first optimizer metric |
 | Eight-H20 count-equalized hidden padding | **failed** | all anchors, AR backward, and update-0 reference prep completed; cached-vs-no-cache topology deadlocked the first image backward (`uqem9ggy`) |
 | Eight-H20 cache-faithful padding plus DP balancing | optimizer-0 gate passed; update 1 OOMed | `7d62ya97` completed optimizer 0 with no ordering failure, then fragmented at update-1 image micro 0; roughly three-hour first update remains unacceptable |
-| Eight-H20 layer-major batch 32 | pending | deploy only after the two real-CUDA parity/order gates; compare first-optimizer wall time against `7d62ya97` |
+| Eight-H20 layer-major batch 32 | pending | both prerequisite CUDA gates passed; compare first-optimizer wall time and update-1 memory against `7d62ya97` |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; validate the one-node batch-32 run first |
 | Reward learning curve | not run | a one-rollout performance smoke cannot establish an increasing reward curve |
 
 The standalone checker does compare per-layer K/V, Stage-1 velocity, transition
 mean, log-prob, and representative decoder gradients with fixed stochastic
-inputs. It does not certify RatioNorm loss, the full gradient vector, CPU-offload
-geometry, or distributed FSDP ordering.
+inputs. Its exact-order gate enables FlashAttention's deterministic backward and
+requires an identical chunk-major self-control before accepting the candidate;
+production keeps the native nondeterministic backward to avoid its extra memory
+and runtime. The checker does not certify RatioNorm loss, the full gradient
+vector, CPU-offload geometry, or distributed FSDP ordering; the separate
+two-H20 FSDP2 gate covers collective topology with a production-shaped toy.
 
 ## Disposition
 
@@ -455,8 +461,8 @@ does not use offload or reduce batch size. Context reuse is implemented as a
 separate follow-on optimization and remains disabled until an instrumented
 peak-memory gate passes.
 
-Before judging learning behavior, layer-major replay must pass real captured
-BAGEL/FlashAttention parity, unequal-depth CUDA/NCCL FSDP2 ordering, and the same
-one-node batch-32 first-optimizer timing gate. Only then should the 32-device
-`P=32, N=24, M=1, U=2` run be used to evaluate sustained throughput and reward
-growth.
+Real captured BAGEL/FlashAttention parity and unequal-depth CUDA/NCCL FSDP2
+ordering now pass. The remaining gate is the same one-node batch-32 run through
+both optimizer updates with materially lower wall time and no fragmentation.
+Only then should the 32-device `P=32, N=24, M=1, U=2` run be used to evaluate
+sustained throughput and reward growth.
