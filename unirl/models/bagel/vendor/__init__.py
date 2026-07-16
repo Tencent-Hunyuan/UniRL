@@ -37,9 +37,10 @@ compatibility/grad fixes below:
   Qwen2 rotary embedding keeps a local default RoPE fallback.
 - reference inferencer dtype edit in ``inferencer.py``: UniRL loads the BAGEL VAE
   in bf16 for the pipeline path, while the upstream inferencer may hand fp32
-  latents directly to ``vae.decode``. The local edit mirrors
-  ``BagelVAEDecodeStage`` by decoding through a temporary fp32 VAE cast, then
-  restoring the loaded dtype.
+  latents directly to ``vae.decode``. The local edit decodes through a temporary
+  fp32 VAE cast, then restores the loaded dtype. This intentionally differs from
+  ``BagelVAEDecodeStage``'s sticky-fp32 pipeline path: the standalone inferencer
+  encodes through the VAE directly and does not cast encode I/O at the boundary.
 
 Apart from those documented fixes the modeling is byte-pristine. The RL primitives
 (SDE step + log-prob, window sampler, replay) live OUTSIDE this tree in

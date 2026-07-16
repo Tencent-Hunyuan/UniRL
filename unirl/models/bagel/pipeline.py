@@ -47,6 +47,7 @@ import logging
 from collections import OrderedDict
 from contextlib import nullcontext
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -241,8 +242,15 @@ class BagelPipeline(Pipeline):
                 new_token_ids=self.bundle.new_token_ids,
             )
             gi = _to_device(gi, device)
-            gi["padded_images"] = gi["padded_images"].to(dtype=self.bundle.vae_dtype)
-            past = bagel.forward_cache_update_vae(self.bundle.vae, ctx["past_key_values"], **gi)
+            # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
+            vae_mod, proj = self.bundle.vae, bagel.vae2llm
+
+            def _vae_encode(x: torch.Tensor) -> torch.Tensor:
+                return vae_mod.encode(x.to(dtype=next(vae_mod.parameters()).dtype)).to(
+                    dtype=next(proj.parameters()).dtype
+                )
+
+            past = bagel.forward_cache_update_vae(SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi)
             ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
         if vit:
             gi, kv_lens, ropes = bagel.prepare_vit_images(
