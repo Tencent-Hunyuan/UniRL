@@ -34,6 +34,7 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from contextlib import nullcontext
 from dataclasses import replace
@@ -71,16 +72,35 @@ _CUDA_PEAK_METRICS = frozenset(
         "cuda_peak_reserved_gb",
     }
 )
-_DP_MAX_METRICS = _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS
+_IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS = frozenset(
+    {
+        "image_micro_empty_cache_call_count",
+        "image_micro_empty_cache_pressure_call_count",
+        "image_micro_empty_cache_pressure_check_count",
+    }
+)
+_IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS = frozenset({"image_micro_empty_cache_skip_count"})
+_IMAGE_MICRO_RECLAIM_COUNT_METRICS = _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS
+_IMAGE_MICRO_RECLAIM_HEADROOM_METRICS = frozenset({"image_micro_empty_cache_min_free_gb"})
+_DP_MAX_METRICS = _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
+_DP_MIN_METRICS = _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS
 
 
 def _max_dp_metrics(base: Mapping[str, object], peers: List[Mapping[str, object]]) -> Dict[str, object]:
-    """Copy ``base`` while reducing BAGEL critical-path diagnostics over DP peers."""
+    """Copy ``base`` while reducing BAGEL safety/critical-path diagnostics over DP peers.
+
+    Timings, allocator peaks, and reclaim counts use the worst-case maximum;
+    free-memory headroom uses the worst-case minimum.
+    """
     reduced = dict(base)
     for metric_name in _DP_MAX_METRICS:
         values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
         if values:
             reduced[metric_name] = max(values)
+    for metric_name in _DP_MIN_METRICS:
+        values = [float(metrics[metric_name]) for metrics in peers if metric_name in metrics]
+        if values:
+            reduced[metric_name] = min(values)
     return reduced
 
 
@@ -125,7 +145,7 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
                 reduced_updates.append(_max_dp_metrics(base_metrics, peer_metrics))
 
             summary_metrics = dict(base_result.metrics)
-            for metric_name in _PHASE_HOST_TIME_METRICS:
+            for metric_name in _PHASE_HOST_TIME_METRICS | _IMAGE_MICRO_RECLAIM_COUNT_METRICS:
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = sum(values) / len(values)
@@ -133,6 +153,10 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = max(values)
+            for metric_name in _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS:
+                values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
+                if values:
+                    summary_metrics[metric_name] = min(values)
             reduced[track_name] = replace(
                 base_result,
                 metrics=summary_metrics,
@@ -174,6 +198,8 @@ class UnifiedModelTrainStack(Remote):
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
         empty_cache_after_image_micro: bool = False,
+        image_micro_empty_cache_interval: int = 1,
+        image_micro_empty_cache_min_free_gb: float = 0.0,
         empty_cache_after_optimizer: bool = False,
         cuda_peak_telemetry: bool = False,
     ) -> None:
@@ -191,6 +217,21 @@ class UnifiedModelTrainStack(Remote):
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
         self.empty_cache_after_image_micro = bool(empty_cache_after_image_micro)
+        self.image_micro_empty_cache_interval = _positive_int(
+            name="UnifiedModelTrainStack.image_micro_empty_cache_interval",
+            value=image_micro_empty_cache_interval,
+        )
+        self.image_micro_empty_cache_min_free_gb = float(image_micro_empty_cache_min_free_gb)
+        if not math.isfinite(self.image_micro_empty_cache_min_free_gb):
+            raise ValueError(
+                "UnifiedModelTrainStack.image_micro_empty_cache_min_free_gb must be finite; "
+                f"got {image_micro_empty_cache_min_free_gb}."
+            )
+        if self.image_micro_empty_cache_min_free_gb < 0.0:
+            raise ValueError(
+                "UnifiedModelTrainStack.image_micro_empty_cache_min_free_gb must be >= 0; "
+                f"got {image_micro_empty_cache_min_free_gb}."
+            )
         self.empty_cache_after_optimizer = bool(empty_cache_after_optimizer)
         self.cuda_peak_telemetry = bool(cuda_peak_telemetry)
         # PPO-style multi-update: split each rollout shard into this many disjoint
@@ -328,9 +369,17 @@ class UnifiedModelTrainStack(Remote):
         total_loss = 0.0
         has_backward = False
         image_micro_empty_cache_host_time_s = 0.0
+        image_micro_empty_cache_call_count = 0
+        image_micro_empty_cache_skip_count = 0
+        image_micro_empty_cache_pressure_call_count = 0
+        image_micro_empty_cache_pressure_check_count = 0
+        image_micro_empty_cache_min_free_gb: Optional[float] = None
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
-        for start, end in micro_slices:
+        image_reclamation_enabled = name == "image" and self.empty_cache_after_image_micro and torch.cuda.is_available()
+        reclaim_interval = int(getattr(self, "image_micro_empty_cache_interval", 1))
+        min_free_gb = float(getattr(self, "image_micro_empty_cache_min_free_gb", 0.0))
+        for micro_index, (start, end) in enumerate(micro_slices):
             micro_track = resp_track if single_micro else resp_track.slice(start, end)
             result = algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
@@ -339,10 +388,33 @@ class UnifiedModelTrainStack(Remote):
                 training_progress=training_progress,
                 loss_scale=loss_scale,
             )
-            if name == "image" and self.empty_cache_after_image_micro and torch.cuda.is_available():
-                empty_cache_started = time.perf_counter()
-                torch.cuda.empty_cache()
-                image_micro_empty_cache_host_time_s += time.perf_counter() - empty_cache_started
+            if image_reclamation_enabled:
+                ordinal = micro_index + 1
+                cadence_due = ordinal % reclaim_interval == 0
+                final_micro = ordinal == len(micro_slices)
+                pressure_due = False
+                # Query the driver only when cadence would otherwise skip this
+                # boundary. A configured floor is an emergency trigger, never a
+                # reason to defer the bounded-cadence or final reclamation.
+                if not cadence_due and not final_micro and min_free_gb > 0.0:
+                    free_bytes, _ = torch.cuda.mem_get_info()
+                    free_gb = float(free_bytes) / 2**30
+                    image_micro_empty_cache_pressure_check_count += 1
+                    image_micro_empty_cache_min_free_gb = (
+                        free_gb
+                        if image_micro_empty_cache_min_free_gb is None
+                        else min(image_micro_empty_cache_min_free_gb, free_gb)
+                    )
+                    pressure_due = free_gb < min_free_gb
+
+                if cadence_due or final_micro or pressure_due:
+                    empty_cache_started = time.perf_counter()
+                    torch.cuda.empty_cache()
+                    image_micro_empty_cache_host_time_s += time.perf_counter() - empty_cache_started
+                    image_micro_empty_cache_call_count += 1
+                    image_micro_empty_cache_pressure_call_count += int(pressure_due)
+                else:
+                    image_micro_empty_cache_skip_count += 1
             micros.append(result)
             total_loss += result.loss
             has_backward = has_backward or result.has_backward
@@ -352,7 +424,16 @@ class UnifiedModelTrainStack(Remote):
             aggregated = {
                 **dict(aggregated),
                 "image_micro_empty_cache_host_time_s": image_micro_empty_cache_host_time_s,
+                "image_micro_empty_cache_call_count": float(image_micro_empty_cache_call_count),
+                "image_micro_empty_cache_skip_count": float(image_micro_empty_cache_skip_count),
+                "image_micro_empty_cache_pressure_call_count": float(image_micro_empty_cache_pressure_call_count),
+                "image_micro_empty_cache_pressure_check_count": float(image_micro_empty_cache_pressure_check_count),
             }
+            if image_micro_empty_cache_min_free_gb is not None:
+                aggregated = {
+                    **dict(aggregated),
+                    "image_micro_empty_cache_min_free_gb": image_micro_empty_cache_min_free_gb,
+                }
         # grad_norm / lr are filled by ``_train_one_step`` after the shared optimizer step.
         partial = TrainStepResult(
             loss=total_loss,

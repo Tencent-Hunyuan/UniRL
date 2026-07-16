@@ -70,6 +70,8 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     assert cfg.reward.backend.config.batch_size == 8
     assert cfg.stack.num_updates_per_batch == 2
     assert cfg.stack.empty_cache_after_image_micro is True
+    assert cfg.stack.image_micro_empty_cache_interval == 1
+    assert cfg.stack.image_micro_empty_cache_min_free_gb == 0.0
     assert cfg.stack.empty_cache_after_optimizer is True
     assert cfg.stack.cuda_peak_telemetry is True
 
@@ -94,6 +96,8 @@ def test_single_gpu_smoke_profile_composes_reduced_overrides() -> None:
     assert smoke.reward.backend.config.batch_size == 2
     assert smoke.stack.num_updates_per_batch == 1
     assert smoke.stack.empty_cache_after_image_micro is False
+    assert smoke.stack.image_micro_empty_cache_interval == 1
+    assert smoke.stack.image_micro_empty_cache_min_free_gb == 0.0
     assert smoke.stack.empty_cache_after_optimizer is False
     assert smoke.stack.cuda_peak_telemetry is False
     assert smoke.algorithm.image.stage_prepared_replay_to_cpu is False

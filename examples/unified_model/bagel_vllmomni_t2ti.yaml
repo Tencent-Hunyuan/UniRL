@@ -187,6 +187,11 @@ stack:
   # each image boundary and after the optimizer, while retaining full-FT shards,
   # gradients, and optimizer state on GPU. Peak counters are reset per update.
   empty_cache_after_image_micro: true
+  # Interval 1 preserves the conservative per-micro behavior. A larger cadence
+  # plus a nonzero driver-free floor is an opt-in H20 tuning knob and must be
+  # capacity-gated before changing this production default.
+  image_micro_empty_cache_interval: 1
+  image_micro_empty_cache_min_free_gb: 0.0
   empty_cache_after_optimizer: true
   cuda_peak_telemetry: true
 

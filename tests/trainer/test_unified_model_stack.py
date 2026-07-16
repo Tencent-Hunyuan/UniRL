@@ -54,6 +54,9 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
                 "optimizer_host_time_s": 6.0,
                 "cuda_peak_allocated_gb": 91.0,
                 "cuda_peak_reserved_gb": 93.0,
+                "image_micro_empty_cache_call_count": 2.5,
+                "image_micro_empty_cache_skip_count": 45.5,
+                "image_micro_empty_cache_min_free_gb": 6.0,
                 "ratio_mean": 1.0,
             },
             per_update=(
@@ -61,12 +64,18 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
                     "optimizer_host_time_s": 5.0,
                     "cuda_peak_allocated_gb": 80.0,
                     "cuda_peak_reserved_gb": 85.0,
+                    "image_micro_empty_cache_call_count": 2.0,
+                    "image_micro_empty_cache_skip_count": 46.0,
+                    "image_micro_empty_cache_min_free_gb": 7.0,
                     "loss": 20.0,
                 },
                 {
                     "optimizer_host_time_s": 7.0,
                     "cuda_peak_allocated_gb": 91.0,
                     "cuda_peak_reserved_gb": 93.0,
+                    "image_micro_empty_cache_call_count": 3.0,
+                    "image_micro_empty_cache_skip_count": 45.0,
+                    "image_micro_empty_cache_min_free_gb": 6.0,
                     "loss": 21.0,
                 },
             ),
@@ -85,6 +94,9 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
                 "optimizer_host_time_s": 8.0,
                 "cuda_peak_allocated_gb": 96.0,
                 "cuda_peak_reserved_gb": 97.0,
+                "image_micro_empty_cache_call_count": 3.0,
+                "image_micro_empty_cache_skip_count": 45.0,
+                "image_micro_empty_cache_min_free_gb": 4.0,
                 "ratio_mean": 9.0,
             },
             per_update=(
@@ -92,12 +104,18 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
                     "optimizer_host_time_s": 6.0,
                     "cuda_peak_allocated_gb": 96.0,
                     "cuda_peak_reserved_gb": 97.0,
+                    "image_micro_empty_cache_call_count": 4.0,
+                    "image_micro_empty_cache_skip_count": 44.0,
+                    "image_micro_empty_cache_min_free_gb": 8.0,
                     "loss": 92.0,
                 },
                 {
                     "optimizer_host_time_s": 10.0,
                     "cuda_peak_allocated_gb": 89.0,
                     "cuda_peak_reserved_gb": 94.0,
+                    "image_micro_empty_cache_call_count": 2.0,
+                    "image_micro_empty_cache_skip_count": 46.0,
+                    "image_micro_empty_cache_min_free_gb": 4.0,
                     "loss": 93.0,
                 },
             ),
@@ -128,12 +146,18 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
             "optimizer_host_time_s": 6.0,
             "cuda_peak_allocated_gb": 96.0,
             "cuda_peak_reserved_gb": 97.0,
+            "image_micro_empty_cache_call_count": 4.0,
+            "image_micro_empty_cache_skip_count": 44.0,
+            "image_micro_empty_cache_min_free_gb": 7.0,
             "loss": 20.0,
         },
         {
             "optimizer_host_time_s": 10.0,
             "cuda_peak_allocated_gb": 91.0,
             "cuda_peak_reserved_gb": 94.0,
+            "image_micro_empty_cache_call_count": 3.0,
+            "image_micro_empty_cache_skip_count": 45.0,
+            "image_micro_empty_cache_min_free_gb": 4.0,
             "loss": 21.0,
         },
     )
@@ -141,6 +165,9 @@ def test_unified_train_collector_uses_dp_critical_path_phase_times(monkeypatch) 
         "optimizer_host_time_s": 8.0,
         "cuda_peak_allocated_gb": 96.0,
         "cuda_peak_reserved_gb": 97.0,
+        "image_micro_empty_cache_call_count": 3.5,
+        "image_micro_empty_cache_skip_count": 44.5,
+        "image_micro_empty_cache_min_free_gb": 4.0,
         "ratio_mean": 1.0,
     }
 
@@ -187,6 +214,8 @@ def test_cuda_reclamation_and_peak_telemetry_default_off() -> None:
     parameters = signature(UnifiedModelTrainStack.__init__).parameters
 
     assert parameters["empty_cache_after_image_micro"].default is False
+    assert parameters["image_micro_empty_cache_interval"].default == 1
+    assert parameters["image_micro_empty_cache_min_free_gb"].default == 0.0
     assert parameters["empty_cache_after_optimizer"].default is False
     assert parameters["cuda_peak_telemetry"].default is False
 
@@ -217,6 +246,137 @@ def test_image_micro_reclamation_runs_after_each_image_backward_only(monkeypatch
 
     assert events == ["backward", "empty_cache", "backward", "empty_cache", "backward", "backward"]
     assert float(image_result.metrics["image_micro_empty_cache_host_time_s"]) >= 0.0
+    assert image_result.metrics["image_micro_empty_cache_call_count"] == 2.0
+    assert image_result.metrics["image_micro_empty_cache_skip_count"] == 0.0
+    assert image_result.metrics["image_micro_empty_cache_pressure_call_count"] == 0.0
+    assert image_result.metrics["image_micro_empty_cache_pressure_check_count"] == 0.0
+
+
+def test_image_micro_reclamation_uses_bounded_cadence_and_final_boundary(monkeypatch) -> None:
+    events: list[str] = []
+
+    class FakeAlgorithm:
+        def compute_loss_and_backward(self, **kwargs):
+            del kwargs
+            events.append("backward")
+            return SimpleNamespace(loss=1.0, metrics={}, num_steps_or_tokens=1, has_backward=True)
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.algorithms = {"image": FakeAlgorithm()}
+    stack.empty_cache_after_image_micro = True
+    stack.image_micro_empty_cache_interval = 3
+    stack.image_micro_empty_cache_min_free_gb = 0.0
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda: (_ for _ in ()).throw(AssertionError("disabled pressure floor must not query CUDA memory")),
+    )
+    track = RolloutTrack(
+        sample_ids=[f"sample-{index}" for index in range(7)],
+        conditions={},
+        segment=make_image_segment(latents=torch.zeros(7, 1, 1, 1)),
+        advantages=torch.ones(7),
+    )
+
+    result, _ = stack._backward_track(
+        "image",
+        track,
+        [(index, index + 1) for index in range(7)],
+        training_progress=0.0,
+    )
+
+    assert events == [
+        "backward",
+        "backward",
+        "backward",
+        "empty_cache",
+        "backward",
+        "backward",
+        "backward",
+        "empty_cache",
+        "backward",
+        "empty_cache",
+    ]
+    assert result.metrics["image_micro_empty_cache_call_count"] == 3.0
+    assert result.metrics["image_micro_empty_cache_skip_count"] == 4.0
+    assert result.metrics["image_micro_empty_cache_pressure_call_count"] == 0.0
+    assert result.metrics["image_micro_empty_cache_pressure_check_count"] == 0.0
+    assert "image_micro_empty_cache_min_free_gb" not in result.metrics
+
+
+def test_image_micro_reclamation_pressure_floor_can_only_add_calls(monkeypatch) -> None:
+    events: list[str] = []
+    free_gb = iter((8.0, 5.0, 9.0))
+
+    class FakeAlgorithm:
+        def compute_loss_and_backward(self, **kwargs):
+            del kwargs
+            events.append("backward")
+            return SimpleNamespace(loss=1.0, metrics={}, num_steps_or_tokens=1, has_backward=True)
+
+    stack = object.__new__(UnifiedModelTrainStack)
+    stack.algorithms = {"image": FakeAlgorithm()}
+    stack.empty_cache_after_image_micro = True
+    stack.image_micro_empty_cache_interval = 4
+    stack.image_micro_empty_cache_min_free_gb = 6.0
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (int(next(free_gb) * 2**30), 96 * 2**30))
+    track = RolloutTrack(
+        sample_ids=[f"sample-{index}" for index in range(5)],
+        conditions={},
+        segment=make_image_segment(latents=torch.zeros(5, 1, 1, 1)),
+        advantages=torch.ones(5),
+    )
+
+    result, _ = stack._backward_track(
+        "image",
+        track,
+        [(index, index + 1) for index in range(5)],
+        training_progress=0.0,
+    )
+
+    # Micro 2 is reclaimed early at 5 GiB free, micro 4 is the cadence
+    # boundary, and micro 5 is always reclaimed as the final boundary.
+    assert events == [
+        "backward",
+        "backward",
+        "empty_cache",
+        "backward",
+        "backward",
+        "empty_cache",
+        "backward",
+        "empty_cache",
+    ]
+    assert result.metrics["image_micro_empty_cache_call_count"] == 3.0
+    assert result.metrics["image_micro_empty_cache_skip_count"] == 2.0
+    assert result.metrics["image_micro_empty_cache_pressure_call_count"] == 1.0
+    assert result.metrics["image_micro_empty_cache_pressure_check_count"] == 3.0
+    assert result.metrics["image_micro_empty_cache_min_free_gb"] == 5.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"image_micro_empty_cache_interval": 0}, "image_micro_empty_cache_interval must be >= 1"),
+        ({"image_micro_empty_cache_min_free_gb": -1.0}, "image_micro_empty_cache_min_free_gb must be >= 0"),
+        ({"image_micro_empty_cache_min_free_gb": float("nan")}, "must be finite"),
+    ],
+)
+def test_image_micro_reclamation_config_validation(kwargs, message) -> None:
+    algorithm = SimpleNamespace(supports_multi_update=True)
+
+    with pytest.raises(ValueError, match=message):
+        UnifiedModelTrainStack(
+            fsdp_backend=object(),
+            ar_algorithm=algorithm,
+            image_algorithm=algorithm,
+            micro_batch_size=1,
+            max_grad_norm=1.0,
+            **kwargs,
+        )
 
 
 def test_post_optimizer_reclamation_and_peak_telemetry(monkeypatch) -> None:
