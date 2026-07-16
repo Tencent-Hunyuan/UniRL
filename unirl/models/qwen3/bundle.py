@@ -76,12 +76,12 @@ class Qwen3Bundle(Bundle):
             # buffers/attrs real on CPU: HF rotary inv_freq / original_inv_freq
             # are non-persistent buffers computed in __init__ and absent from the
             # checkpoint, so to_empty later clobbers them -> garbage RoPE. It
-            # captures them; init_state is stashed on the BUNDLE below and
+            # captures them; meta_init_state is stashed on the BUNDLE below and
             # restored by load_trainable_weights after the sharded weight load.
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
-            transformer, init_state = build_meta_init_transformer(
+            transformer, meta_init_state = build_meta_init_transformer(
                 lambda: AutoModelForCausalLM.from_config(
                     hf_config, trust_remote_code=bool(config.trust_remote_code)
                 ),
@@ -127,9 +127,8 @@ class Qwen3Bundle(Bundle):
         if config.meta_init_transformer:
             # AR checkpoints store *.safetensors at the root (no subfolder).
             bundle._transformer_weights_path = path
-            # Robust non-persistent-state carrier: load_trainable_weights replays
-            # it after the weight load (see build_meta_init_transformer above).
-            bundle._meta_init_state = init_state
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

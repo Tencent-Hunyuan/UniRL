@@ -192,8 +192,7 @@ class WAN21Bundle(Bundle):
         if config.meta_init_transformer:
             # Consumed by the backend's post-shard weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
-            # Restore carrier: load_trainable_weights replays it after the
-            # sharded weight load.
+            # Ray-robust restore carrier for init-computed non-persistent state.
             bundle._meta_init_state = meta_init_state
         return bundle
 
