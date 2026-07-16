@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -313,6 +313,78 @@ def test_optimizer_parking_restores_after_rollout_failure(failure_at: str) -> No
     if failure_at == "generate":
         expected.insert(2, "generate")
     assert events == expected
+
+
+def test_deferred_optimizer_handoff_restores_on_rollout_body_failure() -> None:
+    events: list[str] = []
+
+    class _Rollout:
+        def wake_up(self) -> None:
+            events.append("wake")
+
+        def sleep(self) -> None:
+            events.append("sleep")
+
+    class _Backend:
+        def park_optimizer_state_for_rollout(self):
+            events.append("park")
+            return {}
+
+        def restore_optimizer_state_after_rollout(self):
+            events.append("restore")
+            return {"optimizer_state_restore_slots_pending": 0.0}
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._single_engine = True
+    trainer._rollout_is_trainside = False
+    trainer._single_engine_staged_sync = False
+    trainer._enable_fsdp_offload = False
+    trainer._park_optimizer_state_during_rollout = True
+    trainer._park_optimizer_state_during_train = True
+    trainer.weight_sync = None
+    trainer.rollout = _Rollout()
+    trainer.backend = _Backend()
+
+    with pytest.raises(RuntimeError, match="injected reward handoff failure"):
+        with trainer._external_single_engine_session(
+            sync_weights=False,
+            onload_trainer_after=True,
+            defer_optimizer_restore=True,
+        ) as metrics:
+            events.append("generate")
+            raise RuntimeError("injected reward handoff failure")
+
+    assert metrics.optimizer_restore_deferred is False
+    assert events == ["park", "wake", "generate", "sleep", "restore"]
+
+
+def test_train_step_wrapper_restores_deferred_state_after_scoring_failure() -> None:
+    events: list[str] = []
+
+    class _Backend:
+        def reclaim_cuda_allocator(self):
+            events.append("reclaim")
+
+        def restore_optimizer_state_after_rollout(self):
+            events.append("restore")
+            return [{"optimizer_state_restore_slots_pending": 0.0}]
+
+    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
+    trainer._deferred_train_optimizer_restore = False
+    trainer.backend = _Backend()
+
+    def fail_after_handoff(self, *args, **kwargs):
+        del args, kwargs
+        self._deferred_train_optimizer_restore = True
+        events.append("score")
+        raise RuntimeError("injected scoring failure")
+
+    trainer._train_step_impl = MethodType(fail_after_handoff, trainer)
+    with pytest.raises(RuntimeError, match="injected scoring failure"):
+        trainer.train_step(SimpleNamespace())
+
+    assert events == ["score", "reclaim", "restore"]
+    assert trainer._deferred_train_optimizer_restore is False
 
 
 def test_optimizer_parking_default_off_makes_no_backend_lifecycle_calls() -> None:

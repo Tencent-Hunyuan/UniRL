@@ -805,6 +805,12 @@ class BaseFSDP2Backend(Remote):
         }
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def reclaim_cuda_allocator(self) -> None:
+        """Return unused cached blocks before restoring parked optimizer state."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def prepare_for_compute(self) -> None:
         """Restore the training state needed by forward/backward.
 

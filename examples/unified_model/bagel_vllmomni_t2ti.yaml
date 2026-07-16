@@ -12,7 +12,9 @@
 #
 # Full-FT parameters and FSDP shards stay on GPU. At the external Omni rollout
 # boundary, completed gradients are cleared and only sharded Adam state is
-# parked on CPU, then restored after Omni sleeps. The separate
+# parked on CPU. After Omni sleeps, it remains parked through reward, hydration,
+# and anchor replay, then returns immediately before update 0's optimizer step.
+# The separate
 # ``bagel_vllmomni_t2ti_smoke`` profile retains the one-GPU full CPU-offload path
 # and reduced sampling settings used for functional validation.
 #
@@ -29,10 +31,10 @@ enable_fsdp_offload: false
 # Omni with completed grads + Adam state and can OOM. This narrow lifecycle does
 # not move FSDP parameters/shards and requires backend.fsdp_cfg.cpu_offload=false.
 park_optimizer_state_during_rollout: true
-# Keep sharded Adam moments on CPU during each update's replay/backward, then
-# restore their exact original devices immediately before optimizer.step. The
-# moments remain resident after the step until the next update or rollout
-# boundary actually needs them parked again.
+# Keep sharded Adam moments on CPU from the rollout boundary through anchor and
+# update 0 replay/backward, then restore their exact original devices immediately
+# before optimizer.step. Later updates park on demand; the moments remain resident
+# after each step until the next update or rollout boundary needs them parked.
 park_optimizer_state_during_train: true
 eval_cfg_text_scale: 1.0
 

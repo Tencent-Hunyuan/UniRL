@@ -14,7 +14,7 @@ two-algorithm case.  Sequencing per :meth:`train` call::
     prepare_segment(ar); prepare_segment(image)              # once: freeze both π_old anchors
     for u in range(num_updates_per_batch):                   # PPO-style mini-batches
         backend.zero_grad()
-        backend.park_optimizer_state_for_rollout()           # optional: Adam moments -> CPU
+        backend.park_optimizer_state_for_rollout()           # optional after u0: Adam moments -> CPU
         for name in ("ar", "image"):
             for (start, end) in micro_slices(mini_batch_u):
                 algorithm[name].compute_loss_and_backward(loss_scale=1/N, ...)  # grads accumulate
@@ -77,6 +77,13 @@ _CUDA_PEAK_METRICS = frozenset(
         "cuda_peak_reserved_gb",
     }
 )
+_CUDA_PHASE_MEMORY_METRICS = frozenset(
+    {
+        f"cuda_{phase}_{kind}_gb"
+        for phase in ("pre_optimizer_restore", "post_optimizer_restore", "post_optimizer_step")
+        for kind in ("allocated", "reserved")
+    }
+)
 _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS = frozenset(
     {
         "image_micro_empty_cache_call_count",
@@ -95,7 +102,9 @@ _TRAIN_OPTIMIZER_STATE_SUM_METRICS = frozenset(
     }
 )
 _TRAIN_OPTIMIZER_STATE_MAX_METRICS = frozenset({"train_optimizer_state_restore_slots_pending"})
-_DP_MAX_METRICS = _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
+_DP_MAX_METRICS = (
+    _PHASE_HOST_TIME_METRICS | _CUDA_PEAK_METRICS | _CUDA_PHASE_MEMORY_METRICS | _IMAGE_MICRO_RECLAIM_MAX_COUNT_METRICS
+)
 _DP_MIN_METRICS = _IMAGE_MICRO_RECLAIM_MIN_COUNT_METRICS | _IMAGE_MICRO_RECLAIM_HEADROOM_METRICS
 _DP_SUM_METRICS = _TRAIN_OPTIMIZER_STATE_SUM_METRICS
 
@@ -178,15 +187,12 @@ def _collect_unified_train_results(wg: Any, results: List[Any]) -> Any:
 
             summary_metrics = dict(base_result.metrics)
             for metric_name in (
-                _PHASE_HOST_TIME_METRICS
-                | _IMAGE_MICRO_RECLAIM_COUNT_METRICS
-                | _TRAIN_OPTIMIZER_STATE_SUM_METRICS
-                | _TRAIN_OPTIMIZER_STATE_MAX_METRICS
+                _PHASE_HOST_TIME_METRICS | _IMAGE_MICRO_RECLAIM_COUNT_METRICS | _TRAIN_OPTIMIZER_STATE_SUM_METRICS
             ):
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = sum(values) / len(values)
-            for metric_name in _CUDA_PEAK_METRICS:
+            for metric_name in _CUDA_PEAK_METRICS | _CUDA_PHASE_MEMORY_METRICS | _TRAIN_OPTIMIZER_STATE_MAX_METRICS:
                 values = [float(metrics[metric_name]) for metrics in reduced_updates if metric_name in metrics]
                 if values:
                     summary_metrics[metric_name] = max(values)
@@ -295,6 +301,26 @@ class UnifiedModelTrainStack(Remote):
                         f"algorithm ({type(algo).__name__}) sets supports_multi_update=False. Set "
                         f"num_updates_per_batch=1."
                     )
+
+    def _reset_cuda_peak_memory_stats(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def _cuda_phase_memory_metrics(self, phase: str) -> Dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+        return {
+            f"cuda_{phase}_allocated_gb": torch.cuda.memory_allocated() / 2**30,
+            f"cuda_{phase}_reserved_gb": torch.cuda.memory_reserved() / 2**30,
+        }
+
+    def _cuda_peak_memory_metrics(self) -> Dict[str, float]:
+        if not torch.cuda.is_available():
+            return {}
+        return {
+            "cuda_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+            "cuda_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
+        }
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
         """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices.
@@ -497,31 +523,64 @@ class UnifiedModelTrainStack(Remote):
         update_index: int = 0,
         profiler: Any = None,
         anchor_image_host_time_s: Optional[float] = None,
+        optimizer_state_already_parked: bool = False,
     ) -> Dict[str, TrainStepResult]:
         """One optimizer step: zero_grad → backward BOTH tracks over their mini-batch
         slices → shared optimizer_step → stamp grad_norm / lr onto each track's result.
         """
-        cuda_peak_telemetry = self.cuda_peak_telemetry and torch.cuda.is_available()
-        if cuda_peak_telemetry:
-            torch.cuda.reset_peak_memory_stats()
-        self.fsdp_backend.zero_grad()
+        park_optimizer = bool(getattr(self, "park_optimizer_state_during_train", False))
+        if optimizer_state_already_parked and not park_optimizer:
+            raise ValueError("optimizer_state_already_parked requires park_optimizer_state_during_train=true.")
+        cuda_peak_telemetry = bool(getattr(self, "cuda_peak_telemetry", False))
+        if cuda_peak_telemetry and not park_optimizer:
+            self._reset_cuda_peak_memory_stats()
         phase_times: Dict[str, float] = {}
         train_optimizer_metrics: Dict[str, float] = {}
-        park_optimizer = bool(getattr(self, "park_optimizer_state_during_train", False))
-        optimizer_park_attempted = False
+        optimizer_park_attempted = bool(optimizer_state_already_parked)
         optimizer_restored = False
+        finished_algorithms: set[int] = set()
+
+        def finish_prepared_state(*, succeeded: bool) -> List[Tuple[str, BaseException]]:
+            errors: List[Tuple[str, BaseException]] = []
+            for algorithm in self.algorithms.values():
+                if not algorithm.prepares_update_batch or id(algorithm) in finished_algorithms:
+                    continue
+                # finish_update_batch must release transient state even if its
+                # completeness validation raises, so never call it twice.
+                finished_algorithms.add(id(algorithm))
+                try:
+                    algorithm.finish_update_batch(succeeded=succeeded)
+                except BaseException as exc:
+                    errors.append((f"{type(algorithm).__name__}.finish_update_batch", exc))
+            return errors
+
+        def reclaim_allocator() -> None:
+            started = time.perf_counter()
+            self.fsdp_backend.reclaim_cuda_allocator()
+            phase_times["pre_optimizer_empty_cache_host_time_s"] = phase_times.get(
+                "pre_optimizer_empty_cache_host_time_s", 0.0
+            ) + (time.perf_counter() - started)
 
         def restore_optimizer_state() -> None:
             nonlocal optimizer_restored
             if not optimizer_park_attempted or optimizer_restored:
                 return
+            reclaim_allocator()
+            if cuda_peak_telemetry:
+                train_optimizer_metrics.update(self._cuda_phase_memory_metrics("pre_optimizer_restore"))
             report = self.fsdp_backend.restore_optimizer_state_after_rollout()
             train_optimizer_metrics.update(_train_optimizer_metrics(report))
+            pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
+            if pending:
+                raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
             optimizer_restored = True
+            if cuda_peak_telemetry:
+                train_optimizer_metrics.update(self._cuda_phase_memory_metrics("post_optimizer_restore"))
 
         succeeded = False
         try:
-            if park_optimizer:
+            self.fsdp_backend.zero_grad()
+            if park_optimizer and not optimizer_state_already_parked:
                 # Reuse the rollout boundary's exact per-slot device plan. This
                 # second zero_grad is intentional: the backend primitive records
                 # before transfer and repairs a partially failed park in cleanup.
@@ -559,23 +618,21 @@ class UnifiedModelTrainStack(Remote):
                 any_backward = any_backward or has_backward
 
             if any_backward:
-                # Multi-update only: the prior update's forward/backward churn fragments the
-                # CUDA pool, so this step's clip_grad_norm NCCL all_reduce can fail to find a
-                # contiguous buffer (OOM with free-but-fragmented memory — exactly the
-                # num_updates_per_batch>1 optimizer-step OOM). Returning the freed activation
-                # blocks to the driver first defragments. Gated on >1 so the single-update
-                # path (and the LoRA recipe) pays nothing.
                 with _profile_record(profiler, f"update_{update_index}/optimizer"):
-                    empty_cache_started = time.perf_counter()
-                    if self.num_updates_per_batch > 1 and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    phase_times["pre_optimizer_empty_cache_host_time_s"] = time.perf_counter() - empty_cache_started
+                    if not park_optimizer:
+                        empty_cache_started = time.perf_counter()
+                        if self.num_updates_per_batch > 1 and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        phase_times["pre_optimizer_empty_cache_host_time_s"] = time.perf_counter() - empty_cache_started
                     # Adam moments are absent for forward/backward and return to
                     # their exact original per-slot devices only for the step.
+                    # Reclamation is part of restore and runs for U=1 too.
                     restore_optimizer_state()
                     optimizer_started = time.perf_counter()
                     grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
                     phase_times["optimizer_host_time_s"] = time.perf_counter() - optimizer_started
+                    if cuda_peak_telemetry:
+                        train_optimizer_metrics.update(self._cuda_phase_memory_metrics("post_optimizer_step"))
                     if self.empty_cache_after_optimizer and torch.cuda.is_available():
                         empty_cache_started = time.perf_counter()
                         torch.cuda.empty_cache()
@@ -583,16 +640,17 @@ class UnifiedModelTrainStack(Remote):
                             time.perf_counter() - empty_cache_started
                         )
             else:
+                if park_optimizer:
+                    finish_errors = finish_prepared_state(succeeded=True)
+                    if finish_errors:
+                        action, exc = finish_errors[0]
+                        raise RuntimeError(f"Unified train cleanup failed in {action}.") from exc
+                    self.fsdp_backend.zero_grad()
                 restore_optimizer_state()
                 grad_norm = 0.0
                 logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
 
-            cuda_peak_metrics: Dict[str, float] = {}
-            if cuda_peak_telemetry:
-                cuda_peak_metrics = {
-                    "cuda_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
-                    "cuda_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
-                }
+            cuda_peak_metrics = self._cuda_peak_memory_metrics() if cuda_peak_telemetry else {}
 
             lr = self._current_lr()
             for name, result in list(results.items()):
@@ -631,28 +689,25 @@ class UnifiedModelTrainStack(Remote):
                         algorithm.finish_update_batch(succeeded=succeeded)
             else:
                 active_error = sys.exc_info()[0] is not None
-                cleanup_errors: List[Tuple[str, BaseException]] = []
-                for algorithm in self.algorithms.values():
-                    if not algorithm.prepares_update_batch:
-                        continue
-                    try:
-                        algorithm.finish_update_batch(succeeded=succeeded)
-                    except BaseException as exc:
-                        cleanup_errors.append((f"{type(algorithm).__name__}.finish_update_batch", exc))
+                cleanup_errors = finish_prepared_state(succeeded=succeeded)
 
-                if not optimizer_restored:
-                    # A failed backward can leave sharded grads resident. Release
-                    # them before restoring Adam so error cleanup does not create a
-                    # transient memory peak, then retry the idempotent restore once.
-                    if not succeeded:
-                        try:
-                            self.fsdp_backend.zero_grad()
-                        except BaseException as exc:
-                            cleanup_errors.append(("optimizer gradient cleanup", exc))
+                if not succeeded:
                     try:
-                        restore_optimizer_state()
+                        self.fsdp_backend.zero_grad()
                     except BaseException as exc:
-                        cleanup_errors.append(("optimizer state restore", exc))
+                        cleanup_errors.append(("optimizer gradient cleanup", exc))
+                    if optimizer_restored:
+                        try:
+                            reclaim_allocator()
+                        except BaseException as exc:
+                            cleanup_errors.append(("CUDA allocator reclaim", exc))
+                    else:
+                        # Prepared state is gone and failed gradients are cleared
+                        # before the retryable restore attempts to consume GPU RAM.
+                        try:
+                            restore_optimizer_state()
+                        except BaseException as exc:
+                            cleanup_errors.append(("optimizer state restore", exc))
 
                 if cleanup_errors:
                     if active_error:
@@ -729,6 +784,7 @@ class UnifiedModelTrainStack(Remote):
         image_track: RolloutTrack,
         *,
         training_progress: float,
+        optimizer_state_already_parked: bool = False,
     ) -> Dict[str, TrainStepResult]:
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step.
 
@@ -741,6 +797,15 @@ class UnifiedModelTrainStack(Remote):
         single-step behavior. Per-track results are reduced across the updates;
         per-shard results merge back via ``pytree_cat`` on collect.
         """
+        park_optimizer = bool(getattr(self, "park_optimizer_state_during_train", False))
+        if optimizer_state_already_parked and not park_optimizer:
+            raise ValueError("optimizer_state_already_parked requires park_optimizer_state_during_train=true.")
+        # With train-phase parking, one counter window covers track hydration,
+        # full anchor preparation, and every update. Update-local resets would
+        # erase the anchor peak that this capacity gate needs to observe.
+        if park_optimizer and bool(getattr(self, "cuda_peak_telemetry", False)):
+            self._reset_cuda_peak_memory_stats()
+
         # Move both tracks onto this worker's model device before any replay.
         # The HI3 rollout tracks are hydrated to CPU on the driver (the two
         # anchored engines return single transport handles that the driver
@@ -777,6 +842,7 @@ class UnifiedModelTrainStack(Remote):
                 if bool(getattr(algorithm, "prepares_anchor_plan", False))
             ]
             train_succeeded = False
+            inherited_optimizer_state_pending = bool(optimizer_state_already_parked)
             try:
                 # Freeze each track's π_old anchor before the first optimizer step.
                 # An opt-in algorithm receives the full disjoint-update partition and
@@ -795,6 +861,12 @@ class UnifiedModelTrainStack(Remote):
                 per_update: List[Dict[str, TrainStepResult]] = []
                 for u in range(self.num_updates_per_batch):
                     slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
+                    update_inherits_parked_state = bool(inherited_optimizer_state_pending and u == 0)
+                    if update_inherits_parked_state:
+                        # _train_one_step now owns the restore plan and guarantees
+                        # its own exception cleanup, so the anchor-level fallback
+                        # must not race or duplicate that ownership.
+                        inherited_optimizer_state_pending = False
                     per_update.append(
                         self._train_one_step(
                             tracks,
@@ -803,12 +875,50 @@ class UnifiedModelTrainStack(Remote):
                             update_index=u,
                             profiler=profiler,
                             anchor_image_host_time_s=anchor_image_host_time_s if u == 0 else None,
+                            optimizer_state_already_parked=update_inherits_parked_state,
                         )
                     )
                 train_succeeded = True
             finally:
-                for algorithm in anchor_batch_algorithms:
-                    algorithm.finish_anchor_batch(succeeded=train_succeeded)
+                if not optimizer_state_already_parked:
+                    for algorithm in anchor_batch_algorithms:
+                        algorithm.finish_anchor_batch(succeeded=train_succeeded)
+                else:
+                    active_error = sys.exc_info()[0] is not None
+                    cleanup_errors: List[Tuple[str, BaseException]] = []
+                    for algorithm in anchor_batch_algorithms:
+                        try:
+                            algorithm.finish_anchor_batch(succeeded=train_succeeded)
+                        except BaseException as exc:
+                            cleanup_errors.append((f"{type(algorithm).__name__}.finish_anchor_batch", exc))
+                    if inherited_optimizer_state_pending:
+                        try:
+                            self.fsdp_backend.zero_grad()
+                        except BaseException as exc:
+                            cleanup_errors.append(("optimizer gradient cleanup", exc))
+                        try:
+                            self.fsdp_backend.reclaim_cuda_allocator()
+                        except BaseException as exc:
+                            cleanup_errors.append(("CUDA allocator reclaim", exc))
+                        try:
+                            report = self.fsdp_backend.restore_optimizer_state_after_rollout()
+                            pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
+                            if pending:
+                                raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
+                        except BaseException as exc:
+                            cleanup_errors.append(("optimizer state restore", exc))
+                    if cleanup_errors:
+                        if active_error:
+                            for action, exc in cleanup_errors:
+                                logger.error(
+                                    "Unified anchor cleanup failed in %s: %s",
+                                    action,
+                                    exc,
+                                    exc_info=(type(exc), exc, exc.__traceback__),
+                                )
+                        else:
+                            action, exc = cleanup_errors[0]
+                            raise RuntimeError(f"Unified anchor cleanup failed in {action}.") from exc
         if profiler is not None:
             profiler.step()
 

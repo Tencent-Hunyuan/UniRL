@@ -600,8 +600,10 @@ def test_train_track_attaches_anchor_timing_to_first_update_only(monkeypatch) ->
         update_index,
         profiler,
         anchor_image_host_time_s,
+        optimizer_state_already_parked,
     ):
         del self, tracks, slices_by_track, training_progress
+        assert optimizer_state_already_parked is False
         update_calls.append((update_index, profiler, anchor_image_host_time_s))
         return {
             name: TrainStepResult(

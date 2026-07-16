@@ -169,7 +169,8 @@ def _reduce_rollout_boundary_metrics(reports: Any) -> Dict[str, float]:
 
     ``Dispatch.BROADCAST`` returns one mapping per worker. Byte counters are
     physical per-rank allocations and therefore sum across the DP slab; host
-    times use the slowest worker because handle dispatch is a barrier.
+    times and pending restore slots use the worst worker because handle dispatch
+    is a barrier.
     """
     worker_reports: List[Mapping[str, Any]] = []
 
@@ -187,8 +188,14 @@ def _reduce_rollout_boundary_metrics(reports: Any) -> Dict[str, float]:
         values = [float(report[key]) for report in worker_reports if report.get(key) is not None]
         if not values:
             continue
-        reduced[key] = max(values) if key.endswith("_host_time_s") else sum(values)
+        reduced[key] = max(values) if key.endswith(("_host_time_s", "_slots_pending")) else sum(values)
     return reduced
+
+
+class _RolloutBoundaryMetrics(dict[str, float]):
+    """Boundary telemetry plus a non-logged parked-state handoff marker."""
+
+    optimizer_restore_deferred: bool = False
 
 
 def deep_hydrate(obj: Any) -> Any:
@@ -277,6 +284,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._park_optimizer_state_during_rollout = bool(park_optimizer_state_during_rollout)
         self._park_optimizer_state_during_train = bool(park_optimizer_state_during_train)
+        self._deferred_train_optimizer_restore = False
         fsdp_cfg = backend_cfg.get("fsdp_cfg")
         self._backend_persistent_cpu_offload = bool(fsdp_cfg is not None and fsdp_cfg.get("cpu_offload", False))
 
@@ -695,14 +703,16 @@ class UnifiedModelTrainer(BaseTrainer):
         *,
         sync_weights: bool,
         onload_trainer_after: bool,
+        defer_optimizer_restore: bool = False,
     ):
         """Wake one external engine under an exception-safe memory lifecycle.
 
         Entry and exit steady state is engine-asleep. For the legacy full-state
         lifecycle, training exit also onloads FSDP for replay/backward while
         eval leaves it offloaded. The optimizer-only lifecycle instead leaves
-        FSDP parameters/shards resident, parks completed grads + Adam tensors
-        before wake, and restores Adam only after every stage sleeps.
+        FSDP parameters/shards resident and parks completed grads + Adam tensors
+        before wake. A normal training session may hand that parked state to the
+        train stack after every stage sleeps; all other exits restore it here.
         """
         if not self._single_engine or self._rollout_is_trainside:
             raise RuntimeError("_external_single_engine_session is only valid for an external single engine.")
@@ -710,8 +720,10 @@ class UnifiedModelTrainer(BaseTrainer):
         do_sync = bool(sync_weights and self.weight_sync is not None)
         staged = bool(do_sync and self._single_engine_staged_sync)
         park_optimizer = bool(getattr(self, "_park_optimizer_state_during_rollout", False))
+        if defer_optimizer_restore and not bool(getattr(self, "_park_optimizer_state_during_train", False)):
+            raise ValueError("defer_optimizer_restore requires park_optimizer_state_during_train=true.")
         optimizer_park_attempted = False
-        boundary_metrics: Dict[str, float] = {}
+        boundary_metrics = _RolloutBoundaryMetrics()
         cleanup_errors: List[Tuple[str, BaseException]] = []
         try:
             if staged:
@@ -769,17 +781,26 @@ class UnifiedModelTrainer(BaseTrainer):
                 except BaseException as exc:
                     cleanup_errors.append(("weight_sync.discard", exc))
 
+            defer_restore_now = bool(
+                optimizer_park_attempted
+                and defer_optimizer_restore
+                and rollout_asleep
+                and not active_error
+                and not cleanup_errors
+            )
             # Restoring Adam while any Omni stage may still be awake recreates
-            # the exact overlap this lifecycle prevents. A failed park is still
-            # restored here: the backend operation is intentionally idempotent
-            # and repairs a partially moved optimizer state after safe sleep.
-            if optimizer_park_attempted and rollout_asleep:
+            # the exact overlap this lifecycle prevents. Only a clean training
+            # exit hands the parked plan forward; failures repair it here after
+            # safe sleep, while a failed sleep leaves the state safely parked.
+            if optimizer_park_attempted and rollout_asleep and not defer_restore_now:
                 try:
                     boundary_metrics.update(
                         _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
                     )
                 except BaseException as exc:
                     cleanup_errors.append(("optimizer state restore", exc))
+            elif defer_restore_now:
+                boundary_metrics.optimizer_restore_deferred = True
 
             # Never move trainer state back onto the GPU unless every Omni stage
             # acknowledged sleep. A partial sleep plus FSDP onload can OOM before
@@ -1039,6 +1060,48 @@ class UnifiedModelTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
+        """Run one unified step and repair a deferred boundary on any failure."""
+        if bool(getattr(self, "_deferred_train_optimizer_restore", False)):
+            raise RuntimeError("A previous train step left deferred optimizer state pending restoration.")
+        try:
+            return self._train_step_impl(
+                req,
+                training_progress=training_progress,
+                sync_weights=sync_weights,
+                rollout_id=rollout_id,
+            )
+        except BaseException:
+            if bool(getattr(self, "_deferred_train_optimizer_restore", False)):
+                cleanup_errors: List[Tuple[str, BaseException]] = []
+                try:
+                    self.backend.reclaim_cuda_allocator()
+                except BaseException as exc:
+                    cleanup_errors.append(("CUDA allocator reclaim", exc))
+                try:
+                    report = _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
+                    pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
+                    if pending:
+                        raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
+                    self._deferred_train_optimizer_restore = False
+                except BaseException as exc:
+                    cleanup_errors.append(("optimizer state restore", exc))
+                for action, exc in cleanup_errors:
+                    logger.error(
+                        "Deferred train optimizer cleanup failed in %s: %s",
+                        action,
+                        exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+            raise
+
+    def _train_step_impl(
+        self,
+        req: RolloutReq,
+        *,
+        training_progress: float = 0.0,
+        sync_weights: bool = False,
+        rollout_id: int = 0,
+    ) -> Tuple[Dict[str, TrainStepResult], float]:
         """One ``rollout → reward → credit-assign → advantage → step`` pass.
 
         Returns ``(per_track_results, mean_reward)`` — ``mean_reward`` is the
@@ -1046,21 +1109,23 @@ class UnifiedModelTrainer(BaseTrainer):
         the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        rollout_boundary_metrics: Dict[str, float] = {}
+        rollout_boundary_metrics = _RolloutBoundaryMetrics()
         if self._single_engine and self._rollout_is_trainside:
             # Trainside (M=1): rollout shares the live FSDP modules, so there is
             # no engine lifecycle or weight transfer.
             resp = self.run_rollout(req)
         elif self._single_engine:
-            # External single-engine (BAGEL T2TI): entry is FSDP-offloaded and
-            # engine-asleep. A staged sync snapshots while asleep, then the
-            # session wakes/pushes/generates and ALWAYS sleeps/cleans up before
-            # onloading FSDP for replay and backward.
+            # External single-engine (BAGEL T2TI): a staged sync snapshots while
+            # asleep, then the session wakes/pushes/generates and always sleeps.
+            # Train parking hands Adam's CPU plan through scoring and anchor replay;
+            # all exceptional exits restore it or leave a clearly parked terminal state.
             with self._external_single_engine_session(
                 sync_weights=sync_weights,
                 onload_trainer_after=True,
+                defer_optimizer_restore=self._park_optimizer_state_during_train,
             ) as rollout_boundary_metrics:
                 resp = self.run_rollout(req)
+            self._deferred_train_optimizer_restore = rollout_boundary_metrics.optimizer_restore_deferred
         else:
             # Colocate memory dance (150GB base can't coexist with an awake engine
             # on the same card). Steady state on entry: base offloaded, engines
@@ -1208,7 +1273,9 @@ class UnifiedModelTrainer(BaseTrainer):
             resp.tracks[AR_TRACK],
             resp.tracks[IMAGE_TRACK],
             training_progress=float(training_progress),
+            optimizer_state_already_parked=self._deferred_train_optimizer_restore,
         )
+        self._deferred_train_optimizer_restore = False
         self.wandb_logger.log_rollout_step(
             rollout_id,
             results,
