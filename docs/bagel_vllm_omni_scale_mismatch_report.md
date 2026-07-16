@@ -40,8 +40,12 @@ collective ordering, but the first update still took roughly three hours, so it
 does not validate acceptable throughput. The same run later OOMed in update 1's
 first image backward: an FSDP2 pre-backward all-gather requested 130 MiB with
 41.25 MiB free while PyTorch held 5.01 GiB reserved but unallocated. The
-optimized relaunch therefore also defaults to expandable CUDA allocator
-segments; it still uses no persistent or lifecycle FSDP offload.
+optimized relaunch therefore also defaults the trainer to expandable CUDA
+allocator segments; it still uses no persistent or lifecycle FSDP offload.
+That setting cannot be inherited by vLLM-Omni 0.20.0: sleep mode uses its
+``CuMemAllocator`` pool, which explicitly rejects expandable segments. The
+rollout boot now removes only ``expandable_segments:True`` while spawning the
+Omni process tree, then restores the train actor's exact allocator environment.
 
 The production recipe now selects a second exact execution order,
 `layer_major`. It preserves every native chunk's attention inputs and cache
@@ -455,11 +459,13 @@ padding, and targets the FSDP/checkpoint wrapper overhead exposed by the
 three-hour baseline. The first optimized launch deliberately keeps
 `reuse_ratio_context_for_mse=false`; phasing RatioNorm before the reference swap
 would retain image gradients beside the fp32 live-weight stash, and the baseline
-already fragmented at the second-update peak. The launcher defaults
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the optimized run, but
-does not use offload or reduce batch size. Context reuse is implemented as a
-separate follow-on optimization and remains disabled until an instrumented
-peak-memory gate passes.
+already fragmented at the second-update peak. The launcher defaults the train
+actor to `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for the optimized
+run. Omni spawn descendants receive the remaining allocator options without
+expandable segments because its sleep-mode memory pool is incompatible with
+them. This does not use offload or reduce batch size. Context reuse is
+implemented as a separate follow-on optimization and remains disabled until an
+instrumented peak-memory gate passes.
 
 Real captured BAGEL/FlashAttention parity and unequal-depth CUDA/NCCL FSDP2
 ordering now pass. The remaining gate is the same one-node batch-32 run through

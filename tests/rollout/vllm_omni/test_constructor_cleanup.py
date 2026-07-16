@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,61 @@ import pytest
 import unirl.rollout.engine.vllm_omni.backends.native as native_module
 import unirl.rollout.engine.vllm_omni.engine as engine_module
 import unirl.rollout.engine.vllm_omni.patches as patches_module
+
+
+def test_backend_boot_hides_expandable_allocator_from_omni_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator_env_seen_by_omni = {}
+
+    class _Omni:
+        def __init__(self, **_kwargs) -> None:
+            self.stage_configs = []
+            allocator_env_seen_by_omni.update(
+                {name: os.environ.get(name) for name in native_module._ALLOCATOR_ENV_VARS}
+            )
+
+    monkeypatch.setattr(patches_module, "install", lambda: None)
+    monkeypatch.setattr(mp, "set_start_method", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        native_module,
+        "_import_omni_runtime",
+        lambda: {"Omni": _Omni},
+    )
+    monkeypatch.setattr(native_module, "_resolve_stage_yaml", lambda *_args: "/fake/stages.yaml")
+    monkeypatch.setenv("DIFFRL_OMNI_BOOT_SERIALIZE", "0")
+    cuda_conf = "max_split_size_mb:64,expandable_segments:True,garbage_collection_threshold:0.8"
+    alloc_conf = "expandable_segments:true"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", cuda_conf)
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", alloc_conf)
+
+    native_module.VLLMOmniBackend.boot(
+        {
+            "model_path": "/fake/model",
+            "stage_yaml": "stages.yaml",
+            "stage_yaml_source": "local",
+            "needs_driver_tokenizer": False,
+        }
+    )
+
+    assert allocator_env_seen_by_omni == {
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,garbage_collection_threshold:0.8",
+        "PYTORCH_ALLOC_CONF": None,
+    }
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == cuda_conf
+    assert os.environ["PYTORCH_ALLOC_CONF"] == alloc_conf
+
+
+def test_omni_allocator_scope_restores_environment_after_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    cuda_conf = "expandable_segments:True,max_split_size_mb:64"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", cuda_conf)
+
+    with pytest.raises(RuntimeError, match="injected boot failure"):
+        with native_module._without_expandable_segments_for_omni():
+            assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:64"
+            raise RuntimeError("injected boot failure")
+
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == cuda_conf
 
 
 def test_backend_boot_closes_omni_when_post_boot_setup_fails(monkeypatch: pytest.MonkeyPatch) -> None:

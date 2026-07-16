@@ -14,7 +14,11 @@ Boot sequence (load-bearing order — see each step's note):
 3. ``CUDA_VISIBLE_DEVICES`` pop when the adapter's boot intent asks for it
    (HI3 multi-GPU stages; the documented last-resort env override — vllm-omni
    reads CVD for per-stage device pinning and has no arg for it).
-4. ``Omni(...)`` with the PRISTINE packaged stage YAML + ctor kwargs —
+4. Temporarily remove ``expandable_segments:True`` from the allocator env seen
+   by spawned Omni workers. The colocated trainer keeps its already-initialized
+   expandable allocator, while vLLM's sleep-mode ``CuMemAllocator`` requires
+   ordinary CUDA allocations.
+5. ``Omni(...)`` with the PRISTINE packaged stage YAML + ctor kwargs —
    ``enable_sleep_mode`` / ``master_port`` ride the runtime's own override
    channel (the ``base_engine_args`` merge + the dedicated sleep-mode
    injection in ``AsyncOmniEngine._resolve_stage_configs``), so no YAML
@@ -34,6 +38,8 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
@@ -44,6 +50,56 @@ from unirl.rollout.engine.vllm_omni.backends.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+_ALLOCATOR_ENV_VARS = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+
+
+@contextmanager
+def _without_expandable_segments_for_omni() -> Iterator[None]:
+    """Hide the train-only expandable allocator setting from Omni children.
+
+    ``enable_sleep_mode`` makes vLLM/vLLM-Omni use ``CuMemAllocator`` pools,
+    which reject ``expandable_segments:True``. The trainer needs expandable
+    segments to avoid long-replay FSDP fragmentation, and its allocator is
+    initialized before rollout boot. Scope the environment change to
+    ``Omni(...)`` so its spawn descendants inherit a compatible configuration,
+    then restore the exact trainer environment.
+    """
+    original: Dict[str, str] = {}
+    changed: List[str] = []
+    for name in _ALLOCATOR_ENV_VARS:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        kept: List[str] = []
+        removed = False
+        for item in value.split(","):
+            key, separator, setting = item.partition(":")
+            if separator and key.strip().lower() == "expandable_segments" and setting.strip().lower() == "true":
+                removed = True
+                continue
+            if item.strip():
+                kept.append(item)
+        if not removed:
+            continue
+        original[name] = value
+        changed.append(name)
+        if kept:
+            os.environ[name] = ",".join(kept)
+        else:
+            os.environ.pop(name, None)
+
+    if changed:
+        logger.info(
+            "Removed expandable_segments:True from %s while spawning vLLM-Omni; "
+            "the trainer allocator setting will be restored after boot.",
+            ", ".join(changed),
+        )
+    try:
+        yield
+    finally:
+        for name in changed:
+            os.environ[name] = original[name]
 
 
 def _import_omni_runtime() -> Dict[str, Any]:
@@ -213,7 +269,10 @@ class VLLMOmniBackend:
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
+        # 4-5. Spawn Omni off the pristine YAML asset + the assembled kwargs.
+        # The host actor keeps its expandable allocator, but Omni's spawn tree
+        # must not inherit that option because sleep-mode CuMemAllocator pools
+        # are incompatible with expandable segments.
         #
         # Node-local boot serialization: colocated replicas (8 per node) each
         # spawn worker subprocesses that hold ~20 GiB anon RSS while
@@ -251,11 +310,12 @@ class VLLMOmniBackend:
             try:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
-                omni = rt["Omni"](
-                    model=str(intent["model_path"]),
-                    stage_configs_path=yaml_path,
-                    **_assemble_omni_kwargs(intent),
-                )
+                with _without_expandable_segments_for_omni():
+                    omni = rt["Omni"](
+                        model=str(intent["model_path"]),
+                        stage_configs_path=yaml_path,
+                        **_assemble_omni_kwargs(intent),
+                    )
             finally:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
