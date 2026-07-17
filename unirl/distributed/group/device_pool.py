@@ -16,6 +16,7 @@ PlacementGroup bundles reserve CPU quota for all slots upfront.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Set
 
 import ray
@@ -27,6 +28,13 @@ from unirl.distributed.group.worker import Worker
 from unirl.distributed.utils import get_node_ip_and_port
 
 logger = logging.getLogger(__name__)
+
+_CUDA_ALLOCATOR_ENV_VARS = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+
+
+def _cuda_allocator_env_vars() -> Dict[str, str]:
+    """Copy driver allocator policy into explicitly configured Ray workers."""
+    return {name: os.environ[name] for name in _CUDA_ALLOCATOR_ENV_VARS if os.environ.get(name)}
 
 
 class DevicePool:
@@ -159,6 +167,7 @@ class DevicePool:
             "MASTER_ADDR": master_addr,
             "MASTER_PORT": str(master_port),
             "WORLD_SIZE": str(self.num_devices),
+            **_cuda_allocator_env_vars(),
         }
         for device_id in range(self.num_devices):
             self._device_to_workers[device_id] = []

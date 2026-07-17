@@ -7,6 +7,7 @@ from pathlib import Path
 from hydra import compose, initialize_config_dir
 
 import unirl.train_unified_model as train_entrypoint
+from unirl.distributed.group.device_pool import _cuda_allocator_env_vars
 from unirl.trainer.base import build_sampling_dict
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
@@ -159,3 +160,13 @@ def test_unified_model_entrypoint_preserves_allocator_override(monkeypatch) -> N
     train_entrypoint._configure_cuda_allocator(cfg)
 
     assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:64"
+
+
+def test_device_pool_propagates_allocator_policy_to_ray_workers(monkeypatch) -> None:
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "per_process_memory_fraction:0.90")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "garbage_collection_threshold:0.95")
+
+    assert _cuda_allocator_env_vars() == {
+        "PYTORCH_CUDA_ALLOC_CONF": "per_process_memory_fraction:0.90",
+        "PYTORCH_ALLOC_CONF": "garbage_collection_threshold:0.95",
+    }

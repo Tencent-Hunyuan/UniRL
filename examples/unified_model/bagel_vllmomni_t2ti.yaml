@@ -26,11 +26,12 @@ devices_per_node: 8
 batch_size: 32
 num_rollouts: 2000
 weight_sync_interval: 1
-# Bound the trainer's caching allocator below the physical device limit. This
-# reserves about 9.6 GiB on an H20 for sleeping Omni helpers, NCCL, and other
-# non-allocator CUDA users; it does not offload or shrink FSDP state. The launch
-# script exports the same value before Python starts, while the entrypoint below
-# supplies it for direct Hydra launches when the environment has no override.
+# Bound each trainer caching allocator below the physical device limit. On an
+# H20 this limits the process allocator to 86.0 GiB, leaving nominal headroom
+# for sleeping Omni helpers, NCCL, and other non-allocator CUDA users; it does
+# not offload or shrink FSDP state. The launch script exports the same value
+# before Python starts, while the entrypoint supplies it for direct Hydra
+# launches when the environment has no override.
 # GC starts at 95% of that cap, above the measured 71--74 GiB live-allocation
 # peak, so the reserve does not turn normal image replay into allocation churn.
 cuda_allocator_conf: "expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
