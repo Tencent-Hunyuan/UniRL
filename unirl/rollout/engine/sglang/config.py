@@ -153,7 +153,7 @@ class SGLangEngineConfig(BaseEngineConfig):
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
-    top_k: int = 1024
+    top_k: int = 0
 
     # --- Chat template ---
     # System message prepended to every prompt (e.g. "/no_think" to suppress
