@@ -24,6 +24,23 @@ configure_bagel_cuda_allocator_default() {
     fi
 }
 
+configure_bagel_proxy() {
+    # Keep public launches environment-neutral. Internal deployments can opt in
+    # without baking a site-specific proxy or bypass list into this launcher.
+    local proxy_url="${STAR_PROXY_URL:-}"
+    if [[ -z "$proxy_url" ]]; then
+        return 0
+    fi
+
+    export http_proxy="$proxy_url"
+    export https_proxy="$proxy_url"
+    export HTTP_PROXY="$proxy_url"
+    export HTTPS_PROXY="$proxy_url"
+    local proxy_bypass="${STAR_NO_PROXY:-${no_proxy:-${NO_PROXY:-localhost,127.0.0.1}}}"
+    export no_proxy="$proxy_bypass"
+    export NO_PROXY="$proxy_bypass"
+}
+
 main() {
     local profile="${BAGEL_VLLMOMNI_PROFILE:-production}"
     if [[ "${1:-}" == "--profile" ]]; then
@@ -42,15 +59,8 @@ main() {
     config_name="$(resolve_bagel_profile_config "$profile")"
     local root_dir
     root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    local proxy_url="${STAR_PROXY_URL:-http://star-proxy.oa.com:3128}"
 
-    export http_proxy="$proxy_url"
-    export https_proxy="$proxy_url"
-    export HTTP_PROXY="$proxy_url"
-    export HTTPS_PROXY="$proxy_url"
-    export no_proxy="${no_proxy:-localhost,127.0.0.1},.woa.com,.oa.com,mirrors.tencent.com"
-    export NO_PROXY="$no_proxy"
-
+    configure_bagel_proxy
     export BAGEL_PATH="${BAGEL_PATH:-$root_dir/models/local/BAGEL-7B-MoT}"
     export PICKSCORE_PROCESSOR_ID="${PICKSCORE_PROCESSOR_ID:-$root_dir/models/local/CLIP-ViT-H-14-laion2B-s32B-b79K}"
     export PICKSCORE_MODEL_ID="${PICKSCORE_MODEL_ID:-$root_dir/models/local/PickScore_v1}"

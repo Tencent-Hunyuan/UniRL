@@ -58,6 +58,28 @@ def _run_launcher_allocator_helper(env: dict[str, str]) -> subprocess.CompletedP
     )
 
 
+def _run_launcher_proxy_helper(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; configure_bagel_proxy; '
+                "printf 'http=%s\\nhttps=%s\\nHTTP=%s\\nHTTPS=%s\\nno=%s\\nNO=%s\\n' "
+                '"${http_proxy-<unset>}" "${https_proxy-<unset>}" '
+                '"${HTTP_PROXY-<unset>}" "${HTTPS_PROXY-<unset>}" '
+                '"${no_proxy-<unset>}" "${NO_PROXY-<unset>}"'
+            ),
+            "proxy-test",
+            str(LAUNCHER),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
 def _assert_strict_t2ti_contract(cfg, *, expected_pairs: int) -> None:
     assert cfg.weight_sync_interval == 1
     assert cfg.rollout.config.modality == "bagel_t2ti"
@@ -152,6 +174,39 @@ def test_launcher_resolves_explicit_scale_profiles() -> None:
     assert smoke.stdout.strip() == "unified_model/bagel_vllmomni_t2ti_smoke"
     assert invalid.returncode == 2
     assert "expected production or smoke" in invalid.stderr
+
+
+def test_launcher_does_not_install_a_site_specific_proxy_by_default() -> None:
+    env = dict(os.environ)
+    for name in ("STAR_PROXY_URL", "STAR_NO_PROXY", "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        env.pop(name, None)
+    env.pop("no_proxy", None)
+    env.pop("NO_PROXY", None)
+
+    result = _run_launcher_proxy_helper(env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "http=<unset>\nhttps=<unset>\nHTTP=<unset>\nHTTPS=<unset>\nno=<unset>\nNO=<unset>\n"
+    )
+
+
+def test_launcher_supports_explicit_proxy_injection() -> None:
+    env = dict(os.environ)
+    env["STAR_PROXY_URL"] = "http://proxy.example:3128"
+    env["STAR_NO_PROXY"] = "localhost,.example.com"
+
+    result = _run_launcher_proxy_helper(env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "http=http://proxy.example:3128\n"
+        "https=http://proxy.example:3128\n"
+        "HTTP=http://proxy.example:3128\n"
+        "HTTPS=http://proxy.example:3128\n"
+        "no=localhost,.example.com\n"
+        "NO=localhost,.example.com\n"
+    )
 
 
 def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:

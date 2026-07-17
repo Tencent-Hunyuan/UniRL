@@ -615,9 +615,8 @@ generation began. This passes the first-round lifecycle and next-wake gate; the
 repeated physical-memory gate was not yet established.
 
 The first-round 10-second trace was not fine-grained enough to establish the
-physical-memory gate. During round two, a persistent 2-second trace at
-`/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-guarded2-94d7e7b1-r8-gpu2s-round2.log`
-observed GPU 0/1 using 97,121/97,243 of 97,871 MiB at 06:12:26, leaving only
+physical-memory gate. During round two, a persistent 2-second trace observed
+GPU 0/1 using 97,121/97,243 of 97,871 MiB at 06:12:26, leaving only
 750/628 MiB free. At 06:12:36, GPUs 2--7 used approximately
 96,105--96,167 MiB, leaving 1,704--1,766 MiB free. Every rank therefore crossed
 below the required 2 GiB margin, and the global worst was 628 MiB. Interval 2
@@ -632,8 +631,8 @@ performs explicit cache reclamation.
 
 Run [`zom3ps4z`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/zom3ps4z), at
 revision `291d43b2`, retained the r8 workload and lifecycle controls while
-restoring interval-1/floor-0 reclamation. Its resolved Hydra configuration is
-preserved at `/root/unirl/outputs/2026-07-17/06-47-11/.hydra/config.yaml`.
+restoring interval-1/floor-0 reclamation. Its resolved Hydra configuration was
+captured before launch.
 R9c completed all 768 native generations and entered round-one training with
 flow-many still enabled.
 
@@ -643,9 +642,8 @@ reported used memory of
 97,871 MiB. Free memory was therefore
 `1972/1976/1714/1598/1758/1750/1714/1670` MiB: all eight ranks violated the
 2 GiB gate, with a 1,598 MiB minimum on GPU 3 in this initial alert. The
-persistent 2-second trace at
-`/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-cache1-291d43b2-r9c-gpu2s.log`
-was continuous through the peak after its output buffer flushed. Its final
+persistent 2-second trace was continuous through the peak after its output
+buffer flushed. Its final
 per-rank training minima were
 `1754/1718/1714/1598/1758/1754/1718/854` MiB free, with the authoritative global
 minimum of 854 MiB on GPU 7 at 07:25:07. The run was deliberately stopped during
@@ -666,8 +664,7 @@ R10 completed all 768 native generations and entered update 0 without an OOM or
 fatal error. Its final 2-second trace nevertheless recorded per-rank minimum free
 memory of ``56/422/206/244/68/268/238/1268`` MiB. The global minimum was only
 56 MiB on GPU 0 at 08:13:14. The run was therefore deliberately stopped
-mid-update 0, before a W&B history row. The authoritative trace is
-``/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-serial-e865f4ce-r10-gpu2s.log``.
+mid-update 0, before a W&B history row.
 Serial velocity replay is rejected: reducing simultaneous flow outputs did not
 provide the required 2 GiB physical margin.
 
@@ -1215,8 +1212,7 @@ train/rollout optimizer parking, per-micro reclamation, and serial velocity
 replay. Its final 2-second update-0 trace recorded per-rank minima of
 ``56/422/206/244/68/268/238/1268`` MiB, with the 56 MiB global low at 08:13:14.
 There was no OOM or fatal error, but the run was deliberately stopped mid-update
-0 and produced no W&B row. The trace is
-``/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-serial-e865f4ce-r10-gpu2s.log``.
+0 and produced no W&B row.
 R10 is rejected on physical capacity.
 
 R11 kept that exact serial recipe and added CPU steady-state parking for the
