@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import repeat
 
-from ..utils.import_utils import is_flash_attn_available
+# UniRL vendor edit: flattened same-dir import. See VENDOR_COMMIT.txt.
+from .import_utils import is_flash_attn_available
 
 if is_flash_attn_available():
     from flash_attn import flash_attn_varlen_func

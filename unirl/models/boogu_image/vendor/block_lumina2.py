@@ -1,34 +1,18 @@
-import os
-import warnings
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers.models.embeddings import Timesteps
 
-from ...utils.import_utils import is_flash_attn_available, is_triton_available
-from ..embeddings import TimestepEmbedding
+# UniRL vendor edit: triton-RMSNorm and flash-swiglu env-var conditionals
+# replaced by the upstream default-env branches (torch.nn.RMSNorm + pure-torch
+# swiglu) so training numerics are environment-independent. See
+# VENDOR_COMMIT.txt.
+from .embeddings import TimestepEmbedding
+from torch.nn import RMSNorm
 
-if is_triton_available() and ("cuda" in os.getenv("device", "cpu")):
-    from ...ops.triton.layer_norm import RMSNorm
-else:
-    from torch.nn import RMSNorm
-
-    warnings.warn(
-        "Cannot import triton, install triton to use fused RMSNorm for better performance"
-    )
-
-if is_flash_attn_available() and ("cuda" in os.getenv("device", "cpu")):
-    from flash_attn.ops.activations import swiglu
-
-    from .components import swiglu as torch_swiglu
-else:
-    from .components import swiglu
-    from .components import swiglu as torch_swiglu
-
-    warnings.warn(
-        "Cannot import flash_attn, install flash_attn to use fused SwiGLU for better performance"
-    )
+from .components import swiglu
+from .components import swiglu as torch_swiglu
 
 # try:
 # except ImportError:

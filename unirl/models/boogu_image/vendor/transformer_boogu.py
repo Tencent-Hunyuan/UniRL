@@ -13,7 +13,6 @@ limitations under the License.
 """
 
 import itertools
-import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -33,9 +32,10 @@ from diffusers.utils import (
 )
 from einops import rearrange
 
-from ...utils.import_utils import is_triton_available
-from ...utils.teacache_util import TeaCacheParams
-from ..attention_processor import (
+# UniRL vendor edit: flattened same-dir imports; triton RMSNorm conditional
+# replaced by torch.nn.RMSNorm; TaylorSeer/TeaCache helpers routed to raising
+# stubs (RL rollout/replay must be cache-free). See VENDOR_COMMIT.txt.
+from .attention_processor import (
     BooguImageAttnProcessor,
     BooguImageAttnProcessorFlash2Varlen,
     BooguImageDoubleStreamSelfAttnProcessor,
@@ -51,20 +51,16 @@ from .rope import (
     BooguImageDoubleStreamRotaryPosEmbed,
     BooguImagePromptTuningRotaryPosEmbed,
 )
-
-if is_triton_available() and ("cuda" in os.getenv("device", "cpu")):
-    from ...ops.triton.layer_norm import RMSNorm
-else:
-    from torch.nn import RMSNorm
-
-from ...cache_functions import cal_type
-from ...taylorseer_utils import (
+from .taylorseer_stubs import (
+    cal_type,
     derivative_approximation,
     derivative_approximation_4_double_stream,
     taylor_cache_init,
     taylor_formula,
     taylor_formula_4_double_stream,
 )
+from .teacache_util import TeaCacheParams
+from torch.nn import RMSNorm
 
 logger = logging.get_logger(__name__)
 
@@ -206,14 +202,11 @@ class BooguImageTransformerBlock(nn.Module):
         self.head_dim = dim // num_attention_heads
         self.modulation = modulation
 
-        if "cpu" in os.getenv("device", "cpu"):
-            processor = BooguImageAttnProcessor()
-
-        else:
-            try:
-                processor = BooguImageAttnProcessorFlash2Varlen()
-            except ImportError:
-                processor = BooguImageAttnProcessor()
+        # UniRL vendor edit: attention backend is pinned to SDPA instead of the
+        # upstream `device` env-var gate — training numerics must not depend on
+        # process environment. Swap to Flash2Varlen post-load via the bundle's
+        # `attention_backend` config if desired.
+        processor = BooguImageAttnProcessor()
 
         # Initialize attention layer
         self.attn = Attention(
@@ -416,38 +409,15 @@ class BooguImageDoubleStreamTransformerBlock(nn.Module):
         self.modulation = modulation
         self.hidden_size = dim
 
-        if "cpu" in os.getenv("device", "cpu"):
-            processor = BooguImageAttnProcessor()
-        else:
-            try:
-                processor = BooguImageAttnProcessorFlash2Varlen()
-            except ImportError:
-                processor = BooguImageAttnProcessor()
-
-        if "cpu" in os.getenv("device", "cpu"):
-            double_stream_processor = BooguImageDoubleStreamSelfAttnProcessor(
-                head_dim=self.head_dim,
-                num_attention_heads=num_attention_heads,
-                num_kv_heads=num_kv_heads,
-                qkv_bias=False,
-            )
-        else:
-            try:
-                double_stream_processor = (
-                    BooguImageDoubleStreamSelfAttnProcessorFlash2Varlen(
-                        head_dim=self.head_dim,
-                        num_attention_heads=num_attention_heads,
-                        num_kv_heads=num_kv_heads,
-                        qkv_bias=False,
-                    )
-                )
-            except ImportError:
-                double_stream_processor = BooguImageDoubleStreamSelfAttnProcessor(
-                    head_dim=self.head_dim,
-                    num_attention_heads=num_attention_heads,
-                    num_kv_heads=num_kv_heads,
-                    qkv_bias=False,
-                )
+        # UniRL vendor edit: attention backends pinned to SDPA (see the note in
+        # BooguImageTransformerBlock.__init__).
+        processor = BooguImageAttnProcessor()
+        double_stream_processor = BooguImageDoubleStreamSelfAttnProcessor(
+            head_dim=self.head_dim,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            qkv_bias=False,
+        )
 
         # Image stream components.
         self.img_instruct_attn = Attention(
