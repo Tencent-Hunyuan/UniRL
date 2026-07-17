@@ -32,7 +32,10 @@ def test_backend_boot_hides_expandable_allocator_from_omni_children(
     )
     monkeypatch.setattr(native_module, "_resolve_stage_yaml", lambda *_args: "/fake/stages.yaml")
     monkeypatch.setenv("DIFFRL_OMNI_BOOT_SERIALIZE", "0")
-    cuda_conf = "max_split_size_mb:64,expandable_segments:True,garbage_collection_threshold:0.8"
+    cuda_conf = (
+        "max_split_size_mb:64,expandable_segments:True,"
+        "garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
+    )
     alloc_conf = "expandable_segments:true"
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", cuda_conf)
     monkeypatch.setenv("PYTORCH_ALLOC_CONF", alloc_conf)
@@ -47,7 +50,9 @@ def test_backend_boot_hides_expandable_allocator_from_omni_children(
     )
 
     assert allocator_env_seen_by_omni == {
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,garbage_collection_threshold:0.8",
+        "PYTORCH_CUDA_ALLOC_CONF": (
+            "max_split_size_mb:64,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
+        ),
         "PYTORCH_ALLOC_CONF": None,
     }
     assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == cuda_conf

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -40,7 +41,7 @@ def _assert_strict_t2ti_contract(cfg, *, expected_pairs: int) -> None:
     assert cfg.rollout.config.modality == "bagel_t2ti"
     assert cfg.pipeline.t2ti_replay_chunk_mode == "exact"
     assert cfg.pipeline.t2ti_replay_execution_order == "layer_major"
-    assert cfg.pipeline.t2ti_flow_many_enabled is False
+    assert cfg.pipeline.t2ti_flow_many_enabled is True
     assert cfg.algorithm.image.context_gradient_mode == "stage_boundary"
     assert cfg.algorithm.image.lazy_first_update_anchor is True
     assert cfg.algorithm.image.reuse_ratio_context_for_mse is False
@@ -56,6 +57,9 @@ def test_production_profile_matches_unigrpo_scale() -> None:
     _assert_strict_t2ti_contract(cfg, expected_pairs=32 * 24)
     assert (cfg.num_devices, cfg.devices_per_node, cfg.batch_size) == (32, 8, 32)
     assert cfg.enable_fsdp_offload is False
+    assert cfg.cuda_allocator_conf == (
+        "expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
+    )
     assert cfg.park_optimizer_state_during_rollout is True
     assert cfg.park_optimizer_state_during_train is True
     assert cfg.backend.fsdp_cfg.cpu_offload is False
@@ -131,6 +135,7 @@ def test_launcher_resolves_explicit_scale_profiles() -> None:
 def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:
     cfg = _compose("bagel_vllmomni_t2ti")
     captured = {}
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
 
     class _Trainer:
         def __init__(self, **kwargs) -> None:
@@ -142,5 +147,15 @@ def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:
     monkeypatch.setattr(train_entrypoint, "UnifiedModelTrainer", _Trainer)
     train_entrypoint.main.__wrapped__(cfg)
 
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == cfg.cuda_allocator_conf
     assert captured["park_optimizer_state_during_rollout"] is True
     assert captured["park_optimizer_state_during_train"] is True
+
+
+def test_unified_model_entrypoint_preserves_allocator_override(monkeypatch) -> None:
+    cfg = _compose("bagel_vllmomni_t2ti")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+
+    train_entrypoint._configure_cuda_allocator(cfg)
+
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:64"

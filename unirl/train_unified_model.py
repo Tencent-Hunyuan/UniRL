@@ -13,14 +13,24 @@ Pairs with ``examples/unified_model/hi3_vllmomni.yaml``::
 
 from __future__ import annotations
 
+import os
+
 import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
 
+def _configure_cuda_allocator(cfg: DictConfig) -> None:
+    """Apply a recipe allocator default before the trainer creates Ray workers."""
+    configured = cfg.get("cuda_allocator_conf")
+    if configured and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(configured)
+
+
 @hydra.main(version_base=None, config_path="../examples", config_name="unified_model/hi3_vllmomni")
 def main(cfg: DictConfig) -> None:
+    _configure_cuda_allocator(cfg)
     trainer = UnifiedModelTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

@@ -26,6 +26,14 @@ devices_per_node: 8
 batch_size: 32
 num_rollouts: 2000
 weight_sync_interval: 1
+# Bound the trainer's caching allocator below the physical device limit. This
+# reserves about 9.6 GiB on an H20 for sleeping Omni helpers, NCCL, and other
+# non-allocator CUDA users; it does not offload or shrink FSDP state. The launch
+# script exports the same value before Python starts, while the entrypoint below
+# supplies it for direct Hydra launches when the environment has no override.
+# GC starts at 95% of that cap, above the measured 71--74 GiB live-allocation
+# peak, so the reserve does not turn normal image replay into allocation churn.
+cuda_allocator_conf: "expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
 enable_fsdp_offload: false
 # The first rollout fits before Adam initializes; later wakes otherwise overlap
 # Omni with completed grads + Adam state and can OOM. This narrow lifecycle does
@@ -73,11 +81,11 @@ pipeline:
   # resident while that layer traverses all chunks. This removes per-token
   # unshard/reshard and makes collective order independent of trace depth.
   t2ti_replay_execution_order: layer_major
-  # Keep exact layer-major replay but process SDE velocity streams serially.
-  # Flow-many passed numerical/lifecycle gates, but its simultaneous activations
-  # violated the required 2 GiB H20 physical-memory margin even with per-micro
-  # cache reclamation.
-  t2ti_flow_many_enabled: false
+  # Traverse each FSDP decoder layer once for all three SDE velocity streams.
+  # This path is gradient-equivalent to serial replay and materially reduces
+  # train time. Earlier capacity gates ran with an unbounded caching allocator;
+  # production enables it only together with the 90% allocator cap above.
+  t2ti_flow_many_enabled: true
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
