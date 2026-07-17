@@ -87,11 +87,30 @@ reclamation, yet its update-0 trace still found only 854 MiB free.
 Both candidates are rejected. R10 retained the exact layer-major replay and all
 lifecycle controls while disabling flow-many to reduce simultaneous image
 activations. Its update-0 2-second trace still reached only 56 MiB physical
-headroom, so serial execution does not solve the live-capacity defect. R11 adds
+headroom, so serial execution does not solve the live-capacity defect. R11 added
 an explicit scalar-reward lifecycle: only PickScore's registered model tensors
-are restored for reward scoring and they return to CPU in ``finally`` before
-anchor replay or training. Its H20 memory, numerical, and repeated-lifecycle
-gates remain pending.
+were restored for reward scoring and returned to CPU in ``finally`` before
+anchor replay or training. That lifecycle operated as designed, but
+[run `6m2etqbj`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/6m2etqbj)
+was stopped after 37m32s of serial training without a completed round. Its
+per-rank physical minima were ``60/64/62/14/66/64/14/110`` MiB, globally 14 MiB.
+The trainer-process peaks were
+``94420/94272/94390/94310/94550/94270/94452/94118`` MiB while fixed Omni helpers
+held ``2474/2470/2472/2468/2468/2474/2470/2494`` MiB. R11 is rejected: reward
+parking removed one persistent owner, but the unbounded trainer caching
+allocator still consumed the intended physical reserve.
+
+R12 bounds each trainer allocator at 90% of H20 capacity, starts native garbage
+collection at 95% of that cap, and restores exact layer-major flow-many replay.
+Commit ``b086fd1e`` also propagates the policy into the Ray train-worker runtime
+environment. In [run `s3x6q1h5`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/s3x6q1h5),
+that revision passed the R12 acceptance gate: two finite rounds at
+`P=32, N=24, M=1, U=2` completed in 3,141.711393 s and 3,130.272707 s, the physical-memory
+floors remained 7,312 MiB and 7,320 MiB, and mean reward increased from
+0.776082218 to 0.778691053. The third all-rank Omni wake and generation startup
+also completed without error; the run intentionally remains active in round
+three. The post-launch allocator-policy hardening at ``2a9f6d11`` was validated in
+a detached exact-pod worktree and did not alter the live run.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -641,7 +660,7 @@ CPU immutable bf16 reference, train/rollout optimizer parking, native allocator
 garbage collection, no FSDP offload, and global
 ``P=32, N=24, M=1, U=2``, batch size 32.
 
-## R10 Serial-Flow Gate And R11 Reward Parking
+## R10/R11 Capacity Rejections And R12 Capped Acceptance
 
 R10 completed all 768 native generations and entered update 0 without an OOM or
 fatal error. Its final 2-second trace nevertheless recorded per-rank minimum free
@@ -667,9 +686,73 @@ after a successful score is fatal, while a cleanup failure does not mask the
 original scoring exception. Differentiable reward scoring is incompatible with
 the flag because its model tensors must remain device-resident through backward.
 Per-worker logs report synchronized host transfer times plus exact logical tensor
-counts and bytes. R11 remains experimental until the exact transfer exceeds
-2 GiB and a 2-second H20 trace remains at or above 2 GiB through both updates and
-the following all-rank Omni wake.
+counts and bytes. In [run
+`6m2etqbj`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/6m2etqbj), the reward
+restore-score-park lifecycle completed and PickScore returned to CPU before
+training. The serial train was nevertheless stopped after 37m32s without a
+completed round. The authoritative 2-second trace recorded per-rank physical
+minima of ``60/64/62/14/66/64/14/110`` MiB, with a 14 MiB global minimum on two
+ranks. Trainer-process peaks were
+``94420/94272/94390/94310/94550/94270/94452/94118`` MiB; the fixed Omni helper
+footprint was ``2474/2470/2472/2468/2468/2474/2470/2494`` MiB. R11 is rejected.
+The remaining failure is not an incomplete reward lifecycle: without a hard
+allocator ceiling, the trainer can reserve almost all physical memory and leave
+no stable margin for fixed Omni, NCCL, or other non-allocator users.
+
+R12 changes that capacity policy rather than adding another model offload. The
+trainer caching allocator is capped at 90% per process and its garbage-collection
+threshold is 95% of that cap. Exact layer-major flow-many replay is re-enabled to
+recover its demonstrated throughput advantage. Commit ``b086fd1e`` propagates
+the configured allocator environment through the device pool to every Ray train
+worker, covering both the launcher and direct Hydra entrypoints. Forty-eight
+focused tests passed in the exact pod environment before launch.
+
+[R12b run `s3x6q1h5`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/s3x6q1h5)
+ran that exact revision and passed the acceptance gate. Both rows retained 768
+paired samples, 32 prompt groups, and two disjoint optimizer updates; all
+reported ratios, losses, gradients, rewards, and lifecycle diagnostics were
+finite.
+
+| Round / row time (SGT) | Native generation | Train, both updates | Total | Physical free-memory floor |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 10:51:52 | 829.170585 s | 2,299.625657 s | 3,141.711393 s | 7,312 MiB |
+| 2 / 11:44:02 | 741.686526 s | 2,232.597703 s | 3,130.272707 s | 7,320 MiB |
+
+| Round | Reward mean | Reward std | Reward min | Reward max | Mean delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.776082218 | 0.083198704 | 0.537614286 | 0.969348431 | - |
+| 2 | 0.778691053 | 0.075758934 | 0.598187864 | 1.004981756 | +0.002608836 |
+
+The allocator telemetry remained bounded in every update:
+
+| Round / update | Peak allocated | Peak reserved |
+| --- | ---: | ---: |
+| 1 / 0 | 67.543997 GiB | 84.986328 GiB |
+| 1 / 1 | 67.552124 GiB | 84.992188 GiB |
+| 2 / 0 | 67.543974 GiB | 84.994141 GiB |
+| 2 / 1 | 67.541399 GiB | 84.984375 GiB |
+
+Each update made all 48 possible image-micro cache-reclamation calls, with zero
+skips, pressure checks, or pressure-triggered calls. Optimizer parking and
+restoration moved exactly `104,410,005,504` bytes with zero pending restore
+slots. At the round-two rollout boundary the trainer cleared exactly
+`52,205,002,752` bytes of completed gradients and parked the same
+`104,410,005,504` optimizer bytes. The third all-rank Omni wake completed at
+11:44:24--11:44:25 SGT, and all ranks were generating again by 11:46:36. No
+allocator, lifecycle, NCCL, or fatal error was observed; the run intentionally
+remains active in round three.
+
+Follow-up commit ``2a9f6d11`` makes this production invariant fail closed. It
+resolves `PYTORCH_CUDA_ALLOC_CONF` ahead of `PYTORCH_ALLOC_CONF`, preserves a
+safe effective override without shadowing it, rejects a missing, invalid,
+non-finite, or greater-than-0.90 memory fraction, and snapshots the policy for
+lazy device-pool slots. Local validation comprised 16 focused passes and a
+code-focused result of 53 passed and 3 skipped; a separate initial broad local
+attempt stopped at collection only because `torchvision` was unavailable. A
+detached exact-pod deployment probe reported `GUARD_PROBE=2`, and the full
+focused suite passed 58 tests in 17.57 s at ``2a9f6d11``. This hardening did not
+modify the live R12b process, so the runtime evidence above remains attributable
+to ``b086fd1e``.
 
 ## Scale Mismatch
 
@@ -692,9 +775,36 @@ Production must retain `U=2`; smoke must override it to `U=1`.
 
 The distinction matters in both directions. CPU paging made the feasibility run
 much slower per model invocation than the intended GPU-resident FSDP run. On the
-other hand, production has 24 local thought/image samples per DP rank and longer
-thinking limits, so exact per-token replay would still scale poorly even after
-removing CPU offload.
+other hand, the original 32-device production layout has 24 local thought/image
+samples per DP rank and longer thinking limits, so exact per-token replay would
+still scale poorly even after removing CPU offload.
+
+### Original 32-GPU Recipe Versus The One-Node Gate
+
+The latest one-node H20 run did not reduce the global batch or UniGRPO fanout.
+It launched the vLLM-Omni production profile with ``num_devices=8`` and
+``devices_per_node=8`` while retaining batch size 32; the checked-in production
+default remains 32 devices. The exact comparison is:
+
+| Dimension | Original 32-GPU trainside recipe | One-node 8-H20 vLLM-Omni gate |
+| --- | --- | --- |
+| placement | 4 nodes x 8 GPUs, DP world 32 | 1 node x 8 GPUs, DP world 8 |
+| global ``P/N/M/U`` | ``32/24/1/2`` | ``32/24/1/2`` |
+| paired samples | 768 per rollout; 384 per disjoint update | 768 per rollout; 384 per disjoint update |
+| per-rank work | 1 prompt, 24 pairs per rollout, 12 per update | 4 prompts, 96 pairs per rollout, 48 per update |
+| rollout ownership | in-process trainside rollout on the live FSDP model; no weight sync | external native Omni Stage 0 AR -> Stage 1 image; explicit full-weight sync and native KV metadata |
+| replay/anchor path | AR training forward, opaque in-process conditions, rollout image anchor | AR inference replay, native Stage-0 trace reconstruction, trainer-replay image anchor, detached stage boundary, exact layer-major execution with flow-many in R12 |
+| model placement | full-FT FSDP parameters/shards on GPU; no CPU offload | same no-offload policy, but four-times-larger FSDP shards per rank plus sleeping Omni helpers |
+| lifecycle | Adam and PickScore remain CUDA-resident | sharded Adam and PickScore are parked for bounded phases; R12 also caps the trainer allocator |
+| AR nucleus sampling | ``top_p`` omitted, current default ``0.9`` | explicit ``top_p=0.95``; ``top_k=1024`` in both cases |
+
+The global sample count, disjoint-update geometry, full-FT objective, optimizer,
+learning rates, FSDP precision policy, diffusion schedule, and reward model are
+nominally unchanged. The runs are not numerically identical: rollout sampling,
+the AR kernel, image-anchor source, replay ordering, reduction order, FSDP shard
+size, and process lifecycle all differ. On eight GPUs each rank performs four
+times the replay/backward samples and owns roughly four times the FSDP and Adam
+shard bytes of a rank in the original 32-way layout.
 
 ## Distributed Exact-Replay Deadlock
 
@@ -1018,8 +1128,9 @@ r3's second Stage-1 wake OOM; it is not persistent or whole-trainer FSDP CPU
 offload. R5 repeatedly parked and restored exactly `104,410,005,504` bytes,
 completed eight training rounds, and crossed the ninth wake successfully.
 
-**Flow-many passed its isolated lifecycle gate but failed the physical-memory
-gate.** An exact CFG=1 implementation can traverse all selected SDE velocity
+**Uncapped flow-many passed its isolated lifecycle gate but failed the
+physical-memory gate; capped flow-many passed both.** An exact CFG=1
+implementation can traverse all selected SDE velocity
 streams inside one layer-major decoder pass, reducing wrapped-layer entries
 across anchor, reference, and policy velocity replay. It may retain more
 simultaneous activations. R5 explicitly enabled it and completed eight finite
@@ -1027,14 +1138,20 @@ rounds with a worst PyTorch-reported peak of 86.420 GiB allocated and 91.076 GiB
 reserved, while external sampling left only 622 MiB free. R8's pressure guard
 still fell to 628 MiB free. R9c then paired flow-many with reclamation after
 every replay micro and still left only 854 MiB free in its final 2-second trace.
-Production therefore keeps `t2ti_flow_many_enabled=false`; r10 preserves exact
-layer-major replay while processing the velocity streams serially.
+R10 and R11 showed that serial velocity replay and reward parking alone were
+also insufficient, reaching 56 MiB and 14 MiB global minima respectively. The
+R12 recipe therefore restores ``t2ti_flow_many_enabled=true`` only together
+with the 90% trainer-allocator cap and 95%-of-cap garbage-collection threshold.
+That combined gate completed two finite two-update rounds with 7,312 MiB and
+7,320 MiB physical floors, then crossed the third all-rank Omni wake and resumed
+generation. R12 therefore passes the defined one-node physical-memory and
+lifecycle acceptance gate.
 
 ## Verification Status
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | r11 reward lifecycle/config plus adjacent BAGEL trainer/Omni regressions: 104 passed, 1 skipped locally; prior exact-pod suite: 114 passed; independent broad local suite: 110 passed, 4 skipped |
+| Unit and config regression | passed | r11 reward lifecycle/config plus adjacent BAGEL trainer/Omni regressions: 104 passed, 1 skipped locally; prior exact-pod suite: 114 passed; independent broad local suite: 110 passed, 4 skipped; runtime revision `b086fd1e`: 48 focused exact-pod passes; hardening revision `2a9f6d11`: 16 focused local passes, 53 passed and 3 skipped in the code-focused local set, then `GUARD_PROBE=2` and 58 focused exact-pod passes in 17.57 s; a separate initial broad local attempt was blocked at collection only by missing `torchvision` |
 | Two-rank FSDP2 ordering | passed on CPU/Gloo | production replay helper, unequal 2-vs-5 real depths, three-layer K/V recurrence, activation checkpointing, `reshard_after_forward=true`, and a semantic image call completed and matched averaged unpadded gradients |
 | Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
 | Layer-major local exact parity | passed | production installer/helper are bit-exact against chunk-major for terminal K/V, downstream image output/loss, and every decoder gradient; wrapped calls fall from `chunks + image` to `replay + image` per layer |
@@ -1055,7 +1172,8 @@ layer-major replay while processing the velocity streams serially.
 | Interval-2/floor-12 cadence | **rejected** | r8's first round and next wake passed, but a 2-second round-two trace found all ranks below 2 GiB free and a 628 MiB global minimum; it was stopped during round two without another completed row |
 | Interval-1/floor-0 flow-many cadence | **rejected** | r9c completed 768 native generations, but its update-0 trace found all ranks below 2 GiB free, worst 854 MiB; it was stopped without a completed round |
 | Serial-flow H20 gate | **rejected** | r10 kept exact layer-major replay and per-micro reclamation with flow-many disabled; update 0's 2-second per-rank minimum free memory was 56/422/206/244/68/268/238/1268 MiB, globally 56 MiB, so it was stopped mid-update without a W&B row |
-| Reward-model parking H20 gate | pending | r11 parks only the local PickScore model between scalar scores; acceptance requires a >2 GiB measured model transfer, >=2 GiB external physical headroom through both updates, finite rewards/losses, and the following all-rank Omni wake |
+| Reward-model parking H20 gate | **rejected** | r11 W&B `6m2etqbj` verified restore-score-park but was stopped after 37m32s of serial train with no completed round; physical minima were 60/64/62/14/66/64/14/110 MiB, globally 14 MiB, while trainer peaks were 94420/94272/94390/94310/94550/94270/94452/94118 MiB and fixed Omni helpers held 2474/2470/2472/2468/2468/2474/2470/2494 MiB |
+| 90%-capped flow-many H20 gate | two-round gate passed; third wake passed | [r12b `s3x6q1h5`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/s3x6q1h5) at `b086fd1e` completed two finite `P=32, N=24, M=1, U=2` rounds in 3,141.711393 s and 3,130.272707 s with 7,312/7,320 MiB physical floors; mean reward moved 0.776082218 -> 0.778691053, and every rank crossed the next wake and resumed round-three generation without error |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
 | Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
@@ -1101,20 +1219,36 @@ There was no OOM or fatal error, but the run was deliberately stopped mid-update
 ``/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-serial-e865f4ce-r10-gpu2s.log``.
 R10 is rejected on physical capacity.
 
-R11 keeps that exact recipe and adds CPU steady-state parking for the local
-PickScore scorer. RewardService restores only the reward backend's registered
-model parameters and buffers immediately before scalar scoring, preserves the
-unchanged ``RewardResponse``, and parks the model again even when scoring raises.
-It never calls the FSDP backend or vLLM-Omni lifecycle. Synchronized lifecycle
-telemetry reports the exact logical reward-model tensor bytes and host transfer
-times on every worker. Differentiable reward mode is rejected under this flag
-because its model tensors must remain resident through backward. Both forms of
-FSDP CPU offload remain false throughout.
+R11 kept that exact serial recipe and added CPU steady-state parking for the
+local PickScore scorer. The restore-score-park lifecycle worked, never entered
+the FSDP or Omni lifecycle, and left both forms of FSDP CPU offload false.
+Nevertheless, [run
+`6m2etqbj`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/6m2etqbj) was stopped
+after 37m32s of training without a completed round. Its physical minima were
+``60/64/62/14/66/64/14/110`` MiB, globally 14 MiB. Trainer-process peaks of
+``94420/94272/94390/94310/94550/94270/94452/94118`` MiB overlapped fixed Omni
+helper allocations of ``2474/2470/2472/2468/2468/2474/2470/2494`` MiB. R11 is
+therefore rejected: parking PickScore was correct but did not constrain the
+trainer's unbounded caching allocator.
 
-The immediate gate is repeated r11 execution with a logged reward-model transfer
-materially above 2 GiB and an external physical-memory minimum of at least 2 GiB
-through both optimizer updates and the following Omni wake. Remaining broader
-gates are a longer reward series and the unmeasured 32-device scale.
-The eight-point reward slope and fit are materially stronger, but eight
-heterogeneous prompt batches still need additional rounds before the trend can
-be called sustained growth.
+R12, deployed at ``b086fd1e``, bounds the trainer allocator at 90% of H20
+capacity, applies a 0.95 garbage-collection threshold, propagates that policy to
+the Ray workers, and re-enables exact layer-major flow-many. Forty-eight focused
+tests passed in the exact pod environment before launch. In
+[r12b `s3x6q1h5`](https://wandb.ai/linyuwus/bagel-unigrpo/runs/s3x6q1h5),
+rounds one and two completed in 3,141.711393 s and 3,130.272707 s with finite
+two-update metrics and physical floors of 7,312 MiB and 7,320 MiB. Peak trainer
+allocation stayed between 67.541399 GiB and 67.552124 GiB across the four
+updates, optimizer park/restore accounting was exact with zero pending slots,
+and reward mean increased by 0.002608836 from 0.776082218 to 0.778691053. The
+third all-rank wake completed and every rank resumed generation without error.
+R12 therefore passes its one-node runtime, capacity, numerical, and lifecycle
+acceptance gate; the live run intentionally remains active in round three.
+
+The fail-closed follow-up at ``2a9f6d11`` was deployed only to a detached
+worktree, where `GUARD_PROBE=2` and all 58 focused exact-pod tests passed in
+17.57 s. It did not change the live process or the runtime revision attributed
+above. The broader remaining work is a longer reward series and the unmeasured
+32-device scale. The eight-point reward slope and fit are materially stronger,
+but eight heterogeneous prompt batches still need additional rounds before the
+trend can be called sustained growth.
