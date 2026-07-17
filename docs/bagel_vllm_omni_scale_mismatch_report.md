@@ -84,9 +84,14 @@ finished in 3,056.737 s total with 2,217.634 s in training and passed the
 following all-rank Omni wake, but a 2-second round-two trace later found only
 628 MiB physical headroom. R9c restored per-micro interval-1/floor-0
 reclamation, yet its update-0 trace still found only 854 MiB free.
-Both candidates are rejected. R10 retains the exact layer-major replay and all
+Both candidates are rejected. R10 retained the exact layer-major replay and all
 lifecycle controls while disabling flow-many to reduce simultaneous image
-activations; its repeated runtime and memory gates remain pending.
+activations. Its update-0 2-second trace still reached only 56 MiB physical
+headroom, so serial execution does not solve the live-capacity defect. R11 adds
+an explicit scalar-reward lifecycle: only PickScore's registered model tensors
+are restored for reward scoring and they return to CPU in ``finally`` before
+anchor replay or training. Its H20 memory, numerical, and repeated-lifecycle
+gates remain pending.
 
 A combined experimental one-rollout build completed on one H20 with the same
 incident geometry. It included the one-call collapsed candidate, the
@@ -630,12 +635,41 @@ history row.
 
 R9c proves that cache cadence is not the remaining cause: interval 1 reclaimed
 after every replay micro, but flow-many's in-flight activation set still crossed
-the margin. The r10 candidate changes only production
-`t2ti_flow_many_enabled` from true to false. It retains exact layer-major
-replay, interval-1/floor-0 reclamation, the CPU immutable bf16 reference,
-train/rollout optimizer parking, native allocator garbage collection, no FSDP
-offload, and global `P=32, N=24, M=1, U=2`, batch size 32. R10 must still prove
-the repeated runtime, numerical, lifecycle, and 2 GiB physical-memory gates.
+the margin. R10 changed only production ``t2ti_flow_many_enabled`` from true to
+false. It retained exact layer-major replay, interval-1/floor-0 reclamation, the
+CPU immutable bf16 reference, train/rollout optimizer parking, native allocator
+garbage collection, no FSDP offload, and global
+``P=32, N=24, M=1, U=2``, batch size 32.
+
+## R10 Serial-Flow Gate And R11 Reward Parking
+
+R10 completed all 768 native generations and entered update 0 without an OOM or
+fatal error. Its final 2-second trace nevertheless recorded per-rank minimum free
+memory of ``56/422/206/244/68/268/238/1268`` MiB. The global minimum was only
+56 MiB on GPU 0 at 08:13:14. The run was therefore deliberately stopped
+mid-update 0, before a W&B history row. The authoritative trace is
+``/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-serial-e865f4ce-r10-gpu2s.log``.
+Serial velocity replay is rejected: reducing simultaneous flow outputs did not
+provide the required 2 GiB physical margin.
+
+R11 targets a separate persistent allocation: the local PickScore CLIP model is
+used during reward scoring, then otherwise remains resident throughout anchor
+replay and both optimizer updates. The production RewardService now establishes
+a CPU steady state for this backend during construction, restores it immediately
+before each scalar score, and parks it again in ``finally``. Only the backend's
+registered model parameters and buffers move. FSDP parameters, shards, gradients,
+Adam state, and both vLLM-Omni stages are outside this lifecycle.
+
+The lifecycle is explicit and config-gated. Unsupported or CPU backends fail
+configuration rather than silently pretending to park; the CPU smoke profile
+disables the flag. A scoring failure still re-parks the model. A parking failure
+after a successful score is fatal, while a cleanup failure does not mask the
+original scoring exception. Differentiable reward scoring is incompatible with
+the flag because its model tensors must remain device-resident through backward.
+Per-worker logs report synchronized host transfer times plus exact logical tensor
+counts and bytes. R11 remains experimental until the exact transfer exceeds
+2 GiB and a 2-second H20 trace remains at or above 2 GiB through both updates and
+the following all-rank Omni wake.
 
 ## Scale Mismatch
 
@@ -1000,7 +1034,7 @@ layer-major replay while processing the velocity streams serially.
 
 | Gate | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Unit and config regression | passed | current r10 profile and serial-flow dispatch: 6 passed; preserved lazy-anchor test: 1 passed; prior exact-pod suite: 114 passed; independent broad local suite: 110 passed, 4 skipped |
+| Unit and config regression | passed | r11 reward lifecycle/config plus adjacent BAGEL trainer/Omni regressions: 104 passed, 1 skipped locally; prior exact-pod suite: 114 passed; independent broad local suite: 110 passed, 4 skipped |
 | Two-rank FSDP2 ordering | passed on CPU/Gloo | production replay helper, unequal 2-vs-5 real depths, three-layer K/V recurrence, activation checkpointing, `reshard_after_forward=true`, and a semantic image call completed and matched averaged unpadded gradients |
 | Adversarial CUDA/NCCL ordering | passed in focused toys | bounded cache-DAG padding passed 2-rank depth 100-vs-3 and 4-rank 30/3/4/5 cases; the removed hidden-chain control reproduced the collective mismatch |
 | Layer-major local exact parity | passed | production installer/helper are bit-exact against chunk-major for terminal K/V, downstream image output/loss, and every decoder gradient; wrapped calls fall from `chunks + image` to `replay + image` per layer |
@@ -1020,7 +1054,8 @@ layer-major replay while processing the velocity streams serially.
 | Interval-4/floor-8 cadence | **rejected** | r7 completed and crossed the next wake, but 3/8 ranks fell below 2 GiB free, worst 890 MiB; 75% fewer cache calls did not reduce train wall time |
 | Interval-2/floor-12 cadence | **rejected** | r8's first round and next wake passed, but a 2-second round-two trace found all ranks below 2 GiB free and a 628 MiB global minimum; it was stopped during round two without another completed row |
 | Interval-1/floor-0 flow-many cadence | **rejected** | r9c completed 768 native generations, but its update-0 trace found all ranks below 2 GiB free, worst 854 MiB; it was stopped without a completed round |
-| Serial-flow H20 gate | pending | r10 keeps exact layer-major replay and per-micro reclamation while disabling flow-many; repeated runtime, numerical, lifecycle, and physical-memory evidence is not yet available |
+| Serial-flow H20 gate | **rejected** | r10 kept exact layer-major replay and per-micro reclamation with flow-many disabled; update 0's 2-second per-rank minimum free memory was 56/422/206/244/68/268/238/1268 MiB, globally 56 MiB, so it was stopped mid-update without a W&B row |
+| Reward-model parking H20 gate | pending | r11 parks only the local PickScore model between scalar scores; acceptance requires a >2 GiB measured model transfer, >=2 GiB external physical headroom through both updates, finite rewards/losses, and the following all-rank Omni wake |
 | 32-device production | not run | encoded scale remains `P=32, N=24, M=1, U=2`; the eight-round one-node batch-32 gate passed, but 32-device behavior is unmeasured |
 | Reward learning curve | materially stronger, not yet sustained | eight-point slope is `+0.003446196516/round`, `R^2=0.61667938`, and point eight is a new high; eight heterogeneous prompt batches still do not prove a sustained curve |
 
@@ -1057,14 +1092,29 @@ cadence/floor to 2/12. Its first round matched baseline train time while retaini
 round-two trace later found only 628 MiB free. It is rejected. The conservative
 r9c candidate restored per-micro interval-1/floor-0 reclamation, but its final
 2-second update-0 trace reached only 854 MiB free. It is also rejected. R10
-retains the immutable CPU bf16 reference, allocator garbage collection,
-train/rollout optimizer parking, and per-micro reclamation while disabling
-flow-many to reduce the simultaneous activation set. Both forms of FSDP CPU
-offload remain false throughout.
+retained the immutable CPU bf16 reference, allocator garbage collection,
+train/rollout optimizer parking, per-micro reclamation, and serial velocity
+replay. Its final 2-second update-0 trace recorded per-rank minima of
+``56/422/206/244/68/268/238/1268`` MiB, with the 56 MiB global low at 08:13:14.
+There was no OOM or fatal error, but the run was deliberately stopped mid-update
+0 and produced no W&B row. The trace is
+``/mnt/gz/logs/lin561-bagel-vllmomni-unigrpo-1x8-b32-serial-e865f4ce-r10-gpu2s.log``.
+R10 is rejected on physical capacity.
 
-The immediate gate is repeated r10 execution with the 2 GiB physical-memory
-margin. Remaining broader gates are a longer reward series and the unmeasured
-32-device scale.
+R11 keeps that exact recipe and adds CPU steady-state parking for the local
+PickScore scorer. RewardService restores only the reward backend's registered
+model parameters and buffers immediately before scalar scoring, preserves the
+unchanged ``RewardResponse``, and parks the model again even when scoring raises.
+It never calls the FSDP backend or vLLM-Omni lifecycle. Synchronized lifecycle
+telemetry reports the exact logical reward-model tensor bytes and host transfer
+times on every worker. Differentiable reward mode is rejected under this flag
+because its model tensors must remain resident through backward. Both forms of
+FSDP CPU offload remain false throughout.
+
+The immediate gate is repeated r11 execution with a logged reward-model transfer
+materially above 2 GiB and an external physical-memory minimum of at least 2 GiB
+through both optimizer updates and the following Omni wake. Remaining broader
+gates are a longer reward series and the unmeasured 32-device scale.
 The eight-point reward slope and fit are materially stronger, but eight
 heterogeneous prompt batches still need additional rounds before the trend can
 be called sustained growth.

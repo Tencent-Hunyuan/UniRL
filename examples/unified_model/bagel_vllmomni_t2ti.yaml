@@ -131,6 +131,10 @@ rollout:
 # PickScore follows the original UniGRPO production placement and batch size.
 reward:
   _target_: unirl.reward.service.RewardService
+  # PickScore is needed only for the reward phase. Keep its CLIP parameters and
+  # buffers on CPU during native rollout and the much longer exact replay; each
+  # scalar score restores only this reward module and parks it again in finally.
+  park_backend_between_calls: true
   backend:
     _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
     base_device: cuda

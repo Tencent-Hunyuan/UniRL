@@ -30,6 +30,8 @@ backend:
     cpu_offload: true
 
 reward:
+  # CPU smoke has no GPU reward-model footprint to park.
+  park_backend_between_calls: false
   backend:
     base_device: cpu
     config:
