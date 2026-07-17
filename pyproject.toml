@@ -25,6 +25,10 @@ dependencies = [
   # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
   "transformers>=5.6,<5.7",
   "huggingface-hub>=0.34",
+  # Vendored Boogu-Image DiT (unirl/models/boogu_image/vendor/) imports einops
+  # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
+  # engine-agnostic.
+  "einops>=0.7",
   "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
   "safetensors>=0.4",
   "Pillow>=10",
