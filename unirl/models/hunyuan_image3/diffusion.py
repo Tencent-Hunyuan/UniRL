@@ -42,7 +42,7 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import NoiseGenerator, StepStrategy
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -52,6 +52,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import HunyuanImage3Bundle
 from .conditions import HunyuanImage3DiffusionConditions, HunyuanImage3FusedMultimodalCondition
 from .diffusion_state import HunyuanImage3DiffusionState
+from .seed import make_sde_step_generators
 
 logger = logging.getLogger(__name__)
 
@@ -488,6 +489,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
+        generator: NoiseGenerator = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return strategy.denoise(
             noise_pred=noise_pred,
@@ -496,6 +498,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             sigma_next=sigma_next,
             eta=eta,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             step_index=step_index,
         )
@@ -515,6 +518,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         eta: float = 1.0,
         step_index: int = 0,
         state: Optional[HunyuanImage3DiffusionState] = None,
+        generator: NoiseGenerator = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         noise_pred = self.predict_noise(
             model,
@@ -535,6 +539,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
+            generator=generator,
         )
 
     def step_with_logp(
@@ -552,6 +557,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         eta: float = 1.0,
         step_index: int = 0,
         state: Optional[HunyuanImage3DiffusionState] = None,
+        generator: NoiseGenerator = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self.step(
             model,
@@ -566,6 +572,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             eta=eta,
             step_index=step_index,
             state=state,
+            generator=generator,
         )
 
 
@@ -700,6 +707,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         *,
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
+        sde_sample_keys: Optional[List[str]] = None,
     ) -> LatentSegment:
         """Run full HunyuanImage3 DiT sampling. Returns a ``LatentSegment``.
 
@@ -830,6 +838,18 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = float(params.eta) if i in sde_set else 0.0
+            noise_generators = None
+            if step_eta > 0.0 and params.seed is not None and sde_sample_keys is not None:
+                if len(sde_sample_keys) != batch_size:
+                    raise ValueError(
+                        "HunyuanImage3DiffusionStage.diffuse: sde_sample_keys must align "
+                        f"with batch_size={batch_size}, got {len(sde_sample_keys)}."
+                    )
+                noise_generators = make_sde_step_generators(
+                    int(params.seed),
+                    sde_sample_keys,
+                    i,
+                )
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -844,6 +864,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                     sigma_max=sigma_max,
                     step_index=i,
                     state=state,
+                    generator=noise_generators,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 

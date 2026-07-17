@@ -19,7 +19,9 @@ those slots via the ``HunyuanStaticCache``.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
 
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
@@ -29,9 +31,41 @@ from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
+from ..seed import make_cpu_generators
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
+
+
+def _prepare_seeded_sampling(
+    req: RolloutReq,
+) -> Tuple[DiffusionSamplingParams, Optional[List[torch.Generator]], Optional[List[str]]]:
+    """Prepare request-local RNG streams without touching process-global RNG.
+
+    UniRL's shared trainside contract makes only the initial ``x_T``
+    driver-authoritative. HI3 additionally needs deterministic source-image VAE
+    posterior samples and per-step SDE noise to satisfy strict same-seed
+    end-to-end image reproducibility.
+    """
+    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
+    recipe_ids = [str(noise_id) for noise_id in (req.init_noise_group_ids or [])]
+    if params.seed is None or not recipe_ids:
+        return params, None, None
+
+    sample_ids = [str(sample_id) for sample_id in (req.sample_ids or [])]
+    if len(sample_ids) != len(recipe_ids):
+        raise ValueError(
+            "HunyuanImage3 it2i seeded sampling requires sample_ids aligned with "
+            f"init_noise_group_ids; got {len(sample_ids)} and {len(recipe_ids)}."
+        )
+
+    seeded_params = replace(params, noise_group_ids=recipe_ids)
+    condition_vae_generators = make_cpu_generators(
+        int(params.seed),
+        [f"cond-vae:{recipe_id}" for recipe_id in recipe_ids],
+    )
+    sde_sample_keys = [f"{recipe_id}:sample:{sample_id}" for recipe_id, sample_id in zip(recipe_ids, sample_ids)]
+    return seeded_params, condition_vae_generators, sde_sample_keys
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
@@ -57,21 +91,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
     )
 
-    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
+    params, condition_vae_generators, sde_sample_keys = _prepare_seeded_sampling(req)
     require(
         int(params.samples_per_prompt) <= 2,
         f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet — "
         "the per-sample cond_vit lists (spatial_shapes / attn_mask) trip the dp>1 track merge above 2 "
         "(see the pin in examples/unified_model/hi3_it2i.yaml; per-sample tensors are the tracked follow-up).",
     )
-    # Driver-authored x_T: the trainer ships per-sample noise ids on the request
-    # (gated by ``HunyuanImage3Pipeline.latent_shape``). Attach them to a
-    # request-local params copy so diffuse()'s NoiseRecipe path regenerates the
-    # deterministic x_T at the snapped latent grid it computes itself (HI3's
-    # shape is not knowable driver-side). seed=None opts out -> engine RNG.
-    if params.seed is not None and req.init_noise_group_ids:
-        params = replace(params, noise_group_ids=list(req.init_noise_group_ids))
-
     if req.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "
@@ -91,7 +117,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #    expands CFG. Keeping them B-batched (not doubled) means they survive the
     #    B-sample track transport that a 2B batch would not.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
-        vit["joint_image_info"], cfg_factor=1
+        vit["joint_image_info"],
+        cfg_factor=1,
+        generator=condition_vae_generators,
     )
     vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
 
@@ -141,7 +169,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
+    latent_seg = pipeline.diffusion.diffuse(
+        diff_conds,
+        schedule=schedule,
+        params=params,
+        sde_sample_keys=sde_sample_keys,
+    )
     edited = pipeline.vae_decode.decode(latent_seg)
 
     return RolloutResp(

@@ -69,10 +69,12 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
   to float64, so without `denoise`'s `.float()` cast the transition computes in float64
   while SGLang uses float32; the `1/(2σ²)` term amplifies the gap into the replayed
   log-prob and skews the ratio.
-- **Only `x_T` is reproducible, not the per-step SDE noise** — `denoise` hard-codes
-  `generator=None` into every step ("DONOT PASS GENERATOR HERE — it hurts diversity"),
-  so the intermediate stochastic transitions are unseeded. That is *why* replay
-  re-scores the stored `prev_sample` instead of re-drawing it.
+- **By default only `x_T` is reproducible, not the per-step SDE noise** —
+  `denoise(..., generator=None)` preserves the historical engine-local RNG
+  behaviour, and replay re-scores the stored `prev_sample` instead of re-drawing
+  it. A model or rollout engine may opt into stricter end-to-end reproducibility
+  by passing request-local, sample-unique generators; never reset one shared
+  generator to the same seed for every GRPO sample, which freezes exploration.
 - **`initial_latents` wins over the recipe** — a shipped latent (img2img / i2v
   first frame) is used verbatim; the recipe only fills the t2i `x_T`.
 - **Don't "simplify" the static-σ branch to call diffusers** — it exists to avoid
