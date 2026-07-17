@@ -34,7 +34,7 @@ _CUDA_ALLOCATOR_ENV_VARS = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
 
 def _cuda_allocator_env_vars() -> Dict[str, str]:
     """Copy driver allocator policy into explicitly configured Ray workers."""
-    return {name: os.environ[name] for name in _CUDA_ALLOCATOR_ENV_VARS if os.environ.get(name)}
+    return {name: os.environ[name] for name in _CUDA_ALLOCATOR_ENV_VARS if name in os.environ}
 
 
 class DevicePool:
@@ -67,6 +67,9 @@ class DevicePool:
         self.devices_per_node = devices_per_node
         self.workers_per_device = workers_per_device
         self.transport_kind = transport_kind or "colocate_store"
+        # Ray runtime_env is resolved per actor. Snapshot the driver's allocator
+        # policy once so lazy slots cannot drift from the slot0 workers.
+        self._cuda_allocator_env = _cuda_allocator_env_vars()
         if self.transport_kind in ("colocate_store", "colocate") and self.workers_per_device != 1:
             raise ValueError(
                 f"colocate_store supports one worker per device (got workers_per_device="
@@ -167,7 +170,7 @@ class DevicePool:
             "MASTER_ADDR": master_addr,
             "MASTER_PORT": str(master_port),
             "WORLD_SIZE": str(self.num_devices),
-            **_cuda_allocator_env_vars(),
+            **self._cuda_allocator_env,
         }
         for device_id in range(self.num_devices):
             self._device_to_workers[device_id] = []
@@ -278,7 +281,7 @@ class DevicePool:
             f"Must create slots in order: device={device_id} has {len(workers)} slot(s), requested slot={slot}"
         )
         assert slot < self.workers_per_device, f"slot={slot} >= workers_per_device={self.workers_per_device}"
-        return self._spawn_worker(device_id, slot)
+        return self._spawn_worker(device_id, slot, env_vars=dict(self._cuda_allocator_env))
 
     def _setup_nccl(self) -> None:
         """Initialize NCCL ProcessGroup on all slot0 workers.

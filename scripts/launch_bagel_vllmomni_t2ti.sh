@@ -16,6 +16,14 @@ resolve_bagel_profile_config() {
     esac
 }
 
+configure_bagel_cuda_allocator_default() {
+    # PyTorch gives the CUDA-specific alias precedence. Set the recipe default
+    # only when neither alias exists so a generic override is never shadowed.
+    if [[ -z "${PYTORCH_CUDA_ALLOC_CONF+x}" && -z "${PYTORCH_ALLOC_CONF+x}" ]]; then
+        export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
+    fi
+}
+
 main() {
     local profile="${BAGEL_VLLMOMNI_PROFILE:-production}"
     if [[ "${1:-}" == "--profile" ]]; then
@@ -49,7 +57,7 @@ main() {
     # Expandable segments avoid fixed-segment fragmentation. The 90% per-process
     # ceiling leaves nominal headroom for sleeping Omni helpers, NCCL, and other
     # CUDA users without moving FSDP state off the GPU.
-    export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90}"
+    configure_bagel_cuda_allocator_default
     export PYTHONPATH="$root_dir${PYTHONPATH:+:$PYTHONPATH}"
 
     local path

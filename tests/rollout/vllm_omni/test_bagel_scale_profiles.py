@@ -4,10 +4,11 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_dir
 
 import unirl.train_unified_model as train_entrypoint
-from unirl.distributed.group.device_pool import _cuda_allocator_env_vars
+from unirl.distributed.group.device_pool import DevicePool, _cuda_allocator_env_vars
 from unirl.trainer.base import build_sampling_dict
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
@@ -33,6 +34,26 @@ def _resolve_launcher_profile(profile: str) -> subprocess.CompletedProcess[str]:
         ],
         check=False,
         capture_output=True,
+        text=True,
+    )
+
+
+def _run_launcher_allocator_helper(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; configure_bagel_cuda_allocator_default; '
+                "printf 'cuda=%s\\ngeneric=%s\\n' "
+                '"${PYTORCH_CUDA_ALLOC_CONF-<unset>}" "${PYTORCH_ALLOC_CONF-<unset>}"'
+            ),
+            "allocator-test",
+            str(LAUNCHER),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
         text=True,
     )
 
@@ -137,6 +158,7 @@ def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:
     cfg = _compose("bagel_vllmomni_t2ti")
     captured = {}
     monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
 
     class _Trainer:
         def __init__(self, **kwargs) -> None:
@@ -155,11 +177,69 @@ def test_unified_model_entrypoint_wires_optimizer_parking(monkeypatch) -> None:
 
 def test_unified_model_entrypoint_preserves_allocator_override(monkeypatch) -> None:
     cfg = _compose("bagel_vllmomni_t2ti")
-    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+    override = "max_split_size_mb:64,per_process_memory_fraction:0.85"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", override)
 
     train_entrypoint._configure_cuda_allocator(cfg)
 
-    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:64"
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == override
+
+
+def test_unified_model_entrypoint_preserves_valid_generic_alias(monkeypatch) -> None:
+    cfg = _compose("bagel_vllmomni_t2ti")
+    override = "garbage_collection_threshold:0.8,per_process_memory_fraction:0.80"
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", override)
+
+    train_entrypoint._configure_cuda_allocator(cfg)
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
+    assert os.environ["PYTORCH_ALLOC_CONF"] == override
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "max_split_size_mb:64",
+        "per_process_memory_fraction:0.91",
+        "per_process_memory_fraction:0",
+        "per_process_memory_fraction:nan",
+        "per_process_memory_fraction:inf",
+        "per_process_memory_fraction:not-a-number",
+    ],
+)
+def test_production_flow_many_rejects_unsafe_cuda_allocator_override(monkeypatch, override: str) -> None:
+    cfg = _compose("bagel_vllmomni_t2ti")
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", override)
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "per_process_memory_fraction:0.80")
+
+    with pytest.raises(ValueError, match="finite per_process_memory_fraction") as exc_info:
+        train_entrypoint._configure_cuda_allocator(cfg)
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" in str(exc_info.value)
+    assert "takes precedence over PYTORCH_ALLOC_CONF" in str(exc_info.value)
+
+
+def test_non_production_allocator_paths_do_not_require_cap(monkeypatch) -> None:
+    smoke = _compose("bagel_vllmomni_t2ti_smoke")
+    flow_many_off = _compose("bagel_vllmomni_t2ti")
+    flow_many_off.pipeline.t2ti_flow_many_enabled = False
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+
+    train_entrypoint._configure_cuda_allocator(smoke)
+    train_entrypoint._configure_cuda_allocator(flow_many_off)
+
+
+def test_launcher_allocator_default_does_not_shadow_generic_alias() -> None:
+    env = dict(os.environ)
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    override = "per_process_memory_fraction:0.80"
+    env["PYTORCH_ALLOC_CONF"] = override
+
+    result = _run_launcher_allocator_helper(env)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"cuda=<unset>\ngeneric={override}\n"
 
 
 def test_device_pool_propagates_allocator_policy_to_ray_workers(monkeypatch) -> None:
@@ -169,4 +249,32 @@ def test_device_pool_propagates_allocator_policy_to_ray_workers(monkeypatch) -> 
     assert _cuda_allocator_env_vars() == {
         "PYTORCH_CUDA_ALLOC_CONF": "per_process_memory_fraction:0.90",
         "PYTORCH_ALLOC_CONF": "garbage_collection_threshold:0.95",
+    }
+
+
+def test_device_pool_lazy_slot_receives_allocator_construction_snapshot(monkeypatch) -> None:
+    original = "per_process_memory_fraction:0.90"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", original)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    pool = DevicePool(
+        num_devices=1,
+        devices_per_node=1,
+        workers_per_device=2,
+        transport_kind="gpu_store",
+    )
+    pool._device_to_workers[0] = [object()]
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "per_process_memory_fraction:0.50")
+    captured = {}
+
+    def _spawn_worker(device_id, slot, env_vars=None):
+        captured.update(device_id=device_id, slot=slot, env_vars=env_vars)
+        return "lazy-worker"
+
+    monkeypatch.setattr(pool, "_spawn_worker", _spawn_worker)
+
+    assert pool._get_or_create_worker(0, 1) == "lazy-worker"
+    assert captured == {
+        "device_id": 0,
+        "slot": 1,
+        "env_vars": {"PYTORCH_CUDA_ALLOC_CONF": original},
     }

@@ -13,6 +13,7 @@ Pairs with ``examples/unified_model/hi3_vllmomni.yaml``::
 
 from __future__ import annotations
 
+import math
 import os
 
 import hydra
@@ -20,12 +21,76 @@ from omegaconf import DictConfig
 
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
+_CUDA_ALLOCATOR_ENV_PRECEDENCE = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF")
+_MAX_BAGEL_FLOW_MANY_MEMORY_FRACTION = 0.90
+
+
+def _nested_config_get(config, *keys):
+    value = config
+    for key in keys:
+        if value is None or not hasattr(value, "get"):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _requires_bagel_flow_many_allocator_cap(cfg: DictConfig) -> bool:
+    """Return whether this run uses the GPU-resident BAGEL flow-many path."""
+    return (
+        _nested_config_get(cfg, "rollout", "config", "modality") == "bagel_t2ti"
+        and bool(_nested_config_get(cfg, "pipeline", "t2ti_flow_many_enabled"))
+        and not bool(cfg.get("enable_fsdp_offload", True))
+    )
+
+
+def _effective_cuda_allocator_conf() -> tuple[str | None, str | None]:
+    """Resolve allocator aliases with PyTorch's precedence, including empty values."""
+    for name in _CUDA_ALLOCATOR_ENV_PRECEDENCE:
+        if name in os.environ:
+            return name, os.environ[name]
+    return None, None
+
+
+def _allocator_setting(config: str, name: str) -> str | None:
+    """Return the last value for a comma-delimited PyTorch allocator setting."""
+    value = None
+    for item in config.split(","):
+        key, separator, candidate = item.partition(":")
+        if separator and key.strip() == name:
+            value = candidate.strip()
+    return value
+
+
+def _validate_bagel_flow_many_allocator_cap(source: str | None, config: str | None) -> None:
+    setting = _allocator_setting(config or "", "per_process_memory_fraction")
+    try:
+        fraction = float(setting) if setting is not None else None
+    except ValueError:
+        fraction = None
+
+    if fraction is not None and math.isfinite(fraction) and 0.0 < fraction <= _MAX_BAGEL_FLOW_MANY_MEMORY_FRACTION:
+        return
+
+    effective = f"{source}={config!r}" if source is not None else "no allocator configuration"
+    raise ValueError(
+        "GPU-resident BAGEL T2TI flow-many requires the effective allocator configuration "
+        f"to include a finite per_process_memory_fraction in (0, "
+        f"{_MAX_BAGEL_FLOW_MANY_MEMORY_FRACTION:.2f}]; got {effective}. "
+        "PYTORCH_CUDA_ALLOC_CONF takes precedence over PYTORCH_ALLOC_CONF. "
+        "Unset the override to use cuda_allocator_conf, or add a safe cap to the effective alias."
+    )
+
 
 def _configure_cuda_allocator(cfg: DictConfig) -> None:
-    """Apply a recipe allocator default before the trainer creates Ray workers."""
+    """Apply and validate allocator policy before the trainer creates Ray workers."""
     configured = cfg.get("cuda_allocator_conf")
-    if configured and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
+    source, effective = _effective_cuda_allocator_conf()
+    if configured and source is None:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = str(configured)
+        source, effective = "PYTORCH_CUDA_ALLOC_CONF", str(configured)
+
+    if _requires_bagel_flow_many_allocator_cap(cfg):
+        _validate_bagel_flow_many_allocator_cap(source, effective)
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="unified_model/hi3_vllmomni")
