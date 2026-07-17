@@ -150,9 +150,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
         if use_cfg:
             neg = conditions.negative_text
             if neg.embeds is None or neg.attn_mask is None:
-                raise ValueError(
-                    "BooguImageDiffusionStep.predict_noise: negative_text embeds/attn_mask is None"
-                )
+                raise ValueError("BooguImageDiffusionStep.predict_noise: negative_text embeds/attn_mask is None")
             neg_out = model.transformer(
                 sample,
                 timestep,
@@ -341,9 +339,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         return self._freqs_cis
 
     @staticmethod
-    def _effective_guidance_scale(
-        step_index: int, num_steps: int, params: DiffusionSamplingParams
-    ) -> float:
+    def _effective_guidance_scale(step_index: int, num_steps: int, params: DiffusionSamplingParams) -> float:
         """Collapse the reference's ``cfg_range`` step-fraction gate into a
         per-step scale (pipeline_boogu.py:3367-3381, inclusive bounds; the
         out-of-range value is 1.0 == CFG off in Boogu's convention).
@@ -384,9 +380,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         batch_size = int(prompt_embeds.shape[0])
         T = int(params.num_inference_steps)
         if int(schedule.shape[0]) != T + 1:
-            raise ValueError(
-                f"BooguImageDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}"
-            )
+            raise ValueError(f"BooguImageDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
@@ -517,8 +511,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
-                f"BooguImageDiffusionStage.replay: step_indices {bad} not in "
-                f"segment.sde_indices={sorted(sde_set)}"
+                f"BooguImageDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
             )
 
         device = torch.device(self.model.device)

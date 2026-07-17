@@ -57,8 +57,7 @@ class BooguImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError("BooguImageVAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim < 5:
             raise ValueError(
-                f"BooguImageVAEDecodeStage.decode: expected latents shape [N, K, C, H, W], "
-                f"got {tuple(s.latents.shape)}"
+                f"BooguImageVAEDecodeStage.decode: expected latents shape [N, K, C, H, W], got {tuple(s.latents.shape)}"
             )
         clean = s.latents[:, -1]  # [B, C, H, W]
 

@@ -96,8 +96,7 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         bundle = self.bundle
         if bundle.text_encoder is None or bundle.processor is None:
             raise ValueError(
-                "BooguImageTextEmbedStage._encode: bundle has no text encoder/processor "
-                "(load_text_encoder=False?)"
+                "BooguImageTextEmbedStage._encode: bundle has no text encoder/processor (load_text_encoder=False?)"
             )
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
