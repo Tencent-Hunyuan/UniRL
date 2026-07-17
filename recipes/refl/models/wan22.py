@@ -12,6 +12,7 @@ from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan22.bundle import WAN22Bundle
 from unirl.models.wan22.diffusion import WAN22DiffusionStage, WAN22DiffusionStep
 from unirl.models.wan22.pipeline import WAN22Pipeline
+from unirl.train.lora import adapters_disabled
 from unirl.types.sampling import DiffusionSamplingParams
 
 # Matches the mainline module-level constant in unirl/models/wan22/diffusion.py.
@@ -230,7 +231,6 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                 guidance_scale_2,
                 boundary_ratio=boundary_ratio,
             )
-            active_sub = getattr(dual, "high_noise" if use_high_noise else "low_noise", None)
             use_cfg = active_guidance > 1.0
             grad_enabled = i >= mid_timestep
 
@@ -276,26 +276,19 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
             # conditional prediction of the currently active branch. When CFG
             # is enabled, this intentionally excludes the stop-grad uncond mix.
             if kl_weight != 0.0 and grad_enabled:
-                if active_sub is not None and hasattr(active_sub, "disable_adapter_layers") and hasattr(
-                    active_sub, "enable_adapter_layers"
-                ):
-                    with torch.no_grad(), autocast_ctx:
-                        active_sub.disable_adapter_layers()
-                        try:
-                            ref_pred = step.predict_noise(
-                                self.model,
-                                latents,
-                                sigma,
-                                conditions,
-                                branch="cond",
-                                use_high_noise=use_high_noise,
-                            )
-                        finally:
-                            active_sub.enable_adapter_layers()
-                    sigma_f32 = sigma.to(dtype=torch.float32)
-                    kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32 ** 2)).mean()
-                    kl_total = kl_total + kl_step
-                    kl_steps += 1
+                with torch.no_grad(), autocast_ctx, adapters_disabled(dual):
+                    ref_pred = step.predict_noise(
+                        self.model,
+                        latents,
+                        sigma,
+                        conditions,
+                        branch="cond",
+                        use_high_noise=use_high_noise,
+                    )
+                sigma_f32 = sigma.to(dtype=torch.float32)
+                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32 ** 2)).mean()
+                kl_total = kl_total + kl_step
+                kl_steps += 1
 
             # Keep the transition outside autocast and under the same BPTT
             # window used by WAN21: grad-enabled for train steps, no-grad

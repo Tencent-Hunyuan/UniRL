@@ -29,6 +29,7 @@ from unirl.models.wan21.bundle import WAN21Bundle
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.diffusion import WAN21DiffusionStage, WAN21DiffusionStep
 from unirl.models.wan21.pipeline import WAN21Pipeline
+from unirl.train.lora import adapters_disabled
 from unirl.types.sampling import DiffusionSamplingParams
 
 # Matches the mainline module-level constant in unirl/models/wan21/diffusion.py.
@@ -168,11 +169,10 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
           participate in backward). DRaFT-1 sets ``mid_timestep = T - 1``.
         - ``final_timestep`` (int, default ``num_inference_steps - 1``):
           early stop. The loop breaks once ``i >= final_timestep``.
-        - ``kl_weight`` (float, default 0.0): when non-zero AND the
-          transformer exposes ``disable_adapter_layers`` (PEFT LoRA),
-          per-step KL ``mean((pred - ref_pred)**2 / (2 * sigma**2))`` is
-          accumulated and returned in ``kl_loss``. The trainer multiplies
-          it by its own ``kl_weight`` at the loss site.
+        - ``kl_weight`` (float, default 0.0): when non-zero, per-step KL
+          ``mean((pred - ref_pred)**2 / (2 * sigma**2))`` is accumulated
+          and returned in ``kl_loss``. The trainer multiplies it by its own
+          ``kl_weight`` at the loss site.
 
         ``initial_latents`` follows the same contract as :meth:`diffuse`:
         when provided, used verbatim and the internal RNG path is
@@ -295,24 +295,15 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
             # Per-step KL against the LoRA-disabled reference (REFL-style).
             # When CFG is enabled, this intentionally computes KL on the
             # conditional prediction before the stop-grad uncond CFG mix.
-            if (
-                kl_weight != 0.0
-                and grad_enabled
-                and hasattr(transformer, "disable_adapter_layers")
-                and hasattr(transformer, "enable_adapter_layers")
-            ):
-                with torch.no_grad(), autocast_ctx:
-                    transformer.disable_adapter_layers()
-                    try:
-                        ref_pred = step.predict_noise(
-                            self.model,
-                            latents,
-                            sigma,
-                            conditions,
-                            branch="cond",
-                        )
-                    finally:
-                        transformer.enable_adapter_layers()
+            if kl_weight != 0.0 and grad_enabled:
+                with torch.no_grad(), autocast_ctx, adapters_disabled(transformer):
+                    ref_pred = step.predict_noise(
+                        self.model,
+                        latents,
+                        sigma,
+                        conditions,
+                        branch="cond",
+                    )
                 sigma_f32 = sigma.to(dtype=torch.float32)
                 kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32 ** 2)).mean()
                 kl_total = kl_total + kl_step
