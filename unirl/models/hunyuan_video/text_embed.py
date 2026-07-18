@@ -62,11 +62,13 @@ class HunyuanVideoTextEmbedStage:
         llama_max_length: int = 256,
         clip_max_length: int = 77,
         crop_start: int = 95,
+        hidden_state_skip_layer: int = 2,
     ) -> None:
         self.bundle = bundle
         self.llama_max_length = int(llama_max_length)
         self.clip_max_length = int(clip_max_length)
         self.crop_start = int(crop_start)
+        self.hidden_state_skip_layer = int(hidden_state_skip_layer)
 
     # ------------------------------------------------------------------
     # LLaMA stream
@@ -112,8 +114,13 @@ class HunyuanVideoTextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        # Use the last hidden state (unlike HV15 which uses skip_layers).
-        prompt_embeds = outputs.last_hidden_state
+        # Canonical HunyuanVideo text conditioning: take the
+        # ``hidden_state_skip_layer``-th-from-last LLaMA hidden state (default 2
+        # -> ``hidden_states[-3]``), matching the official HunyuanVideo release
+        # and diffusers' ``HunyuanVideoPipeline`` (``num_hidden_layers_to_skip=2``)
+        # and the sglang rollout. ``skip=0`` reproduces the legacy last-hidden-state
+        # baseline.
+        prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
 
         # Strip the prompt template prefix tokens.
         if crop_start > 0:

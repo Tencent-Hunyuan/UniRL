@@ -85,6 +85,13 @@ class HunyuanVideoPipelineConfig:
     crop_start: int = 95
     # CLIP: standard max_length for CLIPTokenizer.
     clip_max_length: int = 77
+    # LLaMA hidden layer used as the text conditioning: the embedding is taken
+    # from ``hidden_states[-(hidden_state_skip_layer + 1)]``. HunyuanVideo's
+    # canonical recipe is ``2`` -> the 3rd-from-last layer, matching the official
+    # HunyuanVideo release and diffusers' ``HunyuanVideoPipeline``
+    # (``num_hidden_layers_to_skip=2``) and the sglang rollout. (Set ``0`` for the
+    # last hidden state, e.g. to reproduce the legacy skip=0 baseline.)
+    hidden_state_skip_layer: int = 2
 
     # LoRA hints for rollout-side engines (e.g. ``sglang``). Mirrors
     # SD3 / HV15 config; the trainer-side LoRA injection lives in
