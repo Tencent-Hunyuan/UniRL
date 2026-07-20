@@ -18,7 +18,7 @@ Neither reads ``advantages`` / ``old_logp`` / SDE trajectories — both declare
 ``requires_advantages = False`` and leave :meth:`prepare_segment` as the no-op
 the base docstring promises for anchor-free algorithms. Both are driven by the
 regular :class:`~unirl.train.stack.TrainStack`; tracks come from a
-``SupervisedTrackBuilder`` (``unirl/train/sft/source.py``) instead of a
+``SupervisedTrackBuilder`` (``unirl/train/sft/track_builder.py``) instead of a
 rollout engine.
 
 Loss-normalization contract (the cross-framework lesson): token-level CE must

@@ -88,7 +88,7 @@ stack:
   max_grad_norm: 1.0
 
 track_builder:
-  _target_: unirl.train.sft.source.ARSupervisedTrackBuilder
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
   max_response_length: 2048
 
 data_source:

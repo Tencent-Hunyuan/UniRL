@@ -18,8 +18,8 @@ against the manifest's directory):
   for ``prompt``)
 
 Rows are OPAQUE records driver-side — media loading and tokenization happen on
-the training workers (``unirl/train/sft/source.py`` track builders), so nothing heavy crosses
-the driver/Ray boundary.
+the training workers (``unirl/train/sft/track_builder.py``), so nothing heavy
+crosses the driver/Ray boundary.
 
 Epoch semantics: :class:`SupervisedDataSource` walks a per-epoch reshuffled
 order and exposes ``state_dict()`` / ``load_state_dict()`` with the exact

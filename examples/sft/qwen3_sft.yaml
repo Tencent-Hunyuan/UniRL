@@ -3,7 +3,7 @@
 #
 # The SFT domain reuses the RL consumer side verbatim (bundle / pipeline /
 # backend / stack blocks are the qwen3 GRPO recipe's); only the producer
-# changes: `source` (dataset records → tracks, worker-side) replaces the
+# changes: `track_builder` (dataset records → tracks, worker-side) replaces the
 # rollout engine, `algorithm` is the anchor-free CE loss, and there is no
 # reward / sync / sampling block.
 #
@@ -93,7 +93,7 @@ stack:
   max_grad_norm: 1.0
 
 track_builder:
-  _target_: unirl.train.sft.source.ARSupervisedTrackBuilder
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
   max_response_length: 2048
 
 data_source:

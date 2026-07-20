@@ -115,7 +115,7 @@ stack:
   max_grad_norm: 1.0
 
 track_builder:
-  _target_: unirl.train.sft.source.DiffusionSupervisedTrackBuilder
+  _target_: unirl.train.sft.track_builder.DiffusionSupervisedTrackBuilder
   height: 512
   width: 512
   guidance_scale: 1.0
