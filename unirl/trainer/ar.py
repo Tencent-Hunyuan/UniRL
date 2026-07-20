@@ -124,6 +124,8 @@ class ARTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
             else:
+                # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
+                # unified models; replace it with first-class TP/DP/PP support.
                 # Free training memory before starting the anchored rollout actor.
                 if self._enable_fsdp_offload:
                     self.backend.offload()
@@ -139,7 +141,9 @@ class ARTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     # The anchored engine is not a sibling of every train worker.
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+                    self.weight_sync.set_rollout_targets(
+                        [(self.rollout.role_name, self.rollout.workers)]
+                    )
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -183,6 +187,8 @@ class ARTrainer(BaseTrainer):
             resp = self.rollout.generate(req)
             self.rollout.sleep()
         else:
+            # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
+            # unified models; replace it with first-class TP/DP/PP support.
             # Extract while training state is on GPU, then free it for rollout.
             if sync_weights and self.weight_sync is not None:
                 if self._enable_fsdp_offload:
@@ -273,6 +279,8 @@ class ARTrainer(BaseTrainer):
 
         # Prepare weights and memory for the selected rollout topology.
         if anchored:
+            # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
+            # unified models; replace it with first-class TP/DP/PP support.
             if self.weight_sync is not None:
                 if self._enable_fsdp_offload:
                     self.backend.onload()
