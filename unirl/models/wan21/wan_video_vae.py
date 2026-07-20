@@ -847,16 +847,16 @@ class WanVideoVAE(nn.Module):
         return tasks
 
     def tiled_decode(self, hidden_states, device, tile_size, tile_stride):
-        _, _, T, H, W = hidden_states.shape
+        B, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
         tasks = self._make_tile_tasks(H, W, size_h, size_w, stride_h, stride_w)
 
         out_T = T * 4 - 3
-        weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor,
+        weight = torch.zeros((B, 1, out_T, H * self.upsampling_factor,
                               W * self.upsampling_factor),
                              dtype=hidden_states.dtype, device=device)
-        values = torch.zeros((1, 3, out_T, H * self.upsampling_factor,
+        values = torch.zeros((B, 3, out_T, H * self.upsampling_factor,
                               W * self.upsampling_factor),
                              dtype=hidden_states.dtype, device=device)
 
@@ -872,8 +872,10 @@ class WanVideoVAE(nn.Module):
 
             th = h * self.upsampling_factor
             tw = w * self.upsampling_factor
-            values[:, :, :, th:th + batch.shape[3], tw:tw + batch.shape[4]] += batch * mask
-            weight[:, :, :, th:th + batch.shape[3], tw:tw + batch.shape[4]] += mask
+            value_slice = values[:, :, :, th:th + batch.shape[3], tw:tw + batch.shape[4]]
+            weight_slice = weight[:, :, :, th:th + batch.shape[3], tw:tw + batch.shape[4]]
+            value_slice += batch * mask
+            weight_slice += mask.expand_as(weight_slice)
 
         values = values / weight
         return values.clamp_(-1, 1)
@@ -885,7 +887,7 @@ class WanVideoVAE(nn.Module):
         Args:
             sp_group: torch.distributed ProcessGroup for sequence parallelism.
         """
-        _, _, T, H, W = hidden_states.shape
+        B, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
         tile_img_h = size_h * self.upsampling_factor
@@ -893,10 +895,10 @@ class WanVideoVAE(nn.Module):
         tasks = self._make_tile_tasks(H, W, size_h, size_w, stride_h, stride_w)
 
         out_T = T * 4 - 3
-        weight = torch.zeros((1, 1, out_T, H * self.upsampling_factor,
+        weight = torch.zeros((B, 1, out_T, H * self.upsampling_factor,
                               W * self.upsampling_factor),
                              dtype=hidden_states.dtype, device=device)
-        values = torch.zeros((1, 3, out_T, H * self.upsampling_factor,
+        values = torch.zeros((B, 3, out_T, H * self.upsampling_factor,
                               W * self.upsampling_factor),
                              dtype=hidden_states.dtype, device=device)
 
@@ -955,10 +957,12 @@ class WanVideoVAE(nn.Module):
 
             th = h * self.upsampling_factor
             tw = w * self.upsampling_factor
-            values[:, :, :, th:th + decoded_tile.shape[3],
-                   tw:tw + decoded_tile.shape[4]] += decoded_tile * mask
-            weight[:, :, :, th:th + decoded_tile.shape[3],
-                   tw:tw + decoded_tile.shape[4]] += mask
+            value_slice = values[:, :, :, th:th + decoded_tile.shape[3],
+                                 tw:tw + decoded_tile.shape[4]]
+            weight_slice = weight[:, :, :, th:th + decoded_tile.shape[3],
+                                  tw:tw + decoded_tile.shape[4]]
+            value_slice += decoded_tile * mask
+            weight_slice += mask.expand_as(weight_slice)
 
         values = values / weight
         return values.clamp_(-1, 1)
