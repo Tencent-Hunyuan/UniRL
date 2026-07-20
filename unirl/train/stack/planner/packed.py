@@ -243,8 +243,13 @@ class TokenBudgetPlanner:
         return resp_track.select(perm), plan
 
     def validate(self, algorithm: StageAlgorithm) -> None:
-        """Token-budget packing is gradient-exact only under a seq-mean loss (micros are
-        weighted by sample share); fail fast otherwise."""
+        """Require a grouping-invariant loss-weighting contract.
+
+        Global-token weighting scales each micro by its valid-token share, while
+        sequence-mean losses are scaled by sample share.
+        """
+        if getattr(algorithm, "loss_weighting", "sample") == "token":
+            return
         mode = getattr(algorithm, "loss_agg_mode", None)
         if mode is None or not str(mode).startswith("seq-mean"):
             raise ValueError(

@@ -227,10 +227,11 @@ class TrainStack(Remote):
         :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
         geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
         """
-        if resp_track.advantages is None:
+        if resp_track.advantages is None and getattr(self.algorithm, "requires_advantages", True):
             raise ValueError(
                 f"{type(self).__name__}._run_update: resp_track.advantages is None; "
-                "upstream advantage pipeline must populate it before training."
+                "upstream advantage pipeline must populate it before training. "
+                "(Supervised algorithms opt out by declaring requires_advantages=False.)"
             )
         if not micros:
             raise ValueError(f"{type(self).__name__}._run_update: empty micros.")
@@ -238,9 +239,10 @@ class TrainStack(Remote):
         bs = int(resp_track.batch_size)
         self.fsdp_backend.zero_grad()
 
-        update_total = sum(end - start for start, end in micros)
+        loss_scales, global_weight = self._resolve_loss_scales(resp_track, micros=micros)
         micro_results: List[AlgorithmStepResult] = []
-        total_loss = 0.0
+        total_loss = 0.0  # sample-weighted local mean; made FSDP-global below
+        weighted_loss_sum = 0.0  # Σ (micro token count × micro token-mean) — token weighting only
         has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
@@ -251,21 +253,21 @@ class TrainStack(Remote):
             # unless defer_grad_sync + ZeRO-2). Must precede the backward.
             self.fsdp_backend.set_grad_sync(i == last_micro)
             micro_track = resp_track if single_micro else resp_track.slice(start, end)
-            # Sample-share weighting: the algorithm's micro loss is a MEAN over the
-            # micro's sequences (seq-mean agg modes), so the update gradient equals
-            # the whole-update mean only when each micro is weighted by its share of
-            # samples. With equal count-based micros this reduces to 1/len(micros);
-            # with token-budget packing micros vary in size.
-            loss_scale = (end - start) / float(update_total)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
                 segment=micro_track.segment,
                 advantages=micro_track.advantages,
                 training_progress=training_progress,
-                loss_scale=loss_scale,
+                loss_scale=loss_scales[i],
             )
             micro_results.append(result)
-            total_loss += result.loss
+            if global_weight is None:
+                # Match the sample-share factors used for backward. Summing raw
+                # micro means would make train/loss scale with the micro count
+                # (FlowMatchSFT with bs=1 micros was the visible case).
+                total_loss += result.loss * loss_scales[i]
+            else:
+                weighted_loss_sum += result.loss * self._micro_loss_weight(resp_track, start, end)
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
@@ -304,6 +306,22 @@ class TrainStack(Remote):
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
+        if global_weight is None:
+            # DP_SCATTER gives every data rank the same sample count, so the
+            # optimized sample objective is the mean of these rank-local means.
+            # Reduce over the backend's actual FSDP mesh, matching its gradient
+            # averaging instead of returning rank 0's local proxy.
+            (global_loss_sum,) = self._all_reduce_sums([total_loss])
+            total_loss = global_loss_sum / self._loss_weight_world()
+        else:
+            # Exact global token-mean of this update's loss: every rank enters
+            # this collective (micro counts are rank-symmetric), so the logged
+            # number equals the optimized objective — not a rank-local proxy
+            # (the class of display bugs verl fixed in its #102).
+            (global_loss_sum,) = self._all_reduce_sums([weighted_loss_sum])
+            total_loss = global_loss_sum / global_weight
+            aggregated_metrics = {**dict(aggregated_metrics), "global_loss_weight": global_weight}
+
         return TrainStepResult(
             loss=total_loss,
             grad_norm=grad_norm,
@@ -316,6 +334,138 @@ class TrainStack(Remote):
     def on_rollout_end(self) -> None:
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
         self.fsdp_backend.on_rollout_end()
+
+    # ---- loss weighting (micro × DP normalization) --------------------------
+
+    def _resolve_loss_scales(
+        self, resp_track: RolloutTrack, *, micros: UpdatePlan
+    ) -> Tuple[List[float], Optional[float]]:
+        """Per-micro ``loss_scale`` factors for one optimizer step.
+
+        ``algorithm.loss_weighting`` selects the convention (see
+        :class:`~unirl.algorithms.StageAlgorithm`):
+
+        - ``"sample"``: micro's share of the update's samples. Sums to 1 per
+          rank; FSDP's DP-mean gradient reduction then yields the rank-mean of
+          shard means (exact global sample-mean, since DP_SCATTER shards are
+          equal-sized). Returns ``(scales, None)``.
+        - ``"token"``: ``micro_tokens * dp_world / global_tokens`` where
+          ``global_tokens`` is the valid-token count of the WHOLE optimizer
+          step, all-reduced across the training group. The ``* dp_world``
+          cancels FSDP's gradient averaging, so the update gradient equals the
+          full-batch token-mean regardless of micro packing or DP layout.
+          Returns ``(scales, global_tokens)``.
+        """
+        weighting = str(getattr(self.algorithm, "loss_weighting", "sample"))
+        if weighting == "sample":
+            update_total = sum(end - start for start, end in micros)
+            # Sample-share weighting: the algorithm's micro loss is a MEAN over the
+            # micro's sequences (seq-mean agg modes), so the update gradient equals
+            # the whole-update mean only when each micro is weighted by its share of
+            # samples. With equal count-based micros this reduces to 1/len(micros);
+            # with token-budget packing micros vary in size.
+            return [(end - start) / update_total for start, end in micros], None
+        if weighting != "token":
+            raise ValueError(
+                f"{type(self).__name__}: unknown algorithm.loss_weighting={weighting!r}; expected 'sample' or 'token'."
+            )
+        rank_info = getattr(self, "rank_info", None)
+        if rank_info is not None and rank_info.sp_size > 1:
+            # Sequence parallelism shards tokens WITHIN a rank's samples; the
+            # denominator group would have to include the SP dimension too
+            # (the exact undercount verl hit at CP>1 in its #5983). Fail loudly
+            # until that path is built and verified.
+            raise ValueError(
+                f"{type(self).__name__}: loss_weighting='token' is not validated under "
+                f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
+            )
+        weights = [self._micro_loss_weight(resp_track, start, end) for start, end in micros]
+        local_total = sum(weights)
+        (global_total,) = self._all_reduce_sums([local_total])
+        if global_total <= 0.0:
+            raise ValueError(
+                f"{type(self).__name__}: zero valid tokens in this optimizer step "
+                "(fully-masked batch?) — the data source must not emit steps with no "
+                "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
+            )
+        dp_world = self._loss_weight_world()
+        return [w * dp_world / global_total for w in weights], global_total
+
+    def _micro_loss_weight(self, resp_track: RolloutTrack, start: int, end: int) -> float:
+        """Valid-token count of one contiguous micro range (loss_mask-aware)."""
+        segment = resp_track.segment
+        if segment is None:
+            raise ValueError(f"{type(self).__name__}: loss_weighting='token' requires a segment.")
+        cu = segment.cu_seqlens
+        loss_mask = getattr(segment, "loss_mask", None)
+        if loss_mask is not None and cu is not None:
+            return float(loss_mask[int(cu[start]) : int(cu[end])].sum().item())
+        if segment.lengths is not None:
+            return float(segment.lengths[start:end].sum().item())
+        raise ValueError(
+            f"{type(self).__name__}: loss_weighting='token' requires a packed segment "
+            "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
+        )
+
+    def _loss_weight_world(self) -> int:
+        """World size whose gradient averaging the token weighting must cancel."""
+        return self.fsdp_backend.gradient_average_world_size()
+
+    def _all_reduce_sums(self, values: List[float]) -> List[float]:
+        """SUM scalars over the backend's FSDP mesh (no-op single-rank).
+
+        Every rank must call this the same number of times per step — callers keep
+        the collective count rank-symmetric (micro plans are; DP_SCATTER shards are
+        equal-sized).
+        """
+        return self.fsdp_backend.all_reduce_loss_sums(values)
+
+    # ---- forward-only evaluation --------------------------------------------
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def eval_track(self, resp_track: RolloutTrack) -> Dict[str, float]:
+        """Weighted forward-only loss over this shard; returns GLOBAL metrics.
+
+        Drives ``algorithm.evaluate_loss(conditions=..., segment=...) ->
+        (loss_sum, weight)`` micro-by-micro under ``torch.no_grad()`` with the
+        trainable module in eval mode (dropout off — the same loss the train
+        path optimizes, never a second implementation). Per-rank sums are
+        SUM-all-reduced, so every rank returns the identical global weighted
+        mean and the driver's collected dict is exact regardless of which
+        rank's value survives the merge.
+        """
+        eval_fn = getattr(self.algorithm, "evaluate_loss", None)
+        if not callable(eval_fn):
+            raise TypeError(
+                f"{type(self).__name__}.eval_track: {type(self.algorithm).__name__} does not "
+                "expose evaluate_loss(conditions=..., segment=...) -> (loss_sum, weight)."
+            )
+        self._align_track_inputs(resp_track)
+        model = self.fsdp_backend.trainable_module()
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                bs = resp_track.batch_size
+                mbs = self.micro_batch_size
+                loss_sum = 0.0
+                weight_sum = 0.0
+                for start in range(0, bs, mbs):
+                    end = min(start + mbs, bs)
+                    micro = resp_track.slice(start, end)
+                    s, w = eval_fn(
+                        conditions=micro.conditions,
+                        segment=micro.segment,
+                        sample_ids=list(micro.sample_ids) if micro.sample_ids else None,
+                    )
+                    loss_sum += float(s)
+                    weight_sum += float(w)
+        finally:
+            model.train(was_training)
+        global_loss, global_weight = self._all_reduce_sums([loss_sum, weight_sum])
+        if global_weight <= 0.0:
+            raise ValueError(f"{type(self).__name__}.eval_track: zero eval weight (empty/fully-padded batch?).")
+        return {"loss": global_loss / global_weight, "weight": global_weight}
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
