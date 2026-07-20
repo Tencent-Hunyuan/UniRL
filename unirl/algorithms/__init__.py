@@ -15,8 +15,11 @@ from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .flowgrpo import FlowGRPO, FlowGRPOConfig
 from .grpo import GRPO, GRPOConfig
 from .gspo import GSPO, GSPOConfig
+from .sft import SFT, FlowMatchSFT
 
 __all__ = [
+    "SFT",
+    "FlowMatchSFT",
     "GRPO",
     "GRPOConfig",
     "GSPO",
