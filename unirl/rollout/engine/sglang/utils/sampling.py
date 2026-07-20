@@ -41,13 +41,10 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
       else ``ar.samples_per_prompt``, else ``stage_ar['n']``, else 1.
     - ``temperature`` / ``top_p`` / ``max_new_tokens``: typed AR params, else
       the config defaults.
-    - ``top_k``: MUST be threaded through — without it SGLang falls back to
-      the model generation_config default (top_k=20 for Qwen3), which peaks
-      the sampling vs the trainer's top_k=0 (unrestricted) → low intra-group
-      diversity → GRPO advantages collapse. The trainer's ``top_k=0`` (HF
-      convention) maps to SGLang's ``-1`` (disabled); positive passes through.
-      With no typed AR params the predecessor sent ``-1`` (disabled), never
-      the config field — reproduced here.
+    - ``top_k``: typed AR params, else the config default. The value must still
+      be sent so SGLang does not fall back to a model-specific generation-config
+      limit. The trainer/config ``top_k=0`` (HF convention) maps to SGLang's
+      ``-1`` (disabled); positive values pass through.
     - ``return_logprob`` (default True), ``system_instruction``, and the
       ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
       come from ``stage_config['ar']``.
@@ -60,7 +57,7 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
     else:
         n = int(ar.samples_per_prompt if ar is not None else stage_ar.get("n", 1))
 
-    raw_top_k = int(ar.top_k) if ar is not None else 0
+    raw_top_k = ar.top_k if ar is not None else config.top_k
     block: Dict[str, Any] = {
         "temperature": float(ar.temperature if ar is not None else config.temperature),
         "max_new_tokens": int(ar.max_new_tokens if ar is not None else config.max_new_tokens),
