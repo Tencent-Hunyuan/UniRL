@@ -128,6 +128,7 @@ class BaseFSDP2Backend(Remote):
                 rank=lora_cfg.rank,
                 alpha=lora_cfg.alpha,
                 target_modules=tuple(lora_cfg.target_modules),
+                exclude_modules=getattr(lora_cfg, "exclude_modules", None),
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,

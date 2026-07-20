@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from functools import partial
-from typing import Iterator, Sequence
+from typing import Iterator, Optional, Sequence
 
 from torch import nn
 
@@ -26,6 +26,7 @@ def inject_lora(
     rank: int,
     alpha: int,
     target_modules: Sequence[str],
+    exclude_modules: Optional[Sequence[str]] = None,
     dropout: float = 0.0,
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
@@ -39,6 +40,7 @@ def inject_lora(
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
         target_modules=list(target_modules),
+        exclude_modules=list(exclude_modules) if exclude_modules else None,
         bias=str(bias),
         task_type=str(task_type),
     )
@@ -47,11 +49,12 @@ def inject_lora(
     if _current_rank() == 0:
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
         logger.info(
-            "inject_lora: adapter %r (rank=%d, alpha=%d, target_modules=%s) — %d trainable params",
+            "inject_lora: adapter %r (rank=%d, alpha=%d, target_modules=%s, exclude_modules=%s) — %d trainable params",
             adapter_name,
             rank,
             alpha,
             tuple(target_modules),
+            tuple(exclude_modules) if exclude_modules else None,
             n_trainable,
         )
 

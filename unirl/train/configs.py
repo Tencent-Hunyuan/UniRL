@@ -9,6 +9,11 @@ class LoraConfig:
     rank: int = 8
     alpha: int = 16
     target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    # Modules matched by ``target_modules`` but explicitly excluded from injection.
+    # Useful when ``target_modules`` is broad (e.g. ``all-linear``) but some
+    # sub-towers are frozen and must not receive adapters. ``None`` keeps PEFT's
+    # default (no exclusions).
+    exclude_modules: Optional[Tuple[str, ...]] = None
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
