@@ -337,14 +337,9 @@ class TrainStack(Remote):
         ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
         ``on_rollout_end`` runs once — see :meth:`_run_updates`.
         """
-        # HF ``from_pretrained`` returns the model in eval mode and nothing else in
-        # the AR path flips it. ``GradientCheckpointingLayer.__call__`` only
-        # checkpoints when ``self.gradient_checkpointing and self.training`` — so
-        # eval mode silently no-ops the bundle's ``use_gradient_checkpointing=True``,
-        # and the differentiable replay forward retains every decoder layer's
-        # activations → OOM on long sequences. Put the trainable module in train
-        # mode before the update (mirrors ReFLPolicy.sample_and_decode's
-        # ``self.backend.model.train()`` on the diffusion path).
+        # Put the trainable module in train mode before the update (specifically for
+        # AR models). HF ``from_pretrained`` returns the model in eval mode and nothing
+        # else in the AR path flips it. 
         self.fsdp_backend.model.train()
         self._align_track_inputs(resp_track)
         # Arrange once: reorder the track so packed micros are contiguous (no-op for
