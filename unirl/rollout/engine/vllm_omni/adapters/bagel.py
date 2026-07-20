@@ -65,23 +65,19 @@ class BagelInputAdapter(DitInputAdapter):
     """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent."""
 
     def _spp(self, req: RolloutReq) -> int:
-        """``samples_per_prompt`` — the GRPO group size; 1 disables grouping."""
-        return int(getattr(req.sampling_params.get("diffusion"), "samples_per_prompt", 1) or 1)
+        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
+        return req.sampling_params.get("diffusion").samples_per_prompt
 
-    def _wants_grouped_rollout(self, req: RolloutReq) -> bool:
-        """Whether to collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
+    def _is_packable_t2i(self, req: RolloutReq) -> bool:
+        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
 
-        Must match ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
-        only handles pure t2i at cfg=1. CFG>1 needs the unreplicated cfg_* branches
-        upstream builds for a single image, so keep the old sample-level layout.
-        ``bagel_t2i`` already rejects image primitives (no i2i here).
+        Mirrors ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
+        is cfg=1 t2i only. CFG>1 keeps the sample-level layout.
         """
         if self._spp(req) <= 1:
             return False
         diff_params = req.sampling_params.get("diffusion")
-        cfg_text = float(getattr(diff_params, "cfg_text_scale", 1.0))
-        cfg_img = float(getattr(diff_params, "cfg_img_scale", 1.0))
-        return cfg_text <= 1.0 and cfg_img <= 1.0
+        return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
 
     def build_prompts(self, req: RolloutReq) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
@@ -92,14 +88,12 @@ class BagelInputAdapter(DitInputAdapter):
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
 
-        When grouped rollout is armed, each prompt's spp samples collapse to ONE
-        request (``num_outputs_per_prompt=spp``); the worker packs the spp images
-        into one ``generate_image`` and the engine splits them back. Otherwise
-        (spp=1 or cfg>1) keep one request per sample — the pre-batching layout.
+        When packable, each prompt's spp samples collapse to ONE request
+        (``num_outputs_per_prompt=spp``). Otherwise keep one request per sample.
         """
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-        if not self._wants_grouped_rollout(req):
+        if not self._is_packable_t2i(req):
             texts = texts_from_req(req)
             return [{"prompt": text} for text in texts.texts]
         grouped_texts, _ = grouped_texts_from_req(
@@ -118,14 +112,8 @@ class BagelInputAdapter(DitInputAdapter):
         """
         texts = texts_from_req(req)
         diff_params = req.sampling_params.get("diffusion")
-        group = self._wants_grouped_rollout(req)
+        pack = self._is_packable_t2i(req)
         spp = self._spp(req)
-        if group:
-            grouped_texts_from_req(
-                req,
-                samples_per_prompt=spp,
-                caller=f"{self.modality}.build_sampling",
-            )
 
         T = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
@@ -136,9 +124,8 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            # Grouped path: one packed generate_image per prompt. Ungrouped (cfg>1
-            # or spp=1): one image per request — byte-identical to pre-batching.
-            num_outputs_per_prompt=spp if group else 1,
+            # Packable: one packed generate_image. Else: one image per request.
+            num_outputs_per_prompt=spp if pack else 1,
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:

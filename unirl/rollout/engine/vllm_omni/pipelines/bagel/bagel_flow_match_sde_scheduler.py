@@ -100,10 +100,7 @@ class BagelFlowSDEScheduler:
         self._step_index: int = 0
         # generator is required instead of the reseeded global RNG.
         self._noise_generator: Optional[torch.Generator] = None
-        # Per-image token counts when ``generate_image`` runs a packed batch of
-        # ``spp`` same-prompt images (grouped t2i rollout). ``None`` == the plain
-        # bs=1 packed sequence; the log-prob then reduces over the whole packed
-        # tensor and the trajectory keeps batch dim 1.
+        # Packed t2i: per-image token counts to split log-prob/traj. None = bs=1.
         self._image_token_sizes: Optional[List[int]] = None
         # Capture buffers (cleared each request).
         self._traj_latents: List[torch.Tensor] = []
@@ -376,7 +373,10 @@ class BagelFlowSDEScheduler:
 
         if self._traj_log_probs:
             stacked = torch.stack(self._traj_log_probs, dim=0)  # [K] (bs=1) or [K, spp]
-            log_probs = stacked.reshape(1, -1) if self._image_token_sizes is None else stacked.t()  # [1,K] / [spp,K]
+            # contiguous(): IPC-friendly; .t() alone leaves a non-contiguous view.
+            log_probs = (
+                stacked.reshape(1, -1) if self._image_token_sizes is None else stacked.t().contiguous()
+            )  # [1,K] / [spp,K]
         else:
             batch = 1 if self._image_token_sizes is None else len(self._image_token_sizes)
             log_probs = latents.new_zeros((batch, 0), dtype=torch.float32)
