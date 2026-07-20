@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from functools import partial
-from typing import Iterator, Sequence
+from typing import Iterator, Optional, Sequence
 
 from torch import nn
 
@@ -29,12 +29,13 @@ def inject_lora(
     dropout: float = 0.0,
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
+    exclude_modules: Optional[str] = None,
     adapter_name: str = "default",
 ) -> None:
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
 
-    peft_cfg = LoraConfig(
+    peft_kwargs = dict(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
@@ -42,16 +43,21 @@ def inject_lora(
         bias=str(bias),
         task_type=str(task_type),
     )
+    # Omit the optional field for compatibility with older PEFT versions.
+    if exclude_modules:
+        peft_kwargs["exclude_modules"] = str(exclude_modules)
+    peft_cfg = LoraConfig(**peft_kwargs)
     inject_adapter_in_model(peft_cfg, model, adapter_name=adapter_name)
 
     if _current_rank() == 0:
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
         logger.info(
-            "inject_lora: adapter %r (rank=%d, alpha=%d, target_modules=%s) — %d trainable params",
+            "inject_lora: adapter %r (rank=%d, alpha=%d, target_modules=%s, exclude_modules=%s) — %d trainable params",
             adapter_name,
             rank,
             alpha,
             tuple(target_modules),
+            exclude_modules,
             n_trainable,
         )
 

@@ -337,6 +337,8 @@ class TrainStack(Remote):
         ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
         ``on_rollout_end`` runs once — see :meth:`_run_updates`.
         """
+        # Gradient checkpointing is active only while the model is in train mode.
+        self.fsdp_backend.model.train()
         self._align_track_inputs(resp_track)
         # Arrange once: reorder the track so packed micros are contiguous (no-op for
         # CountPlanner) and produce the plan. The SAME (track, plans) feed both the

@@ -207,6 +207,10 @@ class Videos(Batch):
 
     frames: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
+    # Batch-aligned source URIs for processors that load videos directly.
+    # ``frames`` and ``uris`` are mutually exclusive per batch.
+    uris: Optional[List[str]] = concat_field(default=None)
+
     @property
     def cu_frames(self) -> Optional[torch.Tensor]:
         """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`.
@@ -249,6 +253,13 @@ class Videos(Batch):
         # per-sample frames along dim 0 internally.
         return cls.pack(frames=frames_list)
 
+    @classmethod
+    def from_uris(cls, uris: List[str]) -> "Videos":
+        """Build frame-less videos carrying batch-aligned source paths."""
+        if not uris:
+            raise ValueError("Cannot build Videos from an empty uris list")
+        return cls(uris=list(uris))
+
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens
         if cu is None or self.frames is None:
@@ -257,7 +268,9 @@ class Videos(Batch):
 
     def __len__(self) -> int:
         cu = self.cu_seqlens
-        return int(cu.shape[0]) - 1 if cu is not None else 0
+        if cu is not None:
+            return int(cu.shape[0]) - 1
+        return len(self.uris) if self.uris is not None else 0
 
 
 @dataclass

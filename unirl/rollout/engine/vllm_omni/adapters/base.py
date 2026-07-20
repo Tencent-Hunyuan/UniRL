@@ -168,6 +168,9 @@ class ModelAdapter(ABC):
 
     # ---- construction-time validation (v1 engine.py:404-409) ----
     def validate(self) -> None:
+        # AR-only adapters do not require a diffusion schedule.
+        if not self.needs_sigmas:
+            return
         mc = self.model_config
         require(
             mc is not None and hasattr(mc, "shift"),

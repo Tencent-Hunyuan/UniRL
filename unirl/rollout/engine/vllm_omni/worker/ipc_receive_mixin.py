@@ -504,7 +504,9 @@ class BucketedIPCReceiveMixin:
         )
         if manager is None:
             return {}
-        registered = getattr(manager, "_registered_adapters", None)
+        # vLLM may keep the registry on the inner adapter manager.
+        registry_owner = getattr(manager, "_adapter_manager", None) or manager
+        registered = getattr(registry_owner, "_registered_adapters", None)
         if registered is None:
             return {}
         lora_model = registered.get(int(adapter_id))
@@ -515,12 +517,18 @@ class BucketedIPCReceiveMixin:
         for layer_name, layer in lora_model.loras.items():
             if target is not None and layer_name not in target:
                 continue
-            per_field: dict = {}
+            # Hash each tensor in packed LoRA modules separately.
+            sub: dict = {}  # suffix -> {field: hex}
             for field in ("lora_a", "lora_b", "bias", "embeddings_tensor"):
                 t = getattr(layer, field, None)
                 if isinstance(t, torch.Tensor):
-                    per_field[field] = fingerprint_tensor(t)
-            out[layer_name] = per_field
+                    sub.setdefault("", {})[field] = fingerprint_tensor(t)
+                elif isinstance(t, (list, tuple)):
+                    for i, x in enumerate(t):
+                        if isinstance(x, torch.Tensor):
+                            sub.setdefault(f"#{i}", {})[field] = fingerprint_tensor(x)
+            for suffix, per_field in sub.items():
+                out[f"{layer_name}{suffix}"] = per_field
         return out
 
 
