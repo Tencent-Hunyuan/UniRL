@@ -50,6 +50,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
+    grouped_texts_from_req,
     pils_to_images,
     texts_from_req,
 )
@@ -67,24 +68,20 @@ class BagelInputAdapter(DitInputAdapter):
         """``samples_per_prompt`` — the GRPO group size; 1 disables grouping."""
         return int(getattr(req.sampling_params.get("diffusion"), "samples_per_prompt", 1) or 1)
 
-    @staticmethod
-    def _grouped_texts(texts: List[str], spp: int) -> List[str]:
-        """Collapse the ``[p0]*spp + [p1]*spp + ...`` sample layout to one text
-        per prompt group. Guards the block layout the grouped noise-slice
-        (``resolve_request_noise``) + the per-group request-id index both assume."""
-        n = len(texts)
-        if n % spp != 0:
-            raise ValueError(f"bagel grouped rollout: prompt count {n} not divisible by samples_per_prompt {spp}.")
-        grouped: List[str] = []
-        for g in range(n // spp):
-            block = texts[g * spp : (g + 1) * spp]
-            if any(t != block[0] for t in block):
-                raise ValueError(
-                    f"bagel grouped rollout: samples in group {g} are not the same prompt; expand layout "
-                    f"must be block [p0*spp, p1*spp, ...] to match the grouped x_T slice."
-                )
-            grouped.append(block[0])
-        return grouped
+    def _wants_grouped_rollout(self, req: RolloutReq) -> bool:
+        """Whether to collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
+
+        Must match ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
+        only handles pure t2i at cfg=1. CFG>1 needs the unreplicated cfg_* branches
+        upstream builds for a single image, so keep the old sample-level layout.
+        ``bagel_t2i`` already rejects image primitives (no i2i here).
+        """
+        if self._spp(req) <= 1:
+            return False
+        diff_params = req.sampling_params.get("diffusion")
+        cfg_text = float(getattr(diff_params, "cfg_text_scale", 1.0))
+        cfg_img = float(getattr(diff_params, "cfg_img_scale", 1.0))
+        return cfg_text <= 1.0 and cfg_img <= 1.0
 
     def build_prompts(self, req: RolloutReq) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
@@ -95,17 +92,22 @@ class BagelInputAdapter(DitInputAdapter):
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
 
-        With ``samples_per_prompt > 1`` the prompt's samples collapse to ONE
-        request (``num_outputs_per_prompt=spp``); the worker packs the ``spp``
-        images into one ``generate_image`` and the engine splits them back.
+        When grouped rollout is armed, each prompt's spp samples collapse to ONE
+        request (``num_outputs_per_prompt=spp``); the worker packs the spp images
+        into one ``generate_image`` and the engine splits them back. Otherwise
+        (spp=1 or cfg>1) keep one request per sample — the pre-batching layout.
         """
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-        texts = texts_from_req(req)
-        spp = self._spp(req)
-        if spp <= 1:
+        if not self._wants_grouped_rollout(req):
+            texts = texts_from_req(req)
             return [{"prompt": text} for text in texts.texts]
-        return [{"prompt": text} for text in self._grouped_texts(list(texts.texts), spp)]
+        grouped_texts, _ = grouped_texts_from_req(
+            req,
+            samples_per_prompt=self._spp(req),
+            caller=f"{self.modality}.build_prompts",
+        )
+        return [{"prompt": text} for text in grouped_texts]
 
     def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
         """One diffusion-stage intent with the BAGEL-specific kwargs.
@@ -116,6 +118,14 @@ class BagelInputAdapter(DitInputAdapter):
         """
         texts = texts_from_req(req)
         diff_params = req.sampling_params.get("diffusion")
+        group = self._wants_grouped_rollout(req)
+        spp = self._spp(req)
+        if group:
+            grouped_texts_from_req(
+                req,
+                samples_per_prompt=spp,
+                caller=f"{self.modality}.build_sampling",
+            )
 
         T = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
@@ -126,9 +136,9 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            # >1 groups the prompt's samples into one packed generate_image; the
-            # worker splits the log-prob/trajectory per image, the engine the images.
-            num_outputs_per_prompt=self._spp(req),
+            # Grouped path: one packed generate_image per prompt. Ungrouped (cfg>1
+            # or spp=1): one image per request — byte-identical to pre-batching.
+            num_outputs_per_prompt=spp if group else 1,
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
