@@ -375,6 +375,10 @@ class StageAlgorithm(Remote, ABC):
     # Independent of ``requires_ema_rollout`` (DiffusionNFT needs the backend for its
     # EMA shadow). Default False — most algorithms take only the ``pipeline`` sibling.
     requires_backend: bool = False
+    # Whether the loss requires per-sample advantages. SFT variants set False.
+    requires_advantages: bool = True
+    # Weight accumulated losses by samples or the global valid-token count.
+    loss_weighting: str = "sample"
     # Segment fields this algorithm freezes as the π_old anchor in
     # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO:
     # ``("sde_logp", "sde_means")``). When the anchor is recomputed

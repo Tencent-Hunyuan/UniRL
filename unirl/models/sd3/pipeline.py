@@ -38,7 +38,7 @@ from .conditions import SD3Conditions
 from .config import SD3PipelineConfig
 from .diffusion import SD3DiffusionStage, SD3DiffusionStep
 from .text_embed import SD3TextEmbedStage
-from .vae import SD3VAEDecodeStage
+from .vae import SD3VAEDecodeStage, SD3VAEEncodeStage
 
 
 class SD3Pipeline(Pipeline):
@@ -90,6 +90,9 @@ class SD3Pipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else SD3VAEDecodeStage(bundle)
+        # Encode side of the codec (target images → clean latents). Rollout
+        # never calls it; diffusion SFT / future img2img conditioning do.
+        self.vae_encode = SD3VAEEncodeStage(bundle)
         # ``shift`` is retained as an attribute so the hosting engine
         # (TrainsideRolloutEngine) can read it when constructing the
         # FlowMatchSchedulePolicy at startup. It is NOT used by

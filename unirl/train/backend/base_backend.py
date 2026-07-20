@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -52,6 +52,9 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import inject_lora
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +81,7 @@ class BaseFSDP2Backend(Remote):
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
+    _loss_reduction_mesh: Optional["DeviceMesh"]
 
     # ------------------------------------------------------------------
     # Construction helpers (called in sequence from each leaf __init__)
@@ -155,6 +159,7 @@ class BaseFSDP2Backend(Remote):
         usable once the leaf ``__init__`` returns.
         """
         self.model = model
+        self._loss_reduction_mesh = self._find_loss_reduction_mesh(model)
 
         self.ema = None
         if shadow is not None:
@@ -626,6 +631,48 @@ class BaseFSDP2Backend(Remote):
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:
+        """Return the primary FSDP mesh from the model's DTensor parameters."""
+        from torch.distributed.tensor import DTensor
+
+        for param in model.parameters():
+            if isinstance(param, DTensor):
+                return param.device_mesh
+        return None
+
+    def gradient_average_world_size(self) -> int:
+        """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""
+        mesh = self._loss_reduction_mesh
+        if mesh is not None:
+            return mesh.size()
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            raise RuntimeError(
+                f"{type(self).__name__}: distributed training has no FSDP DeviceMesh; "
+                "cannot determine the gradient-averaging world size."
+            )
+        return 1
+
+    def all_reduce_loss_sums(self, values: List[float]) -> List[float]:
+        """SUM loss statistics over the same FSDP mesh used for gradients.
+
+        An HSDP/folded mesh may be multi-dimensional. Reducing once along every
+        mesh dimension produces a full-mesh sum without assuming that the
+        default process group is the FSDP process group.
+        """
+        if not values:
+            return []
+        mesh = self._loss_reduction_mesh
+        world_size = self.gradient_average_world_size()
+        if world_size <= 1:
+            return list(values)
+        if mesh is None or not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(f"{type(self).__name__}: FSDP loss reduction requires initialized distributed state.")
+        tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
+        for group in mesh.get_all_groups():
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor.tolist()
 
     def trainable_module(self) -> nn.Module:
         return self.model
