@@ -14,6 +14,20 @@ from typing import Any
 import torch.nn as nn
 
 
+def _normalize_module_selection_field(peft_dict: dict, field: str) -> None:
+    """Make a PEFT module selector deterministic and JSON/Ray-safe in-place."""
+    value = peft_dict.get(field)
+    if isinstance(value, str) or value is None:
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        peft_dict[field] = sorted(value) if isinstance(value, (set, frozenset)) else list(value)
+        return
+    raise RuntimeError(
+        f"_peft_config_dict: peft_config[{field!r}] has unsupported type "
+        f"{type(value).__name__}; expected str / list / set / tuple."
+    )
+
+
 def _resolve_peft_config_obj(
     model: nn.Module,
     adapter_name: str = "default",
@@ -41,19 +55,8 @@ def _peft_config_dict(model: nn.Module, adapter_name: str = "default") -> dict:
     else:
         peft_dict = dict(peft_cfg_obj)
 
-    tm = peft_dict.get("target_modules")
-    if isinstance(tm, str):
-        pass
-    elif isinstance(tm, (list, tuple, set, frozenset)):
-        peft_dict["target_modules"] = sorted(tm) if isinstance(tm, (set, frozenset)) else list(tm)
-    elif tm is None:
-        pass
-    else:
-        raise RuntimeError(
-            f"_peft_config_dict: peft_config['target_modules'] has "
-            f"unsupported type {type(tm).__name__}; expected str / list / "
-            f"set / tuple."
-        )
+    _normalize_module_selection_field(peft_dict, "target_modules")
+    _normalize_module_selection_field(peft_dict, "exclude_modules")
 
     for required in ("r", "lora_alpha", "target_modules"):
         if peft_dict.get(required) in (None, "", [], ()):
