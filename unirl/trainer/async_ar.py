@@ -300,7 +300,7 @@ class AsyncARTrainer(ARTrainer):
 
         self._async_scheduler = AsyncRolloutScheduler(
             RayGenerationDispatcher(self.rollout),
-            groups_per_batch=self.batch_size,
+            groups_per_step=self.batch_size,
         )
         self._async_scheduler.reset(start_rollout)
 
@@ -312,7 +312,7 @@ class AsyncARTrainer(ARTrainer):
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
-                picked = self._next_batch(rollout_id, interval, M, stale, num_rollouts)
+                picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
                 group_tracks = []
                 for item in picked:
                     (group_track,) = item.resp.tracks.values()
@@ -351,7 +351,7 @@ class AsyncARTrainer(ARTrainer):
             finally:
                 self._finish_wandb()
 
-    def _next_batch(
+    def _next_step(
         self,
         rollout_id: int,
         interval: int,
@@ -360,15 +360,15 @@ class AsyncARTrainer(ARTrainer):
         num_rollouts: int,
     ) -> List[BufferedRolloutGroup]:
         """Top up launches, reap completed generations, and return the freshest
-        ``batch_size`` groups for ``rollout_id`` (blocking on the oldest in-flight
-        generation if the buffer is short).
+        ``groups_per_step`` (``batch_size``) groups for ``rollout_id`` (blocking
+        on the oldest in-flight generation if the buffer is short).
 
         The launch clamp is the load-bearing on-policy guarantee: a generation
         launched now is consumed later, so bound how far ahead we launch to
         ``stale`` weight-syncs. ``stale=0`` ⇒ never launch into a future
         sync-window ⇒ no generation crosses a sync ⇒ ``ratio≈1`` (on-policy).
         """
-        return self._async_scheduler.next_batch(
+        return self._async_scheduler.next_step(
             rollout_id=rollout_id,
             sync_interval=interval,
             max_inflight=M,

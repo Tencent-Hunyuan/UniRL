@@ -51,32 +51,24 @@ class VersionedGroupBuffer:
             )
         )
 
-    def size(self) -> int:
-        return len(self._items)
-
     def drain_freshest(
         self,
         n: int,
         *,
         current_version: Optional[int] = None,
         max_staleness: Optional[int] = None,
-        has_signal: Optional[Callable[[RolloutResp], bool]] = None,
     ) -> Optional[List[BufferedRolloutGroup]]:
         """Pop the ``n`` freshest eligible groups, carrying leftovers forward.
 
-        Eligibility is evaluated in this order: stale groups are evicted, then
-        the optional signal predicate is applied, then groups are sorted by
-        descending generation id.  ``has_signal`` defaults to ``None`` so this
-        extraction does not change existing AR batch selection.
+        Stale groups are evicted first, then remaining groups are sorted by
+        descending generation id.
 
         Returns ``None`` without consuming eligible groups when fewer than ``n``
-        remain after eviction/filtering.
+        remain after eviction.
         """
 
         if max_staleness is not None and current_version is not None:
             self._items = [item for item in self._items if current_version - item.weight_version <= max_staleness]
-        if has_signal is not None:
-            self._items = [item for item in self._items if has_signal(item.resp)]
         if len(self._items) < n:
             return None
         self._items.sort(key=lambda item: item.gen_id, reverse=True)
@@ -205,27 +197,15 @@ class AsyncRolloutScheduler:
         self,
         dispatcher: GenerationDispatcher,
         *,
-        groups_per_batch: int,
+        groups_per_step: int,
     ) -> None:
-        if groups_per_batch < 1:
-            raise ValueError(f"groups_per_batch must be >= 1, got {groups_per_batch}")
+        if groups_per_step < 1:
+            raise ValueError(f"groups_per_step must be >= 1, got {groups_per_step}")
         self._dispatcher = dispatcher
-        self._groups_per_batch = groups_per_batch
+        self._groups_per_step = groups_per_step
         self._buffer = VersionedGroupBuffer()
         self._inflight: List[InflightGeneration] = []
         self._launch_id = 0
-
-    @property
-    def inflight_count(self) -> int:
-        return len(self._inflight)
-
-    @property
-    def launch_id(self) -> int:
-        return self._launch_id
-
-    @property
-    def buffer_size(self) -> int:
-        return self._buffer.size()
 
     def reset(self, start_id: int = 0) -> None:
         """Reset empty runtime state for a fresh or resumed trainer loop."""
@@ -315,7 +295,7 @@ class AsyncRolloutScheduler:
         if first_error is not None:
             raise first_error
 
-    def next_batch(
+    def next_step(
         self,
         *,
         rollout_id: int,
@@ -327,11 +307,11 @@ class AsyncRolloutScheduler:
         build_req: BuildRequest,
         on_complete: CompleteGeneration,
     ) -> List[BufferedRolloutGroup]:
-        """Return the freshest full training batch, blocking only when needed.
+        """Return the freshest full training step, blocking only when needed.
 
-        The launch ceiling is the load-bearing on-policy invariant: at
-        ``max_staleness=0`` no generation is launched into a future weight-sync
-        window.
+        A step is ``groups_per_step`` complete rollout groups. The launch ceiling
+        is the load-bearing on-policy invariant: at ``max_staleness=0`` no
+        generation is launched into a future weight-sync window.
         """
 
         interval = max(1, sync_interval)
@@ -347,7 +327,7 @@ class AsyncRolloutScheduler:
 
             self.reap_ready(on_complete)
             picked = self._buffer.drain_freshest(
-                self._groups_per_batch,
+                self._groups_per_step,
                 current_version=current_version,
                 max_staleness=max_staleness,
             )
