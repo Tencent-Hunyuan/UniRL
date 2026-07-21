@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -36,6 +38,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import BaseSamplingParams
@@ -100,6 +103,11 @@ class PETrainer(BaseTrainer):
         pe_cfg: Optional[DictConfig] = None,
         freeze_llm: bool = False,
         diffusion_group_scope: str = "rewrite",
+        eval_interval: int = 0,
+        eval_num_prompts: int = 8,
+        eval_cfg_text_scale: float = 4.0,
+        eval_eta: float = 0.0,
+        eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -130,6 +138,18 @@ class PETrainer(BaseTrainer):
             raise ValueError(
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
+
+        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
+        # eval_interval=0 disables it. Scores only the image ("diffusion") track,
+        # generated at the deterministic best-quality setting (CFG=
+        # eval_cfg_text_scale, eta=eval_eta) — same knobs/semantics as
+        # DiffusionTrainer; extra eval-only rewards: unirl.trainer.eval_suites.
+        # No eval_samples_per_prompt knob: the P->P*N*M two-level fan-out makes
+        # a single per-prompt count ambiguous (N*M is already a dense eval).
+        self.eval_interval = int(eval_interval)
+        self.eval_num_prompts = int(eval_num_prompts)
+        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
+        self.eval_eta = float(eval_eta)
 
         # PE prompt-rewrite knobs forwarded to the composed PEPipeline (trainside
         # only — they shape the LLM rewrite + the text the diffusion child sees,
@@ -183,6 +203,11 @@ class PETrainer(BaseTrainer):
                 self.rollout = remote(**rollout_parsed)
 
             self.reward = remote_hydra(reward_cfg)
+            # Extra eval-only rewards (eval_rewards) — siblings of the training
+            # reward on this slab; see unirl.trainer.eval_suites.
+            self._eval_suites = build_eval_suites(
+                eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+            )
 
             # Non-trainside: one bridge per track, each routed to its child of
             # the composed engine by ``track_prefix`` (set in the sync block).
@@ -224,7 +249,9 @@ class PETrainer(BaseTrainer):
         pipeline = remote_hydra(cfg.pipeline, bundle=bundle)
         return _Side(bundle=bundle, pipeline=pipeline)
 
-    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
+    def _build_req(
+        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
+    ) -> RolloutReq:
         """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
 
         No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
@@ -238,11 +265,15 @@ class PETrainer(BaseTrainer):
         concrete ``sde_indices`` ride to the engine (mirrors
         :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
         The AR sub-block has no SDE machinery and is left untouched.
+
+        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
+        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
-        diff_params = self.sampling_params.get("diffusion")
+        base = base_sampling if base_sampling is not None else self.sampling_params
+        diff_params = base.get("diffusion")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**self.sampling_params, "diffusion": diffusion}
+        sampling_params = {**base, "diffusion": diffusion}
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
@@ -350,21 +381,225 @@ class PETrainer(BaseTrainer):
         self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
         return results, mean_reward
 
-    def train(self, *, num_rollouts: int, weight_sync_interval: int = 1) -> None:
+    def evaluate(self, step: int) -> float:
+        """Periodic eval on the eval set (no training); returns the mean image reward.
+
+        Mirrors :meth:`train_step`'s rollout+reward path but skips
+        credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
+        (``run.eval_data_path``), generate the composed ``P→P*N*M`` fan-out with
+        the diffusion sub-block forced onto the deterministic best-quality setting
+        (CFG at ``eval_cfg_text_scale``, ``eta=eval_eta``), and score ONLY the
+        image ("diffusion") track. The training reward plus every shared-set
+        ``eval_rewards`` suite scores the SAME generated images; each own-set
+        suite then gets its own generation pass over its own prompts. All means
+        land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``); returns
+        ``eval/reward``.
+        """
+        # Override only the "diffusion" entry of the modality-keyed sampling dict.
+        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
+        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (SD3,
+        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs = dict(eta=self.eval_eta)
+        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        self.rollout.wake_up()
+        if self.diffusion_sync is not None:  # no-op trainside (bridges are None)
+            self.diffusion_sync.sync()
+            if self.ar_sync is not None:
+                self.ar_sync.sync()
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        self.rollout.sleep()
+        logger.info(
+            "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
+            step,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self,
+        data_source: Any,
+        num_prompts: int,
+        scorers: List[Tuple[str, Any]],
+        eval_sp: Dict[str, BaseSamplingParams],
+        step: int,
+    ) -> Dict[str, float]:
+        """One generate→score sweep over one eval set; returns each scorer's mean.
+
+        Chunked by ``self.batch_size`` — the rollout DP-splits the un-expanded
+        P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
+        is what training already runs, so it is divisible. A ragged tail
+        (``num_prompts`` not a multiple of ``batch_size``) is floored off.
+        """
+        all_inputs = data_source.get_eval_samples(num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.batch_size)
+        usable = n_prompts - n_prompts % chunk or n_prompts
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
+        for start in range(0, usable, chunk):
+            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            req = self._build_req(sub, step, base_sampling=eval_sp)
+            resp = self.rollout.generate(req)
+            # Score the image track only; align the P-prompt req to the P*N*M
+            # image track so req and track shard identically across DP workers
+            # (same expansion as train_step).
+            diff_track = resp.tracks["diffusion"]
+            n_track, p = len(diff_track.sample_ids), max(1, req.batch_size)
+            reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
+            for name, reward in scorers:
+                scored = reward.score_and_attach(req=reward_req, track=diff_track)
+                if scored.rewards is not None:
+                    r = hydrate(scored.rewards).to(torch.float32)
+                    sums[name] += float(r.sum().item())
+                    counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+
+    # ---- checkpointing (PE trains two sides → one subdir per trained side) --
+
+    def _ckpt_sides(self):
+        """The trained sides to checkpoint: diffusion always; ar only when it trains.
+
+        A frozen LLM (``freeze_llm=True``) has no AR backend and never trains, so
+        only the diffusion adapter is persisted. Otherwise BOTH LoRA adapters are
+        saved — eval reward depends on the AR rewriter AND the diffusion renderer,
+        so a resumed checkpoint must restore both for the A/B consistency check.
+        """
+        sides = [("diffusion", self.diffusion)]
+        if not self._freeze_llm and self.ar.backend is not None:
+            sides.append(("ar", self.ar))
+        return sides
+
+    def _wait_for_checkpoints(self) -> None:
+        """Flush both side backends before another save or worker teardown."""
+        for _, side in self._ckpt_sides():
+            side.backend.wait_for_checkpoint()
+
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+        save_mode: str = "auto",
+    ) -> None:
+        """Save every ``save_interval`` rollouts (and on the last one), one subdir
+        per trained side. ``save_interval <= 0`` disables saving.
+
+        PE has no single ``self.backend`` (it owns ``self.diffusion.backend`` +
+        ``self.ar.backend``), so this overrides the BaseTrainer single-backend
+        version: each side writes ``<save_dir>/checkpoint-<step>/<side>/`` and the
+        driver-owned ``trainer_state.json`` (wandb run id + step axis) sits beside
+        them, mirroring the base method's semantics.
+        """
+        if save_interval <= 0:
+            return
+        step = rollout_id + 1
+        if step % save_interval != 0 and step < num_rollouts:
+            return
+        base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
+        path = os.path.join(base_dir, f"checkpoint-{step}")
+        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        for name, side in self._ckpt_sides():
+            side.backend.save(os.path.join(path, name), step=step, mode=save_mode)
+        trainer_state_path = os.path.join(path, "trainer_state.json")
+        trainer_state_tmp = f"{trainer_state_path}.tmp"
+        with open(trainer_state_tmp, "w") as f:
+            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        os.replace(trainer_state_tmp, trainer_state_path)
+        if step >= num_rollouts:
+            self._wait_for_checkpoints()
+
+    def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
+        """Restore both trained sides from ``load_dir``; return the resume step.
+
+        Returns 0 for a fresh run (``load_dir`` empty). Each trained side loads
+        from its subdir; both advance in lockstep so either side's returned step
+        is the resume point. Restores the driver-side ``_resume_state`` (wandb run
+        id / step axis) so a resume appends to the same wandb run.
+        """
+        if not load_dir:
+            return 0
+        load_dir = os.path.abspath(load_dir)
+        logger.info("Loading checkpoint from %s", load_dir)
+        start = 0
+        for name, side in self._ckpt_sides():
+            result = side.backend.load(os.path.join(load_dir, name))
+            if isinstance(result, list):  # BROADCAST dispatch collects one result per worker
+                result = result[0]
+            start = int(result or 0)
+        state_path = os.path.join(load_dir, "trainer_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                self._resume_state = json.load(f)
+        logger.info("Checkpoint restored; resuming at rollout %d", start)
+        if num_rollouts is not None and start >= num_rollouts:
+            logger.warning(
+                "Checkpoint step %d >= num_rollouts %d — nothing left to train (num_rollouts is the TOTAL budget).",
+                start,
+                num_rollouts,
+            )
+        return start
+
+    def train(
+        self,
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        save_interval: int = 0,
+        save_dir: Optional[str] = None,
+        load_dir: Optional[str] = None,
+        save_mode: str = "auto",
+    ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
 
         ``weight_sync_interval``: push each track's adapter into the engine
         every N rollouts (fused into ``train_step``'s generate; no-op trainside).
+
+        ``save_interval``: write a checkpoint every N rollouts (and on the last
+        one), one subdir per trained side; ``0`` disables it. ``save_dir`` is the
+        output folder (defaults to ``./checkpoints``); ``save_mode="auto"`` writes
+        LoRA-only checkpoints when LoRA is active. ``load_dir``: restore from a
+        checkpoint directory and RESUME from its saved step — ``num_rollouts`` is
+        the TOTAL budget.
         """
         interval = max(1, weight_sync_interval)
+        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        resumed = bool(load_dir)
+        # Fast-forward the data stream to the resume point — exact when
+        # run.seed is set (deterministic shuffle); with seed=null the stream
+        # is non-reproducible anyway.
+        for _ in range(start_rollout):
+            self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
-            for rollout_id in range(num_rollouts):
+            if self.eval_interval > 0:
+                self.evaluate(start_rollout)  # baseline eval before any training
+            for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
                 req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet).
-                sync_weights = rollout_id > 0 and rollout_id % interval == 0
+                # Sync before generate; skip step 0 (nothing trained yet). On
+                # resume, force the first sync — the engine booted with fresh
+                # weights and needs the restored adapter before generate.
+                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
+                    resumed and rollout_id == start_rollout
+                )
                 results, mean_reward = self.train_step(
                     req,
                     training_progress=training_progress,
@@ -372,5 +607,12 @@ class PETrainer(BaseTrainer):
                     rollout_id=rollout_id,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
+                # eval(k) BEFORE save(checkpoint-k) at the same step, so a
+                # resumed checkpoint re-runs the same eval (A/B consistency).
+                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                    self.evaluate(rollout_id + 1)
+                self.maybe_save_checkpoint(
+                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                )
         finally:
             self._finish_wandb()

@@ -33,6 +33,8 @@ from unirl.types.primitives import Images
 from unirl.types.segments.latent import LatentSegment
 
 if TYPE_CHECKING:
+    from unirl.types.conditions.image import ImageLatentCondition
+
     from .bundle import BagelBundle
 
 
@@ -155,8 +157,6 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             # (per-image independent; cat keeps the [N, 3, H, W] order).
             return torch.cat([vae_fp32.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
 
-        vae = self.bundle.vae
-        orig_dtype = next(vae.parameters()).dtype
         with nullcontext() if grad else torch.no_grad():
             if grad and activation_checkpoint and clean.requires_grad:
                 from torch.utils.checkpoint import checkpoint
@@ -164,13 +164,13 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
                 decoded = _decode(clean)
-        # Restore the VAE's loaded dtype: the image-edit path also ENCODES the
-        # source with this shared VAE on the next rollout, and a left-over fp32
-        # cast would make encode emit fp32 latents that mismatch the bf16 vae2llm.
-        # (Under activation_checkpoint the backward recompute re-casts to fp32;
-        # the restore still holds for the grad=False rollout/eval path it guards.)
-        if orig_dtype != torch.float32:
-            vae.to(orig_dtype)
+        # Framework convention (qwen_image / sd3 / flux2_klein): the VAE stays fp32
+        # after the first decode — the .to(float32) above is a one-time lazy upcast,
+        # a no-op on later calls. The shared encode path is dtype-safe regardless:
+        # pipeline.py casts encode inputs/outputs at the vendor boundary, so the
+        # downstream bf16 vae2llm is unaffected. (This also removes the old restore's
+        # leak, where an activation_checkpoint backward recompute re-cast the VAE to
+        # fp32 after the restore had run.)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Move to CPU before returning: decoded pixels are only ever consumed as
         # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow
@@ -181,4 +181,81 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         return Images(pixels=pixels.cpu())
 
 
-__all__ = ["BagelVAEDecodeStage", "bagel_latent_geometry", "bagel_latent_shape", "unpatchify_latent"]
+def patchify_latent(
+    spatial: torch.Tensor,
+    *,
+    h: int,
+    w: int,
+    patch_size: int,
+    latent_channels: int,
+) -> torch.Tensor:
+    """Spatial ``[N, z, h·p, w·p]`` → packed ``[N, h·w, p²·z]`` (inverse of
+    :func:`unpatchify_latent`; batched form of the vendored
+    ``forward_cache_update_vae`` patchify einsum)."""
+    p, z = patch_size, latent_channels
+    n = spatial.shape[0]
+    cropped = spatial[:, :, : h * p, : w * p]
+    blocks = cropped.reshape(n, z, h, p, w, p)
+    return torch.einsum("nchpwq->nhwpqc", blocks).reshape(n, h * w, p * p * z)
+
+
+class BagelVAEEncodeStage:
+    """Images → packed clean latents ``[B, h·w, p²·z]`` — inverse of the decode stage.
+
+    ``pixels ∈ [0, 1] → [-1, 1] → vae.encode → patchify``. The Bagel
+    ``AutoEncoder.encode`` applies its own ``scale·(z - shift)`` internally
+    (unlike SD3 — no external normalization here), but its posterior SAMPLES by
+    default (``reg.sample=True``); this stage forces the deterministic mean for
+    the duration of the call so the stored latent is the one decode reproduces.
+    First consumer: diffusion SFT's target-image encoding.
+    """
+
+    def __init__(self, bundle: "BagelBundle") -> None:
+        self.bundle = bundle
+
+    @torch.no_grad()
+    def encode(self, p: Images) -> "ImageLatentCondition":
+        from unirl.types.conditions.image import ImageLatentCondition
+
+        pixels = p.pixels
+        if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
+            raise ValueError(
+                f"BagelVAEEncodeStage.encode: expected pixels [B, 3, H, W], got "
+                f"{tuple(pixels.shape) if isinstance(pixels, torch.Tensor) else type(pixels).__name__}"
+            )
+        height, width = pixels.shape[2], pixels.shape[3]
+        down = self.bundle.latent_downsample
+        if height % down or width % down:
+            raise ValueError(
+                f"BagelVAEEncodeStage.encode: image {height}x{width} must be divisible by latent_downsample={down}."
+            )
+        h, w = bagel_latent_geometry((height, width), latent_downsample=down)
+        vae = self.bundle.vae
+        reg = getattr(vae, "reg", None)
+        if reg is None or not hasattr(reg, "sample"):
+            raise RuntimeError("BagelVAEEncodeStage: bundle.vae has no .reg gaussian — vendored API changed?")
+        x = (pixels.to(device=self.bundle.device, dtype=self.bundle.vae_dtype) * 2.0 - 1.0).contiguous()
+        prev_sample = reg.sample
+        reg.sample = False  # deterministic posterior mean, not a draw
+        try:
+            spatial = vae.encode(x)
+        finally:
+            reg.sample = prev_sample
+        packed = patchify_latent(
+            spatial.float(),
+            h=h,
+            w=w,
+            patch_size=self.bundle.latent_patch_size,
+            latent_channels=self.bundle.latent_channels,
+        )
+        return ImageLatentCondition(latents=packed)
+
+
+__all__ = [
+    "BagelVAEDecodeStage",
+    "BagelVAEEncodeStage",
+    "bagel_latent_geometry",
+    "bagel_latent_shape",
+    "patchify_latent",
+    "unpatchify_latent",
+]

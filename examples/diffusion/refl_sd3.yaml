@@ -2,18 +2,19 @@
 # ReFL (DRaFT-K direct differentiable-reward backprop) — SD3.5 trainside, 1x8.
 #
 # Two roles (always): ReFLPolicy (FSDP SD3 + grad DRaFT-K sampling + optimizer)
-# on `policy_device_fraction` of the pool, and a frozen differentiable PickScore
-# reward on the rest. Gradient crosses the role boundary via the distributed
-# enable_grad() context (Phase-0 validated). Loss = -reward.mean(); NO
-# advantages / replay / ratio / rollout-engine / weight-sync.
+# and a frozen differentiable PickScore reward, placed via `reward_fraction` (the
+# SAME unified knob as the GRPO DiffusionTrainer): reward gets its own disjoint
+# tail slab, policy takes the rest. Gradient crosses the role boundary via the
+# distributed enable_grad() context. Loss = -reward.mean(); NO advantages /
+# replay / ratio / rollout-engine / weight-sync.
 #
 # Divisibility: batch_size must be divisible by BOTH role dp sizes. With
-# policy_device_fraction=0.75 on 8 GPUs → policy dp=6, reward dp=2 → batch % 6 == 0.
+# reward_fraction=0.25 on 8 GPUs → policy dp=6, reward dp=2 → batch % 6 == 0.
 
 num_devices: 8
 batch_size: 12                 # divisible by policy dp=6 and reward dp=2
 num_rollouts: 200
-policy_device_fraction: 0.75   # policy on 6 GPUs, reward on 2
+reward_fraction: 0.25          # differentiable reward on its own 2 GPUs; policy on 6
 max_grad_norm: 1.0
 save_interval: 0
 save_mode: adapter
@@ -48,7 +49,9 @@ policy:
     fsdp_mode: full
     reshard_after_forward: true       # deeper ReFL grad graph — re-gather to save memory
     activation_checkpointing: true
-    master_dtype: fp32                # fp32 LoRA master (keeps small DRaFT grads; the dpgo footgun)
+    # master_dtype omitted → LoRA stays bf16 (uniform dtype). fp32 LoRA + bf16 base
+    # trips torch FSDP2's uniform-original-dtype assert; bf16 is portable. If small
+    # DRaFT grads underflow (reward-collapse), give LoRA its own FSDP group + fp32 (TODO).
     root_wrap: true
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig

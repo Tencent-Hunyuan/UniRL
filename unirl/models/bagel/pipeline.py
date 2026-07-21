@@ -43,8 +43,11 @@ this keeps ``BagelPipeline`` importable on CPU for fake-stage tests.
 
 from __future__ import annotations
 
+import logging
+from collections import OrderedDict
 from contextlib import nullcontext
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -63,10 +66,12 @@ from .ar import BagelARStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage
 from .rl_ops import _to_device
-from .vae import BagelVAEDecodeStage, bagel_latent_shape
+from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
     from .bundle import BagelBundle
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
@@ -97,6 +102,8 @@ class BagelPipeline(Pipeline):
         logprob_precision: str = "fp32",
         shift: float = 3.0,
         replay_mode: str = "train",
+        cache_t2i_contexts: Optional[bool] = None,
+        context_cache_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -110,6 +117,9 @@ class BagelPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
+        # Encode side of the codec (target images → packed clean latents).
+        # Rollout never calls it; diffusion SFT does.
+        self.vae_encode = BagelVAEEncodeStage(bundle)
         # AR (text-out) stage for t2t / i2t / it2t; resolvable via the trainside
         # engine's ``stage_attrs=["ar"]``. Shares the bundle (same MoT root).
         self.ar = BagelARStage(
@@ -122,6 +132,18 @@ class BagelPipeline(Pipeline):
         # FlowMatch time-shift for the σ schedule policy (read by the hosting engine
         # via build_schedule_policy → ensure_req_sigmas). Bagel uses static shift.
         self.shift = shift
+        # Reuse prompt KV across T2I siblings only while the und/text prefill is frozen.
+        cache_config = getattr(bundle, "config", None)
+        cache_t2i_contexts = (
+            _cfg_get(cache_config, "cache_t2i_contexts", True) if cache_t2i_contexts is None else cache_t2i_contexts
+        )
+        context_cache_size = (
+            _cfg_get(cache_config, "context_cache_size", 32) if context_cache_size is None else context_cache_size
+        )
+        self._cache_t2i_contexts = bool(cache_t2i_contexts)
+        self._context_cache_size = max(1, int(context_cache_size))
+        self._t2i_context_cache: "OrderedDict[str, Tuple[Any, Any, Any]]" = OrderedDict()
+        self._und_frozen: Optional[bool] = None  # Checked lazily after LoRA injection.
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
@@ -223,8 +245,15 @@ class BagelPipeline(Pipeline):
                 new_token_ids=self.bundle.new_token_ids,
             )
             gi = _to_device(gi, device)
-            gi["padded_images"] = gi["padded_images"].to(dtype=self.bundle.vae_dtype)
-            past = bagel.forward_cache_update_vae(self.bundle.vae, ctx["past_key_values"], **gi)
+            # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
+            vae_mod, proj = self.bundle.vae, bagel.vae2llm
+
+            def _vae_encode(x: torch.Tensor) -> torch.Tensor:
+                return vae_mod.encode(x.to(dtype=next(vae_mod.parameters()).dtype)).to(
+                    dtype=next(proj.parameters()).dtype
+                )
+
+            past = bagel.forward_cache_update_vae(SimpleNamespace(encode=_vae_encode), ctx["past_key_values"], **gi)
             ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
         if vit:
             gi, kv_lens, ropes = bagel.prepare_vit_images(
@@ -265,6 +294,110 @@ class BagelPipeline(Pipeline):
             gen = inf.update_context_text(prompt, gen)
             cfg_img = inf.update_context_text(prompt, cfg_img)
         return gen, cfg_text, cfg_img
+
+    def _t2i_cache_enabled(self) -> bool:
+        """Whether the T2I context cache is safe to use right now.
+
+        Sharing one prompt-prefill context across the N GRPO siblings is correct
+        only if the prefill (und/shared) path is FROZEN — otherwise a weight update
+        makes cached contexts stale, and ``ratio`` would NOT catch it (rollout and
+        replay reuse the same cached conditions, so the staleness cancels). The gen
+        experts (``*_moe_gen``, used only in the gen/denoise forward, never in the
+        prompt prefill) may train. Resolved lazily once on first use — by then the
+        backend has injected LoRA / set ``requires_grad`` (the pipeline is built
+        before the backend). Fails safe: if introspection fails or any non-gen param
+        is trainable, the cache is disabled.
+        """
+        if not self._cache_t2i_contexts:
+            return False
+        if self._und_frozen is None:
+            try:
+                und_trainable = [
+                    n for n, p in self.bundle.transformer.named_parameters() if p.requires_grad and "moe_gen" not in n
+                ]
+            except Exception:  # pragma: no cover - be conservative if not introspectable
+                und_trainable = ["<introspection-failed>"]
+            self._und_frozen = not und_trainable
+            if not self._und_frozen:
+                logger.warning(
+                    "BagelPipeline: T2I context cache DISABLED — the prompt-prefill "
+                    "(und/shared) path has %d trainable param(s) (e.g. %s), so cached "
+                    "contexts could go stale. Caching is only safe with gen-only "
+                    "(*_moe_gen) LoRA; set cache_t2i_contexts=false to silence.",
+                    len(und_trainable),
+                    und_trainable[:3],
+                )
+            else:
+                logger.info("BagelPipeline: T2I context cache enabled (prompt-prefill path is frozen).")
+        return self._und_frozen
+
+    def _build_contexts_cached(self, prompt: str) -> Tuple[Any, Any, Any]:
+        """Memoized :meth:`_build_contexts` for the T2I path (image-free).
+
+        Keyed on the prompt alone — valid because the three KV contexts route
+        through the frozen und experts and carry no gradient (already reused
+        verbatim by ``replay``), so they are bit-stable across the whole run.
+        The shared context objects are read-only downstream (the navit
+        ``_forward_flow`` never writes the prompt ``past_key_values``), so the N
+        GRPO siblings can hold the same reference safely. Bounded LRU.
+        """
+        cache = self._t2i_context_cache
+        hit = cache.get(prompt)
+        if hit is not None:
+            cache.move_to_end(prompt)
+            return hit
+        ctx = self._build_contexts(prompt, image=None)
+        cache[prompt] = ctx
+        while len(cache) > self._context_cache_size:
+            cache.popitem(last=False)
+        return ctx
+
+    def clear_context_cache(self) -> None:
+        """Drop the cached T2I prompt contexts (frees their prompt KV caches)."""
+        self._t2i_context_cache.clear()
+
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+        image_shape: Tuple[int, int] = (512, 512),
+    ) -> BagelDiffusionConditions:
+        """Encode prompts into T2I ``BagelDiffusionConditions`` (no diffusion run).
+
+        The shared ``build_conditions`` protocol every diffusion pipeline
+        exposes, so SFT / conditioning callers encode prompts exactly like
+        :meth:`generate` does — three frozen KV contexts per prompt via the
+        memoized prefill. Bagel's CFG rides those contexts gated by the params'
+        ``cfg_text_scale`` / ``cfg_img_scale`` at forward time, so
+        ``guidance_scale`` and ``negatives`` do not shape the conditions here:
+        ``negatives`` is rejected (Bagel has no negative-embedding branch) and
+        ``guidance_scale`` is accepted for protocol parity only.
+
+        Deliberately UNCACHED (``_build_contexts``, not the memoized
+        ``_build_contexts_cached``): under an FSDP-wrapped transformer the
+        prefill forward is collective, and a per-rank LRU hit would skip a
+        rank's all-gathers while its peers run them — a cross-rank NCCL
+        deadlock. The GRPO path stays cached because sibling expansion makes
+        hits rank-symmetric; supervised batches have no siblings, and each
+        prompt recurs only once per epoch anyway.
+        """
+        del guidance_scale
+        if negatives is not None:
+            raise ValueError(
+                "BagelPipeline.build_conditions: Bagel CFG uses prefilled cfg contexts, not "
+                "negative prompt embeddings — pass negatives=None and set cfg_*_scale on the params."
+            )
+        contexts = [self._build_contexts(prompt, image=None) for prompt in texts.texts]
+        shape = image_shape
+        return BagelDiffusionConditions(
+            gen_contexts=[c[0] for c in contexts],
+            cfg_text_contexts=[c[1] for c in contexts],
+            cfg_img_contexts=[c[2] for c in contexts],
+            prompts=list(texts.texts),
+            image_shapes=[shape] * len(texts.texts),
+        )
 
     @staticmethod
     def _resolve_task(req: RolloutReq) -> str:
@@ -332,10 +465,15 @@ class BagelPipeline(Pipeline):
         sample_ids = list(req.sample_ids) if req.sample_ids else [f"s{i}" for i in range(n)]
         image_shape = (int(params.height), int(params.width))
 
-        contexts = [
-            self._build_contexts(prompt, image=pil_images[i] if pil_images is not None else None)
-            for i, prompt in enumerate(prompts)
-        ]
+        if task == "t2i" and pil_images is None and self._t2i_cache_enabled():
+            # Image-free path: dedup the prompt prefill across the N identical
+            # GRPO siblings (frozen und → contexts are prompt-only + run-stable).
+            contexts = [self._build_contexts_cached(prompt) for prompt in prompts]
+        else:
+            contexts = [
+                self._build_contexts(prompt, image=pil_images[i] if pil_images is not None else None)
+                for i, prompt in enumerate(prompts)
+            ]
         segment, conditions, images = self._diffuse_and_decode(
             contexts, prompts=prompts, params=params, req=req, image_shape=image_shape
         )

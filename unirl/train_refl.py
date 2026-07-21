@@ -24,7 +24,11 @@ def main(cfg: DictConfig) -> None:
         reward_cfg=cfg.reward,
         data_source_cfg=cfg.data_source,
         max_grad_norm=float(cfg.get("max_grad_norm", 1.0)),
-        policy_device_fraction=float(cfg.get("policy_device_fraction", 0.75)),
+        reward_fraction=float(cfg.get("reward_fraction", 0.25)),
+        eval_interval=int(cfg.get("eval_interval", 0)),
+        eval_num_prompts=int(cfg.get("eval_num_prompts", cfg.batch_size)),
+        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
+        eval_rewards_cfg=cfg.get("eval_rewards"),
         logging_cfg=cfg.get("logging"),
     )
     trainer.train(

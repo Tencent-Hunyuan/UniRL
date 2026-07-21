@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -13,6 +13,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -56,6 +57,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_chunk_prompts: int = 16,
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        eval_rewards_cfg: Optional[Any] = None,
         stage_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
@@ -84,6 +86,11 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_chunk_prompts = int(eval_chunk_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
+        # eval_rewards: extra eval-only reward suites (multi-reward eval for
+        # checkpoint selection), built next to the training reward in
+        # _wire_eval_suites so they share its placement — see unirl.trainer.eval_suites.
+        self._eval_rewards_cfg = eval_rewards_cfg
+        self._eval_suites: List[EvalRewardSuite] = []
         # Per-request routing metadata pinned by the recipe (e.g. {"task": "it2i"}),
         # forwarded onto every RolloutReq. Pinning the task makes a dataset that is
         # MISSING source images fail loudly in the pipeline (it2i requires an input
@@ -98,8 +105,10 @@ class DiffusionTrainer(BaseTrainer):
         # so its hot path is untouched.
         self._uses_ema = False
 
-        # Driver-side data iterator (not a Remote).
+        # Driver-side data iterator (not a Remote). The raw cfg is kept so
+        # eval_rewards suites can clone it with their own prompt paths.
         self.data_source = instantiate(data_source_cfg)
+        self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
@@ -193,6 +202,34 @@ class DiffusionTrainer(BaseTrainer):
         if reward_separate:
             with placement(self.pool, fraction=reward_fraction, shared_workers=True):
                 self.reward = remote_hydra(reward_cfg)
+                self._wire_eval_suites()
+
+        # Pre-flight for the reward_fraction footgun: when reward takes its own
+        # slab the policy/rollout DP is the REDUCED card count, and the per-rollout
+        # sample count must divide BOTH the rollout DP and the reward DP — else the
+        # DP_SCATTER fails deep in generate()/score_and_attach with an opaque "not
+        # divisible by dp_size" error. Fail early here, naming the knob.
+        n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
+        if n_samples % self.rollout.dp_size or n_samples % self.reward.dp_size:
+            raise ValueError(
+                f"batch_size({batch_size}) * samples_per_prompt = {n_samples} samples/rollout must be "
+                f"divisible by BOTH rollout dp_size={self.rollout.dp_size} and reward dp_size="
+                f"{self.reward.dp_size}. reward_fraction={reward_fraction} placed reward on its own slab, "
+                f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
+                f"samples_per_prompt divisible by both."
+            )
+
+    def _wire_eval_suites(self) -> None:
+        """Build the ``eval_rewards`` suites in the CALLER's placement scope.
+
+        Called exactly where the training reward was just created (train-side
+        sibling in ``_build_train_side``, or the separate ``reward_fraction``
+        slab in ``__init__``), so every suite reward shares the training
+        reward's placement. See :mod:`unirl.trainer.eval_suites`.
+        """
+        self._eval_suites = build_eval_suites(
+            self._eval_rewards_cfg, data_source_cfg=self._data_source_cfg, enabled=self.eval_interval > 0
+        )
 
     def _build_train_side(
         self,
@@ -218,6 +255,7 @@ class DiffusionTrainer(BaseTrainer):
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
+            self._wire_eval_suites()
         # DiffusionNFT resolves its frozen reference adapter off ``backend.ema`` (the
         # FSDPBackend owns the dual-adapter EMA), and FlowGRPO / FlowDPPO reach the
         # trainable model directly (LoRA disabled = the ``beta`` KL reference policy),
@@ -471,10 +509,12 @@ class DiffusionTrainer(BaseTrainer):
         Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
         Generates at the deterministic best-quality setting (``cfg_text_scale=
         eval_cfg_text_scale``, ``eta=eval_eta``; ``eval_samples_per_prompt`` x_T per
-        prompt) over ``eval_num_prompts`` eval prompts (``run.eval_data_path``),
-        scores, logs the mean reward under ``eval/*``, and returns it. The eval
-        prompts are CHUNKED (``eval_chunk_prompts``) so one generate never holds N x
-        the KV/decoded on the driver.
+        prompt) and scores. The training reward plus every shared-set
+        ``eval_rewards`` suite scores the SAME generated images over the default
+        eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
+        own-set suite then gets its own generation pass over its own prompts.
+        All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
+        returns ``eval/reward``.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
         # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
@@ -492,39 +532,62 @@ class DiffusionTrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        all_inputs = self.data_source.get_eval_samples(self.eval_num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
-        chunk = max(1, self.eval_chunk_prompts)
-        reward_sum, reward_n = 0.0, 0
         self.rollout.wake_up()
         if self.weight_sync is not None:
             self.weight_sync.sync()
+        # Default pass: training reward + shared-set suites score the SAME images.
+        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
+        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+        for suite in self._eval_suites:
+            if suite.data_source is not None:
+                n = suite.num_prompts or self.eval_num_prompts
+                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        self.rollout.sleep()
+        logger.info(
+            "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
+            step,
+            self.eval_samples_per_prompt,
+            self.eval_cfg_text_scale,
+            self.eval_eta,
+            "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
+        )
+        self.wandb_logger.log_eval(step, metrics)
+        return metrics["reward"]
+
+    def _eval_pass(
+        self,
+        data_source: Any,
+        num_prompts: int,
+        scorers: List[Tuple[str, Any]],
+        eval_sp: Dict[str, BaseSamplingParams],
+        step: int,
+    ) -> Dict[str, float]:
+        """One generate→score sweep over one eval set; returns each scorer's mean.
+
+        The eval prompts are CHUNKED (``eval_chunk_prompts``) so one generate
+        never holds N x the KV/decoded on the driver (the it2i memory
+        bottleneck). Scores the single scorable (segment-carrying) track with
+        every scorer — single-track for now; revisit if multi-track lands.
+        """
+        all_inputs = data_source.get_eval_samples(num_prompts)
+        n_prompts = len(all_inputs.sample_ids)
+        chunk = max(1, self.eval_chunk_prompts)
+        sums = {name: 0.0 for name, _ in scorers}
+        counts = {name: 0 for name, _ in scorers}
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             req = self._build_req(sub, step, base_sampling=eval_sp)
             resp = self.rollout.generate(req)
-            for name, track in list(resp.tracks.items()):
-                if track.segment is not None:
-                    resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
-            for track in resp.tracks.values():
-                if track.rewards is not None:
-                    rewards = hydrate(track.rewards).to(torch.float32)
-                    reward_sum += float(rewards.sum().item())
-                    reward_n += int(rewards.numel())
-                    break  # single-track for now; revisit if multi-track lands
-        self.rollout.sleep()
-        mean_reward = reward_sum / max(1, reward_n)
-        logger.info(
-            "EVAL step %d  eval_reward(%d prompts x %d samples, cfg=%.1f eta=%.1f)=%.4f",
-            step,
-            self.eval_num_prompts,
-            self.eval_samples_per_prompt,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
-            mean_reward,
-        )
-        self.wandb_logger.log_eval(step, {"reward": mean_reward})
-        return mean_reward
+            track = next((t for t in resp.tracks.values() if t.segment is not None), None)
+            if track is None:
+                continue
+            for name, reward in scorers:
+                scored = reward.score_and_attach(req=req, track=track)
+                if scored.rewards is not None:
+                    r = hydrate(scored.rewards).to(torch.float32)
+                    sums[name] += float(r.sum().item())
+                    counts[name] += int(r.numel())
+        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(
         self,

@@ -53,6 +53,7 @@ from .base import (
     StageAlgorithm,
     _grpo_clip_loss,
     _resolve_clip_range_from_schedule,
+    rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -190,6 +191,12 @@ class GSPO(StageAlgorithm):
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
             **rollout_replay_logp_absdiff(new_logp, old_logp),
+            # Rollout↔replay drift on the raw PER-TOKEN log-probs (before the
+            # sequence reduction) — the direct autoregress-vs-replay correctness
+            # gauge. k3 is the calibrated KL surrogate (p=replay new, q=rollout
+            # old); on-policy it is ~0 and rises if any misaligns between rollout
+            # and replay.
+            **rollout_replay_k3(new_logp, old_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(
