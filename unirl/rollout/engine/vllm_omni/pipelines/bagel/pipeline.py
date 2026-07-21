@@ -302,7 +302,7 @@ class RLBagelPipeline(BagelPipeline):
         extra = getattr(req.sampling_params, "extra_args", None) or {}
         if "cfg_text_scale" not in extra or "cfg_img_scale" not in extra:
             return False
-        return float(extra["cfg_text_scale"]) <= 1.0 and float(extra["cfg_img_scale"]) <= 1.0
+        return extra["cfg_text_scale"] <= 1.0 and extra["cfg_img_scale"] <= 1.0
 
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()

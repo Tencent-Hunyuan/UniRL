@@ -77,7 +77,7 @@ class BagelInputAdapter(DitInputAdapter):
         if self._spp(req) <= 1:
             return False
         diff_params = req.sampling_params.get("diffusion")
-        return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
+        return diff_params.cfg_text_scale <= 1.0 and diff_params.cfg_img_scale <= 1.0
 
     def build_prompts(self, req: RolloutReq) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
