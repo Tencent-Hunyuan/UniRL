@@ -101,6 +101,7 @@ ray start --head \
     --node-ip-address="${NODE_IP}" \
     --port="${RAY_PORT}" \
     --dashboard-host=0.0.0.0 \
-    --num-gpus="${GPUS_PER_NODE}"
+    --num-gpus="${GPUS_PER_NODE}" \
+    --disable-usage-stats
 
 exec "${CMD[@]}"

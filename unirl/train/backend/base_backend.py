@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, List, Literal, Optional
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -52,7 +53,84 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import inject_lora
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+
 logger = logging.getLogger(__name__)
+
+_PENDING_DCP_SAVE_FUTURE: Optional[Future] = None
+
+
+def _set_pending_dcp_save(future: Future) -> None:
+    """Register the one async DCP upload allowed in this worker process."""
+    global _PENDING_DCP_SAVE_FUTURE
+    if _PENDING_DCP_SAVE_FUTURE is not None:
+        raise RuntimeError("an async DCP save is already pending in this worker process")
+    _PENDING_DCP_SAVE_FUTURE = future
+
+
+def _drain_pending_dcp_save() -> None:
+    """Wait for the process-wide async DCP upload, if any."""
+    global _PENDING_DCP_SAVE_FUTURE
+    future = _PENDING_DCP_SAVE_FUTURE
+    if future is None:
+        return
+    try:
+        future.result()
+    finally:
+        if _PENDING_DCP_SAVE_FUTURE is future:
+            _PENDING_DCP_SAVE_FUTURE = None
+
+
+def _prepare_dcp_directory(
+    path: str,
+    metadata: Dict[str, object],
+    *,
+    process_group: Optional[dist.ProcessGroup],
+) -> None:
+    """Publish app metadata and invalidate any stale DCP completion marker.
+
+    DCP writes ``.metadata`` last. Removing an old copy before an overwrite
+    preserves that commit-marker contract while the new shards are in flight.
+    The rank-0 preparation error is broadcast so no peer enters DCP alone.
+    """
+    local_error: Optional[str] = None
+    local_exc: Optional[Exception] = None
+    metadata_path = os.path.join(path, "metadata.pt")
+    metadata_tmp = f"{metadata_path}.tmp"
+
+    if _current_rank() == 0:
+        try:
+            os.makedirs(path, exist_ok=True)
+            torch.save(metadata, metadata_tmp)
+            dcp_metadata_path = os.path.join(path, ".metadata")
+            if os.path.exists(dcp_metadata_path):
+                os.remove(dcp_metadata_path)
+            torch_checkpoint_path = os.path.join(path, "checkpoint.pt")
+            if os.path.exists(torch_checkpoint_path):
+                os.remove(torch_checkpoint_path)
+            os.replace(metadata_tmp, metadata_path)
+        except Exception as exc:
+            local_exc = exc
+            local_error = f"{type(exc).__name__}: {exc}"
+            try:
+                if os.path.exists(metadata_tmp):
+                    os.remove(metadata_tmp)
+            except OSError:
+                pass
+
+    if dist.is_available() and dist.is_initialized():
+        error_box: List[Optional[str]] = [local_error]
+        dist.broadcast_object_list(error_box, src=0, group=process_group)
+        error = error_box[0]
+    else:
+        error = local_error
+
+    if error is not None:
+        wrapped = RuntimeError(f"failed to prepare DCP checkpoint directory {path!r}: {error}")
+        if local_exc is not None:
+            raise wrapped from local_exc
+        raise wrapped
 
 
 class BaseFSDP2Backend(Remote):
@@ -78,6 +156,7 @@ class BaseFSDP2Backend(Remote):
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
+    _loss_reduction_mesh: Optional["DeviceMesh"]
 
     # ------------------------------------------------------------------
     # Construction helpers (called in sequence from each leaf __init__)
@@ -115,7 +194,8 @@ class BaseFSDP2Backend(Remote):
                 model,
                 rank=ema_lora_cfg.rank,
                 alpha=ema_lora_cfg.alpha,
-                target_modules=tuple(ema_lora_cfg.target_modules),
+                target_modules=ema_lora_cfg.target_modules,
+                exclude_modules=ema_lora_cfg.exclude_modules,
                 default=ema_lora_cfg.default_adapter,
                 shadow=ema_lora_cfg.shadow_adapter,
                 dropout=ema_lora_cfg.dropout,
@@ -127,7 +207,8 @@ class BaseFSDP2Backend(Remote):
                 model,
                 rank=lora_cfg.rank,
                 alpha=lora_cfg.alpha,
-                target_modules=tuple(lora_cfg.target_modules),
+                target_modules=lora_cfg.target_modules,
+                exclude_modules=lora_cfg.exclude_modules,
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
@@ -155,6 +236,7 @@ class BaseFSDP2Backend(Remote):
         usable once the leaf ``__init__`` returns.
         """
         self.model = model
+        self._loss_reduction_mesh = self._find_loss_reduction_mesh(model)
 
         self.ema = None
         if shadow is not None:
@@ -196,6 +278,7 @@ class BaseFSDP2Backend(Remote):
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
                 "target_modules": active_lora.target_modules,
+                "exclude_modules": active_lora.exclude_modules,
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
                 "task_type": active_lora.task_type,
@@ -396,7 +479,22 @@ class BaseFSDP2Backend(Remote):
         if _current_rank() != 0:
             return
         os.makedirs(path, exist_ok=True)
-        torch.save(state, os.path.join(path, "checkpoint.pt"))
+        checkpoint_path = os.path.join(path, "checkpoint.pt")
+        checkpoint_tmp = f"{checkpoint_path}.tmp"
+        try:
+            torch.save(state, checkpoint_tmp)
+            for stale_dcp_file in (".metadata", "metadata.pt"):
+                stale_path = os.path.join(path, stale_dcp_file)
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+            os.replace(checkpoint_tmp, checkpoint_path)
+        except Exception:
+            try:
+                if os.path.exists(checkpoint_tmp):
+                    os.remove(checkpoint_tmp)
+            except OSError:
+                pass
+            raise
 
     def _save_dcp(self, path: str, step: Optional[int], mode: str) -> None:
         """Sharded save: every rank writes its own shard under ``path``.
@@ -406,11 +504,21 @@ class BaseFSDP2Backend(Remote):
         data and are dropped here. Non-tensor metadata (step / save_mode /
         lora_config / scheduler / optimizer_step_count) is light and rides in a
         rank-0 ``metadata.pt`` beside DCP's own ``.metadata``.
+
+        With ``checkpoint_async`` the shard write runs off the train loop's
+        critical path: ``dcp.async_save`` stages (copies) the shards in-process
+        first — so the model is safe to keep training the moment it returns —
+        then flushes to storage on a background thread. The returned future is
+        drained before the next save (below) and by :meth:`wait_for_checkpoint`
+        (the trainer calls it after the final rollout, which has no next save).
         """
         import torch.distributed.checkpoint as dcp
 
+        # Finish any in-flight async save before snapshotting fresh state: two
+        # concurrent DCP collectives can deadlock. The future is process-wide
+        # because PE can colocate two independent backends on the same workers.
+        self._drain_checkpoint()
         self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
-        os.makedirs(path, exist_ok=True)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
             model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
@@ -418,10 +526,6 @@ class BaseFSDP2Backend(Remote):
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
         }
-        dcp.save(sharded_state, checkpoint_id=path)
-
-        if _current_rank() != 0:
-            return
         meta: Dict[str, object] = {
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
@@ -430,7 +534,46 @@ class BaseFSDP2Backend(Remote):
         }
         if self.scheduler is not None:
             meta["scheduler_state_dict"] = self.scheduler.state_dict()
-        torch.save(meta, os.path.join(path, "metadata.pt"))
+
+        pg = None
+        if self._checkpoint_async:
+            # async_save stages to CPU and coordinates on a CPU collective, so it
+            # needs a process group with a CPU (gloo) backend. The train PG is
+            # NCCL-only (fully_shard auto-init / backend="nccl"), which makes
+            # async_save assert "A CPU backend must be enabled for async save", so
+            # hand it a lazily-created, memoized gloo group. None when not
+            # distributed (single process) — async_save then runs no_dist.
+            if dist.is_available() and dist.is_initialized():
+                from unirl.utils.distributed_utils import init_gloo_group
+
+                pg = init_gloo_group()
+        _prepare_dcp_directory(path, meta, process_group=pg)
+
+        if self._checkpoint_async:
+            future = dcp.async_save(sharded_state, checkpoint_id=path, process_group=pg)
+            _set_pending_dcp_save(future)
+        else:
+            dcp.save(sharded_state, checkpoint_id=path)
+
+    def _drain_checkpoint(self) -> None:
+        """Block until a pending async DCP save finishes (no-op if none).
+
+        ``dcp.async_save`` returns a future that completes when the background
+        shard write lands. The future is process-wide so colocated backends
+        cannot start overlapping DCP collectives on the shared gloo group.
+        """
+        _drain_pending_dcp_save()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def wait_for_checkpoint(self) -> None:
+        """Flush the last async DCP save (driver-callable across all workers).
+
+        With ``checkpoint_async`` the shard write runs in the background and is
+        normally drained by the next save; the trainer calls this after the
+        final rollout so the last checkpoint is durable before the workers tear
+        down. A no-op under sync save or when nothing is pending.
+        """
+        self._drain_checkpoint()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> int:
@@ -445,6 +588,9 @@ class BaseFSDP2Backend(Remote):
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
+        # Defensive: flush an in-flight async save before reading from disk
+        # (a save-then-load of the same dir in one process must see the shards).
+        self._drain_checkpoint()
         dcp_metadata_path = os.path.join(path, ".metadata")
         metadata_path = os.path.join(path, "metadata.pt")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
@@ -626,6 +772,48 @@ class BaseFSDP2Backend(Remote):
     # ------------------------------------------------------------------
     # Accessors
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:
+        """Return the primary FSDP mesh from the model's DTensor parameters."""
+        from torch.distributed.tensor import DTensor
+
+        for param in model.parameters():
+            if isinstance(param, DTensor):
+                return param.device_mesh
+        return None
+
+    def gradient_average_world_size(self) -> int:
+        """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""
+        mesh = self._loss_reduction_mesh
+        if mesh is not None:
+            return mesh.size()
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            raise RuntimeError(
+                f"{type(self).__name__}: distributed training has no FSDP DeviceMesh; "
+                "cannot determine the gradient-averaging world size."
+            )
+        return 1
+
+    def all_reduce_loss_sums(self, values: List[float]) -> List[float]:
+        """SUM loss statistics over the same FSDP mesh used for gradients.
+
+        An HSDP/folded mesh may be multi-dimensional. Reducing once along every
+        mesh dimension produces a full-mesh sum without assuming that the
+        default process group is the FSDP process group.
+        """
+        if not values:
+            return []
+        mesh = self._loss_reduction_mesh
+        world_size = self.gradient_average_world_size()
+        if world_size <= 1:
+            return list(values)
+        if mesh is None or not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(f"{type(self).__name__}: FSDP loss reduction requires initialized distributed state.")
+        tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
+        for group in mesh.get_all_groups():
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+        return tensor.tolist()
 
     def trainable_module(self) -> nn.Module:
         return self.model
