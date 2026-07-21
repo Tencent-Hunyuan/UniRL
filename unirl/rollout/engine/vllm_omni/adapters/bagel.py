@@ -50,6 +50,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
+    grouped_texts_from_req,
     pils_to_images,
     texts_from_req,
 )
@@ -63,6 +64,21 @@ from unirl.types.rollout_resp import RolloutResp
 class BagelInputAdapter(DitInputAdapter):
     """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent."""
 
+    def _spp(self, req: RolloutReq) -> int:
+        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
+        return req.sampling_params.get("diffusion").samples_per_prompt
+
+    def _is_packable_t2i(self, req: RolloutReq) -> bool:
+        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
+
+        Mirrors ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
+        is cfg=1 t2i only. CFG>1 keeps the sample-level layout.
+        """
+        if self._spp(req) <= 1:
+            return False
+        diff_params = req.sampling_params.get("diffusion")
+        return diff_params.cfg_text_scale <= 1.0 and diff_params.cfg_img_scale <= 1.0
+
     def build_prompts(self, req: RolloutReq) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
 
@@ -71,11 +87,21 @@ class BagelInputAdapter(DitInputAdapter):
         the text2img diffusion path we want. No ``negative_prompt`` key is added
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
+
+        When packable, each prompt's spp samples collapse to ONE request
+        (``num_outputs_per_prompt=spp``). Otherwise keep one request per sample.
         """
         if req.primitives.get("image") is not None:
             raise ValueError(f"modality={self.modality!r} does not accept req.primitives['image']")
-        texts = texts_from_req(req)
-        return [{"prompt": text} for text in texts.texts]
+        if not self._is_packable_t2i(req):
+            texts = texts_from_req(req)
+            return [{"prompt": text} for text in texts.texts]
+        grouped_texts, _ = grouped_texts_from_req(
+            req,
+            samples_per_prompt=self._spp(req),
+            caller=f"{self.modality}.build_prompts",
+        )
+        return [{"prompt": text} for text in grouped_texts]
 
     def build_sampling(self, req: RolloutReq) -> List[StageSampling]:
         """One diffusion-stage intent with the BAGEL-specific kwargs.
@@ -86,6 +112,8 @@ class BagelInputAdapter(DitInputAdapter):
         """
         texts = texts_from_req(req)
         diff_params = req.sampling_params.get("diffusion")
+        pack = self._is_packable_t2i(req)
+        spp = self._spp(req)
 
         T = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
@@ -96,7 +124,8 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            num_outputs_per_prompt=1,
+            # Packable: one packed generate_image. Else: one image per request.
+            num_outputs_per_prompt=spp if pack else 1,
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
@@ -133,7 +162,7 @@ class BagelInputAdapter(DitInputAdapter):
         if traj_prec is not None:
             extra_args["trajectory_precision"] = str(traj_prec)
 
-        pack_initial_noise_extra_args(extra_args, req, diff_params, n_prompts=len(texts.texts), caller=self.modality)
+        pack_initial_noise_extra_args(extra_args, req, diff_params, n_samples=len(texts.texts), caller=self.modality)
         diff_kwargs["extra_args"] = extra_args
 
         return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]

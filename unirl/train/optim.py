@@ -11,6 +11,7 @@ uses; the standard ``torch.optim.AdamW`` /
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
@@ -146,6 +147,17 @@ def build_lr_scheduler(
     if scheduler_type == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
+    if scheduler_type in {"linear", "cosine"}:
+        if warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {warmup_steps}.")
+        if total_steps < 1:
+            raise ValueError(f"total_steps must be >= 1, got {total_steps}.")
+        if warmup_steps >= total_steps:
+            raise ValueError(
+                "warmup_steps must be less than total_steps for a decaying "
+                f"schedule, got warmup_steps={warmup_steps}, total_steps={total_steps}."
+            )
+
     if scheduler_type == "linear":
 
         def lr_lambda(step: int) -> float:
@@ -156,11 +168,15 @@ def build_lr_scheduler(
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     if scheduler_type == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps - warmup_steps,
-            eta_min=0,
-        )
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     return None
 
