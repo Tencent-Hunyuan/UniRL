@@ -84,7 +84,7 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: unirl.reward.role.RewardRole
+    _target_: recipes.refl.roles.ReflRewardRole
     placement:
       # BPTT gradients must live on the same worker — no cross-process
       # autograd. VideoAlign co-locates with the actor.

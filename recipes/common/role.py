@@ -1,4 +1,4 @@
-"""Base Role abstraction for trainer-managed Remote roles."""
+"""Recipe-level Role abstraction for trainer-managed Remote roles."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ class RoleStepResult:
 
 
 class Role(Remote):
-    """A trainer role that runs as a UniRL Remote inside a Worker.
+    """Recipe-level role that runs as a UniRL Remote inside a Worker.
 
     ``Role`` stores the role config and initializes common role-local
     components (model/runtime bundle / pipeline / backend) as ordinary
