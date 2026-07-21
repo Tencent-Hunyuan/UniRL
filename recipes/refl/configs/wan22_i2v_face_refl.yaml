@@ -81,7 +81,7 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: recipes.refl.roles.ReflRewardRole
+    _target_: recipes.common.roles.RewardRole
     placement:
       share_with: actor
 
