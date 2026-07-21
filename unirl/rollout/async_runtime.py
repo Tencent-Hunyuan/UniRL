@@ -46,8 +46,8 @@ class VersionedGroupBuffer:
         self._items.append(
             BufferedRolloutGroup(
                 resp=resp,
-                weight_version=int(weight_version),
-                gen_id=int(gen_id),
+                weight_version=weight_version,
+                gen_id=gen_id,
             )
         )
 
@@ -74,9 +74,7 @@ class VersionedGroupBuffer:
         """
 
         if max_staleness is not None and current_version is not None:
-            self._items = [
-                item for item in self._items if int(current_version) - item.weight_version <= int(max_staleness)
-            ]
+            self._items = [item for item in self._items if current_version - item.weight_version <= max_staleness]
         if has_signal is not None:
             self._items = [item for item in self._items if has_signal(item.resp)]
         if len(self._items) < n:
@@ -161,8 +159,8 @@ class RayGenerationDispatcher:
             refs=refs,
             worker_local=worker_local,
             req=req,
-            gen_id=int(gen_id),
-            weight_version=int(weight_version),
+            gen_id=gen_id,
+            weight_version=weight_version,
         )
 
     @staticmethod
@@ -209,10 +207,10 @@ class AsyncRolloutScheduler:
         *,
         groups_per_batch: int,
     ) -> None:
-        if int(groups_per_batch) < 1:
+        if groups_per_batch < 1:
             raise ValueError(f"groups_per_batch must be >= 1, got {groups_per_batch}")
         self._dispatcher = dispatcher
-        self._groups_per_batch = int(groups_per_batch)
+        self._groups_per_batch = groups_per_batch
         self._buffer = VersionedGroupBuffer()
         self._inflight: List[InflightGeneration] = []
         self._launch_id = 0
@@ -235,7 +233,7 @@ class AsyncRolloutScheduler:
         if self._inflight:
             raise RuntimeError("cannot reset AsyncRolloutScheduler with generations in flight")
         self._buffer = VersionedGroupBuffer()
-        self._launch_id = int(start_id)
+        self._launch_id = start_id
 
     def _launch_one(
         self,
@@ -336,12 +334,11 @@ class AsyncRolloutScheduler:
         window.
         """
 
-        interval = max(1, int(sync_interval))
-        inflight_limit = max(1, int(max_inflight))
-        stale = int(max_staleness)
+        interval = max(1, sync_interval)
+        inflight_limit = max(1, max_inflight)
         while True:
-            staleness_window = ((int(rollout_id) // interval) + 1 + stale) * interval
-            ceiling = min(int(num_rollouts), staleness_window)
+            staleness_window = ((rollout_id // interval) + 1 + max_staleness) * interval
+            ceiling = min(num_rollouts, staleness_window)
             while self._launch_id < ceiling and len(self._inflight) < inflight_limit:
                 self._launch_one(
                     build_req=build_req,
@@ -352,7 +349,7 @@ class AsyncRolloutScheduler:
             picked = self._buffer.drain_freshest(
                 self._groups_per_batch,
                 current_version=current_version,
-                max_staleness=stale,
+                max_staleness=max_staleness,
             )
             if picked is not None:
                 return picked
