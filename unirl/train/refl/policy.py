@@ -228,5 +228,9 @@ class ReFLPolicy(Remote):
     def load(self, path: str) -> int:
         return self.backend.load(path)
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.ALL)
+    def wait_for_checkpoint(self) -> None:
+        self.backend.wait_for_checkpoint()
+
 
 __all__ = ["ReFLPolicy"]
