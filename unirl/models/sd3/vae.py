@@ -100,6 +100,13 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
 
     @torch.no_grad()
     def encode(self, p: Images) -> ImageLatentCondition:
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "SD3VAEEncodeStage.encode: no VAE loaded (load_vae=False). "
+                "The trainer-side pipeline cannot encode images in this "
+                "configuration — separate-engine recipes encode in the "
+                "rollout engine; trainside / SFT paths require load_vae=True."
+            )
         pixels = p.pixels
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
