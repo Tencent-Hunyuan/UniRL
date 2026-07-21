@@ -12,6 +12,7 @@ trajectory scheduling belongs to a separate, resumable-engine abstraction.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Protocol
 
@@ -22,6 +23,8 @@ from unirl.distributed.tensor import WorkerLocalTransport
 from unirl.distributed.tensor.pytree import infer_batch_size
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -266,38 +269,50 @@ class AsyncRolloutScheduler:
             )
 
     def reap_ready(self, on_complete: CompleteGeneration) -> None:
-        """Collect every ready generation; leave unresolved jobs in flight."""
+        """Collect every ready generation; leave unresolved / failed jobs in flight."""
 
-        ready: List[InflightGeneration] = []
         still: List[InflightGeneration] = []
-        for job in self._inflight:
-            if self._dispatcher.is_ready(job):
-                ready.append(job)
-            else:
-                still.append(job)
-        self._inflight = still
-
         first_error: Optional[BaseException] = None
-        for job in ready:
+        for job in self._inflight:
+            if not self._dispatcher.is_ready(job):
+                still.append(job)
+                continue
             try:
                 self._complete(job, on_complete)
             except BaseException as exc:
+                # Keep the failed job in-flight so finally/drain_all can retry
+                # collect+score (matches pre-extraction _reap_ready semantics).
+                still.append(job)
                 if first_error is None:
                     first_error = exc
+                else:
+                    logger.error(
+                        "reap_ready: additional failure for gen_id=%s",
+                        job.gen_id,
+                        exc_info=exc,
+                    )
+        self._inflight = still
         if first_error is not None:
             raise first_error
 
     def drain_all(self, on_complete: CompleteGeneration) -> None:
         """Quiesce every generation and buffer all successfully completed groups."""
 
-        jobs, self._inflight = self._inflight, []
+        jobs, self._inflight = list(self._inflight), []
         first_error: Optional[BaseException] = None
         for job in jobs:
             try:
                 self._complete(job, on_complete)
             except BaseException as exc:
+                self._inflight.append(job)
                 if first_error is None:
                     first_error = exc
+                else:
+                    logger.error(
+                        "drain_all: additional failure for gen_id=%s",
+                        job.gen_id,
+                        exc_info=exc,
+                    )
         if first_error is not None:
             raise first_error
 
