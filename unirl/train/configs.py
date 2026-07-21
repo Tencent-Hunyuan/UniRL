@@ -87,8 +87,10 @@ class FSDPConfig:
     # ranks, and resumes under a different world size. load auto-detects the
     # on-disk format, so legacy checkpoint.pt dirs still resume regardless.
     checkpoint_format: str = "torch"
-    # dcp only: background (async) save so the train loop is not blocked on the
-    # I/O. Ignored under checkpoint_format="torch". (Wired in a later phase.)
+    # dcp only: background (async) save (dcp.async_save) so the train loop is not
+    # blocked on the shard I/O — staging is synchronous, the flush runs on a
+    # background thread, drained before the next save and after the final one.
+    # Ignored under checkpoint_format="torch".
     checkpoint_async: bool = False
     # Ulysses sequence-parallel degree (default 1 = disabled, a true no-op).
     # When >1 the VeOmni backend builds a folded dp_shard x ulysses FSDP mesh

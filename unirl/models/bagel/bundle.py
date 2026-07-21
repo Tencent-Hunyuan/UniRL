@@ -169,11 +169,14 @@ class BagelBundle(Bundle):
         tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        # Image transforms match flow_grpo (vae 512/256/8, vit 490/112/7). Only
-        # used for image-conditioned paths; pure T2I never exercises them, but
-        # the inferencer constructor requires both.
+        # Image transforms (image-conditioned paths only; pure T2I never exercises
+        # them, but the inferencer constructor requires both). Sizes follow flow_grpo
+        # (vae 512/256, vit 490/112). NB: the ViT resize STRIDE must equal the SigLIP
+        # patch size (14) — patchify() asserts h % patch_size == 0, so a stride that is
+        # not a multiple of 14 makes non-square image inputs crash. flow_grpo's stride 7
+        # (half a patch) is that bug; use 14 to keep resized dims patch-aligned.
         vae_transform = ImageTransform(512, 256, 8)
-        vit_transform = ImageTransform(490, 112, 7)
+        vit_transform = ImageTransform(490, 112, 14)
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)

@@ -8,19 +8,21 @@ one adapter and writes the standard PEFT serving artifact:
 * ``adapter_config.json``
 
 It also works on ``save_mode=full`` checkpoints by filtering the LoRA keys out
-of the full policy state dict.
+of the full policy state dict, and reads either checkpoint flavor —
+the legacy single-file ``checkpoint.pt`` or a sharded ``dcp`` directory.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import pickle
 from collections.abc import Iterable
 from typing import Dict, List, Optional
 
 import torch
 from safetensors.torch import save_file
+
+from unirl.tools._checkpoint import load_training_checkpoint
 
 PEFT_PREFIX = "base_model.model."
 
@@ -111,19 +113,6 @@ def write_adapter_config(
             )
 
 
-def _load_checkpoint(path: str) -> Dict[str, object]:
-    if os.path.isdir(path):
-        path = os.path.join(path, "checkpoint.pt")
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except (TypeError, pickle.UnpicklingError):
-        return torch.load(path, map_location="cpu")
-    except RuntimeError as exc:
-        if "Weights only load failed" not in str(exc):
-            raise
-        return torch.load(path, map_location="cpu")
-
-
 def _split_modules(values: Optional[Iterable[str]]) -> Optional[List[str]]:
     if values is None:
         return None
@@ -170,7 +159,7 @@ def main() -> None:
     parser.add_argument("--task-type", default=None, help="override PEFT task_type")
     args = parser.parse_args()
 
-    checkpoint = _load_checkpoint(args.checkpoint)
+    checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
     recorded = checkpoint.get("lora_config") or {}
 
