@@ -272,16 +272,17 @@ class AsyncRolloutScheduler:
         """Collect every ready generation; leave unresolved / failed jobs in flight."""
 
         still: List[InflightGeneration] = []
-        first_error: Optional[BaseException] = None
+        first_error: Optional[Exception] = None
         for job in self._inflight:
             if not self._dispatcher.is_ready(job):
                 still.append(job)
                 continue
             try:
                 self._complete(job, on_complete)
-            except BaseException as exc:
+            except Exception as exc:
                 # Keep the failed job in-flight so finally/drain_all can retry
-                # collect+score (matches pre-extraction _reap_ready semantics).
+                # collect+score. KeyboardInterrupt/SystemExit propagate immediately
+                # (not deferred behind remaining ready jobs).
                 still.append(job)
                 if first_error is None:
                     first_error = exc
@@ -299,11 +300,11 @@ class AsyncRolloutScheduler:
         """Quiesce every generation and buffer all successfully completed groups."""
 
         jobs, self._inflight = list(self._inflight), []
-        first_error: Optional[BaseException] = None
+        first_error: Optional[Exception] = None
         for job in jobs:
             try:
                 self._complete(job, on_complete)
-            except BaseException as exc:
+            except Exception as exc:
                 self._inflight.append(job)
                 if first_error is None:
                     first_error = exc

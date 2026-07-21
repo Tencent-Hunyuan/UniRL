@@ -33,6 +33,7 @@ opens the colocate ``placement(fraction=1.0)`` block we replace with two slabs).
 
 import inspect
 import logging
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -338,8 +339,15 @@ class AsyncARTrainer(ARTrainer):
                     self.weight_sync.sync()
                     self._weight_version += 1
         finally:
+            # Match BaseTrainer._finish_wandb: cleanup failures must not mask
+            # the exception that caused teardown.
+            active_exception = sys.exc_info()[0] is not None
             try:
                 self._drain_all()
+            except Exception:
+                if not active_exception:
+                    raise
+                logger.exception("Failed to drain in-flight generations during trainer teardown")
             finally:
                 self._finish_wandb()
 
