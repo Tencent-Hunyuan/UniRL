@@ -42,17 +42,6 @@ class VersionedGroupBuffer:
     def __init__(self) -> None:
         self._items: List[BufferedRolloutGroup] = []
 
-    def put(self, resp: RolloutResp, *, weight_version: int, gen_id: int) -> None:
-        self.put_all(
-            [
-                BufferedRolloutGroup(
-                    resp=resp,
-                    weight_version=weight_version,
-                    gen_id=gen_id,
-                )
-            ]
-        )
-
     def put_all(self, items: List[BufferedRolloutGroup]) -> None:
         """Append a prepared batch of groups in one mutation."""
 
