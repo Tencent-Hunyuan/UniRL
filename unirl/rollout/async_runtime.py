@@ -43,13 +43,20 @@ class VersionedGroupBuffer:
         self._items: List[BufferedRolloutGroup] = []
 
     def put(self, resp: RolloutResp, *, weight_version: int, gen_id: int) -> None:
-        self._items.append(
-            BufferedRolloutGroup(
-                resp=resp,
-                weight_version=weight_version,
-                gen_id=gen_id,
-            )
+        self.put_all(
+            [
+                BufferedRolloutGroup(
+                    resp=resp,
+                    weight_version=weight_version,
+                    gen_id=gen_id,
+                )
+            ]
         )
+
+    def put_all(self, items: List[BufferedRolloutGroup]) -> None:
+        """Append a prepared batch of groups in one mutation."""
+
+        self._items.extend(items)
 
     def drain_freshest(
         self,
@@ -155,8 +162,7 @@ class RayGenerationDispatcher:
             weight_version=weight_version,
         )
 
-    @staticmethod
-    def is_ready(job: InflightGeneration) -> bool:
+    def is_ready(self, job: InflightGeneration) -> bool:
         ready, _ = ray.wait(
             job.refs,
             num_returns=len(job.refs),
@@ -164,8 +170,7 @@ class RayGenerationDispatcher:
         )
         return len(ready) == len(job.refs)
 
-    @staticmethod
-    def wait(job: InflightGeneration) -> None:
+    def wait(self, job: InflightGeneration) -> None:
         ray.get(job.refs)
 
     def collect(self, job: InflightGeneration) -> RolloutResp:
@@ -237,14 +242,21 @@ class AsyncRolloutScheduler:
         job: InflightGeneration,
         on_complete: CompleteGeneration,
     ) -> None:
+        # Complete-or-nothing: collect + score first, then a single buffer
+        # mutation. If either step fails the job stays in-flight for retry
+        # without double-inserting groups from a partial put.
         resp = self._dispatcher.collect(job)
         groups = on_complete(job, resp)
-        for group in groups:
-            self._buffer.put(
-                group,
-                weight_version=job.weight_version,
-                gen_id=job.gen_id,
-            )
+        self._buffer.put_all(
+            [
+                BufferedRolloutGroup(
+                    resp=group,
+                    weight_version=job.weight_version,
+                    gen_id=job.gen_id,
+                )
+                for group in groups
+            ]
+        )
 
     def reap_ready(self, on_complete: CompleteGeneration) -> None:
         """Collect every ready generation; leave unresolved / failed jobs in flight."""
@@ -312,14 +324,19 @@ class AsyncRolloutScheduler:
         A step is ``groups_per_step`` complete rollout groups. The launch ceiling
         is the load-bearing on-policy invariant: at ``max_staleness=0`` no
         generation is launched into a future weight-sync window.
+
+        ``sync_interval`` and ``max_inflight`` must already be ``>= 1``; callers
+        (e.g. ``AsyncARTrainer``) clamp config before invoking this method.
         """
 
-        interval = max(1, sync_interval)
-        inflight_limit = max(1, max_inflight)
+        if sync_interval < 1:
+            raise ValueError(f"sync_interval must be >= 1, got {sync_interval}")
+        if max_inflight < 1:
+            raise ValueError(f"max_inflight must be >= 1, got {max_inflight}")
         while True:
-            staleness_window = ((rollout_id // interval) + 1 + max_staleness) * interval
+            staleness_window = ((rollout_id // sync_interval) + 1 + max_staleness) * sync_interval
             ceiling = min(num_rollouts, staleness_window)
-            while self._launch_id < ceiling and len(self._inflight) < inflight_limit:
+            while self._launch_id < ceiling and len(self._inflight) < max_inflight:
                 self._launch_one(
                     build_req=build_req,
                     weight_version=current_version,
