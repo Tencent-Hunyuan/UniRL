@@ -73,9 +73,7 @@ def inject_lora(
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
         logged_targets = target_modules if isinstance(target_modules, str) else tuple(target_modules)
         logged_exclusions = (
-            exclude_modules
-            if isinstance(exclude_modules, str) or exclude_modules is None
-            else tuple(exclude_modules)
+            exclude_modules if isinstance(exclude_modules, str) or exclude_modules is None else tuple(exclude_modules)
         )
         logger.info(
             "inject_lora: adapter %r (rank=%d, alpha=%d, target_modules=%s, exclude_modules=%s) — %d trainable params",

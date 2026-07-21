@@ -22,7 +22,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
