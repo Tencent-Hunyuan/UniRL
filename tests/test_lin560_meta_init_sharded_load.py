@@ -43,7 +43,7 @@ def _tiny_qwen_vl():
         return Qwen2_5_VLForConditionalGeneration(config)
 
 
-def test_hf_checkpoint_renaming_uses_model_type_for_plain_and_fsdp_classes() -> None:
+def test_hf_checkpoint_renaming_uses_model_rules_for_plain_and_fsdp_classes() -> None:
     model = _tiny_qwen_vl()
     model_keys = set(model.state_dict())
     language_key = next(key for key in model_keys if key.startswith("model.language_model."))

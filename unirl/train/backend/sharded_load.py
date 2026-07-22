@@ -215,22 +215,21 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
     try:
         from accelerate import init_empty_weights
         from transformers import PreTrainedModel
-        from transformers.conversion_mapping import (
-            get_checkpoint_conversion_mapping,
-            get_model_conversion_mapping,
-        )
+        from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import WeightRenaming
     except Exception as exc:  # older / patched transformers without the API
         logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
         return state_dict
 
-    # The backend wraps the HF model in an FSDP subclass. Transformers indexes
-    # checkpoint conversions by ``config.model_type`` (not the Python class
-    # name), while the reference build still needs the original HF class.
+    # The backend may wrap the HF model in an FSDP subclass, while the reference
+    # build still needs the original HF class.  Ask Transformers for the rules
+    # from that reference model instead of pre-gating on
+    # ``get_checkpoint_conversion_mapping(config.model_type)``: newer
+    # Transformers releases can register the rules on the model/converter even
+    # when that legacy lookup returns ``None``.
     unwrapped = getattr(model, "module", model)
     config = getattr(unwrapped, "config", None)
-    model_type = getattr(config, "model_type", None)
-    if model_type is None or get_checkpoint_conversion_mapping(model_type) is None:
+    if config is None:
         return state_dict
 
     hf_cls = type(unwrapped)
