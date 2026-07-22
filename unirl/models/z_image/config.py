@@ -48,6 +48,10 @@ class ZImagePipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
+    # Collapse per-SDE-step training replay into one batched transformer
+    # forward. Off by default; stateless SDE strategies only (Flow/Dance/CPS).
+    batch_replay_steps: bool = False
+
     # Static FlowMatch shift. Both Z-Image variants set
     # ``use_dynamic_shifting: false``; the value differs — base Z-Image uses
     # ``shift: 6.0`` (the default here), Z-Image-Turbo uses ``shift: 3.0``.
