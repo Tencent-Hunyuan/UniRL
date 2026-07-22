@@ -147,10 +147,7 @@ class QwenImageBundle(Bundle):
             )
             vae.requires_grad_(False)
 
-        # vllm-omni recipes skip the trainer-side copy (~15 GiB/rank dead
-        # weight there — the engine encodes prompts in its own workers and
-        # the trainer replays from captured conditions); see
-        # QwenImagePipelineConfig.load_text_encoder.
+        # Skipped when load_text_encoder=False (separate-engine; see config).
         text_encoder = None
         if config.load_text_encoder:
             text_encoder = (
