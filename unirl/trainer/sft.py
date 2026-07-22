@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any, Dict, List, Optional
 
 from hydra.utils import instantiate
@@ -15,6 +14,8 @@ from unirl.distributed.group.placement import placement
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.trainer.hydra import remote_hydra
+from unirl.types.sample import Part
+from unirl.utils.wandb_logger import PhaseTimer
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class SFTTrainer(BaseTrainer):
         eval_interval: int = 0,
         eval_batch_size: int = 8,
         eval_num_samples: int = -1,
+        prefetch_next_batch: bool,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -54,8 +56,26 @@ class SFTTrainer(BaseTrainer):
                 "dataset batch. Multi-update SFT is supported by TrainStack but not yet by "
                 "this trainer's outer-step accounting."
             )
+        if not isinstance(prefetch_next_batch, bool):
+            raise TypeError(
+                f"SFTTrainer: prefetch_next_batch must be a bool; got {type(prefetch_next_batch).__name__}."
+            )
+        self.prefetch_next_batch = prefetch_next_batch
 
         self.data_source = instantiate(data_source_cfg)
+        if self.eval_interval > 0 and not self.data_source.has_eval_data:
+            logger.warning(
+                "SFTTrainer: eval_interval=%d but no eval manifest is configured; validation is disabled.",
+                self.eval_interval,
+            )
+            self.eval_interval = 0
+        if self.prefetch_next_batch and not all(
+            callable(getattr(self.data_source, name, None)) for name in ("peek_next_batch", "commit_peeked_batch")
+        ):
+            raise ValueError(
+                "SFTTrainer: prefetch_next_batch requires a data source with "
+                "peek_next_batch() and commit_peeked_batch()."
+            )
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
@@ -65,16 +85,32 @@ class SFTTrainer(BaseTrainer):
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
+        if self.prefetch_next_batch and not callable(getattr(self.track_builder, "prefetch", None)):
+            raise ValueError("SFTTrainer: prefetch_next_batch requires a track builder with prefetch().")
         self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
         logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
 
-    def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
-        """records → worker-side track build → stack train. No rollout legs."""
-        part = self.track_builder.build(records)
+    def _build_part(self, records: List[Dict[str, Any]], timer: PhaseTimer) -> Part:
+        with timer.phase("build"):
+            part = self.track_builder.build(records)
         if part.batch_size != len(records):
             raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
+        return part
+
+    def train_step(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        training_progress: float = 0.0,
+        prefetch_records: Optional[List[Dict[str, Any]]] = None,
+    ) -> TrainStepResult:
+        """records → worker-side track build → stack train. No rollout legs."""
+        part = self._build_part(records, self._step_timer)
+        with self._step_timer.phase("prefetch"):
+            if prefetch_records is not None:
+                self.track_builder.prefetch(prefetch_records)
         return self.stack.train_track(part, training_progress=training_progress)
 
     def evaluate(self, step: int) -> float:
@@ -82,9 +118,12 @@ class SFTTrainer(BaseTrainer):
         loss_sum = 0.0
         weight_sum = 0.0
         batches = 0
+        timer = PhaseTimer()
         for records in self.data_source.iter_eval_batches(self.eval_batch_size, eval_num_samples=self.eval_num_samples):
             records = self._pad_to_dp(records)
-            metrics = self.stack.eval_track(self.track_builder.build(records))
+            part = self._build_part(records, timer)
+            with timer.phase("forward"):
+                metrics = self.stack.eval_track(part)
             loss_sum += float(metrics["loss"]) * float(metrics["weight"])
             weight_sum += float(metrics["weight"])
             batches += 1
@@ -92,15 +131,26 @@ class SFTTrainer(BaseTrainer):
             logger.warning("SFTTrainer.evaluate: no eval data (eval_num_samples=%s).", self.eval_num_samples)
             return float("nan")
         eval_loss = loss_sum / weight_sum
+        eval_time = timer.total()
         logger.info(
-            "EVAL step %d  eval_loss=%.5f  (weight=%.0f over %d batches of <=%d)",
+            "EVAL step %d  eval_loss=%.5f  (weight=%.0f over %d batches of <=%d)  %.1fs (build=%.3fs forward=%.3fs)",
             step + 1,
             eval_loss,
             weight_sum,
             batches,
             self.eval_batch_size,
+            eval_time,
+            timer.phases["build"],
+            timer.phases["forward"],
         )
-        self.wandb_logger.log_eval(step + 1, {"loss": eval_loss})
+        self.wandb_logger.log_eval(
+            step + 1,
+            {
+                "loss": eval_loss,
+                "time_s": eval_time,
+                **{f"{name}_time_s": seconds for name, seconds in timer.phases.items()},
+            },
+        )
         return eval_loss
 
     def _pad_to_dp(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -163,15 +213,28 @@ class SFTTrainer(BaseTrainer):
         self._init_wandb(num_rollouts=num_steps)
         try:
             if self.eval_interval > 0:
-                self.evaluate(step=-1)
+                self.evaluate(step=-1)  # baseline eval-loss at step 0
             for step in range(start_step, num_steps):
-                t0 = time.perf_counter()
+                timer = PhaseTimer()
                 training_progress = step / max(1, num_steps - 1)
-                records = self.data_source.get_samples(self.batch_size)
-                result = self.train_step(records, training_progress=training_progress)
-                dt = time.perf_counter() - t0
+                with timer.phase("data"):
+                    if self.prefetch_next_batch and step > start_step:
+                        records = self.data_source.commit_peeked_batch()
+                    else:
+                        records = self.data_source.get_samples(self.batch_size)
+                    prefetch_records = None
+                    if self.prefetch_next_batch and step + 1 < num_steps:
+                        prefetch_records = self.data_source.peek_next_batch(self.batch_size)
+                result = self.train_step(
+                    records,
+                    training_progress=training_progress,
+                    prefetch_records=prefetch_records,
+                )
+                timer.phases.update(self._step_timer.phases)
+                dt = timer.total()
                 logger.info(
-                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  %.1fs",
+                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  "
+                    "%.1fs (data=%.3fs build=%.3fs prefetch=%.3fs train=%.3fs)",
                     step + 1,
                     num_steps,
                     result.loss,
@@ -179,6 +242,10 @@ class SFTTrainer(BaseTrainer):
                     result.lr,
                     self.data_source.epoch,
                     dt,
+                    timer.phases["data"],
+                    timer.phases["build"],
+                    timer.phases["prefetch"],
+                    timer.phases["train"],
                 )
                 self.wandb_logger.log_step(
                     step + 1,
@@ -188,6 +255,7 @@ class SFTTrainer(BaseTrainer):
                         "train/lr": result.lr,
                         "train/epoch": self.data_source.epoch,
                         "perf/step_time_s": dt,
+                        **{f"perf/{name}_time_s": seconds for name, seconds in timer.phases.items()},
                         **{f"train/{k}": v for k, v in dict(result.metrics).items()},
                     },
                     prefix="",
