@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from accelerate import init_empty_weights
 from torch import nn
@@ -61,6 +62,29 @@ def test_hf_checkpoint_renaming_uses_model_rules_for_plain_and_fsdp_classes() ->
     model.__class__ = type(f"FSDP{original_cls.__name__}", (FSDPModule, original_cls), {})
     renamed = _remap_hf_checkpoint_keys(stale_state, model)
     assert set(renamed) == {language_key, vision_key}
+
+
+def test_hf_checkpoint_renaming_does_not_pre_gate_model_aware_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from transformers import conversion_mapping
+
+    model = _tiny_qwen_vl()
+    model_keys = set(model.state_dict())
+    language_key = next(key for key in model_keys if key.startswith("model.language_model."))
+    vision_key = next(key for key in model_keys if key.startswith("model.visual."))
+    stale_state = {
+        language_key.replace("model.language_model.", "model.", 1): object(),
+        vision_key.replace("model.visual.", "visual.", 1): object(),
+    }
+    model_rules = conversion_mapping.get_model_conversion_mapping(model, add_legacy=True)
+    # Transformers 5.11 moved Qwen2.5-VL's rules from the model-type lookup to
+    # a class-keyed converter. Simulate that registration shape under the 5.6
+    # CI pin so reintroducing a model-type pre-gate is caught there as well.
+    monkeypatch.setattr(conversion_mapping, "get_checkpoint_conversion_mapping", lambda _model_type: None)
+    monkeypatch.setattr(conversion_mapping, "get_model_conversion_mapping", lambda *_args, **_kwargs: model_rules)
+
+    assert set(_remap_hf_checkpoint_keys(stale_state, model)) == {language_key, vision_key}
 
 
 def test_meta_init_capture_survives_materialization() -> None:
