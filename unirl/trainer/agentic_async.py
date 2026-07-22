@@ -8,7 +8,7 @@ GPU). ``AsyncAgenticTrainer`` places training and rollout on **disjoint GPU slab
 multi-turn generation with training.
 
 Mechanism vs policy (LIN-531): the **engine** exposes a ``submit`` / ``poll`` /
-``abort`` / ``drained`` interface over a background drain (see
+``finalize_if_drained`` / ``abort`` interface over a background drain (see
 :class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`); this **trainer**
 owns the *policy* —
 
@@ -19,8 +19,9 @@ owns the *policy* —
 * **Consumer** — drain the freshest ``batch_size`` complete groups (within
   ``buffer_max_staleness``), reward + GRPO advantage + one optimizer step (reusing
   :class:`AgenticTrainer`'s helpers), then **quiesce + sync**: ``abort`` the in-flight
-  tail at a turn boundary (partial rollout — the producer resumes it next ``submit``),
-  ``weight_sync.sync()``, bump the version.
+  tail at a turn boundary, apply the configured ``tail_policy`` (carry only when the
+  environment can resume from the ``Sample``; otherwise drop), ``weight_sync.sync()``,
+  bump the version.
 
 ONE single-threaded loop (the ``AsyncARTrainer`` shape): with disjoint slabs the
 rollout slab keeps generating in the background (the engine's per-worker drain) while
@@ -40,8 +41,9 @@ from __future__ import annotations
 
 import inspect
 import logging
+import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -102,6 +104,17 @@ class _GroupAssembler:
         here; their unfinished siblings are carried by the trainer for resume)."""
         return set(self._by_root)
 
+    def discard_roots(self, roots: Iterable[str]) -> int:
+        """Drop incomplete buckets for abandoned roots.
+
+        Returns the number of terminal sibling trajectories that were being held
+        while the other siblings were still in flight.
+        """
+        discarded = 0
+        for root in set(roots):
+            discarded += len(self._by_root.pop(root, []))
+        return discarded
+
     def size(self) -> int:
         return len(self._by_root)
 
@@ -118,6 +131,7 @@ class _GroupBuffer:
 
     def __init__(self) -> None:
         self._items: List[Tuple[List[Sample], int, int]] = []  # (group, weight_version, gen_id)
+        self._evicted: List[List[Sample]] = []
 
     def put(self, group: List[Sample], *, weight_version: int, gen_id: int) -> None:
         self._items.append((list(group), int(weight_version), int(gen_id)))
@@ -138,12 +152,23 @@ class _GroupBuffer:
         then waits for the producer to fill more).
         """
         if max_staleness is not None and current_version is not None:
-            self._items = [it for it in self._items if current_version - it[1] <= max_staleness]
+            kept: List[Tuple[List[Sample], int, int]] = []
+            for item in self._items:
+                if current_version - item[1] <= max_staleness:
+                    kept.append(item)
+                else:
+                    self._evicted.append(item[0])
+            self._items = kept
         if len(self._items) < n:
             return None
         self._items.sort(key=lambda it: it[2], reverse=True)  # freshest gen_id first
         picked, self._items = self._items[:n], self._items[n:]
         return [grp for grp, _, _ in picked]
+
+    def pop_evicted_groups(self) -> List[List[Sample]]:
+        """Return and clear groups rejected by the latest staleness checks."""
+        evicted, self._evicted = self._evicted, []
+        return evicted
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +206,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
         train_fraction: float = 0.5,
         oversample_batch_size: Optional[int] = None,
         buffer_max_staleness: Optional[int] = None,
+        tail_policy: Literal["carry", "drop"] = "carry",
     ) -> None:
         # Call BaseTrainer.__init__ directly: AgenticTrainer.__init__ → ARTrainer.__init__
         # opens the colocate ``placement(fraction=1.0)`` block we replace with two slabs.
@@ -201,7 +227,14 @@ class AsyncAgenticTrainer(AgenticTrainer):
         # ---- async state ----
         self._train_fraction = float(train_fraction)
         self._buffer_max_staleness = buffer_max_staleness
+        self._tail_policy = str(tail_policy)
+        if self._tail_policy not in ("carry", "drop"):
+            raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
         self._weight_version = 0
+        self._carried_tail_trajectories = 0
+        self._dropped_tail_trajectories = 0
+        self._dropped_tail_roots = 0
+        self._discarded_completed_trajectories = 0
         # root id -> ground-truth answer, recorded at submit time so the reward judge
         # never depends on the engine preserving root-Part metadata through a (possibly
         # resumed) trajectory. Carried partials keep the root id they were submitted
@@ -288,19 +321,69 @@ class AsyncAgenticTrainer(AgenticTrainer):
 
     def _submit_drive(self, carried: List[Sample], rollout_id: int) -> None:
         """Submit a fresh over-sampled drive (non-blocking). Call only when the prior
-        drive is ``drained``/``abort``ed (else two drains would double-pull)."""
+        drive is finalized/``abort``ed (else two drains would double-pull)."""
         self.rollout.submit(self._build_tasks(carried, rollout_id))
 
-    def _pump(self) -> int:
-        """Poll completed trajectories into the assembler, promote complete groups into
-        the buffer. Returns the number of newly-completed trajectories."""
-        completed = self.rollout.poll()[0]
+    def _ingest_completed(self, completed: List[Sample]) -> int:
+        """Ingest terminal trajectories and promote newly complete groups."""
         if completed:
             self._assembler.add_completed(completed)
             for group in self._assembler.pop_complete_groups():
                 self._buffer.put(group, weight_version=self._weight_version, gen_id=self._gen_id)
                 self._gen_id += 1
         return len(completed)
+
+    def _pump(self) -> int:
+        """Poll completed trajectories into the assembler and buffer."""
+        return self._ingest_completed(self.rollout.poll()[0])
+
+    def _apply_tail_policy(self, carried: List[Sample], rollout_id: int) -> List[Sample]:
+        """Keep resumable tails or purge all state belonging to dropped roots."""
+        if self._tail_policy == "carry":
+            self._carried_tail_trajectories += len(carried)
+            logger.info("rollout %d async: carry tail=%d trajectories", rollout_id, len(carried))
+            return carried
+
+        roots = {self._assembler.root_of(sample) for sample in carried}
+        discarded_completed = self._assembler.discard_roots(roots)
+        for root in roots:
+            self._gt_by_root.pop(root, None)
+        self._dropped_tail_trajectories += len(carried)
+        self._dropped_tail_roots += len(roots)
+        self._discarded_completed_trajectories += discarded_completed
+        logger.info(
+            "rollout %d async: drop tail=%d trajectories across %d roots; discarded %d completed siblings",
+            rollout_id,
+            len(carried),
+            len(roots),
+            discarded_completed,
+        )
+        return []
+
+    def _log_tail_metrics(self, rollout_step: int) -> None:
+        """Emit tail counters after abort/policy, including the final step."""
+        self.wandb_logger.log_rollout(
+            rollout_step,
+            {
+                "async/carried_tail_trajectories": self._carried_tail_trajectories,
+                "async/dropped_tail_trajectories": self._dropped_tail_trajectories,
+                "async/dropped_tail_roots": self._dropped_tail_roots,
+                "async/discarded_completed_trajectories": self._discarded_completed_trajectories,
+                "async/assembler_pending_roots": self._assembler.size(),
+            },
+        )
+
+    def _drain_buffer(self, n: int, *, max_staleness: int) -> Optional[List[List[Sample]]]:
+        """Drain fresh groups and forget ground truth for stale evictions."""
+        picked = self._buffer.drain_freshest(
+            n,
+            current_version=self._weight_version,
+            max_staleness=max_staleness,
+        )
+        for group in self._buffer.pop_evicted_groups():
+            if group:
+                self._gt_by_root.pop(self._assembler.root_of(group[0]), None)
+        return picked
 
     def _next_batch(self, rollout_id: int) -> List[List[Sample]]:
         """Pump the producer until the buffer holds ``batch_size`` complete groups within
@@ -311,23 +394,30 @@ class AsyncAgenticTrainer(AgenticTrainer):
         refills = 0
         while True:
             self._pump()
-            picked = self._buffer.drain_freshest(
-                self.batch_size, current_version=self._weight_version, max_staleness=stale
-            )
+            picked = self._drain_buffer(self.batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
-            if self.rollout.drained()[0]:
-                refills += 1
-                if refills > self._MAX_REFILLS:
-                    raise RuntimeError(
-                        f"async-agentic rollout {rollout_id}: buffer underflow after {refills} refills "
-                        f"(buffer={self._buffer.size()} < batch={self.batch_size}); raise "
-                        f"oversample_batch_size or buffer_max_staleness."
-                    )
-                self._submit_drive(self._pending_carried, rollout_id)
-                self._pending_carried = []
-            else:
+            completed = self.rollout.finalize_if_drained()[0]
+            if completed is None:
                 time.sleep(self._POLL_INTERVAL_S)  # in-flight drive still generating; back off
+                continue
+
+            # Atomic engine finalization joins the drain and returns its last
+            # completions before a new submit is allowed to reset worker buffers.
+            self._ingest_completed(completed)
+            picked = self._drain_buffer(self.batch_size, max_staleness=stale)
+            if picked is not None:
+                return picked
+
+            refills += 1
+            if refills > self._MAX_REFILLS:
+                raise RuntimeError(
+                    f"async-agentic rollout {rollout_id}: buffer underflow after {refills} refills "
+                    f"(buffer={self._buffer.size()} < batch={self.batch_size}); raise "
+                    f"oversample_batch_size or buffer_max_staleness."
+                )
+            self._submit_drive(self._pending_carried, rollout_id)
+            self._pending_carried = []
 
     # ------------------------------------------------------------------
     # Consumer — reward + GRPO advantage + one optimizer step over a group batch
@@ -347,6 +437,8 @@ class AsyncAgenticTrainer(AgenticTrainer):
         roots = [tr.parts[0].sample_ids[0] for tr in trajs]
         request = Sample.request(Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots]))
         rewards, group_ids = self._rewards_and_groups(request, trajs, rollout_id)
+        for root in set(roots):
+            self._gt_by_root.pop(root, None)
         finite = torch.isfinite(rewards)
         mean_reward = float(rewards[finite].mean().item()) if bool(finite.any()) else 0.0
         advantages = self._group_advantages(rewards, group_ids)
@@ -381,6 +473,11 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 "async/buffer_groups": self._buffer.size(),
                 "async/weight_version": self._weight_version,
                 "async/version_span": (max(versions) - min(versions)) if versions else 0,
+                "async/assembler_pending_roots": self._assembler.size(),
+                "async/carried_tail_trajectories": self._carried_tail_trajectories,
+                "async/dropped_tail_trajectories": self._dropped_tail_trajectories,
+                "async/dropped_tail_roots": self._dropped_tail_roots,
+                "async/discarded_completed_trajectories": self._discarded_completed_trajectories,
             },
         )
         self._reset_transport_buffers()
@@ -415,6 +512,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 "buffer_max_staleness": stale,
                 "oversample_batch_size": self._oversample,
                 "train_fraction": self._train_fraction,
+                "tail_policy": self._tail_policy,
                 "weight_sync_interval": interval,
             },
         )
@@ -424,9 +522,10 @@ class AsyncAgenticTrainer(AgenticTrainer):
         self._pending_carried: List[Sample] = []
         self._gen_id = start_rollout
 
-        if start_rollout and self.weight_sync is not None:
+        if start_rollout < num_rollouts and start_rollout and self.weight_sync is not None:
             self.weight_sync.sync()  # push restored weights into the fresh engine
-        self._submit_drive(carried=[], rollout_id=start_rollout)  # prime the first drive
+        if start_rollout < num_rollouts:
+            self._submit_drive(carried=[], rollout_id=start_rollout)  # prime the first drive
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
@@ -444,8 +543,11 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 if need_save or need_sync:
                     # ONE turn-boundary quiesce for both: checkpoint the in-flight tail so
                     # the engine is decode-idle (safe to sync / save), then resume it.
-                    carried = self.rollout.abort()[0]
+                    checkpointed = self.rollout.abort()[0]
                     self._pump()  # grab trajectories that completed DURING the quiesce (before submit resets)
+                    carried = self._apply_tail_policy(checkpointed, rollout_id)
+                    if checkpointed:
+                        self._log_tail_metrics(step)
                     if need_save:
                         self.maybe_save_checkpoint(
                             rollout_id,
@@ -457,7 +559,20 @@ class AsyncAgenticTrainer(AgenticTrainer):
                     if need_sync:
                         self.weight_sync.sync()
                         self._weight_version += 1
-                    self._submit_drive(carried=carried, rollout_id=step)  # resume carried + fresh
+                    if step < num_rollouts:
+                        self._submit_drive(carried=carried, rollout_id=step)  # resume safe tails + fresh
         finally:
-            self.rollout.abort()  # stop the resident drive; leak no drives
-            self._finish_wandb()
+            active_error = sys.exc_info()[0] is not None
+            try:
+                checkpointed = self.rollout.abort()[0]  # stop the resident drive; leak no drives
+                self._pump()
+                self._apply_tail_policy(checkpointed, num_rollouts)
+                if checkpointed:
+                    self._log_tail_metrics(num_rollouts)
+            except BaseException:  # noqa: BLE001 — preserve an active training failure
+                if active_error:
+                    logger.warning("AsyncAgenticTrainer cleanup failed", exc_info=True)
+                else:
+                    raise
+            finally:
+                self._finish_wandb()

@@ -72,7 +72,9 @@ the newly synchronized weights. This works only when `Environment.reset(partial)
 existing chain and the environment can recover any required state. Stateless `ToolEnvironment`
 does this. `StatefulTool` sessions and `AlfworldEnv` episodes are closed at checkpoint teardown and
 their reset paths start fresh state, so their current recipes must drop the interrupted tail rather
-than carry it unless the environment supplies its own resumable state.
+than carry it unless the environment supplies its own resumable state. Full stateful resume is
+deferred: it also requires keeping resource ownership on the same worker (or serializing it), plus
+an explicit release path for abandoned tails; disabling checkpoint teardown alone is not sufficient.
 
 ## Included environments and tools
 

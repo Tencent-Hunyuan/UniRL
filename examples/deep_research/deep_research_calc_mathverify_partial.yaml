@@ -4,8 +4,9 @@
 # synchronous partial-rollout sibling of deep_research_calc_mathverify.yaml (barrier AgenticTrainer):
 # over-samples `oversample_batch_size` prompt-groups, commits the freshest `batch_size` complete GRPO
 # groups, and `abort`s the in-flight tail at a turn boundary — `tail_policy: carry` re-submits it next
-# round (ToolEnvironment is history-preserving, so it RESUMES). Cuts the straggler while keeping all
-# GPUs for generation; the per-token rollout-anchored ratio corrects the (bounded) off-policy tail.
+# round because this recipe's CalculatorTool is stateless and its Sample preserves the conversation.
+# Cuts the straggler while keeping all GPUs for generation; the per-token rollout-anchored ratio
+# corrects a carried trajectory even when its turns span multiple weight versions.
 #
 # Run (single node):
 #   QWEN3_INSTRUCT_PATH=/path/to/Qwen3 DATA_PATH=data/calc_math/train.jsonl \
@@ -20,8 +21,8 @@ eval_interval: 0 # agentic eval not implemented (AgenticTrainer.evaluate raises)
 
 # ---- partial-rollout knobs (LIN-531) ----
 oversample_batch_size: 6 # generate 6 prompt-groups/drive; commit the freshest 4 → 2 slow groups carried
-buffer_max_staleness: 1 # a buffered/carried group may cross up to 1 weight sync before eviction
-tail_policy: carry # ToolEnvironment resumes a carried partial (history-preserving)
+buffer_max_staleness: 1 # a completed buffered group may cross up to 1 weight sync before eviction
+tail_policy: carry # CalculatorTool is stateless; the Sample contains all state needed to resume
 
 # Colocate partial oversubscribes rank 0: its own run_drain + every worker's next_task pull +
 # the poll→drain_completed fan + submit/abort/sync all ride these threaded-actor slots. Give it

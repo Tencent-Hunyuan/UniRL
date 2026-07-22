@@ -118,9 +118,12 @@ workflow families are included:
 | Deep-research tools and judging | `train_deep_research`, `train_partial_deep_research`, `train_async_deep_research` | [`examples/deep_research/`](examples/deep_research/) |
 
 The base entrypoint waits for a complete rollout batch. The `partial` variant
-keeps training and rollout colocated while carrying unfinished trajectories into
-later drains. The `async` variant places training and rollout on separate GPU
-slabs and overlaps their producer/consumer loops.
+keeps training and rollout colocated, while the `async` variant places training
+and rollout on separate GPU slabs and overlaps their producer/consumer loops.
+Both use an explicit tail policy: stateless tool trajectories may be carried when
+their `Sample` contains everything needed to resume, while ALFWorld episodes and
+stateful tool sessions must currently be dropped. Cross-worker stateful resume is
+deferred until its resource ownership and teardown contract is implemented.
 
 See the [agent-loop guide](unirl/rollout/loop/README.md) for the environment,
 tool, trajectory, and partial-resume contracts.

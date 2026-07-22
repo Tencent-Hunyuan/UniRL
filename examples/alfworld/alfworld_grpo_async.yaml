@@ -3,10 +3,11 @@
 # The async sibling of alfworld_grpo.yaml (colocate AgenticEnvTrainer barrier). ALFWorld
 # episodes are variable-depth (2 vs 15 turns), so the synchronous barrier waits for the
 # slowest episode each round; this async recipe overlaps generation with training on
-# disjoint slabs, trains the FRESHEST complete GRPO groups (oversample > batch → the slow
-# games are carried, not waited on), and checkpoints the in-flight tail at a turn boundary
-# on each NCCL weight sync (partial rollout). Same env + reward SOURCE as the baseline;
-# only the trainer/placement/sync differ — so a head-to-head SPEED comparison is clean.
+# disjoint slabs, trains the FRESHEST complete GRPO groups (oversample > batch), and
+# checkpoints the in-flight tail at a turn boundary on each NCCL weight sync (partial
+# rollout). ALFWorld episodes are worker-local and checkpoint teardown closes them, so
+# this recipe DROPS interrupted tails instead of pretending they can resume. Same env +
+# reward SOURCE as the baseline; only the trainer/placement/sync differ.
 #
 # Prerequisites (on the pod): QWEN3_INSTRUCT_PATH, ALFWORLD_DATA (alfworld-download),
 #   DATA_PATH (python -m unirl.utils.prepare_alfworld --out-dir data/alfworld).
@@ -23,8 +24,9 @@ eval_interval: 0
 
 # ---- async / disaggregation knobs (LIN-531) ----
 train_fraction: 0.5 # 4 train GPUs (FSDP) + 4 rollout GPUs (resident agentic engine)
-oversample_batch_size: 12 # generate 12 games/drive; train the freshest 8 → 4 slow games carried, not awaited
+oversample_batch_size: 12 # generate 12 games/drive; train the freshest 8 without waiting for every slow game
 buffer_max_staleness: 2 # bounded off-policy: a buffered group may cross up to 2 syncs
+tail_policy: drop # ALFWorld reset creates a fresh episode; interrupted stateful tails cannot resume
 
 worker_max_concurrency: 8
 stop: null # ALFWorld actions are free text; rely on per-turn max_new_tokens
@@ -37,7 +39,7 @@ logging:
   project_name: unirl-alfworld
   run_name: alfworld_grpo_qwen3_async
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [alfworld, agentic, multi-turn, env-reward, grpo, qwen3, async, partial-rollout, lin-531]
+  tags: [alfworld, agentic, multi-turn, env-reward, grpo, qwen3, async, partial-rollout, drop, lin-531]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -85,7 +87,7 @@ backend:
 rollout:
   # Multi-turn agentic engine driving a STATEFUL per-episode ALFWorld env, DISAGGREGATED
   # (owns its own GPU slab, stays resident). partial_rollout=true → the in-flight tail is
-  # checkpointed at a turn boundary on each weight sync and resumed under new weights.
+  # checkpointed at a turn boundary on each weight sync and then dropped by the trainer.
   _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
   config:
     _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig

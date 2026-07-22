@@ -64,8 +64,8 @@ The current trainer surface is:
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
 | `RewardBackpropTrainer` | differentiable image reward → policy step | ReFL/DRaFT-K path; no rollout engine, `Sample`, GRPO advantage, replay ratio, or weight sync. |
 | `AgenticTrainer` / `AgenticEnvTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Barrier multi-turn tool use. The base variant scores terminal answers; the env variant consumes per-trajectory environment returns. |
-| `AgenticPartialTrainer` / `AgenticEnvPartialTrainer` | freshest complete trajectory groups → concatenated turn `Part` | Colocated over-sample/commit/abort loop. `carry` resumes a history-preserving tail; `drop` is for stateful environments that restart episodes. |
-| `AsyncAgenticTrainer` / `AsyncAgenticEnvTrainer` | buffered complete trajectory groups → concatenated turn `Part` | Disaggregated train/rollout slabs, resident agentic drive, and weight-version staleness control. |
+| `AgenticPartialTrainer` / `AgenticEnvPartialTrainer` | freshest complete trajectory groups → concatenated turn `Part` | Colocated over-sample/commit/abort loop. `carry` is for Sample-resumable stateless tools; `drop` purges tails from stateful environments that restart episodes. |
+| `AsyncAgenticTrainer` / `AsyncAgenticEnvTrainer` | buffered complete trajectory groups → concatenated turn `Part` | Disaggregated train/rollout slabs, resident agentic drive, weight-version staleness control, and the same explicit `carry`/`drop` tail policy. |
 
 **Extending it:** a new domain is a new `<Domain>Trainer(BaseTrainer)` that builds its
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the

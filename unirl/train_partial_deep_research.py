@@ -5,7 +5,7 @@ Drives :class:`unirl.trainer.agentic_partial.AgenticPartialTrainer` — the colo
 partial-rollout sibling of ``train_deep_research`` (barrier `AgenticTrainer`). Train and rollout
 still time-share each GPU; the trainer over-samples, commits the freshest `batch_size` complete
 GRPO groups, and checkpoints the in-flight tail at a turn boundary (carried and resumed next round
-for history-preserving tool envs) instead of waiting for the slowest trajectory.
+for this recipe's stateless CalculatorTool) instead of waiting for the slowest trajectory.
 
 Launch (single node; rank 0 owns the driver + the agentic coordinator):
   QWEN3_INSTRUCT_PATH=... DATA_PATH=data/calc_math/train.jsonl \

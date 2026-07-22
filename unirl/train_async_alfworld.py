@@ -6,7 +6,9 @@ disaggregated producer/consumer sibling of ``train_alfworld`` (AgenticEnvTrainer
 ALFWorld's variable-depth episodes (2 vs 15 turns) are the workload the partial-rollout
 overlap targets: the async trainer overlaps generation with training on disjoint slabs
 and checkpoints the in-flight tail at a turn boundary on each weight sync, instead of a
-full barrier that waits for the slowest episode.
+full barrier that waits for the slowest episode. ``tail_policy=drop`` is required because
+an ALFWorld episode is worker-local state and cannot currently resume from a carried
+``Sample`` after checkpoint teardown.
 
 Launch (single node, whole 8-GPU node; train_fraction=0.5 -> 4 train + 4 rollout):
   QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
@@ -44,6 +46,7 @@ def main(cfg: DictConfig) -> None:
         train_fraction=cfg.get("train_fraction", 0.5),
         oversample_batch_size=cfg.get("oversample_batch_size"),
         buffer_max_staleness=cfg.get("buffer_max_staleness"),
+        tail_policy=cfg.get("tail_policy", "drop"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

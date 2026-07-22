@@ -7,8 +7,9 @@
 #
 # Partial rollout: on each weight sync the trainer abort()s the in-flight tail at a
 # TURN boundary (single-version Parts), syncs, and resumes the carried partials under
-# the new weights. buffer_max_staleness bounds how many syncs a buffered group may
-# cross; the per-token rollout-anchored ratio corrects the off-policy gap.
+# the new weights. This is safe here because CalculatorTool is stateless and the Sample
+# contains the whole conversation. StatefulTool sessions must use tail_policy=drop until
+# cross-worker stateful resume is implemented. buffer_max_staleness bounds staleness.
 #
 # Data: same arithmetic-word-problem jsonl as the colocate recipe
 #   {"prompt": "... put the final answer in <answer>...</answer>.", "metadata": {"answer": "7006652"}}
@@ -33,6 +34,7 @@ oversample_batch_size: 8
 # Off-policy staleness budget: a buffered complete group may be up to this many weight
 # syncs old before it is evicted. 0 = on-policy (ratio≈1); >0 = bounded off-policy.
 buffer_max_staleness: 1
+tail_policy: carry # CalculatorTool is stateless; the carried Sample is sufficient to resume exactly
 
 # rank-0 coordinator runs the background drain + serves next_task pulls + the
 # poll/abort/drained control RPCs concurrently on a threaded Worker — needs >=3.
@@ -50,7 +52,7 @@ logging:
   project_name: unirl-deep-research
   run_name: deepresearch_calc_mathverify_qwen3_async
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [deep-research, agentic, calculator, mathverify, qwen3, async, partial-rollout, lin-531]
+  tags: [deep-research, agentic, calculator, mathverify, qwen3, async, partial-rollout, carry, lin-531]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -99,7 +101,7 @@ rollout:
   # Multi-turn agentic engine, DISAGGREGATED: owns its own GPU slab and stays RESIDENT
   # (no sleep()/wake_up()). The rank-0 coordinator drives a background drain the trainer
   # reaps (poll) and interrupts (abort). partial_rollout=true enables the turn-boundary
-  # checkpoint/resume on each weight sync.
+  # checkpoint/resume on each weight sync for this stateless CalculatorTool recipe.
   _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
   config:
     _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig
