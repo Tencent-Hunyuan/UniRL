@@ -30,6 +30,7 @@ model_config:
   model_precision: bf16
   shift: 5.0
   max_sequence_length: 512
+  load_vae: false
   # sglang loads a FULL transformer (NOT LoRA layers): the LoRA-merged sync pushes
   # merged base weights, so the engine must not also apply an online adapter.
   # The trainside still trains LoRA via backend.lora_cfg (peft) — independent of

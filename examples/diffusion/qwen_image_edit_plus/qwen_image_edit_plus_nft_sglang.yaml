@@ -57,6 +57,7 @@ model_config:
   # engine encodes; the trainer replays captured conditions) and its
   # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
   load_text_encoder: false
+  load_vae: false
   # Static-shift fallback; the real checkpoint enables dynamic shifting via
   # scheduler/scheduler_config.json and this value is ignored at runtime.
   shift: 3.0

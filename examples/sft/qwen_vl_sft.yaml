@@ -1,0 +1,101 @@
+# @package _global_
+# SFT — Qwen2.5-VL instruction tuning (VLM path: image + prompt → response).
+#
+# Same track builder/algorithm as the LLM recipe — the VLM delta lives entirely in the
+# model package (QwenVLChatTemplateStage handles image expansion + M-RoPE);
+# ARSupervisedTrackBuilder feeds it role="condition" images from the manifest.
+#
+# Env:
+#   QWEN_VL_PATH    HF id or local checkpoint (default Qwen/Qwen2.5-VL-7B-Instruct)
+#   SFT_DATA        train manifest (.jsonl rows: {"prompt", "response",
+#                   "media": [{"modality": "image", "role": "condition", "uri": ...}]})
+#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#
+# Data prep (HF llava-instruct sample):
+#   python -m unirl.utils.prepare_sft_vlm --out-dir data/sft_vlm
+#
+# Launch:
+#   ENTRY=train_sft SFT_DATA=data/sft_vlm/train.jsonl SFT_EVAL_DATA=data/sft_vlm/val.jsonl \
+#   bash examples/run_experiment_single_node.sh sft/qwen_vl_sft
+
+num_devices: 8
+batch_size: 32
+num_steps: 200
+eval_interval: 20
+eval_batch_size: 16
+eval_num_samples: -1        # -1 = full eval set
+save_interval: 0
+save_mode: auto
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-sft
+  run_name: qwen_vl_sft
+  entity: null
+  tags: [sft, qwen-vl, vlm]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    model_precision: bf16
+    attn_implementation: flash_attention_2
+    freeze_vision_tower: true       # train the LLM only; ViT frozen
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+
+pipeline:
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32              # bf16-loaded base: fp32 trainable master + Adam states
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false # bundle already enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: cosine
+    warmup_steps: 10
+    total_steps: ${num_steps}
+
+algorithm:
+  _target_: unirl.algorithms.sft.SFT
+  stage_attr: ar
+  loss_agg_mode: token-mean
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1               # multimodal AR forward is heavy (full-logits padded path)
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
+  max_response_length: 1024
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42
