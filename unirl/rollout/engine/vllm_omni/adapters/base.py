@@ -172,15 +172,14 @@ class ModelAdapter(ABC):
         # adapters that actually run one. AR-only adapters (``needs_sigmas`` is
         # False) never call :meth:`schedule_policy`, so requiring a diffusion
         # ``model_config.shift`` from them is spurious.
-        if not self.needs_sigmas:
-            return
-        mc = self.model_config
-        require(
-            mc is not None and hasattr(mc, "shift"),
-            f"{type(self).__name__} requires model_config.shift; got "
-            f"{type(mc).__name__}. Use a registered model preset "
-            f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
-        )
+        if self.needs_sigmas:
+            mc = self.model_config
+            require(
+                mc is not None and hasattr(mc, "shift"),
+                f"{type(self).__name__} requires model_config.shift; got "
+                f"{type(mc).__name__}. Use a registered model preset "
+                f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
+            )
 
     # ---- per-request validation (ports v1 ``_validate_request``) ----
     def validate_request(self, req: RolloutReq) -> None:
