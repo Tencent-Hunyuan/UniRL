@@ -413,10 +413,14 @@ class BagelPipeline(Pipeline):
         task = (sample.parts[0].control or {}).get("task")
         if task is not None:
             return str(task)
-        has_ar = any(isinstance(p.sampling_params, ARSamplingParams) for p in sample.parts)
-        has_diff = any(isinstance(p.sampling_params, DiffusionSamplingParams) for p in sample.parts)
+        frontier_params = sample.parts[-1].sampling_params
+        has_ar = isinstance(frontier_params, ARSamplingParams)
+        has_diff = isinstance(frontier_params, DiffusionSamplingParams)
+        has_current_ar_prelude = (
+            has_diff and len(sample.parts) >= 2 and isinstance(sample.parts[-2].sampling_params, ARSamplingParams)
+        )
         has_image = any("image" in p.primitives for p in sample.parts[:-1])
-        if has_ar and has_diff:
+        if has_current_ar_prelude:
             return "t2ti"
         if has_ar:
             return "it2t" if has_image else "t2t"
@@ -438,7 +442,7 @@ class BagelPipeline(Pipeline):
 
     def _generate_image(self, sample: Sample, task: str) -> Sample:
         """Run BAGEL image-out (t2i / it2i) per-sample and fill the diffusion gen Part."""
-        frontier = sample.gen_part(DiffusionSamplingParams)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
         params = frontier.sampling_params
         if not isinstance(params, BagelDiffusionParams):
             raise TypeError(
@@ -486,7 +490,7 @@ class BagelPipeline(Pipeline):
         )
 
         filled = frontier.fill(segment=segment, primitives={"image": images}, conditions=conditions.to_dict())
-        return sample.with_parts([*sample.parts[:-1], filled])
+        return sample.replace_frontier(filled)
 
     def _diffuse_and_decode(
         self,
@@ -584,7 +588,7 @@ class BagelPipeline(Pipeline):
         ``understanding_output=True``): image ingested ViT-only, then the
         prompt text; ``BagelARStage`` owns prefill + decode + replay.
         """
-        frontier = sample.gen_part(ARSamplingParams)
+        frontier = sample.frontier_gen_part(ARSamplingParams)
         ar_params = frontier.sampling_params
         if ar_params is None:
             raise TypeError(f"BagelPipeline.generate ({task}): gen Part must carry ARSamplingParams")
@@ -629,7 +633,7 @@ class BagelPipeline(Pipeline):
         decoded = self._detokenize(segment)
 
         filled = frontier.fill(segment=segment, primitives={"text": decoded}, conditions=conditions.to_dict())
-        return sample.with_parts([*sample.parts[:-1], filled])
+        return sample.replace_frontier(filled)
 
     def _detokenize(self, segment: TextSegment) -> Texts:
         """Decode packed response tokens to strings, stripped at ``<|im_end|>``.
@@ -680,12 +684,20 @@ class BagelPipeline(Pipeline):
 
     def _generate_t2ti(self, sample: Sample) -> Sample:
         """Run the pre-forked P → P*N → P*N*M think-then-generate lineage."""
-        ar_idx = sample.gen_part_index(ARSamplingParams)
-        image_idx = sample.gen_part_index(DiffusionSamplingParams)
-        if ar_idx >= image_idx:
-            raise ValueError("BagelPipeline.generate (t2ti): the AR Part must precede the diffusion Part")
+        if len(sample.parts) < 2:
+            raise ValueError("BagelPipeline.generate (t2ti): expected trailing [AR, diffusion] generation Parts")
+        ar_idx = len(sample.parts) - 2
+        image_idx = len(sample.parts) - 1
         ar_part = sample.parts[ar_idx]
         image_part = sample.parts[image_idx]
+        if not isinstance(ar_part.sampling_params, ARSamplingParams) or not isinstance(
+            image_part.sampling_params, DiffusionSamplingParams
+        ):
+            raise ValueError(
+                "BagelPipeline.generate (t2ti): expected the current trailing Parts to be "
+                f"[ARSamplingParams, DiffusionSamplingParams], got "
+                f"[{type(ar_part.sampling_params).__name__}, {type(image_part.sampling_params).__name__}]"
+            )
         ar_params = ar_part.sampling_params
         diff_params = image_part.sampling_params
         if not isinstance(diff_params, BagelDiffusionParams):

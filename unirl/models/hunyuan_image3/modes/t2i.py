@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2i — single-stage text-to-image, filling the frontier (pre-forked) gen Part."""
-    frontier = sample.gen_part(DiffusionSamplingParams)
+    frontier = sample.frontier_gen_part(DiffusionSamplingParams)
     params = frontier.sampling_params
     if params.sigmas is None:
         raise ValueError(

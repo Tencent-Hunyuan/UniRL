@@ -54,6 +54,31 @@ from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
+
+def _trailing_gen_parts(sample: Sample, *params_types: type, caller: str) -> Tuple[Part, ...]:
+    """Validate and return the current generation-stage suffix.
+
+    HI3 has both one-stage ``[..., AR]`` / ``[..., Diffusion]`` requests and
+    two-stage ``[..., AR, Diffusion]`` requests. Matching from the whole
+    trajectory would select an earlier agent turn when either type repeats.
+    """
+    count = len(params_types)
+    if len(sample.parts) < count:
+        raise ValueError(f"{caller}: expected {count} trailing generation Parts, got {len(sample.parts)} total Parts")
+    start = len(sample.parts) - count
+    trailing = tuple(sample.parts[start:])
+    for offset, (part, params_type) in enumerate(zip(trailing, params_types)):
+        index = start + offset
+        if not part.is_gen:
+            raise ValueError(f"{caller}: trailing Part at index {index} is not generated")
+        if not isinstance(part.sampling_params, params_type):
+            raise ValueError(
+                f"{caller}: trailing Part at index {index} has sampling_params of type "
+                f"{type(part.sampling_params).__name__}, expected {params_type.__name__}"
+            )
+    return trailing
+
+
 # --------------------------------------------------------------------------- #
 # Chat-template prompt construction
 # --------------------------------------------------------------------------- #
@@ -293,6 +318,27 @@ class Hi3InputAdapter:
                 return f"{self.bot_task_base}_{bot_task}", sys_type
         return self.task_key, sys_type
 
+    def _stage_parts(self, sample: Sample) -> Tuple[Part, Optional[Part]]:
+        """Return this call's AR Part and optional diffusion Part from its suffix."""
+        caller = f"{type(self).__name__}({self.modality})"
+        if "dit" in self.stages:
+            ar_part, diff_part = _trailing_gen_parts(
+                sample,
+                ARSamplingParams,
+                DiffusionSamplingParams,
+                caller=caller,
+            )
+            return ar_part, diff_part
+        if self.carries_target_size:
+            diff_part, ar_part = _trailing_gen_parts(
+                sample,
+                DiffusionSamplingParams,
+                ARSamplingParams,
+                caller=caller,
+            )
+            return ar_part, diff_part
+        return sample.frontier_gen_part(ARSamplingParams), None
+
     def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
         """The HI3 chat-templated per-prompt entries (+ the image gates).
 
@@ -309,7 +355,7 @@ class Hi3InputAdapter:
             texts = sample.text_conditioning()[0].content
             pil_images = []
 
-        diff_part = sample.gen_part_or_none(DiffusionSamplingParams)
+        _, diff_part = self._stage_parts(sample)
         diff_params = diff_part.sampling_params if diff_part is not None else None
         return _build_prompt_entries(
             texts,
@@ -322,11 +368,12 @@ class Hi3InputAdapter:
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         """AR always; a DiT stage rides along iff ``"dit" in self.stages``."""
-        ar_params = sample.gen_part(ARSamplingParams).sampling_params
+        ar_part, diff_part = self._stage_parts(sample)
+        ar_params = ar_part.sampling_params
         sampling = [self._ar_sampling(ar_params)]
         if "dit" in self.stages:
-            gen_part = sample.gen_part(DiffusionSamplingParams)
-            sampling.append(self._dit_sampling(gen_part, gen_part.sampling_params))
+            assert diff_part is not None
+            sampling.append(self._dit_sampling(diff_part, diff_part.sampling_params))
         return sampling
 
     def build(self, sample: Sample) -> List[GenerateCall]:
@@ -438,7 +485,7 @@ class Hi3DitRecaptionInputAdapter:
         turns = sample.text_conditioning()
         texts = turns[0].content  # the prompts (root turn)
         cot = turns[1].content  # the chained recaptions, 1:1 with prompts by lineage
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
         sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
 
@@ -533,14 +580,14 @@ class Hi3TextOutputAdapter:
         # segment there is no completed generation Part to write back.
         if segment is None:
             return sample
-        idx = sample.gen_part_index(ARSamplingParams)
-        parts = list(sample.parts)
-        parts[idx] = parts[idx].fill(
-            segment=segment,
-            primitives={"text": decoded},
-            conditions=dict(conditions),
+        frontier = sample.frontier_gen_part(ARSamplingParams)
+        return sample.replace_frontier(
+            frontier.fill(
+                segment=segment,
+                primitives={"text": decoded},
+                conditions=dict(conditions),
+            )
         )
-        return sample.with_parts(parts)
 
 
 class Hi3ArRecaptionOutputAdapter(Hi3TextOutputAdapter):
@@ -583,9 +630,15 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
             # Best-effort parity: a decoded-text failure must not lose the image rollout.
             ar_decoded = None
         ar_conditions = hi3_ar_fused_conditions(per_request)
-        idx = filled.gen_part_index(ARSamplingParams)
+        ar_part, _ = _trailing_gen_parts(
+            filled,
+            ARSamplingParams,
+            DiffusionSamplingParams,
+            caller=f"{type(self).__name__}({self.modality}).build",
+        )
+        idx = len(filled.parts) - 2
         parts = list(filled.parts)
-        parts[idx] = parts[idx].fill(
+        parts[idx] = ar_part.fill(
             segment=ar_segment,
             primitives={"text": ar_decoded} if ar_decoded is not None else {},
             conditions=dict(ar_conditions),

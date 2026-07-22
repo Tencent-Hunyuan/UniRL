@@ -35,7 +35,7 @@ class Sd3InputAdapter(DitInputAdapter):
             sample,
             caller=f"{self.modality}.build_prompts",
         )
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         negative_prompt = _negative_prompt_from_params(diff_params, default="")
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
 
@@ -92,7 +92,7 @@ class Sd3OutputAdapter(DitOutputAdapter):
             if factor > 1:
                 embeds = embeds.repeat_interleave(factor, dim=0)
                 pooled = pooled.repeat_interleave(factor, dim=0)
-        n_samples = len(sample.gen_part(DiffusionSamplingParams).sample_ids)
+        n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
         if int(embeds.shape[0]) != n_samples:
             raise RuntimeError(
                 f"SD3 text condition batch {int(embeds.shape[0])} != diffusion sample count {n_samples}."

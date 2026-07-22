@@ -80,7 +80,7 @@ class QwenImageInputAdapter(DitInputAdapter):
         """
         # text-only consumer: text_conditioning() fails loud if an image turn is present.
         texts = sample.text_conditioning()[0].content
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         if float(diff_params.guidance_scale) > 1.0:
             negative_prompt = _negative_prompt_from_params(diff_params, default=" ")
             return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
@@ -88,7 +88,7 @@ class QwenImageInputAdapter(DitInputAdapter):
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         kwargs = sampling[0].kwargs
         # Qwen's CFG knob: set it ALWAYS so upstream's ``or 4.0`` default
         # never fires (at <= 1.0 ``do_true_cfg`` stays False regardless of
@@ -116,7 +116,7 @@ class QwenImageGroupedInputAdapter(QwenImageInputAdapter):
             sample,
             caller=f"{self.modality}.build_prompts",
         )
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         if float(diff_params.guidance_scale) > 1.0:
             negative_prompt = _negative_prompt_from_params(diff_params, default=" ")
             return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
@@ -174,7 +174,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
             cond_dict["negative_text"] = _ragged_pad_cat(
                 [(c["negative_prompt_embeds"], c["negative_prompt_embeds_mask"]) for c in captures]
             )
-        n_samples = len(sample.gen_part(DiffusionSamplingParams).sample_ids)
+        n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
         for name, condition in cond_dict.items():
             if int(condition.embeds.shape[0]) != n_samples:
                 raise RuntimeError(

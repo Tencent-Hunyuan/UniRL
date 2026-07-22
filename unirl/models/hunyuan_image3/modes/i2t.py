@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """i2t — AR-stage rollout with image comprehension."""
-    frontier = sample.gen_part(ARSamplingParams)
+    frontier = sample.frontier_gen_part(ARSamplingParams)
     ar = frontier.sampling_params
 
     conditioning = sample.conditioning()

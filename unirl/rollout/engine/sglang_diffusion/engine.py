@@ -37,6 +37,7 @@ from unirl.sde.noise import generate_latents
 from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sample import Part, Sample
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous generation for one whole ``Sample``."""
-        gen = sample.parts[-1]
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
             int(gen.batch_size) > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
@@ -164,7 +165,7 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
             chunk = self._generate_batch(sample.replace_frontier(gen.slice(start, end)))
-            gen_chunks.append(chunk.parts[-1])
+            gen_chunks.append(chunk.frontier_gen_part(DiffusionSamplingParams))
             torch.cuda.empty_cache()
         return sample.replace_frontier(Part.concat(gen_chunks))
 
@@ -191,7 +192,7 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         per-sample id. ``initial_latents`` (img2img) rides on the gen part's
         ``LatentSegment`` shell; the regen shape on ``init_noise_latent_shape``.
         """
-        gen = sample.parts[-1]
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
         diffusion = gen.sampling_params
         if diffusion is not None and bool(getattr(diffusion, "disable_driver_xt", False)):
             return None

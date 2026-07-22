@@ -26,7 +26,7 @@ from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _num_frames(sample: Sample) -> int:
-    return int(getattr(sample.gen_part(DiffusionSamplingParams).sampling_params, "num_frames", 5))
+    return int(getattr(sample.frontier_gen_part(DiffusionSamplingParams).sampling_params, "num_frames", 5))
 
 
 class Hv15InputAdapter(DitInputAdapter):

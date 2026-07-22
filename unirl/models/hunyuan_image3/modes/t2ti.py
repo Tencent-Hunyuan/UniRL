@@ -100,8 +100,19 @@ def _cot_stop_tokens(bundle, bot_task: str) -> List[int]:
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2ti — AR CoT phase, then diffusion conditioned on the CoT."""
-    ar_part = sample.gen_part(ARSamplingParams)
-    image_part = sample.gen_part(DiffusionSamplingParams)
+    if len(sample.parts) < 2:
+        raise ValueError("HunyuanImage3Pipeline.generate (t2ti): expected trailing [AR, diffusion] Parts")
+    ar_idx = len(sample.parts) - 2
+    image_idx = len(sample.parts) - 1
+    ar_part = sample.parts[ar_idx]
+    image_part = sample.parts[image_idx]
+    require(
+        isinstance(ar_part.sampling_params, ARSamplingParams)
+        and isinstance(image_part.sampling_params, DiffusionSamplingParams),
+        "HunyuanImage3Pipeline.generate (t2ti): current trailing Parts must carry "
+        f"[ARSamplingParams, DiffusionSamplingParams], got "
+        f"[{type(ar_part.sampling_params).__name__}, {type(image_part.sampling_params).__name__}].",
+    )
     ar_sp = ar_part.sampling_params
     diff_sp = image_part.sampling_params
     require(
@@ -209,8 +220,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     # Fill both gen Parts in their lineage positions (ar precedes diffusion):
     # the ar Part carries the CoT TextSegment + normalized cot Texts; the image
     # Part the LatentSegment + decoded images.
-    ar_idx = sample.gen_part_index(ARSamplingParams)
-    image_idx = sample.gen_part_index(DiffusionSamplingParams)
     new_parts = list(sample.parts)
     new_parts[ar_idx] = ar_part.fill(
         segment=text_seg, primitives={"text": Texts(texts=cots)}, conditions=ar_conds.to_dict()

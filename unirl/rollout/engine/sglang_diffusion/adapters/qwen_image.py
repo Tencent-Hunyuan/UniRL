@@ -28,6 +28,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 # Qwen-Image patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
 _QWEN_DOWNSAMPLE = 16
@@ -54,7 +55,7 @@ class QwenImageAdapter(ImageAdapter):
         NOT ``height // 8`` — the two differ for dims that are multiples of 8 but
         not of 16. 5-D arrivals (image-form) skip the unpack.
         """
-        diffusion = sample.parts[-1].sampling_params
+        diffusion = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 5:
             B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(

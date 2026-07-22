@@ -90,7 +90,7 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                 f"modality={self.model_family!r} requires exactly one text turn and one "
                 f"image turn; got {len(text_turns)} text and {len(image_batches)} image turns."
             )
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         prompts = list(text_turns[0].texts)
         unique_prompts, k = self._deexpand_prompts(prompts, gen_part.group_ids)
         images_prim = image_batches[0]

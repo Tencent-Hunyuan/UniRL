@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
-    frontier = sample.gen_part(DiffusionSamplingParams)
+    frontier = sample.frontier_gen_part(DiffusionSamplingParams)
     params = frontier.sampling_params
     if params.sigmas is None:
         raise ValueError(

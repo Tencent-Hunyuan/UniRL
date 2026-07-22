@@ -13,7 +13,11 @@ from unirl.rollout.engine.sglang_diffusion.adapters.video import VideoAdapter
 from unirl.rollout.engine.vllm_omni.adapters import bagel as bagel_module
 from unirl.rollout.engine.vllm_omni.adapters import dit as dit_module
 from unirl.rollout.engine.vllm_omni.adapters.bagel import BagelOutputAdapter
-from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3ImageOutputAdapter
+from unirl.rollout.engine.vllm_omni.adapters.hi3 import (
+    Hi3ImageOutputAdapter,
+    Hi3InputAdapter,
+    Hi3TextOutputAdapter,
+)
 from unirl.rollout.engine.vllm_omni.adapters.hv15 import Hv15VideoOutputAdapter
 from unirl.rollout.engine.vllm_omni.adapters.qwen_image import QwenImageOutputAdapter
 from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3OutputAdapter
@@ -36,6 +40,23 @@ def _diffusion_output(*, stage_id: int, custom_output: dict | None = None):
         trajectory_timesteps=torch.tensor([1.0, 0.5, 0.0]),
         trajectory_log_probs=torch.empty(1, 0),
         custom_output=dict(custom_output or {}),
+    )
+
+
+def _ar_output(*, text: str = "thinking", token_ids: list[int] | None = None):
+    return SimpleNamespace(
+        request_id="0_test",
+        stage_id=0,
+        final_output_type="text",
+        request_output=SimpleNamespace(
+            outputs=[SimpleNamespace(token_ids=list(token_ids or [5, 6]), logprobs=None, text=text)]
+        ),
+        prompt_token_ids=[1, 2],
+        images=None,
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        custom_output={},
     )
 
 
@@ -112,6 +133,36 @@ def test_single_stage_output_families_share_the_direct_part_fill_contract(
     assert generated.conditions["text"] is condition
 
 
+def test_hi3_ar_only_adapter_reads_and_fills_the_frontier_turn() -> None:
+    root = Part.input(["p"], primitives={"text": Texts(texts=["question"])})
+    old_params = ARSamplingParams(max_new_tokens=7)
+    frontier_params = ARSamplingParams(max_new_tokens=23)
+    first_turn = Sample.request(root).fork(1, sampling_params=old_params)
+    old_ar = first_turn.parts[-1].fill(primitives={"text": Texts(texts=["turn one"])})
+    sample = (
+        first_turn.replace_frontier(old_ar)
+        .observe(Texts(texts=["tool result"]))
+        .fork(1, sampling_params=frontier_params)
+    )
+
+    input_adapter = Hi3InputAdapter(
+        "hi3_t2t",
+        tokenize_fn=None,
+        task_key="t2t",
+        output_modalities=("text",),
+        stages=("ar",),
+    )
+    sampling = input_adapter.build_sampling(sample)
+    output = Hi3TextOutputAdapter("hi3_t2t").build(sample, [[_ar_output(text="turn two", token_ids=[8, 9])]])
+
+    assert sampling[0].kwargs["max_tokens"] == 23
+    assert output.parts[1] is old_ar
+    assert output.parts[1].primitives["text"].texts == ["turn one"]
+    assert output.parts[-1].sampling_params is frontier_params
+    assert output.parts[-1].primitives["text"].texts == ["turn two"]
+    assert output.parts[-1].segment.tokens.tolist() == [8, 9]
+
+
 def test_hi3_two_stage_output_keeps_ar_and_diffusion_conditions_separate(monkeypatch) -> None:
     monkeypatch.setattr(dit_module, "pils_to_images", _fake_images)
     sigmas = torch.tensor([1.0, 0.5, 0.0])
@@ -125,18 +176,7 @@ def test_hi3_two_stage_output_keeps_ar_and_diffusion_conditions_separate(monkeyp
     )
     sample = Sample.request(root).fork(1, sampling_params=ar_params).fork(1, sampling_params=diffusion_params)
 
-    ar_output = SimpleNamespace(
-        request_id="0_test",
-        stage_id=0,
-        final_output_type="text",
-        request_output=SimpleNamespace(outputs=[SimpleNamespace(token_ids=[5, 6], logprobs=None, text="thinking")]),
-        prompt_token_ids=[1, 2],
-        images=None,
-        trajectory_latents=None,
-        trajectory_timesteps=None,
-        trajectory_log_probs=None,
-        custom_output={},
-    )
+    ar_output = _ar_output()
     fused_capture = {
         "input_ids": torch.tensor([[11, 12, 13]]),
         "attention_mask": torch.ones(1, 1, 3, 3, dtype=torch.bool),
@@ -169,6 +209,52 @@ def test_hi3_two_stage_output_keeps_ar_and_diffusion_conditions_separate(monkeyp
     assert diffusion_fused.input_ids.tolist() == [[11, 12, 13]]
     assert diffusion_fused.prompt_lengths is None
     assert diffusion_fused.gen_image_mask.tolist() == [[False, True, True]]
+
+
+def test_hi3_two_stage_output_fills_only_the_current_trailing_stage_pair(monkeypatch) -> None:
+    monkeypatch.setattr(dit_module, "pils_to_images", _fake_images)
+    root = Part.input(["p"], primitives={"text": Texts(texts=["hello"])})
+    old_ar_params = ARSamplingParams(max_new_tokens=1)
+    old_diff_params = DiffusionSamplingParams(sigmas=torch.tensor([1.0, 0.0]))
+    current_ar_params = ARSamplingParams(max_new_tokens=2)
+    current_diff_params = DiffusionSamplingParams(
+        num_inference_steps=2,
+        sigmas=torch.tensor([1.0, 0.5, 0.0]),
+        height=2,
+        width=2,
+    )
+    history = Sample.request(root).fork(1, sampling_params=old_ar_params).fork(1, sampling_params=old_diff_params)
+    old_ar = history.parts[1].fill(primitives={"text": Texts(texts=["old thinking"])})
+    old_diff = history.parts[2].fill(primitives={"image": _fake_images([object()])})
+    sample = (
+        history.with_parts([root, old_ar, old_diff])
+        .observe(Texts(texts=["next turn"]))
+        .fork(1, sampling_params=current_ar_params)
+        .fork(1, sampling_params=current_diff_params)
+    )
+
+    fused_capture = {
+        "input_ids": torch.tensor([[11, 12, 13]]),
+        "attention_mask": torch.ones(1, 1, 3, 3, dtype=torch.bool),
+        "position_ids": torch.tensor([[0, 1, 2]]),
+        "gen_image_mask": torch.tensor([[False, True, True]]),
+        "gen_timestep_scatter_index": torch.tensor([[1]]),
+        "rope_cache": (torch.zeros(1, 3, 1), torch.zeros(1, 3, 1)),
+    }
+    outputs = [
+        _ar_output(text="new thinking"),
+        _diffusion_output(stage_id=1, custom_output={"fused_mm_capture": fused_capture}),
+    ]
+
+    output = Hi3ImageOutputAdapter("hi3_t2i").build(sample, [outputs])
+
+    assert output.parts[1] is old_ar
+    assert output.parts[2] is old_diff
+    assert output.parts[-2].sampling_params is current_ar_params
+    assert output.parts[-2].primitives["text"].texts == ["new thinking"]
+    assert output.parts[-1].sampling_params is current_diff_params
+    assert isinstance(output.parts[-1].segment, LatentSegment)
+    assert set(output.parts[-1].primitives) == {"image"}
 
 
 @pytest.mark.parametrize(
@@ -204,3 +290,31 @@ def test_sglang_diffusion_fills_the_canonical_decoded_modality(
     assert generated.segment is segment
     assert set(generated.primitives) == {primitive_kind}
     assert generated.primitives[primitive_kind] is decoded
+
+
+def test_sglang_diffusion_fills_only_the_repeated_diffusion_frontier(monkeypatch) -> None:
+    root = Part.input(["p"], primitives={"text": Texts(texts=["hello"])})
+    old_params = DiffusionSamplingParams(num_inference_steps=1, sigmas=torch.tensor([1.0, 0.0]))
+    current_params = DiffusionSamplingParams(num_inference_steps=1, sigmas=torch.tensor([1.0, 0.0]))
+    first = Sample.request(root).fork(1, sampling_params=old_params)
+    old_part = first.parts[-1].fill(primitives={"image": _fake_images([object()])})
+    sample = (
+        first.replace_frontier(old_part).observe(Texts(texts=["next turn"])).fork(1, sampling_params=current_params)
+    )
+    segment = make_image_segment(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        sigmas=current_params.sigmas,
+        indices=torch.tensor([0, 1]),
+    )
+    decoded = _fake_images([object()])
+    adapter = ImageAdapter.__new__(ImageAdapter)
+    adapter.cfg = SimpleNamespace(populate_conditions=False)
+    monkeypatch.setattr(adapter, "build_segment", lambda *_args, **_kwargs: segment)
+    monkeypatch.setattr(adapter, "build_decoded", lambda *_args, **_kwargs: decoded)
+
+    output = adapter.build_response(sample, [object()])
+
+    assert output.parts[1] is old_part
+    assert output.parts[-1].sampling_params is current_params
+    assert output.parts[-1].segment is segment
+    assert output.parts[-1].primitives["image"] is decoded

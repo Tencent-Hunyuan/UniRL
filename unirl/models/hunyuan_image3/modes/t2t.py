@@ -45,7 +45,7 @@ def _tokenizer_bot_task(bot_task: str) -> str:
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2t — single AR-stage rollout, no diffusion."""
-    frontier = sample.gen_part(ARSamplingParams)
+    frontier = sample.frontier_gen_part(ARSamplingParams)
     ar = frontier.sampling_params
 
     conditioning = sample.conditioning()

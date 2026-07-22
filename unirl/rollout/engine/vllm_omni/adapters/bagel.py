@@ -68,7 +68,7 @@ class BagelInputAdapter(DitInputAdapter):
 
     def _spp(self, sample: Sample) -> int:
         """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         raw_spp = getattr(diff_params, "samples_per_prompt", 1)
         spp = 1 if raw_spp is None else int(raw_spp)
         if spp < 1:
@@ -83,7 +83,7 @@ class BagelInputAdapter(DitInputAdapter):
         """
         if self._spp(sample) <= 1:
             return False
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
 
     def build_prompts(self, sample: Sample) -> List[Any]:
@@ -111,7 +111,7 @@ class BagelInputAdapter(DitInputAdapter):
                 f"({grouped_spp} from grouping, {spp} from diffusion params)."
             )
 
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         pack = self._is_packable_t2i(sample)
         if pack:
             prompt_texts = grouped_texts
@@ -140,7 +140,7 @@ class BagelInputAdapter(DitInputAdapter):
             sample,
             caller=f"{self.modality}.build_sampling",
         )
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
         if grouped_spp != spp:
             raise RuntimeError(
@@ -220,7 +220,7 @@ class BagelOutputAdapter(DitOutputAdapter):
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
@@ -243,7 +243,7 @@ class BagelOutputAdapter(DitOutputAdapter):
         if len(turns) != 1:
             raise ValueError(f"{self.modality}.build_conditions: expected exactly one text turn, got {len(turns)}")
         texts = turns[0].content
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
         image_shape = (int(diff_params.height), int(diff_params.width))
         prompts = list(texts.texts)

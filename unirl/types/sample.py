@@ -554,33 +554,74 @@ class Sample(Batch):
         ``sampling_params is None`` and are skipped."""
         return [p for p in self.parts if p.is_gen]
 
+    def _gen_part_indices(self, params_type: type) -> List[int]:
+        """Indices of generated Parts whose sampling params match ``params_type``."""
+        return [i for i, part in enumerate(self.parts) if part.is_gen and isinstance(part.sampling_params, params_type)]
+
+    @staticmethod
+    def _require_unique_gen_part_index(indices: List[int], params_type: type, *, caller: str) -> int:
+        if not indices:
+            raise ValueError(f"{caller}: no Part with sampling_params of type {params_type.__name__}")
+        if len(indices) > 1:
+            raise ValueError(
+                f"{caller}: multiple Parts with sampling_params of type {params_type.__name__} "
+                f"at indices {indices}; typed lookup is ambiguous. Use frontier_gen_part(...) "
+                "for a generation frontier or inspect gen_parts() explicitly."
+            )
+        return indices[0]
+
     def gen_part(self, params_type: type) -> Part:
-        """The first gen Part whose ``sampling_params`` is an instance of
-        ``params_type`` (e.g. ``ARSamplingParams`` / ``DiffusionSamplingParams``)
-        — locating a stage by TYPE, not position (the migration's convention;
-        mirrors the engine-side ``ar_gen_part`` / ``diffusion_gen_part`` readers)."""
-        for p in self.parts:
-            if isinstance(p.sampling_params, params_type):
-                return p
-        raise ValueError(f"Sample.gen_part: no Part with sampling_params of type {params_type.__name__}")
+        """The unique gen Part whose sampling params match ``params_type``.
+
+        Type lookup names a stage only when the type occurs once. Repeated
+        agent turns deliberately fail instead of silently selecting an older
+        stage; generation code should use :meth:`frontier_gen_part` when it
+        means the shell appended by the latest :meth:`fork`.
+        """
+        index = self._require_unique_gen_part_index(
+            self._gen_part_indices(params_type), params_type, caller="Sample.gen_part"
+        )
+        return self.parts[index]
 
     def gen_part_or_none(self, params_type: type) -> Optional[Part]:
-        """:meth:`gen_part`, but returns ``None`` instead of raising when no Part of
-        ``params_type`` is present — the Optional replacement for the file-level
-        ``diffusion_gen_part`` / ``ar_gen_part`` readers (e.g. a text-out / AR-only
-        request carries no diffusion stage)."""
-        for p in self.parts:
-            if isinstance(p.sampling_params, params_type):
-                return p
-        return None
+        """:meth:`gen_part`, returning ``None`` only when there is no match.
+
+        Multiple matching Parts remain an error: optionality does not make an
+        ambiguous repeated-stage lookup safe.
+        """
+        indices = self._gen_part_indices(params_type)
+        if not indices:
+            return None
+        index = self._require_unique_gen_part_index(indices, params_type, caller="Sample.gen_part_or_none")
+        return self.parts[index]
 
     def gen_part_index(self, params_type: type) -> int:
-        """Index of :meth:`gen_part` — for write-back (e.g. replacing a Part with
-        its advantage-filled version via :meth:`with_parts`)."""
-        for i, p in enumerate(self.parts):
-            if isinstance(p.sampling_params, params_type):
-                return i
-        raise ValueError(f"Sample.gen_part_index: no Part with sampling_params of type {params_type.__name__}")
+        """Index of the unique :meth:`gen_part`, for non-frontier write-back."""
+        return self._require_unique_gen_part_index(
+            self._gen_part_indices(params_type), params_type, caller="Sample.gen_part_index"
+        )
+
+    def frontier_gen_part(self, params_type: type) -> Part:
+        """Return the final Part after validating it is a gen of ``params_type``.
+
+        This is the generation-path selector: :meth:`fork` appends the shell an
+        engine must fill, so accepting an earlier type match would overwrite
+        trajectory history when a parameter type repeats across agent turns.
+        """
+        if not self.parts:
+            raise ValueError("Sample.frontier_gen_part: Sample has no Parts")
+        index = len(self.parts) - 1
+        frontier = self.parts[index]
+        if not frontier.is_gen:
+            raise ValueError(
+                f"Sample.frontier_gen_part: final Part at index {index} is not generated (sampling_params is None)"
+            )
+        if not isinstance(frontier.sampling_params, params_type):
+            raise ValueError(
+                f"Sample.frontier_gen_part: final generated Part at index {index} has sampling_params "
+                f"of type {type(frontier.sampling_params).__name__}, expected {params_type.__name__}"
+            )
+        return frontier
 
     def with_parts(self, parts: List[Part]) -> "Sample":
         """A copy carrying replacement ``parts`` but the same ``reward_compute_s``

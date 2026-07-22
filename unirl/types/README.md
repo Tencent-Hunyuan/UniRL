@@ -81,8 +81,9 @@ and reward metadata remains in `Part.metadata`.
 
 | Retired helper or pattern | Current API |
 | --- | --- |
-| `resp.tracks["ar"]` / `resp.tracks["image"]` | `sample.gen_part(ARSamplingParams)` / `sample.gen_part(DiffusionSamplingParams)` |
-| Optional track lookup | `sample.gen_part_or_none(ParamsType)` |
+| `resp.tracks["ar"]` / `resp.tracks["image"]` | `sample.gen_part(ARSamplingParams)` / `sample.gen_part(DiffusionSamplingParams)` when that type occurs exactly once |
+| Generation shell appended by the latest `fork` | `sample.frontier_gen_part(ParamsType)`; validates that the final Part is generated and has the requested type |
+| Optional unique-stage lookup | `sample.gen_part_or_none(ParamsType)`; returns `None` for no match and raises for duplicates |
 | Track index needed for write-back | `sample.gen_part_index(ParamsType)`, then `sample.with_parts(new_parts)` |
 | `resp.root_track()` | The chain head is `sample.parts[0]`; the first generated stage is `sample.gen_parts()[0]` |
 | `RolloutResp.concat(items)` | `Sample.concat(items)` |
@@ -98,10 +99,14 @@ and reward metadata remains in `Part.metadata`.
 | `metadata_only()` | Removed; there is no public compatibility helper |
 | `tracks_with_segment_types(...)` | Iterate `sample.parts` and inspect `part.segment` explicitly |
 
-Track names no longer select stages. Prefer sampling-parameter types for a
-single AR or diffusion stage. If a trajectory contains multiple generated parts
-with the same parameter type (for example, multiple agent turns), iterate
-`sample.gen_parts()`; `gen_part(Type)` intentionally returns only the first match.
+Track names no longer select stages. Sampling-parameter type identifies a stage
+only when that type occurs once: `gen_part(Type)`, `gen_part_index(Type)`, and
+`gen_part_or_none(Type)` reject duplicate matches and report their Part indices.
+Generation paths should use `frontier_gen_part(Type)`, because `fork` appends the
+shell to fill. For a multi-stage generator, validate its complete trailing
+structure (for example, `[..., AR, diffusion]`) instead of scanning historical
+turns by type. If a trajectory intentionally contains repeated generated stages,
+iterate `sample.gen_parts()` or address their known lineage positions explicitly.
 
 ## Conceptual before and after
 

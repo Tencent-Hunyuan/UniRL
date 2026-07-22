@@ -486,9 +486,9 @@ def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
     # the complete rollout type graph.
     from unirl.types.sampling import DiffusionSamplingParams
 
-    gen_part = sample.gen_part_or_none(DiffusionSamplingParams)
-    if gen_part is None:
+    if not sample.parts or not isinstance(sample.parts[-1].sampling_params, DiffusionSamplingParams):
         return
+    gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
     diffusion = gen_part.sampling_params
     if diffusion.sigmas is not None:
         return

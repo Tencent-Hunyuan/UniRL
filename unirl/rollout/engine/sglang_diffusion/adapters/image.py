@@ -26,7 +26,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import ModelAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.primitives import Texts, primitive_modality_key
 from unirl.types.sample import Sample
-from unirl.types.sampling import is_forward_process
+from unirl.types.sampling import DiffusionSamplingParams, is_forward_process
 from unirl.types.segments.latent import make_image_segment
 
 
@@ -58,7 +58,8 @@ class ImageAdapter(ModelAdapter):
         variation. Stages return plain kwargs dicts whose keys must stay
         disjoint from the pins; later updates override earlier ones.
         """
-        input_part, gen_part = sample.parts[0], sample.parts[-1]
+        input_part = sample.parts[0]
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         # ---- sealed validation (fail-fast gates survive any stage override) ----
         text_prim = input_part.primitives.get("text")
         if not isinstance(text_prim, Texts):
@@ -211,7 +212,7 @@ class ImageAdapter(ModelAdapter):
         ``num_outputs_per_prompt`` via the group structure — robust to partial
         forward-batch chunks (a chunk may hold a partial group).
         """
-        gen_part = sample.parts[-1]
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         # text-only consumer: the frontier-aligned prompt is the (single) text turn.
         prompts = list(sample.text_conditioning()[0].content.texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
@@ -248,7 +249,7 @@ class ImageAdapter(ModelAdapter):
 
     def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
         require(bool(raw), "build_response: SGLang returned no results")
-        gen_part = sample.parts[-1]
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diffusion = gen_part.sampling_params
         require(
             diffusion is not None and diffusion.sigmas is not None,
@@ -311,7 +312,7 @@ class ImageAdapter(ModelAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=sample.parts[-1].sampling_params.sigmas,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,

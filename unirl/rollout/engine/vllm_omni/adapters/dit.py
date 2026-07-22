@@ -49,7 +49,7 @@ def _grouped_texts_from_sample(sample: Sample, *, caller: str) -> tuple[List[str
     lineage before collapsing so a DP shard that splits or interleaves siblings
     cannot silently pair the wrong prompt with an output.
     """
-    gen_part = sample.gen_part(DiffusionSamplingParams)
+    gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
     diff_params = gen_part.sampling_params
     spp = int(getattr(diff_params, "samples_per_prompt", 1) or 1)
     if spp < 1:
@@ -110,7 +110,7 @@ class DitInputAdapter:
         """The per-prompt dicts: the ``{"prompt", "negative_prompt"}`` shape."""
         # text-only consumer: text_conditioning() fails loud if an image turn is present.
         texts = sample.text_conditioning()[0].content
-        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         negative_prompt = _negative_prompt_from_params(diff_params, default="")
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
 
@@ -118,7 +118,7 @@ class DitInputAdapter:
         """The single diffusion-stage intent: the typed diffusion kwargs,
         optional ``max_sequence_length`` / ``seed``, sparse SDE indices, and
         the driver-authoritative x_T recipe."""
-        gen_part = sample.gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
 
         diff_kwargs = core_diff_kwargs(diff_params)
@@ -173,7 +173,7 @@ class DitOutputAdapter:
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        expected_sigmas = sample.gen_part(DiffusionSamplingParams).sampling_params.sigmas
+        expected_sigmas = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas
         return build_image_segment(diff_outputs, expected_sigmas=expected_sigmas)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
@@ -201,14 +201,14 @@ class DitOutputAdapter:
         segment = self.build_segment(sample, per_request)
         decoded = self.build_decoded(sample, per_request)
         conditions = self.build_conditions(sample, per_request)
-        idx = sample.gen_part_index(DiffusionSamplingParams)
-        parts = list(sample.parts)
-        parts[idx] = parts[idx].fill(
-            segment=segment,
-            primitives={primitive_modality_key(decoded): decoded},
-            conditions=dict(conditions),
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        return sample.replace_frontier(
+            frontier.fill(
+                segment=segment,
+                primitives={primitive_modality_key(decoded): decoded},
+                conditions=dict(conditions),
+            )
         )
-        return sample.with_parts(parts)
 
 
 __all__ = ["DitInputAdapter", "DitOutputAdapter"]
