@@ -44,8 +44,6 @@ class VideoAdapter(ImageAdapter):
     and the decoded media is packed as ``Videos`` rather than dropped.
     """
 
-    #: Frontier primitive key (video, not image).
-    track_name: str = "video"
     #: Modality stamp for the latent segment.
     segment_factory = staticmethod(make_video_segment)
 

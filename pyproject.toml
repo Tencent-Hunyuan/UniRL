@@ -24,7 +24,7 @@ dependencies = [
   "omegaconf>=2.3",
   # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
   "transformers>=5.6,<5.7",
-  "peft>=0.11",
+  "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
   "safetensors>=0.4",
   "Pillow>=10",
   "requests>=2.31",

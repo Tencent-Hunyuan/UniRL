@@ -133,7 +133,7 @@ class QwenImageGroupedInputAdapter(QwenImageInputAdapter):
 
 
 class QwenImageOutputAdapter(DitOutputAdapter):
-    """Single-"image"-track response with the Qwen text-capture conditions."""
+    """Single diffusion-Part response with Qwen text-capture conditions."""
 
     _MISSING_CAPTURE_MSG = (
         "build_response: Qwen-Image rollout returned no 'text_capture' on "

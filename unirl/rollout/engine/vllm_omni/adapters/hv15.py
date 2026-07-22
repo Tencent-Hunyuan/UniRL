@@ -51,9 +51,8 @@ class Hv15InputAdapter(DitInputAdapter):
 
 
 class Hv15VideoOutputAdapter(DitOutputAdapter):
-    """Single-"video"-track response: frame groupings + dual-stream conditions."""
+    """Single diffusion Part response: video frame groups + dual-stream conditions."""
 
-    track_name = "video"
     final_output_type = "video"
 
     _MISSING_CAPTURE_MSG = (
@@ -65,12 +64,12 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         "YAML."
     )
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
         _, frame_groups, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        return {self.track_name: grouped_pils_to_videos(frame_groups)}
+        return grouped_pils_to_videos(frame_groups)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Unpack the per-request HV1.5 dual-stream text conditions.
@@ -80,7 +79,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         MLLM + ByT5 glyph), mapped to ``text_mllm`` / ``text_glyph``
         (+ negatives). Returns the conditions *dict* (keys aligned with
         ``HunyuanVideo15Conditions.from_dict``), NOT the typed wrapper — the
-        trainer runs ``from_dict(track.conditions)`` itself.
+        trainer runs ``from_dict(part.conditions)`` itself.
         """
         del sample
         diff_outputs, _, _ = collect_dit_outputs(

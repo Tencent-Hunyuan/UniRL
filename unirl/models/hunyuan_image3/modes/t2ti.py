@@ -17,9 +17,9 @@ under the system prompt, so the model may occasionally skip the
 recaption block (the CoT then degrades to think-only or plain text —
 upstream's own no-marker fallback feeds it as a plain text section).
 
-Returns TWO tracks: ``"ar"`` (root; ``decoded`` is the truncated +
-normalized CoT that actually conditioned the image — raw tokens stay in
-``segment`` for replay) and ``"image"`` (``parent_track="ar"``).
+Fills TWO generated Parts in one lineage: the AR Part carries the truncated +
+normalized CoT that actually conditioned the image (raw tokens stay in its
+``segment`` for replay), followed by the diffusion Part carrying the image.
 ``samples_per_prompt`` on either sub-params is deliberately NOT honored:
 fan-out belongs to the engine adapter, as with the other HI3 modes.
 

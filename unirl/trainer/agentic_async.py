@@ -356,7 +356,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
             adv_i = float(advantages[i].item())
             for gp in tr.gen_parts():
                 gp = _part_with_field(gp, "advantages", torch.full((gp.batch_size,), adv_i, dtype=torch.float32))
-                gp = _part_with_field(gp, "primitive", None)
+                gp = _part_with_field(gp, "primitives", {})  # free decoded content before train
                 gp = _part_with_field(gp, "rewards", None)
                 train_parts.append(gp)
 

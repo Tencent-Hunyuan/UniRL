@@ -1,4 +1,4 @@
-"""Response-side segment / decoded / track-assembly mechanics.
+"""Response-side segment and decoded-output mechanics.
 
 Pure helpers the adapters' ``build_response`` steps call — they operate on
 already-fetched wire data (the seam's :class:`OmniRawResult` protocol;
@@ -9,16 +9,12 @@ trainer-facing types. No runtime import, no engine state.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
-from unirl.types.conditions import Condition
-from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos, primitive_modality_key
-from unirl.types.sample import Sample
-from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
-from unirl.types.segments import Segment
+from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
 from unirl.types.segments.latent import make_image_segment
 
 
@@ -382,63 +378,7 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Sample assembly — the shared tail of every shape's ``build_response``
-# --------------------------------------------------------------------------- #
-
-
-def _gen_part_index_for_track(sample: Sample, track_name: str) -> int:
-    """Index of the pre-forked gen ``Part`` a track's segment fills.
-
-    Lineage is positional: the parts are already ``[input, ar?, image?]`` (the
-    caller forks them in stage order). A track maps to the gen Part whose
-    ``sampling_params`` type matches — ``"ar"`` → ``ARSamplingParams``;
-    ``"image"`` / ``"video"`` → ``DiffusionSamplingParams`` — so the 1-to-1
-    ar→image linkage the old ``parent_track="ar"`` encoded is now just the
-    parts' order.
-    """
-    want = ARSamplingParams if track_name == "ar" else DiffusionSamplingParams
-    for i, part in enumerate(sample.parts):
-        if i == 0:  # the input Part is never a gen target
-            continue
-        if isinstance(part.sampling_params, want):
-            return i
-    raise RuntimeError(
-        f"assemble_sample: no gen Part with {want.__name__} for track {track_name!r} "
-        f"(parts carry {[type(p.sampling_params).__name__ for p in sample.parts]})"
-    )
-
-
-def assemble_sample(
-    sample: Sample,
-    *,
-    segments_for_track: Dict[str, Segment],
-    decoded_for_track: Dict[str, Optional[Any]],
-    conditions: Dict[str, Condition],
-) -> Sample:
-    """Fill the request ``Sample``'s gen ``Part``s with the per-track outputs.
-
-    One filled Part per ``segments_for_track`` key, each carrying its own
-    segment + decoded primitive map. ``conditions`` were resp-wide in
-    the legacy shape; keep that behavior by replicating onto every filled Part
-    (the legacy single-image-track replay is the only consumer today). The
-    input Part and any untouched gen Part pass through unchanged.
-    """
-    new_parts = list(sample.parts)
-    for track_name, segment in segments_for_track.items():
-        idx = _gen_part_index_for_track(sample, track_name)
-        decoded = decoded_for_track.get(track_name)
-        primitives = {primitive_modality_key(decoded): decoded} if decoded is not None else {}
-        new_parts[idx] = new_parts[idx].fill(
-            segment=segment,
-            primitives=primitives,
-            conditions=dict(conditions),
-        )
-    return sample.with_parts(new_parts)
-
-
 __all__ = [
-    "assemble_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",

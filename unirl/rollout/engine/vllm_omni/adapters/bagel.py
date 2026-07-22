@@ -66,6 +66,26 @@ from unirl.types.sampling import DiffusionSamplingParams
 class BagelInputAdapter(DitInputAdapter):
     """Request side: prompt dicts + the BAGEL diffusion-stage sampling intent."""
 
+    def _spp(self, sample: Sample) -> int:
+        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        raw_spp = getattr(diff_params, "samples_per_prompt", 1)
+        spp = 1 if raw_spp is None else int(raw_spp)
+        if spp < 1:
+            raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
+        return spp
+
+    def _is_packable_t2i(self, sample: Sample) -> bool:
+        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
+
+        Mirrors ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
+        is cfg=1 t2i only. CFG>1 keeps the sample-level layout.
+        """
+        if self._spp(sample) <= 1:
+            return False
+        diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
+        return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
+
     def build_prompts(self, sample: Sample) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
 
@@ -74,14 +94,39 @@ class BagelInputAdapter(DitInputAdapter):
         the text2img diffusion path we want. No ``negative_prompt`` key is added
         — the trainside oracle runs cfg=1 (the negative text branch is unused at
         cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
+
+        When packable, each prompt's spp samples collapse to ONE request
+        (``num_outputs_per_prompt=spp``). Otherwise keep one request per sample.
         """
         if sample.has_image_input():
             raise ValueError(f"modality={self.modality!r} does not accept image conditioning")
-        grouped_texts, _ = _grouped_texts_from_sample(
+        spp = self._spp(sample)
+        grouped_texts, grouped_spp = _grouped_texts_from_sample(
             sample,
             caller=f"{self.modality}.build_prompts",
         )
-        return [{"prompt": text} for text in grouped_texts]
+        if grouped_spp != spp:
+            raise RuntimeError(
+                f"{self.modality}.build_prompts: inconsistent samples_per_prompt "
+                f"({grouped_spp} from grouping, {spp} from diffusion params)."
+            )
+
+        gen_part = sample.gen_part(DiffusionSamplingParams)
+        pack = self._is_packable_t2i(sample)
+        if pack:
+            prompt_texts = grouped_texts
+            num_outputs_per_prompt = spp
+        else:
+            prompt_texts = list(sample.text_conditioning()[0].content.texts)
+            num_outputs_per_prompt = 1
+
+        n_samples = len(gen_part.sample_ids)
+        if len(prompt_texts) * num_outputs_per_prompt != n_samples:
+            raise RuntimeError(
+                f"{self.modality}.build_prompts: prompt count {len(prompt_texts)} * "
+                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
+            )
+        return [{"prompt": text} for text in prompt_texts]
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         """One diffusion-stage intent with the BAGEL-specific kwargs.
@@ -90,12 +135,28 @@ class BagelInputAdapter(DitInputAdapter):
         ``num_timesteps - 1``); CFG knobs + SDE step set + trajectory precision
         ride ``extra_args``; the driver-authoritative x_T recipe is packed in.
         """
-        _, spp = _grouped_texts_from_sample(
+        spp = self._spp(sample)
+        grouped_texts, grouped_spp = _grouped_texts_from_sample(
             sample,
             caller=f"{self.modality}.build_sampling",
         )
         gen_part = sample.gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
+        if grouped_spp != spp:
+            raise RuntimeError(
+                f"{self.modality}.build_sampling: inconsistent samples_per_prompt "
+                f"({grouped_spp} from grouping, {spp} from diffusion params)."
+            )
+        pack = self._is_packable_t2i(sample)
+
+        n_samples = len(gen_part.sample_ids)
+        n_prompts = len(grouped_texts) if pack else n_samples
+        num_outputs_per_prompt = spp if pack else 1
+        if n_prompts * num_outputs_per_prompt != n_samples:
+            raise RuntimeError(
+                f"{self.modality}.build_sampling: prompt count {n_prompts} * "
+                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
+            )
 
         T = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
@@ -106,7 +167,8 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            num_outputs_per_prompt=spp,
+            # Packable: one packed generate_image. Else: one image per request.
+            num_outputs_per_prompt=num_outputs_per_prompt,
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
@@ -150,23 +212,23 @@ class BagelInputAdapter(DitInputAdapter):
 
 
 class BagelOutputAdapter(DitOutputAdapter):
-    """Response side: one ``"image"`` track with prompt-carrying conditions."""
+    """Response side: one image generation Part with prompt-carrying conditions."""
 
-    def build_segments(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         """The DiT trajectory segment (asserts the σ echo). No AR sweep (BAGEL
         single-stage has no Stage-0 completions)."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         diff_params = sample.gen_part(DiffusionSamplingParams).sampling_params
-        return {self.track_name: build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)}
+        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
         _, _, pil_images = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        return {self.track_name: pils_to_images(pil_images)}
+        return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Ship the PROMPTS (deferred conditions) for trainer-side KV rebuild.

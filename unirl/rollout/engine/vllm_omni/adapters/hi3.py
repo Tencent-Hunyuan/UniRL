@@ -16,10 +16,10 @@ calls — and delegate the conversion verbs to their sub-adapters:
 
 - :class:`Hi3DitRecaptionInputAdapter` is the two-engine trainer's
   standalone-DiT request side (externally-injected recaption).
-- :class:`Hi3TextOutputAdapter` packs the single-"ar"-track response;
-  :class:`Hi3ImageOutputAdapter` the two-track (ar root + image child)
-  response; :class:`Hi3DitRecaptionOutputAdapter` the single-"image"-track
-  response — the latter two derive from the shared
+- :class:`Hi3TextOutputAdapter` fills the AR generation Part;
+  :class:`Hi3ImageOutputAdapter` fills the AR and diffusion Parts independently;
+  :class:`Hi3DitRecaptionOutputAdapter` fills one diffusion Part — the latter
+  two derive from the shared
   :class:`~.dit.DitOutputAdapter` skeleton.
 
 The HI3 chat-template knowledge (``task_key`` / ``sys_type`` /
@@ -44,7 +44,6 @@ from unirl.rollout.engine.vllm_omni.backends import (
     StageSampling,
 )
 from unirl.rollout.engine.vllm_omni.utils import (
-    assemble_sample,
     build_ar_segment,
     collect_dit_outputs,
     decoded_text_from_ar,
@@ -190,7 +189,7 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
 
 
 def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-    """The AR-track replay conditions for the recaption producer.
+    """The AR Part replay conditions for the recaption producer.
 
     ARGRPO.replay teacher-forces over prompt+response; it needs the prompt
     token ids (``conditions['fused'].input_ids``). vLLM runs prompts
@@ -500,48 +499,52 @@ class Hi3DitRecaptionInputAdapter:
 
 
 class Hi3TextOutputAdapter:
-    """Per-request AR results → the filled single-"ar"-track ``Sample``.
+    """Per-request AR results → the filled AR generation Part.
 
-    Same three-hook shape as :class:`~.dit.DitOutputAdapter`
-    (:meth:`build_segments` / :meth:`build_decoded` / :meth:`build_conditions`,
-    uniform ``(req, per_request)`` currency). ``build_decoded`` is
-    deliberately NOT best-effort — the text IS the product here, so a broken
-    extraction must raise.
+    Same direct-Part three-hook shape as :class:`~.dit.DitOutputAdapter`:
+    segment, decoded primitive, and replay conditions are derived for the typed
+    AR shell and written only to that Part. ``build_decoded`` is deliberately
+    NOT best-effort — text is the product here, so broken extraction must raise.
     """
 
     def __init__(self, modality: str) -> None:
         self.modality = modality
 
-    def build_segments(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
-        segments: Dict[str, Any] = {}
-        ar_segment = build_ar_segment(per_request)
-        if ar_segment is not None:
-            segments["ar"] = ar_segment
-        return segments
+        return build_ar_segment(per_request)
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Texts:
         del sample
-        return {"ar": decoded_text_from_ar(per_request)}
+        return decoded_text_from_ar(per_request)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """AR-track conditions. Default: none (no replay capture in scope)."""
+        """AR Part conditions. Default: none (no replay capture in scope)."""
         del sample, per_request
         return {}
 
     def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
-        return assemble_sample(
-            sample,
-            segments_for_track=self.build_segments(sample, per_request),
-            decoded_for_track=self.build_decoded(sample, per_request),
-            conditions=self.build_conditions(sample, per_request),
+        segment = self.build_segment(sample, per_request)
+        decoded = self.build_decoded(sample, per_request)
+        conditions = self.build_conditions(sample, per_request)
+        # Preserve the old no-token behavior: all hooks run, but without an AR
+        # segment there is no completed generation Part to write back.
+        if segment is None:
+            return sample
+        idx = sample.gen_part_index(ARSamplingParams)
+        parts = list(sample.parts)
+        parts[idx] = parts[idx].fill(
+            segment=segment,
+            primitives={"text": decoded},
+            conditions=dict(conditions),
         )
+        return sample.with_parts(parts)
 
 
 class Hi3ArRecaptionOutputAdapter(Hi3TextOutputAdapter):
-    """AR-track response + the ARGRPO fused prompt-capture conditions."""
+    """AR Part response + the ARGRPO fused prompt-capture conditions."""
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         del sample
@@ -549,7 +552,7 @@ class Hi3ArRecaptionOutputAdapter(Hi3TextOutputAdapter):
 
 
 class Hi3ImageOutputAdapter(DitOutputAdapter):
-    """Two-track HI3 response: "ar" root + "image" child, DiT is Stage 1."""
+    """Two-stage HI3 response: fill AR and diffusion Parts independently."""
 
     def __init__(self, modality: str) -> None:
         super().__init__(modality, stage_id=1)
@@ -561,19 +564,37 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
         )
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        decoded = super().build_decoded(sample, per_request)
-        # Surface the AR-generated text (best-effort; don't break rollout if
-        # AR text extraction fails).
+    def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        # The base writes the Stage-1 trajectory, image, and DiT fused capture
+        # only to the diffusion Part.
+        filled = super().build(sample, per_request)
+
+        # Stage 0 is a separate generated Part with a different replay contract:
+        # prompt token ids + prompt_lengths, not the DiT's fused image sequence.
+        # Fill it independently so diffusion conditions can never leak onto AR.
+        ar_segment = build_ar_segment(per_request)
+        if ar_segment is None:
+            return filled
+
+        ar_decoded = None
         try:
-            decoded["ar"] = decoded_text_from_ar(per_request)
+            ar_decoded = decoded_text_from_ar(per_request)
         except Exception:
-            decoded["ar"] = None
-        return decoded
+            # Best-effort parity: a decoded-text failure must not lose the image rollout.
+            ar_decoded = None
+        ar_conditions = hi3_ar_fused_conditions(per_request)
+        idx = filled.gen_part_index(ARSamplingParams)
+        parts = list(filled.parts)
+        parts[idx] = parts[idx].fill(
+            segment=ar_segment,
+            primitives={"text": ar_decoded} if ar_decoded is not None else {},
+            conditions=dict(ar_conditions),
+        )
+        return filled.with_parts(parts)
 
 
 class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
-    """Single-"image"-track response of the standalone HI3 DiT (Stage 0)."""
+    """Single diffusion-Part response of the standalone HI3 DiT (Stage 0)."""
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         del sample

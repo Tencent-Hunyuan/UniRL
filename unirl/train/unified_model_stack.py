@@ -57,9 +57,9 @@ logger = logging.getLogger(__name__)
 class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack.
 
-    Holds one shared :class:`FSDPBackend` and a dict of named
-    :class:`StageAlgorithm` siblings (``{"ar": GRPO, "image": FlowGRPO}``).
-    Each algorithm trains its own track but backward-accumulates into the same
+    Holds one shared :class:`FSDPBackend` plus explicit AR and image
+    :class:`StageAlgorithm` siblings. Each algorithm trains its own Part but
+    backward-accumulates into the same
     shared transformer; one optimizer step applies all algorithms' gradients.
 
     Created as a sibling ``Remote`` inside a placement block; takes handles to
@@ -83,11 +83,8 @@ class UnifiedModelTrainStack(Remote):
         if float(max_grad_norm) <= 0.0:
             raise ValueError(f"UnifiedModelTrainStack.max_grad_norm must be > 0; got {max_grad_norm}.")
         self.fsdp_backend = fsdp_backend
-        # Order matters only for logging; gradients accumulate regardless.
-        self.algorithms: Dict[str, StageAlgorithm] = {
-            "ar": ar_algorithm,
-            "image": image_algorithm,
-        }
+        self.ar_algorithm = ar_algorithm
+        self.image_algorithm = image_algorithm
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
         # PPO-style multi-update: split each rollout shard into this many disjoint
@@ -100,7 +97,7 @@ class UnifiedModelTrainStack(Remote):
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
         if self.num_updates_per_batch > 1:
-            for name, algo in self.algorithms.items():
+            for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
                 if not getattr(algo, "supports_multi_update", False):
                     raise ValueError(
                         f"num_updates_per_batch={self.num_updates_per_batch} requires every algorithm's "
@@ -129,7 +126,7 @@ class UnifiedModelTrainStack(Remote):
             )
         return steps
 
-    def prepare_segment(self, name: str, part: Part) -> None:
+    def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop.
 
         No-op if ``segment`` is None or the algorithm has no ``prepare_segment``. If
@@ -143,7 +140,6 @@ class UnifiedModelTrainStack(Remote):
         """
         if part.segment is None:
             return
-        algorithm = self.algorithms[name]
         prepare = getattr(algorithm, "prepare_segment", None)
         if prepare is None:
             return
@@ -171,15 +167,15 @@ class UnifiedModelTrainStack(Remote):
         for field, parts in collected.items():
             setattr(part.segment, field, torch.cat(parts, dim=0))
 
-    def _backward_track(
+    def _backward_part(
         self,
-        name: str,
+        algorithm: StageAlgorithm,
         part: Part,
         micro_slices: List[Tuple[int, int]],
         *,
         training_progress: float,
     ) -> tuple[TrainStepResult, bool]:
-        """Backward one algorithm's track over the given absolute ``micro_slices``
+        """Backward one algorithm's Part over the given absolute ``micro_slices``
         (no zero_grad / no optimizer step).
 
         Returns ``(per_algorithm_result, has_backward)``. ``zero_grad`` and the shared
@@ -190,14 +186,13 @@ class UnifiedModelTrainStack(Remote):
         """
         if part.advantages is None:
             raise ValueError(
-                f"UnifiedModelTrainStack.train: track {name!r} has advantages=None; "
+                f"UnifiedModelTrainStack.train: {type(algorithm).__name__} Part has advantages=None; "
                 "upstream advantage pipeline must populate it before training."
             )
         if not micro_slices:
-            raise ValueError(f"UnifiedModelTrainStack.train: empty micro_slices for track {name!r}.")
+            raise ValueError(f"UnifiedModelTrainStack.train: empty micro_slices for {type(algorithm).__name__} Part.")
 
         bs = int(part.batch_size)
-        algorithm = self.algorithms[name]
         update_total = sum(end - start for start, end in micro_slices)
         micros: List[AlgorithmStepResult] = []
         total_loss = 0.0
@@ -232,23 +227,25 @@ class UnifiedModelTrainStack(Remote):
 
     def _train_one_step(
         self,
-        tracks: Dict[str, Part],
-        slices_by_track: Dict[str, List[Tuple[int, int]]],
+        ar_part: Part,
+        image_part: Part,
         *,
+        ar_slices: List[Tuple[int, int]],
+        image_slices: List[Tuple[int, int]],
         training_progress: float,
     ) -> Dict[str, TrainStepResult]:
-        """One optimizer step: zero_grad → backward BOTH tracks over their mini-batch
-        slices → shared optimizer_step → stamp grad_norm / lr onto each track's result.
+        """One optimizer step: zero_grad → backward BOTH Parts over their mini-batch
+        slices → shared optimizer_step → stamp grad_norm / lr onto each stage result.
         """
         self.fsdp_backend.zero_grad()
-        results: Dict[str, TrainStepResult] = {}
-        any_backward = False
-        for name in self.algorithms:
-            partial, has_backward = self._backward_track(
-                name, tracks[name], slices_by_track[name], training_progress=training_progress
-            )
-            results[name] = partial
-            any_backward = any_backward or has_backward
+        ar_result, ar_backward = self._backward_part(
+            self.ar_algorithm, ar_part, ar_slices, training_progress=training_progress
+        )
+        image_result, image_backward = self._backward_part(
+            self.image_algorithm, image_part, image_slices, training_progress=training_progress
+        )
+        results: Dict[str, TrainStepResult] = {"ar": ar_result, "image": image_result}
+        any_backward = ar_backward or image_backward
 
         if any_backward:
             # Multi-update only: the prior update's forward/backward churn fragments the
@@ -339,21 +336,24 @@ class UnifiedModelTrainStack(Remote):
             )
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            tracks = {"ar": ar_part, "image": image_part}
-            # Freeze each track's π_old anchor once, before the multi-update loop.
-            for name in self.algorithms:
-                self.prepare_segment(name, tracks[name])
+            # Freeze each Part's π_old anchor once, before the multi-update loop.
+            self.prepare_segment(self.ar_algorithm, ar_part)
+            self.prepare_segment(self.image_algorithm, image_part)
 
-            # N optimizer steps over disjoint mini-batches (each track sliced by the same
+            # N optimizer steps over disjoint mini-batches (each Part sliced by the same
             # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
-            steps_by_track = {
-                name: self._optimizer_step_slices(int(tracks[name].batch_size)) for name in self.algorithms
-            }
+            ar_steps = self._optimizer_step_slices(int(ar_part.batch_size))
+            image_steps = self._optimizer_step_slices(int(image_part.batch_size))
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
-                slices_by_track = {name: steps_by_track[name][u] for name in self.algorithms}
                 per_update.append(
-                    self._train_one_step(tracks, slices_by_track, training_progress=float(training_progress))
+                    self._train_one_step(
+                        ar_part,
+                        image_part,
+                        ar_slices=ar_steps[u],
+                        image_slices=image_steps[u],
+                        training_progress=float(training_progress),
+                    )
                 )
         if profiler is not None:
             profiler.step()
@@ -366,7 +366,7 @@ class UnifiedModelTrainStack(Remote):
         # stay distinct series instead of being averaged into one misleading
         # ratio_mean). Mirrors TrainStack.train_track; passthrough at num_updates==1.
         results: Dict[str, TrainStepResult] = {}
-        for name in self.algorithms:
+        for name in ("ar", "image"):
             updates = [upd[name] for upd in per_update]
             aggregated = _aggregate_update_results(updates)
             if len(updates) > 1:

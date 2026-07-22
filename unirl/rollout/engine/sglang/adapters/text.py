@@ -1,9 +1,9 @@
-"""``TextLMAdapter`` — the per-shape base adapter for the packed-text ``ar`` track.
+"""``TextLMAdapter`` — the per-shape base adapter for a packed-text generation Part.
 
 Holds the conversion logic once: chat-template encoding into per-prompt
 ``/generate`` payloads (``build_inputs``) and the predecessor's
 ``build_response`` packing fanned out per ``Part`` field
-(``build_response`` is the template; ``build_ids`` / ``build_segment`` /
+(``build_response`` is the template; ``build_segment`` /
 ``build_decoded`` / ``build_conditions`` each derive one field from
 ``(req, prepared, raw)``). The VLM adapter overrides the steps that differ.
 """
@@ -48,9 +48,6 @@ _FINISH_TO_STATUS = {
 @register_adapter("text")
 class TextLMAdapter(ModelAdapter):
     """Text-only LLM conversion (e.g. Qwen3). The base the VLM adapter derives."""
-
-    #: The single track this engine emits.
-    track_name: str = "ar"
 
     def validate(self) -> None:
         super().validate()

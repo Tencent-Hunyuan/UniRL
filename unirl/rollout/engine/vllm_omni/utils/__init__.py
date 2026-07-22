@@ -10,7 +10,6 @@ from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, s
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 from unirl.rollout.engine.vllm_omni.utils.tracks import (
-    assemble_sample,
     build_ar_segment,
     build_image_segment,
     collect_dit_outputs,
@@ -22,7 +21,6 @@ from unirl.rollout.engine.vllm_omni.utils.tracks import (
 )
 
 __all__ = [
-    "assemble_sample",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",

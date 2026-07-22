@@ -229,16 +229,20 @@ class PEPipeline(Pipeline):
     def _unpack_request(sample: Sample) -> tuple:
         """Resolve the pre-forked ``[input, ar_shell, diff_shell]`` request.
 
-        Shells are located by ``sampling_params`` type (AR vs diffusion), not
-        strictly by position, so the contract survives extra chained input Parts."""
+        This serial pipeline currently accepts exactly one input Part. Reject
+        extra inputs explicitly instead of dropping them from the returned
+        lineage when the two generated Parts are filled."""
         if not sample.parts or not sample.parts[0].is_root:
             raise ValueError("PEPipeline.generate: requires a root input Part at parts[0]")
-        input_part = sample.parts[0]
-        ar_shell = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
-        diff_shell = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None)
-        if ar_shell is None:
+        if len(sample.parts) != 3:
+            raise ValueError(
+                "PEPipeline.generate: requires exactly [input, ar_shell, diffusion_shell]; "
+                f"got {len(sample.parts)} Parts."
+            )
+        input_part, ar_shell, diff_shell = sample.parts
+        if not isinstance(ar_shell.sampling_params, ARSamplingParams):
             raise ValueError("PEPipeline.generate: requires an AR gen-shell Part (ARSamplingParams)")
-        if diff_shell is None:
+        if not isinstance(diff_shell.sampling_params, DiffusionSamplingParams):
             raise ValueError("PEPipeline.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)")
         return input_part, ar_shell, diff_shell
 

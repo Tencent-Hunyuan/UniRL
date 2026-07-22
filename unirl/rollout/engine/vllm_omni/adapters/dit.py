@@ -23,15 +23,13 @@ from unirl.rollout.engine.vllm_omni.backends import (
     StageSampling,
 )
 from unirl.rollout.engine.vllm_omni.utils import (
-    assemble_sample,
-    build_ar_segment,
     build_image_segment,
     collect_dit_outputs,
     pils_to_images,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Texts, primitive_modality_key
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -147,19 +145,19 @@ class DitInputAdapter:
 
 
 class DitOutputAdapter:
-    """Per-request DiT results → the filled DiT gen ``Part``(s) of the ``Sample``.
+    """Per-request DiT results → the filled diffusion ``Part`` of the ``Sample``.
 
-    ``build`` is guard + ``assemble_sample`` over three parallel hooks that
-    mirror its parameter list 1:1 — :meth:`build_segments` /
-    :meth:`build_decoded` / :meth:`build_conditions` — all with the uniform
-    ``(sample, per_request)`` currency: raw wire groups in, each hook collects
-    what it needs (cheap — ``collect_dit_outputs`` only gathers references).
-    Children derive any of the three via ``super()``.
+    The request already carries the typed generation shell. ``build`` locates
+    that shell with :class:`DiffusionSamplingParams`, derives its segment,
+    decoded primitive, and replay conditions, then fills that one ``Part``
+    directly. There is no response-wide condition bag or named-track assembly.
+
+    Every hook has the uniform ``(sample, per_request)`` currency: raw wire
+    groups in, one field of the target Part out. Children derive any hook via
+    ``super()``.
     """
 
-    #: Track key + the wire ``final_output_type`` to collect. Video families
-    #: override both together.
-    track_name = "image"
+    #: Wire ``final_output_type`` to collect. Video families override it.
     final_output_type = "image"
 
     def __init__(self, modality: str, *, stage_id: int = 0) -> None:
@@ -167,38 +165,27 @@ class DitOutputAdapter:
         self.stage_id = stage_id
 
     # ------------------------------------------------------------------ #
-    # Family hooks — one per assemble_sample parameter
+    # Family hooks — one per target Part field
     # ------------------------------------------------------------------ #
 
-    def build_segments(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """The per-track segments: the DiT trajectory (asserting the σ echo)
-        plus the v1-parity Stage-0 AR sweep."""
+    def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
+        """The diffusion trajectory segment, asserting the worker's σ echo."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         expected_sigmas = sample.gen_part(DiffusionSamplingParams).sampling_params.sigmas
-        segments = {self.track_name: build_image_segment(diff_outputs, expected_sigmas=expected_sigmas)}
-        # Parity with v1's unconditional Stage-0 sweep: a single-DiT stage
-        # carries no completions, so this is None unless something upstream
-        # surfaces one (the HI3 two-stage shape always does).
-        ar_segment = build_ar_segment(per_request)
-        if ar_segment is not None:
-            segments["ar"] = ar_segment
-        return segments
+        return build_image_segment(diff_outputs, expected_sigmas=expected_sigmas)
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """The per-track ``decoded`` payloads. Must keep the ``track_name``
-        entry (a missing key silently yields ``decoded=None`` on that track).
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
+        """The decoded diffusion primitive.
 
-        Default: the flat PILs as ``Images``; hv15 swaps the payload for
-        packed frame groups; the HI3 two-track shape adds the AR text via
-        ``super()``.
+        Default: flat PILs as ``Images``; HV1.5 swaps it for packed videos.
         """
         del sample
         _, _, pil_images = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        return {self.track_name: pils_to_images(pil_images)}
+        return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """The family's replay conditions."""
@@ -211,12 +198,17 @@ class DitOutputAdapter:
     def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         if not per_request or not any(per_request):
             raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
-        return assemble_sample(
-            sample,
-            segments_for_track=self.build_segments(sample, per_request),
-            decoded_for_track=self.build_decoded(sample, per_request),
-            conditions=self.build_conditions(sample, per_request),
+        segment = self.build_segment(sample, per_request)
+        decoded = self.build_decoded(sample, per_request)
+        conditions = self.build_conditions(sample, per_request)
+        idx = sample.gen_part_index(DiffusionSamplingParams)
+        parts = list(sample.parts)
+        parts[idx] = parts[idx].fill(
+            segment=segment,
+            primitives={primitive_modality_key(decoded): decoded},
+            conditions=dict(conditions),
         )
+        return sample.with_parts(parts)
 
 
 __all__ = ["DitInputAdapter", "DitOutputAdapter"]

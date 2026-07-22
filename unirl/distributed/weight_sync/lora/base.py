@@ -133,8 +133,22 @@ class LoraWeightSyncBase(Remote):
         """
         for stage_id, per_rank in loaded.items():
             for rank_idx, layer_map in enumerate(per_rank):
-                act_a = sorted(f["lora_a"] for f in layer_map.values() if "lora_a" in f)
-                act_b = sorted(f["lora_b"] for f in layer_map.values() if "lora_b" in f)
+                # Plain layers expose ``lora_a`` / ``lora_b`` directly. Packed
+                # layers expose one checksum per fused projection as
+                # ``lora_a.<index>`` / ``lora_b.<index>``. Flatten both shapes
+                # into the same multisets before comparing with the trainer.
+                act_a = sorted(
+                    checksum
+                    for fields in layer_map.values()
+                    for field, checksum in fields.items()
+                    if field == "lora_a" or field.startswith("lora_a.")
+                )
+                act_b = sorted(
+                    checksum
+                    for fields in layer_map.values()
+                    for field, checksum in fields.items()
+                    if field == "lora_b" or field.startswith("lora_b.")
+                )
                 if act_a != exp_a or act_b != exp_b:
                     raise RuntimeError(
                         f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id} rank "

@@ -2,15 +2,67 @@ import functools
 import json
 import logging
 import os
+import sys
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.device_pool import DevicePool
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def prepare_input_sample(
+    inputs: Sample,
+    rollout_id: int,
+    *,
+    allowed_primitives: set[str],
+    caller: str,
+    root_control: Optional[Dict[str, Any]] = None,
+    require_single_input_part: bool = False,
+) -> Sample:
+    """Prepare a data-source input tree for one rollout without rebuilding it.
+
+    The data-source boundary is an input-only :class:`Sample`: metadata lives on
+    its root and multimodal inputs are already chained as child Parts.  Trainers
+    preserve that structure, namespace *every* id so separate rollouts cannot
+    alias, optionally merge trainer-owned routing control onto the root, and then
+    append their own generation fork(s). ``require_single_input_part`` lets serial
+    runners reject trees they cannot yet return intact instead of silently dropping
+    descendants.
+    """
+    if not isinstance(inputs, Sample):
+        raise TypeError(f"{caller}: expected Sample input, got {type(inputs).__name__}.")
+    if not inputs.parts:
+        raise ValueError(f"{caller}: input Sample must contain at least one Part.")
+    root_text = inputs.parts[0].primitives.get("text")
+    if not isinstance(root_text, Texts):
+        raise TypeError(
+            f"{caller}: input Sample root requires primitives['text']: Texts; "
+            f"got {type(root_text).__name__ if root_text is not None else 'None'}."
+        )
+    generated = [i for i, part in enumerate(inputs.parts) if part.is_gen]
+    if generated:
+        raise ValueError(f"{caller}: data-source Sample must be input-only; generated Parts at {generated}.")
+    if require_single_input_part and len(inputs.parts) != 1:
+        raise ValueError(f"{caller}: this trainer requires exactly one input Part; got {len(inputs.parts)}.")
+
+    present = {key for part in inputs.parts for key in part.primitives}
+    unsupported = present - set(allowed_primitives)
+    if unsupported:
+        raise ValueError(f"{caller}: unsupported input primitive keys: {sorted(unsupported)}")
+
+    namespaced = inputs.map_sample_ids(lambda sample_id: f"r{rollout_id}:{sample_id}")
+    if root_control is None:
+        return namespaced
+    root = namespaced.parts[0]
+    root = replace(root, control={**root.control, **root_control})
+    return namespaced.with_parts([root, *namespaced.parts[1:]])
 
 
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
@@ -241,7 +293,7 @@ class BaseTrainer:
 
     def _drop_decoded(
         self,
-        sample: Any,
+        sample: Sample,
         *,
         rollout_id: int,
     ) -> None:
@@ -311,10 +363,24 @@ class BaseTrainer:
             part.primitive_metadata = {}
             part.media_preview = None
 
+    def _wait_for_checkpoints(self) -> None:
+        """Flush a pending backend checkpoint before worker teardown."""
+        backend = getattr(self, "backend", None)
+        if backend is not None:
+            backend.wait_for_checkpoint()
+
     def _finish_wandb(self) -> None:
-        """Close the wandb run if one is open."""
-        if self.wandb_logger is not None:
-            self.wandb_logger.finish()
+        """Flush pending checkpoints and close the wandb run."""
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            self._wait_for_checkpoints()
+        except Exception:
+            if not active_exception:
+                raise
+            logger.exception("Failed to flush a pending checkpoint during trainer teardown")
+        finally:
+            if self.wandb_logger is not None:
+                self.wandb_logger.finish()
 
     # ---- checkpointing (shared by single-backend trainers) -----------------
 
@@ -329,10 +395,12 @@ class BaseTrainer:
     ) -> None:
         """Save every ``save_interval`` rollouts (and on the last one).
 
-        ``save_interval <= 0`` disables saving. Writes the backend state to
-        ``<save_dir>/checkpoint-<step>/checkpoint.pt`` (``save_dir`` defaults
-        to ``./checkpoints``; ``save_mode="auto"`` keeps only LoRA keys when
-        LoRA is active and writes full checkpoints otherwise).
+        ``save_interval <= 0`` disables saving. Writes the backend state under
+        ``<save_dir>/checkpoint-<step>/`` (``save_dir`` defaults to
+        ``./checkpoints``). The backend's ``checkpoint_format`` selects either
+        a legacy ``checkpoint.pt`` or reshardable DCP shards; ``save_mode="auto"``
+        keeps only LoRA keys when LoRA is active and writes full checkpoints
+        otherwise.
         Paths resolve to absolute here, on the driver — the backend runs in
         Ray workers whose CWD differs from the driver's.
         """
@@ -352,11 +420,20 @@ class BaseTrainer:
         self.backend.save(path, step=step, mode=save_mode)
         if self._memory_monitor is not None:
             self._memory_monitor.boundary("ckpt_save:end", self.backend)
-        # Driver-owned state rides beside the worker-written checkpoint.pt:
+        # Driver-owned state rides beside the worker-written checkpoint data:
         # the wandb run id + train/ step axis let a resume append to the SAME
         # wandb run instead of starting a fresh, misaligned one.
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+        trainer_state_path = os.path.join(path, "trainer_state.json")
+        trainer_state_tmp = f"{trainer_state_path}.tmp"
+        with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        os.replace(trainer_state_tmp, trainer_state_path)
+        # An async DCP save (checkpoint_format="dcp" + checkpoint_async) writes
+        # its shards on a background thread, normally drained by the next save.
+        # The final checkpoint has no next save, so block until it is on disk
+        # before train() returns and the workers are torn down.
+        if step >= num_rollouts:
+            self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from.

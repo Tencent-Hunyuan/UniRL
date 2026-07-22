@@ -11,9 +11,8 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
-from unirl.types.prompts import RolloutInputs
-from unirl.types.sample import Part, Sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -118,42 +117,29 @@ class ARTrainer(BaseTrainer):
 
     def _build_request_sample(
         self,
-        inputs: RolloutInputs,
+        inputs: Sample,
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
         """Turn a data source batch into a request :class:`Sample`.
 
-        The ``P`` prompts become a root text input Part — ids rollout-keyed
-        (``r{rollout_id}:…``) so each rollout is its own provenance — and
-        ``Part.fork`` fans out the AR gen shell to the ``N``-sample GRPO group
-        (replacing the old ``inputs.expand``; siblings stay consecutive). A VLM
-        recipe chains the image input off the prompt via ``Part.input_child``.
+        The data source's input-only Part tree is preserved while every id is
+        rollout-keyed (``r{rollout_id}:…``), then ``Part.fork`` fans out the AR
+        gen shell to the ``N``-sample GRPO group (siblings stay consecutive).
+        VLM image/video inputs are already chained by the data source.
         AR params ride on the gen Part — no SDE schedule to resolve (that is the
         diffusion trainer's job). ``sampling`` overrides the dict (``evaluate``
         passes its own); ``None`` uses ``self.sampling_params``.
         """
         sp = sampling if sampling is not None else self.sampling_params
-        unsupported = set(inputs.primitives) - {"text", "image", "video"}
-        if unsupported:
-            raise ValueError(
-                f"ARTrainer._build_request_sample: unsupported input primitive keys: {sorted(unsupported)}"
-            )
-        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
-        text = Part.input(
-            root_ids,
-            primitives={"text": inputs.primitives["text"]},
-            metadata=list(inputs.metadata) if inputs.metadata else None,
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text", "image", "video"},
+            caller="ARTrainer._build_request_sample",
         )
-        input_parts = [text]
-        parent = text
-        for key in ("image", "video"):
-            primitive = inputs.primitives.get(key)
-            if primitive is not None:
-                parent = parent.input_child(primitives={key: primitive})
-                input_parts.append(parent)
-        return Sample.request(*input_parts).fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
+        return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
 
     def train_step(
         self,
@@ -244,7 +230,7 @@ class ARTrainer(BaseTrainer):
             if self.weight_sync is not None:
                 self.weight_sync.sync()
             for eval_inputs in eval_batches:
-                real_prompt_n = len(eval_inputs.sample_ids)
+                real_prompt_n = eval_inputs.batch_size
                 batch_n += 1
                 prompt_n += real_prompt_n
                 dispatch_inputs = self._pad_eval_inputs(eval_inputs)
@@ -255,11 +241,11 @@ class ARTrainer(BaseTrainer):
                 if rewards is not None:
                     rewards = hydrate(rewards).to(torch.float32)
                     fanout = total_samples_per_prompt(eval_sp)
-                    expected_total = len(dispatch_inputs.sample_ids) * fanout
+                    expected_total = dispatch_inputs.batch_size * fanout
                     if int(rewards.numel()) != expected_total:
                         raise RuntimeError(
                             f"ARTrainer.evaluate: reward count {int(rewards.numel())} != "
-                            f"dispatch prompts {len(dispatch_inputs.sample_ids)} * fanout {fanout} "
+                            f"dispatch prompts {dispatch_inputs.batch_size} * fanout {fanout} "
                             f"({expected_total})."
                         )
                     rewards = rewards[: real_prompt_n * fanout]
@@ -283,14 +269,14 @@ class ARTrainer(BaseTrainer):
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
 
-    def _pad_eval_inputs(self, inputs: RolloutInputs) -> RolloutInputs:
+    def _pad_eval_inputs(self, inputs: Sample) -> Sample:
         """Append replicated prompt rows until rollout and reward DP can shard.
 
         Evaluation still reports only the original rows; the replicas exist solely
         to satisfy ``DP_SCATTER``. Their ids are rewritten because Sample lineage
         requires distinct root ids within one request.
         """
-        n = len(inputs.sample_ids)
+        n = inputs.batch_size
         if n == 0:
             return inputs
         rollout_dp = max(1, int(getattr(self.rollout, "dp_size", 1)))
@@ -300,28 +286,27 @@ class ARTrainer(BaseTrainer):
         if pad_n == 0:
             return inputs
 
-        pad = inputs.select(torch.full((pad_n,), n - 1, dtype=torch.long))
-        used_sample_ids = set(inputs.sample_ids)
-        padded_sample_ids = []
+        source = inputs.slice(n - 1, n)
+        source_root_id = source.parts[0].sample_ids[0]
+        used_root_ids = set(inputs.parts[0].sample_ids)
+        padded: list[Sample] = []
         for i in range(pad_n):
-            candidate = f"{inputs.sample_ids[-1]}:eval-pad:{i}"
-            while candidate in used_sample_ids:
+            candidate = f"{source_root_id}:eval-pad:{i}"
+            while candidate in used_root_ids:
                 candidate += ":pad"
-            used_sample_ids.add(candidate)
-            padded_sample_ids.append(candidate)
-        pad.sample_ids = padded_sample_ids
+            used_root_ids.add(candidate)
 
-        if inputs.group_ids:
-            used_group_ids = set(inputs.group_ids)
-            padded_group_ids = []
-            for i in range(pad_n):
-                candidate = f"{inputs.group_ids[-1]}:eval-pad:{i}"
-                while candidate in used_group_ids:
-                    candidate += ":pad"
-                used_group_ids.add(candidate)
-                padded_group_ids.append(candidate)
-            pad.group_ids = padded_group_ids
-        return inputs.concat_with(pad)
+            def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
+                root, separator, suffix = sample_id.partition("/")
+                if root != source_root_id:
+                    raise ValueError(
+                        "ARTrainer._pad_eval_inputs: selected pad tree contains "
+                        f"unexpected root {root!r}; expected {source_root_id!r}."
+                    )
+                return new_root + (f"/{suffix}" if separator else "")
+
+            padded.append(source.map_sample_ids(replace_root))
+        return Sample.concat([inputs, *padded])
 
     def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
         """Debug dump of the first N (prompt, output, reward) triples per rollout.

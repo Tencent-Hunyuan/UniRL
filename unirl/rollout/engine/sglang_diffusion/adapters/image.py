@@ -4,7 +4,7 @@ Output shape = a 5-D image-form latent trajectory ``[B, T+1, C, H, W]`` decoded 
 ``Images``. Holds ``build_inputs`` / ``build_response`` once and exposes the per-model
 variation points as overridable stages (request side: ``build_prompts``,
 ``build_sampling``; response side: ``build_segment``, ``build_decoded``,
-``build_condition``) and class knobs (``track_name``, ``segment_factory``).
+``build_condition``) and the ``segment_factory`` class knob.
 Concrete adapters override only the stages that differ — no sub-step hooks below
 a stage.
 
@@ -24,7 +24,7 @@ from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import ModelAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Texts, primitive_modality_key
 from unirl.types.sample import Sample
 from unirl.types.sampling import is_forward_process
 from unirl.types.segments.latent import make_image_segment
@@ -33,8 +33,6 @@ from unirl.types.segments.latent import make_image_segment
 class ImageAdapter(ModelAdapter):
     """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
-    #: Part's output slot key the segment/decoded/conditions are stored under.
-    track_name: str = "image"
     #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
     #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are squeezed to
@@ -281,7 +279,7 @@ class ImageAdapter(ModelAdapter):
 
         # Fill the frontier gen Part; ``with_filled_frontier`` preserves every
         # preceding part (the prompt head and any chained inputs).
-        primitives = {self.track_name: decoded} if decoded is not None else {}
+        primitives = {primitive_modality_key(decoded): decoded} if decoded is not None else {}
         return sample.with_filled_frontier(segment=segment, primitives=primitives, conditions=conditions)
 
     # ------------------------------------------------------------------ #

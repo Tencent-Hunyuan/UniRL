@@ -1,7 +1,7 @@
 """Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + boilerplate) over the per-shape base adapter
-(:mod:`text` — both registered families emit the packed-text ``"ar"`` track) that
+(:mod:`text` — both registered families fill a packed-text generation Part) that
 holds the conversion logic as overridable methods. The VLM adapter overrides only
 the steps that differ and self-registers by ``model_family`` key. Selected once
 at engine construction via :func:`get_adapter`.

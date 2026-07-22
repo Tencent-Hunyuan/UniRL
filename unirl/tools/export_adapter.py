@@ -8,21 +8,24 @@ one adapter and writes the standard PEFT serving artifact:
 * ``adapter_config.json``
 
 It also works on ``save_mode=full`` checkpoints by filtering the LoRA keys out
-of the full policy state dict.
+of the full policy state dict, and reads either checkpoint flavor —
+the legacy single-file ``checkpoint.pt`` or a sharded ``dcp`` directory.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import pickle
 from collections.abc import Iterable
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 from safetensors.torch import save_file
 
+from unirl.tools._checkpoint import load_training_checkpoint
+
 PEFT_PREFIX = "base_model.model."
+ModuleSelection = Union[str, List[str]]
 
 
 def export_adapter_state_dict(
@@ -60,7 +63,8 @@ def write_adapter_config(
     base: str,
     r: int,
     lora_alpha: int,
-    target_modules: List[str],
+    target_modules: ModuleSelection,
+    exclude_modules: Optional[ModuleSelection] = None,
     lora_dropout: float = 0.0,
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
@@ -72,7 +76,8 @@ def write_adapter_config(
         config = LoraConfig(
             r=int(r),
             lora_alpha=int(lora_alpha),
-            target_modules=list(target_modules),
+            target_modules=target_modules,
+            exclude_modules=exclude_modules,
             lora_dropout=float(lora_dropout),
             bias=str(bias),
             task_type=str(task_type),
@@ -97,11 +102,12 @@ def write_adapter_config(
                     "lora_alpha": int(lora_alpha),
                     "lora_dropout": float(lora_dropout),
                     "modules_to_save": None,
+                    "exclude_modules": exclude_modules,
                     "peft_type": "LORA",
                     "r": int(r),
                     "rank_pattern": {},
                     "revision": None,
-                    "target_modules": list(target_modules),
+                    "target_modules": target_modules,
                     "task_type": str(task_type),
                     "use_rslora": False,
                 },
@@ -109,19 +115,6 @@ def write_adapter_config(
                 indent=2,
                 sort_keys=True,
             )
-
-
-def _load_checkpoint(path: str) -> Dict[str, object]:
-    if os.path.isdir(path):
-        path = os.path.join(path, "checkpoint.pt")
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except (TypeError, pickle.UnpicklingError):
-        return torch.load(path, map_location="cpu")
-    except RuntimeError as exc:
-        if "Weights only load failed" not in str(exc):
-            raise
-        return torch.load(path, map_location="cpu")
 
 
 def _split_modules(values: Optional[Iterable[str]]) -> Optional[List[str]]:
@@ -139,16 +132,28 @@ def _require_int(value: object, *, name: str) -> int:
     return int(value)
 
 
-def _require_modules(value: object) -> List[str]:
+def _require_modules(value: object, *, name: str = "target_modules") -> ModuleSelection:
     if isinstance(value, str):
-        modules = _split_modules([value])
+        if value:
+            return value
+        modules = None
     elif isinstance(value, Iterable):
         modules = [str(item) for item in value]
     else:
         modules = None
     if not modules:
-        raise SystemExit("missing LoRA target_modules; pass --target-modules")
+        option = name.replace("_", "-")
+        raise SystemExit(f"missing LoRA {name}; pass --{option}")
     return modules
+
+
+def _optional_modules(value: object) -> Optional[ModuleSelection]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, Iterable) and not isinstance(value, str):
+        modules = [str(item) for item in value]
+        return modules or None
+    return _require_modules(value, name="exclude_modules")
 
 
 def main() -> None:
@@ -165,18 +170,52 @@ def main() -> None:
     parser.add_argument("--lora-r", type=int, default=None, help="override LoRA rank")
     parser.add_argument("--lora-alpha", type=int, default=None, help="override LoRA alpha")
     parser.add_argument("--target-modules", nargs="*", default=None, help="override target modules")
+    parser.add_argument(
+        "--target-modules-regex",
+        default=None,
+        help="override target modules with a PEFT regex (also accepts 'all-linear')",
+    )
+    parser.add_argument("--exclude-modules", nargs="*", default=None, help="override excluded module suffixes")
+    parser.add_argument(
+        "--exclude-modules-regex",
+        default=None,
+        help="override excluded modules with a PEFT regex",
+    )
     parser.add_argument("--lora-dropout", type=float, default=None, help="override LoRA dropout")
     parser.add_argument("--bias", default=None, help="override LoRA bias setting")
     parser.add_argument("--task-type", default=None, help="override PEFT task_type")
     args = parser.parse_args()
 
-    checkpoint = _load_checkpoint(args.checkpoint)
+    checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
     recorded = checkpoint.get("lora_config") or {}
 
     r = args.lora_r if args.lora_r is not None else recorded.get("rank")
     alpha = args.lora_alpha if args.lora_alpha is not None else recorded.get("alpha")
-    target_modules = _split_modules(args.target_modules) or _require_modules(recorded.get("target_modules"))
+    if args.target_modules is not None and args.target_modules_regex is not None:
+        parser.error("--target-modules and --target-modules-regex are mutually exclusive")
+    if args.exclude_modules is not None and args.exclude_modules_regex is not None:
+        parser.error("--exclude-modules and --exclude-modules-regex are mutually exclusive")
+
+    if args.target_modules_regex is not None:
+        target_modules: ModuleSelection = _require_modules(args.target_modules_regex)
+    elif args.target_modules is not None:
+        target_modules = _require_modules(_split_modules(args.target_modules))
+        if target_modules == ["all-linear"]:
+            target_modules = "all-linear"
+    else:
+        target_modules = _require_modules(recorded.get("target_modules"))
+
+    if args.exclude_modules_regex is not None:
+        exclude_modules: Optional[ModuleSelection] = _require_modules(
+            args.exclude_modules_regex,
+            name="exclude_modules",
+        )
+    elif args.exclude_modules is not None:
+        exclude_modules = _optional_modules(_split_modules(args.exclude_modules))
+    else:
+        exclude_modules = _optional_modules(recorded.get("exclude_modules"))
+
     dropout = args.lora_dropout if args.lora_dropout is not None else recorded.get("dropout", 0.0)
     bias = args.bias if args.bias is not None else recorded.get("bias", "none")
     task_type = args.task_type if args.task_type is not None else recorded.get("task_type", "FEATURE_EXTRACTION")
@@ -195,6 +234,7 @@ def main() -> None:
         r=_require_int(r, name="r"),
         lora_alpha=_require_int(alpha, name="alpha"),
         target_modules=target_modules,
+        exclude_modules=exclude_modules,
         lora_dropout=float(dropout),
         bias=str(bias),
         task_type=str(task_type),

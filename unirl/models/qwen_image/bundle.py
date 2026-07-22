@@ -33,41 +33,12 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenImagePipelineConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _rebuild_meta_rope_modules(transformer: nn.Module) -> int:
-    """Rebuild rope-embed modules whose tables were built on meta.
-
-    diffusers' ``QwenEmbedRope`` keeps its complex rope tables
-    (``pos_freqs`` / ``neg_freqs``) as PLAIN tensor attributes —
-    deliberately not buffers (upstream comment: registering complex
-    buffers drops the imaginary part) — so ``to_empty`` never
-    materializes them and they stay on meta. The module holds no
-    parameters, so re-instantiating it on CPU from its own ctor attrs
-    and swapping it in is shard-exempt; ``forward`` moves the tables to
-    the live device on use."""
-    count = 0
-    for name, mod in list(transformer.named_modules()):
-        pos_freqs = getattr(mod, "pos_freqs", None)
-        if not (isinstance(pos_freqs, torch.Tensor) and pos_freqs.is_meta):
-            continue
-        fresh = type(mod)(
-            theta=mod.theta,
-            axes_dim=list(mod.axes_dim),
-            scale_rope=getattr(mod, "scale_rope", False),
-        )
-        if "." in name:
-            parent_name, attr = name.rsplit(".", 1)
-            setattr(transformer.get_submodule(parent_name), attr, fresh)
-        else:
-            setattr(transformer, name, fresh)
-        count += 1
-    return count
 
 
 class QwenImageBundle(Bundle):
@@ -150,33 +121,18 @@ class QwenImageBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
+        meta_init_state = None
         if config.meta_init_transformer:
-            # VeOmniBackend lifecycle: architecture only, on the meta device
-            # (no weight allocation). VeOmni's parallelize asserts meta init,
-            # materializes storage via ``to_empty``, and calls the model's
-            # ``init_weights()`` unconditionally — stamped to a no-op here so
-            # it cannot clobber anything; the backend loads the real weights
-            # from the stashed path after sharding (rank0 read + broadcast).
+            # Meta-init (VeOmni load_sharded path): params on meta, weights load
+            # post-parallelize. Qwen-Image's QwenEmbedRope holds its complex rope
+            # tables (pos_freqs / neg_freqs) as plain __dict__ tensors, so to_empty
+            # never materializes them; build_meta_init_transformer keeps them real
+            # on CPU and captures them into meta_init_state for load_trainable_weights
+            # to restore after the sharded load.
             transformer_config = QwenImageTransformer2DModel.load_config(path, subfolder="transformer")
-            with torch.device("meta"):
-                transformer = QwenImageTransformer2DModel.from_config(transformer_config)
-            rebuilt = _rebuild_meta_rope_modules(transformer)
-            if rebuilt:
-                logger.info("meta_init_transformer: rebuilt %d rope module(s) on CPU", rebuilt)
-            transformer = transformer.to(dtype)
-            transformer.init_weights = lambda: None
-            non_persistent = sorted(set(n for n, _ in transformer.named_buffers()) - set(transformer.state_dict()))
-            if non_persistent:
-                # Non-persistent buffers are absent from checkpoints, so
-                # ``to_empty`` leaves them uninitialized — if any module
-                # relies on init-time buffer values, the parity gates will
-                # surface it; this log names the suspects.
-                logger.warning(
-                    "meta_init_transformer: %d non-persistent buffer(s) will not be "
-                    "restored by the checkpoint load: %s",
-                    len(non_persistent),
-                    non_persistent[:8],
-                )
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: QwenImageTransformer2DModel.from_config(transformer_config), dtype=dtype
+            )
         else:
             transformer = QwenImageTransformer2DModel.from_pretrained(
                 path, subfolder="transformer", torch_dtype=dtype
@@ -219,6 +175,8 @@ class QwenImageBundle(Bundle):
             # Kept as the raw join — the backend validates local-dir-ness
             # at load time (HF repo IDs need a local download first).
             bundle._transformer_weights_path = os.path.join(path, "transformer")
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

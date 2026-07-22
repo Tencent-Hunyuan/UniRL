@@ -16,7 +16,7 @@ its own ``_target_``; ``__init__`` builds the child engine via
 ``config.<child>.make_engine(...)``.
 
 Weight sync uses prefix-based tensor routing: the training side prepends
-``"{track_name}."`` to tensor keys; this engine demuxes by prefix and
+the child component name to tensor keys; this engine demuxes by prefix and
 forwards each subset to the matching child with the prefix stripped.
 """
 
@@ -323,23 +323,24 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
     def _unpack_request(self, sample: Sample) -> tuple:
         """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request.
 
-        Shells are located by ``sampling_params`` type (AR vs diffusion), not
-        strictly by position, so the contract survives extra chained input Parts
-        (multi-input, later)."""
+        The serial PE flow currently accepts exactly one input Part. Reject extra
+        inputs explicitly instead of dropping them from the returned lineage."""
         require(
             bool(sample.parts) and sample.parts[0].is_root,
             "ComposedRolloutEngine.generate: requires a root input Part at parts[0]",
         )
-        input_part = sample.parts[0]
-        ar_shell = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
-        diffusion_shell = next(
-            (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
+        require(
+            len(sample.parts) == 3,
+            "ComposedRolloutEngine.generate: requires exactly "
+            f"[input, ar_shell, diffusion_shell]; got {len(sample.parts)} Parts.",
+        )
+        input_part, ar_shell, diffusion_shell = sample.parts
+        require(
+            isinstance(ar_shell.sampling_params, ARSamplingParams),
+            "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)",
         )
         require(
-            ar_shell is not None, "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)"
-        )
-        require(
-            diffusion_shell is not None,
+            isinstance(diffusion_shell.sampling_params, DiffusionSamplingParams),
             "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
         )
         return input_part, ar_shell, diffusion_shell

@@ -9,7 +9,8 @@
 ## What it is
 
 `unirl/trainer/` holds the driver-side trainers for diffusion, autoregressive,
-prompt-enhancement, unified-model, ReFL, asynchronous, and agentic runs. They
+supervised fine-tuning, prompt-enhancement, unified-model, ReFL, asynchronous,
+and agentic runs. They
 subclass `BaseTrainer` directly or through a domain trainer. A trainer places the
 rollout and train workers on GPUs, builds the rollout engine / reward service /
 train stack(s) / weight-sync handler, and runs the optimizer loop over them. It
@@ -57,6 +58,7 @@ The current trainer surface is:
 |---|---|---|
 | `DiffusionTrainer` | one diffusion `Part` → one `TrainStack` | Reference diffusion loop; supports trainside or dedicated rollout, optional separate reward GPUs, FSDP offload, and DiffusionNFT's EMA-adapter rollout. |
 | `ARTrainer` | one AR `Part` → one `TrainStack` | Text or multimodal AR rollout with group/global advantage normalization and optional token-balanced DP shards. |
+| `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
 | `AsyncARTrainer` | buffered AR `Sample` groups → one `TrainStack` | Separate train/rollout slabs with resident generation, bounded staleness, and quiescence before sync, eval, or checkpoint. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
@@ -77,7 +79,8 @@ single-backend checkpoint bundles model state (`save_mode=auto`: LoRA-only when
 LoRA is active, otherwise full; `save_mode=full`: the whole model state;
 `save_mode=adapter`: LoRA keys only), optimizer and scheduler state, the step
 counters (`step`, `optimizer_step_count`), and the LoRA config (rank / alpha /
-target_modules — export tooling reads its scaling from it).
+target_modules / exclude_modules — export tooling reads its scaling and module
+selection from it).
 
 The default backend `checkpoint_format=torch` gathers full state to distributed
 rank 0 and writes `<save_dir>/checkpoint-<step>/checkpoint.pt`. Setting the
@@ -86,6 +89,10 @@ shards plus `metadata.pt` under the checkpoint directory; each rank reads and
 writes its own shard. For example, PE configures the AR and diffusion backends
 independently, while ReFL uses `policy.fsdp_cfg`. Load auto-detects either
 on-disk format.
+
+With `checkpoint_format=dcp`, `checkpoint_async=true` stages the snapshot and
+flushes shards in the background. The next save/load drains the prior future,
+and every trainer drains the final save before worker teardown.
 
 PE checkpoints use one checkpoint directory per trained side:
 `<save_dir>/checkpoint-<step>/diffusion/` and, unless `freeze_llm=true`,
@@ -100,7 +107,7 @@ format every rank writes and reads its shard.
 
 Async and partial agentic checkpoints restore the trainable model, optimizer,
 scheduler, and counters, but not runtime-only rollout state: buffers, in-flight
-requests, carried trajectories, and environment episodes restart empty.
+generations, carried trajectories, and environment episodes restart empty.
 
 **Multi-node**: `save_dir` / `load_dir` must live on storage mounted on every
 node — the same contract the recipes already place on `PRETRAINED_MODEL` and
@@ -177,8 +184,8 @@ in the common parent above the `ar/` and `diffusion/` side checkpoints.
 
 ### Export to Hugging Face format
 
-`checkpoint.pt` is a raw training checkpoint (PEFT-injected names, optimizer
-state), not a release artifact. The offline checkpoint toolset lives in
+The checkpoint directory is a raw training artifact (PEFT-injected names and
+optimizer state), not a release artifact. The offline checkpoint toolset lives in
 `unirl/tools/` (the runtime counterpart for engine weight sync is
 `unirl/utils/peft_merge.py`): `export_full` folds the LoRA delta into the base
 weights and writes a standard `save_pretrained` folder; `export_adapter`
@@ -194,10 +201,10 @@ NFT runs can export the EMA shadow adapter with `--adapter old`.
 
 For PE, point the exporter at one side's directory, for example
 `checkpoint-1000/diffusion` or `checkpoint-1000/ar`, rather than at the common
-parent directory. The current export tools consume the torch-format
-`checkpoint.pt`; this repository does not currently ship a DCP consolidation
-command, so use the torch checkpoint format when a Hugging Face export is
-required.
+parent directory. The exporters auto-detect both the legacy torch-format
+`checkpoint.pt` and complete DCP checkpoints (`.metadata` plus `metadata.pt`);
+an incomplete asynchronous DCP directory is rejected rather than partially
+exported.
 
 ## Multiple optimizer updates per rollout
 

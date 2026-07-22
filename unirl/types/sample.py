@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
 
 import torch
 
@@ -587,6 +587,23 @@ class Sample(Batch):
         — the idiom for swapping in advantage-filled Parts without dropping the
         accumulated reward-compute time."""
         return type(self)(parts=list(parts), reward_compute_s=self.reward_compute_s)
+
+    def map_sample_ids(self, mapper: Callable[[str], str]) -> "Sample":
+        """Rewrite every Part's ids and revalidate the complete lineage tree.
+
+        Request preparation and eval padding both need to rewrite roots without
+        leaving descendant ids behind.  Mapping the whole tree in one operation
+        makes that invariant explicit; ``mapper`` must preserve parent/child
+        relationships (for example by prefixing every id, or replacing only its
+        root segment).  Construction of the returned :class:`Sample` validates
+        the resulting foreign-key chain.
+        """
+        return self.with_parts(
+            [
+                _part_with_field(part, "sample_ids", [mapper(sample_id) for sample_id in part.sample_ids])
+                for part in self.parts
+            ]
+        )
 
     def slice(self, start: int, end: int) -> "Sample":
         """Shard ``[start, end)`` along the batch dim (the P root prompts) by whole

@@ -50,7 +50,7 @@ class Sd3InputAdapter(DitInputAdapter):
 
 
 class Sd3OutputAdapter(DitOutputAdapter):
-    """Single-"image"-track response with the SD3 text-capture conditions."""
+    """Single diffusion-Part response with SD3 text-capture conditions."""
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Concat the per-request SD3 ``text_capture`` dicts into one condition.

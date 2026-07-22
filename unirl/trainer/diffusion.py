@@ -12,10 +12,9 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
-from unirl.types.prompts import RolloutInputs
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -356,18 +355,17 @@ class DiffusionTrainer(BaseTrainer):
 
     def _build_request_sample(
         self,
-        inputs: RolloutInputs,
+        inputs: Sample,
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
         """Turn a data source batch into a request :class:`Sample`.
 
-        The ``P`` prompts become a root text input Part — ids rollout-keyed
-        (``r{rollout_id}:…``) so each rollout is its own provenance — and
-        ``Part.fork`` fans out the diffusion gen shell to the ``N``-sample GRPO
-        group (replacing the old ``inputs.expand``; siblings stay consecutive). An
-        it2i recipe chains the source image off the prompt via ``Part.input_child``.
+        The data source's input-only Part tree is preserved while every id is
+        rollout-keyed (``r{rollout_id}:…``), then ``Part.fork`` fans out the
+        diffusion gen shell to the ``N``-sample GRPO group. Image/video inputs
+        are already chained by the data source.
 
         ``rollout_id`` keys the SDE step scheduler (``resolve_sde_indices``): the
         resolved indices are stamped onto a per-request copy of the diffusion
@@ -408,26 +406,14 @@ class DiffusionTrainer(BaseTrainer):
         # draw its OWN x_T from independent RNG → divergent reward curves; a single
         # driver-authored x_T removes that. Opt out with DISABLE_DRIVER_XT=1
         # (resolved in __init__ → shape None here).
-        unsupported = set(inputs.primitives) - {"text", "image", "video"}
-        if unsupported:
-            raise ValueError(
-                f"DiffusionTrainer._build_request_sample: unsupported input primitive keys: {sorted(unsupported)}"
-            )
-        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
-        text = Part.input(
-            root_ids,
-            primitives={"text": inputs.primitives["text"]},
-            control=dict(self._stage_config),
-            metadata=list(inputs.metadata) if inputs.metadata else None,
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text", "image", "video"},
+            caller="DiffusionTrainer._build_request_sample",
+            root_control=dict(self._stage_config),
         )
-        input_parts = [text]
-        parent = text
-        for key in ("image", "video"):
-            primitive = inputs.primitives.get(key)
-            if primitive is not None:
-                parent = parent.input_child(primitives={key: primitive})
-                input_parts.append(parent)
-        return Sample.request(*input_parts).fork(total_samples_per_prompt(sp), sampling_params=diffusion)
+        return request.fork(total_samples_per_prompt(sp), sampling_params=diffusion)
 
     def train_step(
         self,
@@ -580,7 +566,7 @@ class DiffusionTrainer(BaseTrainer):
         every scorer — single-track for now; revisit if multi-track lands.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
+        n_prompts = all_inputs.batch_size
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}

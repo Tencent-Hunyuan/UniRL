@@ -61,25 +61,25 @@ Single-transformer bundles (the common case) branch in `from_config`:
 ```python
 if config.meta_init_transformer:
     transformer_config = <Class>.load_config(path, subfolder="transformer")   # diffusers
-    with torch.device("meta"):
-        transformer = <Class>.from_config(transformer_config)
-    transformer = finalize_meta_init(transformer, dtype=dtype)                # unirl.models.types.meta_init
+    transformer, meta_init_state = build_meta_init_transformer(               # unirl.models.types.meta_init
+        lambda: <Class>.from_config(transformer_config),
+        dtype=dtype,
+    )
 else:
     transformer = <Class>.from_pretrained(path, subfolder="transformer", torch_dtype=dtype).to(device, dtype=dtype)
 ...
 bundle = cls(...)
 if config.meta_init_transformer:
     bundle._transformer_weights_path = os.path.join(path, "transformer")      # diffusion layout
+    bundle._meta_init_state = meta_init_state
 return bundle
 ```
 
-- `finalize_meta_init` dtype-casts (on meta this is metadata-only), stamps `init_weights` to a no-op (VeOmni's `parallelize` calls it after `to_empty`), and warns about non-persistent buffers the checkpoint load won't restore.
+- `build_meta_init_transformer` builds under `accelerate.init_empty_weights(include_buffers=False)`, captures init-computed non-persistent buffers/plain tensor attributes, dtype-casts (metadata-only on meta), and stamps `init_weights` to a no-op. Stash its returned state on `bundle._meta_init_state`; the backend restores it after the sharded weight load, including across Ray actor serialization.
 - Stash `_transformer_weights_path` = the safetensors dir the backend reads via `load_sharded` (`unirl/train/backend/sharded_load.py`): `<ckpt>/transformer` for diffusers-layout models; the **checkpoint root** (`path`) for AR/VL models loaded through `AutoModelForCausalLM` (no subfolder).
-- AR/VL bundles build on meta via `accelerate.init_empty_weights()` + `AutoModelForCausalLM.from_config(cfg, trust_remote_code=...)` (qwen3) or `ModelClass(cfg)` (qwen_vl). Structural setup that does not touch weights (`gradient_checkpointing_enable`, `requires_grad_(False)` for a frozen vision tower) runs on both builds and persists through `to_empty` + load.
+- AR/VL bundles use the same helper with an `AutoModelForCausalLM.from_config(...)` (qwen3) or `ModelClass(cfg)` (qwen_vl) factory. Structural setup that does not touch weights (`gradient_checkpointing_enable`, `requires_grad_(False)` for a frozen vision tower) runs on both builds and persists through `to_empty` + load.
 
-Per-architecture init-computed state that `to_empty` destroys must be restored — the `finalize_meta_init` non-persistent-buffer warning is the signal to look for a new model's quirk. A bundle that recovers such state builds under `accelerate.init_empty_weights(include_buffers=False)` (parameters on meta, buffers/`__dict__` tensors real on CPU) instead of `with torch.device("meta")` (which forces buffers to meta too); `stamp_init_state_restore` then captures from the model itself and raises if it finds meta tensors (the tell-tale of the wrong context).
-- plain-tensor rope tables (Qwen-Image `QwenEmbedRope.pos_freqs`): rebuild the module on CPU *before* `finalize_meta_init` (see `_rebuild_meta_rope_modules`).
-- non-persistent sincos buffers (SD3 `PatchEmbed.pos_embed`): build under `init_empty_weights(include_buffers=False)` and capture from the model itself via `stamp_init_state_restore(transformer)` (deferred restore after the load).
+Per-architecture init-computed state that `to_empty` destroys is handled by the shared capture/restore path. `build_meta_init_transformer` deliberately keeps buffers and `__dict__` tensors real on CPU while parameters are meta, and raises if a captured tensor is unexpectedly still meta. This covers plain-tensor rope tables (Qwen-Image `QwenEmbedRope.pos_freqs`) and non-persistent sincos buffers (SD3 `PatchEmbed.pos_embed`) without bespoke rebuild/deferred-stamp helpers.
 - params the checkpoint omits (FLUX.2-klein guidance embedder): zero-init them post-load via a deferred op keyed on checkpoint-absent names — `to_empty` leaves them as garbage (not meta), so an `is_meta`-gated fix won't catch them.
 
 Always confirm parity on a GPU pod: the meta build must load weights byte-identical to the eager path, on both backends.

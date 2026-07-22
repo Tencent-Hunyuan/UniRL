@@ -35,8 +35,8 @@ from unirl.algorithms.normalizers import build_group_index_map
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
+from unirl.trainer.base import prepare_input_sample
 from unirl.types.primitives import Texts
-from unirl.types.prompts import RolloutInputs
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import BaseSamplingParams
 
@@ -117,24 +117,23 @@ class AgenticTrainer(ARTrainer):
 
     def _build_request_sample(
         self,
-        inputs: RolloutInputs,
+        inputs: Sample,
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
-        """The ``P`` prompts as a single root input Part — NO ``fork`` (the agentic
-        engine fans the ``n`` GRPO siblings itself) — with the per-turn ``stop`` on the
-        root control bag and ``metadata`` (the ground-truth answer) carried for the
-        reward judge."""
+        """The ``P`` prompts as an input-only ``Sample`` tree — NO ``fork`` (the
+        agentic engine fans the ``n`` GRPO siblings itself) — with the per-turn
+        ``stop`` on the root control bag and root ``metadata`` (the ground-truth
+        answer) carried for the reward judge."""
         del sampling  # the engine's ``episode_sampling`` owns per-turn params + ``n``
-        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
-        text = Part.input(
-            root_ids,
-            primitives={"text": inputs.primitives["text"]},
-            metadata=list(inputs.metadata) if inputs.metadata else None,
-            control={"ar": {"stop": list(self._stop)}},
+        return prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text"},
+            caller="AgenticTrainer._build_request_sample",
+            root_control={"ar": {"stop": list(self._stop)}},
         )
-        return Sample.request(text)
 
     def train_step(
         self,

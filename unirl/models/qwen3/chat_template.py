@@ -1,6 +1,6 @@
-"""Qwen3ChatTemplateStage — ``List[Turn] → Qwen3ARConditions``.
+"""Qwen3ChatTemplateStage — conversations or batched text → AR conditions.
 
-Implements ``EmbedStage[List[Turn], Qwen3ARConditions]`` from
+Implements ``EmbedStage[List[Turn] | Texts, Qwen3ARConditions]`` from
 :mod:`unirl.models.types.embedding`. Renders the role-tagged trajectory
 (:meth:`Sample.text_conditioning`) into one chat conversation per frontier sample
 and applies the bundle tokenizer's chat template (with
@@ -15,20 +15,23 @@ stage does not interpret it.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 
 from unirl.models.types.conversations import build_text_messages
 from unirl.models.types.embedding import EmbedStage
 from unirl.types.conditions import TextTokenCondition
+from unirl.types.primitives import Texts
 from unirl.types.sample import Turn
 
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
+Qwen3ChatInput = Union[List[Turn], Texts]
 
-class Qwen3ChatTemplateStage(EmbedStage[List[Turn], Qwen3ARConditions]):
+
+class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
     """Apply the Qwen3 chat template, right-pad in batch, return AR conditions."""
 
     def __init__(
@@ -47,13 +50,17 @@ class Qwen3ChatTemplateStage(EmbedStage[List[Turn], Qwen3ARConditions]):
         # prompts diverge and the importance ratio breaks.
         self.enable_thinking = bool(enable_thinking)
 
-    def embed(self, turns: List[Turn]) -> Qwen3ARConditions:
-        """Render the trajectory ``turns`` into one chat conversation per frontier
-        sample, tokenize via the chat template, and pack into AR conditions.
+    def embed(self, value: Qwen3ChatInput) -> Qwen3ARConditions:
+        """Render one chat conversation per row and pack it into AR conditions.
 
-        Multi-turn: ``turns`` (from :meth:`Sample.text_conditioning`) becomes one
-        role-tagged message per turn, per sample. Degenerates to today's single
-        ``user`` message when no roles are set (byte-identical, single-turn)."""
+        A ``List[Turn]`` comes from :meth:`Sample.text_conditioning` and retains
+        full role-aware history. ``Texts`` is the supervised single-turn seam and
+        is normalized to one ``user`` turn before the same rendering/tokenization
+        path, keeping SFT and rollout prompts byte-identical.
+        """
+        turns = [Turn(role="user", content=value)] if isinstance(value, Texts) else value
+        if not turns:
+            raise ValueError("Qwen3ChatTemplateStage.embed: expected at least one conversation turn.")
         tokenizer = self.bundle.tokenizer
         device = self.bundle.device
 

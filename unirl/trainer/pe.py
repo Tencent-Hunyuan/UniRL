@@ -37,10 +37,9 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
-from unirl.types.prompts import RolloutInputs
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -251,18 +250,18 @@ class PETrainer(BaseTrainer):
 
     def _build_request_sample(
         self,
-        inputs: RolloutInputs,
+        inputs: Sample,
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``.
 
-        Pre-forks the two gen shells the composed engine expects —
-        ``[input, ar_shell(P*N), diff_shell(P*N*M)]``, located by sampling-params
-        type — replacing PEPipeline's internal ``P → P*N → P*N*M`` fan-out
-        (``ar.samples_per_prompt`` rewrites, ``diffusion.samples_per_prompt``
-        images each).
+        Namespaces the data source's single text input Part, then pre-forks
+        the two gen shells the composed engine expects — ``[input, ar_shell(P*N),
+        diff_shell(P*N*M)]``, located by sampling-params type. The two forks encode
+        ``ar.samples_per_prompt`` rewrites and ``diffusion.samples_per_prompt``
+        images per rewrite.
 
         ``rollout_id`` keys the diffusion SDE-step schedule (resolved off the
         diffusion sub-block, ``scheduler`` nulled so only the concrete
@@ -272,27 +271,21 @@ class PETrainer(BaseTrainer):
         ``sampling`` overrides the modality-keyed sampling dictionary for
         evaluation; ``None`` uses the training parameters.
         """
-        unsupported = set(inputs.primitives) - {"text"}
-        if unsupported:
-            raise ValueError(
-                f"PETrainer._build_request_sample: unsupported input primitive keys: {sorted(unsupported)}"
-            )
         base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        root_ids = [f"r{rollout_id}:{sid}" for sid in inputs.sample_ids]
-        input_part = Part.input(
-            root_ids,
-            primitives={"text": inputs.primitives["text"]},
-            control={"ar": {}, "chat": {}},
-            metadata=list(inputs.metadata) if inputs.metadata else None,
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text"},
+            caller="PETrainer._build_request_sample",
+            root_control={"ar": {}, "chat": {}},
+            require_single_input_part=True,
         )
-        return (
-            Sample.request(input_part)
-            .fork(ar_params.samples_per_prompt, sampling_params=ar_params)
-            .fork(diffusion.samples_per_prompt, sampling_params=diffusion)
+        return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
+            diffusion.samples_per_prompt, sampling_params=diffusion
         )
 
     def train_step(
@@ -461,7 +454,7 @@ class PETrainer(BaseTrainer):
         (``num_prompts`` not a multiple of ``batch_size``) is floored off.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
+        n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
         usable = n_prompts - n_prompts % chunk or n_prompts
         sums = {name: 0.0 for name, _ in scorers}
@@ -494,6 +487,11 @@ class PETrainer(BaseTrainer):
             sides.append(("ar", self.ar))
         return sides
 
+    def _wait_for_checkpoints(self) -> None:
+        """Flush both side backends before another save or worker teardown."""
+        for _, side in self._ckpt_sides():
+            side.backend.wait_for_checkpoint()
+
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
@@ -522,8 +520,13 @@ class PETrainer(BaseTrainer):
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
         for name, side in self._ckpt_sides():
             side.backend.save(os.path.join(path, name), step=step, mode=save_mode)
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+        trainer_state_path = os.path.join(path, "trainer_state.json")
+        trainer_state_tmp = f"{trainer_state_path}.tmp"
+        with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        os.replace(trainer_state_tmp, trainer_state_path)
+        if step >= num_rollouts:
+            self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore both trained sides from ``load_dir``; return the resume step.
