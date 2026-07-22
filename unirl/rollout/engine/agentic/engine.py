@@ -9,11 +9,13 @@ the in-flight requests batching together) and ``env.step`` (the env is re-entran
 
 **Partial rollout interface (LIN-531).** The engine is the *mechanism*; the trainer owns the *policy*
 (how many to over-sample, staleness, when to sync). The coordinator exposes a
-**submit / poll / abort** interface over a **background** drain the trainer reaps and interrupts:
+**submit / poll / finalize / abort** interface over a **background** drain the trainer reaps and interrupts:
 
 - ``submit(request)`` — enqueue a pool (fresh prompts and/or carried partials) and fire the drain
   **non-blocking**; the trainer reaps completions with ``poll`` and cuts the tail with ``abort``.
 - ``poll()`` — the trajectories **completed since the last poll** (aggregated across workers).
+- ``finalize_if_drained()`` — when a drive has naturally drained, join its worker refs and reap the
+  final completions in one coordinator call before the next ``submit`` resets worker buffers.
 - ``abort()`` — a **turn-boundary** stop: workers stop pulling and checkpoint their in-flight
   trajectories at the next turn boundary; returns the carried set (in-flight partials + not-started
   tasks). After it returns the inner engine is **decode-idle** → safe for the trainer to weight-sync.
@@ -210,8 +212,8 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         by ``_run_one`` from ``len(gen_parts())``). A list (not one batched ``Sample``)
         because carried partials have heterogeneous part-depths and cannot share one
         ``Sample``. The trainer reaps completions with :meth:`poll` and cuts the tail
-        with :meth:`abort`. Safe to call only when the previous drive is
-        :meth:`drained` or :meth:`abort`ed (else two drains would double-pull).
+        with :meth:`abort`. Safe to call only when the previous drive was atomically
+        :meth:`finalize_if_drained` or :meth:`abort`ed (else two drains would double-pull).
         """
         require(bool(self._workers), "AgenticRolloutEngine.submit: call set_workers() first (rank 0)")
         self._reset_all()
@@ -227,6 +229,33 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         """
         if not self._workers:
             return []
+        return self._fan("drain_completed")
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
+    def finalize_if_drained(self) -> Optional[List[Sample]]:
+        """Finalize a naturally drained drive and return its last completions.
+
+        ``None`` means at least one ``run_drain`` ref is still active. Once every ref
+        is ready, ``ray.get`` joins them (and surfaces worker failures), the refs are
+        cleared, and the now-stable completed buffers are drained exactly once. An
+        empty ref set is already finalized and returns ``[]`` without polling workers.
+
+        Use this instead of a separate ``drained()`` check followed by ``poll()`` when
+        the next action is ``submit()``: ``submit`` resets per-drive worker buffers, so
+        the readiness check and final reap must remain one coordinator operation.
+        """
+        if not self._drain_refs:
+            return []
+        ready, _ = ray.wait(self._drain_refs, num_returns=len(self._drain_refs), timeout=0)
+        if len(ready) != len(self._drain_refs):
+            return None
+        refs = self._drain_refs
+        try:
+            ray.get(refs)  # join and surface a failed worker drain before polling its buffers
+        finally:
+            # All refs are ready, so this drive is terminal even when one worker
+            # reports a failure. Do not make later callers re-observe stale refs.
+            self._drain_refs = []
         return self._fan("drain_completed")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
@@ -277,10 +306,14 @@ class AgenticRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def drained(self) -> bool:
-        """Rank-0: True once the in-flight drive is finished (queue empty + every
+        """Rank-0 compatibility probe: True once the in-flight drive is finished (queue empty + every
         trajectory terminal) — i.e. every ``run_drain`` ref is resolved. The async
         trainer polls this to know a drive is exhausted so it can safely re-``submit``
-        (firing a drain over a still-running one would double-pull the queue)."""
+        (firing a drain over a still-running one would double-pull the queue).
+
+        This does not join or reap the completed buffers. Call
+        :meth:`finalize_if_drained` for a lossless transition to the next drive.
+        """
         if not self._drain_refs:
             return True
         ready, _ = ray.wait(self._drain_refs, num_returns=len(self._drain_refs), timeout=0)
