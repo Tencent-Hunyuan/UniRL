@@ -50,6 +50,14 @@ class HunyuanVideo15VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
         (grad only) recomputes the decode in backward to trade compute for memory.
         """
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "HunyuanVideo15VAEDecodeStage.decode: no VAE loaded "
+                "(load_vae=False). The trainer-side pipeline cannot decode "
+                "latents in this configuration — separate-engine recipes "
+                "decode in the rollout engine; trainside rollout requires "
+                "load_vae=True."
+            )
         if s.latents is None:
             raise ValueError("HunyuanVideo15VAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 6:

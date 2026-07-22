@@ -42,6 +42,11 @@ model_config:
   pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_PATH,Qwen/Qwen-Image}
   model_precision: bf16
   max_sequence_length: 512
+  # Trainer-side TE is dead weight on the separate-engine path (the
+  # engine encodes; the trainer replays captured conditions) and its
+  # ~15 GiB/rank starves the colocated engine boot (LIN-382 OOM).
+  load_text_encoder: false
+  load_vae: false
   # Static-shift fallback only; the real checkpoint enables dynamic shifting
   # (+ shift_terminal 0.02) via scheduler/scheduler_config.json — and the
   # config's dynamic_shift_overrides carry the same canonical values for

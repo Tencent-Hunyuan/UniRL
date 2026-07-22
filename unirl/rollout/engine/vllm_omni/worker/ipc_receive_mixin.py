@@ -476,10 +476,12 @@ class BucketedIPCReceiveMixin:
     ) -> dict:
         """Full-byte SHA-256 of the worker's loaded LoRA adapter tensors.
 
-        Walks ``lora_manager._registered_adapters[adapter_id].loras`` and
-        hashes ``lora_a`` / ``lora_b`` / ``bias`` / ``embeddings_tensor``
-        when present. ``lora.optimize()`` has already run by this point
-        — ``lora_b`` is post-scaling — so the trainer must apply the
+        Walks the inner ``LoRAModelManager._registered_adapters[adapter_id].loras``
+        and hashes ``lora_a`` / ``lora_b`` / ``bias`` / ``embeddings_tensor``
+        when present. Packed modules store their ``lora_a`` / ``lora_b`` as a
+        list of sub-tensors (one per fused projection), which are hashed
+        per-shard as ``<field>.<i>``. ``lora.optimize()`` has already run by
+        this point — ``lora_b`` is post-scaling — so the trainer must apply the
         matching ``alpha / r`` scaling before hashing for equality. The
         helper :func:`weight_sync.checksum.compute_lora_checksums_post_optimize`
         does that.
@@ -504,6 +506,11 @@ class BucketedIPCReceiveMixin:
         )
         if manager is None:
             return {}
+        # vLLM wraps the registry: the outer ``WorkerLoRAManager`` delegates to
+        # an inner ``LoRAModelManager`` (``_adapter_manager``) that actually owns
+        # ``_registered_adapters``. Reading the outer object returns an empty
+        # mapping, so descend when the inner manager is present.
+        manager = getattr(manager, "_adapter_manager", manager)
         registered = getattr(manager, "_registered_adapters", None)
         if registered is None:
             return {}
@@ -520,6 +527,14 @@ class BucketedIPCReceiveMixin:
                 t = getattr(layer, field, None)
                 if isinstance(t, torch.Tensor):
                     per_field[field] = fingerprint_tensor(t)
+                elif isinstance(t, (list, tuple)):
+                    # Packed modules (``qkv_proj``, ``gate_up_proj``) store one
+                    # sub-tensor per fused projection; ``None`` slots mark
+                    # absent shards. Hash each present shard separately so the
+                    # readback covers the whole fused layer, not just the first.
+                    for i, sub in enumerate(t):
+                        if isinstance(sub, torch.Tensor):
+                            per_field[f"{field}.{i}"] = fingerprint_tensor(sub)
             out[layer_name] = per_field
         return out
 
