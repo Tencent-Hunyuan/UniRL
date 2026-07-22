@@ -1,5 +1,8 @@
 """Export a UniRL training checkpoint to a Hugging Face ``save_pretrained`` folder.
 
+Accepts either flavor ``FSDPBackend.save`` writes: the legacy single-file
+``checkpoint.pt`` or a sharded ``dcp`` directory (reassembled offline on load).
+
 ``checkpoint.pt`` (see ``FSDPBackend.save``) is a raw trainer pickle: the
 trainable module's state dict with PEFT-injected names
 (``*.base_layer.weight`` / ``*.lora_A.<adapter>.weight``) plus optimizer and
@@ -7,8 +10,8 @@ scheduler state. This script folds the LoRA delta into the base weights,
 restores the upstream parameter names, strict-loads them into the base model
 class, and writes a standard HF folder — ready for ``from_pretrained`` or
 ``hf upload``. Both checkpoint flavors work: ``save_mode=full`` merges
-self-contained, ``save_mode=adapter`` folds the LoRA keys onto the freshly
-loaded base weights.
+the recorded tensors onto the freshly loaded base (DCP may omit frozen/meta
+entries), while ``save_mode=adapter`` folds the LoRA keys onto those base weights.
 
 The fold mirrors :func:`unirl.utils.peft_merge.merged_state_dict` (fp32 merge,
 same key grammar) but runs offline on the checkpoint dict. The LoRA scaling
@@ -36,10 +39,11 @@ Loading the SD3 result back into a pipeline:
 from __future__ import annotations
 
 import argparse
-import os
 from typing import Dict, Optional
 
 import torch
+
+from unirl.tools._checkpoint import load_training_checkpoint
 
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
@@ -125,6 +129,19 @@ def fold_adapter_into_base(
     return out
 
 
+def overlay_partial_state_dict(
+    base_state_dict: Dict[str, torch.Tensor],
+    partial_state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Overlay a partial DCP-full state onto the base without hiding name drift."""
+    unexpected = sorted(set(partial_state_dict) - set(base_state_dict))
+    if unexpected:
+        raise SystemExit(f"checkpoint keys do not match the base model; unexpected keys: {unexpected[:8]}")
+    merged = dict(base_state_dict)
+    merged.update(partial_state_dict)
+    return merged
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="checkpoint-<step> dir, or the checkpoint.pt itself")
@@ -142,14 +159,11 @@ def main() -> None:
     parser.add_argument("--dtype", choices=tuple(DTYPES), default="bf16")
     args = parser.parse_args()
 
-    path = args.checkpoint
-    if os.path.isdir(path):
-        path = os.path.join(path, "checkpoint.pt")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
     recorded = checkpoint.get("lora_config") or {}
     alpha = args.lora_alpha if args.lora_alpha is not None else recorded.get("alpha")
-    print(f"loaded {path}: {len(state_dict)} tensors, step={checkpoint.get('step')}, lora_alpha={alpha}")
+    print(f"loaded {args.checkpoint}: {len(state_dict)} tensors, step={checkpoint.get('step')}, lora_alpha={alpha}")
 
     dtype = DTYPES[args.dtype]
     from_pretrained_kwargs = {"torch_dtype": dtype}
@@ -170,6 +184,11 @@ def main() -> None:
         merged = fold_adapter_into_base(model.state_dict(), state_dict, adapter=args.adapter, alpha=alpha)
     else:  # full finetune, no LoRA
         merged = dict(state_dict)
+
+    # DCP full saves intentionally omit frozen/meta entries. Fill those from
+    # --base while still rejecting checkpoint keys the selected model lacks.
+    if checkpoint.get("_checkpoint_format") == "dcp" and checkpoint.get("save_mode", "full") == "full":
+        merged = overlay_partial_state_dict(model.state_dict(), merged)
 
     # strict: naming drift between checkpoint and base class is a hard error,
     # not a silently half-loaded export.

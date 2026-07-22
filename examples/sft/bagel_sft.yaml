@@ -1,0 +1,139 @@
+# @package _global_
+# SFT — BAGEL-7B-MoT unified-model T2I flow-matching finetune (LoRA, gen experts).
+#
+# The unified-model proof of the SFT domain: same FlowMatchSFT loss and
+# DiffusionSupervisedTrackBuilder as SD3, driving Bagel's packed-latent (navit)
+# diffusion stage. Per-model deltas live in the bundle package: prompts →
+# frozen KV contexts via BagelPipeline.build_conditions, target images →
+# packed clean latents via BagelVAEEncodeStage (deterministic posterior mean).
+# Bagel's navit forward is bs=1 — keep micro_batch_size: 1.
+#
+# Env:
+#   BAGEL_PATH      HF id or local ckpt (default ByteDance-Seed/BAGEL-7B-MoT)
+#   SFT_DATA        train manifest (.jsonl rows: {"prompt",
+#                   "media": [{"modality": "image", "role": "target", "uri": ...}]})
+#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#
+# Data prep: shared with sd3_sft (python -m unirl.utils.prepare_sft_t2i).
+#
+# Launch:
+#   ENTRY=train_sft SFT_DATA=data/sft_t2i/train.jsonl SFT_EVAL_DATA=data/sft_t2i/val.jsonl \
+#   bash examples/run_experiment_single_node.sh sft/bagel_sft
+
+num_devices: 8
+batch_size: 16
+num_steps: 300
+eval_interval: 20
+eval_batch_size: 8
+eval_num_samples: -1        # -1 = full eval set
+save_interval: 0
+save_mode: auto
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-sft
+  run_name: bagel_sft_t2i
+  entity: null
+  tags: [sft, bagel, unified-model]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    shift: 3.0
+    use_lora: true
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32               # fp32 LoRA master + Adam states, bf16 compute
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: false                 # vendored bagel calls embed_tokens/lm_head outside a root forward
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_steps}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                  # = BAGEL_MOE_GEN_LORA_TARGETS (gen experts only)
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+algorithm:
+  _target_: unirl.algorithms.sft.FlowMatchSFT
+  stage_attr: diffusion
+  timestep_sampling: logit_normal
+  timestep_shift: 3.0                # match Bagel's inference schedule shift
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1                # navit bs=1 packed forward
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.DiffusionSupervisedTrackBuilder
+  height: 512
+  width: 512
+  guidance_scale: 1.0
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42
+
+# Params object FlowMatchSFT forwards into predict_noise_at_step. cfg scales
+# stay 1.0 (pure conditional forward); num_inference_steps must be >= 2 to
+# pass the dataclass validation but is inert for SFT.
+sampling:
+  _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+  num_inference_steps: 14
+  guidance_scale: 1.0
+  cfg_text_scale: 1.0
+  cfg_img_scale: 1.0
+  height: 512
+  width: 512

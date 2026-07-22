@@ -100,6 +100,8 @@ class BagelFlowSDEScheduler:
         self._step_index: int = 0
         # generator is required instead of the reseeded global RNG.
         self._noise_generator: Optional[torch.Generator] = None
+        # Packed t2i: per-image token counts to split log-prob/traj. None = bs=1.
+        self._image_token_sizes: Optional[List[int]] = None
         # Capture buffers (cleared each request).
         self._traj_latents: List[torch.Tensor] = []
         self._traj_timesteps: List[torch.Tensor] = []
@@ -119,6 +121,7 @@ class BagelFlowSDEScheduler:
         sde_indices: Optional[List[int]],
         sigma_max: Optional[float] = None,
         trajectory_dtype: torch.dtype = torch.float32,
+        image_token_sizes: Optional[List[int]] = None,
     ) -> None:
         """Arm this request: SDE strength, sparse step gate, σ_max, trajectory dtype.
 
@@ -150,6 +153,9 @@ class BagelFlowSDEScheduler:
         if sigma_max is not None:
             self._sigma_max = float(sigma_max)
         self._trajectory_dtype = trajectory_dtype
+        self._image_token_sizes = (
+            [int(s) for s in image_token_sizes] if image_token_sizes and len(image_token_sizes) > 1 else None
+        )
         self._step_index = 0
         self._noise_generator = None
         self._traj_latents = []
@@ -280,7 +286,12 @@ class BagelFlowSDEScheduler:
                 - torch.log(std_var)
                 - 0.5 * math.log(2 * math.pi)
             )
-            log_prob: Optional[torch.Tensor] = log_prob_elem.mean()
+            # bs=1 packed sequence → one scalar; grouped packed batch → one
+            # scalar per image (split the packed token dim by per-image counts).
+            if self._image_token_sizes is None:
+                log_prob: Optional[torch.Tensor] = log_prob_elem.mean()
+            else:
+                log_prob = torch.stack([chunk.mean() for chunk in log_prob_elem.split(self._image_token_sizes, dim=0)])
         else:
             # Pure Euler ODE: x_{t+1} = x_t + v·dt. CRITICAL: no SDE drift
             # correction even when eta>0 — trainside replay drives non-SDE steps
@@ -352,13 +363,23 @@ class BagelFlowSDEScheduler:
             latents = post_latents
             sigmas_full = post_timesteps
 
-        latents = latents.unsqueeze(0)  # [1, T+1, seq, C]
-        timesteps = sigmas_full.unsqueeze(0)  # [1, T+1] (σ echo, batch dim for cat)
+        if self._image_token_sizes is None:
+            latents = latents.unsqueeze(0)  # [1, T+1, seq, C]
+        else:
+            # [T+1, spp*per, C] → split the packed token dim into the spp images →
+            # [spp, T+1, per, C], one trajectory per sample.
+            latents = torch.stack(latents.split(self._image_token_sizes, dim=1), dim=0)
+        timesteps = sigmas_full.unsqueeze(0)  # [1, T+1] (σ echo, sample-shared)
 
         if self._traj_log_probs:
-            log_probs = torch.stack(self._traj_log_probs, dim=0).reshape(1, -1)  # [1, K]
+            stacked = torch.stack(self._traj_log_probs, dim=0)  # [K] (bs=1) or [K, spp]
+            # contiguous(): IPC-friendly; .t() alone leaves a non-contiguous view.
+            log_probs = (
+                stacked.reshape(1, -1) if self._image_token_sizes is None else stacked.t().contiguous()
+            )  # [1,K] / [spp,K]
         else:
-            log_probs = latents.new_zeros((1, 0), dtype=torch.float32)
+            batch = 1 if self._image_token_sizes is None else len(self._image_token_sizes)
+            log_probs = latents.new_zeros((batch, 0), dtype=torch.float32)
 
         return latents, sigmas_full.to(latents.device), timesteps, log_probs
 

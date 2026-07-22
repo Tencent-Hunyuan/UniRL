@@ -484,6 +484,11 @@ class PETrainer(BaseTrainer):
             sides.append(("ar", self.ar))
         return sides
 
+    def _wait_for_checkpoints(self) -> None:
+        """Flush both side backends before another save or worker teardown."""
+        for _, side in self._ckpt_sides():
+            side.backend.wait_for_checkpoint()
+
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
@@ -512,8 +517,13 @@ class PETrainer(BaseTrainer):
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
         for name, side in self._ckpt_sides():
             side.backend.save(os.path.join(path, name), step=step, mode=save_mode)
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+        trainer_state_path = os.path.join(path, "trainer_state.json")
+        trainer_state_tmp = f"{trainer_state_path}.tmp"
+        with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        os.replace(trainer_state_tmp, trainer_state_path)
+        if step >= num_rollouts:
+            self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore both trained sides from ``load_dir``; return the resume step.

@@ -1,0 +1,3 @@
+[submodule "benchmarks/speed_benchmarks/verl_omni/upstream"]
+	path = benchmarks/speed_benchmarks/verl_omni/upstream
+	url = https://github.com/verl-project/verl-omni.git
