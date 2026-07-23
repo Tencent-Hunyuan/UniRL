@@ -54,6 +54,22 @@ def _extract_answer(text: Optional[str]) -> str:
     return matches[-1].group(1).strip() if matches else text.strip()
 
 
+def _is_failed(traj: Sample) -> bool:
+    """Whether the engine marked this trajectory an infrastructure failure.
+
+    :meth:`AgenticRolloutEngine._run_one` isolates faults by returning ``done=True``
+    with a NaN reward on the terminal Part, or — when the fault preceded the first
+    turn — with no gen Parts at all. Either shape must stay out of GRPO's group
+    statistics; grading a dead backend's empty output as a genuine miss would bias
+    every sibling in the group.
+    """
+    gens = traj.gen_parts()
+    if not gens:
+        return True
+    rewards = gens[-1].rewards
+    return rewards is not None and bool(torch.isnan(hydrate(rewards)).any())
+
+
 def _validate_agentic_cfg(kw: dict) -> None:
     """Fail fast on cross-config invariants only jointly visible at the trainer.
 
@@ -296,6 +312,18 @@ class AgenticTrainer(ARTrainer):
         )
         scoring = self.reward.score_and_attach(scoring)
         rewards = hydrate(scoring.parts[-1].rewards).to(torch.float32)
+        # A failed trajectory was still graded above (its empty answer scores as a
+        # miss); overwrite with NaN so _group_advantages excludes it from the group's
+        # mean/std and gives it zero advantage instead of a real negative signal.
+        failed = torch.tensor([_is_failed(tr) for tr in trajs], dtype=torch.bool)
+        if bool(failed.any()):
+            logger.warning(
+                "AgenticTrainer rollout %d: %d/%d trajectories failed; excluded from GRPO statistics.",
+                rollout_id,
+                int(failed.sum()),
+                len(trajs),
+            )
+            rewards = torch.where(failed, torch.full_like(rewards, float("nan")), rewards)
         return rewards, group_ids
 
     def _build_log_sample(

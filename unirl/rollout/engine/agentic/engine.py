@@ -408,8 +408,15 @@ class AgenticRolloutEngine(BaseRolloutEngine):
                     sample = sample.observe(observation)  # +[obs(1)]
             return self._attach_env_reward(sample, env_reward), True  # max_turns reached = terminal
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
-            logger.warning("AgenticRolloutEngine: trajectory failed, returning partial: %s", exc, exc_info=True)
-            return self._attach_env_reward(sample, env_reward), True
+            # Mark the trajectory FAILED (NaN) instead of letting an infrastructure
+            # fault — backend outage, tool timeout, context overflow — enter GRPO as a
+            # legitimate low-scoring sibling. The trainers exclude NaN from the group's
+            # mean/std and give it zero advantage, so a failure neither rewards nor
+            # penalizes. Any partial ``env_reward`` is deliberately dropped: a reward
+            # collected before the fault does not describe a complete trajectory.
+            # Still ``done=True`` — the drain must not stall on a bad trajectory.
+            logger.warning("AgenticRolloutEngine: trajectory failed, marking failed: %s", exc, exc_info=True)
+            return self._attach_env_reward(sample, float("nan")), True
         finally:
             # Guaranteed teardown (LIN-533): end any open tool sessions / episodes for
             # this trajectory — on success, crash, AND abort. Duck-typed like

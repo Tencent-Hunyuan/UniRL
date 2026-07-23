@@ -52,12 +52,16 @@ class AgenticEnvTrainer(AgenticTrainer):
             if reward is not None:
                 values.append(float(hydrate(reward).to(torch.float32).flatten()[0].item()))
             else:
-                values.append(0.0)  # gen-less / failed trajectory stays a legit group member
+                # Gen-less trajectory = engine-marked failure (the fault hit before the
+                # first turn). NaN, not 0.0, so _group_advantages drops it from the
+                # group's mean/std and gives it zero advantage — scoring an
+                # infrastructure fault as a genuine miss biases every sibling.
+                values.append(float("nan"))
                 missing += 1
             group_ids.append(tr.parts[0].sample_ids[0])
         if missing:
             logger.warning(
-                "AgenticEnvTrainer: %d/%d trajectories had no env reward (scored 0.0).",
+                "AgenticEnvTrainer: %d/%d trajectories had no env reward (marked failed).",
                 missing,
                 len(trajs),
             )
