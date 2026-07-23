@@ -281,11 +281,6 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         self.latent_channels = latent_channels
-        # Batched-step replay: stack all S SDE steps into one [S*B] transformer
-        # forward (+ vectorized SDE transition), cutting per-replay forwards /
-        # FSDP all-gathers from S to 1. Stateless SDE strategies only
-        # (Flow/Dance/CPS). Under old_logp_source='replay' the anchor and train
-        # forward share this path, so the on-policy ratio stays exactly 1.
         self.batch_replay_steps = batch_replay_steps
 
     # ------------------------------------------------------------------
@@ -470,8 +465,6 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
             else nullcontext()
         )
 
-        # Fast path (see batch_replay_steps in __init__): stateless SDE
-        # strategies only (step_index unused by .step), and only when S > 1.
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
                 return self._replay_batched_steps(
@@ -521,19 +514,13 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
 
     @staticmethod
     def _tile_conditions(conditions: SD3Conditions, repeats: int) -> SD3Conditions:
-        """Repeat the text (and CFG-negative) embeds ``repeats``× along the batch
-        dim so they align with the step-major ``[S*B, ...]`` sample stack — each
-        block of B reuses the same per-sample conditioning, since all S steps
-        replay the SAME B trajectories at different timesteps."""
-
         def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
 
         def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
             if cond is None:
                 return None
-            # Tile attn_mask too for metadata parity (SD3 predict_noise ignores
-            # it today, but keep the condition self-consistent under batching).
+            # Preserve the unused mask for condition consistency.
             return TextEmbedCondition(
                 embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
             )

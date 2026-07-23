@@ -344,13 +344,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = int(vae_scale_factor)
         self.patchify_factor = int(patchify_factor)
-        # Batched-step replay: collapse the per-SDE-step replay loop into ONE
-        # transformer forward over all S steps stacked on the batch dim (cuts S
-        # forwards + S FSDP all-gathers per replay to 1). Stateless SDE
-        # strategies only (Klein defaults to DanceSDE). The packed latents +
-        # 4-axis RoPE ids are rebuilt per-call from the (stacked) sample, and the
-        # tiled text reproduces the serial per-(sample,step) geometry -> ratio
-        # stays 1 under old_logp_source='replay'. Default OFF.
         self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
             tx_cfg = getattr(model.transformer, "config", None)
@@ -552,11 +545,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         prior_training = self.model.transformer.training
         self.model.transformer.eval()
         try:
-            # Batched-step fast path: stack all S SDE steps on the batch dim and
-            # run ONE transformer forward + one vectorized SDE transition instead
-            # of S serial forwards. Only for stateless SDE strategies (step_index
-            # unused by Dance/Flow/CPS .step). The ``finally`` below still
-            # restores train() mode on this early return.
             if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
                 with autocast_ctx:
                     return self._replay_batched_steps(
@@ -609,11 +597,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
 
     @staticmethod
     def _tile_conditions(conditions: Flux2KleinConditions, repeats: int) -> Flux2KleinConditions:
-        """Repeat the text (+ CFG-negative) embeds and any edit-condition tokens
-        ``repeats``× along the batch dim so they align with the step-major
-        ``[S*B, ...]`` sample stack — each block of B reuses the same per-sample
-        conditioning across all S replayed steps."""
-
         def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
 

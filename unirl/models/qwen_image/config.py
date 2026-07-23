@@ -74,10 +74,6 @@ class QwenImagePipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Collapse the per-SDE-step training replay into ONE batched transformer
-    # forward (see QwenImageDiffusionStage.batch_replay_steps). Off by default;
-    # threaded through QwenImagePipeline.from_config so trainside GRPO/FlowGRPO
-    # recipes can opt in. Stateless SDE strategies only (Flow/Dance/CPS).
     batch_replay_steps: bool = False
 
     # Static-shift fallback for FlowMatchSchedulePolicy when the pretrained
