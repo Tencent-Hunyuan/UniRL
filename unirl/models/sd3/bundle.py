@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,7 @@ class SD3Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         text_encoder_2: nn.Module,
         text_encoder_3: nn.Module,
@@ -103,8 +103,10 @@ class SD3Bundle(Bundle):
                 device
             )
 
-        vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        vae = None
+        if config.load_vae:
+            vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         text_encoder = (
             CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder", torch_dtype=te_dtype)

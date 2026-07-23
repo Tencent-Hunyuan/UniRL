@@ -60,6 +60,9 @@ class SD3PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
+    load_vae: bool = True
+
     # VeOmniBackend lifecycle: build the transformer on the meta device
     # (architecture only, no weight allocation). VeOmni's parallelize
     # asserts meta init, materializes storage via ``to_empty``, and the

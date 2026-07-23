@@ -70,6 +70,11 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
         )
 
+        # Resolve the σ schedule before spawning the backend so a bad diffusion
+        # configuration fails fast. AR-only adapters have no diffusion schedule
+        # and must not touch ``model_config.shift``.
+        self.schedule_policy = self.adapter.schedule_policy() if self.adapter.needs_sigmas else None
+
         # Ports — engine-reserved on this node at the last moment before the
         # spawn (bind-to-0; replaces v1's base + rank*stride math). Tests
         # inject a fixed set.
@@ -93,10 +98,6 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
-
-        # σ schedule policy comes from the adapter; ``ensure_sample_sigmas``
-        # consumes it in ``generate`` (gated on the adapter's needs_sigmas).
-        self.schedule_policy = self.adapter.schedule_policy()
 
         # The Omni orchestrator is synchronous and not request-concurrent-safe;
         # the lock serializes concurrent generate callers.
@@ -140,6 +141,7 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         # echoed it back. AR-only modalities have no diffusion gen Part, so the
         # adapter opts out (needs_sigmas=False).
         if self.adapter.needs_sigmas:
+            require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
             self._ensure_sample_sigmas(sample)
         calls = self.adapter.build_inputs(sample)
         per_request = self._backend.generate(

@@ -56,7 +56,7 @@ class HunyuanVideo15Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         text_encoder_2: nn.Module,
@@ -138,12 +138,14 @@ class HunyuanVideo15Bundle(Bundle):
                 "forward path."
             )
 
-        vae = (
-            AutoencoderKLHunyuanVideo15.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-            .to(device)
-            .eval()
-        )
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLHunyuanVideo15.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(device)
+                .eval()
+            )
+            vae.requires_grad_(False)
 
         text_encoder = (
             Qwen2_5_VLTextModel.from_pretrained(te1_path, subfolder="text_encoder", torch_dtype=te_dtype)

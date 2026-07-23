@@ -49,6 +49,13 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
         (grad only) recomputes the decode in backward to trade compute for memory.
         """
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "SD3VAEDecodeStage.decode: no VAE loaded (load_vae=False). "
+                "The trainer-side pipeline cannot decode latents in this "
+                "configuration — separate-engine recipes decode in the "
+                "rollout engine; trainside rollout requires load_vae=True."
+            )
         if s.latents is None:
             raise ValueError("SD3VAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim < 5:
@@ -93,6 +100,13 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
 
     @torch.no_grad()
     def encode(self, p: Images) -> ImageLatentCondition:
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "SD3VAEEncodeStage.encode: no VAE loaded (load_vae=False). "
+                "The trainer-side pipeline cannot encode images in this "
+                "configuration — separate-engine recipes encode in the "
+                "rollout engine; trainside / SFT paths require load_vae=True."
+            )
         pixels = p.pixels
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
