@@ -231,6 +231,14 @@ class AsyncAgenticTrainer(AgenticTrainer):
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
         self._weight_version = 0
+        # Monotonic per-DRIVE nonce. ``rollout_id`` alone does not make root ids
+        # unique: :meth:`_next_batch` refills re-submit under the SAME rollout_id, and a
+        # data source may restart its ids on every ``get_samples`` (DefaultDataSource
+        # numbers by batch position, not prompt identity). Two drives would then
+        # namespace different source rows identically, and :class:`_GroupAssembler`
+        # — which buckets purely by root id — would merge siblings of unrelated
+        # prompts into one GRPO group and overwrite their ``_gt_by_root`` answers.
+        self._drive_seq = 0
         self._carried_tail_trajectories = 0
         self._dropped_tail_trajectories = 0
         self._dropped_tail_roots = 0
@@ -309,8 +317,15 @@ class AsyncAgenticTrainer(AgenticTrainer):
         request trees and replicated ``n`` times (the GRPO siblings share a root id);
         carried partials (their root ids + turn history preserved) are appended as-is,
         to be resumed by the engine's ``_run_one`` from ``len(gen_parts())``.
+
+        Fresh roots are namespaced by ``_drive_seq`` as well as ``rollout_id`` so a
+        refill can never reuse a drained drive's root ids for different source rows.
+        Carried partials keep the ids they were submitted under, so they still rejoin
+        their own siblings in the assembler.
         """
+        self._drive_seq += 1
         fresh = self._build_request_sample(self.data_source.get_samples(self._oversample), rollout_id)
+        fresh = fresh.map_sample_ids(lambda sample_id: f"d{self._drive_seq}:{sample_id}")
         root = fresh.parts[0]
         root_meta = root.metadata or [None] * len(root.sample_ids)
         for sid, md in zip(root.sample_ids, root_meta):
