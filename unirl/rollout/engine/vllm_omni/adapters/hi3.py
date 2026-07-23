@@ -318,7 +318,29 @@ class Hi3InputAdapter:
         return sampling
 
     def build(self, req: RolloutReq) -> List[GenerateCall]:
-        return [GenerateCall(prompts=self.build_prompts(req), sampling=self.build_sampling(req))]
+        prompts = self.build_prompts(req)
+        recipe_gids = list(req.init_noise_group_ids or [])
+        if "dit" not in self.stages or not recipe_gids:
+            return [GenerateCall(prompts=prompts, sampling=self.build_sampling(req))]
+        if len(recipe_gids) != len(prompts):
+            raise ValueError(
+                f"{self.modality}: x_T recipe gid count {len(recipe_gids)} "
+                f"!= prompt count {len(prompts)}."
+            )
+
+        # vLLM-Omni executes each prompt as a batch_size=1 DiT request while
+        # sharing one sampling object across a multi-prompt GenerateCall. Split
+        # the calls so every worker request receives only its matching x_T gid.
+        calls: List[GenerateCall] = []
+        diff_params = req.sampling_params.get("diffusion")
+        ar_params = req.sampling_params.get("ar")
+        for prompt, gid in zip(prompts, recipe_gids):
+            sampling = [
+                self._ar_sampling(ar_params),
+                self._dit_sampling(req, diff_params, recipe_gids=[gid]),
+            ]
+            calls.append(GenerateCall(prompts=[prompt], sampling=sampling))
+        return calls
 
     def _decorate(self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any) -> None:
         """The per-entry extras, derived from the constructor flags."""
@@ -349,7 +371,13 @@ class Hi3InputAdapter:
             ),
         )
 
-    def _dit_sampling(self, req: RolloutReq, diff_params: Any) -> StageSampling:
+    def _dit_sampling(
+        self,
+        req: RolloutReq,
+        diff_params: Any,
+        *,
+        recipe_gids: Optional[List[Any]] = None,
+    ) -> StageSampling:
         diff_kwargs = core_diff_kwargs(req, diff_params)
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
@@ -370,8 +398,9 @@ class Hi3InputAdapter:
         # Driver-authoritative x_T RECIPE: per-image gids (+ seed; NO shape —
         # the pipeline's prepare_latents hook fills the AR-resolved shape and
         # regenerates the byte-identical x_T via NoiseRecipe.for_batch).
-        if req.init_noise_group_ids:
-            extra_args["init_noise_group_ids"] = [str(g) for g in req.init_noise_group_ids]
+        recipe_gids = list(req.init_noise_group_ids or []) if recipe_gids is None else recipe_gids
+        if recipe_gids:
+            extra_args["init_noise_group_ids"] = [str(g) for g in recipe_gids]
             extra_args["init_noise_seed"] = int(seed) if seed is not None else 0
 
         if extra_args:

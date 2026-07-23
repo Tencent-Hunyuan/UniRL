@@ -45,7 +45,7 @@
 #                export PRETRAINED_MODEL=... EDIT_DATA_PATH=... EDIT_EVAL_DATA_PATH=...
 #                PYTHONPATH=$PWD python -m unirl.train_diffusion --config-name unified_model/hi3_it2i
 #
-# Smoke: override batch_size=1 num_rollouts=2 logging.report_to_wandb=false.
+# Smoke (8 GPUs): override batch_size=4 num_rollouts=2 logging.report_to_wandb=false.
 # Compose check (CPU): python -m unirl.train_diffusion --config-name unified_model/hi3_it2i --cfg job --resolve
 
 num_devices: 8

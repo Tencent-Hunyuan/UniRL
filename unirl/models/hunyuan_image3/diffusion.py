@@ -122,8 +122,18 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         t_scalar = sigma * 1000.0
         if t_scalar.dim() == 0:
             t_expand = t_scalar.expand(sample_2.shape[0])
+        elif t_scalar.numel() == sample_2.shape[0]:
+            t_expand = t_scalar.reshape(sample_2.shape[0])
+        elif cfg and t_scalar.numel() == n_sample:
+            # Conditions/sample use blockwise CFG layout [cond B; uncond B].
+            # Preserve the same ordering for a batched [B] sigma.
+            t_expand = torch.cat([t_scalar.reshape(n_sample), t_scalar.reshape(n_sample)])
         else:
-            t_expand = t_scalar.expand(sample_2.shape[0])
+            raise ValueError(
+                "HunyuanImage3DiffusionStep.predict_noise: sigma must be scalar, "
+                f"[B], or [2B] under CFG; got shape={tuple(sigma.shape)}, "
+                f"sample batch={n_sample}, model batch={int(sample_2.shape[0])}."
+            )
 
         # Decide which path we're on — stateless vs KV-cached.
         use_cache: bool = state is not None
@@ -232,18 +242,11 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         # is a CONCAT field, so under DP_SCATTER each rank already holds ONLY its
         # own rows — no replica-0 cross-feed.
         if fused.rope_cache is not None:
-            # Hit-precondition: the HF wrapper computes seqlen as
-            # ``input_ids.size(1)`` ONLY in train mode (modeling:2155-2159; eval
-            # uses max_position_embeddings) — in eval the seed silently MISSES
-            # and build_2d_rope rebuilds a wrong 1-D rope. TrainsideRolloutEngine
-            # eval()s only ``trainable_module()`` (the inner decoder), never this
-            # wrapper; fail loudly if that ever changes.
-            if not transformer.training:
-                raise RuntimeError(
-                    "HunyuanImage3 rope-cache seeding needs the HF wrapper in train mode "
-                    "(eval-mode seqlen=max_position_embeddings bypasses the seeded CachedRoPE). "
-                    "eval() the inner decoder (trainable_module()), not the wrapper."
-                )
+            # CachedRoPE keys off the outer wrapper's bare ``training`` flag.
+            # Set only that flag: Module.train() would recursively put the
+            # frozen VAE/ViT into training mode. Backends independently manage
+            # the inner trainable decoder's mode.
+            transformer.training = True
             _cr = transformer.cached_rope
             # rope_cache is a stacked [B, 2, L, D] tensor (idx 0=cos, 1=sin).
             _rope = fused.rope_cache

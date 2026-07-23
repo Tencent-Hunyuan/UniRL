@@ -68,6 +68,43 @@ def _prepare_seeded_sampling(
     return seeded_params, condition_vae_generators, sde_sample_keys
 
 
+def _encode_cond_images_per_sample(
+    transformer,
+    batch_cond_images,
+    generators: Optional[List[torch.Generator]],
+):
+    """Encode each outer sample with its matching VAE RNG stream."""
+    if generators is None:
+        return transformer._encode_cond_image(batch_cond_images, cfg_factor=1, generator=None)
+    if len(generators) != len(batch_cond_images):
+        raise ValueError(
+            "HunyuanImage3 it2i condition-VAE generator count "
+            f"{len(generators)} != condition batch {len(batch_cond_images)}."
+        )
+
+    vae_items, timestep_items, vit_items = [], [], []
+    for cond_images, generator in zip(batch_cond_images, generators):
+        cond_vae, cond_timestep, cond_vit = transformer._encode_cond_image(
+            [cond_images],
+            cfg_factor=1,
+            generator=[generator],
+        )
+        vae_items.append(cond_vae)
+        timestep_items.append(cond_timestep)
+        if cond_vit is not None:
+            vit_items.extend(cond_vit)
+
+    if all(isinstance(item, torch.Tensor) for item in vae_items) and all(
+        item.shape[1:] == vae_items[0].shape[1:] for item in vae_items
+    ):
+        cond_vae_images = torch.cat(vae_items, dim=0)
+        cond_timestep = torch.cat(timestep_items, dim=0)
+    else:
+        cond_vae_images = vae_items
+        cond_timestep = timestep_items
+    return cond_vae_images, cond_timestep, vit_items or None
+
+
 def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
     texts = req.primitives.get("text")
@@ -116,10 +153,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #    ``.repeat`` / ``list*cfg``); the diffusion stage re-applies it when it
     #    expands CFG. Keeping them B-batched (not doubled) means they survive the
     #    B-sample track transport that a 2B batch would not.
-    cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
+    cond_vae_images, cond_timestep, cond_vit_images = _encode_cond_images_per_sample(
+        pipeline.bundle.transformer,
         vit["joint_image_info"],
-        cfg_factor=1,
-        generator=condition_vae_generators,
+        condition_vae_generators,
     )
     vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
 
