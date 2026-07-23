@@ -713,11 +713,7 @@ class BagelPipeline(Pipeline):
 
         # Resolve prompts against the AR frontier, not the final image frontier:
         # Sample.conditioning always expands ancestors to its current last Part.
-        ar_request = Sample(
-            parts=list(sample.parts[: ar_idx + 1]),
-            reward_compute_s=sample.reward_compute_s,
-        )
-        ar_texts = [value for value in ar_request.conditioning() if isinstance(value, Texts)]
+        ar_texts = [value for value in sample.conditioning_at(ar_idx) if isinstance(value, Texts)]
         if len(ar_texts) != 1:
             raise TypeError(
                 "BagelPipeline.generate (t2ti): expected exactly one Texts input "

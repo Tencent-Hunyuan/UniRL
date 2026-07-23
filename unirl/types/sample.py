@@ -801,6 +801,23 @@ class Sample(Batch):
         (replay: call on ``parts[:i+1]``)."""
         return [t.content for t in self.turns()]
 
+    def conditioning_at(self, index: int) -> List[Primitive]:
+        """:meth:`conditioning` for generating ``parts[index]`` rather than the frontier.
+
+        :meth:`conditioning` always aligns to the LAST Part, so a multi-stage pipeline
+        filling an *interior* gen Part (the ``ar`` of an ``[input, ar, diffusion]``
+        chain) must re-root the view on that Part — reading the frontier view instead
+        conditions the AR pass at the final ``P*N*M`` width when the Part holds ``P*N``.
+        Names the ``parts[:index+1]`` replay idiom as an operation so the two-stage
+        pipelines share one implementation. Accepts negative indices (``-2`` = the
+        stage before the frontier)."""
+        if not self.parts:
+            raise ValueError("Sample.conditioning_at: Sample has no Parts")
+        if not -len(self.parts) <= index < len(self.parts):
+            raise IndexError(f"Sample.conditioning_at: index {index} out of range for {len(self.parts)} Parts")
+        stop = (index if index >= 0 else len(self.parts) + index) + 1
+        return type(self)(parts=list(self.parts[:stop]), reward_compute_s=self.reward_compute_s).conditioning()
+
     def text_conditioning(self) -> List[Turn]:
         """LLM render: the trajectory as an all-text conversation. Fails loud on
         any non-text turn — this consumer has no image channel."""

@@ -125,12 +125,20 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "pin σ before pipeline.generate."
         )
 
-    conditioning = sample.conditioning()
-    texts = conditioning[0] if conditioning else None
+    # Resolve prompts against the AR frontier, not the final image frontier:
+    # Sample.conditioning always expands ancestors to its current last Part, so the
+    # frontier view carries P*N*M rows while the AR Part holds P*N.
+    ar_texts = [value for value in sample.conditioning_at(ar_idx) if isinstance(value, Texts)]
     require(
-        isinstance(texts, Texts),
-        f"HunyuanImage3Pipeline.generate (t2ti): prompt from sample.conditioning()[0] must be Texts, "
-        f"got {type(texts).__name__ if texts is not None else 'None'}",
+        len(ar_texts) == 1,
+        "HunyuanImage3Pipeline.generate (t2ti): expected exactly one Texts input for the "
+        f"AR frontier, got {len(ar_texts)}",
+    )
+    texts = ar_texts[0]
+    require(
+        len(texts.texts) == len(ar_part.sample_ids),
+        f"HunyuanImage3Pipeline.generate (t2ti): AR-aligned prompt count {len(texts.texts)} "
+        f"!= AR sample count {len(ar_part.sample_ids)}",
     )
 
     control = sample.parts[0].control or {}
@@ -197,17 +205,43 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     raw = pipeline._detokenize_text_segment(text_seg, skip_special_tokens=False)
     cots = [_normalize_cot_text(_truncate_at_cot_end(t)) for t in raw.texts]
 
+    # ---- fill the AR Part first: it conditions the diffusion frontier -
+    # The ar Part carries the CoT TextSegment + normalized cot Texts.
+    new_parts = list(sample.parts)
+    new_parts[ar_idx] = ar_part.fill(
+        segment=text_seg, primitives={"text": Texts(texts=cots)}, conditions=ar_conds.to_dict()
+    )
+    partially_filled = sample.with_parts(new_parts)
+
     # ---- diffusion phase: condition on prompt + CoT -------------------
+    # The now-filled AR Part is an ancestor of the image shell, so the conditioning
+    # walk expands both prompt and CoT from P*N to P*N*M.
+    image_texts = [value for value in partially_filled.conditioning() if isinstance(value, Texts)]
+    require(
+        len(image_texts) >= 2,
+        "HunyuanImage3Pipeline.generate (t2ti): image frontier did not surface both the "
+        "original prompt and the generated CoT",
+    )
+    image_prompts = image_texts[0]
+    image_cots = list(image_texts[-1].texts)
+    n_images = len(image_part.sample_ids)
+    require(
+        len(image_prompts.texts) == n_images and len(image_cots) == n_images,
+        f"HunyuanImage3Pipeline.generate (t2ti): image-aligned conditioning counts "
+        f"prompt={len(image_prompts.texts)}, cot={len(image_cots)}, expected={n_images}",
+    )
+    image_system_prompts = [system_prompt] * n_images if system_prompt is not None else None
+
     schedule = diff_sp.sigmas.to(pipeline.bundle.device)
 
     mm2 = pipeline.text_embed.embed_for_gen_image(
-        texts,
+        image_prompts,
         cfg=float(diff_sp.guidance_scale) > 1.0,
         height=int(diff_sp.height),
         width=int(diff_sp.width),
         bot_task=tok_bot_task,
-        cot_text=cots,
-        system_prompt=system_prompt_list,
+        cot_text=image_cots,
+        system_prompt=image_system_prompts,
     )
     diff_conds = HunyuanImage3DiffusionConditions(
         fused=mm2["fused"],
@@ -217,13 +251,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=diff_sp)
     images = pipeline.vae_decode.decode(latent_seg)
 
-    # Fill both gen Parts in their lineage positions (ar precedes diffusion):
-    # the ar Part carries the CoT TextSegment + normalized cot Texts; the image
-    # Part the LatentSegment + decoded images.
-    new_parts = list(sample.parts)
-    new_parts[ar_idx] = ar_part.fill(
-        segment=text_seg, primitives={"text": Texts(texts=cots)}, conditions=ar_conds.to_dict()
-    )
+    # The image Part carries the LatentSegment + decoded images.
     new_parts[image_idx] = image_part.fill(
         segment=latent_seg, primitives={"image": images}, conditions=diff_conds.to_dict()
     )
