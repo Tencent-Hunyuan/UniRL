@@ -78,6 +78,10 @@ class AgenticPartialTrainer(AgenticTrainer):
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
         self._weight_version = 0
+        # Refills happen under the same optimizer ``rollout_id``. Keep a
+        # per-drive nonce so data sources whose ids restart on every draw cannot
+        # mix unrelated siblings in the root-keyed group assembler.
+        self._drive_seq = 0
         self._last_dropped_trajectories = 0
         self._last_dropped_roots = 0
         self._last_discarded_completed_trajectories = 0
@@ -91,8 +95,10 @@ class AgenticPartialTrainer(AgenticTrainer):
     # ------------------------------------------------------------------
 
     def _build_tasks(self, carried: List[Sample], rollout_id: int) -> List[Sample]:
-        """A drive's task list: ``n`` fresh siblings per new prompt + carried partials."""
+        """A drive's task list: uniquely namespaced fresh siblings + carried partials."""
+        self._drive_seq += 1
         fresh = self._build_request_sample(self.data_source.get_samples(self._oversample), rollout_id)
+        fresh = fresh.map_sample_ids(lambda sample_id: f"d{self._drive_seq}:{sample_id}")
         root = fresh.parts[0]
         root_meta = root.metadata or [None] * len(root.sample_ids)
         for sid, md in zip(root.sample_ids, root_meta):
