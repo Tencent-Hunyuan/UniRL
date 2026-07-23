@@ -168,13 +168,18 @@ class ModelAdapter(ABC):
 
     # ---- construction-time validation (v1 engine.py:404-409) ----
     def validate(self) -> None:
-        mc = self.model_config
-        require(
-            mc is not None and hasattr(mc, "shift"),
-            f"{type(self).__name__} requires model_config.shift; got "
-            f"{type(mc).__name__}. Use a registered model preset "
-            f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
-        )
+        # ``shift`` parametrizes the FlowMatch σ schedule and only matters for
+        # adapters that actually run one. AR-only adapters (``needs_sigmas`` is
+        # False) never call :meth:`schedule_policy`, so requiring a diffusion
+        # ``model_config.shift`` from them is spurious.
+        if self.needs_sigmas:
+            mc = self.model_config
+            require(
+                mc is not None and hasattr(mc, "shift"),
+                f"{type(self).__name__} requires model_config.shift; got "
+                f"{type(mc).__name__}. Use a registered model preset "
+                f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
+            )
 
     # ---- per-request validation (ports v1 ``_validate_request``) ----
     def validate_request(self, req: RolloutReq) -> None:

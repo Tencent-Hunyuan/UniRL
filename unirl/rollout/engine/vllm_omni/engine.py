@@ -70,6 +70,11 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
         )
 
+        # Resolve the σ schedule before spawning the backend so a bad diffusion
+        # configuration fails fast. AR-only adapters have no diffusion schedule
+        # and must not touch ``model_config.shift``.
+        self.schedule_policy = self.adapter.schedule_policy() if self.adapter.needs_sigmas else None
+
         # Ports — engine-reserved on this node at the last moment before the
         # spawn (bind-to-0; replaces v1's base + rank*stride math). Tests
         # inject a fixed set.
@@ -94,10 +99,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
 
-        # σ schedule policy comes from the adapter; ``ensure_req_sigmas``
-        # consumes it in ``generate`` (gated on the adapter's needs_sigmas).
-        self.schedule_policy = self.adapter.schedule_policy()
-
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
         return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
@@ -121,6 +122,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         # worker echoed it back. AR-only modalities have no diffusion params,
         # so the adapter opts out (ensure_req_sigmas would raise on them).
         if self.adapter.needs_sigmas:
+            require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
             ensure_req_sigmas(req, self.schedule_policy)
         calls = self.adapter.build_inputs(req)
         per_request = self._backend.generate(

@@ -41,6 +41,7 @@ model_config:
   # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
   # shifting (build_schedule_policy) and this value is ignored at runtime.
   shift: 1.0
+  load_vae: false
   # SGLang builds its LoRA ServerArgs from these fields. This list MUST stay in
   # lockstep with backend.lora_cfg.target_modules and rollout.config.target_modules
   # below — three independent consumers (PEFT injection, weight-sync bucket

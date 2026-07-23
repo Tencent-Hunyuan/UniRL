@@ -30,6 +30,7 @@ model_config:
   model_precision: bf16
   shift: 5.0
   max_sequence_length: 512
+  load_vae: false
   # SGLang builds its LoRA ServerArgs from these two fields.
   use_lora: true
   # WAN transformer attention LoRA targets — SGLANG NAMING (leaf module names).
