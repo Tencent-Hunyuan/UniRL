@@ -324,8 +324,7 @@ class Hi3InputAdapter:
             return [GenerateCall(prompts=prompts, sampling=self.build_sampling(req))]
         if len(recipe_gids) != len(prompts):
             raise ValueError(
-                f"{self.modality}: x_T recipe gid count {len(recipe_gids)} "
-                f"!= prompt count {len(prompts)}."
+                f"{self.modality}: x_T recipe gid count {len(recipe_gids)} != prompt count {len(prompts)}."
             )
 
         # vLLM-Omni executes each prompt as a batch_size=1 DiT request while
