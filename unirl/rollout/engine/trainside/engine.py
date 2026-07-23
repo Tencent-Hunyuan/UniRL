@@ -45,7 +45,9 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
             :meth:`Part.slice`, runs ``pipeline.generate`` per chunk, and
             concatenates the filled gen parts via :meth:`Part.concat`. Bounds
             stage peak memory (e.g. SD3 VAE decode) when there is no external
-            inference runtime to chunk for us.
+            inference runtime to chunk for us. **Single gen Part only** — chunking
+            a multi-stage lineage would re-run the interior stage(s) per chunk and
+            drop their output; ``generate`` rejects that combination.
     """
 
     _component_name = "trainside"
@@ -116,6 +118,18 @@ class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous pipeline forward for one whole ``Sample``."""
+        if self.forward_batch_size is not None:
+            gen_parts = [p for p in sample.parts if p.is_gen]
+            if len(gen_parts) > 1:
+                raise ValueError(
+                    "TrainsideRolloutEngine.forward_batch_size chunks pipeline.generate, which "
+                    f"fills EVERY gen Part; this Sample has {len(gen_parts)} "
+                    f"({[type(p.sampling_params).__name__ for p in gen_parts]}). Chunking would "
+                    "re-run the interior stage(s) once per chunk, keep only the frontier, and "
+                    "return the earlier stages as empty shells. Unset forward_batch_size, or "
+                    "chunk inside the stage that needs it (as the PE recipes do via the SGLang "
+                    "diffusion sub-engine's own forward_batch_size)."
+                )
         if self.schedule_policy is not None:
             self._ensure_sample_sigmas(sample)
         prev_modes = [m.training for m in self._models]
