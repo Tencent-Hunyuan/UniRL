@@ -2,6 +2,7 @@ import functools
 import json
 import logging
 import os
+import sys
 from typing import Any, Dict, List, Optional
 
 from hydra.utils import instantiate
@@ -297,10 +298,32 @@ class BaseTrainer:
             track.decoded = None
             track.media_preview = None
 
+    def _wait_for_checkpoints(self) -> None:
+        """Flush a pending backend checkpoint before worker teardown."""
+        backend = getattr(self, "backend", None)
+        if backend is not None:
+            backend.wait_for_checkpoint()
+
+    def _cleanup_weight_sync(self) -> None:
+        """Let transports remove run-scoped artifacts before workers are killed."""
+        weight_sync = getattr(self, "weight_sync", None)
+        cleanup = getattr(weight_sync, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+
     def _finish_wandb(self) -> None:
-        """Close the wandb run if one is open."""
-        if self.wandb_logger is not None:
-            self.wandb_logger.finish()
+        """Flush pending work, clean transport artifacts, and close wandb."""
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            self._wait_for_checkpoints()
+            self._cleanup_weight_sync()
+        except Exception:
+            if not active_exception:
+                raise
+            logger.exception("Failed to flush checkpoint/weight-sync state during trainer teardown")
+        finally:
+            if self.wandb_logger is not None:
+                self.wandb_logger.finish()
 
     # ---- checkpointing (shared by single-backend trainers) -----------------
 
@@ -341,8 +364,17 @@ class BaseTrainer:
         # Driver-owned state rides beside the worker-written checkpoint.pt:
         # the wandb run id + train/ step axis let a resume append to the SAME
         # wandb run instead of starting a fresh, misaligned one.
-        with open(os.path.join(path, "trainer_state.json"), "w") as f:
+        trainer_state_path = os.path.join(path, "trainer_state.json")
+        trainer_state_tmp = f"{trainer_state_path}.tmp"
+        with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+        os.replace(trainer_state_tmp, trainer_state_path)
+        # An async DCP save (checkpoint_format="dcp" + checkpoint_async) writes
+        # its shards on a background thread, normally drained by the next save.
+        # The final checkpoint has no next save, so block until it is on disk
+        # before train() returns and the workers are torn down.
+        if step >= num_rollouts:
+            self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from.

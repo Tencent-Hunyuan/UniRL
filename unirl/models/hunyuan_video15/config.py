@@ -111,6 +111,9 @@ class HunyuanVideo15PipelineConfig:
     # the SigLIP module itself is skipped.
     load_vision_encoder: bool = False
 
+    # Trainer-side 3D VAE. False for separate-engine recipes (engine owns decode).
+    load_vae: bool = True
+
     # LoRA hints for rollout-side engines (e.g. ``sglang``). Mirrors
     # SD3 / Qwen-Image config; the trainer-side LoRA injection lives in
     # ``cfg.training.policies`` via LoRAPolicy.

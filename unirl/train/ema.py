@@ -22,7 +22,7 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Iterator, List, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -30,7 +30,12 @@ from torch.nn.parameter import Parameter
 
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig
 from unirl.train.deferred import _stamp
-from unirl.train.lora import _reset_adapter
+from unirl.train.lora import (
+    ModuleSelection,
+    _reset_adapter,
+    normalize_module_selection,
+    normalize_optional_module_selection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +144,8 @@ def inject_nft(
     *,
     rank: int,
     alpha: int,
-    target_modules: Sequence[str],
+    target_modules: ModuleSelection,
+    exclude_modules: Optional[ModuleSelection] = None,
     default: str = "default",
     shadow: str = "old",
     dropout: float = 0.0,
@@ -153,7 +159,8 @@ def inject_nft(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
-        target_modules=list(target_modules),
+        target_modules=normalize_module_selection(target_modules),
+        exclude_modules=normalize_optional_module_selection(exclude_modules),
         bias=str(bias),
         task_type=str(task_type),
     )

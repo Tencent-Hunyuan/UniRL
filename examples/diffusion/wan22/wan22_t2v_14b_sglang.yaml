@@ -30,6 +30,7 @@ model_config:
   model_precision: bf16
   shift: 5.0
   max_sequence_length: 512
+  load_vae: false
   boundary_ratio: 0.875        # WAN 2.2 reference: sigma >= 0.875 → high_noise, else low_noise
   num_train_timesteps: 1000
   # SGLang builds its LoRA ServerArgs from these two fields.

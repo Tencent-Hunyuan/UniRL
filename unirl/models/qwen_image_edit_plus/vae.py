@@ -108,6 +108,14 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
             ``[B, 16, H_vae/8, W_vae/8]`` on the bundle device, in the
             bundle dtype.
         """
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "QwenImageEditPlusVAEEncodeStage.encode: no VAE loaded "
+                "(load_vae=False). The trainer-side pipeline cannot encode "
+                "source images in this configuration — separate-engine "
+                "recipes encode in the rollout engine (image_latent arrives "
+                "captured); trainside rollout requires load_vae=True."
+            )
         pixels = images.pixels
         if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(

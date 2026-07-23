@@ -31,9 +31,7 @@ class Qwen3OmniPipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.chat_template = (
-            chat_template if chat_template is not None else Qwen3OmniChatTemplateStage(bundle)
-        )
+        self.chat_template = chat_template if chat_template is not None else Qwen3OmniChatTemplateStage(bundle)
         self.ar = (
             ar
             if ar is not None
@@ -64,9 +62,7 @@ class Qwen3OmniPipeline(Pipeline):
             video_max_pixels=video_max_pixels,
             use_audio_in_video=use_audio_in_video,
         )
-        ar = Qwen3OmniARStage(
-            model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision
-        )
+        ar = Qwen3OmniARStage(model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision)
         return cls(
             bundle=bundle,
             chat_template=chat_template,

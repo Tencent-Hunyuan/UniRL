@@ -141,9 +141,7 @@ class ARTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     # The anchored engine is not a sibling of every train worker.
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-                    self.weight_sync.set_rollout_targets(
-                        [(self.rollout.role_name, self.rollout.workers)]
-                    )
+                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.

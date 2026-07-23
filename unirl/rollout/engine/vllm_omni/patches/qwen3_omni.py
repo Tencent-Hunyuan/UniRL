@@ -25,9 +25,7 @@ def _register_qwen3_omni_automodel() -> None:
     try:
         from verl.utils.model import _architecture_to_auto_class
 
-        _architecture_to_auto_class.setdefault(
-            "Qwen3OmniMoeForConditionalGeneration", AutoModelForCausalLM
-        )
+        _architecture_to_auto_class.setdefault("Qwen3OmniMoeForConditionalGeneration", AutoModelForCausalLM)
     except ImportError:
         pass
 
@@ -131,9 +129,7 @@ def _patch_hf_processor_for_qwen3_omni() -> None:
             processor.spatial_merge_size = config.thinker_config.vision_config.spatial_merge_size
             model_class = Qwen3OmniMoeThinkerForConditionalGeneration
             processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)
-            processor.get_llm_pos_ids_for_vision = types.MethodType(
-                model_class.get_llm_pos_ids_for_vision, processor
-            )
+            processor.get_llm_pos_ids_for_vision = types.MethodType(model_class.get_llm_pos_ids_for_vision, processor)
             return processor
         except Exception:
             return None

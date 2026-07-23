@@ -89,7 +89,7 @@ class QwenImagePipeline(Pipeline):
         super().__init__()
         self.bundle = bundle
         # No default text-embed stage without a loaded text encoder
-        # (load_text_encoder=False — the vllm-omni recipes' trainer side).
+        # (load_text_encoder=False — separate-engine recipes' trainer side).
         if text_embed is None and bundle.text_encoder is not None:
             text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
         self.text_embed = text_embed
@@ -184,7 +184,7 @@ class QwenImagePipeline(Pipeline):
         from ``cfg.sampling.sde_strategy``.
         """
         bundle = QwenImageBundle.from_config(config)
-        # load_text_encoder=False (vllm-omni recipes): no trainer-side TE —
+        # load_text_encoder=False (separate-engine recipes): no trainer-side TE —
         # prompts are encoded engine-side and conditions arrive captured.
         text_embed = (
             QwenImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)

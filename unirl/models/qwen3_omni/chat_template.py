@@ -24,9 +24,7 @@ def _sample_video_frames_pyav(path: str, target_fps: float) -> "torch.Tensor":
         src_fps = float(stream.average_rate) if stream.average_rate else target_fps
         step = max(1, round(src_fps / float(target_fps)))
         frames = [
-            frame.to_ndarray(format="rgb24")
-            for i, frame in enumerate(container.decode(video=0))
-            if i % step == 0
+            frame.to_ndarray(format="rgb24") for i, frame in enumerate(container.decode(video=0)) if i % step == 0
         ]
     finally:
         container.close()

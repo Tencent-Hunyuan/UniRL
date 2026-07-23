@@ -31,9 +31,7 @@ def _sample_video_frames_pyav(path: str, target_fps: float) -> Any:
         src_fps = float(stream.average_rate) if stream.average_rate else target_fps
         step = max(1, round(src_fps / float(target_fps)))
         frames = [
-            frame.to_ndarray(format="rgb24")
-            for i, frame in enumerate(container.decode(video=0))
-            if i % step == 0
+            frame.to_ndarray(format="rgb24") for i, frame in enumerate(container.decode(video=0)) if i % step == 0
         ]
     finally:
         container.close()
@@ -95,8 +93,7 @@ class Qwen3OmniThinkerInputAdapter:
             return [None] * n
         if not isinstance(prim, Videos):
             raise TypeError(
-                f"Qwen3OmniThinkerInputAdapter: req.primitives['video'] must be Videos, "
-                f"got {type(prim).__name__}"
+                f"Qwen3OmniThinkerInputAdapter: req.primitives['video'] must be Videos, got {type(prim).__name__}"
             )
         # Prefer raw paths and sample them at the configured rate.
         uris = getattr(prim, "uris", None)
@@ -110,9 +107,7 @@ class Qwen3OmniThinkerInputAdapter:
         frames = prim.frames
         cu = prim.cu_frames
         if frames is None or cu is None:
-            raise ValueError(
-                "Qwen3OmniThinkerInputAdapter: Videos primitive carries neither uris nor packed frames."
-            )
+            raise ValueError("Qwen3OmniThinkerInputAdapter: Videos primitive carries neither uris nor packed frames.")
         cu_list = [int(x) for x in cu.tolist()]
         require(
             len(cu_list) - 1 == n,

@@ -20,6 +20,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import re
 from typing import Dict
 
 import torch
@@ -60,17 +61,15 @@ def load_trainable_weights(
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
         load_sharded(model, weights_path, device=device, strict=False)
-        # Recover init-computed non-persistent state (RoPE inv_freq, sincos tables,
-        # …) clobbered by meta-init `to_empty` and not carried by the checkpoint.
-        # The bundle carries the capture (capture_init_state); restoring here — in
-        # the shared post-load path — is robust to the live trainer's Ray-actor
-        # boundaries where the model-bound deferred closure can be dropped. Without
-        # this the train model keeps garbage RoPE -> garbage replay log-probs ->
-        # the DRPO rollout/replay ratio collapses (~0.05) and nothing learns.
+        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
+        # tables, …) captured on the bundle before meta-init's `to_empty` clobbered
+        # them and not carried by the checkpoint. Restoring here — in the shared
+        # post-load path — is robust to the live trainer's Ray-actor boundaries where
+        # a model-bound deferred closure can be dropped. Without this the train model
+        # keeps garbage RoPE -> garbage replay log-probs -> the DRPO rollout/replay
+        # ratio collapses (~0.05) and nothing learns.
         from unirl.models.types.meta_init import restore_init_state
 
-        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
-        # tables, …) captured on the bundle before meta-init's to_empty clobbered them.
         n_recovered = restore_init_state(model, getattr(bundle, "_meta_init_state", None))
         # Re-establish TIED weights (lm_head <-> embed_tokens). For tie_word_embeddings
         # models, meta-init's to_empty breaks the tie and the checkpoint carries NO
@@ -158,7 +157,11 @@ def _load_state_dict_sharded(
         module.to_empty(device=device)
 
     if _current_rank() == 0:
+        # Align raw-checkpoint keys to the constructed model's key layout *before*
+        # the LoRA base_layer hop, then guard against a silent no-load.
+        state_dict = _remap_hf_checkpoint_keys(state_dict, module)
         state_dict = _remap_lora_base_keys(state_dict, module)
+        _assert_state_dict_covers_model(state_dict, module)
 
     options = _build_state_dict_options(
         full_state_dict=True,
@@ -198,6 +201,93 @@ def _read_safetensors_dir(weights_dir: str) -> StateDict:
     for shard in shards:
         state_dict.update(load_file(shard, device="cpu"))
     return state_dict
+
+
+def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
+    """Rewrite stale HF checkpoint keys to the constructed model's naming.
+
+    ``from_pretrained`` renames checkpoint keys on load (e.g. transformers 5.x
+    moved a VLM's language model under ``model.language_model.*``); this
+    direct-safetensors path must replay the same ``WeightRenaming`` rules, or
+    ``strict=False`` silently drops every stale key and the module keeps its
+    uninitialized ``to_empty()`` values. No-op when the keys already match.
+    """
+    try:
+        from accelerate import init_empty_weights
+        from transformers import PreTrainedModel
+        from transformers.conversion_mapping import (
+            get_checkpoint_conversion_mapping,
+            get_model_conversion_mapping,
+        )
+        from transformers.core_model_loading import WeightRenaming
+    except Exception as exc:  # older / patched transformers without the API
+        logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
+        return state_dict
+
+    # The backend wraps the HF model in an FSDP subclass, but HF registers its
+    # renaming rules by class name — look up the original class via the MRO.
+    unwrapped = getattr(model, "module", model)
+    hf_cls = next(
+        (
+            cls
+            for cls in type(unwrapped).__mro__
+            if issubclass(cls, PreTrainedModel) and get_checkpoint_conversion_mapping(cls.__name__) is not None
+        ),
+        None,
+    )
+    if hf_cls is None or getattr(unwrapped, "config", None) is None:
+        return state_dict
+
+    # The live module is sharded and restructured, so take the rules and the
+    # canonical key set from a meta-built reference model (no weights, cheap).
+    try:
+        with init_empty_weights(include_buffers=False):
+            ref = hf_cls(unwrapped.config)
+        rules = [
+            (re.compile(t.source_patterns[0]), t.target_patterns[0])
+            for t in get_model_conversion_mapping(ref, add_legacy=True)
+            if isinstance(t, WeightRenaming)
+        ]
+    except Exception as exc:
+        logger.warning("sharded_load: could not build HF rename rules (%r); skipping", exc)
+        return state_dict
+
+    def rename(key: str) -> str:
+        for pattern, target in rules:
+            key = pattern.sub(target, key)
+        return key
+
+    renamed = {rename(k): v for k, v in state_dict.items()}
+    ref_keys = {n for n, _ in ref.named_parameters()} | {n for n, _ in ref.named_buffers()}
+    matched_old = sum(k in ref_keys for k in state_dict)
+    matched_new = sum(k in ref_keys for k in renamed)
+    if matched_new <= matched_old:  # keys already matched — keep the original
+        return state_dict
+    logger.info(
+        "sharded_load: applied HF checkpoint key-renaming (%d -> %d / %d keys matched)",
+        matched_old,
+        matched_new,
+        len(ref_keys),
+    )
+    return renamed
+
+
+def _assert_state_dict_covers_model(state_dict: StateDict, model: nn.Module) -> None:
+    """Raise if the checkpoint matches almost none of the model's parameters.
+
+    ``strict=False`` would silently drop them all and train on ``to_empty()``
+    garbage. Buffers and tied params are legitimately absent, hence the low
+    25% bar — this only trips on a wholesale key mismatch.
+    """
+    params = {n for n, _ in getattr(model, "module", model).named_parameters()}
+    matched = sum(k in params for k in state_dict)
+    if params and matched < 0.25 * len(params):
+        raise ValueError(
+            f"sharded_load: checkpoint matches only {matched}/{len(params)} model "
+            "parameters — the checkpoint keys do not fit the constructed model "
+            "(likely a transformers module-tree rename that _remap_hf_checkpoint_keys "
+            "did not cover); strict=False would silently drop them all."
+        )
 
 
 def _remap_lora_base_keys(state_dict: StateDict, model: nn.Module) -> StateDict:

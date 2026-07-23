@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """Convert Video-R1-260k video multiple-choice rows to UniRL jsonl.
 
 Video paths are resolved under ``--data-root`` and stored as absolute

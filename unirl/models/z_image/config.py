@@ -69,6 +69,9 @@ class ZImagePipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # Trainer-side VAE. False for separate-engine recipes (engine owns decode).
+    load_vae: bool = True
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="ZImagePipelineConfig.model_precision")
 
