@@ -366,5 +366,21 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             return False
         return self._weight_sync.lora_dirty
 
+    def update_weights_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+        track_prefix: str = "",
+    ) -> None:
+        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
+        del track_prefix
+        if not self._is_tp_zero:
+            return
+        self._weight_sync.update_weights_from_ipc(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+
 
 __all__ = ["SGLangRolloutEngine"]

@@ -54,6 +54,8 @@ dependencies = [
 # (upgrade pending; verified meanwhile via a 2.34-prefixed python).
 sglang = [
   "sglang[diffusion]==0.5.12.post1 ; sys_platform == 'linux'",
+  # Required by SGLang's update_weights_from_ipc implementation.
+  "checkpoint-engine>=0.4.2,<0.5 ; sys_platform == 'linux'",
   # sglang pins a prerelease; a first-party declaration makes it "explicitly
   # requested" under uv's default prerelease policy (scoped, not global).
   "flash-attn-4>=4.0.0b9,<5 ; sys_platform == 'linux'",

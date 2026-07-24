@@ -155,11 +155,17 @@ algorithm:
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
 
 sync:
-  # FULL-weight colocate sync: push the full dense FSDP weights into the SGLang
-  # server each rollout via update_weights_from_tensor.
-  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  # Stream packed MoE experts through per-GPU checkpoint-engine IPC. Unlike the
+  # serialized tensor path this does not concentrate flatten/deserialization
+  # copies on the TP-zero GPU.
+  _target_: unirl.distributed.weight_sync.full.ckpt_engine_ipc.CkptEngineIPCWeightSync
   lora_merged: false
-  bucket_size_mb: 64
+  # Qwen3-30B's bf16 token embedding is ~594 MiB and checkpoint-engine's worker
+  # protocol cannot split one logical tensor across buckets.
+  bucket_size_mb: 640
+  # Training masters are fp32; cast each local FSDP shard before all-gather so
+  # both transient materialization and transfer match the bf16 rollout model.
+  wire_dtype: bf16
   flush_cache: true
 
 stack:

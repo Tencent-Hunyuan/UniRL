@@ -114,6 +114,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         ReleaseMemoryOccupationReqInput,
         ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromIPCReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
@@ -125,6 +126,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
+        "UpdateWeightsFromIPCReqInput": UpdateWeightsFromIPCReqInput,
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
@@ -202,6 +204,8 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
 
 class HTTPBackend:
     """The HTTP ``Backend`` impl over a spawned SGLang SRT server."""
+
+    requires_main_thread_ipc_receiver = False
 
     def __init__(
         self,
@@ -538,6 +542,21 @@ class HTTPBackend:
             "/destroy_weights_update_group",
             self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=str(group_name)),
             "destroy_weights_group",
+        )
+
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ) -> None:
+        self._post_struct(
+            "/update_weights_from_ipc",
+            self._rt["UpdateWeightsFromIPCReqInput"](
+                zmq_handles=zmq_handles,
+                flush_cache=flush_cache,
+            ),
+            "update_from_ipc",
         )
 
     def set_lora(

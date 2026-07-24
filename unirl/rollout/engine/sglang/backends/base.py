@@ -73,6 +73,11 @@ class RawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
+    # ``NativeBackend.update_from_ipc`` drives the engine event loop and must
+    # run on the engine-owning thread. HTTP transport is thread-safe. Weight
+    # sync uses this capability instead of coupling to concrete class names.
+    requires_main_thread_ipc_receiver: bool
+
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None: ...
     def pause(self) -> None: ...
@@ -115,6 +120,13 @@ class Backend(Protocol):
         lora_name: str,
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
+    ) -> None: ...
+
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
     ) -> None: ...
 
 
