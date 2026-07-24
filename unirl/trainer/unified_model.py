@@ -964,6 +964,12 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+        except Exception:
+            # Surface the real failure (e.g. a worker CUDA OOM re-raised by ray.get)
+            # at the point we catch it -- before _finish_wandb runs -- so it lands in
+            # the log immediately instead of being masked by a hanging teardown.
+            logger.exception("Training loop aborted at rollout %s", locals().get("rollout_id", "?"))
+            raise
         finally:
             self._finish_wandb()
 
