@@ -101,6 +101,11 @@ class HunyuanVideoPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="HunyuanVideoPipelineConfig.model_precision")
+        self.hidden_state_skip_layer = int(self.hidden_state_skip_layer)
+        if self.hidden_state_skip_layer < 0:
+            raise ValueError(
+                f"HunyuanVideoPipelineConfig.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+            )
 
 
 __all__ = ["HunyuanVideoPipelineConfig"]

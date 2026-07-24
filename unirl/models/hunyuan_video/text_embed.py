@@ -5,8 +5,9 @@ HunyuanVideo-1.0 cross-attends to **two text streams**:
 - ``llama``  -- LlamaModel (transformers). The prompt is wrapped in a
   LLaMA-style prompt template with a system header, tokenized with padding
   to ``llama_max_length + crop_start``, encoded, and the template prefix
-  is stripped by slicing ``[:, crop_start:]``. Output is the last hidden
-  state (3D: ``[B, seq, 4096]``).
+  is stripped by slicing ``[:, crop_start:]``. Output is a configurable
+  hidden state (the canonical third-from-last layer by default; 3D:
+  ``[B, seq, 4096]``).
 - ``clip`` -- CLIPTextModel (transformers). Standard CLIP text encoding,
   output is the pooled vector (2D: ``[B, 768]``).
 
@@ -69,6 +70,10 @@ class HunyuanVideoTextEmbedStage:
         self.clip_max_length = int(clip_max_length)
         self.crop_start = int(crop_start)
         self.hidden_state_skip_layer = int(hidden_state_skip_layer)
+        if self.hidden_state_skip_layer < 0:
+            raise ValueError(
+                f"HunyuanVideoTextEmbedStage.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+            )
 
     # ------------------------------------------------------------------
     # LLaMA stream
@@ -120,7 +125,16 @@ class HunyuanVideoTextEmbedStage:
         # and diffusers' ``HunyuanVideoPipeline`` (``num_hidden_layers_to_skip=2``)
         # and the sglang rollout. ``skip=0`` reproduces the legacy last-hidden-state
         # baseline.
-        prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
+        hidden_states = getattr(outputs, "hidden_states", None)
+        selected_from_end = self.hidden_state_skip_layer + 1
+        if hidden_states is None or selected_from_end > len(hidden_states):
+            available = 0 if hidden_states is None else len(hidden_states)
+            raise ValueError(
+                "HunyuanVideoTextEmbedStage.hidden_state_skip_layer selects a "
+                f"nonexistent state: skip={self.hidden_state_skip_layer}, "
+                f"encoder returned {available} hidden states"
+            )
+        prompt_embeds = hidden_states[-selected_from_end]
 
         # Strip the prompt template prefix tokens.
         if crop_start > 0:
