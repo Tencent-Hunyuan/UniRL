@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import HunyuanVideo15PipelineConfig
@@ -56,7 +56,7 @@ class HunyuanVideo15Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         text_encoder_2: nn.Module,
@@ -113,17 +113,22 @@ class HunyuanVideo15Bundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
+        meta_init_state = None
         if config.meta_init_transformer:
             # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
             # no per-rank weight allocation; the backend materializes + loads
-            # from the stashed dir after sharding.
+            # from the stashed dir after sharding. build_meta_init_transformer
+            # keeps init-computed non-persistent buffers (rope tables) real and
+            # captures them into meta_init_state (stashed on the bundle below).
             transformer_config = HunyuanVideo15Transformer3DModel.load_config(path, subfolder="transformer")
-            with torch.device("meta"):
-                transformer = HunyuanVideo15Transformer3DModel.from_config(transformer_config)
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: HunyuanVideo15Transformer3DModel.from_config(transformer_config), dtype=dtype
+            )
         else:
             transformer = HunyuanVideo15Transformer3DModel.from_pretrained(
                 path, subfolder="transformer", torch_dtype=dtype
             )
+            transformer = transformer.to(device=device, dtype=dtype)
         # Reject meanflow checkpoints — replay path doesn't thread timestep_r yet.
         # (config is metadata, present on both the meta and eager builds.)
         if bool(getattr(getattr(transformer, "config", None), "use_meanflow", False)):
@@ -132,17 +137,15 @@ class HunyuanVideo15Bundle(Bundle):
                 "use_meanflow=True; timestep_r is not threaded through the "
                 "forward path."
             )
-        if config.meta_init_transformer:
-            transformer = finalize_meta_init(transformer, dtype=dtype)
-        else:
-            transformer = transformer.to(device=device, dtype=dtype)
 
-        vae = (
-            AutoencoderKLHunyuanVideo15.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-            .to(device)
-            .eval()
-        )
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLHunyuanVideo15.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(device)
+                .eval()
+            )
+            vae.requires_grad_(False)
 
         text_encoder = (
             Qwen2_5_VLTextModel.from_pretrained(te1_path, subfolder="text_encoder", torch_dtype=te_dtype)
@@ -190,6 +193,8 @@ class HunyuanVideo15Bundle(Bundle):
         if config.meta_init_transformer:
             # Consumed by the backend's post-shard weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

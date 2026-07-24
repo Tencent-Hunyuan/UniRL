@@ -487,6 +487,10 @@ class TrainStack(Remote):
         ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
         ``on_rollout_end`` runs once — see :meth:`_run_updates`.
         """
+        # Freeze the old-policy anchor without train-mode stochasticity (notably
+        # dropout). The gradient-bearing replay below switches back to train mode
+        # so HF gradient checkpointing, which is gated on ``self.training``, engages.
+        self.fsdp_backend.model.eval()
         self._align_track_inputs(resp_track)
         # Arrange once: reorder the track so packed micros are contiguous (no-op for
         # CountPlanner) and produce the plan. The SAME (track, plans) feed both the
@@ -503,6 +507,7 @@ class TrainStack(Remote):
         profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             self.prepare_segment(resp_track, plans=plans)
+            self.fsdp_backend.model.train()
             result = self._run_updates(resp_track, plans=plans, training_progress=float(training_progress))
         if profiler is not None:
             profiler.step()

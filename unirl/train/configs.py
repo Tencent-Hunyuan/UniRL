@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, Union
+
+LoraModuleSelection = Union[str, Tuple[str, ...]]
 
 
 @dataclass
 class LoraConfig:
     rank: int = 8
     alpha: int = 16
-    target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    # A tuple uses PEFT's exact/suffix matching; a string is preserved for
+    # regular-expression matching and the special ``all-linear`` shorthand.
+    # ``Any`` is intentional: OmegaConf 2.3 rejects unions containing
+    # containers. The injection boundary validates this as LoraModuleSelection.
+    target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
+    # Modules matched by ``target_modules`` but explicitly excluded from injection.
+    # Like ``target_modules``, tuples match exact names/suffixes and strings are
+    # regular expressions. This lets a regex exclude an entire frozen sub-tower.
+    exclude_modules: Any = None
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
@@ -18,7 +28,8 @@ class LoraConfig:
 class EmaLoraConfig:
     rank: int = 8
     alpha: int = 16
-    target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
+    exclude_modules: Any = None
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
@@ -107,6 +118,7 @@ class FSDPConfig:
 
 __all__ = [
     "LoraConfig",
+    "LoraModuleSelection",
     "EmaLoraConfig",
     "EmaFullConfig",
     "FSDPConfig",
