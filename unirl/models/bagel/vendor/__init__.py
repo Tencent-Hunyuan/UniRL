@@ -68,10 +68,7 @@ try:
     _flash_attn = importlib.import_module("flash_attn")
 except Exception:
     _flash_attn = types.ModuleType("flash_attn")
-    # A bare ModuleType has __spec__ = None; importlib.util.find_spec("flash_attn")
-    # (transformers' flash-attn availability probe) then raises
-    # "flash_attn.__spec__ is None". Give the stub a real spec so the probe cleanly
-    # reports flash-attn absent and the SDPA fallback below is used.
+    # Real spec so find_spec("flash_attn") doesn't raise "flash_attn.__spec__ is None".
     _flash_attn.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
     sys.modules["flash_attn"] = _flash_attn
 
