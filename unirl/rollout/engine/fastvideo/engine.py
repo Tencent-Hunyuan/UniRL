@@ -34,7 +34,7 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
-from unirl.rollout.engine.fastvideo.sigma import shift_preimage_sigmas, verify_fastvideo_used_sigmas
+from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_req_sigmas
 from unirl.types.conditions import TextEmbedCondition
@@ -44,6 +44,8 @@ from unirl.types.rollout_resp import RolloutResp, RolloutTrack
 from unirl.types.segments.latent import make_video_segment
 
 logger = logging.getLogger(__name__)
+
+_FASTVIDEO_TIMESTEP_SCALE = 1000
 
 
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
@@ -60,6 +62,31 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List
     if bad:
         raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
     return selected, selected
+
+
+def _verify_fastvideo_used_sigmas(
+    trajectory_timesteps: Any,
+    *,
+    expected: torch.Tensor,
+    sample_index: int,
+) -> None:
+    """Adapt FastVideo's integer ``[T]`` timesteps to the shared verifier."""
+    actual = trajectory_timesteps
+    expected_for_verification = expected
+    if actual is not None:
+        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
+        if actual_t.ndim == 1:
+            actual = torch.cat([actual_t, actual_t.new_zeros(1)])
+        if not torch.is_floating_point(actual_t):
+            expected_f32 = expected.detach().cpu().to(torch.float32)
+            expected_for_verification = (
+                torch.trunc(expected_f32 * _FASTVIDEO_TIMESTEP_SCALE) / _FASTVIDEO_TIMESTEP_SCALE
+            )
+    verify_engine_used_sigmas(
+        actual,
+        expected=expected_for_verification,
+        engine_name=f"fastvideo (sample {sample_index})",
+    )
 
 
 class FastVideoRolloutEngine(BaseRolloutEngine):
@@ -311,11 +338,9 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # (valid because FastVideo's WAN flow_shift == model_config.shift). Drop
         # the terminal 0 — FastVideo appends its own endpoint.
         _f = float(getattr(self._fastvideo_args.pipeline_config, "flow_shift", self.model_config.shift))
-        sp.sigmas = shift_preimage_sigmas(
-            sigmas,
-            _f,
-            num_inference_steps=int(params.num_inference_steps),
-        )
+        _s = sigmas.detach().cpu().double()
+        _g = _s / (_f - _s * (_f - 1.0))
+        sp.sigmas = [float(x) for x in _g.tolist()[:-1]]
 
         # SDE window handed to FastVideo's denoiser so it injects exploration
         # noise ONLY on the trainer's SDE steps and runs the rest as a
@@ -367,7 +392,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             trajectory_timesteps = getattr(rl, "trajectory_timesteps", None) if rl is not None else None
             if trajectory_timesteps is None:
                 trajectory_timesteps = getattr(out, "trajectory_timesteps", None)
-            verify_fastvideo_used_sigmas(
+            _verify_fastvideo_used_sigmas(
                 trajectory_timesteps,
                 expected=sigmas,
                 sample_index=sample_index,
