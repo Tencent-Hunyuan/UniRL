@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import math
 import os
 import sys
 from pathlib import Path
@@ -35,7 +34,7 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
-from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
+from unirl.rollout.engine.fastvideo.sigma import shift_preimage_sigmas, verify_fastvideo_used_sigmas
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_req_sigmas
 from unirl.types.conditions import TextEmbedCondition
@@ -61,49 +60,6 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List
     if bad:
         raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
     return selected, selected
-
-
-def _shift_preimage_sigmas(sigmas: torch.Tensor, shift: float) -> List[float]:
-    """Invert FastVideo's static flow shift and drop the terminal sigma."""
-    require(math.isfinite(shift) and shift > 0.0, f"FastVideo flow_shift must be finite and > 0; got {shift!r}")
-    sigmas_f64 = sigmas.detach().cpu().double()
-    require(
-        sigmas_f64.ndim == 1 and sigmas_f64.numel() >= 2,
-        f"FastVideo requested sigmas must be a one-dimensional [T+1] schedule; got {tuple(sigmas_f64.shape)}",
-    )
-    require(bool(torch.isfinite(sigmas_f64).all()), "FastVideo requested sigmas must all be finite")
-    require(
-        bool(torch.all((sigmas_f64 >= 0.0) & (sigmas_f64 <= 1.0))),
-        "FastVideo requested sigmas must be normalized to [0, 1]",
-    )
-    require(float(sigmas_f64[-1].item()) == 0.0, "FastVideo requested sigmas must end at terminal sigma 0")
-    denominator = shift - sigmas_f64 * (shift - 1.0)
-    require(
-        bool(torch.isfinite(denominator).all() and torch.all(denominator != 0)),
-        "FastVideo flow-shift inversion has a non-finite or zero denominator",
-    )
-    preimage = sigmas_f64 / denominator
-    require(bool(torch.isfinite(preimage).all()), "FastVideo flow-shift pre-image sigmas must all be finite")
-    return [float(x) for x in preimage.tolist()[:-1]]
-
-
-def _verify_fastvideo_used_sigmas(
-    trajectory_timesteps: Any,
-    *,
-    expected: torch.Tensor,
-    sample_index: int,
-) -> None:
-    """Adapt FastVideo's scaled ``[T]`` timesteps to the shared ``[T+1]`` verifier."""
-    actual = trajectory_timesteps
-    if actual is not None:
-        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
-        if actual_t.ndim == 1:
-            actual = torch.cat([actual_t, actual_t.new_zeros(1)])
-    verify_engine_used_sigmas(
-        actual,
-        expected=expected,
-        engine_name=f"fastvideo (sample {sample_index})",
-    )
 
 
 class FastVideoRolloutEngine(BaseRolloutEngine):
@@ -355,7 +311,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # (valid because FastVideo's WAN flow_shift == model_config.shift). Drop
         # the terminal 0 — FastVideo appends its own endpoint.
         _f = float(getattr(self._fastvideo_args.pipeline_config, "flow_shift", self.model_config.shift))
-        sp.sigmas = _shift_preimage_sigmas(sigmas, _f)
+        sp.sigmas = shift_preimage_sigmas(
+            sigmas,
+            _f,
+            num_inference_steps=int(params.num_inference_steps),
+        )
 
         # SDE window handed to FastVideo's denoiser so it injects exploration
         # noise ONLY on the trainer's SDE steps and runs the rest as a
@@ -407,7 +367,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             trajectory_timesteps = getattr(rl, "trajectory_timesteps", None) if rl is not None else None
             if trajectory_timesteps is None:
                 trajectory_timesteps = getattr(out, "trajectory_timesteps", None)
-            _verify_fastvideo_used_sigmas(
+            verify_fastvideo_used_sigmas(
                 trajectory_timesteps,
                 expected=sigmas,
                 sample_index=sample_index,
