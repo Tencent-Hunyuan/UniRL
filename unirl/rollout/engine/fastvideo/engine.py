@@ -404,8 +404,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             )
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
+            trajectory_timesteps = getattr(rl, "trajectory_timesteps", None) if rl is not None else None
+            if trajectory_timesteps is None:
+                trajectory_timesteps = getattr(out, "trajectory_timesteps", None)
             _verify_fastvideo_used_sigmas(
-                getattr(rl, "trajectory_timesteps", None) if rl is not None else None,
+                trajectory_timesteps,
                 expected=sigmas,
                 sample_index=sample_index,
             )
