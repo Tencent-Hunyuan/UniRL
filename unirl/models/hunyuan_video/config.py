@@ -74,6 +74,10 @@ class HunyuanVideoPipelineConfig:
     # before the bundle is loaded.
     latent_channels: Optional[int] = None
 
+    # Decode large frames with the VAE's spatial tiling path. The 720p
+    # recipes enable this to bound fp32 decode activation memory.
+    vae_use_tiling: bool = False
+
     # ------------------------------------------------------------------
     # Text-encoder shape parameters
     # ------------------------------------------------------------------

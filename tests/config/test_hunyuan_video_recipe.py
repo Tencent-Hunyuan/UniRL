@@ -8,6 +8,7 @@ def test_trainside_recipe_threads_hidden_state_skip_to_pipeline():
     recipe = OmegaConf.load(repo_root / "examples/diffusion/hunyuan_video/hunyuan_video_t2v_trainside.yaml")
 
     assert recipe.pipeline.hidden_state_skip_layer == 2
+    assert recipe.bundle.config.vae_use_tiling is True
     assert (recipe.sampling.height, recipe.sampling.width, recipe.sampling.num_frames) == (720, 1280, 5)
     recipe.bundle.config.hidden_state_skip_layer = 0
     assert recipe.pipeline.hidden_state_skip_layer == 0
@@ -20,6 +21,7 @@ def test_sglang_recipe_uses_expected_hunyuan_settings():
     assert recipe.rollout.config.model_family == "hunyuan_video"
     assert recipe.rollout.config.populate_conditions is True
     assert recipe.model_config.use_lora is False
+    assert recipe.model_config.vae_use_tiling is True
     assert recipe.model_config.hidden_state_skip_layer == 2
     assert recipe.pipeline.hidden_state_skip_layer == 2
     assert recipe.backend.lora_cfg.rank == 64

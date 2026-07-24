@@ -30,6 +30,7 @@ bundle:
     _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
     model_precision: bf16
+    vae_use_tiling: true
     shift: 5.0
     hidden_state_skip_layer: 2
 
