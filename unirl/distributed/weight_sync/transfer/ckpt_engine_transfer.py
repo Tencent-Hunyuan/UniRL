@@ -121,15 +121,15 @@ class CkptEngineWeightSender:
                         f"Please increase bucket_size_mb (currently {self.bucket_size_mb} MB)."
                     )
 
-                bucket_meta.append({
-                    "name": name,
-                    "shape": weight.shape,
-                    "dtype": weight.dtype,
-                    "offset": offset,
-                })
-                self.buffer[offset : offset + weight_nbytes].copy_(
-                    weight.view(-1).view(torch.uint8), non_blocking=True
+                bucket_meta.append(
+                    {
+                        "name": name,
+                        "shape": weight.shape,
+                        "dtype": weight.dtype,
+                        "offset": offset,
+                    }
                 )
+                self.buffer[offset : offset + weight_nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
                 offset += weight_nbytes
                 weight = None
 
@@ -179,7 +179,7 @@ class CkptEngineWeightSender:
         """Create one REQ socket per supplied device handle."""
         for path in self.socket_paths:
             if path.startswith("ipc://"):
-                ipc_path = path[len("ipc://"):]
+                ipc_path = path[len("ipc://") :]
                 try:
                     os.remove(ipc_path)
                 except OSError:
@@ -233,9 +233,7 @@ class CkptEngineWeightSender:
             ack = sock.recv()
             self._can_send[i] = True
             if ack != b"":
-                errors.append(
-                    f"receiver {i}: {ack.decode('utf-8', errors='replace')}"
-                )
+                errors.append(f"receiver {i}: {ack.decode('utf-8', errors='replace')}")
         if errors:
             raise RuntimeError(f"CkptEngineWeightSender: bucket load failed: {errors[0]}")
 
@@ -278,7 +276,7 @@ class CkptEngineWeightSender:
 
         for path in self.socket_paths:
             if path.startswith("ipc://"):
-                ipc_path = path[len("ipc://"):]
+                ipc_path = path[len("ipc://") :]
                 try:
                     os.remove(ipc_path)
                 except OSError:
