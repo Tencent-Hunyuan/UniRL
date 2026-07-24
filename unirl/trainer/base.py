@@ -13,6 +13,13 @@ from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_sam
 
 logger = logging.getLogger(__name__)
 
+# Upper bound (seconds) on the teardown checkpoint/weight-sync flush, applied ONLY on
+# the exception path. A healthy exit (Ctrl-C, a driver-side error) drains an in-flight
+# async DCP save well within this; a worker wedged in an NCCL collective (e.g. one that
+# OOM'd mid-backward) cannot service the flush's ray.get, so the bound stops it hanging
+# forever and masking the primary exception. Env-tunable.
+_TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
+
 
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
     """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict.
@@ -298,28 +305,56 @@ class BaseTrainer:
             track.decoded = None
             track.media_preview = None
 
-    def _wait_for_checkpoints(self) -> None:
-        """Flush a pending backend checkpoint before worker teardown."""
-        backend = getattr(self, "backend", None)
-        if backend is not None:
-            backend.wait_for_checkpoint()
+    def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
+        """Flush a pending backend checkpoint before worker teardown.
 
-    def _cleanup_weight_sync(self) -> None:
-        """Let transports remove run-scoped artifacts before workers are killed."""
+        ``timeout`` bounds the underlying ``ray.get`` — passed on the exception
+        path so a worker wedged in an NCCL collective can't hang the flush
+        forever; ``None`` (the default, e.g. the final-save drain) waits
+        indefinitely.
+        """
+        backend = getattr(self, "backend", None)
+        if backend is None:
+            return
+        if timeout is None:
+            backend.wait_for_checkpoint()
+        else:
+            backend.wait_for_checkpoint(_ray_get_timeout=timeout)
+
+    def _cleanup_weight_sync(self, *, timeout: Optional[float] = None) -> None:
+        """Let transports remove run-scoped artifacts before workers are killed.
+
+        ``cleanup`` is a BROADCAST dispatch, so like the checkpoint flush it can
+        wedge on a stuck worker; ``timeout`` bounds its ``ray.get`` on the
+        exception path (``None`` waits indefinitely).
+        """
         weight_sync = getattr(self, "weight_sync", None)
         cleanup = getattr(weight_sync, "cleanup", None)
-        if callable(cleanup):
+        if not callable(cleanup):
+            return
+        if timeout is None:
             cleanup()
+        else:
+            cleanup(_ray_get_timeout=timeout)
 
     def _finish_wandb(self) -> None:
         """Flush pending work, clean transport artifacts, and close wandb."""
         active_exception = sys.exc_info()[0] is not None
+        # On the exception path, bound the flush's ray.get: a worker wedged in an NCCL
+        # collective (e.g. one that OOM'd mid-backward) can't service it, so an
+        # unbounded flush would hang forever and mask the primary exception. A healthy
+        # crash (Ctrl-C, a driver-side error) still drains the in-flight async DCP save
+        # -- well within the bound -- so the last checkpoint is not left half-written.
+        # On the success path, flush unbounded.
+        timeout = _TEARDOWN_FLUSH_TIMEOUT_S if active_exception else None
         try:
-            self._wait_for_checkpoints()
-            self._cleanup_weight_sync()
+            self._wait_for_checkpoints(timeout=timeout)
+            self._cleanup_weight_sync(timeout=timeout)
         except Exception:
             if not active_exception:
                 raise
+            # GetTimeoutError (a wedged worker) or any flush error: keep the primary
+            # exception, just record the failed best-effort flush.
             logger.exception("Failed to flush checkpoint/weight-sync state during trainer teardown")
         finally:
             if self.wandb_logger is not None:
