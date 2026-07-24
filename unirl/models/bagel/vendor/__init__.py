@@ -60,6 +60,7 @@ the documented local fixes. This subtree is excluded from repo lint/format.
 # API lacks ``flash_attn_varlen_func``. That function is the only symbol the vendored
 # navit code imports straight from the ``flash_attn`` package.
 import importlib
+import importlib.machinery
 import sys
 import types
 
@@ -67,6 +68,11 @@ try:
     _flash_attn = importlib.import_module("flash_attn")
 except Exception:
     _flash_attn = types.ModuleType("flash_attn")
+    # A bare ModuleType has __spec__ = None; importlib.util.find_spec("flash_attn")
+    # (transformers' flash-attn availability probe) then raises
+    # "flash_attn.__spec__ is None". Give the stub a real spec so the probe cleanly
+    # reports flash-attn absent and the SDPA fallback below is used.
+    _flash_attn.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
     sys.modules["flash_attn"] = _flash_attn
 
 if not hasattr(_flash_attn, "flash_attn_varlen_func"):
