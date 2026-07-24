@@ -45,8 +45,6 @@ from unirl.types.segments.latent import make_video_segment
 
 logger = logging.getLogger(__name__)
 
-_FASTVIDEO_TIMESTEP_SCALE = 1000
-
 
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
     """Return the FastVideo wire value and canonical segment indices.
@@ -64,24 +62,55 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List
     return selected, selected
 
 
+def _read_fastvideo_num_train_timesteps(worker: Any) -> int:
+    """Return the timestep scale from the scheduler owned by a FastVideo worker."""
+    pipeline = getattr(worker, "pipeline", None)
+    modules = getattr(pipeline, "modules", None)
+    scheduler = modules.get("scheduler") if hasattr(modules, "get") else None
+    if scheduler is None:
+        raise RuntimeError("FastVideo worker pipeline has no scheduler module")
+
+    config = getattr(scheduler, "config", None)
+    value = getattr(config, "num_train_timesteps", None)
+    if value is None and hasattr(config, "get"):
+        value = config.get("num_train_timesteps")
+    if value is None:
+        value = getattr(scheduler, "num_train_timesteps", None)
+
+    if isinstance(value, bool):
+        raise RuntimeError(f"FastVideo scheduler has invalid num_train_timesteps={value!r}")
+    try:
+        scale = int(value)
+        exact_value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f"FastVideo scheduler has invalid num_train_timesteps={value!r}") from exc
+    if scale <= 0 or exact_value != float(scale):
+        raise RuntimeError(f"FastVideo scheduler has invalid num_train_timesteps={value!r}")
+    return scale
+
+
 def _verify_fastvideo_used_sigmas(
     trajectory_timesteps: Any,
     *,
     expected: torch.Tensor,
     sample_index: int,
+    timestep_scale: int,
 ) -> None:
-    """Adapt FastVideo's integer ``[T]`` timesteps to the shared verifier."""
+    """Adapt FastVideo's integer ``[T]`` timestep ticks to the shared verifier."""
     actual = trajectory_timesteps
     expected_for_verification = expected
     if actual is not None:
         actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
         if actual_t.ndim == 1:
-            actual = torch.cat([actual_t, actual_t.new_zeros(1)])
+            actual_t = torch.cat([actual_t, actual_t.new_zeros(1)])
+            actual = actual_t
         if not torch.is_floating_point(actual_t):
             expected_f32 = expected.detach().cpu().to(torch.float32)
-            expected_for_verification = (
-                torch.trunc(expected_f32 * _FASTVIDEO_TIMESTEP_SCALE) / _FASTVIDEO_TIMESTEP_SCALE
-            )
+            # FastVideo casts ``sigma * num_train_timesteps`` to int64.
+            # Normalize those ticks and quantize the reference to the worker's
+            # independently reported scheduler scale before comparison.
+            actual = actual_t.to(torch.float32) / timestep_scale
+            expected_for_verification = torch.trunc(expected_f32 * timestep_scale) / timestep_scale
     verify_engine_used_sigmas(
         actual,
         expected=expected_for_verification,
@@ -120,6 +149,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._is_offloaded = False
         self._generator: Any = None
         self._fastvideo_args: Any = None
+        self._fastvideo_timestep_scale: Optional[int] = None
         # Last checkpoint pushed by the weight sync. ``VideoGenerator`` loads the
         # PRETRAINED weights from ``model_path`` on every (re)build, so a sleep/wake
         # would silently roll back to pretrained; we re-apply this on wake. None
@@ -215,6 +245,35 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     max_port_attempts,
                     self._ports.master_port,
                 )
+        try:
+            self._cache_fastvideo_timestep_scale()
+        except Exception:
+            try:
+                if self._generator is not None:
+                    self._generator.shutdown()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning("fastvideo init cleanup after scheduler query failure: %s", cleanup_exc)
+            self._generator = None
+            raise
+
+    def _cache_fastvideo_timestep_scale(self) -> None:
+        """Read and validate the scheduler scale once across all workers."""
+        if self._generator is None:
+            raise RuntimeError("Cannot query FastVideo scheduler without an active generator")
+        values = self._generator.executor.collective_rpc(_read_fastvideo_num_train_timesteps)
+        scales = [int(value) for value in values]
+        if not scales:
+            raise RuntimeError("FastVideo executor returned no scheduler timestep scales")
+        if any(scale <= 0 for scale in scales):
+            raise RuntimeError(f"FastVideo workers returned invalid num_train_timesteps: {scales}")
+        if len(set(scales)) != 1:
+            raise RuntimeError(f"FastVideo workers disagree on num_train_timesteps: {scales}")
+        self._fastvideo_timestep_scale = scales[0]
+        logger.info(
+            "fastvideo scheduler num_train_timesteps=%d (verified across %d workers)",
+            self._fastvideo_timestep_scale,
+            len(scales),
+        )
 
     # ------------------------------------------------------------------ #
     # Generation
@@ -365,6 +424,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             len(seeds) == len(prompts),
             f"fastvideo engine expects one seed per prompt; got {len(seeds)} vs {len(prompts)}",
         )
+        timestep_scale = self._fastvideo_timestep_scale
+        require(timestep_scale is not None, "fastvideo engine has no cached scheduler num_train_timesteps")
         for sample_index, (prompt, seed) in enumerate(zip(prompts, seeds)):
             one = deepcopy(sp)
             one.prompt = prompt
@@ -396,6 +457,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 trajectory_timesteps,
                 expected=sigmas,
                 sample_index=sample_index,
+                timestep_scale=timestep_scale,
             )
             traj = rl.trajectory_latents if rl is not None else None
             if traj is None:
@@ -608,6 +670,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # checkpoint so wake is weight-preserving, matching the other engines'
         # sleep/wake contract (sglang resume_memory keeps weights resident).
         try:
+            self._cache_fastvideo_timestep_scale()
             if self._last_weights_path is not None:
                 self._generator.update_transformer_weights_from_path(self._last_weights_path)
                 logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
