@@ -13,7 +13,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
-from unirl.rollout.engine.vllm_omni.utils import seed_from_sample_id, texts_from_req
+from unirl.rollout.engine.vllm_omni.utils import texts_from_req
 from unirl.types.primitives import Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
@@ -86,6 +86,21 @@ class Qwen3OmniThinkerInputAdapter:
         # Cached for replay-condition construction by the output adapter.
         self._last_encodings: List[Dict[str, Any]] = []
 
+    def _multimodal_processor_kwargs(self) -> Dict[str, Any]:
+        """Processor kwargs shared by driver encoding and vLLM."""
+        kwargs: Dict[str, Any] = {
+            "fps": self.video_fps,
+            "do_sample_frames": False,
+        }
+        if self.video_max_pixels is not None:
+            kwargs["size"] = {
+                "shortest_edge": int(self._processor.video_processor.size["shortest_edge"]),
+                "longest_edge": self.video_max_pixels,
+            }
+        if self.use_audio_in_video:
+            kwargs["use_audio_in_video"] = True
+        return kwargs
+
     def _extract_videos(self, req: RolloutReq, n: int) -> List[Optional[Any]]:
         """Return one entry per prompt: pyav-decoded frames tensor, or ``None``."""
         prim = req.primitives.get("video")
@@ -138,20 +153,16 @@ class Qwen3OmniThinkerInputAdapter:
             return_tensors="pt",
         )
         if video_frames is not None:
-            template_kwargs["fps"] = self.video_fps
-            template_kwargs["do_sample_frames"] = False
-            if self.video_max_pixels is not None:
-                template_kwargs["size"] = {
-                    "shortest_edge": int(self._processor.video_processor.size["shortest_edge"]),
-                    "longest_edge": self.video_max_pixels,
-                }
-            if self.use_audio_in_video:
-                template_kwargs["use_audio_in_video"] = True
+            template_kwargs.update(self._multimodal_processor_kwargs())
         return self._processor.apply_chat_template(messages, **template_kwargs)
 
     def build(self, req: RolloutReq) -> List[GenerateCall]:
         texts = texts_from_req(req)
         n = len(texts.texts)
+        require(
+            len(req.sample_ids) == n,
+            f"Qwen3OmniThinkerInputAdapter: sample id count {len(req.sample_ids)} != prompt count {n}",
+        )
         video_frames = self._extract_videos(req, n)
 
         # Allow a per-request system instruction.
@@ -172,10 +183,14 @@ class Qwen3OmniThinkerInputAdapter:
                         f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_pixels "
                         "or video_fps, or raise max_prompt_length."
                     )
-                ids = ids[-self.max_prompt_length :]
+                enc = dict(enc)
+                enc["input_ids"] = enc["input_ids"][..., -self.max_prompt_length :]
+                enc["attention_mask"] = enc["attention_mask"][..., -self.max_prompt_length :]
+                ids = enc["input_ids"].squeeze(0).tolist()
             entry: Dict[str, Any] = {"prompt_token_ids": ids}
             if vf is not None:
                 entry["multi_modal_data"] = {"video": [vf]}
+                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs()
             prompts.append(entry)
             self._last_encodings.append(enc)
 
@@ -187,21 +202,23 @@ class Qwen3OmniThinkerInputAdapter:
         top_k = top_k_val if top_k_val > 0 else -1  # vLLM: -1 disables top_k
         stop_token_id = getattr(ar, "stop_token_id", None)
 
-        sampling_kwargs: Dict[str, Any] = {
+        base_sampling_kwargs: Dict[str, Any] = {
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
             "max_tokens": max_new_tokens,
             "logprobs": 1,
-            "seed": seed_from_sample_id(req.sample_ids[0]) if req.sample_ids else 0,
         }
         if stop_token_id is not None:
-            sampling_kwargs["stop_token_ids"] = [int(stop_token_id)]
+            base_sampling_kwargs["stop_token_ids"] = [int(stop_token_id)]
 
+        # Keep seed unset: AsyncOmniEngine.add_request receives each prompt as an
+        # independent request, and patch_per_request_ar_seed clones the shared
+        # SamplingParams with a fresh seed for every request.
         return [
             GenerateCall(
                 prompts=prompts,
-                sampling=[StageSampling(kind=STAGE_KIND_AR, kwargs=sampling_kwargs)],
+                sampling=[StageSampling(kind=STAGE_KIND_AR, kwargs=base_sampling_kwargs)],
             )
         ]
 

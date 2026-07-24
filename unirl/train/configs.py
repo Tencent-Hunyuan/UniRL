@@ -22,8 +22,6 @@ class LoraConfig:
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
-    # Optional PEFT module-path regex excluded from adapter injection.
-    exclude_modules: Optional[str] = None
 
 
 @dataclass
