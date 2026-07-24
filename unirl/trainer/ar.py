@@ -142,8 +142,15 @@ class ARTrainer(BaseTrainer):
                     init_kwargs=rollout_parsed,
                 )
                 self._anchored_rollout_awake = None
-                self.rollout.sleep()
-                self._anchored_rollout_awake = False
+                if self._enable_fsdp_offload:
+                    self.rollout.sleep()
+                    self._anchored_rollout_awake = False
+                else:
+                    # Resident colocate: enable_fsdp_offload=false keeps the
+                    # training FSDP shards on-GPU, so keep the rollout engine
+                    # awake alongside them (both resident, no per-step swap).
+                    # vLLM's low gpu_memory_utilization leaves room for both.
+                    self._anchored_rollout_awake = True
 
                 if sync_cfg is not None:
                     # The anchored engine is not a sibling of every train worker.
@@ -165,6 +172,8 @@ class ARTrainer(BaseTrainer):
         self._anchored_backend_offloaded = True
 
     def _ensure_anchored_rollout_awake(self) -> None:
+        if not self._enable_fsdp_offload:
+            return  # resident colocate: engine stays awake
         if self._anchored_rollout_awake is True:
             return
         self._anchored_rollout_awake = None
@@ -172,6 +181,8 @@ class ARTrainer(BaseTrainer):
         self._anchored_rollout_awake = True
 
     def _ensure_anchored_rollout_asleep(self) -> None:
+        if not self._enable_fsdp_offload:
+            return  # resident colocate: never sleep the engine
         if self._anchored_rollout_awake is False:
             return
         self._anchored_rollout_awake = None
