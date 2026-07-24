@@ -2,8 +2,9 @@
 # HunyuanVideo-1.0 T2V GRPO — SGLang rollout with LoRA-merged weight sync.
 #
 # This is the SGLang counterpart of ``hunyuan_video_t2v_trainside``. Its
-# training and sampling defaults match the validated 1x8 H20 run: LoRA r64
-# alpha=256, skip-layer=2, 10 denoising steps, 480x640x5, and four SDE steps.
+# optimization defaults match the validated 1x8 H20 run: LoRA r64, alpha=256,
+# skip-layer=2, 10 denoising steps, and four SDE steps. Both recipes generate
+# standard landscape 720p video (1280x720x5).
 # SGLang holds a full transformer while FSDP trains LoRA; after every rollout,
 # TensorWeightSync folds the adapter into the base weights and pushes the
 # merged transformer. This avoids the known online-SGLang-LoRA delta mismatch.
@@ -164,8 +165,8 @@ sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
   num_inference_steps: 10
   guidance_scale: 1.0
-  height: 480
-  width: 640
+  height: 720
+  width: 1280
   num_frames: 5
   eta: 0.7
   samples_per_prompt: 8

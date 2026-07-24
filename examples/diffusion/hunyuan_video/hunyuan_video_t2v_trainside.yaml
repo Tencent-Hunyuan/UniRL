@@ -1,5 +1,5 @@
 # @package _global_
-# HunyuanVideo-1.0 T2V GRPO — validated in-process (trainside) rollout.
+# HunyuanVideo-1.0 T2V GRPO — 720p in-process (trainside) rollout.
 # LoRA alpha=256 (scale=4x rank) produces a climbing PickScore curve in the
 # controlled run; alpha=rank=64 left the reward flat under bf16 LoRA.
 #
@@ -159,14 +159,14 @@ data_source:
     algorithm:
       prompts_per_rollout: ${batch_size}
 
-# Validated 1x8-GPU run: 10 denoising steps, cfg=1.0, 480×640, eta=0.7,
-# shift=5.0; four SDE/trainable steps sampled from the first half.
+# Standard landscape 720p (1280x720), with the validated optimization defaults:
+# 10 denoising steps, cfg=1.0, eta=0.7, shift=5.0, and four SDE/trainable steps.
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
   num_inference_steps: 10
   guidance_scale: 1.0
-  height: 480
-  width: 640
+  height: 720
+  width: 1280
   num_frames: 5
   eta: 0.7
   samples_per_prompt: 8
