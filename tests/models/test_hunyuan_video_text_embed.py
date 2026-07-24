@@ -42,6 +42,17 @@ def test_llama_hidden_state_skip_selects_from_end(skip, expected):
     assert torch.all(embeds == expected)
 
 
+def test_llama_encoding_disables_unstable_cudnn_sdpa(monkeypatch):
+    cudnn_sdp_calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.backends.cuda, "enable_cudnn_sdp", cudnn_sdp_calls.append)
+    stage = HunyuanVideoTextEmbedStage(_bundle(), crop_start=0)
+
+    stage._encode_llama(["prompt"])
+
+    assert cudnn_sdp_calls == [False]
+
+
 def test_hidden_state_skip_rejects_negative_values():
     with pytest.raises(ValueError, match="hidden_state_skip_layer must be >= 0"):
         HunyuanVideoPipelineConfig(

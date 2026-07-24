@@ -97,6 +97,15 @@ class HunyuanVideoTextEmbedStage:
         dtype = next(text_encoder.parameters()).dtype
         crop_start = self.crop_start
 
+        # cuDNN SDPA can abort in native code under NVIDIA's CUDA
+        # forward-compat layer (for example, a CUDA 13 runtime on a 535
+        # driver). Keep SDPA enabled, but route it through PyTorch's stable
+        # flash / memory-efficient kernels instead of the cuDNN backend.
+        # This setting is process-wide and also protects the subsequent CLIP
+        # and diffusion attention calls in this rollout worker.
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_cudnn_sdp(False)
+
         # Apply the prompt template to each prompt.
         template = PROMPT_TEMPLATE["template"]
         formatted = [template.format(p if p else "") for p in prompts]
