@@ -1,4 +1,4 @@
-"""Per-sample SDE noise determinism via ``denoise_seeds`` (gap #2, LIN-365).
+"""Per-sample SDE noise via ``denoise_seeds`` + per-request fallback (LIN-365).
 
 Stock upstream builds one ``extra_step_kwargs["generator"] = batch.generator``
 once per request (denoising.py) and reuses it across steps. The fork instead
@@ -26,11 +26,37 @@ step is safe and matches the fork's per-step re-seed for the SDE steps.
 NOTE: model-specific stages may override ``_run_denoising_step``; this patches
 the shared base ``DenoisingStage``, which SD3's image path uses. A subclass that
 overrides the method would need its own wrap -- flagged for taiji verification.
+
+**Per-request fallback** (``_patch_rollout_variance_noise_device``): when the
+AROUND-wrap above is a no-op because a model-specific ``DenoisingStage``
+subclass overrode ``_run_denoising_step`` (e.g. Qwen-Image-Edit-Plus), upstream's
+default ``extra_step_kwargs["generator"] = batch.generator`` reaches
+``_rollout_variance_noise``. That generator is seeded from the shared
+``batch.seed`` — the SAME value for every GRPO-group sample (each is a separate
+B=1 request reseeded to the same ``sampling_params.seed``) — so all samples draw
+byte-identical per-step z_t → frozen exploration noise → breaks GRPO sample
+independence → reward regresses after ~100 rollouts. This is the same root cause
+as the vLLM-Omni BAGEL fix (PR #89, heguangxin's comment): ``pipeline_bagel``
+reseeds the global RNG per request and the SDE scheduler drew z_t from it. Fix
+(mirrors ``BagelFlowSDEScheduler.step``): when ``_rollout_variance_noise``
+receives a single ``torch.Generator`` (not a denoise_seeds list), replace it
+with a per-request generator whose seed is derived from
+``(base_seed, denoise_seeds[0])`` — the per-sample-unique ``sample_id`` that
+``patch_latent_prep`` slices onto each B=1 output — via the same blake2b
+derivation as ``_make_step_generators``, so the fallback stays reproducible from
+``seed`` AND independent per GRPO sample (distinct sample_ids → distinct seeds,
+the property that fixes the reward regression; ``os.urandom`` is used only when
+neither a base seed nor a sample key is available). Stashed on ``batch`` so the
+generator persists across SDE steps within one request. The denoise_seeds path
+(list of generators) is unaffected — it fires for models whose denoising stage
+inherits the base ``_run_denoising_step`` (e.g. SD3), preserving its
+deterministic driver-aligned per-sample noise.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 
 import torch
 
@@ -66,6 +92,27 @@ def _resolve_base_seed(batch) -> int | None:
     if seed is None:
         seed = getattr(getattr(batch, "sampling_params", None), "seed", None)
     return int(seed) if seed is not None else None
+
+
+def _resolve_fallback_seed(batch) -> int:
+    """Deterministic per-request seed for the single-``torch.Generator`` fallback.
+
+    Prefer a stable per-sample key so the fallback stays reproducible from
+    ``seed`` AND independent per GRPO sample: derive from
+    ``(base_seed, denoise_seeds[0])`` — the per-sample-unique ``sample_id`` that
+    ``patch_latent_prep`` slices onto each B=1 output — via the same blake2b
+    derivation as :func:`_make_step_generators`. Fall back to ``os.urandom`` only
+    when neither the base seed nor a sample key is available (keeps samples
+    independent, but non-reproducible).
+    """
+    base_seed = _resolve_base_seed(batch)
+    denoise_seeds = getattr(batch, "denoise_seeds", None)
+    sample_key = str(denoise_seeds[0]) if denoise_seeds else None
+    if base_seed is not None and sample_key is not None:
+        payload = (f"{int(base_seed)}::fallback::sample::{sample_key}").encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="big", signed=False) % _MAX_TORCH_SEED
+    return int.from_bytes(os.urandom(8), byteorder="big") % _MAX_TORCH_SEED
 
 
 def patch_denoising() -> None:
@@ -106,6 +153,11 @@ def _patch_rollout_variance_noise_device() -> None:
     generator but found 'cpu'``. Draw on the generator's device then copy to the
     buffer (mirrors diffusers ``randn_tensor``). REPLACE-patched (the buggy draw is
     mid-method); the rest is byte-for-byte upstream.
+
+    Also installs a per-request ``os.urandom``-seeded generator fallback for
+    when the ``denoise_seeds`` AROUND-wrap on
+    ``DenoisingStage._run_denoising_step`` is a no-op (model-specific subclass
+    overrode the method). See the module docstring for the root-cause analysis.
     """
     from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
         SchedulerRLMixin,
@@ -122,8 +174,44 @@ def _patch_rollout_variance_noise_device() -> None:
         local_shape = tuple(model_output.shape)
         B = local_shape[0]
         if isinstance(generator, torch.Generator):
+            # Fallback: the denoise_seeds AROUND-wrap on
+            # ``DenoisingStage._run_denoising_step`` did not fire (a
+            # model-specific stage subclass overrode the method), so
+            # upstream's default ``extra_step_kwargs["generator"] =
+            # batch.generator`` reached us. That generator is seeded from
+            # the shared ``batch.seed`` — the SAME value for every
+            # GRPO-group sample (each is a separate B=1 request reseeded
+            # to the same ``sampling_params.seed``) — so with this shared
+            # generator all samples draw byte-identical per-step z_t ->
+            # frozen exploration noise -> breaks GRPO sample independence
+            # -> reward regresses after ~100 rollouts. Same root cause as
+            # the vLLM-Omni BAGEL fix (PR #89, heguangxin's comment):
+            # ``pipeline_bagel`` reseeds the global RNG per request and the
+            # SDE scheduler drew z_t from it. Fix (mirrors
+            # ``BagelFlowSDEScheduler.step`` in
+            # ``vllm_omni/pipelines/bagel/bagel_flow_match_sde_scheduler.py``):
+            # replace the shared generator with a per-request generator
+            # seeded deterministically from ``(base_seed, sample_id)`` via
+            # ``_resolve_fallback_seed`` so it stays reproducible AND per-sample
+            # independent (``os.urandom`` only when no stable key exists). Stash
+            # on ``batch`` so the generator
+            # persists across SDE steps within one request (each
+            # per-output forward has its own batch -> generator is
+            # naturally per-sample). The denoise_seeds path (list of
+            # generators) is unaffected: it fires for models whose
+            # denoising stage inherits the base ``_run_denoising_step``
+            # (e.g. SD3), preserving its deterministic driver-aligned
+            # per-sample noise.
             assert B == 1, "Generator must be a list if batch size is not 1"
-            generator = [generator]
+            gen = getattr(batch, "_unirl_noise_gen", None)
+            if gen is None:
+                gen = torch.Generator(device=device)
+                gen.manual_seed(_resolve_fallback_seed(batch))
+                try:
+                    batch._unirl_noise_gen = gen  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass  # immutable batch — generator is still valid for this step
+            generator = [gen]
         else:
             assert len(generator) == B, "Generator list must have the same length as batch size"
         buffer = self._get_or_create_rollout_noise_buffer(rsd, rsd.latents_shape, device, dtype)

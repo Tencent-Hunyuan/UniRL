@@ -78,6 +78,21 @@ logger = logging.getLogger(__name__)
 # The 6 conditions fields, in the fork's order. All default to None and are
 # typed ``list[torch.Tensor] | None`` (one entry per text encoder) on
 # OutputBatch; ``Any``-typed on GenerationResult to match its existing style.
+#
+# ``image_latent`` (7th field, Edit-Plus only) is a single packed
+# ``[B, S_img, C*4]`` tensor — NOT a per-encoder list. It is wrapped as a
+# one-element list ``[tensor]`` at copy time so it flows through the existing
+# list-based merge/slice path unchanged (one "encoder", one tensor). Only
+# Edit-Plus sets ``batch.image_latent`` (via upstream's
+# ``ImageVAEEncodingStage``); T2I models leave it ``None``, so this field is
+# a no-op for every non-Edit-Plus adapter.
+#
+# ``image_latent_sizes`` (8th field, Edit-Plus only) carries the per-request
+# ``vae_image_sizes`` (a ``list[tuple[int, int]]`` of pixel (W, H) pairs from
+# upstream's ``preprocess_vae_image``). The adapter needs these to unpack
+# ``image_latent`` from packed ``[S_img, C*4]`` to spatial ``[C, H_img, W_img]``
+# (S_img alone is ambiguous — multiple H×W grids give the same token count).
+# Wrapped as ``[value]`` to fit the list-based merge/slice path.
 _COND_FIELDS = (
     "prompt_embeds",
     "pooled_prompt_embeds",
@@ -85,6 +100,8 @@ _COND_FIELDS = (
     "negative_prompt_embeds",
     "neg_pooled_prompt_embeds",
     "negative_attention_mask",
+    "image_latent",
+    "image_latent_sizes",
 )
 
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
@@ -289,6 +306,24 @@ def _copy_conditions(src, output_batch) -> None:
         _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
         _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+    # Edit-Plus image_latent: a single packed [B, S_img, C*4] tensor set by
+    # upstream's ImageVAEEncodingStage. Not gated on a SamplingParams flag —
+    # presence on the batch IS the gate (only Edit-Plus sets it; T2I leaves
+    # it None). Wrapped as [tensor] to fit the list-based merge/slice path.
+    image_latent = getattr(src, "image_latent", None)
+    if image_latent is not None:
+        import torch
+
+        if torch.is_tensor(image_latent):
+            output_batch.image_latent = [image_latent.detach().cpu()]
+        elif isinstance(image_latent, (list, tuple)):
+            output_batch.image_latent = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
+    # Edit-Plus vae_image_sizes: list[tuple[int, int]] of pixel (W, H) pairs
+    # from upstream's preprocess_vae_image. The adapter needs these to unpack
+    # image_latent to spatial form. Wrapped as [value] for the merge/slice path.
+    vae_image_sizes = getattr(src, "vae_image_sizes", None)
+    if vae_image_sizes is not None:
+        output_batch.image_latent_sizes = [vae_image_sizes]
 
 
 def _copy_mapped_conditions(src, output_batch, mapping) -> None:
@@ -305,6 +340,7 @@ def _copy_mapped_conditions(src, output_batch, mapping) -> None:
         val = _to_cpu_embed_list(getattr(src, srcattr, None))
         if dst in _TOKEN_EMBED_DESTS:
             val = _ensure_batched_embed_list(val)
+            val = _coalesce_duplicate_single_sample_encodes(val)
         setattr(output_batch, dst, val)
 
 
@@ -318,6 +354,35 @@ def _ensure_batched_embed_list(value):
         return value
     out = [t if (t is None or t.dim() >= 3) else t.unsqueeze(0) for t in value]
     return out if isinstance(value, list) else type(value)(out)
+
+
+def _coalesce_duplicate_single_sample_encodes(value):
+    """Collapse shallow-copy duplicate prompt encodes.
+
+    Only same-shaped singleton-batch tensors ``[1, seq, hidden]`` are collapsed.
+    Multi-encoder outputs (different shapes), non-tensors, and already-batched
+    tensors are preserved.
+    """
+    import torch
+
+    if not isinstance(value, (list, tuple)) or len(value) <= 1:
+        return value
+    if not all(torch.is_tensor(t) for t in value):
+        return value
+
+    first = value[0]
+    first_shape = tuple(first.shape)
+    if first.dim() < 1 or int(first.shape[0]) != 1:
+        return value
+    if any(tuple(t.shape) != first_shape for t in value[1:]):
+        return value
+    # Value check: only coalesce when the same-shape entries are actually
+    # byte-identical (the shared-list duplicate signature). Same-shape-but-
+    # differing tensors are a genuine multi-encoder whose outputs must NOT be
+    # collapsed — hardens the shape-only heuristic per the examples/ README note.
+    if not all(torch.equal(first, t) for t in value[1:]):
+        return value
+    return [first]
 
 
 def _wrap_decoding_stage(DecodingStage) -> None:
@@ -433,6 +498,10 @@ def _merge_conditions(merged, output_batches) -> None:
             tensors = [v[enc_idx] for v in per_batch]
             if any(t is None for t in tensors):
                 merged_list.append(None)
+            elif name == "image_latent_sizes":
+                # Non-tensor (list[tuple[int,int]]); all outputs in a group
+                # share the same source image, so take the first.
+                merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
@@ -467,7 +536,18 @@ def _wrap_result_common(DiffGenerator) -> None:
         common = raw(req, output_batch, generation_time, output_index)
         idx = 0 if output_index is None else int(output_index)
         for name in _COND_FIELDS:
-            common[name] = _slice_embed_list(getattr(output_batch, name, None), idx)
+            val = getattr(output_batch, name, None)
+            if name == "image_latent_sizes":
+                # image_latent_sizes is list[tuple[int,int]] per encoder (NOT
+                # per-output — all outputs in a group share one source image).
+                # _merge_conditions already took tensors[0] across batches, so
+                # the merged value has exactly one entry per encoder. Slicing
+                # by output_index would index past it (e.g. [(1024,1024)][3:4]
+                # = []) → "got 0 source images" in _collect_image_latents.
+                # Pass through unchanged.
+                common[name] = val
+            else:
+                common[name] = _slice_embed_list(val, idx)
         return common
 
     setattr(_result_common, _RESULT_COMMON_SENTINEL, True)

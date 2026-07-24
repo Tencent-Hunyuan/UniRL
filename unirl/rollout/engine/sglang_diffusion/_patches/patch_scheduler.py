@@ -82,7 +82,13 @@ def patch_scheduler() -> None:
 
         def _handle_set_lora_from_tensors(self, reqs: List[Any]) -> OutputBatch:
             req = reqs[0]
-            return self.worker.set_lora_from_tensors(req.lora_nickname, req.lora_tensors, req.target, req.strength)
+            return self.worker.set_lora_from_tensors(
+                req.lora_nickname,
+                req.lora_tensors,
+                req.target,
+                req.strength,
+                lora_alpha=req.lora_alpha,
+            )
 
         def _handle_get_weights_detail(self, reqs: List[Any]) -> OutputBatch:
             """Handle get_weights_detail request — per-param names, shapes, checksums."""

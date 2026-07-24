@@ -60,9 +60,26 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from dataclasses import field
 
 logger = logging.getLogger(__name__)
+
+# Thread-local stash for the per-prompt ``condition_image`` index.
+#
+# Upstream ``DiffGenerator.generate`` (diffusion_generator.py:209-221) loops
+# over prompts and builds one ``Req`` per prompt via ``dataclasses.replace``
+# + ``prepare_request``. It indexes ``image_path`` per prompt via
+# ``_resolve_image_paths_per_prompt`` but does NOT index ``condition_image`` --
+# so every per-prompt ``sampling_params`` carries the WHOLE list, and
+# ``InputValidationStage.preprocess_condition_image`` (input_validation.py:117)
+# then uses ``batch.condition_image[-1]`` as the source image. Every prompt in
+# a multi-prompt batch ends up conditioned on the LAST source image.
+#
+# We fix this by stashing the list in thread-local state at the start of
+# ``generate`` and indexing it per Req in ``_wrap_prepare_request`` (which
+# upstream calls once per prompt, in prompt order, in the same thread).
+_local = threading.local()
 
 # Fork field name -> (default, human-readable type) for SamplingParams injection.
 # Defaults/types mirror the fork's sampling_params.py diff (sigmas/timesteps real
@@ -82,11 +99,20 @@ _SP_INJECT_FIELDS = {
     "denoise_seeds": (None, "list[str] | None"),
     "return_prompt_embeds": (False, "bool"),
     "return_negative_prompt_embeds": (False, "bool"),
+    # Edit-Plus source-image PIL. ``Req.condition_image`` is a real dataclass
+    # field (schedule_batch.py:59), but ``SamplingParams`` lacks it, so without
+    # injection a PIL passed in sampling kwargs would be dropped at
+    # ``SamplingParams`` construction. SGLang's ``InputValidationStage`` checks
+    # ``batch.condition_image is not None`` BEFORE ``image_path``
+    # (input_validation.py:108), so pre-populating it via this field bypasses
+    # the file-path load. ``_wrap_prepare_request`` copies it onto the Req.
+    "condition_image": (None, "Any"),
 }
 
 # Sentinels.
 _SP_INIT_SENTINEL = "_unirl_sampling_io_init"
 _PREP_SENTINEL = "_unirl_sampling_io_prepare"
+_VALIDATE_SENTINEL = "_unirl_sampling_io_validate"
 _REQ_FIELD = "denoise_seeds"
 
 
@@ -122,6 +148,36 @@ def patch_sampling_io() -> None:
     # hash (json.dumps(_json_safe(asdict(self)))) doesn't crash on a Tensor.
     _install_json_safe_tensor_guard(sp_mod)
 
+    # (5) Bypass the I2I ``image_path`` requirement when ``condition_image`` is
+    # set. Edit-Plus ships the source-image PIL via ``condition_image`` (a Req
+    # field populated in ``_wrap_prepare_request``), NOT via ``image_path`` (a
+    # file path). Upstream's ``_validate_with_pipeline_config`` raises
+    # ``ValueError`` for I2I task types when ``image_path is None`` — without
+    # this bypass the first ``generate()`` crashes before the PIL ever reaches
+    # ``InputValidationStage`` (which checks ``batch.condition_image is not
+    # None`` BEFORE ``image_path`` at input_validation.py:108, so the PIL path
+    # is correct once validation passes).
+    _wrap_validate_with_pipeline_config(SamplingParams)
+
+    # (6) Index ``condition_image`` per prompt. Upstream's per-prompt loop in
+    # ``DiffGenerator.generate`` indexes ``image_path`` but NOT
+    # ``condition_image``, so a multi-prompt batch would condition every prompt
+    # on the last source image (input_validation.py:117). Stash the list at
+    # the start of ``generate`` and index it per Req in
+    # ``_wrap_prepare_request``.
+    _wrap_diff_generator_generate()
+
+    # (7) Upstream's ``InputValidationStage.forward`` only calls
+    # ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via
+    # ``config.preprocess_vae_image``) inside the ``if batch.image_path is not
+    # None`` branch. Edit-Plus ships the source image as a PIL via
+    # ``condition_image`` with ``image_path=None``, so that branch is skipped
+    # and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises
+    # ``TypeError: 'NoneType' object is not iterable``. Wrap forward to invoke
+    # ``preprocess_condition_image`` when ``condition_image`` is set but
+    # ``image_path`` is not.
+    _wrap_input_validation_condition_image()
+
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values.
@@ -144,6 +200,11 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     def _json_safe(obj):
         if torch.is_tensor(obj):
             return f"<tensor:{tuple(obj.shape)}:{obj.dtype}>"
+        # PIL.Image.Image (Edit-Plus ``condition_image``) — not JSON
+        # serializable; only feeds the output-filename hash, so a placeholder
+        # is harmless. ``save_output=False`` in rollout anyway.
+        if obj.__class__.__name__ == "Image" or obj.__class__.__module__.startswith("PIL."):
+            return f"<pil:{getattr(obj, 'size', None)}:{getattr(obj, 'mode', None)}>"
         if isinstance(obj, dict):
             return {k: _json_safe(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple, set)):
@@ -152,6 +213,221 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
 
     _json_safe._unirl_tensor_safe = True  # type: ignore[attr-defined]
     sp_mod._json_safe = _json_safe
+
+
+# ------------------------------------------------------------------ #
+# (5) Bypass I2I image_path validation when condition_image is set
+# ------------------------------------------------------------------
+
+
+#: Stand-in image_path used only for the duration of the wrapped validation
+#: call — never persisted, never dereferenced (upstream 0.5.12.post1 only
+#: None-checks image_path inside _validate_with_pipeline_config).
+_CONDITION_IMAGE_PATH_SENTINEL = "<unirl:condition_image>"
+
+
+def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
+    """AROUND-wrap ``_validate_with_pipeline_config`` to let ``condition_image``
+    satisfy the I2I ``image_path`` requirement.
+
+    Edit-Plus ships the source-image PIL via the ``condition_image`` field (a
+    Req dataclass field, populated by ``_wrap_prepare_request``), NOT via
+    ``image_path`` (a file-path string). Upstream's validation raises
+    ``ValueError`` for I2I task types when ``image_path is None`` — this would
+    crash the first ``generate()`` before the PIL reaches ``InputValidationStage``
+    (which checks ``batch.condition_image is not None`` BEFORE ``image_path``,
+    so the PIL path is correct once validation passes).
+
+    Instead of re-implementing upstream's checks (which would silently skip
+    any validation a future sglang adds to this method), the wrap runs the
+    FULL original validation with ``image_path`` temporarily stubbed to a
+    sentinel string. Upstream 0.5.12.post1 only None-checks ``image_path``
+    here, so the sentinel (a) satisfies ``requires_image_input()`` — the
+    intended bypass — and (b) keeps the ``accepts_image_input()`` reject path
+    live: a T2I-only task type given a ``condition_image`` now fails
+    validation instead of silently ignoring the image. The sentinel is
+    restored in ``finally`` and never escapes the call.
+
+    When ``condition_image`` is None (T2I) or ``image_path`` is genuinely set,
+    the original validation runs untouched. Idempotent.
+    """
+    orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
+    if orig is None:
+        return  # pragma: no cover - upstream method missing
+    if getattr(orig, _VALIDATE_SENTINEL, False):
+        return
+
+    def _validate_with_pipeline_config(self, pipeline_config, __orig=orig):
+        condition_image = getattr(self, "condition_image", None)
+        if condition_image is None or getattr(self, "image_path", None) is not None:
+            return __orig(self, pipeline_config)
+        self.image_path = _CONDITION_IMAGE_PATH_SENTINEL
+        try:
+            return __orig(self, pipeline_config)
+        finally:
+            self.image_path = None
+
+    setattr(_validate_with_pipeline_config, _VALIDATE_SENTINEL, True)
+    SamplingParams._validate_with_pipeline_config = _validate_with_pipeline_config
+
+
+# ------------------------------------------------------------------ #
+# (6) Per-prompt condition_image indexing in DiffGenerator.generate
+# ------------------------------------------------------------------
+
+
+_GEN_SENTINEL = "_unirl_diff_gen_index"
+
+
+def _wrap_diff_generator_generate() -> None:
+    """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image``
+    per prompt.
+
+    Upstream's per-prompt loop (diffusion_generator.py:209-221) indexes
+    ``image_path`` via ``_resolve_image_paths_per_prompt`` but NOT
+    ``condition_image`` -- every per-prompt ``dataclasses.replace`` carries
+    the whole list, and ``InputValidationStage.preprocess_condition_image``
+    (input_validation.py:117) then uses ``batch.condition_image[-1]`` as the
+    source image. Every prompt in a multi-prompt batch ends up conditioned
+    on the LAST source image.
+
+    This wrap stashes the list in thread-local state at the start of
+    ``generate``; ``_wrap_prepare_request`` (called once per prompt, in
+    prompt order, in the same thread) consumes one element per call.
+    Single-prompt path (list len 1 or scalar PIL) is a passthrough.
+
+    Safety: ``generate`` is synchronous in ``local_mode=True`` (the only
+    mode UniRL uses) and calls ``prepare_request`` sequentially in the same
+    thread, so the thread-local counter is correct. Concurrent ``generate``
+    calls in different threads each get their own thread-local slot.
+
+    Idempotent. No-op when ``DiffGenerator`` is unavailable in this
+    interpreter (e.g. a CPU-only unit-test process importing only the
+    rollout math).
+    """
+    try:
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            DiffGenerator,
+        )
+    except Exception:  # pragma: no cover - environment dependent
+        return
+
+    orig = DiffGenerator.__dict__.get("generate")
+    if orig is None:
+        return
+    if getattr(orig, _GEN_SENTINEL, False):
+        return
+
+    def generate(self, sampling_params_kwargs=None, *args, **kwargs):
+        # Stash the per-prompt condition_image list BEFORE the per-prompt loop
+        # so _wrap_prepare_request can index it. Reset the counter regardless
+        # so a leftover stash from a prior call can't corrupt this one.
+        ci = (sampling_params_kwargs or {}).get("condition_image")
+        if isinstance(ci, list) and len(ci) > 1:
+            _local.condition_image_per_prompt = ci
+            _local.condition_image_idx = 0
+        else:
+            # Clear any stale stash so _wrap_prepare_request falls back to the
+            # scalar-PIL passthrough (single prompt or T2I).
+            _local.condition_image_per_prompt = None
+            _local.condition_image_idx = 0
+        try:
+            return orig(self, sampling_params_kwargs, *args, **kwargs)
+        finally:
+            # Always clear so a later T2I call in the same thread can't pick
+            # up a stale Edit-Plus stash.
+            _local.condition_image_per_prompt = None
+            _local.condition_image_idx = 0
+
+    setattr(generate, _GEN_SENTINEL, True)
+    DiffGenerator.generate = generate
+
+
+# ------------------------------------------------------------------ #
+# (7) InputValidationStage: call preprocess_condition_image when only
+#     condition_image (PIL) is set, no image_path
+# ------------------------------------------------------------------
+
+
+_IVL_SENTINEL = "_unirl_ivl_cond_img"
+
+
+def _wrap_input_validation_condition_image() -> None:
+    """AROUND-wrap ``InputValidationStage.forward`` to invoke
+    ``preprocess_condition_image`` when ``condition_image`` is set but
+    ``image_path`` is None.
+
+    Upstream's forward (input_validation.py:380-412) only calls
+    ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via
+    ``config.preprocess_vae_image``) inside the ``if batch.image_path is not
+    None`` branch. Edit-Plus ships the source image as a PIL via
+    ``condition_image`` with ``image_path=None``, so that branch is skipped
+    and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises
+    ``TypeError: 'NoneType' object is not iterable``.
+
+    This wrap detects the PIL-only path and calls
+    ``preprocess_condition_image`` after upstream forward returns, using the
+    PIL's own width/height as the condition-image size (mirroring what
+    upstream would have done inside the image_path branch). No-op when
+    ``condition_image`` is None (T2I) or when ``image_path`` is set (upstream
+    already handled it). Idempotent.
+    """
+    try:
+        import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
+    except ImportError:
+        return  # pragma: no cover - upstream module missing
+
+    IVL = getattr(ivl_mod, "InputValidationStage", None)
+    if IVL is None:
+        return  # pragma: no cover
+
+    orig_forward = IVL.__dict__.get("forward")
+    if orig_forward is None or getattr(orig_forward, _IVL_SENTINEL, False):
+        return
+
+    def forward(self, batch, server_args, __orig=orig_forward):
+        batch = __orig(self, batch, server_args)
+
+        # Only act on the PIL-only path: condition_image set, image_path None,
+        # and vae_image_sizes not yet populated (upstream didn't call
+        # preprocess_condition_image).
+        condition_image = getattr(batch, "condition_image", None)
+        image_path = getattr(batch, "image_path", None)
+        vae_image_sizes = getattr(batch, "vae_image_sizes", None)
+        if condition_image is None or image_path is not None or vae_image_sizes is not None:
+            return batch
+
+        # Mirror upstream's preprocess_condition_image entry (input_validation.py:131-165):
+        # it needs a single PIL to read width/height, and calls
+        # config.preprocess_vae_image(batch, self.vae_image_processor) which
+        # populates batch.vae_image_sizes.
+        img = condition_image[-1] if isinstance(condition_image, list) else condition_image
+        condition_image_width = img.width
+        condition_image_height = img.height
+        batch.original_condition_image_size = (condition_image_width, condition_image_height)
+
+        # Preserve the driver-pinned output dims. ``preprocess_condition_image``
+        # overwrites batch.height/width with the source-image-derived VAE size
+        # (~1024²) UNLESS ``extra["explicit_fields"]`` lists them. Upstream's
+        # ``_explicit_fields`` (set in ``from_user_sampling_params_args``) is a
+        # plain attribute that ``dataclasses.replace`` drops in
+        # ``DiffGenerator.generate``'s per-prompt loop, so for the PIL path
+        # (which skips the image_path branch that re-sets it) ``explicit_fields``
+        # is empty here and the user's 384² gets clobbered to 1024². The
+        # driver-authoritative ``initial_noise`` was created at 384², so a
+        # clobbered 1024² makes ``maybe_pack_latents`` reshape against the
+        # wrong grid → ``RuntimeError: shape '[1,16,64,2,64,2]' is invalid for
+        # input of size 36864``. UniRL's adapter always pins height/width
+        # (build_sampling), so save/restore them across the call.
+        saved_height = batch.height
+        saved_width = batch.width
+        self.preprocess_condition_image(batch, server_args, condition_image_width, condition_image_height)
+        batch.height = saved_height
+        batch.width = saved_width
+        return batch
+
+    setattr(forward, _IVL_SENTINEL, True)
+    IVL.forward = forward
 
 
 # ------------------------------------------------------------------ #
@@ -340,6 +616,35 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
+
+        # Edit-Plus source-image PIL. Req.condition_image is a real dataclass
+        # field (schedule_batch.py:59), so this assignment lands on the Req
+        # directly (not delegated to sampling_params). Upstream's
+        # InputValidationStage then preprocesses the PIL (resize + VAE encode
+        # → batch.image_latent). No-op when the adapter didn't set it (T2I).
+        condition_image = getattr(sampling_params, "condition_image", None)
+        if condition_image is not None:
+            # Multi-prompt indexing: when the adapter emitted a list of PILs
+            # (one per unique prompt), upstream's per-prompt loop in
+            # ``DiffGenerator.generate`` carries the WHOLE list on every
+            # per-prompt ``sampling_params`` (it indexes ``image_path`` but
+            # not ``condition_image``). ``_wrap_diff_generator_generate``
+            # stashed the list in thread-local state at the start of
+            # ``generate``; index it per Req here, mirroring
+            # ``image_paths_per_prompt[i]``. Single-prompt path (list len 1
+            # or scalar PIL) is a passthrough.
+            stash = getattr(_local, "condition_image_per_prompt", None)
+            if isinstance(stash, list) and len(stash) > 1:
+                idx = getattr(_local, "condition_image_idx", 0)
+                if idx >= len(stash):
+                    raise RuntimeError(
+                        f"prepare_request: condition_image index {idx} >= "
+                        f"stash length {len(stash)} — generate() prompt count "
+                        f"mismatch. This is a UniRL patch bug."
+                    )
+                condition_image = stash[idx]
+                _local.condition_image_idx = idx + 1
+            req.condition_image = condition_image
 
         return req
 

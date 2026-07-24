@@ -106,6 +106,22 @@ class HunyuanImage3Bundle(Bundle):
         double-prefixed it)."""
         return self.transformer.model
 
+    def prepare_for_expert_parallel(self) -> None:
+        """Make the decoder expert-parallel-ready (backend hook; called only when
+        ``ep_size > 1``, on the meta model, before ``veomni_parallelize``).
+
+        Swaps each decoder layer's ``HunyuanMoE`` (nn.ModuleList experts) for a
+        ``FusedHunyuanMoE`` (fused ``[E,2I,H]`` experts via veomni grouped GEMM +
+        all_to_all) and attaches ``get_parallel_plan`` so VeOmni's EP can
+        ``Shard(0)`` the fused tensors. Flags :meth:`materialize` to fuse the
+        per-expert checkpoint keys and take the EP-sharded load path. Driven
+        solely by ``backend.fsdp_cfg.ep_size`` — there is no separate config flag."""
+        from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
+
+        n_swapped = replace_hunyuan_moe_with_fused(self.transformer.model)
+        logger.info("expert-parallel: swapped %d HunyuanMoE layer(s) for FusedHunyuanMoE", n_swapped)
+        self._ep_enabled = True
+
     @classmethod
     def from_config(cls, config: HunyuanImage3PipelineConfig) -> "HunyuanImage3Bundle":
         """Load all HunyuanImage3 components from a HuggingFace checkpoint.
@@ -413,6 +429,15 @@ class HunyuanImage3Bundle(Bundle):
             prefixes = tuple(attr for attr, _ in plan)
             sd = _collect_filtered_state_dict(self.pretrained_path, prefixes=prefixes)
 
+            # Expert parallelism: fuse per-expert checkpoint keys
+            # (model.layers.*.mlp.experts.{j}.{gate_and_up,down}_proj.weight) into
+            # the FusedHunyuanMoE's [E,...] params (gate_and_up half-swapped to
+            # veomni's silu-first convention). Matches prepare_for_expert_parallel's swap.
+            if getattr(self, "_ep_enabled", False):
+                from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
+
+                sd = fuse_expert_state_dict(sd)
+
             # [Bug B fix] LoRA key rename: peft.inject_adapter_in_model wraps
             # q/k/v/o_proj.weight as q/k/v/o_proj.base_layer.weight. The ckpt
             # has original names (*.weight). With strict=False,
@@ -438,7 +463,17 @@ class HunyuanImage3Bundle(Bundle):
         else:
             sd = {}
 
-        # 3. Single DCP load
+        # Expert parallelism: pull the fused expert tensors OUT of the DCP load.
+        # They are EP-sharded DTensors (Shard(0) on the EP mesh); DCP's broadcast
+        # path copies the full [E,...] onto the local [E/ep,...] shard and fails.
+        # load_ep_experts re-shards them with the param's own mesh instead.
+        expert_sd = {}
+        if getattr(self, "_ep_enabled", False):
+            from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
+
+            expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
+
+        # 3. Single DCP load (non-expert params: FSDP-sharded + plain heads)
         set_model_state_dict(
             self.transformer,
             sd,
@@ -448,6 +483,38 @@ class HunyuanImage3Bundle(Bundle):
                 strict=False,
             ),
         )
+
+        if getattr(self, "_ep_enabled", False):
+            from unirl.train.backend.veomni.ep import load_ep_experts
+            from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
+
+            n_exp = load_ep_experts(self.transformer, expert_sd, is_fused_expert_key)
+            if n_exp == 0:
+                raise RuntimeError(
+                    "expert-parallel: load_ep_experts loaded 0 EP-sharded expert params — "
+                    "expert weights would stay meta/uninitialized. Check is_fused_expert_key "
+                    "against the checkpoint keys."
+                )
+            if _current_rank() == 0:
+                logger.info("expert-parallel: loaded %d EP-sharded expert param(s)", n_exp)
+
+            # VeOmni root-shards the non-layer params (wte, ln_f, lm_head) into
+            # DTensors; HI3's ForCausalMM wrapper calls them OUTSIDE the decoder
+            # forward (wte -> inputs_embeds for ViT scatter; ln_f/lm_head -> logits),
+            # hitting `aten.* got mixed Tensor and DTensor`. Hook those three to
+            # all-gather their weights for such direct calls. Pass the whole
+            # transformer so lm_head (on the outer ForCausalMM) is reachable too.
+            from unirl.train.backend.veomni.ep import register_unsharded_param_hooks
+
+            n_hooked = register_unsharded_param_hooks(self.transformer)
+            if n_hooked == 0:
+                raise RuntimeError(
+                    "expert-parallel: register_unsharded_param_hooks hooked 0 root params — "
+                    "wte/ln_f/lm_head would hit mixed Tensor/DTensor at forward. Check the "
+                    "hook targets against the model."
+                )
+            if _current_rank() == 0:
+                logger.info("expert-parallel: hooked root params for direct all-gather: %d", n_hooked)
 
         # [Bug B fix] Post-load validation: verify all LoRA base_layer
         # params are finite and not on meta.

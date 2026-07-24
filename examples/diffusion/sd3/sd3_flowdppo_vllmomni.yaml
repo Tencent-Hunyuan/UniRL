@@ -28,6 +28,7 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
     shift: 3.0
+    load_vae: false
 
 pipeline:
   _target_: unirl.models.sd3.pipeline.SD3Pipeline
@@ -110,6 +111,8 @@ algorithm:
   params: ${sampling}
   kl_mask_threshold: 1.0e-5
   add_kl_coefficient: true
+  # beta: reference-policy KL coeff (Flow-DPPO eq.17), LoRA-only; 0 disables. Detail in FlowDPPO/config.yaml.
+  beta: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack

@@ -25,7 +25,11 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _grpo_clip_loss,
+    _reference_kl_loss,
+    _reference_replay_means,
     _resolve_clip_range_from_schedule,
+    _resolve_reference_model,
+    _transition_sigma,
     gather_sde_field,
     typed_conditions,
 )
@@ -37,6 +41,7 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
     conditions_cls: str = ""
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
+    beta: float = 0.0
     old_logp_source: str = "rollout"
     params: Any = dc_field(default=None)
 
@@ -60,6 +65,19 @@ class FlowGRPO(StageAlgorithm):
         old_logp_source: ``"rollout"`` (default) trusts the rollout engine's
             emitted ``segment.sde_logp``; ``"replay"`` recomputes it via
             ``stage.replay`` at pre-update weights. See :meth:`prepare_segment`.
+        beta: Reference-policy KL coefficient (Flow-GRPO eq.5). ``> 0`` adds
+            ``beta * KL(pi_theta || pi_ref)`` to the clipped loss, where ``pi_ref``
+            is the base model with its LoRA adapter disabled (a per-update no_grad
+            reference replay). ``0`` (default) disables the term and skips that
+            replay. Requires a LoRA recipe + the injected ``backend``.
+            The KL is normalized by the full per-step transition std
+            (``std_dev_t*sqrt(-dt)`` for Flow/Dance) — the exact Gaussian KL.
+            The reference flow_grpo code divides by ``std_dev_t**2`` only, so at
+            equal ``beta`` this term is ~``1/|dt|`` stronger (≈10x at 10 sampling
+            steps): don't port ``beta`` values 1:1 from flow_grpo configs.
+        backend: FSDP backend sibling (injected by the v2 trainer). Only used when
+            ``beta > 0`` to reach the trainable model for the adapter-disabled
+            reference replay.
         conditions_cls: Stage-typed conditions container with a
             ``from_dict(Mapping[str, Condition])`` classmethod. ``None``
             forwards the dict verbatim (unit-test path).
@@ -68,6 +86,9 @@ class FlowGRPO(StageAlgorithm):
     # prepare_segment freezes segment.sde_logp once, so the PPO ratio stays
     # anchored across every num_updates_per_batch optimizer step.
     supports_multi_update = True
+    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2
+    # trainer must inject the FSDP backend (the trainable model lives on it).
+    requires_backend = True
     anchor_fields = ("sde_logp",)
 
     def recomputes_anchor(self) -> bool:
@@ -83,7 +104,9 @@ class FlowGRPO(StageAlgorithm):
         stage_attr: str = "diffusion",
         clip_range: float = 1e-4,
         clip_schedule: str = "constant",
+        beta: float = 0.0,
         old_logp_source: str = "rollout",
+        backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         super().__init__()
@@ -95,6 +118,8 @@ class FlowGRPO(StageAlgorithm):
         self.params = params
         self.clip_range = float(clip_range)
         self.clip_schedule = str(clip_schedule)
+        self.beta = float(beta)
+        self._ref_model = _resolve_reference_model(backend, beta=self.beta, algo="FlowGRPO")
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
             self.old_logp_source in ("rollout", "replay"),
@@ -163,6 +188,7 @@ class FlowGRPO(StageAlgorithm):
             step_indices=target_steps,
         )
         new_logp = replay_result.log_probs  # [B, S']
+        new_means = replay_result.prev_sample_means  # [B, S', ...]; used only when beta>0
 
         old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
             dtype=new_logp.dtype, device=new_logp.device
@@ -177,14 +203,45 @@ class FlowGRPO(StageAlgorithm):
             advantages=adv_b,
             clip_range=clip_range,
         )
-        loss = loss_per_elem.mean()
-        (loss * loss_scale).backward()
-
+        policy_loss = loss_per_elem.mean()
+        loss = policy_loss
         metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
+            "policy_loss": float(policy_loss.detach().item()),
             "clip_range": float(clip_range),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
+
+        # Optional reference-policy KL penalty (Flow-GRPO eq.5): pull pi_theta toward
+        # pi_ref (LoRA-disabled base model).
+        if self.beta > 0.0:
+            if new_means is None:
+                raise RuntimeError(
+                    "FlowGRPO: beta>0 requires stage.replay() to return prev_sample_means, "
+                    "but got None. Ensure the stage's replay method produces means."
+                )
+            sigma_t = _transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=target_steps,
+                eta=float(self.params.eta),
+                device=new_logp.device,
+                add_coefficient=True,
+            )
+            ref_means = _reference_replay_means(
+                self.stage,
+                self._ref_model,
+                conditions=typed_conds,
+                segment=segment,
+                params=self.params,
+                target_steps=target_steps,
+            ).to(dtype=new_means.dtype, device=new_means.device)
+            kl_ref = _reference_kl_loss(new_means, ref_means, sigma_t)
+            loss = loss + self.beta * kl_ref
+            metrics["beta"] = float(self.beta)
+            metrics["kl_ref_mean"] = float(kl_ref.detach().item())
+
+        (loss * loss_scale).backward()
+
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

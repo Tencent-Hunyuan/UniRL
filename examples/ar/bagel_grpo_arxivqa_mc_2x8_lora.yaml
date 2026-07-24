@@ -38,7 +38,8 @@ adv_normalization_scope: global
 # Full-val eval (166 arxivqa val prompts x g8 @ T1.0) + LoRA-only checkpoint,
 # both every 20 rollouts.
 eval_interval: 20
-eval_num_prompts: 166
+eval_num_prompts: 166  # cap: score up to 166 prompts from val (== full arxivqa val)
+eval_batch_size: 166   # single-batch eval preserves the pre-split legacy behavior
 eval_samples_per_prompt: 8
 eval_temperature: 1.0
 

@@ -8,7 +8,9 @@ default_stages: [pre-commit, pre-push, manual]
 #   - unirl/models/bagel/vendor/ : pristine official ByteDance-Seed/Bagel modeling
 #     (see VENDOR_COMMIT.txt); kept byte-identical to upstream, so the whitespace/format
 #     hooks must not rewrite it either.
-exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/)
+#   - benchmarks/*/*/data/ : vendored upstream benchmark prompt sets (GenEval,
+#     PartiPrompts, VBench, ...); kept byte-identical so upstream checksums verify.
+exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/|benchmarks/[^/]+/[^/]+/data/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

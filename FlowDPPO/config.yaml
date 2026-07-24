@@ -24,6 +24,18 @@ algorithm:
                                  # σ_t = std_dev_t·√(-dt), the flow-matching
                                  # step noise scale. false ⇒ raw squared mean
                                  # shift / 2 (still mean-reduced).
+  beta: 0.0                      # reference-policy KL coefficient (eq.17). >0 adds
+                                 # beta·KL(π_θ‖π_ref) to the loss, where π_ref is the
+                                 # base model with the LoRA adapter DISABLED (an extra
+                                 # per-update no_grad replay). 0 disables the term.
+                                 # Separate from the kl_mask_threshold KL-to-old gate;
+                                 # requires a LoRA recipe + the injected backend.
+                                 # NOTE: normalized by the FULL transition std
+                                 # (std_dev_t·√(-dt)) — the exact Gaussian KL. The
+                                 # reference flow_grpo code divides by std_dev_t² only,
+                                 # so at equal beta this term is ≈1/|dt| stronger
+                                 # (~10× at 10 steps): don't port beta 1:1 from
+                                 # flow_grpo configs.
 
 # Same GRPO-style SDE rollout (eta>0, SDE steps recorded). FlowDPPO additionally needs
 # the per-step Gaussian transition means (prev_sample_means) — replay() emits them.

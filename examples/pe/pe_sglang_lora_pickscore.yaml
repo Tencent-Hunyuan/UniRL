@@ -59,6 +59,7 @@ diffusion:
       pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
       model_precision: bf16
       shift: 3.0
+      load_vae: false
       # SGLang diffusion rollout boots in (online) LoRA mode and wraps these
       # modules. Trainside ignores these hints (FSDPBackend.lora_cfg injects
       # the same target set). model_config is shared with the rollout via
@@ -304,6 +305,7 @@ sampling:
     temperature: 0.7
     max_new_tokens: 512
     top_p: 0.9
+    top_k: 1024
   diffusion:
     _target_: unirl.types.sampling.DiffusionSamplingParams
     samples_per_prompt: 8       # M images per rewrite

@@ -21,7 +21,7 @@ to behaves identically.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
@@ -68,8 +68,10 @@ class BagelBundle(Bundle):
         latent_patch_size: int,
         latent_channels: int,
         latent_downsample: int,
+        config: Optional[BagelPipelineConfig] = None,
     ) -> None:
         super().__init__()
+        self.config = config  # Defaults for the separately constructed pipeline.
         self.model = model
         # The trainable MoT (where the *_moe_gen experts live). Same object the
         # vendored generate_image / _forward_flow run on, so FSDP2 fully_shard
@@ -167,17 +169,42 @@ class BagelBundle(Bundle):
         tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        # Image transforms match flow_grpo (vae 512/256/8, vit 490/112/7). Only
-        # used for image-conditioned paths; pure T2I never exercises them, but
-        # the inferencer constructor requires both.
+        # Image transforms (image-conditioned paths only; pure T2I never exercises
+        # them, but the inferencer constructor requires both). Sizes follow flow_grpo
+        # (vae 512/256, vit 490/112). NB: the ViT resize STRIDE must equal the SigLIP
+        # patch size (14) — patchify() asserts h % patch_size == 0, so a stride that is
+        # not a multiple of 14 makes non-square image inputs crash. flow_grpo's stride 7
+        # (half a patch) is that bug; use 14 to keep resized dims patch-aligned.
         vae_transform = ImageTransform(512, 256, 8)
-        vit_transform = ImageTransform(490, 112, 7)
+        vit_transform = ImageTransform(490, 112, 14)
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)
-        # Freeze the whole MoT here; the backend re-enables only the LoRA (or
-        # moe_gen) params it injects/unfreezes.
+        # Freeze the whole MoT. LoRA recipes (use_lora=True) keep it frozen and the
+        # backend's inject_lora adds the trainable adapters. Full fine-tuning
+        # (use_lora=False) instead unfreezes the MoT decoder blocks below.
         model.requires_grad_(False)
+        if not config.use_lora:
+            # Full fine-tuning: unfreeze ONLY the Qwen2MoTDecoderLayer blocks (the
+            # und + gen experts) — the exact set the backend FSDP-wraps
+            # (block_class_names=[BAGEL_FSDP_BLOCK_CLASS]). embed/norm/lm_head, the
+            # VAE and the gen heads stay frozen so (a) the trainable set == the
+            # sharded block set and (b) the unsharded leftovers (root_wrap=false)
+            # carry no grad — which keeps fsdp_wrap's no-root-wrap DP-sync guard
+            # satisfied. The backend (no lora_cfg) then builds the optimizer over
+            # these params; per-expert LRs (param_group_lrs={moe_gen: ...}) match by
+            # name exactly as in the LoRA path. fsdp_wrap reads requires_grad here to
+            # decide the fp32-master upcast, so this MUST run before the backend wrap.
+            n_blocks = 0
+            for module in model.language_model.modules():
+                if type(module).__name__ == BAGEL_FSDP_BLOCK_CLASS:
+                    module.requires_grad_(True)
+                    n_blocks += 1
+            if n_blocks == 0:
+                raise RuntimeError(
+                    f"BagelBundle.from_config: use_lora=False (full fine-tuning) but found no "
+                    f"{BAGEL_FSDP_BLOCK_CLASS} blocks to unfreeze in language_model."
+                )
 
         inferencer = InterleaveInferencer(
             model=model,
@@ -203,6 +230,7 @@ class BagelBundle(Bundle):
             latent_patch_size=int(model.latent_patch_size),
             latent_channels=int(model.latent_channel),
             latent_downsample=int(model.latent_downsample),
+            config=config,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

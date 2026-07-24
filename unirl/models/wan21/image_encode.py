@@ -53,6 +53,14 @@ class WAN21ImageLatentEncodeStage(EncodeStage[Images, ImageLatentCondition]):
         self.width = int(width)
 
     def encode(self, p: Images) -> ImageLatentCondition:
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "WAN21ImageLatentEncodeStage.encode: no VAE loaded "
+                "(load_vae=False). The trainer-side pipeline cannot encode "
+                "reference images in this configuration — separate-engine "
+                "recipes encode in the rollout engine; trainside I2V "
+                "requires load_vae=True."
+            )
         if not isinstance(p, Images):
             raise TypeError(f"WAN21ImageLatentEncodeStage.encode: expected Images, got {type(p).__name__}")
         pixels = p.pixels
