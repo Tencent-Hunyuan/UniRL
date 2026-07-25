@@ -32,6 +32,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.wan21.diffusion import WAN21DiffusionStep
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
@@ -96,20 +97,22 @@ def _verify_fastvideo_used_sigmas(
     sample_index: int,
     timestep_scale: int,
 ) -> None:
-    """Adapt FastVideo's integer ``[T]`` timestep ticks to the shared verifier."""
+    """Decode FastVideo's raw ``[T]`` timesteps for the shared verifier."""
     actual = trajectory_timesteps
     expected_for_verification = expected
     if actual is not None:
         actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
         if actual_t.ndim == 1:
             actual_t = torch.cat([actual_t, actual_t.new_zeros(1)])
-            actual = actual_t
+        # FastVideo echoes scheduler timesteps, i.e. normalized sigma times
+        # WAN's model-conditioning scale. Decode both integer UniPC ticks and
+        # floating Euler timesteps with the model-owned contract.
+        actual = actual_t.to(torch.float32) / float(timestep_scale)
         if not torch.is_floating_point(actual_t):
             expected_f32 = expected.detach().cpu().to(torch.float32)
             # FastVideo casts ``sigma * num_train_timesteps`` to int64.
-            # Normalize those ticks and quantize the reference to the worker's
-            # independently reported scheduler scale before comparison.
-            actual = actual_t.to(torch.float32) / timestep_scale
+            # Quantize the reference the same way before comparing normalized
+            # schedules; the worker scale was already checked against WAN.
             expected_for_verification = torch.trunc(expected_f32 * timestep_scale) / timestep_scale
     verify_engine_used_sigmas(
         actual,
@@ -149,7 +152,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._is_offloaded = False
         self._generator: Any = None
         self._fastvideo_args: Any = None
-        self._fastvideo_timestep_scale: Optional[int] = None
+        self._model_timestep_scale = int(WAN21DiffusionStep.TIMESTEP_SCALE)
         # Last checkpoint pushed by the weight sync. ``VideoGenerator`` loads the
         # PRETRAINED weights from ``model_path`` on every (re)build, so a sleep/wake
         # would silently roll back to pretrained; we re-apply this on wake. None
@@ -246,7 +249,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     self._ports.master_port,
                 )
         try:
-            self._cache_fastvideo_timestep_scale()
+            self._validate_fastvideo_timestep_scale()
         except Exception:
             try:
                 if self._generator is not None:
@@ -256,8 +259,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             self._generator = None
             raise
 
-    def _cache_fastvideo_timestep_scale(self) -> None:
-        """Read and validate the scheduler scale once across all workers."""
+    def _validate_fastvideo_timestep_scale(self) -> None:
+        """Require every worker scheduler to match WAN's timestep contract."""
         if self._generator is None:
             raise RuntimeError("Cannot query FastVideo scheduler without an active generator")
         values = self._generator.executor.collective_rpc(_read_fastvideo_num_train_timesteps)
@@ -268,10 +271,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             raise RuntimeError(f"FastVideo workers returned invalid num_train_timesteps: {scales}")
         if len(set(scales)) != 1:
             raise RuntimeError(f"FastVideo workers disagree on num_train_timesteps: {scales}")
-        self._fastvideo_timestep_scale = scales[0]
+        if scales[0] != self._model_timestep_scale:
+            raise RuntimeError(
+                "FastVideo scheduler num_train_timesteps does not match the WAN21 model "
+                f"timestep scale: workers={scales}, model={self._model_timestep_scale}"
+            )
         logger.info(
-            "fastvideo scheduler num_train_timesteps=%d (verified across %d workers)",
-            self._fastvideo_timestep_scale,
+            "fastvideo scheduler num_train_timesteps=%d matches WAN21 model contract across %d workers",
+            self._model_timestep_scale,
             len(scales),
         )
 
@@ -424,8 +431,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             len(seeds) == len(prompts),
             f"fastvideo engine expects one seed per prompt; got {len(seeds)} vs {len(prompts)}",
         )
-        timestep_scale = self._fastvideo_timestep_scale
-        require(timestep_scale is not None, "fastvideo engine has no cached scheduler num_train_timesteps")
         for sample_index, (prompt, seed) in enumerate(zip(prompts, seeds)):
             one = deepcopy(sp)
             one.prompt = prompt
@@ -457,7 +462,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 trajectory_timesteps,
                 expected=sigmas,
                 sample_index=sample_index,
-                timestep_scale=timestep_scale,
+                timestep_scale=self._model_timestep_scale,
             )
             traj = rl.trajectory_latents if rl is not None else None
             if traj is None:
@@ -670,7 +675,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # checkpoint so wake is weight-preserving, matching the other engines'
         # sleep/wake contract (sglang resume_memory keeps weights resident).
         try:
-            self._cache_fastvideo_timestep_scale()
+            self._validate_fastvideo_timestep_scale()
             if self._last_weights_path is not None:
                 self._generator.update_transformer_weights_from_path(self._last_weights_path)
                 logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
