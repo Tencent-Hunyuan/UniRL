@@ -8,12 +8,15 @@
   <img src="../../assets/sde-kernel-modes-new.png" alt="UniRL SDE: one multi-step denoise loop (x_T to x_0) walked twice — rollout (diffuse) walks all T steps, drawing fresh noise and keeping a Gaussian log-prob on the eta>0 SDE steps while the rest stay deterministic, and stores the trajectory; train (replay) re-walks only those SDE steps, feeding the stored transitions back through the same kernel to get new log-probs for the GRPO/FlowDPPO ratio" width="100%">
 </div>
 
-*One `strategy.denoise()` per step, under two **orthogonal** switches: **sampling** vs **replay** is the `prev_sample` argument; **stochastic** vs **deterministic** is the per-index `eta` (a step degenerates to deterministic at `eta=0` — there is no separate Euler solver).*
+*One `strategy.denoise()` per step. **Sampling** vs **replay** is the
+`prev_sample` argument; the rollout's selected indices use an SDE kernel, while
+engine adapters may route the remaining deterministic indices through a
+stateful ODE solver such as UniPC.*
 
 ## What it is
 
 `unirl.sde` owns the per-step diffusion math that sampling and training both
-replay: the step **kernels** (Flow / Dance / CPS / DPM2), the FlowMatch **σ
+replay: the step **kernels** (Flow / Dance / CPS / DPM2 / UniPC), the FlowMatch **σ
 schedule** policy (with a per-model μ override), and the deterministic
 **initial-noise (`x_T`) recipe**.
 
@@ -33,11 +36,13 @@ them wrong and GRPO/FlowDPPO optimize noise.
   fresh noise); passing a `prev_sample` means *replay* (score the given transition,
   no noise drawn). Sampling and replay share the exact same code — that's the
   point. The transition math runs in fp32 (σ forced to fp32 to match SGLang).
-- **SDE vs deterministic is an `eta` switch, not a branch.** The denoise loop runs
-  the same `step_with_logp` at every index and sets `eta>0` only on the chosen
-  `sde_indices`. Those steps get a stochastic transition with a real per-step
-  Gaussian log-prob (→ `LatentSegment.sde_logp`); the rest collapse to a
-  deterministic Euler step with `log_prob=None` and contribute no gradient.
+- **SDE indices own the policy-gradient density.** Selected `sde_indices` get a
+  stochastic transition with a real per-step Gaussian log-prob (→
+  `LatentSegment.sde_logp`). Trainside loops can collapse the same SDE kernel to
+  Euler with `eta=0`; adapters that need inference-scheduler parity can instead
+  route non-SDE indices through `UniPCStrategy`. UniPC keeps model-output
+  history across consecutive ODE steps and clears it after an intervening SDE
+  jump before warming up from first order again.
 - **The σ schedule** comes from `FlowMatchSchedulePolicy` (`runtime.py`), loaded
   once per actor from the checkpoint JSON (no weights). Static schedules apply the
   SD3 time-shift locally (to dodge diffusers' double-shift bug #13243); dynamic
@@ -53,7 +58,7 @@ them wrong and GRPO/FlowDPPO optimize noise.
   engine starts each rollout from byte-identical noise.
 
 **Extending it:** a new kernel subclasses `SDEStrategy` (or `StepStrategy` for a
-deterministic ODE solver) in `kernels.py`, wired under `pipeline.strategy`. A
+deterministic ODE solver), wired under `pipeline.strategy` or an engine adapter. A
 per-model σ override subclasses `FlowMatchSchedulePolicy` and overrides only
 `compute_mu`. A new SDE-index schedule is *not* here — it's a `TimestepScheduler`
 in `utils/scheduler_utils.py`, wired under `sampling.scheduler`. DanceGRPO/MixGRPO
@@ -65,6 +70,9 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 
 - **`DPM2Strategy` can't train** — it returns `log_prob=None` everywhere, so
   GRPO/FlowDPPO have no ratio. Eval-only, and stateful (needs `init_schedule`/`reset`).
+- **`UniPCStrategy` is deterministic and stateful** — it also returns
+  `log_prob=None`, requires `init_schedule`, and only reuses history across
+  consecutive ODE indices. An SDE jump must reset its history.
 - **σ silently arrives as float64** — `torch.linspace` (the static-σ branch) defaults
   to float64, so without `denoise`'s `.float()` cast the transition computes in float64
   while SGLang uses float32; the `1/(2σ²)` term amplifies the gap into the replayed

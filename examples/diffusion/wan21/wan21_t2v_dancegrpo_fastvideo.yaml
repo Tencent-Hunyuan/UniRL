@@ -37,9 +37,9 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  # Match wan21_t2v_dancegrpo.yaml exactly. The FastVideo engine now sets its
-  # pipeline flow_shift from this value and pre-images custom sigmas before
-  # FastVideo reapplies the shift, so rollout and trainer both consume shift=5.
+  # Match wan21_t2v_dancegrpo.yaml exactly. FlowMatchSchedulePolicy applies this
+  # shift once; the FastVideo adapter consumes the resulting canonical sigmas
+  # verbatim instead of reapplying its scheduler-local flow_shift.
   shift: 5.0
   max_sequence_length: 512
   # FastVideo owns video decoding; the trainer-side pipeline only replays the

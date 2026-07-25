@@ -15,6 +15,11 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.fastvideo._unipc import (
+    FastVideoUniPCPlan,
+    patch_fastvideo_unipc,
+    verify_fastvideo_used_sigmas,
+)
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
@@ -77,6 +82,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._ports = ports
 
         self._ensure_fastvideo_importable()
+        require(
+            os.getenv("FASTVIDEO_WAN_SCHEDULER", "unipc").strip().lower() == "unipc",
+            "FastVideo canonical rollout requires FASTVIDEO_WAN_SCHEDULER=unipc; "
+            "Euler fallback would change the deterministic trajectory.",
+        )
+        patch_fastvideo_unipc()
         self._build_generator()
 
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
@@ -130,15 +141,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
-        target_shift = float(self.model_config.shift)
-        pc = self._fastvideo_args.pipeline_config
-        if getattr(pc, "flow_shift", None) != target_shift:
-            logger.info(
-                "fastvideo engine: pipeline_config.flow_shift %s -> %s (model_config.shift)",
-                getattr(pc, "flow_shift", None),
-                target_shift,
-            )
-            pc.flow_shift = target_shift
         max_port_attempts = 5
         for attempt in range(1, max_port_attempts + 1):
             try:
@@ -259,14 +261,22 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.return_frames = False
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
-        _f = float(getattr(self._fastvideo_args.pipeline_config, "flow_shift", self.model_config.shift))
-        _s = sigmas.detach().cpu().double()
-        _g = _s / (_f - _s * (_f - 1.0))
-        sp.sigmas = [float(x) for x in _g.tolist()[:-1]]
+        # Canonical σ are already fully shifted by FlowMatchSchedulePolicy.
+        # FastVideo's adapter patch consumes them verbatim and appends the
+        # terminal zero; no engine-specific shift pre-image is allowed.
+        sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
 
-        sde_step_indices, _ = _resolve_sde_window(
+        # Resolve the trainer's exploration window once. The worker dispatches
+        # these indices to the selected SDE kernel and every other index to
+        # canonical UniPC. ``None`` keeps the legacy all-SDE spelling; an
+        # explicit empty list makes the full path deterministic.
+        _, resolved_sde_indices = _resolve_sde_window(
             getattr(params, "sde_indices", None),
             int(params.num_inference_steps),
+        )
+        step_plan = FastVideoUniPCPlan(
+            sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+            sde_indices=tuple(resolved_sde_indices),
         )
 
         all_log_probs: List[torch.Tensor] = []
@@ -281,7 +291,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             len(seeds) == len(prompts),
             f"fastvideo engine expects one seed per prompt; got {len(seeds)} vs {len(prompts)}",
         )
-        for prompt, seed in zip(prompts, seeds):
+        for sample_index, (prompt, seed) in enumerate(zip(prompts, seeds)):
             one = deepcopy(sp)
             one.prompt = prompt
             one.seed = int(seed)
@@ -299,12 +309,20 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     collect_log_probs=bool(self.cfg.native_logprob),
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
-                    sde_step_indices=sde_step_indices,
-                    sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+                    # Force FastVideo's RL branch through its helper on every
+                    # index. FastVideoUniPCPlan then dispatches selected indices
+                    # to SDE and all remaining indices to canonical UniPC.
+                    sde_step_indices=None,
+                    sde_type=step_plan,
                 ),
             )
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
+            verify_fastvideo_used_sigmas(
+                getattr(rl, "trajectory_timesteps", None) if rl is not None else None,
+                expected=sigmas,
+                sample_index=sample_index,
+            )
             traj = rl.trajectory_latents if rl is not None else None
             if traj is None:
                 traj = out.trajectory_latents
@@ -341,7 +359,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 ntm = nm[0] if isinstance(nm, (list, tuple)) and len(nm) > 0 and torch.is_tensor(nm[0]) else None
                 all_neg_masks.append(ntm.detach().cpu() if ntm is not None else None)
 
-            if self.cfg.native_logprob and sde_step_indices != []:
+            if self.cfg.native_logprob and resolved_sde_indices:
                 lp = rl.log_probs if rl is not None else None
                 require(torch.is_tensor(lp), "FastVideo native rollout returned no log_probs")
                 all_log_probs.append(lp.detach().cpu())
