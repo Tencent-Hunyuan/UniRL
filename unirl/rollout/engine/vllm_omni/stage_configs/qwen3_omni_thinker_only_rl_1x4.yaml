@@ -26,6 +26,8 @@ stage_args:
         video: 1
         image: 0
 
+      mm_processor_cache_gb: 0
+
       dtype: bfloat16
       load_format: safetensors
       trust_remote_code: true
