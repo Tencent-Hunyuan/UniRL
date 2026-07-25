@@ -25,9 +25,11 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.value_head import ValueHead
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3PipelineConfig
@@ -57,8 +59,6 @@ class Qwen3Bundle(Bundle):
     @classmethod
     def from_config(cls, config: Qwen3PipelineConfig) -> "Qwen3Bundle":
         """Load the Qwen3 transformer + tokenizer from a HuggingFace-layout checkpoint."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         path = config.pretrained_model_ckpt_path
         tokenizer_path = config.tokenizer_ckpt_path or path
 
@@ -78,8 +78,6 @@ class Qwen3Bundle(Bundle):
             # checkpoint, so to_empty later clobbers them -> garbage RoPE. It
             # captures them; meta_init_state is stashed on the BUNDLE below and
             # restored by load_trainable_weights after the sharded weight load.
-            from transformers import AutoConfig
-
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: AutoModelForCausalLM.from_config(hf_config, trust_remote_code=bool(config.trust_remote_code)),
@@ -114,6 +112,10 @@ class Qwen3Bundle(Bundle):
         )
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
+
+        if config.use_value_head:
+            hidden_size = int(getattr(transformer.config, "hidden_size"))
+            transformer.value_head = ValueHead(hidden_size).to(device)
 
         bundle = cls(
             transformer=transformer,

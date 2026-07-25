@@ -71,6 +71,48 @@ def compute_gae_advantages(
     return advantages, returns
 
 
+def scatter_terminal_rewards(
+    rewards_per_sample: torch.Tensor,
+    *,
+    lengths: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Place each sample's scalar reward on its last response token in packed layout.
+
+    Args:
+        rewards_per_sample: Per-trajectory rewards ``[B]``.
+        lengths: Response token counts per sample ``[B]``.
+        cu_seqlens: Packed cumulative offsets ``[B + 1]`` (``TextSegment.cu_seqlens``).
+
+    Returns:
+        Packed per-token rewards ``[total_tokens]`` (zero except terminal positions).
+    """
+    if rewards_per_sample.ndim != 1:
+        raise ValueError(
+            f"scatter_terminal_rewards: rewards_per_sample must be 1D, got shape {tuple(rewards_per_sample.shape)}"
+        )
+    batch_size = int(lengths.shape[0])
+    if int(rewards_per_sample.shape[0]) != batch_size:
+        raise ValueError(
+            f"scatter_terminal_rewards: rewards batch ({int(rewards_per_sample.shape[0])}) "
+            f"!= lengths batch ({batch_size})"
+        )
+    if int(cu_seqlens.shape[0]) != batch_size + 1:
+        raise ValueError(
+            f"scatter_terminal_rewards: cu_seqlens length ({int(cu_seqlens.shape[0])}) "
+            f"!= batch_size + 1 ({batch_size + 1})"
+        )
+    total = int(cu_seqlens[-1].item())
+    out = rewards_per_sample.new_zeros(total)
+    cu = [int(c) for c in cu_seqlens.tolist()]
+    for b in range(batch_size):
+        n = int(lengths[b].item())
+        if n <= 0:
+            continue
+        out[cu[b] + n - 1] = rewards_per_sample[b]
+    return out
+
+
 def _gae_1d(
     rewards: torch.Tensor,
     values: torch.Tensor,
