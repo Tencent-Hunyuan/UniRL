@@ -110,6 +110,8 @@ def _replay_aware_forward(
                 return f(self, **kw)
         raise RuntimeError("_replay_aware_forward: no class-level forward found in the MRO")
 
+    _require_value_head_for_replay(self, return_values)
+
     # cuDNN's fused SDPA backward (ScaledDotProductCudnnAttentionBackward0) returns
     # NaN grads on some bf16 sequences while the forward stays finite (confirmed via
     # torch.autograd.detect_anomaly): it floods every parameter grad and forces the
@@ -206,7 +208,7 @@ def _replay_aware_forward(
 def _require_value_head_for_replay(model: Any, return_values: bool) -> None:
     if return_values and getattr(model, "value_head", None) is None:
         raise ValueError(
-            "Qwen3ARStage.replay: return_values=True requires a value head "
+            "Qwen3 replay: return_values=True requires a value head "
             "(set use_value_head=True in the pipeline config)"
         )
 
