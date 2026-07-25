@@ -6,6 +6,7 @@ from functools import wraps
 from typing import Any
 
 _PATCH_SENTINEL = "_unirl_qwen3_omni_lora_compat"
+_AUDIO_TRUNCATION_SENTINEL = "_unirl_audio_truncation_lengths_patched"
 
 
 def patch_qwen3_omni_thinker_class(model_cls: type[Any]) -> None:
@@ -62,4 +63,55 @@ def patch_qwen3_omni_thinker_class(model_cls: type[Any]) -> None:
     setattr(model_cls, _PATCH_SENTINEL, True)
 
 
-__all__ = ["patch_qwen3_omni_thinker_class"]
+def patch_qwen3_omni_audio_truncation(processor_cls: type[Any]) -> None:
+    """Keep reconstructed audio lengths within truncated Whisper features."""
+    if getattr(processor_cls, _AUDIO_TRUNCATION_SENTINEL, False):
+        return
+
+    import torch
+
+    original = processor_cls._call_hf_processor
+
+    @wraps(original)
+    def _patched_call_hf_processor(
+        self: Any,
+        prompt: Any,
+        mm_data: Any,
+        mm_kwargs: Any,
+        tok_kwargs: Any,
+    ) -> Any:
+        outputs = original(
+            self,
+            prompt=prompt,
+            mm_data=mm_data,
+            mm_kwargs=mm_kwargs,
+            tok_kwargs=tok_kwargs,
+        )
+        audio_kwargs = mm_kwargs.get("audio_kwargs") or {}
+        truncation = bool(mm_kwargs.get("truncation", audio_kwargs.get("truncation", False)))
+        lengths = outputs.get("audio_feature_lengths")
+        if not truncation or lengths is None:
+            return outputs
+
+        feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
+        max_frames = int(feature_extractor.n_samples // feature_extractor.hop_length)
+        lengths_tensor = torch.as_tensor(lengths).clamp_max(max_frames)
+        outputs["audio_feature_lengths"] = lengths_tensor
+        old_mask = outputs.get("feature_attention_mask")
+        if isinstance(old_mask, list):
+            outputs["feature_attention_mask"] = [
+                torch.ones(int(length), dtype=mask.dtype if isinstance(mask, torch.Tensor) else torch.float32)
+                for length, mask in zip(lengths_tensor.tolist(), old_mask)
+            ]
+        elif isinstance(old_mask, torch.Tensor):
+            positions = torch.arange(max_frames, device=old_mask.device)
+            outputs["feature_attention_mask"] = (
+                positions.unsqueeze(0) < lengths_tensor.to(old_mask.device).unsqueeze(1)
+            ).to(old_mask.dtype)
+        return outputs
+
+    processor_cls._call_hf_processor = _patched_call_hf_processor
+    setattr(processor_cls, _AUDIO_TRUNCATION_SENTINEL, True)
+
+
+__all__ = ["patch_qwen3_omni_audio_truncation", "patch_qwen3_omni_thinker_class"]
