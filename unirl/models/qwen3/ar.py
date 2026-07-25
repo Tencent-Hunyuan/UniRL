@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
-from unirl.models.types.ar_replay import ARReplayOutput
+from unirl.models.types.replay_result import ReplayResult
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -163,7 +163,7 @@ def _replay_aware_forward(
             empty = hidden.new_zeros((0,), dtype=torch.float32)
             if value_head is None:
                 return empty
-            return ARReplayOutput(log_probs=empty, values=empty)
+            return ReplayResult(log_probs=empty, values=empty)
         log_probs = torch.cat(flat_parts, dim=0)
         if value_head is None:
             return log_probs
@@ -171,7 +171,7 @@ def _replay_aware_forward(
         for s in range(0, int(h_pred.size(0)), flat_chunk):
             value_parts.append(value_head(h_pred[s : s + flat_chunk]))
         values = torch.cat(value_parts, dim=0) if value_parts else log_probs.new_zeros(0)
-        return ARReplayOutput(log_probs=log_probs, values=values)
+        return ReplayResult(log_probs=log_probs, values=values)
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
@@ -194,7 +194,7 @@ def _replay_aware_forward(
         empty = resp_hidden.new_zeros((bsz, 0), dtype=torch.float32)
         if value_head is None:
             return empty
-        return ARReplayOutput(log_probs=empty, values=empty)
+        return ReplayResult(log_probs=empty, values=empty)
     log_probs = torch.cat(parts, dim=1)
     if value_head is None:
         return log_probs
@@ -202,7 +202,7 @@ def _replay_aware_forward(
     for s in range(0, T_max, chunk):
         value_parts.append(value_head(resp_hidden[:, s : s + chunk, :]))
     values = torch.cat(value_parts, dim=1) if value_parts else log_probs.new_zeros((bsz, 0))
-    return ARReplayOutput(log_probs=log_probs, values=values)
+    return ReplayResult(log_probs=log_probs, values=values)
 
 
 def _require_value_head_for_replay(model: Any, return_values: bool) -> None:
@@ -214,15 +214,15 @@ def _require_value_head_for_replay(model: Any, return_values: bool) -> None:
 
 
 def _finalize_replay_output(
-    out: Union[torch.Tensor, ARReplayOutput],
+    out: Union[torch.Tensor, ReplayResult],
     *,
     segment: TextSegment,
     return_values: bool,
     logprob_dtype: torch.dtype,
     device: torch.device,
-) -> Union[torch.Tensor, ARReplayOutput]:
+) -> Union[torch.Tensor, ReplayResult]:
     """Cast log-probs and flatten packed values to match ``segment`` layout."""
-    if isinstance(out, ARReplayOutput):
+    if isinstance(out, ReplayResult):
         log_probs = out.log_probs.to(dtype=logprob_dtype)
         if not return_values:
             return log_probs
@@ -230,7 +230,7 @@ def _finalize_replay_output(
         if values is None:
             raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
         if log_probs.ndim == 1:
-            return ARReplayOutput(log_probs=log_probs, values=values.to(device=device))
+            return ReplayResult(log_probs=log_probs, values=values.to(device=device))
         if segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError("Qwen3ARStage.replay: segment requires cu_seqlens to flatten values")
         lengths = [int(n) for n in segment.lengths.tolist()]
@@ -241,7 +241,7 @@ def _finalize_replay_output(
                 continue
             flat.append(values[b, :n])
         packed_values = torch.cat(flat, dim=0) if flat else values.new_zeros(0, device=device)
-        return ARReplayOutput(log_probs=log_probs, values=packed_values.to(device=device))
+        return ReplayResult(log_probs=log_probs, values=packed_values.to(device=device))
     if return_values:
         raise ValueError(
             "Qwen3ARStage.replay: return_values=True but critic returned no values "
@@ -492,14 +492,14 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
-    ) -> Union[torch.Tensor, ARReplayOutput]:
+    ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay over a stored rollout segment.
 
         Branch: prefer :meth:`packed_replay` (packed-varlen, zero padding, B > 1)
         and fall back to :meth:`padding_replay` (the dense ``[B, P_max + T_max]``
         padded path) when packing does not apply. Returns packed varlen
         ``[total_tokens]`` aligned with ``segment.log_probs`` unless
-        ``return_values=True``, in which case an :class:`ARReplayOutput` with
+        ``return_values=True``, in which case an :class:`ReplayResult` with
         packed ``values`` is returned alongside log-probs.
         """
         _require_value_head_for_replay(self.model.transformer, return_values)
@@ -521,7 +521,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
-    ) -> Optional[Union[torch.Tensor, ARReplayOutput]]:
+    ) -> Optional[Union[torch.Tensor, ReplayResult]]:
         """Packed-varlen replay (B > 1): zero padding anywhere.
 
         Concatenate every sample's REAL prompt tokens + its flat response tokens
@@ -615,7 +615,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
-    ) -> Union[torch.Tensor, ARReplayOutput]:
+    ) -> Union[torch.Tensor, ReplayResult]:
         """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path.
 
         One teacher-forced forward over padded ``prompt + response``; gather
@@ -723,15 +723,15 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             temperature=temperature,
             return_values=return_values,
             autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
-        )  # [B, T_max] FP32 or ARReplayOutput
+        )  # [B, T_max] FP32 or ReplayResult
 
         if T_max == 0:
             empty = torch.zeros(0, dtype=self.logprob_dtype, device=device)
             if return_values:
-                return ARReplayOutput(log_probs=empty, values=empty)
+                return ReplayResult(log_probs=empty, values=empty)
             return empty
 
-        if isinstance(out, ARReplayOutput):
+        if isinstance(out, ReplayResult):
             per_token = out.log_probs
             per_value = out.values
         else:
@@ -755,13 +755,13 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         if not flat_logp:
             empty = torch.zeros(0, dtype=self.logprob_dtype, device=device)
             if return_values:
-                return ARReplayOutput(log_probs=empty, values=empty)
+                return ReplayResult(log_probs=empty, values=empty)
             return empty
         log_probs = torch.cat(flat_logp, dim=0).to(dtype=self.logprob_dtype)
         if not return_values:
             return log_probs
         values = torch.cat(flat_val, dim=0)
-        return ARReplayOutput(log_probs=log_probs, values=values)
+        return ReplayResult(log_probs=log_probs, values=values)
 
     def _resolve_stop_ids(
         self,
