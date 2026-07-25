@@ -4,14 +4,37 @@ from __future__ import annotations
 
 import functools
 import importlib
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
 
+from unirl.models.wan21.diffusion import WAN21DiffusionStep
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
+
+
+def _require_float_wan_timesteps() -> None:
+    """Reject FastVideo's post-scheduler integer cast, which its echo cannot expose."""
+    if os.getenv("DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG", "0").lower() in ("1", "true", "yes"):
+        raise RuntimeError(
+            "FastVideo canonical UniPC requires floating WAN timesteps; "
+            "unset DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG"
+        )
+
+
+def _wan_timestep_scale(scheduler: Any) -> float:
+    """Return the model-owned scale after validating the worker scheduler contract."""
+    expected = float(WAN21DiffusionStep.TIMESTEP_SCALE)
+    actual = getattr(scheduler.config, "num_train_timesteps", None)
+    if actual != expected:
+        raise RuntimeError(
+            "FastVideo scheduler num_train_timesteps does not match the WAN21 model "
+            f"timestep scale: scheduler={actual!r}, model={expected:g}"
+        )
+    return expected
 
 
 @dataclass(frozen=True)
@@ -118,12 +141,11 @@ def _patch_scheduler_set_timesteps() -> None:
         if str(getattr(self.config, "final_sigmas_type", "zero")) != "zero":
             raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
 
+        timestep_scale = _wan_timestep_scale(self)
         terminal = np.zeros(1, dtype=np.float32)
         schedule = np.concatenate([external, terminal])
         self.sigmas = torch.from_numpy(schedule).cpu()
-        self.timesteps = torch.from_numpy(external * float(self.config.num_train_timesteps)).to(
-            device=device, dtype=torch.float32
-        )
+        self.timesteps = torch.from_numpy(external * timestep_scale).to(device=device, dtype=torch.float32)
         self.num_inference_steps = int(external.size)
 
         solver_order = int(self.config.solver_order)
@@ -256,6 +278,7 @@ def _patch_denoising_step() -> None:
 
 
 def _patch_worker_runtime() -> None:
+    _require_float_wan_timesteps()
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
 

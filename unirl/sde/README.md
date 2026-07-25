@@ -1,7 +1,8 @@
 # SDE runtime
 
-> **Where it fits:** cross-cutting — shared by the *rollout* and *train* steps,
-> which replay the same kernels, σ schedule, and noise so their trajectories match.
+> **Where it fits:** cross-cutting — shared by *rollout* and train-side *replay*
+> for the σ schedule and stochastic transition density. Deterministic solver
+> choice can remain engine-specific.
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
@@ -15,27 +16,27 @@ stateful ODE solver such as UniPC.*
 
 ## What it is
 
-`unirl.sde` owns the per-step diffusion math that sampling and training both
-replay: the step **kernels** (Flow / Dance / CPS / DPM2 / UniPC), the FlowMatch **σ
-schedule** policy (with a per-model μ override), and the deterministic
-**initial-noise (`x_T`) recipe**.
+`unirl.sde` owns shared per-step diffusion math: the stochastic **kernels**
+replayed during training (Flow / Dance / CPS), deterministic solvers (DPM2 /
+UniPC), the FlowMatch **σ schedule** policy (with a per-model μ override), and
+the deterministic **initial-noise (`x_T`) recipe**.
 
 ## Why it exists
 
-The policy-gradient ratio is only meaningful if rollout and train-side replay walk
-the *same* trajectory. That requires three things to be bit-identical across very
-different engines (trainside, SGLang, vLLM-Omni): the σ schedule, the start noise
-`x_T`, and the per-step transition math. Centralizing all three here — instead of
-letting each engine compute its own — is what keeps the ratio honest. Get any of
-them wrong and GRPO/FlowDPPO optimize noise.
+The policy-gradient ratio is only meaningful when train-side replay scores each
+stored stochastic transition with the same σ, model conditioning, and SDE
+density used during rollout. Cross-engine output parity additionally requires
+the same start noise and deterministic solver; adapters may deliberately choose
+different deterministic solvers, so that stronger parity is not implied here.
 
 ## How it works
 
-- **One transition kernel, two modes.** Each model's diffusion stage calls
-  `strategy.denoise(...)` once per step. `prev_sample=None` means *sampling* (draw
-  fresh noise); passing a `prev_sample` means *replay* (score the given transition,
-  no noise drawn). Sampling and replay share the exact same code — that's the
-  point. The transition math runs in fp32 (σ forced to fp32 to match SGLang).
+- **One SDE kernel, two modes.** Each model's diffusion stage calls
+  `strategy.denoise(...)` once per step. For stochastic kernels,
+  `prev_sample=None` means *sampling* (draw fresh noise); passing a `prev_sample`
+  means *replay* (score the given transition, no noise drawn). Those two modes
+  share the exact transition code. The math runs in fp32 (σ forced to fp32 to
+  match SGLang).
 - **SDE indices own the policy-gradient density.** Selected `sde_indices` get a
   stochastic transition with a real per-step Gaussian log-prob (→
   `LatentSegment.sde_logp`). Trainside loops can collapse the same SDE kernel to

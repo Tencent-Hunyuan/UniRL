@@ -1,12 +1,13 @@
 # @package _global_
 # DanceGRPO WAN 2.1 T2V with the FastVideo rollout engine, colocate, v2 trainer, 1x8.
 #
-# This is wan21_t2v_dancegrpo.yaml with ONLY the rollout swapped from the
+# This is derived from wan21_t2v_dancegrpo.yaml with rollout moved from the
 # in-process trainside engine to the dedicated FastVideo VideoGenerator engine
-# (+ the weight-sync block a dedicated engine requires). Everything else — 720p/
-# 5-frame video shape, UMT5, video_pickscore reward, LoRA targets, DanceGRPO
-# Dance SDE kernel, replay log-prob, sampling schedule — is unchanged from the
-# official recipe.
+# (+ the weight-sync block a dedicated engine requires). The 720p/5-frame shape,
+# UMT5, video_pickscore reward, LoRA targets, Dance SDE kernel, replay log-prob,
+# sigma schedule, and SDE-index window remain aligned with the official recipe.
+# The deterministic non-SDE tail intentionally uses UniPC instead of the
+# trainside recipe's eta=0 Euler steps, so generated trajectories can differ.
 #
 # Two structural deltas the swap forces:
 #   1. A dedicated engine needs `model_config` + `strategy` injected, so the
