@@ -129,6 +129,12 @@ class ARTrainer(BaseTrainer):
             else:
                 # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
                 # unified models; replace it with first-class TP/DP/PP support.
+                if sync_cfg is not None and self._rollout_anchor_device == 0:
+                    raise ValueError(
+                        "rollout_anchor_device=0 would colocate the TP engine with "
+                        "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
+                        "use a nonzero anchor device."
+                    )
                 # Free training memory before starting the anchored rollout actor.
                 if self._enable_fsdp_offload:
                     self._anchored_backend_offloaded = None
@@ -190,8 +196,20 @@ class ARTrainer(BaseTrainer):
         self._anchored_rollout_awake = False
 
     @contextmanager
-    def _anchored_rollout_session(self, *, sync_weights: bool) -> Iterator[None]:
-        """Run one anchored rollout phase and restore the training steady state."""
+    def _anchored_rollout_session(
+        self,
+        *,
+        sync_weights: bool,
+        restore_backend: bool = True,
+    ) -> Iterator[None]:
+        """Run one anchored rollout phase and restore the requested steady state.
+
+        ``enable_fsdp_offload`` controls the trainer's *manual* placement dance;
+        it is independent from FSDP's ``CPUOffloadPolicy`` (``fsdp_cfg.cpu_offload``).
+        Callers doing a backward pass request ``restore_backend=True``. Eval and
+        pre-backward reward processing keep the backend offloaded so only the
+        vLLM subprocess owns GPU memory.
+        """
         original_error: Optional[BaseException] = None
         try:
             if sync_weights and self.weight_sync is not None:
@@ -207,10 +225,10 @@ class ARTrainer(BaseTrainer):
             raise
         finally:
             cleanup_errors: list[tuple[str, BaseException]] = []
-            for operation, cleanup in (
-                ("sleep rollout", self._ensure_anchored_rollout_asleep),
-                ("onload backend", self._ensure_anchored_backend_loaded),
-            ):
+            cleanup_ops = [("sleep rollout", self._ensure_anchored_rollout_asleep)]
+            if restore_backend:
+                cleanup_ops.append(("onload backend", self._ensure_anchored_backend_loaded))
+            for operation, cleanup in cleanup_ops:
                 try:
                     cleanup()
                 except BaseException as exc:
@@ -235,21 +253,6 @@ class ARTrainer(BaseTrainer):
                         )
                     cleanup_error.add_note(f"anchored cleanup operation: {operation}")
                     raise cleanup_error
-
-    @contextmanager
-    def _rollout_eval_session(self, *, anchored: bool) -> Iterator[None]:
-        if anchored:
-            with self._anchored_rollout_session(sync_weights=self.weight_sync is not None):
-                yield
-            return
-
-        self.rollout.wake_up()
-        try:
-            if self.weight_sync is not None:
-                self.weight_sync.sync()
-            yield
-        finally:
-            self.rollout.sleep()
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -285,7 +288,8 @@ class ARTrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        if self._rollout_anchor_device is None:
+        anchored = self._rollout_anchor_device is not None
+        if not anchored:
             # SPMD path: rollout sibling of every train rank; sync + generate + sleep in-place.
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
@@ -295,7 +299,7 @@ class ARTrainer(BaseTrainer):
         else:
             # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
             # unified models; replace it with first-class TP/DP/PP support.
-            with self._anchored_rollout_session(sync_weights=sync_weights):
+            with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
                 resp = self.rollout.generate(req)
                 # DP_SCATTER consumers require materialized tensors.
                 from unirl.trainer.unified_model import deep_hydrate
@@ -329,7 +333,16 @@ class ARTrainer(BaseTrainer):
         # token load before DP_SCATTER (no-op when already balanced).
         if self.balance_shards:
             track = track.balance_shards(int(self.num_devices))
-        result = self.stack.train_track(track, training_progress=float(training_progress))
+        if anchored:
+            self._ensure_anchored_backend_loaded()
+        try:
+            result = self.stack.train_track(track, training_progress=float(training_progress))
+        finally:
+            # Match UnifiedModelTrainer's steady state: FSDP on CPU and the
+            # rollout asleep between steps.  This also reclaims every rank's
+            # eager-load/activation allocator cache, not only the anchor rank.
+            if anchored:
+                self._ensure_anchored_backend_offloaded()
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
@@ -373,7 +386,12 @@ class ARTrainer(BaseTrainer):
         # TODO: The anchored branch is temporarily migrated from unified models;
         # replace it with first-class TP/DP/PP support.
 
-        with self._rollout_eval_session(anchored=anchored):
+        if not anchored:
+            self.rollout.wake_up()
+            if self.weight_sync is not None:
+                self.weight_sync.sync()
+        sync_anchored_weights = anchored and self.weight_sync is not None
+        try:
             for eval_inputs in eval_batches:
                 batch_n += 1
                 prompt_n += len(eval_inputs.sample_ids)
@@ -386,12 +404,22 @@ class ARTrainer(BaseTrainer):
                     sampling_params=eval_sp,
                     metadata=list(inputs.metadata) if inputs.metadata else [],
                 )
-                resp = self.rollout.generate(req)
                 if anchored:
-                    # DP_SCATTER reward scoring requires materialized tensors.
-                    from unirl.trainer.unified_model import deep_hydrate
+                    # Keep the manual FSDP state offloaded throughout eval and
+                    # release the TP engine between batches.  Only the first
+                    # batch needs an adapter extract/push.
+                    with self._anchored_rollout_session(
+                        sync_weights=sync_anchored_weights,
+                        restore_backend=False,
+                    ):
+                        sync_anchored_weights = False
+                        resp = self.rollout.generate(req)
+                        # DP_SCATTER reward scoring requires materialized tensors.
+                        from unirl.trainer.unified_model import deep_hydrate
 
-                    resp = deep_hydrate(resp)
+                        resp = deep_hydrate(resp)
+                else:
+                    resp = self.rollout.generate(req)
                 for track in resp.tracks.values():
                     if track.segment is not None:
                         track = self.reward.score_and_attach(req=req, track=track)
@@ -400,6 +428,9 @@ class ARTrainer(BaseTrainer):
                         reward_sum += float(rewards.sum().item())
                         reward_n += int(rewards.numel())
                         break  # single-track for now; revisit if multi-track lands
+        finally:
+            if not anchored:
+                self.rollout.sleep()
 
         acc = reward_sum / max(1, reward_n)
         logger.info(
@@ -519,4 +550,24 @@ class ARTrainer(BaseTrainer):
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
-            self._finish_wandb()
+            try:
+                self._finish_wandb()
+            finally:
+                self._shutdown_runtime()
+
+    def _shutdown_runtime(self) -> None:
+        """Best-effort ordered teardown for rollout children and Ray actors."""
+        rollout = getattr(self, "rollout", None)
+        shutdown = getattr(rollout, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logger.exception("Failed to shut down AR rollout engine")
+
+        pool = getattr(self, "pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down AR trainer device pool")
