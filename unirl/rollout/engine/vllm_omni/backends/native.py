@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pprint import pformat
 from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
@@ -240,6 +241,18 @@ class VLLMOmniBackend:
             pass
 
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+        omni_kwargs = _assemble_omni_kwargs(intent)
+        logger.info(
+            "VLLM-Omni boot intent (before engine startup):\n%s",
+            pformat(
+                {
+                    **intent,
+                    "stage_yaml_path": yaml_path,
+                    "assembled_omni_kwargs": omni_kwargs,
+                },
+                sort_dicts=True,
+            ),
+        )
         serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
         try:
@@ -248,12 +261,26 @@ class VLLMOmniBackend:
             omni = rt["Omni"](
                 model=str(intent["model_path"]),
                 stage_configs_path=yaml_path,
-                **_assemble_omni_kwargs(intent),
+                **omni_kwargs,
             )
         finally:
             if lock_file is not None:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
                 lock_file.close()
+
+        try:
+            from omegaconf import OmegaConf
+
+            resolved_stage_configs = OmegaConf.to_container(
+                OmegaConf.create(omni.stage_configs),
+                resolve=True,
+            )
+        except Exception:  # noqa: BLE001 - config logging must never block boot
+            resolved_stage_configs = omni.stage_configs
+        logger.info(
+            "VLLM-Omni resolved runtime stage configs (after all overrides):\n%s",
+            pformat(resolved_stage_configs, sort_dicts=True),
+        )
 
         # Driver-side tokenizer for AR prompt-token construction (workers
         # reload their own from the model path). Pure-DiT modalities skip it.

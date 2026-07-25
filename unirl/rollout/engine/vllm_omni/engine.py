@@ -23,6 +23,7 @@ worker partitions.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -37,6 +38,9 @@ from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.sde.runtime import ensure_req_sigmas
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
+
+
+logger = logging.getLogger(__name__)
 
 
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
@@ -62,6 +66,13 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        logger.info(
+            "VLLM-Omni engine config (complete typed config): %s; "
+            "model_config_available=%s model_config=%s",
+            config,
+            model_config is not None,
+            model_config,
+        )
 
         # Adapter (the only read of the modality knob) — owns the conversion,
         # topology knobs, and the σ schedule. ``tokenize_fn`` is late-bound to

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
@@ -19,6 +20,68 @@ from unirl.rollout.engine.vllm_omni.utils import texts_from_req
 from unirl.types.primitives import Videos
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
+
+
+logger = logging.getLogger(__name__)
+
+
+def _compress_qwen3_omni_prompt_ids(
+    token_ids: List[int],
+    *,
+    audio_token_id: int,
+    image_token_id: int,
+    video_token_id: int,
+    vision_bos_token_id: int,
+    vision_eos_token_id: int,
+    audio_bos_token_id: int,
+    audio_eos_token_id: int,
+    use_audio_in_video: bool,
+) -> List[int]:
+    """Undo HF multimodal expansion before vLLM processes the raw media.
+
+    This mirrors vLLM's
+    ``Qwen3OmniMoeThinkerMultiModalProcessor._get_raw_input_ids``. Replay
+    keeps the original expanded IDs; only the IDs sent to vLLM are compressed.
+    """
+    result = list(token_ids)
+    if use_audio_in_video:
+        while True:
+            start = next(
+                (
+                    i
+                    for i in range(len(result) - 1)
+                    if result[i : i + 2] == [vision_bos_token_id, audio_bos_token_id]
+                ),
+                None,
+            )
+            if start is None:
+                break
+            end = next(
+                (
+                    i
+                    for i in range(start + 2, len(result) - 1)
+                    if result[i : i + 2] == [audio_eos_token_id, vision_eos_token_id]
+                ),
+                None,
+            )
+            if end is None:
+                raise ValueError(
+                    "Qwen3OmniThinkerInputAdapter: expanded audio-in-video span "
+                    "has no matching audio/vision end tokens."
+                )
+            result = (
+                result[:start]
+                + [vision_bos_token_id, video_token_id, vision_eos_token_id]
+                + result[end + 2 :]
+            )
+
+    for mm_token_id in (audio_token_id, image_token_id, video_token_id):
+        compressed: List[int] = []
+        for token_id in result:
+            if token_id != mm_token_id or not compressed or compressed[-1] != mm_token_id:
+                compressed.append(token_id)
+        result = compressed
+    return result
 
 
 class Qwen3OmniThinkerInputAdapter:
@@ -80,6 +143,29 @@ class Qwen3OmniThinkerInputAdapter:
                 "longest_edge": self.video_max_pixels,
             }
         return kwargs
+
+    def _token_id(self, token: str) -> int:
+        token_id = self._tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or int(token_id) < 0:
+            encoded = self._tokenizer.encode(token, add_special_tokens=False)
+            if len(encoded) != 1:
+                raise ValueError(f"Qwen3OmniThinkerInputAdapter: cannot resolve token id for {token!r}")
+            token_id = encoded[0]
+        return int(token_id)
+
+    def _compress_prompt_ids(self, token_ids: List[int], *, use_audio_in_video: bool) -> List[int]:
+        """Compress processor-expanded placeholders for vLLM re-expansion."""
+        return _compress_qwen3_omni_prompt_ids(
+            token_ids,
+            audio_token_id=self._token_id("<|audio_pad|>"),
+            image_token_id=self._token_id("<|image_pad|>"),
+            video_token_id=self._token_id("<|video_pad|>"),
+            vision_bos_token_id=self._token_id("<|vision_start|>"),
+            vision_eos_token_id=self._token_id("<|vision_end|>"),
+            audio_bos_token_id=self._token_id("<|audio_start|>"),
+            audio_eos_token_id=self._token_id("<|audio_end|>"),
+            use_audio_in_video=use_audio_in_video,
+        )
 
     def _extract_videos(self, req: RolloutReq, n: int) -> List[Optional[tuple[Any, float]]]:
         """Return one ``(frames, effective_fps)`` entry per prompt, or ``None``."""
@@ -209,20 +295,25 @@ class Qwen3OmniThinkerInputAdapter:
         for text, video_sample, aw in zip(texts.texts, video_frames, audio_waves):
             vf, effective_fps = video_sample if video_sample is not None else (None, self.video_fps)
             enc = self._encode_one(text, vf, effective_fps, aw, sys_instr)
-            ids = enc["input_ids"].squeeze(0).tolist()
-            if len(ids) > self.max_prompt_length:
+            expanded_ids = enc["input_ids"].squeeze(0).tolist()
+            if len(expanded_ids) > self.max_prompt_length:
                 # Multimodal token truncation would break feature alignment.
                 if vf is not None or aw is not None:
                     raise ValueError(
-                        f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(ids)} tokens, "
-                        f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_frames, "
-                        "video_max_pixels, or video_fps, or raise max_prompt_length."
+                        f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(expanded_ids)} tokens, "
+                        f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_pixels "
+                        "or video_fps, or raise max_prompt_length."
                     )
                 enc = dict(enc)
                 enc["input_ids"] = enc["input_ids"][..., -self.max_prompt_length :]
                 enc["attention_mask"] = enc["attention_mask"][..., -self.max_prompt_length :]
-                ids = enc["input_ids"].squeeze(0).tolist()
-            entry: Dict[str, Any] = {"prompt_token_ids": ids}
+                expanded_ids = enc["input_ids"].squeeze(0).tolist()
+            rollout_ids = (
+                self._compress_prompt_ids(expanded_ids, use_audio_in_video=aw is not None)
+                if vf is not None or aw is not None
+                else expanded_ids
+            )
+            entry: Dict[str, Any] = {"prompt_token_ids": rollout_ids}
             media: Dict[str, Any] = {}
             if vf is not None:
                 media["video"] = [vf]
@@ -230,16 +321,20 @@ class Qwen3OmniThinkerInputAdapter:
                 media["audio"] = [aw]
             if media:
                 entry["multi_modal_data"] = media
-            if aw is not None:
-                # This must be request-local. A global setting breaks vLLM's
-                # video-only dummy profiling during engine startup.
-                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs(
-                    video_fps=effective_fps
-                )
-                entry["mm_processor_kwargs"]["use_audio_in_video"] = True
-            elif vf is not None:
-                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs(
-                    video_fps=effective_fps
+            if vf is not None or aw is not None:
+                # Keep this request-local: globally enabling audio-in-video
+                # breaks vLLM's video-only dummy profiling during engine boot.
+                mm_processor_kwargs = self._multimodal_processor_kwargs(video_fps=effective_fps)
+                if aw is not None:
+                    mm_processor_kwargs["use_audio_in_video"] = True
+                entry["mm_processor_kwargs"] = mm_processor_kwargs
+                logger.debug(
+                    "Qwen3-Omni rollout prompt: expanded_tokens=%d compressed_tokens=%d "
+                    "modalities=%s mm_processor_kwargs=%s",
+                    len(expanded_ids),
+                    len(rollout_ids),
+                    sorted(media),
+                    mm_processor_kwargs,
                 )
             prompts.append(entry)
             self._last_encodings.append(enc)
@@ -373,10 +468,33 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         video_max_pixels = getattr(mc, "video_max_pixels", None) if mc is not None else None
         use_audio_in_video = bool(getattr(mc, "use_audio_in_video", False)) if mc is not None else False
         max_prompt_length = int(getattr(mc, "max_prompt_length", 12288)) if mc is not None else 12288
-        config_cap = getattr(config, "max_prompt_length", None)
-        if config_cap is not None:
-            max_prompt_length = int(config_cap)
+        config_video_fps = getattr(config, "video_fps", None)
+        config_video_max_pixels = getattr(config, "video_max_pixels", None)
+        config_use_audio_in_video = getattr(config, "use_audio_in_video", None)
+        config_max_prompt_length = getattr(config, "max_prompt_length", None)
+        if config_video_fps is not None:
+            video_fps = float(config_video_fps)
+        if config_video_max_pixels is not None:
+            video_max_pixels = int(config_video_max_pixels)
+        if config_use_audio_in_video is not None:
+            use_audio_in_video = bool(config_use_audio_in_video)
+        if config_max_prompt_length is not None:
+            max_prompt_length = int(config_max_prompt_length)
         system_instruction = getattr(mc, "system_instruction", None) if mc is not None else None
+
+        logger.info(
+            "Resolved Qwen3-Omni rollout adapter config: model_path=%s video_fps=%s "
+            "video_max_frames=%s video_max_pixels=%s use_audio_in_video=%s max_prompt_length=%s "
+            "system_instruction_set=%s model_config_available=%s",
+            model_path,
+            video_fps,
+            video_max_frames,
+            video_max_pixels,
+            use_audio_in_video,
+            max_prompt_length,
+            system_instruction is not None,
+            model_config is not None,
+        )
 
         self.input_adapter = Qwen3OmniThinkerInputAdapter(
             self.modality,

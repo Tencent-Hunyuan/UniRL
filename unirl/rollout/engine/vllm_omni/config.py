@@ -81,6 +81,12 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     # Adapter-side cap used when an anchored engine is created without the
     # training model config. Multimodal prompts cannot be truncated safely.
     max_prompt_length: Optional[int] = None
+    # Explicit Qwen3-Omni processor settings. These duplicate the bundle-side
+    # values intentionally: anchored rollout actors must not silently fall back
+    # when model_config wiring changes.
+    video_fps: Optional[float] = None
+    video_max_pixels: Optional[int] = None
+    use_audio_in_video: Optional[bool] = None
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
