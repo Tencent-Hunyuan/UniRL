@@ -136,6 +136,7 @@ class Qwen3OmniThinkerInputAdapter:
         kwargs: Dict[str, Any] = {
             "fps": video_fps,
             "do_sample_frames": False,
+            "truncation": True,
         }
         if self.video_max_pixels is not None:
             kwargs["size"] = {
@@ -256,6 +257,7 @@ class Qwen3OmniThinkerInputAdapter:
                 "use_audio_in_video": True,
                 "fps": video_fps,
                 "do_sample_frames": False,
+                "truncation": True,
                 "return_tensors": "pt",
             }
             if self.video_max_pixels is not None:
@@ -327,6 +329,12 @@ class Qwen3OmniThinkerInputAdapter:
                 mm_processor_kwargs = self._multimodal_processor_kwargs(video_fps=effective_fps)
                 if aw is not None:
                     mm_processor_kwargs["use_audio_in_video"] = True
+                    temporal_patch_size = int(
+                        getattr(self._processor.video_processor, "temporal_patch_size", 2)
+                    )
+                    mm_processor_kwargs["second_per_grid_ts"] = [
+                        temporal_patch_size / self.video_fps
+                    ]
                 entry["mm_processor_kwargs"] = mm_processor_kwargs
                 logger.debug(
                     "Qwen3-Omni rollout prompt: expanded_tokens=%d compressed_tokens=%d "
