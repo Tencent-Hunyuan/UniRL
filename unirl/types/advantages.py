@@ -49,8 +49,7 @@ def compute_gae_advantages(
     """
     if rewards.shape != values.shape:
         raise ValueError(
-            f"compute_gae_advantages: rewards shape {tuple(rewards.shape)} != "
-            f"values shape {tuple(values.shape)}"
+            f"compute_gae_advantages: rewards shape {tuple(rewards.shape)} != values shape {tuple(values.shape)}"
         )
     if not (0.0 <= gamma <= 1.0):
         raise ValueError(f"compute_gae_advantages: gamma must be in [0, 1], got {gamma}")
@@ -58,8 +57,7 @@ def compute_gae_advantages(
         raise ValueError(f"compute_gae_advantages: gae_lambda must be in [0, 1], got {gae_lambda}")
     if mask is not None and mask.shape != rewards.shape:
         raise ValueError(
-            f"compute_gae_advantages: mask shape {tuple(mask.shape)} != "
-            f"rewards shape {tuple(rewards.shape)}"
+            f"compute_gae_advantages: mask shape {tuple(mask.shape)} != rewards shape {tuple(rewards.shape)}"
         )
 
     if rewards.ndim == 1:
@@ -67,9 +65,7 @@ def compute_gae_advantages(
     elif rewards.ndim == 2:
         advantages = _gae_2d(rewards, values, gamma=gamma, gae_lambda=gae_lambda, mask=mask)
     else:
-        raise ValueError(
-            f"compute_gae_advantages: expected 1D or 2D tensors, got ndim={rewards.ndim}"
-        )
+        raise ValueError(f"compute_gae_advantages: expected 1D or 2D tensors, got ndim={rewards.ndim}")
 
     returns = advantages + values
     return advantages, returns
@@ -85,18 +81,19 @@ def _gae_1d(
 ) -> torch.Tensor:
     t_steps = int(rewards.shape[0])
     next_values = torch.cat([values[1:], values.new_zeros(1)])
+    if mask is not None:
+        valid = mask.to(dtype=values.dtype)
+        next_valid = torch.cat([valid[1:], valid.new_zeros(1)])
+        next_values = next_values * next_valid
     deltas = rewards + gamma * next_values - values
 
     advantages = rewards.new_zeros(t_steps)
     gae = rewards.new_zeros(())
     for t in range(t_steps - 1, -1, -1):
-        if mask is not None and mask[t].item() == 0:
-            gae = rewards.new_zeros(())
-        else:
-            gae = deltas[t] + gamma * gae_lambda * gae
+        gae = deltas[t] + gamma * gae_lambda * gae
+        if mask is not None:
+            gae = gae * mask[t].to(dtype=gae.dtype)
         advantages[t] = gae
-    if mask is not None:
-        advantages = advantages * mask.to(dtype=advantages.dtype)
     return advantages
 
 
@@ -110,6 +107,10 @@ def _gae_2d(
 ) -> torch.Tensor:
     batch, t_steps = rewards.shape
     next_values = torch.cat([values[:, 1:], values.new_zeros(batch, 1)], dim=1)
+    if mask is not None:
+        valid = mask.to(dtype=values.dtype)
+        next_valid = torch.cat([valid[:, 1:], valid.new_zeros(batch, 1)], dim=1)
+        next_values = next_values * next_valid
     deltas = rewards + gamma * next_values - values
 
     advantages = rewards.new_zeros(batch, t_steps)
@@ -122,6 +123,4 @@ def _gae_2d(
         else:
             gae = deltas[:, t] + gamma * gae_lambda * gae
         advantages[:, t] = gae
-    if mask is not None:
-        advantages = advantages * mask.to(dtype=advantages.dtype)
     return advantages

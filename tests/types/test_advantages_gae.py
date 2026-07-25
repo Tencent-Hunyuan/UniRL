@@ -14,9 +14,7 @@ def test_gae_hand_computed_lambda_one() -> None:
     """Sparse terminal reward; λ=1; hand-computed backward pass."""
     rewards = torch.tensor([0.0, 0.0, 1.0])
     values = torch.tensor([0.2, 0.5, 0.8])
-    advantages, returns = compute_gae_advantages(
-        rewards, values, gamma=1.0, gae_lambda=1.0
-    )
+    advantages, returns = compute_gae_advantages(rewards, values, gamma=1.0, gae_lambda=1.0)
     # δ = [0.3, 0.3, 0.2]; backward GAE with λ=1 → [0.8, 0.5, 0.2]
     expected_adv = torch.tensor([0.8, 0.5, 0.2])
     assert torch.allclose(advantages, expected_adv, atol=1e-6)
@@ -41,9 +39,9 @@ def test_gae_flat_critic_sparse_reward() -> None:
 
 
 def test_gae_uniform_reward_zero_advantage() -> None:
-    """Constant rewards and matching flat values → zero TD errors."""
+    """Constant rewards and matching finite-horizon values → zero TD errors."""
     rewards = torch.tensor([1.0, 1.0, 1.0])
-    values = torch.tensor([2.0, 2.0, 2.0])
+    values = torch.tensor([3.0, 2.0, 1.0])
     advantages, _ = compute_gae_advantages(rewards, values, gamma=1.0, gae_lambda=0.95)
     assert torch.allclose(advantages, torch.zeros(3), atol=1e-6)
 
@@ -63,14 +61,35 @@ def test_gae_mask_resets_carry() -> None:
     rewards = torch.tensor([[0.0, 0.0, 1.0, 0.0]])
     values = torch.tensor([[0.2, 0.5, 0.8, 0.0]])
     mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
-    advantages, _ = compute_gae_advantages(
-        rewards, values, gamma=1.0, gae_lambda=1.0, mask=mask
-    )
-    unmasked_adv, _ = compute_gae_advantages(
-        rewards[0, :3], values[0, :3], gamma=1.0, gae_lambda=1.0
-    )
+    advantages, _ = compute_gae_advantages(rewards, values, gamma=1.0, gae_lambda=1.0, mask=mask)
+    unmasked_adv, _ = compute_gae_advantages(rewards[0, :3], values[0, :3], gamma=1.0, gae_lambda=1.0)
     assert torch.allclose(advantages[0, :3], unmasked_adv, atol=1e-6)
     assert advantages[0, 3].item() == 0.0
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_gae_mask_zeros_bootstrap_from_padding_values(batched: bool) -> None:
+    """The last valid step is terminal even when padding contains nonzero values."""
+    rewards = torch.tensor([0.0, 0.0, 0.0])
+    values = torch.tensor([0.25, 123.0, 456.0])
+    mask = torch.tensor([1.0, 0.0, 0.0])
+    if batched:
+        rewards = rewards.unsqueeze(0)
+        values = values.unsqueeze(0)
+        mask = mask.unsqueeze(0)
+
+    advantages, _ = compute_gae_advantages(
+        rewards,
+        values,
+        gamma=1.0,
+        gae_lambda=1.0,
+        mask=mask,
+    )
+
+    expected = torch.tensor([-0.25, 0.0, 0.0])
+    if batched:
+        expected = expected.unsqueeze(0)
+    assert torch.allclose(advantages, expected, atol=1e-6)
 
 
 def test_gae_gamma_discount() -> None:
