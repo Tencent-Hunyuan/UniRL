@@ -43,6 +43,8 @@ class Qwen3OmniPipelineConfig:
     video_max_frames: Optional[int] = None
     # Per-frame pixel cap passed to the processor as ``size.longest_edge``.
     video_max_pixels: Optional[int] = None
+    # Whether to include the video's audio track in TMRoPE inputs.
+    use_audio_in_video: bool = False
 
     # Unsupported until the FSDP loader remaps checkpoint ``thinker.`` keys.
     meta_init_transformer: bool = False

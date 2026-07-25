@@ -78,6 +78,10 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     # Passthrough for advanced ``Omni`` kwargs not surfaced as typed fields.
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
+    # Adapter-side cap used when an anchored engine is created without the
+    # training model config. Multimodal prompts cannot be truncated safely.
+    max_prompt_length: Optional[int] = None
+
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
         # Validate against the live adapter registry (importing it registers them).

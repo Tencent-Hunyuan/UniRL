@@ -24,14 +24,23 @@ from .conditions import Qwen3OmniARConditions
 logger = logging.getLogger(__name__)
 
 
-def _fuse_video_embeds(
+def _fuse_mm_embeds(
     transformer: Any,
     full_ids: torch.Tensor,
     pixel_values_videos: torch.Tensor,
     video_grid_thw: torch.Tensor,
+    input_features: Optional[torch.Tensor] = None,
+    feature_attention_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-    """Prepare video and DeepStack inputs inside the root FSDP forward."""
+    """Prepare audio, video, and DeepStack inputs inside the root FSDP forward."""
     inputs_embeds = transformer.get_input_embeddings()(full_ids)
+    if input_features is not None:
+        audio_features = transformer.get_audio_features(
+            input_features, feature_attention_mask=feature_attention_mask
+        )
+        audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
+        _, _, audio_mask = transformer.get_placeholder_mask(full_ids, inputs_embeds=inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
     video_outputs = transformer.get_video_features(
         pixel_values_videos,
         video_grid_thw,
@@ -70,13 +79,20 @@ def _replay_aware_forward(
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
 
-    # FSDP must unshard embeddings and the vision tower before video fusion.
+    # FSDP must unshard embeddings and the media towers before fusion.
     pixel_values_videos = kw.pop("pixel_values_videos", None)
+    input_features = kw.pop("input_features", None)
+    feature_attention_mask = kw.pop("feature_attention_mask", None)
     if pixel_values_videos is not None:
         video_grid_thw = kw.pop("video_grid_thw")
         fuse_full_ids = kw.pop("fuse_full_ids")
-        inputs_embeds, deepstack_embeds, visual_pos_masks = _fuse_video_embeds(
-            self, fuse_full_ids, pixel_values_videos, video_grid_thw
+        inputs_embeds, deepstack_embeds, visual_pos_masks = _fuse_mm_embeds(
+            self,
+            fuse_full_ids,
+            pixel_values_videos,
+            video_grid_thw,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
         )
         kw["inputs_embeds"] = inputs_embeds
         kw["deepstack_visual_embeds"] = deepstack_embeds
@@ -172,6 +188,28 @@ def _merge_video(per_sample: Optional[List[Optional[torch.Tensor]]]) -> Optional
     return torch.cat(parts, dim=0) if parts else None
 
 
+def _merge_audio(
+    input_features: Optional[List[Optional[torch.Tensor]]],
+    feature_attention_mask: Optional[List[Optional[torch.Tensor]]],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Pad and concatenate per-sample Whisper features and masks."""
+    if input_features is None or feature_attention_mask is None:
+        return None, None
+    pairs = [(f, m) for f, m in zip(input_features, feature_attention_mask) if f is not None and m is not None]
+    if not pairs:
+        return None, None
+    max_t = max(int(f.shape[-1]) for f, _ in pairs)
+    features, masks = [], []
+    for feature, mask in pairs:
+        pad = max_t - int(feature.shape[-1])
+        if pad:
+            feature = F.pad(feature, (0, pad))
+            mask = F.pad(mask, (0, pad))
+        features.append(feature)
+        masks.append(mask)
+    return torch.cat(features, dim=0), torch.cat(masks, dim=0)
+
+
 class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
     """Rollout-level AR stage for the Qwen3-Omni thinker."""
 
@@ -239,6 +277,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         pvv = _merge_video(conditions.pixel_values_videos)
         vgt = _merge_video(conditions.video_grid_thw)
         vspg = _merge_video(conditions.video_second_per_grid)
+        ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
         if pvv is not None:
             model_kwargs["pixel_values_videos"] = pvv
         if vgt is not None:
@@ -246,6 +285,10 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         if vspg is not None:
             # TMRoPE needs seconds per grid for the temporal axis.
             model_kwargs["video_second_per_grid"] = vspg
+        if ivf is not None:
+            model_kwargs["input_features"] = ivf
+            model_kwargs["feature_attention_mask"] = fam
+            model_kwargs["use_audio_in_video"] = True
 
         cur_input_ids = input_ids
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
@@ -267,6 +310,10 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                     prep_kwargs["video_grid_thw"] = model_kwargs["video_grid_thw"]
                 if "video_second_per_grid" in model_kwargs:
                     prep_kwargs["video_second_per_grid"] = model_kwargs["video_second_per_grid"]
+                if "input_features" in model_kwargs:
+                    prep_kwargs["input_features"] = model_kwargs["input_features"]
+                    prep_kwargs["feature_attention_mask"] = model_kwargs["feature_attention_mask"]
+                    prep_kwargs["use_audio_in_video"] = True
 
             model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
             with torch.no_grad():
@@ -371,6 +418,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         pvv = _merge_video(conditions.pixel_values_videos)
         vgt = _merge_video(conditions.video_grid_thw)
         vspg = _merge_video(conditions.video_second_per_grid)
+        ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
 
         forward_kwargs: dict = {
             "response_tokens": response_tokens,
@@ -389,14 +437,20 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             pvv = pvv.to(device=device, dtype=self.model.dtype)
             vgt = vgt.to(device=device)
             vspg = vspg.to(device=device) if vspg is not None else None
+            use_audio = ivf is not None
+            audio_seqlens = None
+            if use_audio:
+                ivf = ivf.to(device=device, dtype=self.model.dtype)
+                fam = fam.to(device=device)
+                audio_seqlens = fam.sum(-1)
             # Preserve the [3, B, seq] temporal/height/width position layout.
             position_ids, _ = transformer.get_rope_index(
                 full_ids,
                 image_grid_thw=None,
                 video_grid_thw=vgt,
                 attention_mask=full_mask,
-                use_audio_in_video=False,
-                audio_seqlens=None,
+                use_audio_in_video=use_audio,
+                audio_seqlens=audio_seqlens,
                 second_per_grids=vspg,
             )  # [3, B, seq]
             # Integer positions prevent FSDP mixed precision from rounding indices.
@@ -406,6 +460,9 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             forward_kwargs["fuse_full_ids"] = full_ids
             forward_kwargs["attention_mask"] = full_mask
             forward_kwargs["position_ids"] = position_ids
+            if use_audio:
+                forward_kwargs["input_features"] = ivf
+                forward_kwargs["feature_attention_mask"] = fam
         per_token = transformer(**forward_kwargs)  # [B, T_max] FP32
 
         if T_max == 0:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
+from unirl.models.qwen3_omni.media import extract_audio_from_video_pyav
 from unirl.models.qwen3_omni.video import limit_video_frames, sample_video_frames_pyav
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3TextOutputAdapter
@@ -31,6 +32,7 @@ class Qwen3OmniThinkerInputAdapter:
         video_fps: float = 1.0,
         video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
+        use_audio_in_video: bool = False,
         max_prompt_length: int = 12288,
         system_instruction: Optional[str] = None,
     ) -> None:
@@ -39,6 +41,7 @@ class Qwen3OmniThinkerInputAdapter:
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
+        self.use_audio_in_video = bool(use_audio_in_video)
         self.max_prompt_length = int(max_prompt_length)
         self.system_instruction = system_instruction
 
@@ -121,11 +124,29 @@ class Qwen3OmniThinkerInputAdapter:
             for i in range(n)
         ]
 
+    def _extract_audios(self, req: RolloutReq, n: int) -> List[Optional[Any]]:
+        """Extract one waveform from each source video when audio fusion is enabled."""
+        if not self.use_audio_in_video:
+            return [None] * n
+        prim = req.primitives.get("video")
+        uris = getattr(prim, "uris", None) if prim is not None else None
+        if not uris:
+            return [None] * n
+        require(
+            len(uris) == n,
+            f"Qwen3OmniThinkerInputAdapter: audio uris count {len(uris)} != prompt count {n}",
+        )
+        sample_rate = int(
+            getattr(getattr(self._processor, "feature_extractor", None), "sampling_rate", 16000)
+        )
+        return [extract_audio_from_video_pyav(uri, sample_rate) for uri in uris]
+
     def _encode_one(
         self,
         text: str,
         video_frames: Optional[Any],
         video_fps: float,
+        audio_wave: Optional[Any],
         system_instruction: Optional[str],
     ) -> Dict[str, Any]:
         content: List[Dict[str, Any]] = []
@@ -137,6 +158,26 @@ class Qwen3OmniThinkerInputAdapter:
         if system_instruction is not None:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": content})
+
+        if audio_wave is not None:
+            prompt_text = self._processor.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            processor_kwargs: Dict[str, Any] = {
+                "text": [prompt_text],
+                "videos": [video_frames],
+                "audio": [audio_wave],
+                "use_audio_in_video": True,
+                "fps": video_fps,
+                "do_sample_frames": False,
+                "return_tensors": "pt",
+            }
+            if self.video_max_pixels is not None:
+                processor_kwargs["size"] = {
+                    "shortest_edge": int(self._processor.video_processor.size["shortest_edge"]),
+                    "longest_edge": self.video_max_pixels,
+                }
+            return self._processor(**processor_kwargs)
 
         template_kwargs: Dict[str, Any] = dict(
             add_generation_prompt=True,
@@ -156,6 +197,7 @@ class Qwen3OmniThinkerInputAdapter:
             f"Qwen3OmniThinkerInputAdapter: sample id count {len(req.sample_ids)} != prompt count {n}",
         )
         video_frames = self._extract_videos(req, n)
+        audio_waves = self._extract_audios(req, n)
 
         # Allow a per-request system instruction.
         chat_overrides = dict(req.task_config.get("chat") or {})
@@ -164,13 +206,13 @@ class Qwen3OmniThinkerInputAdapter:
         prompts: List[Dict[str, Any]] = []
         # The output adapter consumes this cache after generation.
         self._last_encodings = []
-        for text, video_sample in zip(texts.texts, video_frames):
+        for text, video_sample, aw in zip(texts.texts, video_frames, audio_waves):
             vf, effective_fps = video_sample if video_sample is not None else (None, self.video_fps)
-            enc = self._encode_one(text, vf, effective_fps, sys_instr)
+            enc = self._encode_one(text, vf, effective_fps, aw, sys_instr)
             ids = enc["input_ids"].squeeze(0).tolist()
             if len(ids) > self.max_prompt_length:
                 # Multimodal token truncation would break feature alignment.
-                if vf is not None:
+                if vf is not None or aw is not None:
                     raise ValueError(
                         f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(ids)} tokens, "
                         f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_frames, "
@@ -181,9 +223,24 @@ class Qwen3OmniThinkerInputAdapter:
                 enc["attention_mask"] = enc["attention_mask"][..., -self.max_prompt_length :]
                 ids = enc["input_ids"].squeeze(0).tolist()
             entry: Dict[str, Any] = {"prompt_token_ids": ids}
+            media: Dict[str, Any] = {}
             if vf is not None:
-                entry["multi_modal_data"] = {"video": [vf]}
-                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs(video_fps=effective_fps)
+                media["video"] = [vf]
+            if aw is not None:
+                media["audio"] = [aw]
+            if media:
+                entry["multi_modal_data"] = media
+            if aw is not None:
+                # This must be request-local. A global setting breaks vLLM's
+                # video-only dummy profiling during engine startup.
+                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs(
+                    video_fps=effective_fps
+                )
+                entry["mm_processor_kwargs"]["use_audio_in_video"] = True
+            elif vf is not None:
+                entry["mm_processor_kwargs"] = self._multimodal_processor_kwargs(
+                    video_fps=effective_fps
+                )
             prompts.append(entry)
             self._last_encodings.append(enc)
 
@@ -257,6 +314,8 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
         pixel_values_videos: List[Any] = []
         video_grid_thw: List[Any] = []
         video_second_per_grid: List[Any] = []
+        input_features: List[Any] = []
+        feature_attention_mask: List[Any] = []
         for e in encs:
             pvv = e.get("pixel_values_videos")
             vgt = e.get("video_grid_thw")
@@ -266,13 +325,18 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
             if vspg is not None and not isinstance(vspg, torch.Tensor):
                 vspg = torch.as_tensor(vspg)
             video_second_per_grid.append(vspg if vspg is not None else None)
+            input_features.append(e.get("input_features"))
+            feature_attention_mask.append(e.get("feature_attention_mask"))
 
         has_video = any(p is not None for p in pixel_values_videos)
+        has_audio = any(a is not None for a in input_features)
         cond = Qwen3OmniARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
             pixel_values_videos=pixel_values_videos if has_video else None,
             video_grid_thw=video_grid_thw if has_video else None,
             video_second_per_grid=video_second_per_grid if has_video else None,
+            input_features=input_features if has_audio else None,
+            feature_attention_mask=feature_attention_mask if has_audio else None,
         )
         return cond.to_dict()
 
@@ -307,7 +371,11 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         video_fps = float(getattr(mc, "video_fps", 1.0)) if mc is not None else 1.0
         video_max_frames = getattr(mc, "video_max_frames", None) if mc is not None else None
         video_max_pixels = getattr(mc, "video_max_pixels", None) if mc is not None else None
+        use_audio_in_video = bool(getattr(mc, "use_audio_in_video", False)) if mc is not None else False
         max_prompt_length = int(getattr(mc, "max_prompt_length", 12288)) if mc is not None else 12288
+        config_cap = getattr(config, "max_prompt_length", None)
+        if config_cap is not None:
+            max_prompt_length = int(config_cap)
         system_instruction = getattr(mc, "system_instruction", None) if mc is not None else None
 
         self.input_adapter = Qwen3OmniThinkerInputAdapter(
@@ -316,6 +384,7 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
             video_fps=video_fps,
             video_max_frames=video_max_frames,
             video_max_pixels=video_max_pixels,
+            use_audio_in_video=use_audio_in_video,
             max_prompt_length=max_prompt_length,
             system_instruction=system_instruction,
         )
