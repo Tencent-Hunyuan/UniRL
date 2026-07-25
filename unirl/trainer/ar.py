@@ -1,7 +1,7 @@
 import inspect
 import logging
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Iterator, Optional, Tuple
 
 import torch
@@ -386,48 +386,68 @@ class ARTrainer(BaseTrainer):
         # TODO: The anchored branch is temporarily migrated from unified models;
         # replace it with first-class TP/DP/PP support.
 
+        logger.info(
+            "EVAL rollout %d starting: max_prompts=%s batch_size=%d samples_per_prompt=%d "
+            "temperature=%s anchored=%s",
+            rollout_id + 1,
+            "all" if self.eval_num_prompts < 0 else self.eval_num_prompts,
+            self.eval_batch_size,
+            self.eval_samples_per_prompt,
+            self.eval_temperature,
+            anchored,
+        )
         if not anchored:
             self.rollout.wake_up()
             if self.weight_sync is not None:
                 self.weight_sync.sync()
-        sync_anchored_weights = anchored and self.weight_sync is not None
+        # Anchored eval keeps FSDP offloaded and vLLM awake for the entire eval
+        # set. Training still uses one _anchored_rollout_session per rollout in
+        # train_step(), so its sleep/wake and onload/offload lifecycle is unchanged.
+        eval_session = (
+            self._anchored_rollout_session(
+                sync_weights=self.weight_sync is not None,
+                restore_backend=False,
+            )
+            if anchored
+            else nullcontext()
+        )
         try:
-            for eval_inputs in eval_batches:
-                batch_n += 1
-                prompt_n += len(eval_inputs.sample_ids)
-                inputs = eval_inputs.expand(self.eval_samples_per_prompt)
-                req = RolloutReq(
-                    sample_ids=list(inputs.sample_ids),
-                    group_ids=list(inputs.group_ids),
-                    primitives=dict(inputs.primitives),
-                    request_conditions={},
-                    sampling_params=eval_sp,
-                    metadata=list(inputs.metadata) if inputs.metadata else [],
-                )
-                if anchored:
-                    # Keep the manual FSDP state offloaded throughout eval and
-                    # release the TP engine between batches.  Only the first
-                    # batch needs an adapter extract/push.
-                    with self._anchored_rollout_session(
-                        sync_weights=sync_anchored_weights,
-                        restore_backend=False,
-                    ):
-                        sync_anchored_weights = False
+            with eval_session:
+                for eval_inputs in eval_batches:
+                    batch_n += 1
+                    prompt_n += len(eval_inputs.sample_ids)
+                    inputs = eval_inputs.expand(self.eval_samples_per_prompt)
+                    req = RolloutReq(
+                        sample_ids=list(inputs.sample_ids),
+                        group_ids=list(inputs.group_ids),
+                        primitives=dict(inputs.primitives),
+                        request_conditions={},
+                        sampling_params=eval_sp,
+                        metadata=list(inputs.metadata) if inputs.metadata else [],
+                    )
+                    if anchored:
                         resp = self.rollout.generate(req)
                         # DP_SCATTER reward scoring requires materialized tensors.
                         from unirl.trainer.unified_model import deep_hydrate
 
                         resp = deep_hydrate(resp)
-                else:
-                    resp = self.rollout.generate(req)
-                for track in resp.tracks.values():
-                    if track.segment is not None:
-                        track = self.reward.score_and_attach(req=req, track=track)
-                    if track.rewards is not None:
-                        rewards = hydrate(track.rewards).to(torch.float32)
-                        reward_sum += float(rewards.sum().item())
-                        reward_n += int(rewards.numel())
-                        break  # single-track for now; revisit if multi-track lands
+                    else:
+                        resp = self.rollout.generate(req)
+                    for track in resp.tracks.values():
+                        if track.segment is not None:
+                            track = self.reward.score_and_attach(req=req, track=track)
+                        if track.rewards is not None:
+                            rewards = hydrate(track.rewards).to(torch.float32)
+                            reward_sum += float(rewards.sum().item())
+                            reward_n += int(rewards.numel())
+                            break  # single-track for now; revisit if multi-track lands
+                    logger.info(
+                        "EVAL rollout %d progress: batch=%d prompts=%d samples=%d",
+                        rollout_id + 1,
+                        batch_n,
+                        prompt_n,
+                        reward_n,
+                    )
         finally:
             if not anchored:
                 self.rollout.sleep()
