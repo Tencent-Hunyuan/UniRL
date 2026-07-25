@@ -42,11 +42,6 @@ logger = logging.getLogger(__name__)
 
 _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
-try:
-    from transformers.masking_utils import find_packed_sequence_indices
-except Exception:
-    find_packed_sequence_indices = None
-
 
 @functools.lru_cache(maxsize=None)
 def _warn_packed_disabled(attn_impl: str) -> None:
@@ -78,7 +73,9 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
         return False
-    if find_packed_sequence_indices is None:
+    try:
+        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
+    except Exception:
         return False
     return True
 
