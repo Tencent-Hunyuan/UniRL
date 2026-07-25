@@ -120,8 +120,11 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             )
         # timestep: scalar or [B] -> [N] float, matching sample_2's batch axis.
         t_scalar = sigma * 1000.0
-        if t_scalar.dim() == 0:
-            t_expand = t_scalar.expand(sample_2.shape[0])
+        if t_scalar.numel() == 1:
+            # Accept both a true scalar and the legacy scalar-like ``[1]``
+            # form. The latter used to broadcast through ``Tensor.expand`` and
+            # remains a valid caller shape for batched forward processes.
+            t_expand = t_scalar.reshape(()).expand(sample_2.shape[0])
         elif t_scalar.numel() == sample_2.shape[0]:
             t_expand = t_scalar.reshape(sample_2.shape[0])
         elif cfg and t_scalar.numel() == n_sample:
