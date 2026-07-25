@@ -18,7 +18,7 @@ from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
 def _require_float_wan_timesteps() -> None:
     """Reject FastVideo's post-scheduler integer cast, which its echo cannot expose."""
-    if os.getenv("DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG", "0").lower() in ("1", "true", "yes"):
+    if os.getenv("DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG", "0").strip().lower() in ("1", "true", "yes"):
         raise RuntimeError(
             "FastVideo canonical UniPC requires floating WAN timesteps; "
             "unset DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG"
