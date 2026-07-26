@@ -52,10 +52,11 @@ class VLMAdapter(TextLMAdapter):
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
         mm_encs: List[MMEncoding] = []
-        for prompt, image in zip(prompts, pil_images):
+        sample_ids = self._sampling_identities(req, sampling, expected=len(prompts))
+        for prompt, image, sample_id in zip(prompts, pil_images, sample_ids):
             mm = self.encode_mm(prompt, image, sampling.system_instruction)
             mm_encs.append(mm)
-            payload = self.base_payload(sampling)
+            payload = self.base_payload(sampling, sample_id=sample_id)
             # Send the chat-templated TEXT (single placeholder) + image_data so
             # SRT's processor expands the placeholder and the model actually
             # attends the image. (Sending the pre-expanded input_ids +

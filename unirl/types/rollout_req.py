@@ -117,6 +117,19 @@ class RolloutReq(Batch):
             return len(self.sample_ids)
         return super().batch_size
 
+    def validated_sample_ids(self, *, context: str) -> List[str]:
+        """Return non-empty unique sample identities or raise.
+
+        Call this on the complete driver-side request before DP sharding when
+        an operation derives deterministic state from ``sample_ids``. Worker
+        checks alone cannot detect duplicates split across different shards.
+        """
+        if not all(isinstance(sample_id, str) and sample_id.strip() for sample_id in self.sample_ids):
+            raise ValueError(f"{context} requires non-empty string sample_ids")
+        if len(set(self.sample_ids)) != len(self.sample_ids):
+            raise ValueError(f"{context} requires globally unique sample_ids")
+        return list(self.sample_ids)
+
     # ---- tracks fan-out helper ---------------------------------------------
 
     def make_root_track(

@@ -774,6 +774,11 @@ class UniRLWandBLogger:
         # wrap), and this is the step window boundary for the peak counters.
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
+            # Checkpoint/resume state must not depend on whether telemetry is
+            # enabled. The live logging path advances this counter in
+            # ``_log_train`` while emitting points; the null-logger path still
+            # advances by the same number of optimizer updates.
+            self._optimizer_step += self._optimizer_update_count(results)
             return
         # Lazy import keeps wandb_logger importable without the training stack.
         from unirl.utils.wandb_metrics import compute_rollout_resp_metrics
@@ -795,6 +800,25 @@ class UniRLWandBLogger:
             perf.update(mem_summary)
         if perf:
             self.log_perf(step, perf)
+
+    @staticmethod
+    def _optimizer_update_count(
+        results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
+    ) -> int:
+        """Return the number of train-axis slots emitted by ``_log_train``."""
+        if isinstance(results, dict):
+            counts = []
+            for result in results.values():
+                per_update = getattr(result, "per_update", ()) or ()
+                if len(per_update) > 1:
+                    counts.append(len(per_update))
+                elif getattr(result, "has_backward", False):
+                    counts.append(1)
+            return max(counts, default=0)
+        per_update = getattr(results, "per_update", ()) or ()
+        if len(per_update) > 1:
+            return len(per_update)
+        return 1 if getattr(results, "has_backward", False) else 0
 
     def _log_train(
         self,

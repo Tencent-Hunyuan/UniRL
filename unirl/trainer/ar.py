@@ -132,7 +132,15 @@ class ARTrainer(BaseTrainer):
             sampling_params=self.sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
         )
+        self._validate_seeded_request(req)
         return req
+
+    @staticmethod
+    def _validate_seeded_request(req: RolloutReq) -> None:
+        """Validate seed identities on the full request before DP sharding."""
+        ar_params = req.sampling_params.get("ar")
+        if ar_params is not None and getattr(ar_params, "seed", None) is not None:
+            req.validated_sample_ids(context="Seeded AR sampling")
 
     def train_step(
         self,
@@ -238,6 +246,7 @@ class ARTrainer(BaseTrainer):
                     sampling_params=eval_sp,
                     metadata=list(inputs.metadata) if inputs.metadata else [],
                 )
+                self._validate_seeded_request(req)
                 resp = self.rollout.generate(req)
                 for track in resp.tracks.values():
                     if track.segment is not None:

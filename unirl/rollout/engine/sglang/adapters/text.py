@@ -26,6 +26,7 @@ from unirl.rollout.engine.sglang.utils import (
     ResolvedSampling,
     pack_prompt_condition,
 )
+from unirl.rollout.engine.sglang.utils.sampling import derive_sampling_seed
 from unirl.types.primitives import Texts
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp, RolloutTrack
@@ -74,8 +75,9 @@ class TextLMAdapter(ModelAdapter):
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
-        for prompt in prompts:
-            payload = self.base_payload(sampling)
+        sample_ids = self._sampling_identities(req, sampling, expected=len(prompts))
+        for prompt, sample_id in zip(prompts, sample_ids):
+            payload = self.base_payload(sampling, sample_id=sample_id)
             if use_template:
                 ids = self.apply_chat_template(prompt, sampling.system_instruction)
                 payload["input_ids"] = ids
@@ -107,13 +109,50 @@ class TextLMAdapter(ModelAdapter):
         )
         return prompts
 
-    def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
+    @staticmethod
+    def _sampling_identities(
+        req: RolloutReq,
+        sampling: ResolvedSampling,
+        *,
+        expected: int,
+    ) -> List[Optional[str]]:
+        """Return stable per-entry identities when seeded sampling is enabled."""
+        if sampling.base_seed is None:
+            return [None] * expected
+
+        identities = req.validated_sample_ids(context="Seeded SGLang sampling")
+        require(
+            len(identities) == expected,
+            "Seeded SGLang sampling requires one stable sample_id per request "
+            f"entry; got {len(identities)} ids for {expected} entries",
+        )
+        return identities
+
+    def base_payload(
+        self,
+        sampling: ResolvedSampling,
+        *,
+        sample_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
-        return {
+        payload = {
             "sampling_params": dict(sampling.block),
             "return_logprob": sampling.return_logprob,
             "logprob_start_len": 0,
         }
+        if sampling.base_seed is not None:
+            require(
+                sample_id is not None,
+                "Seeded SGLang sampling requires a stable sample_id",
+            )
+            # SGLang 0.5.12 names the per-request field ``sampling_seed``.
+            # Derive it before asynchronous fan-out from an identity authored
+            # before DP sharding, not from this worker's local list position.
+            payload["sampling_params"]["sampling_seed"] = derive_sampling_seed(
+                sampling.base_seed,
+                sample_id,
+            )
+        return payload
 
     def apply_chat_template(
         self,

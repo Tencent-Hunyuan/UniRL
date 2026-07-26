@@ -183,3 +183,7 @@ class ARSamplingParams(BaseSamplingParams):
     # each engine's sentinel (for example, SGLang -1).
     top_k: int = 0
     stop_token_id: int | None = None
+    # Optional deterministic rollout seed. Engines that support per-request
+    # seeded sampling derive stable child seeds from this value and sample_ids;
+    # None preserves their default fast sampling path.
+    seed: Optional[int] = None

@@ -51,7 +51,8 @@ def fingerprint_tensor(t: torch.Tensor) -> str:
     # above) and a dtype with itemsize-aligned numel — true for every
     # torch dtype we hash here. ``flatten()`` is a no-op view; numpy
     # ``.tobytes()`` does the actual byte materialisation.
-    h.update(data.view(torch.uint8).flatten().numpy().tobytes())
+    byte_source = data.reshape(1) if data.dim() == 0 else data
+    h.update(byte_source.view(torch.uint8).flatten().numpy().tobytes())
     return h.hexdigest()[:16]
 
 

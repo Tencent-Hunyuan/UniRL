@@ -143,6 +143,9 @@ rollout:
       disable_cuda_graph: false
       cuda_graph_max_bs: 16
       enable_lora: false
+      # Keep production sampling on SGLang's fast default backend. The
+      # profiling launcher overrides this to true together with a fixed seed.
+      enable_deterministic_inference: false
 
 reward:
   # math-verify (the paper's grader). 1.0 if the parsed answer matches the ground
