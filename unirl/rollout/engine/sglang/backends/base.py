@@ -27,6 +27,7 @@ Deliberate divergences from the ``sglang_diffusion`` seam:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from contextlib import contextmanager
 from glob import glob
@@ -61,6 +62,24 @@ def _python_cuda_library_dirs() -> List[str]:
         _add(os.path.join(os.path.dirname(torch.__file__), "lib"))
     except (ImportError, AttributeError):
         pass
+    return result
+
+
+def _preloaded_cuda_driver_dirs() -> List[str]:
+    """Return directories of explicitly preloaded CUDA driver shims.
+
+    ``torch-memory-saver`` replaces ``LD_PRELOAD`` while it starts SGLang
+    schedulers. Keeping a preloaded forward-compatibility driver's directory
+    in ``LD_LIBRARY_PATH`` lets the child still resolve that same ``libcuda``
+    after the preload value changes.
+    """
+    result: List[str] = []
+    for item in re.split(r"[\s:]+", os.environ.get("LD_PRELOAD", "")):
+        if not item or not os.path.basename(item).startswith("libcuda.so"):
+            continue
+        directory = os.path.abspath(os.path.dirname(item) or ".")
+        if os.path.isdir(directory) and directory not in result:
+            result.append(directory)
     return result
 
 
@@ -109,7 +128,7 @@ def _scheduler_spawn_environment(
     """
     saved_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
     saved_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    active_library_dirs = _python_cuda_library_dirs()
+    active_library_dirs = _preloaded_cuda_driver_dirs() + _python_cuda_library_dirs()
     inherited_library_dirs = (saved_ld_library_path or "").split(os.pathsep)
     child_library_dirs = list(dict.fromkeys(active_library_dirs + [path for path in inherited_library_dirs if path]))
     if child_library_dirs:
