@@ -120,6 +120,12 @@ class Part(Batch):
     # ``fill``). One fork = one version, so it is shared across a part's samples;
     # ``None`` means "not stamped / not applicable" (e.g. train-side sampling).
     weight_version: Optional[int] = shared_field(default=None)
+    # Optional explicit per-sample initial-noise keys. Normal training derives
+    # these from lineage (sample/group ids); deterministic evaluation overrides
+    # them with prompt-content keys so the same prompt/sample slot keeps the same
+    # x_T across steps and checkpoints. CONCAT is load-bearing: DP
+    # select/split must slice the keys with their samples.
+    init_noise_group_ids: List[str] = concat_field(default_factory=list)
 
     def __post_init__(self) -> None:
         expected_batch = len(self.sample_ids)
@@ -150,6 +156,11 @@ class Part(Batch):
                 raise ValueError(
                     f"Part.primitive_metadata['audio']['sample_rate'] must be a positive int, got {sample_rate!r}."
                 )
+        if self.init_noise_group_ids and len(self.init_noise_group_ids) != expected_batch:
+            raise ValueError(
+                "Part.init_noise_group_ids must be empty or aligned with sample_ids; "
+                f"got {len(self.init_noise_group_ids)} keys for {expected_batch} samples."
+            )
 
     @classmethod
     def concat(cls, items: Sequence["Part"]) -> "Part":

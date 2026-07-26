@@ -8,12 +8,16 @@ module README to read next. (For *what* UniRL is and how to launch it, see the
 see [`distributed/README.md`](distributed/README.md).)
 
 <div align="center">
-  <img src="../assets/code-architecture-new.png" alt="UniRL code architecture: a thin entrypoint hands a recipe to the trainer (the driver), which places a Worker pool and wires each stage (rollout / reward / algorithm / train / weight-sync) as a Remote from the recipe's _target_; the Remotes run the model code (models, sde) and rest on types (the shared contracts) and distributed (the Remote/Worker/transport substrate)" width="100%">
+  <img src="../assets/code-architecture-new.png" alt="UniRL code architecture: a thin entrypoint hands a recipe to the trainer (the driver), which places a Worker pool and wires each loop component (rollout / reward / algorithm / train / weight-sync) as a Remote from the recipe's _target_; the Remotes run the model code (models, sde) and rest on types (the shared contracts) and distributed (the Remote/Worker/transport substrate)" width="100%">
 </div>
 
 UniRL is a thin entrypoint that hands a recipe to the trainer (the **driver**),
-which places a Worker pool and wires each stage as a `Remote` from the recipe's
-`_target_` — not by import. As source, the package falls into four groups:
+which places a Worker pool and wires each **loop component** as a `Remote` from the
+recipe's `_target_` — not by import. (Deliberately *not* "stage": in this repo a stage
+is a trainable unit of a model pipeline — `DiffusionStage` / `ARStage`, see
+[`models/README.md`](models/README.md) — never a position in the training loop.)
+
+As source, the package falls into four groups:
 
 - **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
   `train_unified_model.py`, plus the ALFWorld and deep-research agentic variants)
@@ -22,7 +26,7 @@ which places a Worker pool and wires each stage as a `Remote` from the recipe's
   placement, builds the rollout and train workers, and runs the
   rollout→reward→advantage→train loop.
 - **Training loop** (`rollout/`, `reward/`, `algorithms/`, `train/`) — the four
-  pluggable stages of one rollout, plus the components they share: `models/`
+  pluggable components of one rollout, plus what they share: `models/`
   (per-model bundles), `sde/` (step kernels / σ schedule), and `data/` (sources).
 - **Foundation** (`distributed/`, `config/`, `types/`, `utils/`) — the
   cross-cutting infrastructure every layer rests on: the Ray

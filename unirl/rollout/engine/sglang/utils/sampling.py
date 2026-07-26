@@ -53,7 +53,7 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     """
     input_part, gen_part = sample.parts[0], sample.parts[-1]
     ar = gen_part.sampling_params
-    stage_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
+    control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
     # Fan-out is the LAST-fork branch (children per *frontier parent*), not the
     # root-relative count: in a multi-turn Sample the frontier's parent is a later
@@ -71,13 +71,13 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
         "n": n,
     }
     for key in ("stop", "stop_token_ids", "skip_special_tokens"):
-        if key in stage_ar:
-            block[key] = stage_ar[key]
+        if key in control_ar:
+            block[key] = control_ar[key]
 
     return ResolvedSampling(
         n=n,
-        return_logprob=bool(stage_ar.get("return_logprob", True)),
-        system_instruction=stage_ar.get("system_instruction") or config.system_instruction,
+        return_logprob=bool(control_ar.get("return_logprob", True)),
+        system_instruction=control_ar.get("system_instruction") or config.system_instruction,
         block=block,
     )
 

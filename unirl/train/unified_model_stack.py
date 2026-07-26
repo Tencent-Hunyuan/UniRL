@@ -210,7 +210,7 @@ class UnifiedModelTrainStack(Remote):
                 loss_scale=loss_scale,
             )
             micros.append(result)
-            total_loss += result.loss
+            total_loss += result.loss * loss_scale
             has_backward = has_backward or result.has_backward
 
         aggregated: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])

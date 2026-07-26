@@ -15,7 +15,7 @@ stage does not interpret it.
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -61,27 +61,53 @@ class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
         turns = [Turn(role="user", content=value)] if isinstance(value, Texts) else value
         if not turns:
             raise ValueError("Qwen3ChatTemplateStage.embed: expected at least one conversation turn.")
+        return self.embed_messages(build_text_messages(turns, self.system_instruction))
+
+    def embed_messages(
+        self,
+        conversations: Sequence[Sequence[Dict[str, Any]]],
+        *,
+        tools: Optional[Sequence[Optional[Sequence[Dict[str, Any]]]]] = None,
+    ) -> Qwen3ARConditions:
+        """Render OpenAI-style histories and pack them as generation conditions.
+
+        Agent SFT passes each conversation without its final target assistant
+        turn. Long histories are cropped from the left after templating so the
+        latest user/tool interaction and assistant generation prefix survive.
+        """
+        if not conversations:
+            raise ValueError("Qwen3ChatTemplateStage.embed_messages: empty conversation batch.")
+        if tools is None:
+            tools = [None] * len(conversations)
+        if len(tools) != len(conversations):
+            raise ValueError(
+                "Qwen3ChatTemplateStage.embed_messages: tools and conversations batch sizes differ "
+                f"({len(tools)} != {len(conversations)})."
+            )
+
         tokenizer = self.bundle.tokenizer
         device = self.bundle.device
-
         per_sample_ids: List[torch.Tensor] = []
-        for messages in build_text_messages(turns, self.system_instruction):
+        for messages, sample_tools in zip(conversations, tools):
             ids = tokenizer.apply_chat_template(
                 messages,
+                tools=sample_tools,
                 add_generation_prompt=True,
                 enable_thinking=self.enable_thinking,
                 tokenize=True,
                 return_tensors="pt",
                 return_dict=False,
-                truncation=True,
-                max_length=self.max_prompt_length,
+                truncation=False,
             )
             # transformers v5 flipped apply_chat_template's `return_dict` default
             # from False to True: it now returns a BatchEncoding, and integer-
             # indexing a fast-tokenizer BatchEncoding yields a tokenizers.Encoding
             # (no `.to`), not a tensor. Pin return_dict=False so we keep the bare
             # input_ids [1, L] tensor identically across v4/v5; squeeze leading dim.
-            per_sample_ids.append(ids[0].to(device=device, dtype=torch.long))
+            ids = ids[0]
+            if ids.shape[0] > self.max_prompt_length:
+                ids = ids[-self.max_prompt_length :]
+            per_sample_ids.append(ids.to(device=device, dtype=torch.long))
 
         # Right-pad to the in-batch max so the AR loop can use a single tensor.
         max_len = max(int(t.shape[0]) for t in per_sample_ids)

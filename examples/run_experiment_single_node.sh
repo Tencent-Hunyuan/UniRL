@@ -6,6 +6,7 @@
 # The driver is one of the Hydra entrypoints, selected with ENTRY:
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
 #   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
+#   train_sft                  examples/sft/ (qwen3, qwen_vl, BAGEL, SD3)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
 #   train_unified_model        examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
 #   train_alfworld             examples/alfworld/ (barrier agentic environment training)
@@ -21,8 +22,8 @@
 # a different node count still runs here (an explicit num_devices=... wins).
 #
 # Run settings come from the conf via ${oc.env:...}: model checkpoint
-# (PRETRAINED_MODEL / QWEN_VL_PATH / ...), data (DATA_PATH / EVAL_DATA_PATH —
-# read only by the VLM/AR recipes; diffusion recipes use their own data_source),
+# (PRETRAINED_MODEL / QWEN_VL_PATH / ...), data (DATA_PATH / EVAL_DATA_PATH /
+# SFT_DATA / SFT_EVAL_DATA; diffusion recipes use their own data_source),
 # and W&B (REPORT_TO_WANDB / WANDB_RUN_NAME / WANDB_ENTITY / WANDB_PROJECT).
 # Export any of them before running to override a conf's own default.
 #

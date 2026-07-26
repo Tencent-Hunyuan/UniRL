@@ -202,6 +202,10 @@ def build_media_preview_for_part(
         # pair it beside the output when it covers the (possibly shard-prefixed) batch.
         input_pixels = None
         if isinstance(input_image, Images) and input_image.pixels is not None:
+            # The source image reaches the driver through the same dehydrated
+            # transport path as decoded output. Hydrate it before shape checks
+            # and indexing; a TensorRef is metadata, not a tensor.
+            input_image = map_tree(input_image, hydrate)
             input_pixels = input_image.pixels
         show_edit_pairs = input_pixels is not None and int(input_pixels.shape[0]) >= int(pixels.shape[0])
         for idx in range(int(pixels.shape[0])):

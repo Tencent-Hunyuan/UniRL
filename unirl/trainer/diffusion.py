@@ -14,6 +14,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
+from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
@@ -57,7 +58,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
         eval_rewards_cfg: Optional[Any] = None,
-        stage_config: Optional[Dict[str, Any]] = None,
+        task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -95,7 +96,7 @@ class DiffusionTrainer(BaseTrainer):
         # dataset that is MISSING source images fail loudly in the pipeline (it2i
         # requires an input image) instead of silently degrading to t2i. Empty ⇒ the
         # pipeline infers the task as before (unchanged for every other recipe).
-        self._stage_config: Dict[str, Any] = dict(stage_config) if stage_config else {}
+        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -411,9 +412,32 @@ class DiffusionTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text", "image", "video"},
             caller="DiffusionTrainer._build_request_sample",
-            root_control=dict(self._stage_config),
+            root_control=dict(self._task_config),
         )
-        return request.fork(total_samples_per_prompt(sp), sampling_params=diffusion)
+        samples_per_prompt = total_samples_per_prompt(sp)
+        request = request.fork(samples_per_prompt, sampling_params=diffusion)
+
+        # Eval x_T is keyed on prompt CONTENT plus sibling ordinal instead of the
+        # rollout id. This keeps the same prompt/sample slot byte-identical across
+        # steps/checkpoints while K>1 siblings remain distinct. The explicit keys
+        # live on the gen Part as a CONCAT field so DP splitting preserves alignment.
+        if sampling is not None and self._noise_latent_shape is not None:
+            from unirl.sde.noise import make_prompt_seed_group_id
+
+            texts = next((value for value in request.conditioning() if isinstance(value, Texts)), None)
+            if not isinstance(texts, Texts) or len(texts.texts) != len(request.parts[-1].sample_ids):
+                raise ValueError(
+                    "DiffusionTrainer eval cannot key x_T on prompt content: "
+                    f"prompt count {len(texts.texts) if isinstance(texts, Texts) else 'None'} != "
+                    f"sample count {len(request.parts[-1].sample_ids)}."
+                )
+            noise_group_ids = [
+                make_prompt_seed_group_id(text, sample_ordinal=index % samples_per_prompt)
+                for index, text in enumerate(texts.texts)
+            ]
+            frontier = dataclasses.replace(request.parts[-1], init_noise_group_ids=noise_group_ids)
+            request = request.with_parts([*request.parts[:-1], frontier])
+        return request
 
     def train_step(
         self,

@@ -126,8 +126,9 @@ class NoiseRecipe:
         if bool(getattr(diffusion, "disable_driver_xt", False)):
             return cls()
         seg = gen.segment
+        explicit_keys = list(getattr(gen, "init_noise_group_ids", None) or [])
         share = bool(getattr(diffusion, "init_same_noise", False)) if diffusion is not None else False
-        keys = gen.group_ids if share else list(gen.sample_ids)
+        keys = explicit_keys or (gen.group_ids if share else list(gen.sample_ids))
         shape = getattr(diffusion, "init_noise_latent_shape", None) if diffusion is not None else None
         seed = int(diffusion.seed) if diffusion is not None and getattr(diffusion, "seed", None) is not None else 0
         return cls(
