@@ -7,6 +7,7 @@ from typing import Any
 
 _PATCH_SENTINEL = "_unirl_qwen3_omni_lora_compat"
 _AUDIO_TRUNCATION_SENTINEL = "_unirl_audio_truncation_lengths_patched"
+_MROPE_SENTINEL = "_unirl_audio_video_mrope_patched"
 
 
 def patch_qwen3_omni_thinker_class(model_cls: type[Any]) -> None:
@@ -114,4 +115,70 @@ def patch_qwen3_omni_audio_truncation(processor_cls: type[Any]) -> None:
     setattr(processor_cls, _AUDIO_TRUNCATION_SENTINEL, True)
 
 
-__all__ = ["patch_qwen3_omni_audio_truncation", "patch_qwen3_omni_thinker_class"]
+def patch_qwen3_omni_audio_video_mrope(thinker_cls: type[Any]) -> None:
+    """Align interleaved audio/video delimiter positions with Transformers."""
+    if getattr(thinker_cls, _MROPE_SENTINEL, False):
+        return
+
+    import torch
+
+    original = thinker_cls.get_mrope_input_positions
+
+    @wraps(original)
+    def _patched_get_mrope_input_positions(
+        self: Any,
+        input_tokens: list[int],
+        mm_features: Any,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, int]:
+        positions, delta = original(self, input_tokens, mm_features, **kwargs)
+        config = self.config
+        audio_start = int(config.audio_start_token_id)
+        audio_end = int(config.audio_end_token_id)
+        audio_token = int(config.audio_token_id)
+        video_token = int(config.video_token_id)
+        tokens = torch.as_tensor(input_tokens, dtype=torch.long)
+
+        blocks: list[tuple[int, int]] = []
+        for start in (tokens == audio_start).nonzero().flatten().tolist():
+            video_start = int(start) + 1
+            if video_start >= tokens.numel() or int(tokens[video_start]) != video_token:
+                continue
+            audio_end_idx = video_start
+            while audio_end_idx < tokens.numel() and int(tokens[audio_end_idx]) in (
+                video_token,
+                audio_token,
+            ):
+                audio_end_idx += 1
+            if audio_end_idx + 1 >= tokens.numel() or int(tokens[audio_end_idx]) != audio_end:
+                continue
+            blocks.append((video_start, audio_end_idx))
+        if not blocks:
+            return positions, delta
+
+        corrected = positions.clone()
+        cursor = 0
+        cumulative_shift = 0
+        for video_start, audio_end_idx in blocks:
+            corrected[:, cursor:video_start] = positions[:, cursor:video_start] + cumulative_shift
+            corrected[:, video_start:audio_end_idx] = (
+                positions[:, video_start + 1 : audio_end_idx + 1] + cumulative_shift
+            )
+            eos_position = positions[:, audio_end_idx + 1] + cumulative_shift
+            corrected[:, audio_end_idx] = eos_position
+            corrected[:, audio_end_idx + 1] = eos_position + 1
+            cursor = audio_end_idx + 2
+            cumulative_shift += 2
+        corrected[:, cursor:] = positions[:, cursor:] + cumulative_shift
+        corrected_delta = int(corrected.max().item()) + 1 - len(input_tokens)
+        return corrected, corrected_delta
+
+    thinker_cls.get_mrope_input_positions = _patched_get_mrope_input_positions
+    setattr(thinker_cls, _MROPE_SENTINEL, True)
+
+
+__all__ = [
+    "patch_qwen3_omni_audio_truncation",
+    "patch_qwen3_omni_audio_video_mrope",
+    "patch_qwen3_omni_thinker_class",
+]
