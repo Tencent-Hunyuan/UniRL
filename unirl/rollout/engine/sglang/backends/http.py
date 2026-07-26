@@ -39,6 +39,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.sglang.backends.base import (
     _normalize_cuda_visible_devices,
+    _preloaded_cuda_driver_libraries,
+    _run_with_cuda_driver_preloads,
     _scheduler_spawn_environment,
 )
 
@@ -309,7 +311,14 @@ class HTTPBackend:
         if visible_devices is not None:
             # The restricted list is re-indexed to logical ordinals 0..TP-1.
             server_args.base_gpu_id = 0
-        process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
+        cuda_driver_preloads = _preloaded_cuda_driver_libraries()
+        if cuda_driver_preloads:
+            process = multiprocessing.Process(
+                target=_run_with_cuda_driver_preloads,
+                args=(rt["launch_server"], (server_args,), cuda_driver_preloads),
+            )
+        else:
+            process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
         # The server child captures the clean library path and CUDA tokens at
         # start; the Ray Worker's environment is restored immediately after.
         with _scheduler_spawn_environment(visible_devices):

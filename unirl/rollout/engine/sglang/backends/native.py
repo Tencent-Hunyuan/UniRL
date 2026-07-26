@@ -43,6 +43,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.sglang.backends.base import (
     _normalize_cuda_visible_devices,
+    _preserve_cuda_driver_preloads,
     _scheduler_spawn_environment,
 )
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
@@ -206,7 +207,7 @@ class NativeBackend:
         if visible_devices is not None:
             # The restricted list is re-indexed to logical ordinals 0..TP-1.
             engine_kwargs["base_gpu_id"] = 0
-        with _scheduler_spawn_environment(visible_devices):
+        with _scheduler_spawn_environment(visible_devices), _preserve_cuda_driver_preloads():
             engine = rt["Engine"](**engine_kwargs)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
