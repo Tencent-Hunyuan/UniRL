@@ -16,11 +16,13 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="unified_model/hi3_vllmomni")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_unified_model")
     trainer = UnifiedModelTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

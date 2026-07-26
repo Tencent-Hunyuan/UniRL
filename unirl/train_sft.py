@@ -13,11 +13,13 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.sft import SFTTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="sft/qwen3_sft")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_sft")
     trainer = SFTTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

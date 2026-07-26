@@ -6,10 +6,11 @@ training Policy itself is the sampler (direct sampling, on-policy RL) —
 the rollout runs in the same Ray actor / Python process / GPU as
 training, so no worker subprocess and no weight sync are needed.
 
-Selected via ``cfg.rollout.engine: trainside`` (the registration in
-``config.py`` wires ``_target_`` to ``TrainsideRolloutEngine``). The
-presence of this target is the canonical signal for
-:func:`unirl.config.validation.is_direct_sampling`.
+Selected by pointing a recipe's ``rollout`` block at
+``TrainsideRolloutEngine``. Living in this package is what marks the engine
+direct-sampling for :func:`unirl.config.contracts.is_direct_sampling`, which
+gates the recipe contracts that follow from it (no ``sync`` section, no
+offload, no separate device slab).
 """
 
 from unirl.rollout.engine.trainside.config import TrainsideEngineConfig

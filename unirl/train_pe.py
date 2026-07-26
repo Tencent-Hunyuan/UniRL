@@ -14,11 +14,13 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.pe import PETrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="pe/pe_trainside_pickscore")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_pe")
     trainer = PETrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

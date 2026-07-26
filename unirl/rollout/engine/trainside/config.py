@@ -4,9 +4,11 @@ Empty dataclass — the engine's only runtime deps (``pipeline``, ``policy``)
 are Python handles owned by the train actor, injected when the actor
 constructs :class:`TrainsideRolloutEngine`.
 
-Recipes wire ``rollout: {_target_: ...TrainsideRolloutEngine, ...}`` directly;
-a ``_target_`` ending in ``TrainsideRolloutEngine`` is what
-:func:`unirl.config.validation.is_direct_sampling` keys off.
+Recipes wire ``rollout: {_target_: ...TrainsideRolloutEngine, ...}`` directly.
+A ``_target_`` under this package is what
+:func:`unirl.config.contracts.is_direct_sampling` keys off, so the class may be
+renamed freely but moving it out of ``engine/trainside/`` would need a matching
+update to ``ENGINE_FAMILIES``.
 """
 
 from __future__ import annotations

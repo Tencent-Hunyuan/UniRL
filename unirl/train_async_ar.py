@@ -26,11 +26,13 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.async_ar import AsyncARTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="ar/qwen3_grpo_4b_base_dapo_sglang_async")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_async_ar")
     trainer = AsyncARTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

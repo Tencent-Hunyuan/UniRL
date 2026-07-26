@@ -49,3 +49,14 @@ repos:
         language: python
         pass_filenames: false
         always_run: true
+
+      # Static guard that every recipe satisfies the cross-component contracts
+      # (engine <-> sync, offload, layout) and that the engine-family table
+      # those contracts read still matches the engine classes.
+      - id: check-recipe-contracts
+        name: recipe cross-component contracts hold
+        entry: python scripts/check_recipe_contracts.py
+        language: python
+        additional_dependencies: [pyyaml]
+        pass_filenames: false
+        always_run: true
