@@ -1,0 +1,95 @@
+# Native BAGEL think-then-image topology for UniRL T2TI rollouts.
+#
+# This is a self-contained copy of vllm-omni's bagel.yaml deployment knobs
+# with the bagel_think pipeline selected. Unlike the normal bagel topology,
+# bagel_think transfers KV only after AR decoding finishes. UniRL adds the two
+# weight receivers and its trajectory/replay-aware BAGEL diffusion pipeline.
+
+pipeline: bagel_think
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: "mp"
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    # UniRL fans out N thoughts as independent prompt-major requests, so this
+    # stage never needs the stock BAGEL deployment's three concurrent 32k
+    # multimodal sequences. The adapter rejects image inputs, so explicitly
+    # disable both BAGEL multimodal input classes; otherwise vLLM profiles a
+    # worst-case img2img item and leaves no memory for the AR KV cache when the
+    # two stages share one GPU.
+    max_model_len: 8192
+    max_num_batched_tokens: 8192
+    max_num_seqs: 1
+    # The co-located DiT is already resident when vLLM profiles free memory,
+    # which makes a fractional KV budget collapse to zero. One GiB holds more
+    # than one full 8k BAGEL KV sequence; let vLLM allocate that cache directly.
+    kv_cache_memory_bytes: 1073741824
+    enforce_eager: true
+    limit_mm_per_prompt:
+      image: 0
+      img2img: 0
+    gpu_memory_utilization: 0.45
+    devices: "0"
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 52
+      detokenize: true
+      repetition_penalty: 1.05
+    # vLLM-Omni 0.20 ignores an explicit nested engine_extras mapping. Unknown
+    # flat stage keys are preserved as engine extras by both 0.20 and newer.
+    enable_lora: false
+    tensor_parallel_size: 1
+    worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.ar_extension.BagelARWeightSyncExtension
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 52
+    enable_lora: false
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend: null
+    cache_config: null
+    enable_cache_dit_summary: false
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    custom_pipeline_args:
+      pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.bagel.pipeline.RLBagelPipeline
+    worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"
+      device_name: ""
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"

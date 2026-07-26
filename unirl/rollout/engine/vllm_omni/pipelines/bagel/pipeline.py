@@ -20,6 +20,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
     resolve_request_noise,
+    stamp_custom_output,
 )
 from unirl.rollout.engine.vllm_omni.pipelines.bagel.bagel_flow_match_sde_scheduler import (
     BagelFlowSDEScheduler,
@@ -27,6 +28,9 @@ from unirl.rollout.engine.vllm_omni.pipelines.bagel.bagel_flow_match_sde_schedul
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+
+_BAGEL_KV_REPLAY_TRACE_KEY = "unirl_bagel_t2ti_trace"
+_BAGEL_T2TI_REPLAY_OUTPUT_KEY = "bagel_t2ti_replay"
 
 
 class RLBagelPipeline(BagelPipeline):
@@ -265,6 +269,7 @@ class RLBagelPipeline(BagelPipeline):
             sde_indices=extra.get("sde_indices"),
             sigma_max=float(sigma_max) if sigma_max is not None else None,
             trajectory_dtype=traj_dtype,
+            noise_seed=int(extra["sde_seed"]) if extra.get("sde_seed") is not None else None,
             image_token_sizes=image_token_sizes,
         )
 
@@ -280,6 +285,97 @@ class RLBagelPipeline(BagelPipeline):
         """Overwrite upstream's trajectory capture with the SDE scheduler's — sets
         latents/timesteps/log_probs + sparse sde_step_indices (the build_image_segment wire)."""
         drain_trajectory_into(out, self._sde_scheduler)
+
+    def _native_t2ti_replay_payload(self, req: OmniDiffusionRequest) -> Optional[dict[str, Any]]:
+        """Validate Stage-0's transfer trace and echo Stage-1's observations.
+
+        Presence of the private transfer key identifies a native BAGEL T2TI
+        request. Plain single-stage ``bagel_t2i`` has no injected cache and
+        returns ``None`` here, preserving its existing prompt-rebuild path.
+        """
+        sp = req.sampling_params
+        metadata = getattr(sp, "kv_metadata", None) or {}
+        trace = metadata.get(_BAGEL_KV_REPLAY_TRACE_KEY)
+        if trace is None:
+            return None
+        if not isinstance(trace, dict):
+            raise RuntimeError(
+                f"RLBagelPipeline: native T2TI KV replay trace must be a mapping; got {type(trace).__name__}."
+            )
+
+        required = {"cache_input_ids", "chunk_offsets", "excluded_tail_input_ids", "kv_length", "ropes"}
+        missing = sorted(required - set(trace))
+        if missing:
+            raise RuntimeError(f"RLBagelPipeline: native T2TI KV replay trace is missing fields {missing}.")
+
+        cache_input_ids = [int(token) for token in trace["cache_input_ids"]]
+        chunk_offsets = [int(offset) for offset in trace["chunk_offsets"]]
+        excluded_tail_input_ids = [int(token) for token in trace["excluded_tail_input_ids"]]
+        kv_length = int(trace["kv_length"])
+        stage0_ropes = [int(rope) for rope in trace["ropes"]]
+        if not cache_input_ids or len(cache_input_ids) != kv_length:
+            raise RuntimeError(
+                "RLBagelPipeline: Stage-0 cache-input trace length does not match its KV length: "
+                f"tokens={len(cache_input_ids)}, kv_length={kv_length}."
+            )
+        if (
+            len(chunk_offsets) < 2
+            or chunk_offsets[0] != 0
+            or chunk_offsets[-1] != kv_length
+            or any(b <= a for a, b in zip(chunk_offsets, chunk_offsets[1:]))
+        ):
+            raise RuntimeError(
+                "RLBagelPipeline: invalid Stage-0 cache-input chunk offsets "
+                f"{chunk_offsets!r} for kv_length={kv_length}."
+            )
+        if not stage0_ropes:
+            raise RuntimeError("RLBagelPipeline: Stage-0 T2TI ropes must be non-empty.")
+        if len(excluded_tail_input_ids) > 1 or any(token < 0 for token in excluded_tail_input_ids):
+            raise RuntimeError(
+                "RLBagelPipeline: Stage-0 excluded async tail must contain at most one non-negative token; "
+                f"got {excluded_tail_input_ids!r}."
+            )
+
+        injected_kv = getattr(sp, "past_key_values", None)
+        try:
+            received_kv_length = int(injected_kv.key_cache[0].shape[0])
+        except (AttributeError, KeyError, TypeError, IndexError) as exc:
+            raise RuntimeError(
+                "RLBagelPipeline: native T2TI replay metadata arrived without a readable injected KV cache."
+            ) from exc
+        received_ropes = [int(rope) for rope in (metadata.get("ropes") or [received_kv_length])]
+        if received_kv_length != kv_length:
+            raise RuntimeError(
+                "RLBagelPipeline: Stage-1 received KV length differs from Stage 0: "
+                f"received={received_kv_length}, stage0={kv_length}."
+            )
+        if received_ropes != stage0_ropes:
+            raise RuntimeError(
+                "RLBagelPipeline: Stage-1 received ropes differ from Stage 0: "
+                f"received={received_ropes!r}, stage0={stage0_ropes!r}."
+            )
+
+        if metadata.get("image_shape") is not None:
+            image_shape = [int(value) for value in metadata["image_shape"]]
+        else:
+            max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
+            image_shape = [
+                int(sp.height) if sp.height is not None else max_hw,
+                int(sp.width) if sp.width is not None else max_hw,
+            ]
+        if len(image_shape) != 2 or any(value <= 0 for value in image_shape):
+            raise RuntimeError(f"RLBagelPipeline: invalid native T2TI image shape {image_shape!r}.")
+
+        return {
+            "cache_input_ids": cache_input_ids,
+            "chunk_offsets": chunk_offsets,
+            "excluded_tail_input_ids": excluded_tail_input_ids,
+            "kv_length": kv_length,
+            "ropes": stage0_ropes,
+            "received_kv_length": received_kv_length,
+            "received_ropes": received_ropes,
+            "image_shape": image_shape,
+        }
 
     # ------------------------------------------------------------------ #
     # the protocol
@@ -329,11 +425,17 @@ class RLBagelPipeline(BagelPipeline):
         self._arm_sde(req)
         self._arm_initial_noise(req)
 
+        # Validate the native transfer before Stage 1 consumes it. This payload
+        # contains only reconstruction metadata; cache tensors stay in vLLM-Omni.
+        replay_payload = self._native_t2ti_replay_payload(req)
+
         # Delegate the full pipeline to upstream; the noise tap fires inside and the
         # scheduler captures the trajectory as the loop runs.
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
+        if replay_payload is not None:
+            stamp_custom_output(out, _BAGEL_T2TI_REPLAY_OUTPUT_KEY, replay_payload)
         return out
 
     def _forward_batched(self, req: OmniDiffusionRequest, spp: int, **kwargs) -> DiffusionOutput:

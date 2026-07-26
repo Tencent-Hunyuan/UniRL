@@ -56,16 +56,19 @@ import inspect
 import json
 import logging
 import os
+import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager, nullcontext
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
-from hydra.utils import instantiate
+from hydra.utils import get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
+from unirl.models.bagel.conditions import BagelT2TIDiffusionConditions
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.eval_suites import build_eval_suites
@@ -83,6 +86,116 @@ logger = logging.getLogger(__name__)
 # groups by prompt), "image" is its 1:1 child (LatentSegment).
 AR_TRACK = "ar"
 IMAGE_TRACK = "image"
+
+
+def _bagel_t2ti_replay_permutation(
+    track: RolloutTrack,
+    *,
+    num_shards: int,
+    num_updates: int,
+) -> Optional[torch.Tensor]:
+    """Plan equal-size DP shards with aligned exact-replay depths.
+
+    Each optimizer update keeps exactly the samples it owned before the
+    permutation. Within that membership, adjacent replay depths are distributed
+    one per rank so the per-position MAX used by collective padding stays close
+    to real work on every rank.
+    """
+    num_shards = int(num_shards)
+    num_updates = int(num_updates)
+    total = int(track.batch_size)
+    if num_shards <= 1 or num_updates <= 0 or total == 0 or total % num_shards != 0:
+        return None
+    shard_size = total // num_shards
+    if shard_size % num_updates != 0:
+        return None
+
+    try:
+        conditions = BagelT2TIDiffusionConditions.from_dict(track.conditions)
+    except ValueError:
+        return None
+    if conditions.batch_size != total:
+        return None
+
+    update_size = shard_size // num_updates
+    replay_depths = [len(spec.chunk_offsets) - 1 for spec in conditions.replay_specs]
+    planned: List[List[List[int]]] = [[[] for _ in range(num_updates)] for _ in range(num_shards)]
+
+    for update in range(num_updates):
+        members = [
+            rank * shard_size + update * update_size + offset
+            for rank in range(num_shards)
+            for offset in range(update_size)
+        ]
+        members.sort(key=lambda index: (-replay_depths[index], index))
+        loads = [0 for _ in range(num_shards)]
+        for start in range(0, len(members), num_shards):
+            bucket = members[start : start + num_shards]
+            ranks = sorted(range(num_shards), key=lambda rank: (loads[rank], rank))
+            for rank, index in zip(ranks, bucket):
+                planned[rank][update].append(index)
+                loads[rank] += replay_depths[index]
+
+    permutation = [
+        index for rank in range(num_shards) for update in range(num_updates) for index in planned[rank][update]
+    ]
+    if len(permutation) != total or len(set(permutation)) != total:
+        raise RuntimeError("BAGEL T2TI replay planner did not produce a complete permutation.")
+    return torch.tensor(permutation, dtype=torch.long)
+
+
+def _bagel_t2ti_replay_depth_metrics(depths: List[int]) -> Dict[str, float]:
+    """Summarize native Stage-0 scheduler depth without retaining a histogram."""
+    if not depths:
+        return {}
+    ordered = sorted(int(depth) for depth in depths)
+
+    def percentile(fraction: float) -> float:
+        index = round((len(ordered) - 1) * float(fraction))
+        return float(ordered[index])
+
+    return {
+        "bagel_t2ti_replay_depth_min": float(ordered[0]),
+        "bagel_t2ti_replay_depth_mean": float(sum(ordered) / len(ordered)),
+        "bagel_t2ti_replay_depth_p50": percentile(0.50),
+        "bagel_t2ti_replay_depth_p90": percentile(0.90),
+        "bagel_t2ti_replay_depth_p99": percentile(0.99),
+        "bagel_t2ti_replay_depth_max": float(ordered[-1]),
+    }
+
+
+def _reduce_rollout_boundary_metrics(reports: Any) -> Dict[str, float]:
+    """Reduce per-DP-worker optimizer-boundary telemetry on the driver.
+
+    ``Dispatch.BROADCAST`` returns one mapping per worker. Byte counters are
+    physical per-rank allocations and therefore sum across the DP slab; host
+    times and pending restore slots use the worst worker because handle dispatch
+    is a barrier.
+    """
+    worker_reports: List[Mapping[str, Any]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            worker_reports.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+
+    collect(reports)
+    keys = {str(key) for report in worker_reports for key in report}
+    reduced: Dict[str, float] = {}
+    for key in keys:
+        values = [float(report[key]) for report in worker_reports if report.get(key) is not None]
+        if not values:
+            continue
+        reduced[key] = max(values) if key.endswith(("_host_time_s", "_slots_pending")) else sum(values)
+    return reduced
+
+
+class _RolloutBoundaryMetrics(dict[str, float]):
+    """Boundary telemetry plus a non-logged parked-state handoff marker."""
+
+    optimizer_restore_deferred: bool = False
 
 
 def deep_hydrate(obj: Any) -> Any:
@@ -153,6 +266,8 @@ class UnifiedModelTrainer(BaseTrainer):
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
+        park_optimizer_state_during_rollout: bool = False,
+        park_optimizer_state_during_train: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = 32,
         eval_cfg_text_scale: float = 4.0,
@@ -161,10 +276,17 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
+        self._train_dp_size = int(self.pool.num_devices)
+        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         # Colocate memory dance: offload the FSDP train state (base + grads +
         # optimizer) to CPU during rollout so the awake engines fit, onload
         # before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        self._park_optimizer_state_during_rollout = bool(park_optimizer_state_during_rollout)
+        self._park_optimizer_state_during_train = bool(park_optimizer_state_during_train)
+        self._deferred_train_optimizer_restore = False
+        fsdp_cfg = backend_cfg.get("fsdp_cfg")
+        self._backend_persistent_cpu_offload = bool(fsdp_cfg is not None and fsdp_cfg.get("cpu_offload", False))
 
         # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
         # eval_interval=0 disables it. Scores only the image track, generated at
@@ -193,6 +315,23 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        rollout_engine_cfg = rollout_cfg.get("config") if rollout_cfg is not None else None
+        self._strict_bagel_t2ti = bool(
+            rollout_engine_cfg is not None and rollout_engine_cfg.get("modality") == "bagel_t2ti"
+        )
+        if self._strict_bagel_t2ti:
+            self._validate_bagel_t2ti_contract(self.sampling_params, sync_cfg)
+        # Driver-authored x_T recipe for native BAGEL T2TI. Keep one base key
+        # per source prompt; the adapter either shares it across N thoughts or
+        # expands it to /aN/i0 according to init_same_noise.
+        self._noise_latent_shape: Optional[List[int]] = (
+            None
+            if os.environ.get("DISABLE_DRIVER_XT")
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+            )
+        )
 
         # Set below from the `sync` block; None means no sync (e.g. trainside).
         self.weight_sync = None
@@ -222,6 +361,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 fsdp_backend=self.backend,
                 ar_algorithm=self.ar_algorithm,
                 image_algorithm=self.image_algorithm,
+                park_optimizer_state_during_train=self._park_optimizer_state_during_train,
             )
 
             # Rollout wiring. Single-engine (M=1 / UniGRPO — a trainside or single
@@ -233,6 +373,7 @@ class UnifiedModelTrainer(BaseTrainer):
             self._single_engine = rollout_cfg is not None
             self._shared_advantage = self._single_engine
             self._rollout_is_trainside = False
+            self._single_engine_staged_sync = False
             if self._single_engine:
                 self.dp = 1
                 self.ar_rollouts = []
@@ -241,13 +382,97 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.dit_rollout = None
                 rollout_parsed = parse_hydra_cfg(rollout_cfg)
                 self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+                self._validate_optimizer_state_parking_contract(
+                    enabled=self._park_optimizer_state_during_rollout,
+                    single_engine=True,
+                    rollout_is_trainside=self._rollout_is_trainside,
+                    enable_fsdp_offload=self._enable_fsdp_offload,
+                    backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+                )
+                self._validate_train_optimizer_state_parking_contract(
+                    enabled=self._park_optimizer_state_during_train,
+                    rollout_parking_enabled=self._park_optimizer_state_during_rollout,
+                    single_engine=True,
+                    rollout_is_trainside=self._rollout_is_trainside,
+                    enable_fsdp_offload=self._enable_fsdp_offload,
+                    backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+                )
                 if self._rollout_is_trainside:
                     self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
                     self._enable_fsdp_offload = False  # shares live FSDP modules
                 else:
+                    sync_role_cls = None
+                    if sync_cfg is not None:
+                        sync_role_cls = parse_hydra_cfg(sync_cfg)["role_cls"]
+                        self._single_engine_staged_sync = all(
+                            callable(getattr(sync_role_cls, method, None)) for method in ("extract", "push", "discard")
+                        )
+                        if self._enable_fsdp_offload and not self._single_engine_staged_sync:
+                            raise ValueError(
+                                "UnifiedModelTrainer: an offloaded external single engine "
+                                "requires a staged weight sync exposing extract(), push(), "
+                                "and discard(); use CPUStagedFullWeightSync. A one-shot "
+                                "sync would require the trainer and awake engine to coexist."
+                            )
+                        needs_cpu_policy = bool(
+                            getattr(
+                                sync_role_cls,
+                                "requires_persistent_cpu_offload_on_single_device",
+                                False,
+                            )
+                        )
+                        if needs_cpu_policy and self.pool.num_devices == 1 and not self._backend_persistent_cpu_offload:
+                            raise ValueError(
+                                "UnifiedModelTrainer: single-device staged full fine-tuning "
+                                "requires backend.fsdp_cfg.cpu_offload=true. Coarse engine/FSDP "
+                                "time-sharing alone is insufficient because fp32 masters and "
+                                "Adam state exceed one 80GB GPU."
+                            )
+                    # External single-engine mode time-shares one GPU with the
+                    # trainer. Boot only after FSDP has left the device, then
+                    # immediately sleep the engine to establish the steady state
+                    # expected by train_step/evaluate.
+                    if self._enable_fsdp_offload:
+                        self.backend.prepare_for_rollout()
                     self.rollout = remote(**rollout_parsed)
+                    try:
+                        self.rollout.sleep()
+                        if sync_cfg is not None:
+                            self.weight_sync = remote_hydra(
+                                sync_cfg,
+                                backend=self.backend,
+                                rollout=self.rollout,
+                            )
+                    except BaseException:
+                        # Construction has no enclosing rollout session yet. Do
+                        # an explicit best-effort release so a failed initial
+                        # sleep or sync constructor cannot orphan Omni pools.
+                        try:
+                            self.rollout.sleep()
+                        except BaseException as exc:
+                            logger.exception("Initial Omni cleanup sleep failed: %s", exc)
+                        try:
+                            self.rollout.shutdown()
+                        except BaseException as exc:
+                            logger.exception("Initial Omni shutdown failed: %s", exc)
+                        raise
                 return
 
+            self._validate_optimizer_state_parking_contract(
+                enabled=self._park_optimizer_state_during_rollout,
+                single_engine=False,
+                rollout_is_trainside=False,
+                enable_fsdp_offload=self._enable_fsdp_offload,
+                backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+            )
+            self._validate_train_optimizer_state_parking_contract(
+                enabled=self._park_optimizer_state_during_train,
+                rollout_parking_enabled=self._park_optimizer_state_during_rollout,
+                single_engine=False,
+                rollout_is_trainside=False,
+                enable_fsdp_offload=self._enable_fsdp_offload,
+                backend_persistent_cpu_offload=self._backend_persistent_cpu_offload,
+            )
             if ar_rollout_cfg is None or dit_rollout_cfg is None:
                 raise ValueError(
                     "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
@@ -340,6 +565,97 @@ class UnifiedModelTrainer(BaseTrainer):
                     [(eng.role_name, eng.workers) for eng in self.ar_rollouts + self.dit_rollouts]
                 )
 
+    @staticmethod
+    def _validate_bagel_t2ti_contract(
+        sampling_params: Dict[str, BaseSamplingParams],
+        sync_cfg: Optional[DictConfig],
+    ) -> None:
+        """Reject BAGEL settings that cannot represent on-policy P*N*1 training."""
+        ar_params = sampling_params.get("ar")
+        diff_params = sampling_params.get("diffusion")
+        n_thoughts = int(getattr(ar_params, "samples_per_prompt", 0))
+        n_images = int(getattr(diff_params, "samples_per_prompt", 0))
+        if n_thoughts < 2:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires ar.samples_per_prompt >= 2; "
+                "N=1 produces zero prompt-group advantages."
+            )
+        if n_images != 1:
+            raise ValueError(
+                f"UnifiedModelTrainer: bagel_t2ti requires diffusion.samples_per_prompt == 1; got {n_images}."
+            )
+        if sync_cfg is None:
+            raise ValueError(
+                "UnifiedModelTrainer: external bagel_t2ti requires strict full-weight sync to both Omni stages."
+            )
+        sync_target = str(sync_cfg.get("_target_", ""))
+        if not sync_target.endswith("CPUStagedFullWeightSync"):
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires CPUStagedFullWeightSync; "
+                f"got {sync_target or '<missing target>'}."
+            )
+        if sync_cfg.get("load_plan") != "bagel_vllm_omni_0_20":
+            raise ValueError("UnifiedModelTrainer: bagel_t2ti requires sync.load_plan='bagel_vllm_omni_0_20'.")
+        stage_ids = {int(stage_id) for stage_id in sync_cfg.get("stage_ids", ())}
+        if stage_ids != {0, 1}:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires sync.stage_ids to contain exactly {0, 1}; "
+                f"got {sorted(stage_ids)}."
+            )
+
+    @staticmethod
+    def _validate_optimizer_state_parking_contract(
+        *,
+        enabled: bool,
+        single_engine: bool,
+        rollout_is_trainside: bool,
+        enable_fsdp_offload: bool,
+        backend_persistent_cpu_offload: bool,
+    ) -> None:
+        """Keep optimizer-only parking distinct from either FSDP offload mode."""
+        if not enabled:
+            return
+        if not single_engine or rollout_is_trainside:
+            raise ValueError(
+                "UnifiedModelTrainer: park_optimizer_state_during_rollout is only valid "
+                "for an external single-engine rollout."
+            )
+        if enable_fsdp_offload:
+            raise ValueError(
+                "UnifiedModelTrainer: optimizer-state parking requires enable_fsdp_offload=false; "
+                "the feature keeps FSDP parameters and shards on GPU."
+            )
+        if backend_persistent_cpu_offload:
+            raise ValueError(
+                "UnifiedModelTrainer: optimizer-state parking requires backend.fsdp_cfg.cpu_offload=false."
+            )
+
+    @staticmethod
+    def _validate_train_optimizer_state_parking_contract(
+        *,
+        enabled: bool,
+        rollout_parking_enabled: bool,
+        single_engine: bool,
+        rollout_is_trainside: bool,
+        enable_fsdp_offload: bool,
+        backend_persistent_cpu_offload: bool,
+    ) -> None:
+        """Limit train-phase parking to the proven external BAGEL lifecycle."""
+        if not enabled:
+            return
+        if not rollout_parking_enabled:
+            raise ValueError(
+                "UnifiedModelTrainer: park_optimizer_state_during_train requires "
+                "park_optimizer_state_during_rollout=true so Adam is also absent while Omni is awake."
+            )
+        UnifiedModelTrainer._validate_optimizer_state_parking_contract(
+            enabled=True,
+            single_engine=single_engine,
+            rollout_is_trainside=rollout_is_trainside,
+            enable_fsdp_offload=enable_fsdp_offload,
+            backend_persistent_cpu_offload=backend_persistent_cpu_offload,
+        )
+
     def _wire_engine(self, cfg: DictConfig, *, anchor_device: int) -> Any:
         """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker.
 
@@ -356,6 +672,200 @@ class UnifiedModelTrainer(BaseTrainer):
         parsed = parse_hydra_cfg(cfg)
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
+
+    def _resolve_noise_latent_shape(
+        self,
+        *,
+        pipeline_cfg: DictConfig,
+        model_cfg: DictConfig,
+    ) -> Optional[List[int]]:
+        """Resolve the pipeline-owned packed x_T geometry without instantiation."""
+        target = getattr(pipeline_cfg, "_target_", None)
+        if not isinstance(target, str):
+            return None
+        resolved = get_object(target)
+        pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
+        latent_shape = getattr(pipeline_cls, "latent_shape", None)
+        if latent_shape is None:
+            return None
+        try:
+            shape = latent_shape(
+                model_config=model_cfg,
+                sampling_spec=self.sampling_params.get("diffusion"),
+            )
+        except NotImplementedError:
+            return None
+        return [int(value) for value in shape]
+
+    def _restore_optimizer_state_after_reclaim(self) -> Dict[str, float]:
+        """Reclaim cached CUDA blocks, restore Adam, and verify the plan drained."""
+        self.backend.reclaim_cuda_allocator()
+        report = _reduce_rollout_boundary_metrics(self.backend.restore_optimizer_state_after_rollout())
+        pending = float(report.get("optimizer_state_restore_slots_pending", 0.0))
+        if pending:
+            raise RuntimeError(f"optimizer restore left {int(pending)} state slot(s) pending.")
+        return report
+
+    def _restore_deferred_train_optimizer_state(self) -> Dict[str, float]:
+        """Idempotently consume deferred optimizer ownership before driver work."""
+        if not bool(getattr(self, "_deferred_train_optimizer_restore", False)):
+            return {}
+        report = self._restore_optimizer_state_after_reclaim()
+        self._deferred_train_optimizer_restore = False
+        return report
+
+    @contextmanager
+    def _external_single_engine_session(
+        self,
+        *,
+        sync_weights: bool,
+        onload_trainer_after: bool,
+        defer_optimizer_restore: bool = False,
+    ):
+        """Wake one external engine under an exception-safe memory lifecycle.
+
+        Entry and exit steady state is engine-asleep. For the legacy full-state
+        lifecycle, training exit also onloads FSDP for replay/backward while
+        eval leaves it offloaded. The optimizer-only lifecycle instead leaves
+        FSDP parameters/shards resident and parks completed grads + Adam tensors
+        before wake. A normal training session may hand that parked state to the
+        train stack after every stage sleeps; all other exits restore it here.
+        """
+        if not self._single_engine or self._rollout_is_trainside:
+            raise RuntimeError("_external_single_engine_session is only valid for an external single engine.")
+
+        do_sync = bool(sync_weights and self.weight_sync is not None)
+        staged = bool(do_sync and self._single_engine_staged_sync)
+        park_optimizer = bool(getattr(self, "_park_optimizer_state_during_rollout", False))
+        if defer_optimizer_restore and not bool(getattr(self, "_park_optimizer_state_during_train", False)):
+            raise ValueError("defer_optimizer_restore requires park_optimizer_state_during_train=true.")
+        optimizer_park_attempted = False
+        boundary_metrics = _RolloutBoundaryMetrics()
+        cleanup_errors: List[Tuple[str, BaseException]] = []
+        try:
+            if staged:
+                if self._enable_fsdp_offload:
+                    self.backend.prepare_for_compute()
+                self.weight_sync.extract()
+                if self._enable_fsdp_offload:
+                    self.backend.prepare_for_rollout()
+
+            if park_optimizer:
+                # Extract first while the engine sleeps, then release only the
+                # post-step gradient + optimizer footprint. FSDP parameters and
+                # shards remain on the compute device for the whole session.
+                optimizer_park_attempted = True
+                boundary_metrics.update(
+                    _reduce_rollout_boundary_metrics(self.backend.park_optimizer_state_for_rollout())
+                )
+
+            # Keep wake, push, and every generate call inside this try. Even a
+            # partially failed wake is followed by sleep in the finally block.
+            self.rollout.wake_up()
+            if do_sync:
+                if staged:
+                    self.weight_sync.push()
+                else:
+                    self.weight_sync.sync()
+            yield boundary_metrics
+        finally:
+            active_error = sys.exc_info()[0] is not None
+            rollout_asleep = False
+            try:
+                self.rollout.sleep()
+                rollout_asleep = True
+            except BaseException as first_exc:
+                # Backend stage tracking retains only failed/possibly-awake
+                # stages, so one bounded retry completes transient ACK failures
+                # without re-sleeping stages that already succeeded.
+                try:
+                    self.rollout.sleep()
+                    rollout_asleep = True
+                    logger.warning("Recovered from initial rollout.sleep failure: %s", first_exc)
+                except BaseException as retry_exc:  # preserve the primary rollout failure
+                    cleanup_errors.append(("rollout.sleep", first_exc))
+                    cleanup_errors.append(("rollout.sleep retry", retry_exc))
+                    try:
+                        self.rollout.shutdown()
+                    except BaseException as shutdown_exc:
+                        cleanup_errors.append(("rollout.shutdown", shutdown_exc))
+
+            if staged:
+                try:
+                    # Idempotent after a successful push; essential if extract,
+                    # wake, or push failed with a CPU snapshot still pending.
+                    self.weight_sync.discard()
+                except BaseException as exc:
+                    cleanup_errors.append(("weight_sync.discard", exc))
+
+            defer_restore_now = bool(
+                optimizer_park_attempted
+                and defer_optimizer_restore
+                and rollout_asleep
+                and not active_error
+                and not cleanup_errors
+            )
+            # Restoring Adam while any Omni stage may still be awake recreates
+            # the exact overlap this lifecycle prevents. Only a clean training
+            # exit hands the parked plan forward; failures repair it here after
+            # safe sleep, while a failed sleep leaves the state safely parked.
+            if optimizer_park_attempted and rollout_asleep and not defer_restore_now:
+                try:
+                    boundary_metrics.update(self._restore_optimizer_state_after_reclaim())
+                    self._deferred_train_optimizer_restore = False
+                except BaseException as exc:
+                    # The engine is safely asleep, so the next driver operation
+                    # may retry this idempotent restore before doing any work.
+                    self._deferred_train_optimizer_restore = True
+                    cleanup_errors.append(("optimizer state restore", exc))
+            elif defer_restore_now:
+                boundary_metrics.optimizer_restore_deferred = True
+                self._deferred_train_optimizer_restore = True
+
+            # Never move trainer state back onto the GPU unless every Omni stage
+            # acknowledged sleep. A partial sleep plus FSDP onload can OOM before
+            # the original lifecycle error reaches the caller.
+            if self._enable_fsdp_offload and rollout_asleep:
+                try:
+                    if onload_trainer_after:
+                        self.backend.prepare_for_compute()
+                    else:
+                        self.backend.prepare_for_rollout()
+                except BaseException as exc:
+                    cleanup_errors.append(("backend lifecycle restore", exc))
+
+            if cleanup_errors:
+                if active_error:
+                    for action, exc in cleanup_errors:
+                        logger.exception(
+                            "External single-engine cleanup failed in %s: %s",
+                            action,
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                else:
+                    action, exc = cleanup_errors[0]
+                    raise RuntimeError(f"External single-engine cleanup failed in {action}.") from exc
+
+            if boundary_metrics:
+                if boundary_metrics.optimizer_restore_deferred:
+                    logger.info(
+                        "External rollout optimizer boundary: cleared=%.3f GiB parked=%.3f GiB "
+                        "park=%.3fs restore=deferred",
+                        boundary_metrics.get("grad_bytes_cleared", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_parked", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_park_host_time_s", 0.0),
+                    )
+                else:
+                    logger.info(
+                        "External rollout optimizer boundary: cleared=%.3f GiB parked=%.3f GiB "
+                        "restored=%.3f GiB park=%.3fs restore=%.3fs",
+                        boundary_metrics.get("grad_bytes_cleared", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_parked", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_state_bytes_restored", 0.0) / 2**30,
+                        boundary_metrics.get("optimizer_park_host_time_s", 0.0),
+                        boundary_metrics.get("optimizer_restore_host_time_s", 0.0),
+                    )
 
     def _build_req(
         self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
@@ -379,13 +889,20 @@ class UnifiedModelTrainer(BaseTrainer):
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         sampling_params = {**base, "diffusion": diffusion}
+        init_noise_group_ids: List[str] = []
+        if self._noise_latent_shape is not None:
+            source_ids = inputs.group_ids if bool(getattr(diff_params, "init_same_noise", False)) else inputs.sample_ids
+            init_noise_group_ids = [f"r{rollout_id}:{source_id}" for source_id in source_ids]
         return RolloutReq(
             sample_ids=list(inputs.sample_ids),
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
+            task_config={"rollout_id": int(rollout_id)},
             sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
+            init_noise_group_ids=init_noise_group_ids,
+            init_noise_latent_shape=self._noise_latent_shape,
         )
 
     def run_rollout(self, req: RolloutReq) -> RolloutResp:
@@ -572,6 +1089,37 @@ class UnifiedModelTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
+        """Run one unified step and repair a deferred boundary on any failure."""
+        # A transient restore failure from the prior call is retried before any
+        # new rollout or scoring work. Ownership clears only at zero pending slots.
+        self._restore_deferred_train_optimizer_state()
+        try:
+            return self._train_step_impl(
+                req,
+                training_progress=training_progress,
+                sync_weights=sync_weights,
+                rollout_id=rollout_id,
+            )
+        except BaseException:
+            if bool(getattr(self, "_deferred_train_optimizer_restore", False)):
+                try:
+                    self._restore_deferred_train_optimizer_state()
+                except BaseException as exc:
+                    logger.error(
+                        "Deferred train optimizer cleanup failed: %s",
+                        exc,
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+            raise
+
+    def _train_step_impl(
+        self,
+        req: RolloutReq,
+        *,
+        training_progress: float = 0.0,
+        sync_weights: bool = False,
+        rollout_id: int = 0,
+    ) -> Tuple[Dict[str, TrainStepResult], float]:
         """One ``rollout → reward → credit-assign → advantage → step`` pass.
 
         Returns ``(per_track_results, mean_reward)`` — ``mean_reward`` is the
@@ -579,10 +1127,23 @@ class UnifiedModelTrainer(BaseTrainer):
         the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        if self._single_engine:
-            # Trainside / single-engine (M=1): the rollout shares the live FSDP
-            # modules — no engine wake/sleep, no base offload, no weight sync.
+        rollout_boundary_metrics = _RolloutBoundaryMetrics()
+        if self._single_engine and self._rollout_is_trainside:
+            # Trainside (M=1): rollout shares the live FSDP modules, so there is
+            # no engine lifecycle or weight transfer.
             resp = self.run_rollout(req)
+        elif self._single_engine:
+            # External single-engine (BAGEL T2TI): a staged sync snapshots while
+            # asleep, then the session wakes/pushes/generates and always sleeps.
+            # Train parking hands Adam's CPU plan through scoring and anchor replay;
+            # all exceptional exits restore it or leave a clearly parked terminal state.
+            with self._external_single_engine_session(
+                sync_weights=sync_weights,
+                onload_trainer_after=True,
+                defer_optimizer_restore=self._park_optimizer_state_during_train,
+            ) as rollout_boundary_metrics:
+                resp = self.run_rollout(req)
+            self._deferred_train_optimizer_restore = rollout_boundary_metrics.optimizer_restore_deferred
         else:
             # Colocate memory dance (150GB base can't coexist with an awake engine
             # on the same card). Steady state on entry: base offloaded, engines
@@ -674,24 +1235,80 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id=rollout_id,
             media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
         )
+        extra_metrics: Dict[str, float] = {
+            "sync_weights": float(bool(sync_weights)),
+            **rollout_boundary_metrics,
+        }
+        if self._strict_bagel_t2ti:
+            ar_track = resp.tracks[AR_TRACK]
+            image_track = resp.tracks[IMAGE_TRACK]
+            if ar_track.batch_size != image_track.batch_size:
+                raise RuntimeError(
+                    "BAGEL T2TI replay balancing requires 1:1 AR/image tracks; "
+                    f"got {ar_track.batch_size} and {image_track.batch_size}."
+                )
+            if image_track.parent_ids is None or list(image_track.parent_ids) != list(ar_track.sample_ids):
+                raise RuntimeError(
+                    "BAGEL T2TI replay balancing requires positional M=1 lineage: "
+                    "image parent_ids must equal AR sample_ids."
+                )
+            replay_specs = BagelT2TIDiffusionConditions.from_dict(image_track.conditions).replay_specs
+            depths = [len(spec.chunk_offsets) - 1 for spec in replay_specs]
+            extra_metrics.update(_bagel_t2ti_replay_depth_metrics(depths))
+            permutation = _bagel_t2ti_replay_permutation(
+                image_track,
+                num_shards=self._train_dp_size,
+                num_updates=self._num_updates_per_batch,
+            )
+            if permutation is not None:
+                shard_size = len(depths) // self._train_dp_size
+
+                def padded_work(order: List[int]) -> int:
+                    return sum(
+                        max(depths[order[rank * shard_size + offset]] for rank in range(self._train_dp_size))
+                        for offset in range(shard_size)
+                    )
+
+                original_work = padded_work(list(range(len(depths))))
+                balanced_work = padded_work(permutation.tolist())
+                extra_metrics.update(
+                    {
+                        "bagel_t2ti_replay_collective_work_original": float(original_work),
+                        "bagel_t2ti_replay_collective_work_balanced": float(balanced_work),
+                    }
+                )
+                logger.info(
+                    "BAGEL T2TI replay balancing: collective traversal target %d -> %d (%.1f%% reduction)",
+                    original_work,
+                    balanced_work,
+                    100.0 * (original_work - balanced_work) / max(original_work, 1),
+                )
+                resp.tracks[AR_TRACK] = ar_track.select(permutation)
+                resp.tracks[IMAGE_TRACK] = image_track.select(permutation)
+
         # 5. Two backward (shared backbone) → one optimizer step.
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             resp.tracks[AR_TRACK],
             resp.tracks[IMAGE_TRACK],
             training_progress=float(training_progress),
+            optimizer_state_already_parked=self._deferred_train_optimizer_restore,
         )
+        self._deferred_train_optimizer_restore = False
         self.wandb_logger.log_rollout_step(
             rollout_id,
             results,
             resp,
             step_time_s=time.perf_counter() - t0,
-            extra_metrics={"sync_weights": float(bool(sync_weights))},
+            extra_metrics=extra_metrics,
         )
 
         # 6. Back to steady state (base on CPU) so the next rollout's engines
         #    have room to wake.
         if self._enable_fsdp_offload:
-            self.backend.offload()
+            if self._single_engine and not self._rollout_is_trainside:
+                self.backend.prepare_for_rollout()
+            else:
+                self.backend.offload()
         return results, mean_reward
 
     def _dump_rollout(self, rollout_id: int, req: RolloutReq, resp: Any) -> None:
@@ -721,6 +1338,8 @@ class UnifiedModelTrainer(BaseTrainer):
             img_decoded = getattr(image_track, "decoded", None) if image_track is not None else None
             sample_ids = list(image_track.sample_ids) if image_track is not None else []
             parent_ids = list(image_track.parent_ids) if (image_track is not None and image_track.parent_ids) else []
+            replay_conditions = image_track.conditions.get("bagel_t2ti") if image_track is not None else None
+            replay_specs = list(getattr(replay_conditions, "replay_specs", ()))
 
             rewards = None
             if image_track is not None and image_track.rewards is not None:
@@ -759,6 +1378,10 @@ class UnifiedModelTrainer(BaseTrainer):
                                 "ar_text_fed_to_dit": ar_texts[a_idx] if a_idx < len(ar_texts) else None,
                                 "image_reward": rewards[k] if (rewards is not None and k < len(rewards)) else None,
                                 "image_file": f"img_{k}.png" if k < n_imgs else None,
+                                # Metadata only (token IDs + scheduler boundaries),
+                                # never KV tensors. This makes exact/collapsed
+                                # real-trace parity reproducible from a debug dump.
+                                "t2ti_replay": dataclasses.asdict(replay_specs[k]) if k < len(replay_specs) else None,
                             },
                             ensure_ascii=False,
                         )
@@ -767,6 +1390,19 @@ class UnifiedModelTrainer(BaseTrainer):
             logger.info("[HI3-DUMP] rollout %d → %s (%d samples, %d images)", rollout_id, out_dir, n, n_imgs)
         except Exception as exc:  # noqa: BLE001 — dump must never break training
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
+
+    def _eval_sampling_params(self) -> Dict[str, BaseSamplingParams]:
+        """Build eval params, making deterministic eta=0 an explicit ODE rollout."""
+        base_diffusion = self.sampling_params.get("diffusion")
+        replace_kwargs: Dict[str, Any] = {"eta": self.eval_eta}
+        if "cfg_text_scale" in {field.name for field in dataclasses.fields(base_diffusion)}:
+            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
+        else:
+            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
+        if self.eval_eta <= 1e-7:
+            replace_kwargs.update(scheduler=None, sde_indices=[])
+        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        return {**self.sampling_params, "diffusion": eval_diffusion}
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward.
@@ -780,31 +1416,14 @@ class UnifiedModelTrainer(BaseTrainer):
         :mod:`unirl.trainer.eval_suites`). Logs one ``eval/*`` row; returns
         ``eval/reward``.
 
-        The two-engine path syncs the live adapter into the engines once per
-        eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
-        :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
-        so without this the engines would eval one update stale, and a
-        restored-checkpoint baseline eval would see fresh engine weights.
-        Pushed weights persist across sleep/wake cycles (as train_step relies
-        on), so the passes below just wake/sleep around each chunk's rollout.
-        Unlike train_step, eval never onloads the base after the extract: there
-        is no backward, so the FSDP state stays offloaded (the steady state)
-        throughout. The single-engine trainside path needs none of it (the
-        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
-        forced False).
+        External engines sync current weights once per eval. The single-engine
+        path uses the same staged extract → wake/push/generate → sleep lifecycle
+        as training, with exception-safe snapshot cleanup; unlike training, it
+        leaves FSDP offloaded because eval has no backward. The trainside path
+        needs none of it because it shares the live FSDP modules.
         """
-        # Override only the "diffusion" entry of the modality-keyed sampling dict.
-        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
-        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (HI3,
-        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(eta=self.eval_eta)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        self._restore_deferred_train_optimizer_state()
+        eval_sp = self._eval_sampling_params()
         # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH
         # needs awake engines, so it rides one short wake/sleep cycle here).
         if not self._single_engine and self.weight_sync is not None:
@@ -818,13 +1437,38 @@ class UnifiedModelTrainer(BaseTrainer):
             self.weight_sync.push()
             for eng in self.ar_rollouts + self.dit_rollouts:
                 eng.sleep()
-        # Default pass: training reward + shared-set suites score the SAME images.
-        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
-        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
-        for suite in self._eval_suites:
-            if suite.data_source is not None:
-                n = suite.num_prompts or self.eval_num_prompts
-                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        single_session = (
+            self._external_single_engine_session(
+                sync_weights=True,
+                onload_trainer_after=False,
+            )
+            if self._single_engine and not self._rollout_is_trainside
+            else nullcontext()
+        )
+        with single_session:
+            # Default pass: training reward + shared-set suites score the SAME images.
+            scorers = [("reward", self.reward)] + [
+                (s.name, s.reward) for s in self._eval_suites if s.data_source is None
+            ]
+            metrics = self._eval_pass(
+                self.data_source,
+                self.eval_num_prompts,
+                scorers,
+                eval_sp,
+                step,
+            )
+            for suite in self._eval_suites:
+                if suite.data_source is not None:
+                    n = suite.num_prompts or self.eval_num_prompts
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                        )
+                    )
         logger.info(
             "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
             step,
@@ -898,6 +1542,25 @@ class UnifiedModelTrainer(BaseTrainer):
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
+    def maybe_save_checkpoint(
+        self,
+        rollout_id: int,
+        num_rollouts: int,
+        *,
+        save_interval: int,
+        save_dir: Optional[str],
+        save_mode: str = "auto",
+    ) -> Optional[str]:
+        """Never expose a partially parked optimizer to checkpoint gathering."""
+        self._restore_deferred_train_optimizer_state()
+        return super().maybe_save_checkpoint(
+            rollout_id,
+            num_rollouts,
+            save_interval=save_interval,
+            save_dir=save_dir,
+            save_mode=save_mode,
+        )
+
     def train(
         self,
         *,
@@ -917,15 +1580,28 @@ class UnifiedModelTrainer(BaseTrainer):
         directory and RESUME from its saved step — ``num_rollouts`` is the TOTAL
         budget.
         """
+        if self._strict_bagel_t2ti and int(weight_sync_interval) != 1:
+            raise ValueError(
+                "UnifiedModelTrainer: bagel_t2ti requires weight_sync_interval=1 so every rollout uses "
+                "the current trainer policy; skipped syncs invalidate the replay old-policy anchor."
+            )
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        if load_dir and self._strict_bagel_t2ti:
+            self.image_algorithm.load_reference_checkpoint(os.path.abspath(load_dir))
         resumed = bool(load_dir)
         # Fast-forward the data stream to the resume point — exact when
         # run.seed is set (deterministic shuffle); with seed=null the stream
         # is non-reproducible anyway.
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
-        self._init_wandb(num_rollouts=num_rollouts)
+        self._init_wandb(
+            num_rollouts=num_rollouts,
+            extra={
+                "park_optimizer_state_during_rollout": self._park_optimizer_state_during_rollout,
+                "park_optimizer_state_during_train": self._park_optimizer_state_during_train,
+            },
+        )
         try:
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)  # baseline eval before any training
@@ -961,9 +1637,11 @@ class UnifiedModelTrainer(BaseTrainer):
                 # resumed checkpoint re-runs the same eval (A/B consistency).
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id + 1)
-                self.maybe_save_checkpoint(
+                checkpoint_path = self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+                if checkpoint_path is not None and self._strict_bagel_t2ti:
+                    self.image_algorithm.save_reference_checkpoint(checkpoint_path)
         finally:
             self._finish_wandb()
 

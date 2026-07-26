@@ -220,6 +220,12 @@ class NaiveCache:
         else:
             return 0
 
+    def fork(self):
+        cache = type(self)(self.num_layers)
+        cache.key_cache = self.key_cache.copy()
+        cache.value_cache = self.value_cache.copy()
+        return cache
+
 
 @dataclass
 class BaseNavitOutputWithPast(ModelOutput):
@@ -322,6 +328,11 @@ class PackedAttention(Qwen2Attention):
         update_past_key_values=True,
         is_causal=True,
     ):
+        # Checkpoint recompute must see the pre-update cache captured by the
+        # decoder block, so mutate a shallow cache fork instead of its input.
+        if update_past_key_values and past_key_values is not None and torch.is_grad_enabled():
+            past_key_values = past_key_values.fork()
+
         packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
         packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
@@ -511,6 +522,11 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
     ):
+        # See PackedAttention.forward_inference: the cache container is mutable,
+        # while activation-checkpoint inputs must remain stable until backward.
+        if update_past_key_values and past_key_values is not None and torch.is_grad_enabled():
+            past_key_values = past_key_values.fork()
+
         if mode == 'und':
             packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
             packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)

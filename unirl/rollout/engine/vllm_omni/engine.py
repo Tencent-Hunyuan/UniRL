@@ -23,6 +23,7 @@ worker partitions.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -37,6 +38,8 @@ from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.sde.runtime import ensure_req_sigmas
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.rollout_resp import RolloutResp
+
+logger = logging.getLogger(__name__)
 
 
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
@@ -91,13 +94,22 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             extra=self.adapter.boot_kwargs(),
         )
         self._backend = VLLMOmniBackend.boot(intent)
-
-        # Weight sync — owns all sync/LoRA state, over the live seam.
-        self._weight_sync = WeightSync(
-            self._backend,
-            uses_lora=bool(getattr(model_config, "use_lora", False)),
-            lora_copy_transport=self.adapter.lora_copy_transport,
-        )
+        try:
+            # Weight sync — owns all sync/LoRA state, over the live seam.
+            self._weight_sync = WeightSync(
+                self._backend,
+                uses_lora=bool(getattr(model_config, "use_lora", False)),
+                lora_copy_transport=self.adapter.lora_copy_transport,
+            )
+        except BaseException:
+            # A remote actor constructor has no object handle to clean up when
+            # it raises. Release the successfully booted backend here, before
+            # the partially initialized rollout engine becomes unreachable.
+            try:
+                self._backend.shutdown()
+            except BaseException:
+                logger.exception("Failed to shut down vLLM-Omni after rollout engine construction failed.")
+            raise
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
@@ -138,11 +150,21 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
-        if self._is_offloaded:
+        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
+        if self._is_offloaded and self._backend.all_stages_sleeping():
             return
-        self._backend.sleep_task()
-        self._is_offloaded = True
+        try:
+            self._backend.sleep_task()
+        except BaseException:
+            # A partially slept pipeline is not usable for generation. Keep the
+            # engine unavailable while still allowing a later sleep() retry to
+            # target the stages retained by the backend's acknowledgement map.
+            self._is_offloaded = True
+            raise
+        self._is_offloaded = self._backend.all_stages_sleeping()
+        if not self._is_offloaded:
+            self._is_offloaded = True
+            raise RuntimeError("VLLMOmniRolloutEngine.sleep: one or more stages remain awake.")
         # The released memory includes the worker-side LoRA pool; the wake
         # path restores it from the component's cache.
         self._weight_sync.mark_weights_released()
@@ -161,7 +183,13 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         # trainer.train_step demonstrably does NOT reach this process).
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self._backend.wake_task()
+        try:
+            self._backend.wake_task()
+        except Exception:
+            # Even when one stage acknowledged wake, the full pipeline is not
+            # ready. Fail closed until the caller's cleanup sleep succeeds.
+            self._is_offloaded = True
+            raise
         try:
             # v1 parity: actively re-push the cached adapter (NOT the passive
             # lora_dirty model). On failure the engine STAYS offloaded so the
@@ -179,6 +207,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def health_check(self) -> bool:
         return self._backend.ping()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
         self._backend.shutdown()
 
@@ -274,14 +303,16 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         target_modules: Optional[List[str]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        stage_ids: Optional[List[int]] = None,
         track_prefix: str = "",
-    ) -> None:
+    ) -> Dict[int, Any]:
         del track_prefix
-        self._weight_sync.update_weights_from_tensor(
+        return self._weight_sync.update_weights_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
             target_modules=target_modules,
             load_format=load_format,
             flush_cache=flush_cache,
+            stage_ids=stage_ids,
         )
 
     def set_lora_from_tensors(

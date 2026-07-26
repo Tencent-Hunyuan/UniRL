@@ -38,11 +38,121 @@ stored contexts; this matches the standard frozen-context treatment.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 
 from unirl.config.require import require
 from unirl.distributed.tensor.batch import concat_field
 from unirl.types.conditions.base import Condition, Modality
+
+BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT = "bagel_t2ti_replay"
+
+
+@dataclass(frozen=True)
+class BagelThinkKVReplaySpec:
+    """Metadata-only recipe for rebuilding BAGEL's transferred thinking cache.
+
+    Native vLLM-Omni ``bagel_think`` transfers the Stage-0 KV cache directly to
+    the DiT worker.  The cache tensors must never leave that runtime, but replay
+    still needs to rebuild an equivalent, grad-carrying context on the trainer.
+    This spec records the exact token IDs that were inserted into the cache and
+    the original scheduler chunk boundaries, plus independent Stage-0/Stage-1
+    observations of the transfer geometry.
+
+    ``chunk_offsets`` is a CSR-style boundary vector over ``cache_input_ids``.
+    Replaying one slice at a time preserves chunked-prefill versus decode call
+    structure instead of silently collapsing the trace into one prefill.
+    """
+
+    cache_input_ids: Tuple[int, ...]
+    chunk_offsets: Tuple[int, ...]
+    kv_length: int
+    ropes: Tuple[int, ...]
+    received_kv_length: int
+    received_ropes: Tuple[int, ...]
+    image_shape: Tuple[int, int]
+
+    def __post_init__(self) -> None:
+        ids = tuple(int(x) for x in self.cache_input_ids)
+        offsets = tuple(int(x) for x in self.chunk_offsets)
+        ropes = tuple(int(x) for x in self.ropes)
+        received_ropes = tuple(int(x) for x in self.received_ropes)
+        image_shape = tuple(int(x) for x in self.image_shape)
+        object.__setattr__(self, "cache_input_ids", ids)
+        object.__setattr__(self, "chunk_offsets", offsets)
+        object.__setattr__(self, "ropes", ropes)
+        object.__setattr__(self, "received_ropes", received_ropes)
+        object.__setattr__(self, "image_shape", image_shape)
+        object.__setattr__(self, "kv_length", int(self.kv_length))
+        object.__setattr__(self, "received_kv_length", int(self.received_kv_length))
+
+        require(bool(ids), "BagelThinkKVReplaySpec.cache_input_ids must be non-empty.")
+        require(all(t >= 0 for t in ids), "BagelThinkKVReplaySpec.cache_input_ids must be non-negative.")
+        require(
+            len(offsets) >= 2 and offsets[0] == 0,
+            "BagelThinkKVReplaySpec.chunk_offsets must start at 0 and contain at least one chunk.",
+        )
+        require(
+            all(b > a for a, b in zip(offsets, offsets[1:])),
+            f"BagelThinkKVReplaySpec.chunk_offsets must be strictly increasing; got {offsets!r}.",
+        )
+        require(
+            offsets[-1] == len(ids),
+            f"BagelThinkKVReplaySpec.chunk_offsets[-1]={offsets[-1]} != token count {len(ids)}.",
+        )
+        require(
+            int(self.kv_length) == len(ids),
+            f"BagelThinkKVReplaySpec.kv_length={self.kv_length} != token count {len(ids)}.",
+        )
+        require(bool(ropes), "BagelThinkKVReplaySpec.ropes must be non-empty.")
+        require(
+            int(self.received_kv_length) == int(self.kv_length),
+            "BagelThinkKVReplaySpec Stage-1 received KV length does not match Stage-0 transfer length: "
+            f"{self.received_kv_length} != {self.kv_length}.",
+        )
+        require(
+            received_ropes == ropes,
+            "BagelThinkKVReplaySpec Stage-1 received ropes do not match Stage-0 transfer ropes: "
+            f"{received_ropes!r} != {ropes!r}.",
+        )
+        require(
+            len(image_shape) == 2 and all(x > 0 for x in image_shape),
+            f"BagelThinkKVReplaySpec.image_shape must be a positive (H, W) pair; got {image_shape!r}.",
+        )
+
+    @classmethod
+    def from_custom_output(cls, payload: Mapping[str, Any]) -> "BagelThinkKVReplaySpec":
+        """Parse the Stage-1 ``custom_output`` payload and validate the transfer."""
+        if BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT in payload:
+            nested = payload[BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT]
+            require(
+                isinstance(nested, Mapping),
+                f"custom_output[{BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT!r}] must be a mapping; got {type(nested).__name__}.",
+            )
+            payload = nested
+        required = {
+            "cache_input_ids",
+            "chunk_offsets",
+            "kv_length",
+            "ropes",
+            "received_kv_length",
+            "received_ropes",
+            "image_shape",
+        }
+        missing = sorted(required - set(payload))
+        require(not missing, f"Bagel T2TI replay metadata is missing fields {missing}.")
+        return cls(
+            cache_input_ids=tuple(payload["cache_input_ids"]),
+            chunk_offsets=tuple(payload["chunk_offsets"]),
+            kv_length=int(payload["kv_length"]),
+            ropes=tuple(payload["ropes"]),
+            received_kv_length=int(payload["received_kv_length"]),
+            received_ropes=tuple(payload["received_ropes"]),
+            image_shape=tuple(payload["image_shape"]),
+        )
+
+    def chunks(self) -> Tuple[Tuple[int, ...], ...]:
+        """Return the exact cache-input token chunks in execution order."""
+        return tuple(self.cache_input_ids[start:end] for start, end in zip(self.chunk_offsets, self.chunk_offsets[1:]))
 
 
 @dataclass
@@ -232,4 +342,64 @@ class BagelDiffusionConditions(Condition):
         return {"bagel": self}
 
 
-__all__ = ["BagelARConditions", "BagelDiffusionConditions"]
+@dataclass
+class BagelT2TIDiffusionConditions(Condition):
+    """Exact native-KV replay recipes for BAGEL think-then-image rollouts.
+
+    This condition is deliberately separate from :class:`BagelDiffusionConditions`:
+    plain ``bagel_t2i`` continues to rebuild its frozen context from prompt text,
+    while ``bagel_t2ti`` must carry a complete native transfer trace and fails if
+    any part of that trace is missing.
+    """
+
+    modality: ClassVar[Modality] = Modality.IMAGE
+
+    replay_specs: List[BagelThinkKVReplaySpec] = concat_field(default_factory=list)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.replay_specs)
+
+    @classmethod
+    def for_sample(cls, spec: BagelThinkKVReplaySpec) -> "BagelT2TIDiffusionConditions":
+        require(
+            isinstance(spec, BagelThinkKVReplaySpec),
+            f"BagelT2TIDiffusionConditions.for_sample expected BagelThinkKVReplaySpec; got {type(spec).__name__}.",
+        )
+        return cls(replay_specs=[spec])
+
+    def single_spec(self) -> BagelThinkKVReplaySpec:
+        require(
+            self.batch_size == 1,
+            "BagelT2TIDiffusionConditions.single_spec expects exactly one sample "
+            f"(BAGEL navit bs=1); got {self.batch_size}.",
+        )
+        spec = self.replay_specs[0]
+        require(
+            isinstance(spec, BagelThinkKVReplaySpec),
+            "BagelT2TIDiffusionConditions.replay_specs must contain "
+            f"BagelThinkKVReplaySpec values; got {type(spec).__name__}.",
+        )
+        return spec
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "BagelT2TIDiffusionConditions":
+        value = d.get("bagel_t2ti")
+        if isinstance(value, cls):
+            return value
+        raise ValueError(
+            "BagelT2TIDiffusionConditions.from_dict: expected a 'bagel_t2ti' key holding a "
+            f"BagelT2TIDiffusionConditions instance; got keys {sorted(d.keys())}."
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"bagel_t2ti": self}
+
+
+__all__ = [
+    "BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT",
+    "BagelARConditions",
+    "BagelDiffusionConditions",
+    "BagelT2TIDiffusionConditions",
+    "BagelThinkKVReplaySpec",
+]

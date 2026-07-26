@@ -9,7 +9,8 @@ to a copy of the track under DP-sharded distributed dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import sys
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 
@@ -131,9 +132,13 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
+        park_backend_between_calls: bool = False,
     ) -> None:
         super().__init__()
         self.backend = backend
+        self._park_backend_between_calls = bool(park_backend_between_calls)
+        self._backend_parked = False
+        self._backend_parking_metrics: Dict[str, float] = {}
         # How to score AR generations that hit max_new_tokens (sglang finish=="length"):
         #   "zero" — force reward 0 on truncated traces (anti-ramble; the default).
         #   "keep" — keep the raw score on the partial text (= verl dapo reward manager
@@ -148,10 +153,21 @@ class RewardService(Remote):
         if self.truncated_reward not in ("zero", "keep", "soft"):
             raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
         logger.info(
-            "RewardService initialized with backend=%s, truncated_reward=%s",
+            "RewardService initialized with backend=%s, truncated_reward=%s, park_backend_between_calls=%s",
             backend.get_model_name() or type(backend).__name__,
             self.truncated_reward,
+            self._park_backend_between_calls,
         )
+
+        if self._park_backend_between_calls:
+            if not backend.supports_model_parking:
+                raise ValueError(
+                    "RewardService.park_backend_between_calls=true requires a CUDA reward backend whose "
+                    "offload/onload hooks move only its own model tensors."
+                )
+            # Keep the reward model absent during the first native rollout too;
+            # the steady state outside scalar scoring is always CPU-resident.
+            self._park_backend(phase="initial", force=True)
 
     @property
     def preferred_input_kind(self) -> str:
@@ -164,7 +180,67 @@ class RewardService(Remote):
         return kind
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        return self.backend.compute_rewards(request)
+        if not self._park_backend_between_calls:
+            return self.backend.compute_rewards(request)
+
+        restore_attempted = False
+        try:
+            if not self._backend_parked:
+                raise RuntimeError(
+                    "RewardService automatic reward-model parking lost its CPU-resident steady state; "
+                    "refusing to score with ambiguous device ownership."
+                )
+            restore_attempted = True
+            self._restore_backend(phase="before_score")
+            return self.backend.compute_rewards(request)
+        finally:
+            # If restore itself partially failed, force the model back to CPU.
+            # Cleanup errors do not mask a primary scoring/restore exception.
+            if restore_attempted:
+                active_error = sys.exc_info()[0] is not None
+                try:
+                    self._park_backend(phase="after_score", force=True)
+                except BaseException as exc:
+                    self._backend_parked = False
+                    if active_error:
+                        logger.error(
+                            "RewardService cleanup failed while parking backend after score: %s",
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                    else:
+                        raise RuntimeError("RewardService failed to park its backend after scalar scoring.") from exc
+
+    def _record_backend_lifecycle(
+        self,
+        *,
+        action: str,
+        phase: str,
+        report: Optional[Mapping[str, float]],
+    ) -> None:
+        if not report:
+            return
+        for name, value in report.items():
+            self._backend_parking_metrics[name] = self._backend_parking_metrics.get(name, 0.0) + float(value)
+        logger.info(
+            "RewardService backend lifecycle: action=%s phase=%s backend=%s metrics=%s",
+            action,
+            phase,
+            type(self.backend).__name__,
+            ",".join(f"{name}={float(value):.6f}" for name, value in sorted(report.items())),
+        )
+
+    def _park_backend(self, *, phase: str, force: bool = False) -> None:
+        if self._backend_parked and not force:
+            return
+        report = self.backend.offload()
+        self._backend_parked = True
+        self._record_backend_lifecycle(action="park", phase=phase, report=report)
+
+    def _restore_backend(self, *, phase: str) -> None:
+        report = self.backend.onload()
+        self._backend_parked = False
+        self._record_backend_lifecycle(action="restore", phase=phase, report=report)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def score_differentiable(self, *, images: Images, prompts: Texts) -> torch.Tensor:
@@ -178,6 +254,11 @@ class RewardService(Remote):
         grad leaf and chains the returned reward's grad back to it. The backend must
         satisfy the :class:`~unirl.reward.base.DifferentiableReward` Protocol.
         """
+        if self._park_backend_between_calls:
+            raise RuntimeError(
+                "RewardService.park_backend_between_calls is scalar-scoring only; differentiable reward graphs "
+                "retain model tensors through backward and cannot be parked immediately after forward."
+            )
         if not isinstance(self.backend, DifferentiableReward):
             raise TypeError(
                 f"RewardService.score_differentiable: backend "
@@ -309,10 +390,10 @@ class RewardService(Remote):
         return self.backend.is_available()
 
     def offload(self) -> None:
-        self.backend.offload()
+        self._park_backend(phase="explicit", force=True)
 
     def onload(self) -> None:
-        self.backend.onload()
+        self._restore_backend(phase="explicit")
 
     def dispose(self) -> None:
         self.backend.dispose()

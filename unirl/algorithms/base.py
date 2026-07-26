@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
@@ -385,6 +385,22 @@ class StageAlgorithm(Remote, ABC):
     # (:meth:`recomputes_anchor`), the train stack re-slices and reassembles
     # exactly these fields at train-time geometry — it never hardcodes them.
     anchor_fields: Tuple[str, ...] = ()
+    # Opt-in for the exact-geometry preparation/finalization pass around each
+    # optimizer update. False avoids duplicate Batch slicing for algorithms that
+    # use only the regular compute hook.
+    prepares_update_batch: bool = False
+    # Opt-in extension for algorithms that phase backward across the update.
+    # These receive advantages/progress/loss scale in addition to the legacy
+    # condition/segment pairs. Keeping this separate preserves compatibility for
+    # existing ``prepares_update_batch`` implementations.
+    prepares_phased_update_batch: bool = False
+    # Opt-in for algorithms that can prepare a frozen anchor over the complete
+    # optimizer-update partition. The unified stack supplies every update before
+    # the first optimizer step and owns failure-safe finalization.
+    prepares_anchor_plan: bool = False
+    # Opt-in extension for phased update preparation that also needs the update
+    # index. Kept separate so existing phased hooks retain their call signature.
+    prepares_indexed_update_batch: bool = False
 
     def recomputes_anchor(self) -> bool:
         """Whether the anchor must be recomputed at the EXACT ``(mini, micro)``
@@ -431,6 +447,51 @@ class StageAlgorithm(Remote, ABC):
                 slot. Implementations may mutate field defaults that were
                 left ``None`` by the rollout (lazy initialization); they
                 must NOT mutate fields that the rollout already populated.
+        """
+        return None
+
+    def prepare_update_batch(
+        self,
+        *,
+        micro_batches: Sequence[Tuple[Mapping[str, "Condition"], "Segment"]],
+    ) -> None:
+        """Optional hook run once before each optimizer update.
+
+        ``micro_batches`` has the exact geometry and order that
+        :meth:`compute_loss_and_backward` will consume for this algorithm in the
+        upcoming update. Most algorithms need no preparation. Reference-policy
+        algorithms may use the hook to batch detached work that would otherwise
+        be repeated once per micro-batch, provided they preserve the policy state
+        at this update boundary. Algorithms opting into
+        ``prepares_phased_update_batch`` additionally receive each slice's
+        advantages plus ``training_progress`` and ``loss_scale``.
+        """
+        return None
+
+    def prepare_anchor_batch(
+        self,
+        *,
+        updates: Sequence[Sequence[Tuple[Mapping[str, "Condition"], "Segment"]]],
+    ) -> None:
+        """Optionally freeze anchors using the complete disjoint-update plan.
+
+        Called before any optimizer step, at the same micro geometry later used
+        by training. Algorithms may defer the first update's anchor to its
+        current-policy replay because no weight update precedes it, while all
+        later updates must still be anchored eagerly here.
+        """
+        return None
+
+    def finish_anchor_batch(self, *, succeeded: bool) -> None:
+        """Release state created by :meth:`prepare_anchor_batch`."""
+        return None
+
+    def finish_update_batch(self, *, succeeded: bool) -> None:
+        """Release state created by :meth:`prepare_update_batch`.
+
+        Called in a train-stack ``finally`` block. Implementations must clear
+        transient state on both success and failure; they may validate complete
+        consumption when ``succeeded`` is true.
         """
         return None
 

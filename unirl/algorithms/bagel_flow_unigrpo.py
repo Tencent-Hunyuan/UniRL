@@ -15,18 +15,25 @@ Subclasses :class:`FlowGRPO`: the clipped surrogate is inherited; the MSE term
 adds its own backward into the same optimizer step. GRPO-Guard RatioNorm
 (per-SDE-step ratio normalization) is optional via ``ratio_norm=True``.
 
-Compute note: the MSE runs two extra velocity forwards per SDE step (``v_theta``
-with grad, ``v_ref`` with adapters off / base snapshot), separate from the
-inherited GRPO log-prob replay; fusing them is a follow-up.
+Compute note: the default ``context_gradient_mode="full"`` keeps the established
+separate RatioNorm and velocity-MSE backwards. The opt-in ``"stage_boundary"``
+mode shares one detached Stage-0 context and reuses replay's ``v_theta`` values
+for MSE, matching the native rollout boundary while avoiding duplicate policy
+forwards.
 """
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 
+from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.bagel.rl_ops import move_replay_tree
+from unirl.models.types.replay_result import ReplayResult
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
@@ -38,6 +45,28 @@ from .base import (
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
+
+_CONTEXT_GRADIENT_MODES = ("full", "stage_boundary")
+
+
+@dataclass
+class _PreparedMSEBatch:
+    """Detached MSE inputs prepared at one optimizer-update boundary."""
+
+    target_steps: Tuple[int, ...]
+    forward_kwargs: Dict[str, Any]
+    reference_velocities: List[torch.Tensor]
+    surrogate_result: Optional[AlgorithmStepResult] = None
+    staged_on_cpu: bool = False
+
+
+@dataclass
+class _PreparedAnchor:
+    """One exact pre-update anchor, or an update-0 current-replay marker."""
+
+    target_steps: Tuple[int, ...]
+    replay: Optional[ReplayResult]
+    derive_from_current: bool
 
 
 @contextmanager
@@ -75,6 +104,10 @@ def _disable_lora(module: Any) -> Iterator[bool]:
 class BagelFlowUniGRPO(FlowGRPO):
     """FlowGRPO with UniGRPO's velocity-MSE regularization (BAGEL image side)."""
 
+    prepares_update_batch = True
+    prepares_phased_update_batch = True
+    prepares_indexed_update_batch = True
+
     def __init__(
         self,
         *,
@@ -89,6 +122,10 @@ class BagelFlowUniGRPO(FlowGRPO):
         mse_weight: float = 0.0,
         ratio_norm: bool = False,
         grad_reweight: bool = False,
+        reuse_ratio_context_for_mse: bool = False,
+        context_gradient_mode: str = "full",
+        lazy_first_update_anchor: bool = False,
+        stage_prepared_replay_to_cpu: bool = False,
     ) -> None:
         super().__init__(
             params=params,
@@ -106,6 +143,37 @@ class BagelFlowUniGRPO(FlowGRPO):
         # mean<1). grad_reweight (×1/|dt|) is the optional 2nd component, off by default.
         self.ratio_norm = bool(ratio_norm)
         self.grad_reweight = bool(grad_reweight)
+        self.reuse_ratio_context_for_mse = bool(reuse_ratio_context_for_mse)
+        self.context_gradient_mode = str(context_gradient_mode).strip().lower()
+        self.lazy_first_update_anchor = bool(lazy_first_update_anchor)
+        self.stage_prepared_replay_to_cpu = bool(stage_prepared_replay_to_cpu)
+        if self.context_gradient_mode not in _CONTEXT_GRADIENT_MODES:
+            raise ValueError(
+                "BagelFlowUniGRPO.context_gradient_mode must be one of "
+                f"{_CONTEXT_GRADIENT_MODES}; got {context_gradient_mode!r}."
+            )
+        if self.context_gradient_mode == "stage_boundary" and not self.ratio_norm:
+            raise ValueError("context_gradient_mode='stage_boundary' requires ratio_norm=True.")
+        if self.reuse_ratio_context_for_mse and not self.ratio_norm:
+            raise ValueError("reuse_ratio_context_for_mse requires ratio_norm=True.")
+        if self.context_gradient_mode == "stage_boundary" and self.reuse_ratio_context_for_mse:
+            raise ValueError(
+                "context_gradient_mode='stage_boundary' already shares one detached context between "
+                "RatioNorm and MSE; reuse_ratio_context_for_mse must remain false."
+            )
+        if self.lazy_first_update_anchor and (
+            self.context_gradient_mode != "stage_boundary" or not self.ratio_norm or self.old_logp_source != "replay"
+        ):
+            raise ValueError(
+                "lazy_first_update_anchor=True requires context_gradient_mode='stage_boundary', "
+                "ratio_norm=True, and old_logp_source='replay'."
+            )
+        if self.stage_prepared_replay_to_cpu and self.context_gradient_mode != "stage_boundary":
+            raise ValueError(
+                "stage_prepared_replay_to_cpu=True requires context_gradient_mode='stage_boundary' so only "
+                "graph-free native-boundary replay data is staged."
+            )
+        self.prepares_anchor_plan = self.lazy_first_update_anchor
         # Under old_logp_source="replay" the train stack recomputes these per 1-sample
         # micro-slice and cats them back (UnifiedModelTrainStack.prepare_segment). RatioNorm
         # needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp)
@@ -113,10 +181,19 @@ class BagelFlowUniGRPO(FlowGRPO):
         self.anchor_fields = ("sde_logp", "sde_means") if self.ratio_norm else ("sde_logp",)
         # Full-FT v_ref: a frozen bf16 snapshot of the base (pre-training) weights, captured
         # lazily on the first v_ref swap (before the first optimizer step) from each trainable
-        # param's local shard, keyed by param id, and swapped in per step via in-place copy.
+        # param's local shard, keyed by stable parameter name, and swapped in per step via in-place copy.
         # Stays None under LoRA (v_ref = adapters off) or mse_weight=0 (no MSE). See
         # _reference_weights.
-        self._ref_snapshot: Optional[Dict[int, torch.Tensor]] = None
+        self._ref_snapshot: Optional[Dict[str, torch.Tensor]] = None
+        # Set by prepare_update_batch and consumed in the exact micro-batch order
+        # supplied by UnifiedModelTrainStack. None keeps direct algorithm callers
+        # on the legacy per-micro fallback.
+        self._prepared_mse_batches: Optional[List[Optional[_PreparedMSEBatch]]] = None
+        # Whole-rollout anchor plan. Update 0 uses its own exact current replay
+        # (before any optimizer step); later disjoint updates are replayed eagerly
+        # and held as small CPU log-prob/mean tensors.
+        self._prepared_anchor_updates: Optional[List[Tuple[int, List[_PreparedAnchor]]]] = None
+        self._active_anchor_entries: Optional[List[_PreparedAnchor]] = None
 
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
@@ -127,12 +204,107 @@ class BagelFlowUniGRPO(FlowGRPO):
             return False
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
+    def _predict_velocities_at(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        samples: Sequence[torch.Tensor],
+        sigmas: Sequence[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Use BAGEL's layer-major multi-step API with a serial stage fallback."""
+        predict_many = getattr(self.stage, "predict_velocities_at", None)
+        if callable(predict_many):
+            return list(
+                predict_many(
+                    forward_kwargs,
+                    samples=samples,
+                    sigmas=sigmas,
+                    params=self.params,
+                )
+            )
+        return [
+            self.stage.predict_velocity_at(
+                forward_kwargs,
+                sample=sample,
+                sigma=sigma,
+                params=self.params,
+            )
+            for sample, sigma in zip(samples, sigmas)
+        ]
+
     def _snapshot_reference(self, transformer: Any) -> None:
         """Deprecated shim — the v_ref base snapshot is now captured lazily inside
         :meth:`_reference_weights` (at the swap site, so the shard state matches every
         step). Kept as a no-op for any external caller; safe to remove once none remain.
         """
         return None
+
+    def _full_ft_reference_params(self) -> List[tuple[str, torch.nn.Parameter]]:
+        transformer = self.stage.model.transformer
+        return [(name, param) for name, param in transformer.named_parameters() if param.requires_grad]
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def save_reference_checkpoint(self, path: str) -> None:
+        """Persist the immutable full-FT MSE reference beside a trainer checkpoint."""
+        transformer = self.stage.model.transformer
+        if self.mse_weight <= 0.0 or self._has_lora(transformer):
+            return
+        if self._ref_snapshot is None:
+            raise RuntimeError("BagelFlowUniGRPO.save_reference_checkpoint: the base reference has not been captured.")
+        rank = int(getattr(self.rank_info, "rank", 0))
+        world_size = int(getattr(self.rank_info, "world_size", 1))
+        os.makedirs(path, exist_ok=True)
+        torch.save(
+            {
+                "format_version": 1,
+                "world_size": world_size,
+                "rank": rank,
+                "tensors": {name: tensor.detach().cpu() for name, tensor in self._ref_snapshot.items()},
+            },
+            os.path.join(path, f"bagel_image_reference_rank{rank:05d}.pt"),
+        )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def load_reference_checkpoint(self, path: str) -> None:
+        """Restore the original full-FT MSE reference before resumed training."""
+        transformer = self.stage.model.transformer
+        if self.mse_weight <= 0.0 or self._has_lora(transformer):
+            return
+        rank = int(getattr(self.rank_info, "rank", 0))
+        world_size = int(getattr(self.rank_info, "world_size", 1))
+        snapshot_path = os.path.join(path, f"bagel_image_reference_rank{rank:05d}.pt")
+        if not os.path.isfile(snapshot_path):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: checkpoint is missing the immutable base reference "
+                f"for rank {rank}: {snapshot_path}."
+            )
+        payload = torch.load(snapshot_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("BagelFlowUniGRPO.load_reference_checkpoint: malformed reference payload.")
+        if (
+            int(payload.get("format_version", -1)) != 1
+            or int(payload.get("world_size", -1)) != world_size
+            or int(payload.get("rank", -1)) != rank
+        ):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: reference topology/version does not match "
+                f"rank {rank}/{world_size}."
+            )
+        tensors = payload.get("tensors")
+        if not isinstance(tensors, Mapping) or not all(torch.is_tensor(tensor) for tensor in tensors.values()):
+            raise RuntimeError("BagelFlowUniGRPO.load_reference_checkpoint: malformed reference tensor payload.")
+        expected_names = {name for name, _ in self._full_ft_reference_params()}
+        actual_names = {str(name) for name in tensors}
+        if actual_names != expected_names:
+            missing = sorted(expected_names - actual_names)
+            extra = sorted(actual_names - expected_names)
+            raise RuntimeError(
+                "BagelFlowUniGRPO.load_reference_checkpoint: reference parameter names do not match the model; "
+                f"missing={missing[:5]}, extra={extra[:5]}."
+            )
+        self._ref_snapshot = {
+            str(name): tensor.detach().to(dtype=torch.bfloat16).clone() for name, tensor in tensors.items()
+        }
 
     @contextmanager
     def _reference_weights(self, transformer: Any) -> Iterator[None]:
@@ -148,18 +320,22 @@ class BagelFlowUniGRPO(FlowGRPO):
         the first optimizer step) **at this swap site** — the same shard state every
         subsequent step sees, so the copy sizes always match (a pre-loop snapshot would be
         sharded while the swap site, right after the v_theta forward, is unsharded → size
-        mismatch). Stored as bf16 (the forward computes in bf16; halves the ~3.5→1.75
-        GiB/GPU footprint) keyed by param id.
+        mismatch). Stored as bf16 on CPU, keyed by stable parameter name. Keeping
+        this immutable reference off device removes a model-sized persistent GPU
+        allocation without moving live FSDP parameters or shards; a resumed run
+        already loads the same CPU representation from its checkpoint.
 
-        Per step: stash each live local shard, copy the base in (cast to the live fp32
-        master dtype), run the (no_grad) v_ref forward, then copy the trained weights back
+        Per scope: stash each live local shard, copy the base in (cast to the live fp32
+        master dtype), run the no-grad v_ref forward(s), then copy the trained weights back
         before any backward — so v_theta's autograd graph (recomputed under activation
-        checkpointing at the post-loop backward) reads the trained weights. In-place
-        copy+restore is autograd-safe here (verified on a 2-GPU backward repro).
+        checkpointing at the post-loop backward) reads the trained weights. The unified
+        stack opens one scope per optimizer update; direct callers retain a per-micro
+        fallback. In-place copy+restore is autograd-safe here (verified on a 2-GPU
+        backward repro).
         """
         from unirl.train.ema import local_view
 
-        live = [p for p in transformer.parameters() if p.requires_grad]
+        live = [(name, param) for name, param in transformer.named_parameters() if param.requires_grad]
         if not live:
             raise RuntimeError(
                 "BagelFlowUniGRPO: mse_weight > 0 with no LoRA and no trainable params to snapshot "
@@ -167,18 +343,36 @@ class BagelFlowUniGRPO(FlowGRPO):
                 "(use_lora=false unfreezes the decoder blocks) or set mse_weight=0."
             )
         if self._ref_snapshot is None:
-            self._ref_snapshot = {id(p): local_view(p).detach().to(dtype=torch.bfloat16).clone() for p in live}
+            self._ref_snapshot = {
+                name: local_view(param).detach().to(device="cpu", dtype=torch.bfloat16, copy=True)
+                for name, param in live
+            }
 
-        stash: List[torch.Tensor] = []
-        for p in live:
-            lv = local_view(p)
-            stash.append(lv.detach().clone())
-            lv.copy_(self._ref_snapshot[id(p)])
+        prepared: List[tuple[str, torch.nn.Parameter, torch.Tensor]] = []
+        for name, param in live:
+            lv = local_view(param)
+            reference = self._ref_snapshot.get(name)
+            if reference is None or reference.shape != lv.shape:
+                shape = None if reference is None else tuple(reference.shape)
+                raise RuntimeError(
+                    "BagelFlowUniGRPO: persisted base reference is incompatible with the live parameter "
+                    f"{name!r}: reference shape={shape}, live shape={tuple(lv.shape)}. "
+                    "Resume with the same FSDP topology used to save the checkpoint."
+                )
+            prepared.append((name, param, reference))
+
+        stash: List[tuple[torch.nn.Parameter, torch.Tensor]] = []
         try:
+            with torch.no_grad():
+                for _, param, reference in prepared:
+                    lv = local_view(param)
+                    stash.append((param, lv.detach().clone()))
+                    lv.copy_(reference)
             yield
         finally:
-            for p, saved in zip(live, stash):
-                local_view(p).copy_(saved)
+            with torch.no_grad():
+                for param, saved in stash:
+                    local_view(param).copy_(saved)
 
     def prepare_segment(
         self,
@@ -210,6 +404,295 @@ class BagelFlowUniGRPO(FlowGRPO):
         segment.sde_logp = result.log_probs.detach().cpu()
         segment.sde_means = result.prev_sample_means.detach().cpu()
 
+    def prepare_anchor_batch(
+        self,
+        *,
+        updates: Sequence[Sequence[Tuple[Mapping[str, Condition], LatentSegment]]],
+    ) -> None:
+        """Freeze only the anchors that precede a weight-changing update.
+
+        The unified stack partitions a rollout into disjoint optimizer updates.
+        Update 0 runs at the same pre-update weights as the eager anchor, so its
+        exact current replay can also serve as a detached old-policy anchor.
+        Every later update is still replayed here, before optimizer 0, and stored
+        on CPU. This preserves the policy state and exact bs=1 replay geometry
+        while removing one anchor replay for every update-0 sample.
+        """
+        if not self.lazy_first_update_anchor:
+            raise RuntimeError("prepare_anchor_batch requires lazy_first_update_anchor=True.")
+        if self._prepared_anchor_updates is not None or self._active_anchor_entries is not None:
+            raise RuntimeError("BagelFlowUniGRPO.prepare_anchor_batch: previous anchor state was not released.")
+        if not updates:
+            raise ValueError("BagelFlowUniGRPO.prepare_anchor_batch requires at least one optimizer update.")
+
+        prepared_updates: List[Tuple[int, List[_PreparedAnchor]]] = []
+        for update_index, micro_batches in enumerate(updates):
+            entries: List[_PreparedAnchor] = []
+            for conditions, segment in micro_batches:
+                if int(segment.batch_size) != 1:
+                    raise ValueError(
+                        "BagelFlowUniGRPO.prepare_anchor_batch requires one image per micro-batch "
+                        f"(BAGEL navit bs=1); got batch_size={segment.batch_size}."
+                    )
+                target_steps = tuple(self._resolve_target_steps(segment))
+                if update_index == 0 or not target_steps:
+                    entries.append(
+                        _PreparedAnchor(
+                            target_steps=target_steps,
+                            replay=None,
+                            derive_from_current=update_index == 0,
+                        )
+                    )
+                    continue
+
+                typed_conds = typed_conditions(conditions, self.conditions_cls)
+                with torch.no_grad():
+                    replay = self.stage.replay(
+                        typed_conds,
+                        segment=segment,
+                        params=self.params,
+                        step_indices=list(target_steps),
+                    )
+                if replay.prev_sample_means is None:
+                    raise RuntimeError(
+                        "BagelFlowUniGRPO.prepare_anchor_batch: exact anchor replay returned no prev_sample_means."
+                    )
+                entries.append(
+                    _PreparedAnchor(
+                        target_steps=target_steps,
+                        replay=ReplayResult(
+                            log_probs=replay.log_probs.detach().cpu(),
+                            prev_sample_means=replay.prev_sample_means.detach().cpu(),
+                        ),
+                        derive_from_current=False,
+                    )
+                )
+            prepared_updates.append((update_index, entries))
+        self._prepared_anchor_updates = prepared_updates
+
+    def _activate_anchor_update(self, *, update_index: int, expected_count: int) -> None:
+        if not self.lazy_first_update_anchor:
+            return
+        if self._active_anchor_entries is not None:
+            raise RuntimeError("BagelFlowUniGRPO: previous update left active anchor entries.")
+        updates = self._prepared_anchor_updates
+        if not updates:
+            raise RuntimeError("BagelFlowUniGRPO: no prepared anchor update is available.")
+        prepared_index, entries = updates.pop(0)
+        if prepared_index != int(update_index):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor update order mismatch: "
+                f"prepared={prepared_index}, requested={int(update_index)}."
+            )
+        if len(entries) != int(expected_count):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor micro-batch count mismatch: "
+                f"prepared={len(entries)}, requested={int(expected_count)}."
+            )
+        self._active_anchor_entries = entries
+
+    def _take_prepared_anchor(self, target_steps: Sequence[int]) -> Optional[_PreparedAnchor]:
+        if not self.lazy_first_update_anchor:
+            return None
+        entries = self._active_anchor_entries
+        if entries is None or not entries:
+            raise RuntimeError("BagelFlowUniGRPO: prepared anchor queue was exhausted early.")
+        prepared = entries.pop(0)
+        expected = tuple(int(step) for step in target_steps)
+        if prepared.target_steps != expected:
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared anchor step indices do not match the consumed micro-batch: "
+                f"prepared={prepared.target_steps}, current={expected}."
+            )
+        return prepared
+
+    def finish_anchor_batch(self, *, succeeded: bool) -> None:
+        remaining_updates = len(self._prepared_anchor_updates or ())
+        remaining_active = len(self._active_anchor_entries or ())
+        self._prepared_anchor_updates = None
+        self._active_anchor_entries = None
+        if succeeded and (remaining_updates or remaining_active):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.finish_anchor_batch: training completed with unconsumed anchors: "
+                f"updates={remaining_updates}, active_entries={remaining_active}."
+            )
+
+    def prepare_update_batch(
+        self,
+        *,
+        micro_batches: Sequence[Tuple[Mapping[str, Condition], LatentSegment, torch.Tensor]],
+        training_progress: float,
+        loss_scale: float,
+        update_index: int = 0,
+    ) -> None:
+        """Prepare detached MSE references under one weight swap per update.
+
+        BAGEL image replay is constrained to one sample per micro-batch. The old
+        path stashed, replaced, and restored every trainable full-FT shard for
+        each sample. Here all current-policy text contexts are built first, then
+        every ``v_ref`` is evaluated inside one reference-weight scope. The
+        contexts and detached reference velocities are consumed later in the
+        same order by :meth:`compute_loss_and_backward`.
+
+        With ``reuse_ratio_context_for_mse``, the first phase runs each
+        RatioNorm replay and backward, then retains only graph-free terminal K/V
+        views. The reference and current-policy MSE phases reuse those exact
+        contexts, removing the otherwise duplicated exact Stage-0 reconstruction.
+
+        This hook runs once per optimizer update rather than once per rollout:
+        under ``num_updates_per_batch > 1`` the later update therefore rebuilds
+        its detached context after the preceding optimizer step, preserving the
+        prior policy-state semantics.
+        """
+        if self._prepared_mse_batches is not None:
+            raise RuntimeError(
+                "BagelFlowUniGRPO.prepare_update_batch: the previous update left "
+                f"{len(self._prepared_mse_batches)} unconsumed MSE micro-batches."
+            )
+        self._activate_anchor_update(update_index=update_index, expected_count=len(micro_batches))
+        if self.mse_weight <= 0.0:
+            self._prepared_mse_batches = None
+            return
+
+        # The expensive operation is the full-FT local-shard stash/copy/restore.
+        # LoRA's adapter toggle is cheap and retains no fp32 model-sized stash, so
+        # keep its established per-micro path and avoid retaining a whole update's
+        # contexts.
+        transformer = self.stage.model.transformer
+        if self._has_lora(transformer):
+            self._prepared_mse_batches = None
+            return
+
+        entries: List[Optional[_PreparedMSEBatch]] = [None] * len(micro_batches)
+        pending: List[
+            Tuple[
+                int,
+                LatentSegment,
+                Tuple[int, ...],
+                Dict[str, Any],
+                torch.device,
+                Optional[AlgorithmStepResult],
+            ]
+        ] = []
+        for index, (conditions, segment, advantages) in enumerate(micro_batches):
+            if int(segment.batch_size) != 1:
+                raise ValueError(
+                    "BagelFlowUniGRPO.prepare_update_batch requires one image per micro-batch "
+                    f"(BAGEL navit bs=1); got batch_size={segment.batch_size}."
+                )
+            target_steps = tuple(self._resolve_target_steps(segment))
+            if not target_steps or segment.sigmas is None:
+                continue
+            typed_conds = typed_conditions(conditions, self.conditions_cls)
+            device = torch.device(self.stage.model.device)
+            surrogate_result: Optional[AlgorithmStepResult] = None
+            if self.reuse_ratio_context_for_mse:
+                surrogate_result, forward_kwargs = self._ratio_norm_surrogate_with_context(
+                    conditions=conditions,
+                    segment=segment,
+                    advantages=advantages,
+                    training_progress=float(training_progress),
+                    loss_scale=float(loss_scale),
+                )
+            else:
+                with torch.no_grad():
+                    forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            if self.context_gradient_mode == "stage_boundary":
+                # no_grad prevents new graph construction, but does not detach
+                # graph-bearing leaves supplied by an existing replay tree.
+                forward_kwargs = self.stage.detach_forward_kwargs(forward_kwargs)
+            pending.append((index, segment, target_steps, forward_kwargs, device, surrogate_result))
+
+        if pending:
+            with torch.no_grad():
+                with self._reference_weights(transformer):
+                    for index, segment, target_steps, forward_kwargs, device, surrogate_result in pending:
+                        schedule = segment.sigmas.to(device)
+                        v_refs = [
+                            velocity.detach()
+                            for velocity in self._predict_velocities_at(
+                                forward_kwargs,
+                                samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+                                sigmas=[schedule[step_idx] for step_idx in target_steps],
+                            )
+                        ]
+                        if self.stage_prepared_replay_to_cpu:
+                            staged_forward_kwargs, staged_v_refs = move_replay_tree(
+                                (forward_kwargs, v_refs),
+                                torch.device("cpu"),
+                            )
+                            entries[index] = _PreparedMSEBatch(
+                                target_steps=target_steps,
+                                forward_kwargs=staged_forward_kwargs,
+                                reference_velocities=staged_v_refs,
+                                surrogate_result=surrogate_result,
+                                staged_on_cpu=True,
+                            )
+                        else:
+                            entries[index] = _PreparedMSEBatch(
+                                target_steps=target_steps,
+                                forward_kwargs=forward_kwargs,
+                                reference_velocities=v_refs,
+                                surrogate_result=surrogate_result,
+                            )
+            # The pending tuples own the accelerator copies after CPU staging.
+            # Drop them before empty_cache so only the graph-free CPU queue
+            # survives into image backward. Loop locals retain the final entry.
+            pending.clear()
+            if self.stage_prepared_replay_to_cpu:
+                del forward_kwargs, v_refs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self._prepared_mse_batches = entries
+
+    def _take_prepared_mse(self, target_steps: Sequence[int]) -> Optional[_PreparedMSEBatch]:
+        """Consume one prepared entry, or return None for direct-call fallback."""
+        queue = self._prepared_mse_batches
+        if queue is None:
+            return None
+        if not queue:
+            raise RuntimeError("BagelFlowUniGRPO: prepared MSE micro-batch queue was exhausted early.")
+        prepared = queue.pop(0)
+        if not queue:
+            # Restore the documented direct-call fallback immediately after the
+            # last stacked micro-batch releases its cached context/reference.
+            self._prepared_mse_batches = None
+        if prepared is None:
+            if target_steps:
+                raise RuntimeError("BagelFlowUniGRPO: missing prepared MSE data for a trainable micro-batch.")
+            return None
+        if prepared.target_steps != tuple(int(step) for step in target_steps):
+            raise RuntimeError(
+                "BagelFlowUniGRPO: prepared MSE step indices do not match the consumed micro-batch: "
+                f"prepared={prepared.target_steps}, current={tuple(target_steps)}."
+            )
+        if prepared.staged_on_cpu:
+            forward_kwargs, reference_velocities = move_replay_tree(
+                (prepared.forward_kwargs, prepared.reference_velocities),
+                torch.device(self.stage.model.device),
+            )
+            prepared = _PreparedMSEBatch(
+                target_steps=prepared.target_steps,
+                forward_kwargs=forward_kwargs,
+                reference_velocities=reference_velocities,
+                surrogate_result=prepared.surrogate_result,
+                staged_on_cpu=False,
+            )
+        return prepared
+
+    def finish_update_batch(self, *, succeeded: bool) -> None:
+        """Release prepared KV/reference tensors, including failed updates."""
+        remaining = len(self._prepared_mse_batches or ())
+        remaining_anchors = len(self._active_anchor_entries or ())
+        self._prepared_mse_batches = None
+        self._active_anchor_entries = None
+        if succeeded and (remaining or remaining_anchors):
+            raise RuntimeError(
+                "BagelFlowUniGRPO.finish_update_batch: optimizer update completed with unconsumed state: "
+                f"mse_batches={remaining}, anchor_entries={remaining_anchors}."
+            )
+
     def compute_loss_and_backward(
         self,
         *,
@@ -219,10 +702,85 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
+        needs_boundary_context = self.ratio_norm and self.context_gradient_mode == "stage_boundary"
+        target_steps = self._resolve_target_steps(segment) if self.mse_weight > 0.0 or needs_boundary_context else []
+        prepared_anchor = self._take_prepared_anchor(target_steps)
+        prepared_mse = self._take_prepared_mse(target_steps) if self.mse_weight > 0.0 else None
+
+        # The native Stage 0 -> Stage 1 engine boundary transfers values, not an
+        # autograd graph. In the opt-in stage-boundary mode, mirror that contract:
+        # use the exact current-policy context built under no_grad for both image
+        # losses. Unified training supplies it from prepare_update_batch; direct
+        # callers build it once here and retain the existing serial fallback.
+        boundary_forward_kwargs: Optional[Dict[str, Any]] = None
+        if needs_boundary_context and target_steps:
+            if prepared_mse is not None:
+                boundary_forward_kwargs = prepared_mse.forward_kwargs
+            else:
+                typed_conds = typed_conditions(conditions, self.conditions_cls)
+                device = torch.device(self.stage.model.device)
+                with torch.no_grad():
+                    boundary_forward_kwargs = self.stage.build_forward_kwargs(
+                        typed_conds,
+                        params=self.params,
+                        device=device,
+                    )
+                boundary_forward_kwargs = self.stage.detach_forward_kwargs(boundary_forward_kwargs)
+
+        if needs_boundary_context:
+            if not target_steps or segment.sigmas is None:
+                return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            if boundary_forward_kwargs is None:
+                raise RuntimeError("Stage-boundary RatioNorm requires a prepared detached context.")
+
+            v_refs: Optional[List[torch.Tensor]] = None
+            if self.mse_weight > 0.0:
+                if prepared_mse is not None:
+                    v_refs = prepared_mse.reference_velocities
+                else:
+                    device = torch.device(self.stage.model.device)
+                    schedule = segment.sigmas.to(device)
+                    transformer = self.stage.model.transformer
+                    full_ft_ref = not self._has_lora(transformer)
+                    with torch.no_grad():
+                        ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+                        with ref_ctx as disabled:
+                            if not full_ft_ref and not disabled:
+                                raise RuntimeError(
+                                    "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
+                                    "to disable nor trainable params to snapshot as v_ref on "
+                                    "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
+                                    "or set mse_weight=0."
+                                )
+                            v_refs = [
+                                self.stage.predict_velocity_at(
+                                    boundary_forward_kwargs,
+                                    sample=segment.latents_at(step_idx)[0].to(device),
+                                    sigma=schedule[step_idx],
+                                    params=self.params,
+                                ).detach()
+                                for step_idx in target_steps
+                            ]
+                    if full_ft_ref and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+            return self._stage_boundary_loss_and_backward(
+                segment=segment,
+                advantages=advantages,
+                training_progress=training_progress,
+                loss_scale=loss_scale,
+                forward_kwargs=boundary_forward_kwargs,
+                target_steps=target_steps,
+                reference_velocities=v_refs,
+                prepared_anchor=prepared_anchor,
+            )
+
         # 1. Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the
         #    plain FlowGRPO ratio with the per-step normalized one when enabled;
         #    otherwise the inherited FlowGRPO surrogate.
-        if self.ratio_norm:
+        if prepared_mse is not None and prepared_mse.surrogate_result is not None:
+            result = prepared_mse.surrogate_result
+        elif self.ratio_norm:
             result = self._ratio_norm_surrogate(
                 conditions=conditions,
                 segment=segment,
@@ -240,74 +798,65 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         if self.mse_weight <= 0.0 or not result.has_backward:
             return result
-        target_steps = self._resolve_target_steps(segment)
         if not target_steps or segment.sigmas is None:
             return result
 
         # 2. Velocity-MSE regularizer toward the LoRA-disabled base, at the SDE
         #    steps. Separate backward -> grads accumulate into the same step.
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        device = next(self.stage.model.transformer.parameters()).device
+        # FSDP2 CPUOffloadPolicy keeps the decoder's parameter shards on CPU;
+        # BAGEL's bundle device is the execution device used by the live
+        # embeddings, heads, and FSDP all-gathers.
+        device = torch.device(self.stage.model.device)
         schedule = segment.sigmas.to(device)
-        # Rebuild the conditioning KV contexts from text ONCE (the und-path prefill)
-        # and reuse the resulting forward kwargs across every SDE step and both
-        # v_theta / v_ref. The conditions now carry only text (see
-        # BagelDiffusionConditions), and the context is a detached constant, so one
-        # build serves all steps. Built here (outside the _disable_lora scope) it is
-        # the LoRA-on context; v_ref then runs the velocity forward with LoRA disabled
-        # over that same context — matching the prior behavior, where v_ref reused the
-        # rollout (LoRA-on) context with a base velocity forward.
-        forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
-        transformer = self.stage.model.transformer
-        # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen bf16 snapshot of
-        # the base weights, captured lazily on the first _reference_weights swap (= the
-        # pre-trained base, before the first optimizer step). Both yield the pre-trained
-        # reference velocity over the prebuilt context.
-        full_ft_ref = not self._has_lora(transformer)
-        # Compute ALL v_ref FIRST, under a SINGLE base-weight swap, storing only the
-        # detached velocity tensors (tiny [seq,C] each — no autograd graphs). Then run the
-        # v_theta forwards (grad-on) against those constants. This keeps the expensive
-        # base-weight swap (a full fp32 master-sized stash under full FT) OUT of the window
-        # where the N retained v_theta graphs + activations are live — the peak that OOM'd
-        # a per-step swap. v_ref is a detached constant either way (it is `.detach()`ed into
-        # the MSE), so hoisting it changes nothing numerically.
-        with torch.no_grad():
-            if full_ft_ref:
-                ref_ctx = self._reference_weights(transformer)
-            else:
-                ref_ctx = _disable_lora(transformer)
-            with ref_ctx as disabled:
-                if not full_ft_ref and not disabled:
-                    raise RuntimeError(
-                        "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
-                        "to disable nor trainable params to snapshot as v_ref on "
-                        "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
-                        "or set mse_weight=0."
-                    )
-                v_refs = [
-                    self.stage.predict_velocity_at(
-                        forward_kwargs,
-                        sample=segment.latents_at(s)[0].to(device),
-                        sigma=schedule[s],
-                        params=self.params,
-                    ).detach()
-                    for s in target_steps
-                ]
-        # Return the freed stash + v_ref activation blocks to the driver before the v_theta
-        # graphs build, so this step's peak does not carry both (mirrors the train stack's
-        # post-churn defrag under num_updates_per_batch>1). Full-FT only — the LoRA path's
-        # v_ref leaves no stash to reclaim.
-        if full_ft_ref and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Reuse one detached conditioning context across every SDE step and both
+        # v_theta / v_ref. Unified full-FT training prepares it before this call;
+        # direct callers and LoRA build it in the fallback below. In either case it
+        # is built at the live policy weights before entering the reference scope.
+        # The surrogate replay above already trains through the reconstructed
+        # T2TI text cache. Keep the MSE context detached: full-FT v_ref swaps
+        # parameter shards in place, and mutating them after a grad-carrying
+        # context prefill would invalidate autograd's version counters.
+        if prepared_mse is not None:
+            forward_kwargs = prepared_mse.forward_kwargs
+            v_refs = prepared_mse.reference_velocities
+        else:
+            typed_conds = typed_conditions(conditions, self.conditions_cls)
+            with torch.no_grad():
+                forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
+            transformer = self.stage.model.transformer
+            full_ft_ref = not self._has_lora(transformer)
+            with torch.no_grad():
+                ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+                with ref_ctx as disabled:
+                    if not full_ft_ref and not disabled:
+                        raise RuntimeError(
+                            "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
+                            "to disable nor trainable params to snapshot as v_ref on "
+                            "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
+                            "or set mse_weight=0."
+                        )
+                    v_refs = [
+                        velocity.detach()
+                        for velocity in self._predict_velocities_at(
+                            forward_kwargs,
+                            samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+                            sigmas=[schedule[step_idx] for step_idx in target_steps],
+                        )
+                    ]
+            if full_ft_ref and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        mse_terms: List[torch.Tensor] = []
-        for step_idx, v_ref in zip(target_steps, v_refs):
-            x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C] (navit bs=1)
-            sigma = schedule[step_idx]
-            v_theta = self.stage.predict_velocity_at(forward_kwargs, sample=x_t, sigma=sigma, params=self.params)
-            mse_terms.append(((v_theta - v_ref) ** 2).mean())
+        policy_velocities = self._predict_velocities_at(
+            forward_kwargs,
+            samples=[segment.latents_at(step_idx)[0].to(device) for step_idx in target_steps],
+            sigmas=[schedule[step_idx] for step_idx in target_steps],
+        )
 
-        mse = torch.stack(mse_terms).mean()
+        mse = self._velocity_mse(
+            policy_velocities=policy_velocities,
+            reference_velocities=v_refs,
+            target_steps=target_steps,
+        )
         (self.mse_weight * mse * loss_scale).backward()
 
         mse_val = float(mse.detach().item())
@@ -322,6 +871,87 @@ class BagelFlowUniGRPO(FlowGRPO):
     # GRPO-Guard RatioNorm surrogate
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _velocity_mse(
+        *,
+        policy_velocities: Sequence[torch.Tensor],
+        reference_velocities: Sequence[torch.Tensor],
+        target_steps: Sequence[int],
+    ) -> torch.Tensor:
+        """Compute velocity MSE after validating one exact-shaped pair per step."""
+        if len(policy_velocities) != len(reference_velocities) or len(policy_velocities) != len(target_steps):
+            raise RuntimeError(
+                "BAGEL velocity MSE count mismatch: "
+                f"policy={len(policy_velocities)}, reference={len(reference_velocities)}, "
+                f"steps={len(target_steps)}."
+            )
+        terms: List[torch.Tensor] = []
+        for step_idx, v_theta, v_ref in zip(target_steps, policy_velocities, reference_velocities):
+            if v_theta.shape != v_ref.shape:
+                raise RuntimeError(
+                    f"BAGEL velocity MSE shape mismatch at SDE step {int(step_idx)}: "
+                    f"policy={tuple(v_theta.shape)}, reference={tuple(v_ref.shape)}. "
+                    "Exact shape equality is required; broadcasting is not supported."
+                )
+            terms.append(((v_theta - v_ref) ** 2).mean())
+        return torch.stack(terms).mean()
+
+    def _stage_boundary_loss_and_backward(
+        self,
+        *,
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+        forward_kwargs: Dict[str, Any],
+        target_steps: List[int],
+        reference_velocities: Optional[List[torch.Tensor]],
+        prepared_anchor: Optional[_PreparedAnchor] = None,
+    ) -> AlgorithmStepResult:
+        """Joint RatioNorm + velocity MSE at the detached native stage boundary."""
+        replay, policy_velocities = self.stage.replay_from_forward_kwargs_with_velocities(
+            forward_kwargs,
+            segment=segment,
+            params=self.params,
+            step_indices=target_steps,
+        )
+        anchor_replay: Optional[ReplayResult] = None
+        if prepared_anchor is not None:
+            anchor_replay = replay if prepared_anchor.derive_from_current else prepared_anchor.replay
+            if anchor_replay is None:
+                raise RuntimeError("Prepared BAGEL anchor contains no replay values for a trainable micro-batch.")
+        policy_loss, metrics = self._ratio_norm_loss(
+            replay=replay,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            target_steps=target_steps,
+            anchor_replay=anchor_replay,
+        )
+
+        mse: Optional[torch.Tensor] = None
+        if self.mse_weight > 0.0:
+            if reference_velocities is None:
+                raise RuntimeError("Stage-boundary velocity MSE requires prepared reference velocities.")
+            mse = self._velocity_mse(
+                policy_velocities=policy_velocities,
+                reference_velocities=reference_velocities,
+                target_steps=target_steps,
+            )
+
+        total_loss = policy_loss if mse is None else policy_loss + self.mse_weight * mse
+        (total_loss * loss_scale).backward()
+
+        result_metrics = dict(metrics)
+        if mse is not None:
+            result_metrics.update(velocity_mse=float(mse.detach().item()), mse_weight=self.mse_weight)
+        return AlgorithmStepResult(
+            loss=float(total_loss.detach().item()),
+            metrics=result_metrics,
+            num_steps_or_tokens=len(target_steps),
+            has_backward=True,
+        )
+
     def _ratio_norm_surrogate(
         self,
         *,
@@ -331,6 +961,47 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
+        result, _ = self._ratio_norm_surrogate_impl(
+            conditions=conditions,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            loss_scale=loss_scale,
+            retain_forward_kwargs=False,
+        )
+        return result
+
+    def _ratio_norm_surrogate_with_context(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+    ) -> Tuple[AlgorithmStepResult, Dict[str, Any]]:
+        result, forward_kwargs = self._ratio_norm_surrogate_impl(
+            conditions=conditions,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            loss_scale=loss_scale,
+            retain_forward_kwargs=True,
+        )
+        if forward_kwargs is None:
+            raise RuntimeError("RatioNorm context reuse requested but replay produced no forward kwargs.")
+        return result, forward_kwargs
+
+    def _ratio_norm_surrogate_impl(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        loss_scale: float,
+        retain_forward_kwargs: bool,
+    ) -> Tuple[AlgorithmStepResult, Optional[Dict[str, Any]]]:
         """FlowGRPO clipped surrogate with GRPO-Guard RatioNorm.
 
         The flow importance ratio is left-shifted (mean < 1) and step-inconsistent,
@@ -353,24 +1024,74 @@ class BagelFlowUniGRPO(FlowGRPO):
         """
         target_steps = self._resolve_target_steps(segment)
         if not target_steps:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False), None
         if segment.sde_means is None:
             raise RuntimeError(
                 "BagelFlowUniGRPO(ratio_norm=True): segment.sde_means is None. RatioNorm needs the rollout "
                 "to store per-SDE-step μ_old; ensure BagelDiffusionStage.diffuse records sde_means."
             )
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+        forward_kwargs: Optional[Dict[str, Any]] = None
+        if retain_forward_kwargs:
+            replay, forward_kwargs = self.stage.replay_with_detached_forward_kwargs(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=target_steps,
+            )
+        else:
+            replay = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+        loss, metrics = self._ratio_norm_loss(
+            replay=replay,
+            segment=segment,
+            advantages=advantages,
+            training_progress=training_progress,
+            target_steps=target_steps,
+        )
+        (loss * loss_scale).backward()
+        return (
+            AlgorithmStepResult(
+                loss=float(loss.detach().item()),
+                metrics=metrics,
+                num_steps_or_tokens=len(target_steps),
+                has_backward=True,
+            ),
+            forward_kwargs,
+        )
+
+    def _ratio_norm_loss(
+        self,
+        *,
+        replay: Any,
+        segment: "LatentSegment",
+        advantages: torch.Tensor,
+        training_progress: float,
+        target_steps: List[int],
+        anchor_replay: Optional[ReplayResult] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Build the RatioNorm loss without choosing a backward schedule."""
         new_logp = replay.log_probs  # [1, S']
         mu_theta = replay.prev_sample_means  # [1, S', seq, C]
         if mu_theta is None:
             raise RuntimeError("BagelFlowUniGRPO(ratio_norm=True): stage.replay returned no prev_sample_means (μ_θ).")
-        old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
-        mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
-            dtype=mu_theta.dtype, device=mu_theta.device
-        )
+        if anchor_replay is None:
+            old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
+            mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
+                dtype=mu_theta.dtype, device=mu_theta.device
+            )
+        else:
+            if anchor_replay.prev_sample_means is None:
+                raise RuntimeError("Prepared BAGEL anchor replay returned no prev_sample_means (μ_old).")
+            old_logp = anchor_replay.log_probs.detach().to(dtype=new_logp.dtype, device=new_logp.device)
+            mu_old = anchor_replay.prev_sample_means.detach().to(dtype=mu_theta.dtype, device=mu_theta.device)
+            if old_logp.shape != new_logp.shape or mu_old.shape != mu_theta.shape:
+                raise RuntimeError(
+                    "Prepared BAGEL anchor shape mismatch: "
+                    f"old_logp={tuple(old_logp.shape)}, new_logp={tuple(new_logp.shape)}, "
+                    f"mu_old={tuple(mu_old.shape)}, mu_theta={tuple(mu_theta.shape)}."
+                )
         # std_var must use the same sigma_max as the SDE step that produced old/new log_probs
         # (diffuse/replay pass schedule[1]); otherwise the two disagree at the σ=1 step.
         sde_sigma_max = float(segment.sigmas[1]) if int(segment.sigmas.shape[0]) > 1 else float(segment.sigmas[0])
@@ -400,7 +1121,6 @@ class BagelFlowUniGRPO(FlowGRPO):
             loss = (loss_per_elem * weight).mean()
         else:
             loss = loss_per_elem.mean()
-        (loss * loss_scale).backward()
 
         with torch.no_grad():
             raw_ratio_mean = float(torch.exp(log_r).mean().item())
@@ -413,12 +1133,7 @@ class BagelFlowUniGRPO(FlowGRPO):
             "ratio_norm": 1.0,
             "grad_reweight": float(bool(self.grad_reweight)),
         }
-        return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
-            metrics=metrics,
-            num_steps_or_tokens=len(target_steps),
-            has_backward=True,
-        )
+        return loss, metrics
 
     @staticmethod
     def _sde_std_var(

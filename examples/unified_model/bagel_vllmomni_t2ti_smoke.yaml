@@ -1,0 +1,66 @@
+# @package _global_
+# Single-GPU functional smoke profile for native BAGEL T2TI vLLM-Omni.
+#
+# This composes the production recipe and changes only scale and device-memory
+# placement. It preserves the previously validated P=1, N=4, M=1 settings and
+# CPU-offloaded full-FT path for an 80GB-class GPU. Use this for contract and
+# end-to-end functional checks, not as the production UniGRPO recipe.
+#
+# Launch:
+#   scripts/launch_bagel_vllmomni_t2ti.sh --profile smoke
+
+defaults:
+  - /unified_model/bagel_vllmomni_t2ti
+  - _self_
+
+num_devices: 1
+devices_per_node: 1
+batch_size: 1
+enable_fsdp_offload: true
+# Smoke keeps its existing whole-trainer CPU lifecycle; optimizer-only parking
+# is deliberately mutually exclusive with that mode.
+park_optimizer_state_during_rollout: false
+park_optimizer_state_during_train: false
+
+logging:
+  tags: [bagel, unigrpo, t2ti, vllm-omni, fullft, smoke, cpu-offload]
+
+backend:
+  fsdp_cfg:
+    cpu_offload: true
+
+reward:
+  # CPU smoke has no GPU reward-model footprint to park.
+  park_backend_between_calls: false
+  backend:
+    base_device: cpu
+    config:
+      batch_size: 2
+      device: cpu
+
+algorithm:
+  image:
+    # The one-update smoke has four micros and already exercises FSDP CPU
+    # offload. Keep the production-only prepared-data staging gate disabled.
+    stage_prepared_replay_to_cpu: false
+
+stack:
+  # Keep the functional smoke bounded to one replay/update pass.
+  num_updates_per_batch: 1
+  # Production-only H20 reclamation controls; preserve the smoke's default-off
+  # behavior so its CPU-offload lifecycle remains the sole memory mechanism.
+  empty_cache_after_image_micro: false
+  image_micro_empty_cache_interval: 1
+  image_micro_empty_cache_min_free_gb: 0.0
+  empty_cache_after_optimizer: false
+  cuda_peak_telemetry: false
+
+sampling:
+  ar:
+    samples_per_prompt: 4
+    max_new_tokens: 512
+  diffusion:
+    samples_per_prompt: 1
+    num_inference_steps: 14
+    scheduler:
+      num_sde_steps: 2

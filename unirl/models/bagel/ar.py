@@ -297,7 +297,10 @@ class BagelARStage(ARStage[BagelARConditions]):
             f"BagelARStage.replay: conditions batch ({conditions.batch_size}) != "
             f"segment samples ({int(segment.lengths.numel())}).",
         )
-        device = next(self.model.transformer.parameters()).device
+        # FSDP2 CPUOffloadPolicy deliberately keeps decoder shards on CPU.
+        # ``bundle.device`` remains the authoritative execution device for the
+        # unsharded embeddings/heads and for FSDP's just-in-time all-gathers.
+        device = torch.device(self.model.device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
         lengths = [int(n) for n in segment.lengths.tolist()]
         start_id = int(self.model.new_token_ids["bos_token_id"])

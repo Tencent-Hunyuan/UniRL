@@ -28,7 +28,13 @@ is flash-free too (torch + diffusers only).
 """
 
 from .ar import BagelARParams, BagelARStage, BagelARStep
-from .conditions import BagelARConditions, BagelDiffusionConditions
+from .conditions import (
+    BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT,
+    BagelARConditions,
+    BagelDiffusionConditions,
+    BagelT2TIDiffusionConditions,
+    BagelThinkKVReplaySpec,
+)
 from .config import BAGEL_MOE_GEN_LORA_TARGETS, BAGEL_UND_LORA_TARGETS, BagelPipelineConfig
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage, BagelDiffusionStep
 from .pipeline import BagelPipeline, BagelUniPipeline
@@ -36,6 +42,7 @@ from .vae import BagelVAEDecodeStage, bagel_latent_geometry, bagel_latent_shape,
 
 __all__ = [
     "BAGEL_MOE_GEN_LORA_TARGETS",
+    "BAGEL_T2TI_REPLAY_CUSTOM_OUTPUT",
     "BAGEL_UND_LORA_TARGETS",
     "BagelARConditions",
     "BagelARParams",
@@ -45,6 +52,8 @@ __all__ = [
     "BagelDiffusionParams",
     "BagelDiffusionStage",
     "BagelDiffusionStep",
+    "BagelT2TIDiffusionConditions",
+    "BagelThinkKVReplaySpec",
     "BagelPipeline",
     "BagelUniPipeline",
     "BagelPipelineConfig",

@@ -100,6 +100,7 @@ class BagelFlowSDEScheduler:
         self._step_index: int = 0
         # generator is required instead of the reseeded global RNG.
         self._noise_generator: Optional[torch.Generator] = None
+        self._noise_seed: Optional[int] = None
         # Packed t2i: per-image token counts to split log-prob/traj. None = bs=1.
         self._image_token_sizes: Optional[List[int]] = None
         # Capture buffers (cleared each request).
@@ -121,6 +122,7 @@ class BagelFlowSDEScheduler:
         sde_indices: Optional[List[int]],
         sigma_max: Optional[float] = None,
         trajectory_dtype: torch.dtype = torch.float32,
+        noise_seed: Optional[int] = None,
         image_token_sizes: Optional[List[int]] = None,
     ) -> None:
         """Arm this request: SDE strength, sparse step gate, σ_max, trajectory dtype.
@@ -158,6 +160,7 @@ class BagelFlowSDEScheduler:
         )
         self._step_index = 0
         self._noise_generator = None
+        self._noise_seed = int(noise_seed) if noise_seed is not None else None
         self._traj_latents = []
         self._traj_timesteps = []
         self._traj_log_probs = []
@@ -265,7 +268,8 @@ class BagelFlowSDEScheduler:
             # broadcast across cfg_group like x_t).
             if self._noise_generator is None:
                 self._noise_generator = torch.Generator(device=v_t_f32.device)
-                self._noise_generator.manual_seed(int.from_bytes(os.urandom(8), "big"))
+                seed = self._noise_seed
+                self._noise_generator.manual_seed(seed if seed is not None else int.from_bytes(os.urandom(8), "big"))
             noise = randn_tensor(
                 v_t_f32.shape,
                 generator=self._noise_generator,

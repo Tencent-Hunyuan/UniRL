@@ -39,6 +39,57 @@ from unirl.train.deferred import apply_deferred_ops
 from unirl.utils.dtypes import parse_torch_dtype
 
 
+def _remove_accelerate_hooks_before_fsdp(model: torch.nn.Module) -> int:
+    """Give FSDP sole ownership of forwards in its trainable subtree.
+
+    ``accelerate.load_checkpoint_and_dispatch(force_hooks=True)`` rewrites
+    ``forward`` on every loaded submodule.  Those wrappers are useful while
+    loading/inferencing, but must not survive on modules that FSDP2 converts in
+    place.  Avoid importing Accelerate for the common case with no such hooks.
+    """
+    hooked = [module for module in model.modules() if hasattr(module, "_hf_hook")]
+    if not hooked:
+        return 0
+
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except ImportError as exc:  # pragma: no cover - hooks imply Accelerate was present
+        raise RuntimeError(
+            "FSDPBackend found Accelerate device hooks on the trainable model, "
+            "but Accelerate is unavailable to remove them."
+        ) from exc
+
+    remove_hook_from_module(model, recurse=True)
+    remaining = [type(module).__name__ for module in model.modules() if hasattr(module, "_hf_hook")]
+    if remaining:
+        raise RuntimeError(
+            "FSDPBackend could not remove every Accelerate device hook from the "
+            f"trainable model (remaining module types: {remaining[:3]})."
+        )
+    return len(hooked)
+
+
+def _prepare_cpu_offload_model(model: torch.nn.Module) -> None:
+    """Materialize eager FSDP2 CPU-offload inputs on their required device.
+
+    ``CPUOffloadPolicy`` validates that every sharded parameter is on CPU at
+    lazy initialization time. Eager bundles such as BAGEL load on the compute
+    GPU, so move their trainable subtree before ``fully_shard`` creates the
+    DTensor shards. Fully-meta bundles stay meta and are materialized onto CPU
+    by the post-wrap sharded loader.
+    """
+    tensors = [*model.parameters(), *model.buffers()]
+    has_meta = any(tensor.is_meta for tensor in tensors)
+    has_materialized = any(not tensor.is_meta for tensor in tensors)
+    if has_meta and has_materialized:
+        raise RuntimeError(
+            "FSDPBackend cpu_offload does not support a partially-meta trainable "
+            "model; materialize all tensors or keep the entire model on meta."
+        )
+    if has_materialized:
+        model.to(device="cpu")
+
+
 class FSDPBackend(BaseFSDP2Backend):
     """Single-track FSDP training backend.
 
@@ -81,7 +132,10 @@ class FSDPBackend(BaseFSDP2Backend):
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
+        _remove_accelerate_hooks_before_fsdp(model)
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
+        if fsdp_cfg.cpu_offload:
+            _prepare_cpu_offload_model(model)
 
         fsdp_wrap(
             model,
@@ -105,7 +159,7 @@ class FSDPBackend(BaseFSDP2Backend):
         load_trainable_weights(
             model,
             bundle,
-            device=self._device,
+            device=torch.device("cpu") if fsdp_cfg.cpu_offload else self._device,
             rank=self._rank,
             with_aux=with_aux,
             eager_ok=True,

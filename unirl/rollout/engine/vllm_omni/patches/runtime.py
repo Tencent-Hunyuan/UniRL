@@ -34,10 +34,165 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
+from unirl.rollout.engine.vllm_omni.patches.bagel_kv_replay import finalize_bagel_kv_replay_trace
+
 
 class OmniTensorLoRARequest(OmniLoRARequest):
     peft_config: dict = field(default=None)
     lora_tensors: dict = field(default=None)
+
+
+_BAGEL_KV_REPLAY_TRACE_KEY = "unirl_bagel_t2ti_trace"
+_BAGEL_KV_REPLAY_TRACE_ATTR = "_unirl_bagel_t2ti_traces"
+
+
+def patch_bagel_kv_replay_trace() -> None:
+    """Attach BAGEL's exact cache-input token trace to native KV transfers.
+
+    Stage 0 and Stage 1 may exchange the actual cache tensors inside
+    vLLM-Omni, but UniRL's rollout response must remain metadata-only.  BAGEL's
+    model hook sees the flattened token IDs immediately before every scheduled
+    cache update, so capture those chunks on device and convert only once when
+    the request finishes.  The resulting transfer metadata contains token IDs,
+    chunk boundaries, the authoritative transferred length, and RoPE state.
+
+    Prefix-cache hits are intentionally rejected by the final length check:
+    UniRL's BAGEL stage config disables prefix caching, and a hit would omit the
+    cached prefix's IDs from this per-request execution trace.
+    """
+    try:
+        import torch
+        from vllm_omni.model_executor.models.bagel.bagel import OmniBagelForConditionalGeneration
+    except (ImportError, AttributeError):
+        return
+
+    cls = OmniBagelForConditionalGeneration
+    original_prepare = getattr(cls, "prepare_runner_inputs", None)
+    original_get_metadata = getattr(cls, "get_kv_transfer_metadata", None)
+    if not callable(original_prepare) or not callable(original_get_metadata):
+        return
+    if getattr(original_prepare, "_unirl_bagel_kv_replay_trace", False):
+        return
+
+    def prepare_runner_inputs(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds,
+        req_ids,
+        num_computed_tokens,
+        num_scheduled_tokens,
+        input_ids_buffer=None,
+        _original=original_prepare,
+    ):
+        resolved_ids, resolved_positions = _original(
+            self,
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            req_ids=req_ids,
+            num_computed_tokens=num_computed_tokens,
+            num_scheduled_tokens=num_scheduled_tokens,
+            input_ids_buffer=input_ids_buffer,
+        )
+
+        traces = getattr(self, _BAGEL_KV_REPLAY_TRACE_ATTR, None)
+        if not isinstance(traces, dict):
+            traces = {}
+            setattr(self, _BAGEL_KV_REPLAY_TRACE_ATTR, traces)
+
+        source = resolved_ids if resolved_ids is not None else input_ids_buffer
+        total_scheduled = sum(int(n) for n in num_scheduled_tokens)
+        if source is None or int(source.numel()) < total_scheduled:
+            reason = (
+                "BAGEL KV replay trace could not read the scheduled input IDs: "
+                f"available={None if source is None else int(source.numel())}, "
+                f"scheduled={total_scheduled}."
+            )
+            for req_id in req_ids:
+                entry = traces.setdefault(str(req_id), {"chunks": [], "next_offset": 0})
+                entry["error"] = reason
+            return resolved_ids, resolved_positions
+
+        flat_ids = source.reshape(-1)
+        cursor = 0
+        for req_id, start, count in zip(req_ids, num_computed_tokens, num_scheduled_tokens):
+            req_id = str(req_id)
+            start = int(start)
+            count = int(count)
+            chunk = flat_ids[cursor : cursor + count].detach().clone()
+            cursor += count
+            if count <= 0:
+                continue
+
+            entry = traces.setdefault(req_id, {"chunks": [], "next_offset": 0})
+            expected_start = int(entry["next_offset"])
+            if start != expected_start:
+                entry["error"] = (
+                    "BAGEL KV replay trace is non-contiguous; prefix caching must be disabled: "
+                    f"request={req_id!r}, scheduled_start={start}, captured_length={expected_start}."
+                )
+            entry["chunks"].append((start, chunk))
+            entry["next_offset"] = start + count
+
+        return resolved_ids, resolved_positions
+
+    def get_kv_transfer_metadata(
+        self,
+        req_id,
+        *,
+        num_computed_tokens=None,
+        _original=original_get_metadata,
+    ):
+        model_metadata = _original(self, req_id, num_computed_tokens=num_computed_tokens)
+        traces = getattr(self, _BAGEL_KV_REPLAY_TRACE_ATTR, None)
+        trace = traces.pop(str(req_id), None) if isinstance(traces, dict) else None
+        if trace is None or (model_metadata and "image_shape" in model_metadata):
+            # Native img2img has non-token VAE/ViT cache inputs and advertises
+            # image_shape in BAGEL's existing metadata. Preserve that path; the
+            # strict T2TI adapter submits text-only prompts.
+            return model_metadata
+
+        error = trace.get("error")
+        if error:
+            raise RuntimeError(error)
+        if num_computed_tokens is None:
+            raise RuntimeError("BAGEL KV replay trace requires num_computed_tokens at transfer time.")
+
+        chunks = list(trace.get("chunks") or [])
+        if not chunks:
+            raise RuntimeError(f"BAGEL KV replay trace for request {req_id!r} is empty.")
+        chunks.sort(key=lambda item: int(item[0]))
+        kv_length = int(num_computed_tokens)
+        cache_ids_tensor = torch.cat([chunk for _, chunk in chunks], dim=0)
+        trace_metadata = finalize_bagel_kv_replay_trace(
+            chunk_records=[(int(start), int(chunk.numel())) for start, chunk in chunks],
+            captured_input_ids=cache_ids_tensor.to(device="cpu").tolist(),
+            kv_length=kv_length,
+            request_id=str(req_id),
+        )
+
+        metadata = dict(model_metadata or {})
+        # Text-only T2TI advances RoPE once per committed KV row. Upstream may
+        # report the async lookahead boundary, so normalize to the transfer.
+        metadata["ropes"] = list(trace_metadata["ropes"])
+        metadata[_BAGEL_KV_REPLAY_TRACE_KEY] = trace_metadata
+        return metadata
+
+    prepare_runner_inputs._unirl_bagel_kv_replay_trace = True  # type: ignore[attr-defined]
+    cls.prepare_runner_inputs = prepare_runner_inputs
+    cls.get_kv_transfer_metadata = get_kv_transfer_metadata
+
+    original_clear = getattr(cls, "_clear_warmup_state", None)
+    if callable(original_clear):
+
+        def clear_warmup_state(self, *args, _original=original_clear, **kwargs):
+            try:
+                return _original(self, *args, **kwargs)
+            finally:
+                setattr(self, _BAGEL_KV_REPLAY_TRACE_ATTR, {})
+
+        cls._clear_warmup_state = clear_warmup_state
 
 
 # ============================================================
@@ -669,6 +824,7 @@ class VLLMOmniHijack:
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
+        patch_bagel_kv_replay_trace()
         patch_hi3_flow_alignment()
         patch_master_port_unstrip()
 
@@ -676,6 +832,7 @@ class VLLMOmniHijack:
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
+    "patch_bagel_kv_replay_trace",
     "patch_hi3_flow_alignment",
     "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",

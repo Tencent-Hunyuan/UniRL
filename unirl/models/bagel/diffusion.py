@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -53,7 +53,9 @@ from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
 from . import rl_ops
-from .conditions import BagelDiffusionConditions
+from .conditions import BagelDiffusionConditions, BagelT2TIDiffusionConditions
+
+BagelStageConditions = BagelDiffusionConditions | BagelT2TIDiffusionConditions
 
 if TYPE_CHECKING:
     from .bundle import BagelBundle
@@ -161,6 +163,65 @@ class BagelDiffusionStep:
             **forward_kwargs,
         )
 
+    def predict_velocities(
+        self,
+        bagel: Any,
+        *,
+        x_ts: Sequence[torch.Tensor],
+        t_curs: Sequence[torch.Tensor],
+        cfg_text_scales: Sequence[float],
+        cfg_img_scales: Sequence[float],
+        forward_kwargs: Dict[str, Any],
+        use_layer_major: bool,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Predict several independent velocities, with an exact serial fallback."""
+        x_ts = tuple(x_ts)
+        t_curs = tuple(t_curs)
+        cfg_text_scales = tuple(float(scale) for scale in cfg_text_scales)
+        cfg_img_scales = tuple(float(scale) for scale in cfg_img_scales)
+        require(
+            len(x_ts) == len(t_curs) == len(cfg_text_scales) == len(cfg_img_scales),
+            "BagelDiffusionStep.predict_velocities inputs must have the same length.",
+        )
+        require(bool(x_ts), "BagelDiffusionStep.predict_velocities requires at least one stream.")
+
+        supports_many = (
+            use_layer_major
+            and len(x_ts) >= 2
+            and all(scale == 1.0 for scale in cfg_text_scales)
+            and all(scale == 1.0 for scale in cfg_img_scales)
+        )
+        if not supports_many:
+            return tuple(
+                self.predict_velocity(
+                    bagel,
+                    x_t=x_t,
+                    t_cur=t_cur,
+                    cfg_text_scale=cfg_text_scale,
+                    cfg_img_scale=cfg_img_scale,
+                    forward_kwargs=forward_kwargs,
+                )
+                for x_t, t_cur, cfg_text_scale, cfg_img_scale in zip(
+                    x_ts,
+                    t_curs,
+                    cfg_text_scales,
+                    cfg_img_scales,
+                )
+            )
+
+        rl_ops.disable_inference_cache(bagel)
+        timesteps = tuple(
+            torch.full((int(x_t.shape[0]),), float(t_cur), device=x_t.device) for x_t, t_cur in zip(x_ts, t_curs)
+        )
+        return rl_ops.forward_flow_many(
+            bagel,
+            x_ts=x_ts,
+            timesteps=timesteps,
+            forward_kwargs=forward_kwargs,
+            cfg_text_scales=cfg_text_scales,
+            cfg_img_scales=cfg_img_scales,
+        )
+
     def denoise(
         self,
         strategy: StepStrategy,
@@ -240,7 +301,7 @@ class BagelDiffusionStep:
         )
 
 
-class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
+class BagelDiffusionStage(DiffusionStage[BagelStageConditions]):
     """Bagel rollout-level diffusion stage (trainside A1) — central-runtime, SD3-shaped.
 
     Owns the bundle, the per-step navit kernel, the SDE ``strategy``, and the
@@ -265,6 +326,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
+        t2ti_replay_chunk_mode: str = "exact",
+        t2ti_replay_execution_order: str = "chunk_major",
+        t2ti_flow_many_enabled: bool = False,
     ) -> None:
         # ``model`` is the bundle (kept name-compatible with the other stages so
         # the pipeline / FSDPPolicy treat it uniformly). The Bagel nn.Module is
@@ -275,6 +339,11 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.t2ti_replay_chunk_mode = rl_ops.validate_t2ti_replay_chunk_mode(t2ti_replay_chunk_mode)
+        self.t2ti_replay_execution_order = rl_ops.validate_t2ti_replay_execution_order(t2ti_replay_execution_order)
+        self.t2ti_flow_many_enabled = bool(t2ti_flow_many_enabled)
+        if self.t2ti_replay_chunk_mode != "exact" and self.t2ti_replay_execution_order != "chunk_major":
+            raise ValueError("BAGEL collapsed replay only supports chunk_major execution.")
 
     # ------------------------------------------------------------------
     # Helpers (navit adapter)
@@ -311,14 +380,65 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         cfg_img = deepcopy(gen)
         with torch.no_grad(), self._autocast_ctx(device):
             cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
-            gen = inf.update_context_text(clean_prompt, gen)
-            cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+            gen = rl_ops.prefill_prompt_text(
+                self.model.model,
+                gen,
+                prompt=clean_prompt,
+                tokenizer=self.model.tokenizer,
+                new_token_ids=self.model.new_token_ids,
+                device=device,
+            )
+            cfg_img = rl_ops.prefill_prompt_text(
+                self.model.model,
+                cfg_img,
+                prompt=clean_prompt,
+                tokenizer=self.model.tokenizer,
+                new_token_ids=self.model.new_token_ids,
+                device=device,
+            )
         return gen, cfg_text, cfg_img
 
-    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+    def _build_contexts_from_replay(
+        self, conditions: BagelT2TIDiffusionConditions
+    ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+        """Rebuild Stage-0's transferred text cache with autograd enabled.
+
+        Native ``bagel_think`` sends KV tensors directly from the AR worker to
+        the diffusion worker.  Replay must not transport those tensors to the
+        trainer, so it re-executes the cache-input tokens captured at Stage 0.
+        Exact mode preserves scheduler chunk boundaries; collapsed mode uses one
+        causal prefill over the same tokens. The outer caller owns the grad scope:
+        loss replay therefore differentiates through this prefill, while old-logp
+        preparation remains grad-free under its existing ``torch.no_grad`` scope.
+
+        BAGEL's native text2img transfer contract uses an empty text-CFG cache
+        and reuses the positive cache for image-CFG when no companion branches
+        were transferred (vllm-omni ``pipeline_bagel.py``).
+        """
+        spec = conditions.single_spec()
+        device = torch.device(self.model.device)
+        with self._autocast_ctx(device):
+            gen = rl_ops.rebuild_text_context_from_chunks(
+                self.model.model,
+                chunks=spec.chunks(),
+                expected_kv_length=spec.kv_length,
+                expected_ropes=spec.ropes,
+                device=device,
+                chunk_mode=self.t2ti_replay_chunk_mode,
+                execution_order=self.t2ti_replay_execution_order,
+            )
+        cfg_text = rl_ops.init_und_context(self.model.model)
+        cfg_img = gen
+        return gen, cfg_text, cfg_img, spec.image_shape
+
+    def _resolve_single(self, conditions: BagelStageConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
 
-        Two sources, transparently:
+        Three sources, transparently:
+
+        - **native T2TI replay recipe**: rebuild the transferred cache from
+          captured cache-input IDs, preserving or collapsing scheduler chunk
+          boundaries according to ``t2ti_replay_chunk_mode``.
 
         - **opaque contexts present** (trainside / colocate): return them directly
           via :meth:`BagelDiffusionConditions.single`.
@@ -326,6 +446,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
           contexts from the shipped prompt on this bundle (the und path is frozen
           → identical contexts), then return them.
         """
+        if isinstance(conditions, BagelT2TIDiffusionConditions):
+            return self._build_contexts_from_replay(conditions)
         if conditions.has_contexts():
             return conditions.single()
         prompt, image_shape = conditions.single_prompt()
@@ -420,7 +542,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def diffuse(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         schedule: torch.Tensor,
         params: BagelDiffusionParams,
@@ -532,27 +654,112 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def replay(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         segment: LatentSegment,
         params: BagelDiffusionParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Recompute per-step log-probs over the SDE window (mirrors SD3 replay).
+        result, _ = self._replay_impl(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+        )
+        return result
 
-        Loops ``step.step_with_logp`` (``prev_sample`` = the stored next frame) over
-        ``segment.sde_indices`` (or the ``step_indices`` subset). Returns a
-        :class:`ReplayResult` with ``log_probs [1, S']`` aligned with
-        ``segment.sde_logp`` plus ``prev_sample_means [1, S', seq, C]`` for KL.
+    def replay_with_detached_forward_kwargs(
+        self,
+        conditions: BagelStageConditions,
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> Tuple[ReplayResult, Dict[str, Any]]:
+        """Replay once and retain a graph-free view of its exact text context.
 
-        Caller owns ``.train()`` mode + grad scope; this method manages only the
-        autocast scope (mirrors ``SD3DiffusionStage.replay``).
+        The returned kwargs share the replay's terminal K/V storage but every
+        tensor is detached from autograd. A phased UniGRPO update can therefore
+        finish the RatioNorm backward, swap reference weights, and reuse the
+        numerically identical context for velocity MSE without rebuilding the
+        Stage-0 prefix.
         """
+        result, forward_kwargs = self._replay_impl(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+        )
+        return result, self.detach_forward_kwargs(forward_kwargs)
+
+    @staticmethod
+    def detach_forward_kwargs(forward_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a graph-free BAGEL replay tree without cloning tensor storage."""
+        return rl_ops.detach_replay_tree(forward_kwargs)
+
+    def replay_from_forward_kwargs(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> ReplayResult:
+        """Replay image transitions from an already constructed context.
+
+        ``forward_kwargs`` must describe the exact current-policy context for
+        ``segment``. The stage-boundary UniGRPO path builds it under ``no_grad``
+        immediately before an optimizer update, then shares that detached context
+        between RatioNorm and velocity MSE. Only the context gradient is stopped;
+        every image velocity and SDE operation remains grad-capable.
+        """
+        result, _ = self.replay_from_forward_kwargs_with_velocities(
+            forward_kwargs,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+        )
+        return result
+
+    def replay_from_forward_kwargs_with_velocities(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> Tuple[ReplayResult, List[torch.Tensor]]:
+        """Replay from a detached context and expose each policy velocity.
+
+        UniGRPO's stage-boundary mode uses the same ``v_theta`` values for the
+        SDE RatioNorm objective and its velocity-MSE regularizer, avoiding a
+        second set of policy forwards without changing either loss.
+        """
+        device = torch.device(self.model.device)
+        schedule, target = self._resolve_replay_schedule_and_target(
+            segment,
+            step_indices=step_indices,
+            device=device,
+        )
+        return self._replay_from_forward_kwargs_impl(
+            forward_kwargs,
+            segment=segment,
+            params=params,
+            schedule=schedule,
+            target=target,
+            collective_pad_zero=None,
+        )
+
+    @staticmethod
+    def _resolve_replay_schedule_and_target(
+        segment: LatentSegment,
+        *,
+        step_indices: Optional[List[int]],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, List[int]]:
         if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
             raise ValueError("BagelDiffusionStage.replay: segment.sde_indices / latents / sigmas missing")
 
-        bagel = self.model.model
-        device = torch.device(self.model.device)
         sde_set = set(int(i) for i in segment.sde_indices.tolist())
         target = [int(i) for i in step_indices] if step_indices is not None else sorted(sde_set)
         bad = [i for i in target if i not in sde_set]
@@ -560,35 +767,111 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             raise ValueError(
                 f"BagelDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
             )
+        return segment.sigmas.to(device), target
 
-        schedule = segment.sigmas.to(device)
-        sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
+    def _replay_impl(
+        self,
+        conditions: BagelStageConditions,
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> Tuple[ReplayResult, Dict[str, Any]]:
+        """Recompute per-step log-probs over the SDE window (mirrors SD3 replay).
+
+        Predicts the target velocities together when exact layer-major CFG=1 replay
+        is available, then applies the unchanged per-step SDE transition in target
+        order (``prev_sample`` = the stored next frame). Returns a
+        :class:`ReplayResult` with ``log_probs [1, S']`` aligned with
+        ``segment.sde_logp`` plus ``prev_sample_means [1, S', seq, C]`` for KL.
+
+        Caller owns ``.train()`` mode + grad scope; this method manages only the
+        autocast scope (mirrors ``SD3DiffusionStage.replay``).
+        """
+        device = torch.device(self.model.device)
+        schedule, target = self._resolve_replay_schedule_and_target(
+            segment,
+            step_indices=step_indices,
+            device=device,
+        )
 
         gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        collective_pad_zero = gen.get("collective_pad_zero")
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
+        result, _ = self._replay_from_forward_kwargs_impl(
+            forward_kwargs,
+            segment=segment,
+            params=params,
+            schedule=schedule,
+            target=target,
+            collective_pad_zero=collective_pad_zero,
+        )
+        return result, forward_kwargs
+
+    def _replay_from_forward_kwargs_impl(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        segment: LatentSegment,
+        params: BagelDiffusionParams,
+        schedule: torch.Tensor,
+        target: List[int],
+        collective_pad_zero: Optional[torch.Tensor],
+    ) -> Tuple[ReplayResult, List[torch.Tensor]]:
+        bagel = self.model.model
+        device = torch.device(self.model.device)
+        sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
+
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
+        velocities: List[torch.Tensor] = []
         with self._autocast_ctx(device):
+            x_ts: List[torch.Tensor] = []
+            prev_samples: List[torch.Tensor] = []
+            t_curs: List[torch.Tensor] = []
+            t_nexts: List[torch.Tensor] = []
+            cfg_text_scales: List[float] = []
+            cfg_img_scales: List[float] = []
             for step_idx in target:
                 t_cur = schedule[step_idx]
-                t_next = schedule[step_idx + 1]
                 cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
-                x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C]
-                prev_sample = segment.latents_at(step_idx + 1)[0].to(device)
-                _, log_prob, prev_mean = self.step.step_with_logp(
+                x_ts.append(segment.latents_at(step_idx)[0].to(device))  # [seq, C]
+                prev_samples.append(segment.latents_at(step_idx + 1)[0].to(device))
+                t_curs.append(t_cur)
+                t_nexts.append(schedule[step_idx + 1])
+                cfg_text_scales.append(cfg_text_scale)
+                cfg_img_scales.append(cfg_img_scale)
+
+            velocities = list(
+                self.step.predict_velocities(
                     bagel,
+                    x_ts=x_ts,
+                    t_curs=t_curs,
+                    cfg_text_scales=cfg_text_scales,
+                    cfg_img_scales=cfg_img_scales,
+                    forward_kwargs=forward_kwargs,
+                    use_layer_major=(self.t2ti_flow_many_enabled and self.t2ti_replay_execution_order == "layer_major"),
+                )
+            )
+            for step_idx, x_t, prev_sample, t_cur, t_next, v_t in zip(
+                target,
+                x_ts,
+                prev_samples,
+                t_curs,
+                t_nexts,
+                velocities,
+            ):
+                _, log_prob, prev_mean = self.step.denoise(
                     self.strategy,
+                    v_t=v_t,
                     x_t=x_t,
+                    sigma=t_cur,
+                    sigma_next=t_next,
                     prev_sample=prev_sample,
-                    t_cur=t_cur,
-                    t_next=t_next,
                     sigma_max=sigma_max,
                     eta=float(params.eta),
-                    cfg_text_scale=cfg_text_scale,
-                    cfg_img_scale=cfg_img_scale,
-                    forward_kwargs=forward_kwargs,
                 )
                 if log_prob is None:
                     raise RuntimeError(
@@ -599,8 +882,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)  # [1, S']
+        if collective_pad_zero is not None:
+            # The value is exactly zero. Its graph carries discarded decoder
+            # traversals so shorter native traces mirror the longest rank's
+            # FSDP forward/backward collective sequence.
+            log_probs_t = log_probs_t + collective_pad_zero.to(dtype=log_probs_t.dtype)
         means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)  # [1, S', seq, C]
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t), velocities
 
     # ------------------------------------------------------------------
     # Single-step velocity (forward-process algorithms: DiffusionNFT et al.)
@@ -608,7 +896,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     def build_forward_kwargs(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         params: BagelDiffusionParams,
         device: torch.device,
@@ -642,26 +930,56 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         through the velocity forward (gen experts) only — the contexts inside
         ``forward_kwargs`` are detached constants built under ``no_grad``.
         """
+        return self.predict_velocities_at(
+            forward_kwargs,
+            samples=(sample,),
+            sigmas=(sigma,),
+            params=params,
+        )[0]
+
+    def predict_velocities_at(
+        self,
+        forward_kwargs: Dict[str, Any],
+        *,
+        samples: Sequence[torch.Tensor],
+        sigmas: Sequence[torch.Tensor],
+        params: BagelDiffusionParams,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Velocity predictions sharing conditioning, layer-major when exact and CFG=1."""
+        samples = tuple(samples)
+        sigmas = tuple(sigmas)
+        require(
+            bool(samples) and len(samples) == len(sigmas),
+            "BagelDiffusionStage.predict_velocities_at requires equally sized non-empty samples and sigmas.",
+        )
         bagel = self.model.model
         device = torch.device(self.model.device)
-        t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
-        cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(t_val, params)
-        sample = sample.to(device)
-        if sample.dim() == 3:  # [1, seq, C] → [seq, C] (navit bs=1)
-            sample = sample[0]
+        packed_samples: List[torch.Tensor] = []
+        cfg_text_scales: List[float] = []
+        cfg_img_scales: List[float] = []
+        for sample, sigma in zip(samples, sigmas):
+            t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
+            cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(t_val, params)
+            sample = sample.to(device)
+            if sample.dim() == 3:  # [1, seq, C] → [seq, C] (navit bs=1)
+                sample = sample[0]
+            packed_samples.append(sample)
+            cfg_text_scales.append(cfg_text_scale)
+            cfg_img_scales.append(cfg_img_scale)
         with self._autocast_ctx(device):
-            return self.step.predict_velocity(
+            return self.step.predict_velocities(
                 bagel,
-                x_t=sample,
-                t_cur=sigma,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
+                x_ts=packed_samples,
+                t_curs=sigmas,
+                cfg_text_scales=cfg_text_scales,
+                cfg_img_scales=cfg_img_scales,
                 forward_kwargs=forward_kwargs,
+                use_layer_major=(self.t2ti_flow_many_enabled and self.t2ti_replay_execution_order == "layer_major"),
             )
 
     def predict_noise_at_step(
         self,
-        conditions: BagelDiffusionConditions,
+        conditions: BagelStageConditions,
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,

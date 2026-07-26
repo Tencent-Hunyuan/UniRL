@@ -1,0 +1,279 @@
+# @package _global_
+# BAGEL-7B-MoT UniGRPO T2TI with native vLLM-Omni rollout, production scale.
+#
+# One external vLLM-Omni pipeline performs native thinking (Stage 0 AR) followed
+# by image generation (Stage 1 diffusion). The trainer full-finetunes the shared
+# MoT decoder and replays both returned tracks with one shared prompt-level
+# advantage. The production geometry matches the original BAGEL UniGRPO recipe:
+#   - P=32 prompts across 32 data-parallel devices (4 nodes x 8 GPUs);
+#   - N=24 thinking chains per prompt, exactly M=1 image per chain;
+#   - CFG=1 on every knob;
+#   - full weights, not LoRA.
+#
+# Full-FT parameters and FSDP shards stay on GPU. At the external Omni rollout
+# boundary, completed gradients are cleared and only sharded Adam state is
+# parked on CPU. After Omni sleeps, it remains parked through reward, hydration,
+# and anchor replay, then returns immediately before update 0's optimizer step.
+# The separate
+# ``bagel_vllmomni_t2ti_smoke`` profile retains the one-GPU full CPU-offload path
+# and reduced sampling settings used for functional validation.
+#
+# Launch:
+#   scripts/launch_bagel_vllmomni_t2ti.sh --profile production
+
+num_devices: 32
+devices_per_node: 8
+batch_size: 32
+num_rollouts: 2000
+weight_sync_interval: 1
+# Bound each trainer caching allocator below the physical device limit. On an
+# H20 this limits the process allocator to 86.0 GiB, leaving nominal headroom
+# for sleeping Omni helpers, NCCL, and other non-allocator CUDA users; it does
+# not offload or shrink FSDP state. The launch script exports the same value
+# before Python starts, while the entrypoint supplies it for direct Hydra
+# launches when the environment has no override.
+# GC starts at 95% of that cap, above the measured 71--74 GiB live-allocation
+# peak, so the reserve does not turn normal image replay into allocation churn.
+cuda_allocator_conf: "expandable_segments:True,garbage_collection_threshold:0.95,per_process_memory_fraction:0.90"
+enable_fsdp_offload: false
+# The first rollout fits before Adam initializes; later wakes otherwise overlap
+# Omni with completed grads + Adam state and can OOM. This narrow lifecycle does
+# not move FSDP parameters/shards and requires backend.fsdp_cfg.cpu_offload=false.
+park_optimizer_state_during_rollout: true
+# Keep sharded Adam moments on CPU from the rollout boundary through anchor and
+# update 0 replay/backward, then restore their exact original devices immediately
+# before optimizer.step. Later updates park on demand; the moments remain resident
+# after each step until the next update or rollout boundary needs them parked.
+park_optimizer_state_during_train: true
+eval_cfg_text_scale: 1.0
+
+save_interval: 0
+save_dir: ${oc.env:CKPT_DIR,outputs}/${oc.env:WANDB_RUN_NAME,bagel-vllmomni-t2ti}/checkpoints
+save_mode: full
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,bagel-unigrpo}
+  run_name: ${oc.env:WANDB_RUN_NAME,null}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [bagel, unigrpo, t2ti, vllm-omni, fullft, production]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,/root/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    shift: 3.0
+    use_lora: false
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelUniPipeline
+  # Native Stage 0 runs BAGEL's inference dispatch. The grad-capable inference
+  # replay avoids the known forward_train vs forward_inference ratio offset.
+  replay_mode: inference
+  # Exact replay remains the production default until the captured-trace
+  # cache/velocity/gradient gate approves a faster chunk geometry.
+  t2ti_replay_chunk_mode: exact
+  # Preserve every native chunk attention call, but keep one FSDP block
+  # resident while that layer traverses all chunks. This removes per-token
+  # unshard/reshard and makes collective order independent of trace depth.
+  t2ti_replay_execution_order: layer_major
+  # Traverse each FSDP decoder layer once for all three SDE velocity streams.
+  # This path is gradient-equivalent to serial replay and materially reduces
+  # train time. Earlier capacity gates ran with an unbounded caching allocator;
+  # production enables it only together with the 90% allocator cap above.
+  t2ti_flow_many_enabled: true
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # BAGEL invokes embed_tokens/lm_head outside a root forward. They remain
+    # frozen regular tensors and use the policy-aware lifecycle in the backend.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+    param_group_lrs:
+      moe_gen: 3.0e-5
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+
+# One native two-stage engine. UnifiedModelTrainer boots it once and immediately
+# sleeps Omni; subsequent wake/sleep sessions use the optimizer-only boundary.
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:BAGEL_PATH,/root/BAGEL-7B-MoT}
+    modality: bagel_t2ti
+    enable_sleep_mode: true
+
+# PickScore follows the original UniGRPO production placement and batch size.
+reward:
+  _target_: unirl.reward.service.RewardService
+  # PickScore is needed only for the reward phase. Keep its CLIP parameters and
+  # buffers on CPU during native rollout and the much longer exact replay; each
+  # scalar score restores only this reward module and parks it again in finally.
+  park_backend_between_calls: true
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR_ID,laion/CLIP-ViT-H-14-laion2B-s32B-b79K}
+      model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
+
+algorithm:
+  ar:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  image:
+    _target_: unirl.algorithms.bagel_flow_unigrpo.BagelFlowUniGRPO
+    stage_attr: diffusion
+    clip_range: 1.0e-6
+    clip_schedule: constant
+    # Rebuild the old-policy anchor trainer-side from native KV replay metadata;
+    # do not trust cross-runtime rollout means for the strict parity path.
+    old_logp_source: replay
+    mse_weight: 1.5e-5
+    ratio_norm: true
+    grad_reweight: false
+    # Match the native Omni Stage-0 -> Stage-1 KV-transfer boundary: Stage 1 sees
+    # the exact current-policy cache values but does not backpropagate through the
+    # Stage-0 cache construction. The AR objective still trains the thinking track
+    # with the shared advantage. RatioNorm and MSE then share this detached context
+    # and the same policy velocities, removing duplicate image-policy forwards.
+    context_gradient_mode: stage_boundary
+    # Updates are disjoint. Update 0 derives its detached old-policy anchor from
+    # the same exact replay used for its current-policy loss (before optimizer 0);
+    # only later updates need a separate eager pre-update anchor replay.
+    lazy_first_update_anchor: true
+    # Prepared Stage-0 caches and frozen velocity targets are data, not FSDP
+    # state. Keep queued future image micros on CPU and synchronously hydrate
+    # only the micro being consumed. This does not move model parameters,
+    # gradients, optimizer state, or the rollout engine off GPU.
+    stage_prepared_replay_to_cpu: true
+    # stage_boundary already performs detached context reuse; the older full-grad
+    # phased-reuse path is mutually exclusive and remains disabled.
+    reuse_ratio_context_for_mse: false
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.bagel.conditions.BagelT2TIDiffusionConditions
+    params: ${sampling.diffusion}
+
+stack:
+  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # UniGRPO parity: the second disjoint mini-batch is off-policy after update 1.
+  num_updates_per_batch: 2
+  # Exact replay has variable-length image micros. Return dead cached blocks at
+  # each image boundary and after the optimizer while retaining full-FT shards
+  # and live gradients. cuda_peak_* counters reset per update;
+  # cuda_train_window_peak_* also covers hydration, full anchor, and all updates.
+  empty_cache_after_image_micro: true
+  # Reclaim after every replay micro. External 2-second sampling showed that
+  # even one skipped boundary can leave less than the required 2 GiB H20 margin;
+  # interval 1 therefore remains the conservative production capacity policy.
+  image_micro_empty_cache_interval: 1
+  image_micro_empty_cache_min_free_gb: 0.0
+  empty_cache_after_optimizer: true
+  cuda_peak_telemetry: true
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 24
+    seed: 42
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 1024
+    max_new_tokens: 1024
+  diffusion:
+    _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+    # Strict M=1; UnifiedModelTrainer copies AR advantages to the image track.
+    samples_per_prompt: 1
+    num_inference_steps: 25
+    guidance_scale: 1.0
+    cfg_text_scale: 1.0
+    cfg_img_scale: 1.0
+    cfg_interval: [0.0, 1.0]
+    cfg_renorm_min: 0.0
+    cfg_renorm_type: global
+    eta: 0.8
+    height: 512
+    width: 512
+    seed: 42
+    init_same_noise: false
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    scheduler:
+      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      timestep_fraction: [0.0, 0.2]
+      num_sde_steps: 3
+
+# Full MoT snapshot -> both native Omni stages. `name_remap` converts the bare
+# Qwen2ForCausalLM state dict to BAGEL checkpoint keys; each upstream stage
+# loader filters/packs the tensors it owns. The pinned load plan separates packed
+# q/k/v and gate/up shards, then requires every bucket's returned destination-name
+# set to match exactly on both stages. A shared TP-flat trainable decoder-block norm
+# is also hashed after the full push so stale or corrupted bytes fail before generation.
+sync:
+  _target_: unirl.distributed.weight_sync.full.CPUStagedFullWeightSync
+  bucket_size_mb: 256
+  flush_cache: true
+  wire_dtype: bf16
+  load_plan: bagel_vllm_omni_0_20
+  name_remap:
+    "*": "language_model.*"
+  stage_ids: [0, 1]
+  verify_names: [language_model.model.layers.0.input_layernorm_moe_gen.weight]

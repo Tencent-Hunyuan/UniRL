@@ -150,12 +150,14 @@ class WeightSync:
         target_modules: Optional[List[str]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
-    ) -> None:
-        self._backend.update_from_tensor(
+        stage_ids: Optional[List[int]] = None,
+    ) -> Dict[int, Any]:
+        return self._backend.update_from_tensor(
             serialized_named_tensors=list(serialized_named_tensors),
             target_modules=list(target_modules) if target_modules else None,
             load_format=load_format,
             flush_cache=bool(flush_cache),
+            stage_ids=list(stage_ids) if stage_ids is not None else None,
         )
 
     # ------------------------------------------------------------------ #

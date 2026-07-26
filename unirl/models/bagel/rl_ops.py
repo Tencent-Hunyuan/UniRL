@@ -9,6 +9,9 @@ two facts to UniRL's shared diffusion runtime — and nothing more:
 - :func:`forward_flow`           grad-capable velocity via the pristine
                                  ``Bagel._forward_flow`` (bypasses ``@torch.no_grad``
                                  through ``functools.wraps``' ``__wrapped__``).
+- :func:`forward_flow_many`      exact CFG=1 velocities for several independent
+                                 diffusion steps, traversed layer-major so one
+                                 wrapped decoder block serves every step.
 - :func:`disable_inference_cache` turns off TaylorSeer (per-step determinism for replay).
 
 AR (text-out) adapters — same philosophy, for ``BagelARStage``:
@@ -63,25 +66,133 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from types import MethodType
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from unirl.config.require import require
+
 __all__ = [
     "decode_text",
+    "detach_replay_tree",
     "disable_inference_cache",
     "forward_flow",
+    "forward_flow_many",
     "init_und_context",
+    "install_layer_major_replay_dispatch",
+    "move_replay_tree",
     "pack_und_forward_inputs",
+    "prefill_prompt_text",
     "prefill_text_split",
     "prefill_vit_split",
+    "rebuild_text_context_from_chunks",
+    "validate_t2ti_replay_chunk_mode",
+    "validate_t2ti_replay_execution_order",
     "require_inference_dispatch",
     "score_response",
     "score_response_with_prompt",
     "und_replay_logits",
 ]
+
+
+T2TI_REPLAY_CHUNK_MODES = ("exact", "collapsed")
+T2TI_REPLAY_EXECUTION_ORDERS = ("chunk_major", "layer_major")
+
+
+def validate_t2ti_replay_chunk_mode(mode: Any) -> str:
+    """Return a normalized T2TI cache-replay mode or raise.
+
+    ``exact`` preserves the Stage-0 scheduler boundaries. ``collapsed`` preserves
+    the initial prefill boundary and coalesces the decode tail into one causal
+    update. The latter changes decode-kernel geometry, so callers must opt into it.
+    """
+    normalized = str(mode).strip().lower()
+    require(
+        normalized in T2TI_REPLAY_CHUNK_MODES,
+        f"Bagel T2TI replay chunk mode must be one of {T2TI_REPLAY_CHUNK_MODES}; got {mode!r}.",
+    )
+    return normalized
+
+
+def validate_t2ti_replay_execution_order(order: Any) -> str:
+    """Validate how the exact chunk/layer replay DAG is traversed."""
+    normalized = str(order).strip().lower()
+    require(
+        normalized in T2TI_REPLAY_EXECUTION_ORDERS,
+        f"Bagel T2TI replay execution order must be one of {T2TI_REPLAY_EXECUTION_ORDERS}; got {order!r}.",
+    )
+    return normalized
+
+
+def _layer_major_replay_forward_dispatch(self: Any, *args: Any, **kwargs: Any) -> Any:
+    """Enter one wrapped decoder block for one exact replay or flow stream set."""
+    replay_chunks = kwargs.pop("_unirl_exact_replay_chunks", None)
+    flow_streams = kwargs.pop("_unirl_exact_flow_streams", None)
+    require(
+        replay_chunks is None or flow_streams is None,
+        "BAGEL layer-major dispatch accepts only one exact replay mode per call.",
+    )
+    if replay_chunks is None and flow_streams is None:
+        return self._unirl_original_forward(*args, **kwargs)
+
+    require(not args, "BAGEL layer-major replay accepts keyword inputs only.")
+    require(not bool(self.training), "BAGEL layer-major replay requires decoder layers in eval mode.")
+    if flow_streams is not None:
+        require(not kwargs, f"BAGEL layer-major flow received unexpected inputs: {sorted(kwargs)}.")
+        require(len(flow_streams) >= 2, "BAGEL layer-major flow requires at least two streams.")
+        outputs: List[Tuple[torch.Tensor, Any]] = []
+        for stream in flow_streams:
+            require(isinstance(stream, dict), "BAGEL layer-major flow streams must be dictionaries.")
+            stream_kwargs = dict(stream)
+            require(
+                stream_kwargs.get("update_past_key_values") is False,
+                "BAGEL layer-major flow requires read-only KV caches.",
+            )
+            require(stream_kwargs.get("mode") == "gen", "BAGEL layer-major flow requires gen mode.")
+            require(stream_kwargs.get("is_causal") is False, "BAGEL layer-major flow requires non-causal queries.")
+            input_cache = stream_kwargs.get("past_key_values")
+            require(input_cache is not None, "BAGEL layer-major flow requires a KV cache.")
+            hidden, cache = self.forward_inference(**stream_kwargs)
+            require(cache is input_cache, "BAGEL layer-major flow must not replace its read-only KV cache.")
+            outputs.append((hidden, cache))
+        return tuple(outputs)
+
+    cache = kwargs.pop("past_key_values", None)
+    require(cache is not None, "BAGEL layer-major replay requires a cache.")
+    require(not kwargs, f"BAGEL layer-major replay received unexpected inputs: {sorted(kwargs)}.")
+    outputs: List[torch.Tensor] = []
+    for chunk in replay_chunks:
+        hidden, cache = self.forward_inference(past_key_values=cache, **chunk)
+        outputs.append(hidden)
+    return tuple(outputs), cache
+
+
+def install_layer_major_replay_dispatch(model: Any) -> None:
+    """Install the replay dispatch before Accelerate/checkpoint/FSDP wrapping.
+
+    The permanent instance dispatch falls through to the pristine bound
+    ``forward`` for every normal BAGEL call. The special replay entry is still a
+    single ``decoder_layer(...)`` invocation, so composable checkpointing and
+    FSDP wrap the whole native-chunk loop and unshard each block only once.
+    """
+    try:
+        layers = tuple(model.language_model.model.layers)
+    except AttributeError as exc:
+        raise ValueError("BAGEL layer-major replay could not find language_model.model.layers.") from exc
+    require(bool(layers), "BAGEL layer-major replay requires at least one decoder layer.")
+    for layer in layers:
+        if bool(getattr(layer, "_unirl_layer_major_replay_installed", False)):
+            continue
+        require(
+            callable(getattr(layer, "forward_inference", None)),
+            f"BAGEL layer-major replay requires forward_inference on {type(layer).__name__}.",
+        )
+        layer._unirl_original_forward = layer.forward
+        layer.forward = MethodType(_layer_major_replay_forward_dispatch, layer)
+        layer._unirl_layer_major_replay_installed = True
 
 
 def disable_inference_cache(model: Any) -> None:
@@ -144,6 +255,186 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
         lm.eval()
     try:
         return _raw_forward_flow(model)(model, **kwargs)
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
+
+
+def _require_flow_many_geometry(
+    x_ts: Sequence[torch.Tensor],
+    timesteps: Sequence[torch.Tensor],
+    cfg_text_scales: Sequence[float],
+    cfg_img_scales: Sequence[float],
+) -> None:
+    """Validate the exact CFG=1 layer-major flow contract."""
+    stream_count = len(x_ts)
+    require(stream_count >= 2, "BAGEL forward_flow_many requires at least two streams.")
+    require(
+        len(timesteps) == len(cfg_text_scales) == len(cfg_img_scales) == stream_count,
+        "BAGEL forward_flow_many inputs must have the same stream count.",
+    )
+    require(
+        all(float(scale) == 1.0 for scale in cfg_text_scales) and all(float(scale) == 1.0 for scale in cfg_img_scales),
+        "BAGEL forward_flow_many currently supports CFG text/image scales exactly equal to 1.",
+    )
+    require(all(torch.is_tensor(x_t) for x_t in x_ts), "BAGEL forward_flow_many x_ts must be tensors.")
+    reference = x_ts[0]
+    require(reference.ndim == 2, "BAGEL forward_flow_many expects packed [seq, C] latent tensors.")
+    require(
+        all(
+            x_t.shape == reference.shape and x_t.dtype == reference.dtype and x_t.device == reference.device
+            for x_t in x_ts
+        ),
+        "BAGEL forward_flow_many requires equal latent shape, dtype, and device across streams.",
+    )
+    require(
+        len({bool(x_t.requires_grad) for x_t in x_ts}) == 1,
+        "BAGEL forward_flow_many does not allow mixed latent requires_grad states.",
+    )
+    for index, timestep in enumerate(timesteps):
+        require(torch.is_tensor(timestep), f"BAGEL forward_flow_many timestep {index} must be a tensor.")
+        require(
+            timestep.ndim == 1 and int(timestep.numel()) == int(reference.shape[0]),
+            f"BAGEL forward_flow_many timestep {index} must have one value per packed latent token.",
+        )
+        require(
+            timestep.device == reference.device,
+            f"BAGEL forward_flow_many timestep {index} must be on the latent device.",
+        )
+        require(
+            int(timestep.unique().numel()) == 1,
+            f"BAGEL forward_flow_many timestep {index} must contain one unique value.",
+        )
+
+
+def forward_flow_many(
+    model: Any,
+    *,
+    x_ts: Sequence[torch.Tensor],
+    timesteps: Sequence[torch.Tensor],
+    forward_kwargs: Dict[str, Any],
+    cfg_text_scales: Sequence[float],
+    cfg_img_scales: Sequence[float],
+) -> Tuple[torch.Tensor, ...]:
+    """Compute independent CFG=1 BAGEL velocities in one layer-major traversal.
+
+    This is the exact multi-step counterpart of :func:`forward_flow`. Every stream
+    retains BAGEL's native packed attention geometry and its own read-only KV-cache
+    view. Only the traversal order changes: instead of completing all decoder layers
+    for step 0 before step 1, each wrapped decoder layer processes every step while
+    its FSDP shard is resident. The special dispatch is permanent and falls through
+    for every ordinary model call.
+
+    CFG branches are intentionally excluded. A caller must fall back to serial
+    :func:`forward_flow` whenever either CFG scale is not exactly one.
+    """
+    x_ts = tuple(x_ts)
+    timesteps = tuple(timesteps)
+    cfg_text_scales = tuple(float(scale) for scale in cfg_text_scales)
+    cfg_img_scales = tuple(float(scale) for scale in cfg_img_scales)
+    _require_flow_many_geometry(x_ts, timesteps, cfg_text_scales, cfg_img_scales)
+
+    disable_inference_cache(model)
+    lm = model.language_model
+    lm_model = lm.model
+    require(
+        not bool(getattr(lm_model, "enable_taylorseer", False)),
+        "BAGEL forward_flow_many requires TaylorSeer to be disabled.",
+    )
+    layers = tuple(lm_model.layers)
+    require(bool(layers), "BAGEL forward_flow_many requires at least one decoder layer.")
+    require(
+        all(bool(getattr(layer, "_unirl_layer_major_replay_installed", False)) for layer in layers),
+        "BAGEL forward_flow_many requires the permanent layer-major dispatch on every decoder layer.",
+    )
+
+    required_keys = (
+        "packed_vae_token_indexes",
+        "packed_vae_position_ids",
+        "packed_text_ids",
+        "packed_text_indexes",
+        "packed_indexes",
+        "packed_position_ids",
+        "packed_seqlens",
+        "key_values_lens",
+        "past_key_values",
+        "packed_key_value_indexes",
+    )
+    missing = tuple(key for key in required_keys if key not in forward_kwargs)
+    require(not missing, f"BAGEL forward_flow_many missing forward inputs: {missing}.")
+
+    packed_vae_token_indexes = forward_kwargs["packed_vae_token_indexes"]
+    packed_vae_position_ids = forward_kwargs["packed_vae_position_ids"]
+    packed_text_ids = forward_kwargs["packed_text_ids"]
+    packed_text_indexes = forward_kwargs["packed_text_indexes"]
+    packed_indexes = forward_kwargs["packed_indexes"]
+    packed_position_ids = forward_kwargs["packed_position_ids"]
+    packed_seqlens = forward_kwargs["packed_seqlens"]
+    key_values_lens = forward_kwargs["key_values_lens"]
+    past_key_values = forward_kwargs["past_key_values"]
+    packed_key_value_indexes = forward_kwargs["packed_key_value_indexes"]
+
+    was_training = bool(lm.training)
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+    try:
+        require_inference_dispatch(model)
+        position_embeddings: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        hidden_streams: List[torch.Tensor] = []
+        for x_t, timestep in zip(x_ts, timesteps):
+            packed_text_embedding = lm_model.embed_tokens(packed_text_ids)
+            packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), model.hidden_size))
+            packed_sequence[packed_text_indexes] = packed_text_embedding
+            packed_pos_embed = model.latent_pos_embed(packed_vae_position_ids)
+            packed_timestep_embeds = model.time_embedder(timestep)
+            packed_latent = model.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+            if packed_latent.dtype != packed_sequence.dtype:
+                packed_latent = packed_latent.to(packed_sequence.dtype)
+            packed_sequence[packed_vae_token_indexes] = packed_latent
+            cos, sin = lm_model.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
+            position_embeddings.append((cos.squeeze(0), sin.squeeze(0)))
+            hidden_streams.append(packed_sequence)
+
+        extra_inputs: Dict[str, Any] = {}
+        if model.use_moe:
+            extra_inputs = {
+                "mode": "gen",
+                "packed_vae_token_indexes": packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes,
+            }
+        caches: List[Any] = [past_key_values] * len(hidden_streams)
+        for layer in layers:
+            streams = tuple(
+                {
+                    "packed_query_sequence": hidden,
+                    "query_lens": packed_seqlens,
+                    "packed_query_position_embeddings": positions,
+                    "packed_query_indexes": packed_indexes,
+                    "past_key_values": cache,
+                    "key_values_lens": key_values_lens,
+                    "packed_key_value_indexes": packed_key_value_indexes,
+                    "update_past_key_values": False,
+                    "is_causal": False,
+                    **extra_inputs,
+                }
+                for hidden, positions, cache in zip(hidden_streams, position_embeddings, caches)
+            )
+            layer_outputs = layer(_unirl_exact_flow_streams=streams)
+            hidden_streams = [hidden for hidden, _cache in layer_outputs]
+            caches = [cache for _hidden, cache in layer_outputs]
+
+        velocities: List[torch.Tensor] = []
+        for hidden in hidden_streams:
+            if lm_model.use_moe:
+                normalized = torch.zeros_like(hidden)
+                normalized[packed_text_indexes] = lm_model.norm(hidden[packed_text_indexes])
+                normalized[packed_vae_token_indexes] = lm_model.norm_moe_gen(hidden[packed_vae_token_indexes])
+                hidden = normalized
+            else:
+                hidden = lm_model.norm(hidden)
+            velocities.append(model.llm2vae(hidden)[packed_vae_token_indexes])
+        return tuple(velocities)
     finally:
         if was_training and not grad_enabled:
             lm.train()
@@ -215,6 +506,34 @@ def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
 
 
+def prefill_prompt_text(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    prompt: str,
+    tokenizer: Any,
+    new_token_ids: Any,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Tokenize and prefill one prompt with every packed tensor on ``device``.
+
+    BAGEL's vendored ``prepare_prompts`` intentionally creates CPU tensors and
+    its reference inferencer relies on Accelerate hooks to move them. Training
+    removes those hooks before FSDP2 takes ownership, so trainside context
+    construction must make the transfer explicit.
+    """
+    generation_input, kv_lens, ropes = model.prepare_prompts(
+        curr_kvlens=ctx["kv_lens"],
+        curr_rope=ctx["ropes"],
+        prompts=[prompt],
+        tokenizer=tokenizer,
+        new_token_ids=new_token_ids,
+    )
+    generation_input = _to_device(generation_input, device)
+    past = model.forward_cache_update_text(ctx["past_key_values"], **generation_input)
+    return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+
+
 def prefill_text_split(
     model: Any, ctx: Dict[str, Any], *, text_ids: torch.Tensor, device: torch.device
 ) -> Dict[str, Any]:
@@ -229,6 +548,367 @@ def prefill_text_split(
     past = _raw(type(model).forward_cache_update_text)(model, ctx["past_key_values"], **gi)
     n = int(text_ids.numel())
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
+
+
+def _rebuild_text_context_layer_major(
+    model: Any,
+    *,
+    replay_chunks: Sequence[Sequence[int]],
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Traverse the exact chunk/layer replay DAG with one wrapped call per layer."""
+    lm_model = model.language_model.model
+    layers = tuple(lm_model.layers)
+    require(bool(layers), "BAGEL layer-major replay requires decoder layers.")
+    require(
+        not bool(getattr(lm_model, "enable_taylorseer", False)),
+        "BAGEL layer-major exact replay requires TaylorSeer to be disabled.",
+    )
+    require(
+        all(bool(getattr(layer, "_unirl_layer_major_replay_installed", False)) for layer in layers),
+        "BAGEL layer-major replay dispatch was not installed before checkpoint/FSDP wrapping.",
+    )
+
+    ctx = init_und_context(model)
+    kv_len = int(ctx["kv_lens"][0])
+    rope = int(ctx["ropes"][0])
+    hidden_states: List[torch.Tensor] = []
+    chunk_inputs: List[Dict[str, Any]] = []
+    for chunk in replay_chunks:
+        token_ids = torch.as_tensor(chunk, dtype=torch.long)
+        generation_input = _to_device(_pack_text_ids(token_ids, kv_len=kv_len, rope_start=rope), device)
+        hidden = lm_model.embed_tokens(generation_input["packed_text_ids"])
+        cos, sin = lm_model.rotary_emb(hidden, generation_input["packed_text_position_ids"].unsqueeze(0))
+        hidden_states.append(hidden)
+        chunk_inputs.append(
+            {
+                "query_lens": generation_input["text_token_lens"],
+                "packed_query_position_embeddings": (cos.squeeze(0), sin.squeeze(0)),
+                "packed_query_indexes": generation_input["packed_text_indexes"],
+                "key_values_lens": generation_input["key_values_lens"],
+                "packed_key_value_indexes": generation_input["packed_key_value_indexes"],
+                "update_past_key_values": True,
+                "is_causal": True,
+                "mode": "und",
+            }
+        )
+        token_count = int(token_ids.numel())
+        kv_len += token_count
+        rope += token_count
+
+    cache = ctx["past_key_values"]
+    for layer in layers:
+        per_chunk = tuple(
+            {**static_inputs, "packed_query_sequence": hidden}
+            for hidden, static_inputs in zip(hidden_states, chunk_inputs)
+        )
+        hidden_states, cache = layer(
+            _unirl_exact_replay_chunks=per_chunk,
+            past_key_values=cache,
+        )
+        require(
+            len(hidden_states) == len(replay_chunks),
+            "BAGEL layer-major replay returned the wrong number of chunk hidden states.",
+        )
+
+    return {"kv_lens": [kv_len], "ropes": [rope], "past_key_values": cache}
+
+
+def _distributed_replay_chunk_target(local_count: int, *, device: torch.device) -> int:
+    """Return the largest exact-replay traversal count in the DP world.
+
+    The BAGEL production recipe is pure data parallelism (SP=1), so the default
+    process group is also the FSDP group. A sequence-parallel rollout would need
+    to synchronize on its data-parallel mesh instead.
+    """
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return int(local_count)
+    count = torch.tensor([int(local_count)], dtype=torch.int64, device=device)
+    dist.all_reduce(count, op=dist.ReduceOp.MAX)
+    return int(count.item())
+
+
+def _cache_update_dependency_zero(cache: Any) -> torch.Tensor:
+    """Build an exact zero whose graph touches the newest K/V from every layer."""
+    dependencies: List[torch.Tensor] = []
+    for store in (cache.key_cache, cache.value_cache):
+        for layer_idx in sorted(store):
+            value = store[layer_idx]
+            if value is not None and value.numel() > 0:
+                dependencies.append(value[-1].float().sum())
+    require(bool(dependencies), "BAGEL collective replay padding produced no cache tensors.")
+    return torch.stack(dependencies).sum() * 0.0
+
+
+def _fork_cache_last_token(cache: Any) -> Any:
+    """Fork a ``NaiveCache`` with one graph-connected K/V slot per layer."""
+    trimmed = cache.fork()
+    for store_name in ("key_cache", "value_cache"):
+        source = getattr(cache, store_name)
+        destination = getattr(trimmed, store_name)
+        for layer_idx, value in source.items():
+            destination[layer_idx] = None if value is None else value[-1:]
+    return trimmed
+
+
+def detach_replay_tree(value: Any, _memo: Optional[Dict[int, Any]] = None) -> Any:
+    """Detach a BAGEL replay input tree while preserving cache aliasing.
+
+    ``forward_kwargs`` contains ordinary tensor leaves plus vendored
+    ``NaiveCache`` objects. PyTorch's pytree helpers do not know how to traverse
+    that cache, so handle its K/V stores explicitly and memoize object identities:
+    BAGEL intentionally aliases the positive ``gen`` and ``cfg_img`` caches.
+    Storage is shared with the completed replay; no model-sized clone is made.
+    """
+    memo = {} if _memo is None else _memo
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+    if torch.is_tensor(value):
+        detached = value.detach()
+        memo[object_id] = detached
+        return detached
+    if isinstance(value, dict):
+        detached_dict: Dict[Any, Any] = {}
+        memo[object_id] = detached_dict
+        detached_dict.update({key: detach_replay_tree(item, memo) for key, item in value.items()})
+        return detached_dict
+    if isinstance(value, list):
+        detached_list: List[Any] = []
+        memo[object_id] = detached_list
+        detached_list.extend(detach_replay_tree(item, memo) for item in value)
+        return detached_list
+    if isinstance(value, tuple):
+        detached_tuple = tuple(detach_replay_tree(item, memo) for item in value)
+        memo[object_id] = detached_tuple
+        return detached_tuple
+    if callable(getattr(value, "fork", None)) and hasattr(value, "key_cache") and hasattr(value, "value_cache"):
+        detached_cache = value.fork()
+        memo[object_id] = detached_cache
+        for store_name in ("key_cache", "value_cache"):
+            source = getattr(value, store_name)
+            destination = getattr(detached_cache, store_name)
+            for layer_idx, tensor in source.items():
+                destination[layer_idx] = detach_replay_tree(tensor, memo) if tensor is not None else None
+        return detached_cache
+    memo[object_id] = value
+    return value
+
+
+def move_replay_tree(
+    value: Any,
+    device: torch.device | str,
+    _memo: Optional[Dict[int, Any]] = None,
+) -> Any:
+    """Copy a detached BAGEL replay tree to ``device`` without losing aliases.
+
+    Prepared image replay contains ordinary containers and vendored
+    ``NaiveCache`` instances, including an intentional alias between the
+    positive ``gen`` and ``cfg_img`` caches. Copy every tensor leaf even when it
+    is already on the destination device so the moved tree owns independent
+    storage. This lets the prepared queue release its accelerator tree without
+    sharing mutable tensor storage with either the source or a later hydration.
+
+    The copy is synchronous by design: prepared CPU tensors are pageable, and a
+    completed copy gives the consumer an unambiguous lifetime boundary. Tensor
+    dtype and layout are preserved; every leaf is detached before transfer.
+    """
+    destination_device = torch.device(device)
+    memo = {} if _memo is None else _memo
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+    if torch.is_tensor(value):
+        moved = value.detach().to(device=destination_device, copy=True)
+        memo[object_id] = moved
+        return moved
+    if isinstance(value, dict):
+        moved_dict: Dict[Any, Any] = {}
+        memo[object_id] = moved_dict
+        moved_dict.update({key: move_replay_tree(item, destination_device, memo) for key, item in value.items()})
+        return moved_dict
+    if isinstance(value, list):
+        moved_list: List[Any] = []
+        memo[object_id] = moved_list
+        moved_list.extend(move_replay_tree(item, destination_device, memo) for item in value)
+        return moved_list
+    if isinstance(value, tuple):
+        moved_tuple = tuple(move_replay_tree(item, destination_device, memo) for item in value)
+        memo[object_id] = moved_tuple
+        return moved_tuple
+    if callable(getattr(value, "fork", None)) and hasattr(value, "key_cache") and hasattr(value, "value_cache"):
+        moved_cache = value.fork()
+        memo[object_id] = moved_cache
+        for store_name in ("key_cache", "value_cache"):
+            source = getattr(value, store_name)
+            destination = getattr(moved_cache, store_name)
+            for layer_idx, tensor in source.items():
+                destination[layer_idx] = (
+                    move_replay_tree(tensor, destination_device, memo) if tensor is not None else None
+                )
+        return moved_cache
+    memo[object_id] = value
+    return value
+
+
+def _pad_text_context_traversals(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    count: int,
+    token_id: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Issue bounded cached traversals so every FSDP rank has equal depth."""
+    if int(count) <= 0:
+        return None
+
+    # Keep the dummy suffix on the same cached update branch as the real trace.
+    # Trimming every layer back to its newest slot bounds each update to a 1+1
+    # attention geometry while preserving graph recurrence through the cache.
+    # ``fork`` and the K/V views also keep the semantic context untouched.
+    token_ids = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+    dummy_ctx = {
+        "kv_lens": [1],
+        "ropes": [int(x) for x in ctx["ropes"]],
+        "past_key_values": _fork_cache_last_token(ctx["past_key_values"]),
+    }
+    for _ in range(int(count)):
+        dummy_ctx = prefill_text_split(
+            model,
+            dummy_ctx,
+            text_ids=token_ids,
+            device=device,
+        )
+        dummy_ctx = {
+            "kv_lens": [1],
+            "ropes": dummy_ctx["ropes"],
+            "past_key_values": _fork_cache_last_token(dummy_ctx["past_key_values"]),
+        }
+    if not torch.is_grad_enabled():
+        return None
+    return _cache_update_dependency_zero(dummy_ctx["past_key_values"])
+
+
+def rebuild_text_context_from_chunks(
+    model: Any,
+    *,
+    chunks: Sequence[Sequence[int]],
+    expected_kv_length: int,
+    expected_ropes: Sequence[int],
+    device: torch.device,
+    chunk_mode: str = "exact",
+    execution_order: str = "chunk_major",
+    collective_target_chunks: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Rebuild a grad-capable BAGEL context from native cache-input tokens.
+
+    ``chunks`` are captured at the vLLM Stage-0 runner boundary, after prompt
+    tokenization and scheduling. ``chunk_mode="exact"`` preserves every native
+    prefill/decode attention call. ``execution_order="layer_major"`` traverses
+    the same two-dimensional chunk/layer DAG in the alternate topological order,
+    entering each wrapped decoder block once while its parameters are resident.
+    The explicit ``"collapsed"`` fast path keeps
+    the native initial prefill and sends the same ordered decode IDs through one
+    causal update. No cache tensor crosses the rollout boundary; this function creates a fresh
+    ``NaiveCache`` on the trainer and lets autograd connect every reconstructed K/V
+    tensor to the current policy weights. In exact mode, pure-DP workers agree on
+    the largest per-sample chunk count before the first decoder call. Shorter
+    traces issue bounded, cache-faithful decoder traversals so FSDP2 sees the same
+    cached forward branch and backward collective depth on every rank. The dummy
+    cache retains only one graph-connected K/V slot per layer and never advances
+    the semantic context returned to the caller.
+
+    The MoT inference kernels dispatch on ``module.training``.  Keep the language
+    model in ``eval`` for grad-enabled replay, matching :func:`forward_flow`; do not
+    restore it until backward has consumed any activation-checkpoint recomputation.
+    """
+    chunk_mode = validate_t2ti_replay_chunk_mode(chunk_mode)
+    execution_order = validate_t2ti_replay_execution_order(execution_order)
+    require(
+        chunk_mode == "exact" or execution_order == "chunk_major",
+        "BAGEL collapsed replay only supports chunk_major execution.",
+    )
+    require(
+        collective_target_chunks is None or execution_order == "chunk_major",
+        "BAGEL layer_major replay has no collective padding target.",
+    )
+    require(bool(chunks), "rebuild_text_context_from_chunks: chunks must be non-empty.")
+    replay_chunks = tuple(tuple(int(token) for token in chunk) for chunk in chunks)
+    for index, chunk in enumerate(replay_chunks):
+        require(bool(chunk), f"rebuild_text_context_from_chunks: chunk {index} is empty.")
+    if chunk_mode == "collapsed" and len(replay_chunks) > 1:
+        replay_chunks = (
+            replay_chunks[0],
+            tuple(token for chunk in replay_chunks[1:] for token in chunk),
+        )
+    expected_kv_length = int(expected_kv_length)
+    expected_ropes = tuple(int(x) for x in expected_ropes)
+    require(bool(expected_ropes), "rebuild_text_context_from_chunks: expected_ropes must be non-empty.")
+
+    lm = model.language_model
+    was_training = bool(getattr(lm, "training", False))
+    grad_enabled = torch.is_grad_enabled()
+    if was_training:
+        lm.eval()
+
+    try:
+        require_inference_dispatch(model)
+        target_chunks = len(replay_chunks)
+        if chunk_mode == "exact" and execution_order == "chunk_major":
+            # Agree before the first decoder call. Computing this after the real
+            # trace would already let unequal ranks desynchronize all-gathers.
+            target_chunks = (
+                _distributed_replay_chunk_target(len(replay_chunks), device=device)
+                if collective_target_chunks is None
+                else int(collective_target_chunks)
+            )
+            require(
+                target_chunks >= len(replay_chunks),
+                "rebuild_text_context_from_chunks: collective target cannot be shorter than the real trace: "
+                f"{target_chunks} < {len(replay_chunks)}.",
+            )
+        if execution_order == "layer_major":
+            ctx = _rebuild_text_context_layer_major(
+                model,
+                replay_chunks=replay_chunks,
+                device=device,
+            )
+        else:
+            ctx = init_und_context(model)
+            for chunk in replay_chunks:
+                token_ids = torch.as_tensor(chunk, dtype=torch.long)
+                ctx = prefill_text_split(model, ctx, text_ids=token_ids, device=device)
+
+        if chunk_mode == "exact" and execution_order == "chunk_major":
+            dependency_zero = _pad_text_context_traversals(
+                model,
+                ctx,
+                count=target_chunks - len(replay_chunks),
+                token_id=replay_chunks[-1][-1],
+                device=device,
+            )
+            if dependency_zero is not None:
+                ctx["collective_pad_zero"] = dependency_zero
+
+        actual_kv_length = int(ctx["kv_lens"][0])
+        actual_ropes = tuple(int(x) for x in ctx["ropes"])
+        require(
+            actual_kv_length == expected_kv_length,
+            "rebuild_text_context_from_chunks: reconstructed KV length does not match native transfer metadata: "
+            f"{actual_kv_length} != {expected_kv_length}.",
+        )
+        require(
+            actual_ropes == expected_ropes,
+            "rebuild_text_context_from_chunks: reconstructed ropes do not match native transfer metadata: "
+            f"{actual_ropes!r} != {expected_ropes!r}.",
+        )
+        return ctx
+    finally:
+        if was_training and not grad_enabled:
+            lm.train()
 
 
 def prefill_vit_split(

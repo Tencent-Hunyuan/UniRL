@@ -9,7 +9,7 @@ holds exactly one of them.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, runtime_checkable
 
 from unirl.types.reward import RewardRequest, RewardResponse
 
@@ -55,11 +55,18 @@ class RewardBackend(ABC):
     def is_available(self) -> bool:
         """Whether this backend is ready to score."""
 
-    def offload(self) -> None:
-        """Optional lifecycle hook: release device memory."""
+    @property
+    def supports_model_parking(self) -> bool:
+        """Whether ``offload``/``onload`` move only this backend's model state."""
+        return False
 
-    def onload(self) -> None:
-        """Optional lifecycle hook: reacquire device memory."""
+    def offload(self) -> Optional[Dict[str, float]]:
+        """Optional lifecycle hook: release device memory and report the transfer."""
+        return None
+
+    def onload(self) -> Optional[Dict[str, float]]:
+        """Optional lifecycle hook: reacquire device memory and report the transfer."""
+        return None
 
     def dispose(self) -> None:
         """Optional lifecycle hook: terminal cleanup."""

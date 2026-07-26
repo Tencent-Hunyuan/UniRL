@@ -65,7 +65,12 @@ from unirl.types.segments.text import TextSegment
 from .ar import BagelARStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage
-from .rl_ops import _to_device
+from .rl_ops import (
+    _to_device,
+    prefill_prompt_text,
+    validate_t2ti_replay_chunk_mode,
+    validate_t2ti_replay_execution_order,
+)
 from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
@@ -102,11 +107,16 @@ class BagelPipeline(Pipeline):
         logprob_precision: str = "fp32",
         shift: float = 3.0,
         replay_mode: str = "train",
+        t2ti_replay_chunk_mode: str = "exact",
+        t2ti_replay_execution_order: str = "chunk_major",
+        t2ti_flow_many_enabled: bool = False,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
+        t2ti_replay_chunk_mode = validate_t2ti_replay_chunk_mode(t2ti_replay_chunk_mode)
+        t2ti_replay_execution_order = validate_t2ti_replay_execution_order(t2ti_replay_execution_order)
         if diffusion is None:
             diffusion = BagelDiffusionStage(
                 model=bundle,
@@ -114,6 +124,9 @@ class BagelPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                t2ti_replay_chunk_mode=t2ti_replay_chunk_mode,
+                t2ti_replay_execution_order=t2ti_replay_execution_order,
+                t2ti_flow_many_enabled=t2ti_flow_many_enabled,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
@@ -291,8 +304,22 @@ class BagelPipeline(Pipeline):
             if image is not None:
                 gen = self._update_context_image(self._resize_input_image(image), gen, vae=True, vit=True)
             cfg_text = deepcopy(gen)  # snapshot before the prompt text → drop-text branch
-            gen = inf.update_context_text(prompt, gen)
-            cfg_img = inf.update_context_text(prompt, cfg_img)
+            gen = prefill_prompt_text(
+                self.bundle.model,
+                gen,
+                prompt=prompt,
+                tokenizer=self.bundle.tokenizer,
+                new_token_ids=self.bundle.new_token_ids,
+                device=torch.device(self.bundle.device),
+            )
+            cfg_img = prefill_prompt_text(
+                self.bundle.model,
+                cfg_img,
+                prompt=prompt,
+                tokenizer=self.bundle.tokenizer,
+                new_token_ids=self.bundle.new_token_ids,
+                device=torch.device(self.bundle.device),
+            )
         return gen, cfg_text, cfg_img
 
     def _t2i_cache_enabled(self) -> bool:
@@ -679,13 +706,25 @@ class BagelPipeline(Pipeline):
         inf = self.bundle.inferencer
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
+        device = torch.device(self.bundle.device)
+
+        def prefill(text: str, context: Any) -> Any:
+            return prefill_prompt_text(
+                self.bundle.model,
+                context,
+                prompt=text,
+                tokenizer=self.bundle.tokenizer,
+                new_token_ids=self.bundle.new_token_ids,
+                device=device,
+            )
+
         with torch.no_grad(), self._autocast_ctx():
-            gen = inf.update_context_text(system_prompt, gen)
-            cfg_img = inf.update_context_text(system_prompt, cfg_img)
+            gen = prefill(system_prompt, gen)
+            cfg_img = prefill(system_prompt, cfg_img)
             cfg_text = deepcopy(gen)  # init + system → drop-prompt-and-think branch
-            gen = inf.update_context_text(prompt, gen)
-            cfg_img = inf.update_context_text(prompt, cfg_img)
-            gen = inf.update_context_text(think_text, gen)
+            gen = prefill(prompt, gen)
+            cfg_img = prefill(prompt, cfg_img)
+            gen = prefill(think_text, gen)
         return gen, cfg_text, cfg_img
 
     def _generate_t2ti(self, req: RolloutReq) -> RolloutResp:
