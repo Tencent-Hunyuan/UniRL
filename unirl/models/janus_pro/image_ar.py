@@ -235,10 +235,24 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                     dim=1,
                 )
 
-        return TextSegment.pack(
+        segment = TextSegment.pack(
             tokens=[generated_tokens[i] for i in range(batch_size)],
             log_probs=[generated_logps[i] for i in range(batch_size)],
         )
+        # Cached one-token decode and full-sequence teacher forcing are
+        # mathematically equivalent, but bf16 attention kernels use different
+        # numerical geometries. CFG amplifies that gap enough to move the
+        # nominally on-policy PPO ratio far outside its clip range. Freeze the
+        # old-policy anchor with the exact replay geometry used by training.
+        # This extra forward is graph-free and replaces 576 cached forwards in
+        # the old replay implementation.
+        with torch.no_grad():
+            segment.log_probs = self.replay(
+                conditions,
+                segment=segment,
+                temperature=float(sampling_params.temperature),
+            ).detach()
+        return segment
 
     def replay(
         self,
