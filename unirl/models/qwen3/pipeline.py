@@ -95,6 +95,7 @@ class Qwen3Pipeline(Pipeline):
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
         enable_thinking: bool = False,
+        max_prompt_length: int = 4096,
     ) -> "Qwen3Pipeline":
         """Wire chat-template + AR stages around an already-loaded bundle.
 
@@ -105,7 +106,10 @@ class Qwen3Pipeline(Pipeline):
         not lost on the bundle-injected path.
         """
         chat_template = Qwen3ChatTemplateStage(
-            bundle, system_instruction=system_instruction, enable_thinking=enable_thinking
+            bundle,
+            system_instruction=system_instruction,
+            enable_thinking=enable_thinking,
+            max_prompt_length=max_prompt_length,
         )
         ar = Qwen3ARStage(
             model=bundle,
@@ -128,6 +132,7 @@ class Qwen3Pipeline(Pipeline):
             bundle,
             system_instruction=config.system_instruction,
             enable_thinking=config.enable_thinking,
+            max_prompt_length=config.max_prompt_length,
         )
         ar = Qwen3ARStage(
             model=bundle,

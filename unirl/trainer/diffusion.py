@@ -372,7 +372,8 @@ class DiffusionTrainer(BaseTrainer):
         passes its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
         base = base_sampling if base_sampling is not None else self.sampling_params
-        inputs = inputs.expand(total_samples_per_prompt(base))
+        samples_per_prompt = total_samples_per_prompt(base)
+        inputs = inputs.expand(samples_per_prompt)
         diffusion = base.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
@@ -400,7 +401,29 @@ class DiffusionTrainer(BaseTrainer):
         init_noise_group_ids: list = []
         init_noise_latent_shape = self._noise_latent_shape
         if init_noise_latent_shape is not None:
-            if bool(getattr(base.get("diffusion"), "init_same_noise", False)):
+            # Eval (base_sampling is not None): seed x_T per prompt CONTENT plus
+            # sibling-sample ordinal. The same prompt/sample slot is stable across
+            # steps/checkpoints, while K>1 eval siblings still get distinct x_T.
+            # Training keeps per-rollout/per-sample varying noise.
+            is_eval = (
+                base_sampling is not None
+                and "text" in inputs.primitives
+                and hasattr(inputs.primitives["text"], "texts")
+            )
+            if is_eval:
+                from unirl.sde.noise import make_prompt_seed_group_id
+
+                texts = list(inputs.primitives["text"].texts)
+                if len(texts) != len(inputs.sample_ids):
+                    raise ValueError(
+                        f"eval prompt-text count {len(texts)} != sample count "
+                        f"{len(inputs.sample_ids)}; cannot key x_T on prompt content."
+                    )
+                init_noise_group_ids = [
+                    make_prompt_seed_group_id(text, sample_ordinal=index % samples_per_prompt)
+                    for index, text in enumerate(texts)
+                ]
+            elif bool(getattr(base.get("diffusion"), "init_same_noise", False)):
                 init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
             else:
                 init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]
