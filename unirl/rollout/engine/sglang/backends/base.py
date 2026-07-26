@@ -9,7 +9,6 @@ from contextlib import contextmanager
 from glob import glob
 from typing import (
     Any,
-    Callable,
     Dict,
     Iterator,
     List,
@@ -71,7 +70,7 @@ def _python_cuda_library_dirs() -> List[str]:
 
 
 def _preloaded_cuda_driver_libraries() -> List[str]:
-    """Return explicitly preloaded CUDA driver shims."""
+    """Return explicitly preloaded CUDA forward-compatibility drivers."""
     result: List[str] = []
     for item in _split_preloads(os.environ.get("LD_PRELOAD", "")):
         if not os.path.basename(item).startswith("libcuda.so"):
@@ -85,10 +84,11 @@ def _preloaded_cuda_driver_libraries() -> List[str]:
 def _preloaded_cuda_driver_dirs() -> List[str]:
     """Return directories containing explicitly preloaded CUDA driver shims.
 
-    ``torch-memory-saver`` replaces ``LD_PRELOAD`` while it starts SGLang
-    schedulers. Keeping a preloaded forward-compatibility driver's directory
-    in ``LD_LIBRARY_PATH`` lets the child still resolve that same ``libcuda``
-    after the preload value changes.
+    ``torch-memory-saver`` replaces ``LD_PRELOAD`` with its own hook while it
+    starts SGLang schedulers. Keeping a forward-compatibility driver's
+    directory in ``LD_LIBRARY_PATH`` lets the child resolve that same
+    ``libcuda`` without changing torch-memory-saver's single-library preload
+    contract.
     """
     return list(dict.fromkeys(os.path.dirname(path) for path in _preloaded_cuda_driver_libraries()))
 
@@ -97,7 +97,16 @@ def _preloaded_cuda_driver_dirs() -> List[str]:
 def _preserve_cuda_driver_preloads(
     libraries: Optional[Sequence[str]] = None,
 ) -> Iterator[None]:
-    """Append CUDA driver shims when torch-memory-saver rewrites LD_PRELOAD."""
+    """Keep driver shims loaded when torch-memory-saver starts schedulers.
+
+    ``torch-memory-saver`` intentionally replaces ``LD_PRELOAD`` with its hook
+    path. On Python builds whose executable has an ``RPATH`` to the host driver,
+    ``LD_LIBRARY_PATH`` alone cannot make that hook resolve a forward-compatible
+    ``libcuda``. Preload the driver first for the child process; the scheduler
+    target teaches torch-memory-saver to select its hook from the composite
+    preload while leaving the driver in the environment for compiler and worker
+    subprocesses spawned later.
+    """
     driver_libraries = list(libraries) if libraries is not None else _preloaded_cuda_driver_libraries()
     if not driver_libraries:
         yield
@@ -116,7 +125,9 @@ def _preserve_cuda_driver_preloads(
         with original_configure_subprocess():
             saved_preload = os.environ.get("LD_PRELOAD")
             current = _split_preloads(saved_preload or "")
-            os.environ["LD_PRELOAD"] = os.pathsep.join(list(dict.fromkeys(current + driver_libraries)))
+            # Driver first is load-bearing: the Python executable's host-driver
+            # RPATH otherwise wins while resolving the memory-saver hook.
+            os.environ["LD_PRELOAD"] = os.pathsep.join(list(dict.fromkeys(driver_libraries + current)))
             try:
                 yield
             finally:
@@ -132,14 +143,50 @@ def _preserve_cuda_driver_preloads(
         torch_memory_saver.configure_subprocess = original_configure_subprocess
 
 
-def _run_with_cuda_driver_preloads(
-    target: Callable[..., Any],
-    args: tuple[Any, ...],
-    libraries: Sequence[str],
-) -> Any:
-    """Spawn target used by the HTTP backend to patch its scheduler children."""
-    with _preserve_cuda_driver_preloads(libraries):
-        return target(*args)
+_TMS_COMPOSITE_PRELOAD_SENTINEL = "_unirl_composite_preload"
+
+
+def _configure_torch_memory_saver_composite_preload() -> None:
+    """Let torch-memory-saver read its hook from a composite ``LD_PRELOAD``.
+
+    Hook mode normally returns the entire environment value as one ``ctypes``
+    path, so ``driver.so:memory_saver.so`` cannot initialize. Replacing that
+    narrow lookup keeps initialization lazy while preserving the composite
+    value for TorchInductor and other scheduler descendants that must load the
+    forward-compatible CUDA driver themselves.
+    """
+    try:
+        from torch_memory_saver.hooks.mode_preload import HookUtilModePreload
+    except ImportError:
+        return
+
+    current = HookUtilModePreload.__dict__.get("get_path_binary")
+    if getattr(current, _TMS_COMPOSITE_PRELOAD_SENTINEL, False):
+        return
+
+    def _get_path_binary(_self: Any) -> str:
+        hooks = [
+            item
+            for item in _split_preloads(os.environ.get("LD_PRELOAD", ""))
+            if "torch_memory_saver" in os.path.basename(item)
+        ]
+        if len(hooks) != 1:
+            raise RuntimeError(
+                f"SGLang CUDA compatibility spawn expected exactly one torch-memory-saver preload hook; got {hooks!r}"
+            )
+        return hooks[0]
+
+    setattr(_get_path_binary, _TMS_COMPOSITE_PRELOAD_SENTINEL, True)
+    HookUtilModePreload.get_path_binary = _get_path_binary
+
+
+def _run_sglang_scheduler_with_cuda_driver_preload(*args: Any, **kwargs: Any) -> Any:
+    """Scheduler target for a child started with driver + memory-saver hooks."""
+    _configure_torch_memory_saver_composite_preload()
+
+    from sglang.srt.managers.scheduler import run_scheduler_process
+
+    return run_scheduler_process(*args, **kwargs)
 
 
 def _normalize_cuda_visible_devices(

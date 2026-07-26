@@ -19,6 +19,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from unirl.rollout.engine.sglang.backends.base import (
     _filter_server_args_or_raise,
     _normalize_cuda_visible_devices,
+    _preloaded_cuda_driver_libraries,
+    _preserve_cuda_driver_preloads,
+    _run_sglang_scheduler_with_cuda_driver_preload,
     _scheduler_spawn_environment,
 )
 
@@ -136,7 +139,11 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     }
 
 
-def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
+def _launch_server_with_env(
+    server_args: Any,
+    env_overrides: Dict[str, str],
+    driver_libraries: Sequence[str],
+) -> Any:
     """HTTP server target with child-local launch environment overrides."""
     os.setsid()
 
@@ -145,6 +152,12 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
 
     from sglang.srt.entrypoints.http_server import launch_server
 
+    if driver_libraries:
+        with _preserve_cuda_driver_preloads(driver_libraries):
+            return launch_server(
+                server_args,
+                run_scheduler_process_func=_run_sglang_scheduler_with_cuda_driver_preload,
+            )
     return launch_server(server_args)
 
 
@@ -278,9 +291,10 @@ class HTTPBackend:
         if visible_devices is not None:
             server_args.base_gpu_id = 0
             env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        cuda_driver_preloads = _preloaded_cuda_driver_libraries()
         process = multiprocessing.Process(
             target=_launch_server_with_env,
-            args=(server_args, env_overrides),
+            args=(server_args, env_overrides, cuda_driver_preloads),
         )
         with _scheduler_spawn_environment(visible_devices):
             process.start()
