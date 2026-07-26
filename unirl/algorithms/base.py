@@ -103,6 +103,42 @@ def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) 
     }
 
 
+def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
+    """Per-token K3 KL estimator between rollout and replay log-probs.
+
+    K3 is Schulman's low-variance, always-non-negative KL estimator
+    (http://joschu.net/blog/kl-approx.html)::
+
+        log_r = log_p - log_q
+        k3    = exp(log_r) - log_r - 1   (== (r - 1) - log(r),  r = p/q)
+
+    Here ``p`` is the teacher-forced replay distribution (``new_logp``, trainside)
+    and ``q`` is the rollout distribution (``old_logp``, autoregress / SGLang), so
+    ``log_r = new_logp - old_logp`` — the same signed log-ratio ``_grpo_clip_loss``
+    forms. Unlike the symmetric ``|Δlogp|`` and the exp-biased ``ratio_mean``, k3
+    is the calibrated per-token KL(q‖p) surrogate; on an on-policy first update it
+    is ~0 and it grows the moment rollout and replay disagree (a temperature
+    misconfig, a broken weight sync, or a multimodal position-encoding mismatch).
+    Mean / max / p90 / p99 let online and offline k3 distributions compare directly.
+
+    Assumes non-empty inputs, mirroring :func:`rollout_replay_logp_absdiff` — AR
+    callers early-return on a zero-token segment before this runs.
+    """
+    with torch.no_grad():
+        log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
+        # expm1 is exp(x)-1 evaluated stably near x=0 (the on-policy regime).
+        k3 = torch.expm1(log_r) - log_r
+        out = {
+            "k3_mean": float(k3.mean()),
+            "k3_max": float(k3.max()),
+        }
+        if k3.numel() >= 2:
+            q = torch.quantile(k3.float(), torch.tensor([0.90, 0.99], device=k3.device))
+            out["k3_p90"] = float(q[0])
+            out["k3_p99"] = float(q[1])
+    return out
+
+
 def _resolve_clip_range_from_schedule(clip_range: float, schedule: str, progress: float) -> float:
     """Schedule-aware clip range. Mirrors ``GRPOAlgorithm.get_clip_range``."""
     if schedule == "linear_decay":
@@ -339,6 +375,10 @@ class StageAlgorithm(Remote, ABC):
     # Independent of ``requires_ema_rollout`` (DiffusionNFT needs the backend for its
     # EMA shadow). Default False — most algorithms take only the ``pipeline`` sibling.
     requires_backend: bool = False
+    # Whether the loss requires per-sample advantages. SFT variants set False.
+    requires_advantages: bool = True
+    # Weight accumulated losses by samples or the global valid-token count.
+    loss_weighting: str = "sample"
     # Segment fields this algorithm freezes as the π_old anchor in
     # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO:
     # ``("sde_logp", "sde_means")``). When the anchor is recomputed
@@ -427,5 +467,6 @@ __all__ = [
     "StageAlgorithm",
     "gather_sde_field",
     "rollout_replay_logp_absdiff",
+    "rollout_replay_k3",
     "typed_conditions",
 ]

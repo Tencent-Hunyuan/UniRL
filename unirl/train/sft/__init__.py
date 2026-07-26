@@ -1,7 +1,20 @@
-"""Generic supervised-finetuning (SFT / behavior-cloning) training domain."""
+"""SFT domain package — worker-side supervised track builders.
 
-from unirl.train.sft.data import JsonlSFTDataSource
-from unirl.train.sft.policy import SFTPolicy
-from unirl.train.sft.task import SFTTask, SFTTaskBase
+The losses live in ``unirl/algorithms/sft.py`` (peers of GRPO/FlowGRPO); the
+driver is ``unirl/trainer/sft.py``; this package holds only the piece that is
+genuinely new to supervision: turning dataset records into stage-ready tracks.
+"""
 
-__all__ = ["JsonlSFTDataSource", "SFTPolicy", "SFTTask", "SFTTaskBase"]
+from unirl.train.sft.cosmos3 import Cosmos3SupervisedTrackBuilder
+from unirl.train.sft.track_builder import (
+    ARSupervisedTrackBuilder,
+    DiffusionSupervisedTrackBuilder,
+    SupervisedTrackBuilder,
+)
+
+__all__ = [
+    "ARSupervisedTrackBuilder",
+    "Cosmos3SupervisedTrackBuilder",
+    "DiffusionSupervisedTrackBuilder",
+    "SupervisedTrackBuilder",
+]

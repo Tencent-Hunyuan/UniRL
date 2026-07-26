@@ -1,0 +1,100 @@
+# @package _global_
+# Validation run: Qwen2.5-VL-7B LoRA SFT on llava-instruct-mix (~8k rows).
+#
+# Launch (1×8):
+#   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen_vl_sft_lora
+
+num_devices: 8
+batch_size: 32
+num_steps: 400
+eval_interval: 40
+eval_batch_size: 16
+eval_num_samples: -1
+save_interval: 100
+save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen_vl}
+save_mode: auto
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft-validation}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen-vl-7b-lora-llava}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sft, qwen-vl, vlm, lora, validation]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    model_precision: fp32
+    attn_implementation: flash_attention_2
+    freeze_vision_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+
+pipeline:
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: cosine
+    warmup_steps: 10
+    total_steps: ${num_steps}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+
+algorithm:
+  _target_: unirl.algorithms.sft.SFT
+  stage_attr: ar
+  loss_agg_mode: token-mean
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
+  max_response_length: 1024
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42

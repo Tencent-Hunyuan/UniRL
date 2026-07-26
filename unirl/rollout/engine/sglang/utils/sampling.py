@@ -3,7 +3,7 @@
 The predecessor resolved sampling inline across ``generate`` and the async
 helper, re-deriving the precedence per field. This is the one place it happens
 now: typed ``ARSamplingParams`` (``req.sampling_params['ar']``) > the
-``req.stage_config['ar']`` bag > engine-config defaults, including the
+``req.task_config['ar']`` bag > engine-config defaults, including the
 ``top_k`` translation and the ``samples_pre_expanded`` n-logic. Pure —
 table-testable with config/req stand-ins.
 """
@@ -38,29 +38,26 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
     - ``n``: 1 when ``config.samples_pre_expanded`` (the caller already
       expanded P prompts → P*N entries, one per GRPO sibling — re-applying
       ``samples_per_prompt`` would generate N completions per expanded entry);
-      else ``ar.samples_per_prompt``, else ``stage_ar['n']``, else 1.
+      else ``ar.samples_per_prompt``, else ``task_ar['n']``, else 1.
     - ``temperature`` / ``top_p`` / ``max_new_tokens``: typed AR params, else
       the config defaults.
-    - ``top_k``: MUST be threaded through — without it SGLang falls back to
-      the model generation_config default (top_k=20 for Qwen3), which peaks
-      the sampling vs the trainer's top_k=0 (unrestricted) → low intra-group
-      diversity → GRPO advantages collapse. The trainer's ``top_k=0`` (HF
-      convention) maps to SGLang's ``-1`` (disabled); positive passes through.
-      With no typed AR params the predecessor sent ``-1`` (disabled), never
-      the config field — reproduced here.
+    - ``top_k``: typed AR params, else the config default. The value must still
+      be sent so SGLang does not fall back to a model-specific generation-config
+      limit. The trainer/config ``top_k=0`` (HF convention) maps to SGLang's
+      ``-1`` (disabled); positive values pass through.
     - ``return_logprob`` (default True), ``system_instruction``, and the
       ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
-      come from ``stage_config['ar']``.
+      come from ``task_config['ar']``.
     """
     ar = req.sampling_params.get("ar")
-    stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    task_ar: Dict[str, Any] = dict(req.task_config.get("ar") or {})
 
     if config.samples_pre_expanded:
         n = 1
     else:
-        n = int(ar.samples_per_prompt if ar is not None else stage_ar.get("n", 1))
+        n = int(ar.samples_per_prompt if ar is not None else task_ar.get("n", 1))
 
-    raw_top_k = int(ar.top_k) if ar is not None else 0
+    raw_top_k = ar.top_k if ar is not None else config.top_k
     block: Dict[str, Any] = {
         "temperature": float(ar.temperature if ar is not None else config.temperature),
         "max_new_tokens": int(ar.max_new_tokens if ar is not None else config.max_new_tokens),
@@ -69,13 +66,13 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
         "n": n,
     }
     for key in ("stop", "stop_token_ids", "skip_special_tokens"):
-        if key in stage_ar:
-            block[key] = stage_ar[key]
+        if key in task_ar:
+            block[key] = task_ar[key]
 
     return ResolvedSampling(
         n=n,
-        return_logprob=bool(stage_ar.get("return_logprob", True)),
-        system_instruction=stage_ar.get("system_instruction") or config.system_instruction,
+        return_logprob=bool(task_ar.get("return_logprob", True)),
+        system_instruction=task_ar.get("system_instruction") or config.system_instruction,
         block=block,
     )
 

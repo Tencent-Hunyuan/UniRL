@@ -26,6 +26,18 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 
+def resolution_tier(height: int, width: int) -> str:
+    """Map a sample to the official short-edge Cosmos resolution tier."""
+    short_edge = min(int(height), int(width))
+    if short_edge <= 256:
+        return "256"
+    if short_edge <= 640:
+        return "480"
+    if short_edge <= 960:
+        return "720"
+    return "768"
+
+
 def sample_train_sigma(
     *,
     time_dist: str,
@@ -187,5 +199,6 @@ __all__ = [
     "noise_vision_latents",
     "pack_joint_sequence",
     "pad_action_chunk",
+    "resolution_tier",
     "sample_train_sigma",
 ]

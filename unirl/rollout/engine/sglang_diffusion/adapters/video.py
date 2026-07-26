@@ -6,29 +6,33 @@ Two output shapes live here:
   6-D ``[B, T+1, C, F, H, W]`` (an extra latent-frame axis vs the image path's
   5-D ``[B, T+1, C, H, W]``) and the decoded media is packed into a ragged
   :class:`~unirl.types.primitives.Videos` (``[total_T, C, H, W]``) instead of
-  being dropped. WAN 2.1 T2V rides this base — its rollout output is consumed by
-  the ``video_pickscore`` reward, the first such video reward consumer.
+  being dropped. HunyuanVideo and WAN ride this base so their rollout output can
+  be consumed by the ``video_pickscore`` reward.
 
-* ``MochiAdapter`` / ``HunyuanVideoAdapter`` — kept on the legacy image path
-  (see note below) for behavioral parity with the old ``sglang`` engine. Migrate
-  them onto ``VideoAdapter`` once each has a verified video reward baseline.
+* ``MochiAdapter`` — kept on the legacy image path (see note below) for
+  behavioral parity with the old ``sglang`` engine. Migrate it onto
+  ``VideoAdapter`` once it has a verified video reward baseline.
 
 PARITY NOTE (image-path video families): the legacy ``sglang`` engine treated
 every family — including the video ones — through the image path: it built an
 image-form ``LatentSegment`` (``make_image_segment``) and *dropped* 4-D decoded
-video with a warning (there was no video reward consumer yet). ``MochiAdapter`` /
-``HunyuanVideoAdapter`` reproduce that exactly so the per-family parity gate
-holds; only families with a real video consumer (WAN) move to ``VideoAdapter``.
+video with a warning (there was no video reward consumer yet). ``MochiAdapter``
+reproduces that exactly; families with a real video consumer move to
+``VideoAdapter``.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import torch
+
+from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
+from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.segments.latent import make_video_segment
 
@@ -95,12 +99,74 @@ class MochiAdapter(ImageAdapter):
 
 
 @register_adapter("hunyuan_video")
-class HunyuanVideoAdapter(ImageAdapter):
-    """HunyuanVideo — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
+class HunyuanVideoAdapter(VideoAdapter):
+    """HunyuanVideo-1.0 T2V with video output and dual text conditions."""
 
-    # Legacy image-path video family: drop 4-D decoded samples (incl. single-frame)
-    # rather than squeezing them into images.
-    squeeze_single_frame_4d = False
+    def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
+        """Keep HunyuanVideo's LLaMA and pooled-CLIP streams separate.
+
+        SGLang returns ``prompt_embeds`` as
+        ``[LLaMA [B, seq, 4096], CLIP [B, 1, 768]]``. The generic image adapter
+        fuses multi-encoder outputs along the token axis, which cannot combine
+        these different hidden sizes and does not match
+        :class:`HunyuanVideoConditions`. Pack the two streams under the exact
+        keys consumed by trainer-side replay instead.
+        """
+        require(bool(results), "HunyuanVideo: cannot build conditions from empty results")
+
+        llama_conditions: List[TextEmbedCondition] = []
+        clip_list: List[torch.Tensor] = []
+        mask_presence: List[bool] = []
+        for result in results:
+            prompt_embeds = result.prompt_embeds
+            require(
+                isinstance(prompt_embeds, (list, tuple)) and len(prompt_embeds) >= 2,
+                "HunyuanVideo: expected prompt_embeds=[LLaMA, CLIP-pooled]; got "
+                f"{type(prompt_embeds).__name__} with "
+                f"{len(prompt_embeds) if isinstance(prompt_embeds, (list, tuple)) else 'n/a'} entries",
+            )
+            llama, clip = prompt_embeds[:2]
+            require(
+                torch.is_tensor(llama) and llama.ndim == 3,
+                "HunyuanVideo: LLaMA prompt embed must be [B, seq, hidden]",
+            )
+            require(
+                torch.is_tensor(clip) and clip.ndim in (2, 3),
+                "HunyuanVideo: pooled CLIP embed must be [B, hidden] or [B, 1, hidden]",
+            )
+            require(
+                int(llama.shape[0]) == int(clip.shape[0]),
+                "HunyuanVideo: LLaMA and CLIP prompt embed batch sizes must match",
+            )
+
+            attention_mask = None
+            encoder_masks = result.encoder_attention_mask
+            if isinstance(encoder_masks, (list, tuple)) and encoder_masks and encoder_masks[0] is not None:
+                attention_mask = encoder_masks[0]
+                require(
+                    torch.is_tensor(attention_mask)
+                    and attention_mask.ndim == 2
+                    and tuple(attention_mask.shape) == tuple(llama.shape[:2]),
+                    "HunyuanVideo: LLaMA attention mask must match [B, seq]",
+                )
+
+            mask_presence.append(attention_mask is not None)
+            llama_conditions.append(
+                TextEmbedCondition(
+                    embeds=llama.detach().cpu(),
+                    attn_mask=attention_mask.detach().cpu() if attention_mask is not None else None,
+                )
+            )
+            clip_list.append(clip.detach().cpu().reshape(int(clip.shape[0]), -1))
+
+        require(
+            all(mask_presence) or not any(mask_presence),
+            "HunyuanVideo: LLaMA attention masks must be present for every result or none",
+        )
+        return {
+            "text_llama": TextEmbedCondition.concat(llama_conditions),
+            "pooled_clip": TextEmbedCondition(embeds=torch.cat(clip_list, dim=0)),
+        }
 
 
 @register_adapter("wan22")

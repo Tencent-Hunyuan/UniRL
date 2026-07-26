@@ -17,6 +17,7 @@ import re
 import torch
 
 from unirl.models.cosmos3.config import Cosmos3SFTConfig
+from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,8 @@ class _CastOutput(torch.nn.Module):
 
     Cosmos3's ``forward`` feeds ``time_proj`` sinusoids (always fp32 — diffusers'
     ``get_timestep_embedding`` calls ``.float()`` internally) straight into
-    ``time_embedder`` and relies on that embedder staying fp32. With the
-    transformer uniformly cast for FSDP2 the embedder is bf16, so restore the
+    ``time_embedder`` and relies on that embedder staying fp32. Under FSDP mixed
+    precision the embedder is all-gathered as bf16 for compute, so restore the
     standard diffusers convention (cast the projection before the linear).
     """
 
@@ -75,17 +76,20 @@ class _CastOutput(torch.nn.Module):
         return self.inner(*args, **kwargs).to(self._dtype)
 
 
-class Cosmos3Bundle:
+class Cosmos3Bundle(Bundle):
     """Weights for Cosmos3 SFT: MoT transformer (trainable), WanVAE + tokenizer
     + scheduler (frozen helpers)."""
 
     def __init__(self, *, transformer, vae, text_tokenizer, scheduler, config: Cosmos3SFTConfig) -> None:
+        super().__init__()
         self.transformer = transformer
         self.vae = vae
         self.text_tokenizer = text_tokenizer
         self.scheduler = scheduler
         self.config = config
-        self._pipeline = None
+        self.dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
+        self.device = torch.device(config.device)
+        self.pretrained_path = config.pretrained_model_ckpt_path
 
     @classmethod
     def from_config(cls, config: Cosmos3SFTConfig) -> "Cosmos3Bundle":
@@ -93,14 +97,19 @@ class Cosmos3Bundle:
         path = config.pretrained_model_ckpt_path
         device = torch.device(config.device)
         model_dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
+        master_dtype = parse_torch_dtype(config.master_precision, field_name="master_precision")
         vae_dtype = parse_torch_dtype(config.vae_precision, field_name="vae_precision")
 
-        transformer = Cosmos3OmniTransformer.from_pretrained(path, subfolder="transformer", torch_dtype=model_dtype)
-        # diffusers pins `time_embedder` to fp32 (_keep_in_fp32_modules), but FSDP2
-        # requires a uniform original dtype per param group — cast the whole module,
-        # matching the other UniRL bundles that run transformers fully in
-        # model_precision.
-        transformer = transformer.to(device=device, dtype=model_dtype)
+        # Uniform fp32 storage gives the optimizer a stable master while FSDP's
+        # mixed-precision policy all-gathers bf16 compute copies. Upcasting only
+        # trainable params in the recipe would mix bf16/fp32 inside every MoT
+        # layer because the understanding stream is frozen, which FSDP2 rejects.
+        transformer = Cosmos3OmniTransformer.from_pretrained(
+            path,
+            subfolder="transformer",
+            torch_dtype=master_dtype,
+        )
+        transformer = transformer.to(device=device, dtype=master_dtype)
         transformer.time_proj = _CastOutput(transformer.time_proj, model_dtype)
         vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)
@@ -139,28 +148,6 @@ class Cosmos3Bundle:
         if self.config.flow_shift is not None:
             return float(self.config.flow_shift)
         return float(getattr(self.scheduler.config, "flow_shift", 5.0))
-
-    def build_pipeline(self):
-        """The real ``Cosmos3OmniPipeline`` over this bundle's components.
-
-        Used both for its packing helpers (tokenize_prompt / _prepare_*_segment /
-        _encode_video — training mirrors inference bit-for-bit through them) and
-        for eval sampling. Safety checker disabled: SFT prompts come from local
-        datasets, and the guardrail model download/latency has no place in the
-        training loop.
-        """
-        if self._pipeline is None:
-            *_, Cosmos3OmniPipeline = _import_diffusers_classes()
-            self._pipeline = Cosmos3OmniPipeline(
-                transformer=self.transformer,
-                text_tokenizer=self.text_tokenizer,
-                vae=self.vae,
-                scheduler=self.scheduler,
-                sound_tokenizer=None,
-                safety_checker=None,
-                enable_safety_checker=False,
-            )
-        return self._pipeline
 
 
 __all__ = ["Cosmos3Bundle", "is_understanding_param"]

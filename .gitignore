@@ -98,3 +98,9 @@ settings.json
 !.cursor/rules/
 REFACTOR_LOG.md
 uv.lock
+
+# Benchmarks: fetched / gated data and results (see benchmarks/README.md)
+benchmarks/image/dpg_bench/data/
+benchmarks/text/aime/data/aime2025.jsonl
+benchmarks/text/gpqa/data/
+benchmarks_results/

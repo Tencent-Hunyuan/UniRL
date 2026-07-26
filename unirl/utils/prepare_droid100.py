@@ -261,11 +261,23 @@ def main() -> None:
             manifests[split].append(
                 {
                     "sample_id": sample_id,
-                    "instruction": instruction,
-                    "frames_path": f"frames/{sample_id}.pt",
-                    "actions_path": f"actions/{sample_id}.pt",
-                    "fps": fps,
-                    "episode_index": ep_idx,
+                    "prompt": instruction,
+                    "media": [
+                        {
+                            "modality": "video",
+                            "role": "target",
+                            "uri": f"frames/{sample_id}.pt",
+                        },
+                        {
+                            "modality": "action",
+                            "role": "target",
+                            "uri": f"actions/{sample_id}.pt",
+                        },
+                    ],
+                    "metadata": {
+                        "fps": fps,
+                        "episode_index": ep_idx,
+                    },
                 }
             )
         print(f"episode {ep_idx} [{split}]: total {len(manifests[split])} windows")

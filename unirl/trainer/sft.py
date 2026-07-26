@@ -1,143 +1,245 @@
-"""SFTTrainer — driver orchestrator for supervised finetuning / behavior cloning.
+"""SFTTrainer — driver orchestrator for supervised finetuning.
 
-One role: an :class:`~unirl.train.sft.policy.SFTPolicy` (config-chosen task
-adapter + FSDP + optimizer) on the whole device pool. Each step::
+The supervised sibling of :class:`~unirl.trainer.ar.ARTrainer` /
+:class:`~unirl.trainer.diffusion.DiffusionTrainer`: same consumer side
+(``bundle → pipeline → backend → algorithm → stack`` siblings on one
+placement), but the data producer is a dataset-backed ``SupervisedTrackBuilder``
+instead of a rollout engine — no reward service, no advantages, no weight
+sync, no sampling params. Each step::
 
-    records = data_source.get_samples(batch_size)     # driver-side manifest rows
-    policy.train_batch(records, step, dp_size)        # worker-side load->loss->backward
-    policy.optimizer_step(max_grad_norm); policy.zero_grad()
+    records = data_source.get_samples(batch_size)       # driver-side rows
+    track   = track_builder.build(records)              # worker-side encode → RolloutTrack
+    result  = stack.train_track(track, ...)             # the SAME stack RL uses
 
-No rollout engine / reward / advantages / weight sync — mirrors the ReFL
-domain's shape (``unirl/trainer/refl.py``), the codified template for
-non-GRPO domains. Success signal: the flow-matching loss falls and periodic
-samples improve.
+The algorithm (``unirl.algorithms.SFT`` / ``FlowMatchSFT``) declares
+``requires_advantages=False``; everything else about the stack — micro
+planning, grad accumulation, the token-weighted global loss normalization,
+EMA, checkpointing through the backend — is shared with the RL trainers, so
+SFT inherits every stack/backend improvement for free (and doubles as the
+cheapest end-to-end regression exercise of that machinery).
+
+Supervised-only concerns owned here: epoch semantics with an exact
+``{epoch, position}`` resume cursor (saved beside each checkpoint), and
+full-validation-set eval loss through ``stack.eval_track`` — the final partial
+eval batch is padded to the DP width with ``_eval_pad`` rows the loss masks
+out, so no tail sample is dropped and no padded row is counted.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
-from unirl.distributed.tensor.ref import hydrate, map_tree
+from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
 from unirl.utils.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
 
+_DATA_STATE_FILENAME = "sft_data_state.json"
+
 
 class SFTTrainer(BaseTrainer):
-    """Supervised trainer: manifest records -> task loss -> optimizer step."""
+    """Supervised trainer: dataset records → stage loss → optimizer step."""
 
     def __init__(
         self,
         *,
         cfg: DictConfig,
         batch_size: int,
-        policy_cfg: DictConfig,
+        bundle_cfg: DictConfig,
+        pipeline_cfg: DictConfig,
+        backend_cfg: DictConfig,
+        algorithm_cfg: DictConfig,
+        stack_cfg: DictConfig,
+        track_builder_cfg: DictConfig,
         data_source_cfg: DictConfig,
-        max_grad_norm: float = 1.0,
-        eval_interval: int = 0,
-        eval_num_samples: int = 1,
         logging_cfg: Optional[DictConfig] = None,
+        eval_interval: int = 0,
+        eval_batch_size: int = 8,
+        eval_num_samples: int = -1,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
-        self.batch_size = int(batch_size)
-        self.max_grad_norm = float(max_grad_norm)
-        self.eval_interval = int(eval_interval)
-        self.eval_num_samples = int(eval_num_samples)
+        self.batch_size = batch_size
+        self.eval_interval = eval_interval
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_num_samples = -1 if eval_num_samples < 0 else eval_num_samples
+
+        # Driver-side data iterator (not a Remote) — records stay light dicts;
+        # tokenization / media loading run worker-side in the track builder.
         self.data_source = instantiate(data_source_cfg)
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
-            self.policy = remote_hydra(policy_cfg)
-        self.policy.initialize()
-        # BaseTrainer.maybe_save/load_checkpoint operate on ``self.backend``.
-        self.backend = self.policy
+            self.bundle = remote_hydra(bundle_cfg)
+            self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
+            self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
+            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+            self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+            self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
-        self.dp_size = int(self.policy.dp_size)
+        self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
-            raise ValueError(f"batch_size={self.batch_size} must be divisible by policy dp={self.dp_size}")
+            raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
+        logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
+
+    # ------------------------------------------------------------------
+    # One optimizer step
+    # ------------------------------------------------------------------
+
+    def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
+        """records → worker-side track build → stack train. No rollout legs."""
+        track = self.track_builder.build(records)
+        if track.batch_size != len(records):
+            # AReaL's single-controller once broadcast SFT batches instead of
+            # scattering them — 8× duplicated tokens with a correct-LOOKING loss.
+            # Token conservation is cheap to assert; assert it.
+            raise RuntimeError(f"SFTTrainer: track builder built {track.batch_size} rows from {len(records)} records.")
+        return self.stack.train_track(track, training_progress=training_progress)
+
+    # ------------------------------------------------------------------
+    # Validation loss (full set, exact)
+    # ------------------------------------------------------------------
+
+    def evaluate(self, step: int) -> float:
+        """Weighted eval loss over the full validation set; logs ``eval/loss``."""
+        loss_sum = 0.0
+        weight_sum = 0.0
+        batches = 0
+        for records in self.data_source.iter_eval_batches(self.eval_batch_size, eval_num_samples=self.eval_num_samples):
+            records = self._pad_to_dp(records)
+            metrics = self.stack.eval_track(self.track_builder.build(records))
+            loss_sum += float(metrics["loss"]) * float(metrics["weight"])
+            weight_sum += float(metrics["weight"])
+            batches += 1
+        if weight_sum <= 0.0:
+            logger.warning("SFTTrainer.evaluate: no eval data (eval_num_samples=%s).", self.eval_num_samples)
+            return float("nan")
+        eval_loss = loss_sum / weight_sum
         logger.info(
-            "SFTTrainer ready: dp=%d batch=%d max_grad_norm=%.2f", self.dp_size, self.batch_size, self.max_grad_norm
+            "EVAL step %d  eval_loss=%.5f  (weight=%.0f over %d batches of <=%d)",
+            step + 1,
+            eval_loss,
+            weight_sum,
+            batches,
+            self.eval_batch_size,
         )
+        self.wandb_logger.log_eval(step + 1, {"loss": eval_loss})
+        return eval_loss
 
-    def train_step(self, records: List[Dict[str, Any]], *, step: int) -> Tuple[Dict[str, float], float, float]:
-        t0 = time.perf_counter()
-        per_worker = self.policy.train_batch(records=records, step=step, dp_size=self.dp_size)
-        grad_norm = self.policy.optimizer_step(max_grad_norm=self.max_grad_norm)
-        if isinstance(grad_norm, list):  # BROADCAST -> one result per worker
-            grad_norm = grad_norm[0]
-        self.policy.zero_grad()
+    def _pad_to_dp(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Pad a partial eval batch up to a DP multiple with zero-weight rows.
 
-        metrics: Dict[str, float] = {}
-        worker_metrics = per_worker if isinstance(per_worker, list) else [per_worker]
-        for worker in worker_metrics:
-            for key, value in worker.items():
-                metrics[key] = metrics.get(key, 0.0) + float(value) / len(worker_metrics)
-        return metrics, float(grad_norm or 0.0), time.perf_counter() - t0
+        DP_SCATTER needs divisibility; dropping the tail would silently shrink
+        the eval set. Padded rows are duplicates flagged ``_eval_pad`` — the
+        track builders zero their loss weight, so coverage stays exact.
+        """
+        records = list(records)
+        while len(records) % self.dp_size:
+            pad = dict(records[-1])
+            pad["_eval_pad"] = True
+            pad["sample_id"] = f"{pad.get('sample_id', 'sft')}/pad{len(records)}"
+            records.append(pad)
+        return records
 
-    def _run_eval(self, step: int, save_dir: Optional[str]) -> None:
-        records = self.data_source.eval_samples(self.eval_num_samples)
-        outputs = self.policy.sample_media(records=records, step=step)
-        if isinstance(outputs, list):  # one entry per worker; dp rank 0 carries media
-            outputs = next((o for o in outputs if o is not None), None)
-        if outputs is None:
+    # ------------------------------------------------------------------
+    # Data-cursor sidecar (exact mid-epoch resume)
+    # ------------------------------------------------------------------
+
+    def _save_data_state(self, step: int, num_steps: int, *, save_interval: int, save_dir: Optional[str]) -> None:
+        """Write the dataset cursor beside the checkpoint this step produced
+        (same cadence/path arithmetic as :meth:`BaseTrainer.maybe_save_checkpoint`)."""
+        if save_interval <= 0:
             return
-        outputs = map_tree(outputs, hydrate)  # materialize worker-side TensorRef proxies
-        out_dir = os.path.join(save_dir or ".", "samples")
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"step_{step}.pt")
-        torch.save(outputs, path)
-        logger.info("eval samples @ step %d -> %s", step, path)
+        step_1 = step + 1
+        if step_1 % save_interval != 0 and step_1 < num_steps:
+            return
+        base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
+        path = os.path.join(base_dir, f"checkpoint-{step_1}", _DATA_STATE_FILENAME)
+        with open(path, "w") as fh:
+            json.dump(self.data_source.state_dict(), fh)
+
+    def _load_data_state(self, load_dir: Optional[str], start_step: int) -> None:
+        if not load_dir:
+            return
+        path = os.path.join(os.path.abspath(load_dir), _DATA_STATE_FILENAME)
+        if os.path.exists(path):
+            with open(path) as fh:
+                self.data_source.load_state_dict(json.load(fh))
+            logger.info("Restored dataset cursor from %s (epoch=%.3f)", path, self.data_source.epoch)
+            return
+        # Sidecar-less checkpoint: replay the stream to the resume point (exact
+        # for a fixed seed — the shuffle is seed+epoch generated).
+        logger.warning("No %s beside the checkpoint; fast-forwarding %d batches.", _DATA_STATE_FILENAME, start_step)
+        for _ in range(start_step):
+            self.data_source.get_samples(self.batch_size)
+
+    # ------------------------------------------------------------------
+    # Loop
+    # ------------------------------------------------------------------
 
     def train(
         self,
         *,
-        num_rollouts: int,
+        num_steps: int,
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        start = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        self._init_wandb(num_rollouts=num_rollouts)
+        """``num_steps`` optimizer steps of ``records → build → train_track``.
+
+        ``num_steps`` is the TOTAL budget (resume continues toward it); one
+        step consumes ``batch_size`` samples, so N epochs ≈
+        ``N * len(dataset) / batch_size`` steps (``train/epoch`` tracks the
+        exact position).
+        """
+        start_step = self.maybe_load_checkpoint(load_dir, num_rollouts=num_steps)
+        self._load_data_state(load_dir, start_step)
+        self._init_wandb(num_rollouts=num_steps)
         try:
-            for step in range(start, num_rollouts):
+            if self.eval_interval > 0:
+                self.evaluate(step=-1)  # baseline eval-loss at step 0
+            for step in range(start_step, num_steps):
+                t0 = time.perf_counter()
+                training_progress = step / max(1, num_steps - 1)
                 records = self.data_source.get_samples(self.batch_size)
-                metrics, grad_norm, dt = self.train_step(records, step=step)
+                result = self.train_step(records, training_progress=training_progress)
+                dt = time.perf_counter() - t0
                 logger.info(
-                    "step %d/%d  loss=%.5f grad_norm=%.4f  %.1fs",
+                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  %.1fs",
                     step + 1,
-                    num_rollouts,
-                    metrics.get("loss/total", float("nan")),
-                    grad_norm,
+                    num_steps,
+                    result.loss,
+                    result.grad_norm,
+                    result.lr,
+                    self.data_source.epoch,
                     dt,
                 )
                 self.wandb_logger.log_step(
                     step + 1,
                     {
-                        "train/loss": metrics.get("loss/total", 0.0),
-                        "train/grad_norm": grad_norm,
+                        "train/loss": result.loss,
+                        "train/grad_norm": result.grad_norm,
+                        "train/lr": result.lr,
+                        "train/epoch": self.data_source.epoch,
                         "perf/step_time_s": dt,
-                        **metrics,
+                        **{f"train/{k}": v for k, v in dict(result.metrics).items()},
                     },
                     prefix="",
                 )
-                if self.eval_interval and (step + 1) % self.eval_interval == 0:
-                    self._run_eval(step + 1, save_dir)
+                if self.eval_interval > 0 and (step + 1) % self.eval_interval == 0:
+                    self.evaluate(step=step)
                 self.maybe_save_checkpoint(
-                    step,
-                    num_rollouts,
-                    save_interval=save_interval,
-                    save_dir=save_dir,
-                    save_mode=save_mode,
+                    step, num_steps, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+                self._save_data_state(step, num_steps, save_interval=save_interval, save_dir=save_dir)
         finally:
             self._finish_wandb()
 

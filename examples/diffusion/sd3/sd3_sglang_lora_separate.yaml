@@ -30,6 +30,7 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
     shift: 3.0
+    load_vae: false
     # rollout.model_config points here (${bundle.config}); SGLang builds its LoRA
     # ServerArgs from these two fields so the engine accepts the synced adapter.
     use_lora: true

@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import capture_init_state, finalize_meta_init, stamp_init_state_restore
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3PipelineConfig
@@ -72,29 +72,19 @@ class Qwen3Bundle(Bundle):
             # Meta-init (FSDP / VeOmni load_sharded path): parameters on the meta
             # device, materialized + loaded by the backend from the checkpoint
             # root after sharding (AR layout: no transformer/ subfolder, so the
-            # stashed dir is the root). init_empty_weights(include_buffers=False)
-            # keeps buffers/attrs real on CPU: HF rotary inv_freq / original_inv_freq
+            # stashed dir is the root). build_meta_init_transformer keeps
+            # buffers/attrs real on CPU: HF rotary inv_freq / original_inv_freq
             # are non-persistent buffers computed in __init__ and absent from the
-            # checkpoint, so to_empty later clobbers them -> garbage RoPE. Capture
-            # them straight off the model and stamp a deferred restore (drained
-            # post-load by apply_deferred_ops).
-            from accelerate import init_empty_weights
+            # checkpoint, so to_empty later clobbers them -> garbage RoPE. It
+            # captures them; meta_init_state is stashed on the BUNDLE below and
+            # restored by load_trainable_weights after the sharded weight load.
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
-            with init_empty_weights(include_buffers=False):
-                transformer = AutoModelForCausalLM.from_config(
-                    hf_config, trust_remote_code=bool(config.trust_remote_code)
-                )
-            # Capture init-computed non-persistent state (RoPE inv_freq etc.) onto
-            # the BUNDLE — a robust carrier the backend holds (self._bundle) and
-            # replays in load_trainable_weights. The model-bound deferred closure
-            # (stamp_init_state_restore, kept for the in-process path) can be lost
-            # when the bundle crosses Ray actors in the live trainer; the bundle
-            # capture (plain CPU tensors) survives. Both restores are idempotent.
-            init_state = capture_init_state(transformer)
-            stamp_init_state_restore(transformer)
-            transformer = finalize_meta_init(transformer, dtype=dtype)
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: AutoModelForCausalLM.from_config(hf_config, trust_remote_code=bool(config.trust_remote_code)),
+                dtype=dtype,
+            )
         else:
             load_kwargs = {}
             if getattr(config, "attn_implementation", None):
@@ -135,9 +125,8 @@ class Qwen3Bundle(Bundle):
         if config.meta_init_transformer:
             # AR checkpoints store *.safetensors at the root (no subfolder).
             bundle._transformer_weights_path = path
-            # Robust non-persistent-state carrier: load_trainable_weights replays
-            # it after the weight load (see capture_init_state above).
-            bundle._meta_init_state = init_state
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

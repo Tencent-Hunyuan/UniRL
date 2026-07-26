@@ -25,9 +25,10 @@ Plus local compatibility edits (NOT pristine):
      modeling/qwen2/modeling_qwen2.py also preserves the default RoPE init path
      because transformers 5's ROPE_INIT_FUNCTIONS no longer exposes "default".
   3. Reference-inferencer VAE decode dtype compatibility:
-     inferencer.py mirrors UniRL's BagelVAEDecodeStage by temporarily decoding
-     with the VAE in fp32, then restoring its loaded dtype. This keeps the
-     vendored reference/debug path usable when UniRL loads the VAE in bf16.
+     inferencer.py temporarily decodes with the VAE in fp32, then restores its
+     loaded dtype. Unlike BagelVAEDecodeStage's sticky-fp32 pipeline path, the
+     standalone inferencer encodes through the VAE directly and does not cast
+     encode I/O at the boundary.
 
 To re-vendor a newer upstream:
   1. git -C Bagel fetch && git -C Bagel checkout <new_commit>
