@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ValueHead(nn.Module):
@@ -18,7 +19,13 @@ class ValueHead(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Map ``[..., H]`` hidden states to ``[...,]`` scalar values."""
-        return self.proj(hidden.float()).squeeze(-1)
+        # FSDP mixed precision may expose gathered parameters in its compute
+        # dtype even though their sharded masters were initialized in FP32.
+        # Cast both operands: casting only ``hidden`` fails when the gathered
+        # projection is BF16.
+        weight = self.proj.weight.float()
+        bias = self.proj.bias.float() if self.proj.bias is not None else None
+        return F.linear(hidden.float(), weight, bias).squeeze(-1)
 
 
 __all__ = ["ValueHead"]
