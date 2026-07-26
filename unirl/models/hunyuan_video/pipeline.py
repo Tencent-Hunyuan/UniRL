@@ -85,6 +85,7 @@ class HunyuanVideoPipeline(Pipeline):
         llama_max_length: int = 256,
         crop_start: int = 95,
         clip_max_length: int = 77,
+        hidden_state_skip_layer: int = 2,
         latent_channels: Optional[int] = None,
     ) -> None:
         self.bundle = bundle
@@ -96,6 +97,7 @@ class HunyuanVideoPipeline(Pipeline):
                 llama_max_length=llama_max_length,
                 clip_max_length=clip_max_length,
                 crop_start=crop_start,
+                hidden_state_skip_layer=hidden_state_skip_layer,
             )
         )
         if diffusion is None:
@@ -160,6 +162,7 @@ class HunyuanVideoPipeline(Pipeline):
             llama_max_length=config.llama_max_length,
             clip_max_length=config.clip_max_length,
             crop_start=config.crop_start,
+            hidden_state_skip_layer=config.hidden_state_skip_layer,
         )
         step = HunyuanVideoDiffusionStep()
         diffusion = HunyuanVideoDiffusionStage(

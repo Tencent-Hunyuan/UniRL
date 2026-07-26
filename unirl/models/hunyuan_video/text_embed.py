@@ -5,8 +5,9 @@ HunyuanVideo-1.0 cross-attends to **two text streams**:
 - ``llama``  -- LlamaModel (transformers). The prompt is wrapped in a
   LLaMA-style prompt template with a system header, tokenized with padding
   to ``llama_max_length + crop_start``, encoded, and the template prefix
-  is stripped by slicing ``[:, crop_start:]``. Output is the last hidden
-  state (3D: ``[B, seq, 4096]``).
+  is stripped by slicing ``[:, crop_start:]``. Output is a configurable
+  hidden state (the canonical third-from-last layer by default; 3D:
+  ``[B, seq, 4096]``).
 - ``clip`` -- CLIPTextModel (transformers). Standard CLIP text encoding,
   output is the pooled vector (2D: ``[B, 768]``).
 
@@ -62,11 +63,17 @@ class HunyuanVideoTextEmbedStage:
         llama_max_length: int = 256,
         clip_max_length: int = 77,
         crop_start: int = 95,
+        hidden_state_skip_layer: int = 2,
     ) -> None:
         self.bundle = bundle
         self.llama_max_length = int(llama_max_length)
         self.clip_max_length = int(clip_max_length)
         self.crop_start = int(crop_start)
+        self.hidden_state_skip_layer = int(hidden_state_skip_layer)
+        if self.hidden_state_skip_layer < 0:
+            raise ValueError(
+                f"HunyuanVideoTextEmbedStage.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+            )
 
     # ------------------------------------------------------------------
     # LLaMA stream
@@ -90,6 +97,15 @@ class HunyuanVideoTextEmbedStage:
         dtype = next(text_encoder.parameters()).dtype
         crop_start = self.crop_start
 
+        # cuDNN SDPA can abort in native code under NVIDIA's CUDA
+        # forward-compat layer (for example, a CUDA 13 runtime on a 535
+        # driver). Keep SDPA enabled, but route it through PyTorch's stable
+        # flash / memory-efficient kernels instead of the cuDNN backend.
+        # This setting is process-wide and also protects the subsequent CLIP
+        # and diffusion attention calls in this rollout worker.
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_cudnn_sdp(False)
+
         # Apply the prompt template to each prompt.
         template = PROMPT_TEMPLATE["template"]
         formatted = [template.format(p if p else "") for p in prompts]
@@ -112,8 +128,22 @@ class HunyuanVideoTextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        # Use the last hidden state (unlike HV15 which uses skip_layers).
-        prompt_embeds = outputs.last_hidden_state
+        # Canonical HunyuanVideo text conditioning: take the
+        # ``hidden_state_skip_layer``-th-from-last LLaMA hidden state (default 2
+        # -> ``hidden_states[-3]``), matching the official HunyuanVideo release
+        # and diffusers' ``HunyuanVideoPipeline`` (``num_hidden_layers_to_skip=2``)
+        # and the sglang rollout. ``skip=0`` reproduces the legacy last-hidden-state
+        # baseline.
+        hidden_states = getattr(outputs, "hidden_states", None)
+        selected_from_end = self.hidden_state_skip_layer + 1
+        if hidden_states is None or selected_from_end > len(hidden_states):
+            available = 0 if hidden_states is None else len(hidden_states)
+            raise ValueError(
+                "HunyuanVideoTextEmbedStage.hidden_state_skip_layer selects a "
+                f"nonexistent state: skip={self.hidden_state_skip_layer}, "
+                f"encoder returned {available} hidden states"
+            )
+        prompt_embeds = hidden_states[-selected_from_end]
 
         # Strip the prompt template prefix tokens.
         if crop_start > 0:

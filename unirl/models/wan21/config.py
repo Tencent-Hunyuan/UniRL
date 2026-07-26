@@ -82,6 +82,9 @@ class WAN21PipelineConfig:
     # the stashed ``_transformer_weights_path``.
     meta_init_transformer: bool = False
 
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
+    load_vae: bool = True
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="WAN21PipelineConfig.model_precision")
 

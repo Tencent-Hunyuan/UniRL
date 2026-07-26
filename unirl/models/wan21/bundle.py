@@ -43,7 +43,7 @@ class WAN21Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         dtype: torch.dtype,
@@ -134,8 +134,10 @@ class WAN21Bundle(Bundle):
             # the wrapped module.
             transformer = transformer.to(device, dtype=dtype)
 
-        vae = AutoencoderKLWan.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = AutoencoderKLWan.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         text_encoder = (
             UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()

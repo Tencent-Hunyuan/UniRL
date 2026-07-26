@@ -30,7 +30,7 @@ channel concat inside :class:`WAN22DiffusionStep`.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -85,7 +85,7 @@ class WAN22Bundle(Bundle):
         transformer: WanDualTransformer,
         high_noise_transformer: nn.Module,
         low_noise_transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         dtype: torch.dtype,

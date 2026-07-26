@@ -54,6 +54,7 @@ bundle:
     # sigma schedule via the generic static-shift FlowMatchSchedulePolicy (Z-Image
     # is static-shift, like SD3 — unlike Qwen-Image / Flux.2 dynamic shift).
     shift: 6.0
+    load_vae: false
 
 pipeline:
   _target_: unirl.models.z_image.pipeline.ZImagePipeline

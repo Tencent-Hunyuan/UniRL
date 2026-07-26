@@ -28,7 +28,7 @@ Use :meth:`ZImageBundle.from_config` to load a checkpoint.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -46,7 +46,7 @@ class ZImageBundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         tokenizer: Any,
         scheduler: Any,
@@ -95,8 +95,10 @@ class ZImageBundle(Bundle):
             device
         )
 
-        vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        vae = None
+        if config.load_vae:
+            vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         # AutoModel (not a hardcoded Qwen3Model) mirrors the official Z-Image
         # loader: it instantiates the base encoder named in the checkpoint's

@@ -24,7 +24,50 @@ from typing import Dict, List, Optional
 from benchmarks.core import checkpoints, report
 from benchmarks.core.generate import T2I_KWARGS, image_path, read_completions, run_t2i, run_text, server_model, t2i_jobs
 from benchmarks.core.registry import SPECS, BenchmarkSpec, load_items, load_metadata, load_prompts
-from benchmarks.core.score import GRADERS, RewardServiceClient, check_geneval2_metadata
+from benchmarks.core.score import (
+    GRADERS,
+    RewardServiceClient,
+    check_geneval2_metadata,
+    score_images_local_geneval2,
+)
+
+
+def _parse_sim_even_batches(value: str) -> tuple[int, int]:
+    try:
+        parts = value.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError
+        world, batch_size = (int(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected WxB with positive integers, for example 32x32") from exc
+    if world <= 0 or batch_size <= 0:
+        raise argparse.ArgumentTypeError("W and B must both be positive integers")
+    return world, batch_size
+
+
+def _sim_even_order(num_items: int, world: int, batch_size: int) -> List[int]:
+    """Indices after repeating the dataset prefix to fill complete W×B waves."""
+    if num_items <= 0:
+        return []
+    wave_size = world * batch_size
+    target_size = ((num_items + wave_size - 1) // wave_size) * wave_size
+    return list(range(num_items)) + [index % num_items for index in range(target_size - num_items)]
+
+
+def _sim_even_metrics(
+    rows: List[Optional[Dict[str, float]]],
+    keys: List[str],
+    *,
+    world: int,
+    batch_size: int,
+) -> Dict[str, float]:
+    order = _sim_even_order(len(rows), world, batch_size)
+    metrics: Dict[str, float] = {}
+    for key in keys:
+        values = [rows[index][key] for index in order if isinstance(rows[index], dict) and key in rows[index]]
+        if values:
+            metrics[f"{key}_sim{world}x{batch_size}"] = sum(values) / len(values)
+    return metrics
 
 
 def _parse_args() -> argparse.Namespace:
@@ -56,6 +99,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, help="t2i: image height (default: pipeline default)")
     parser.add_argument("--width", type=int, help="t2i: image width (default: pipeline default)")
     parser.add_argument("--shard", default="0/1", help="t2i generate: 'i/n' to split work across n processes")
+    parser.add_argument(
+        "--sim-even-batches",
+        metavar="WxB",
+        type=_parse_sim_even_batches,
+        help="t2i: also report the metric under a simulated distributed eval that repeats "
+        "the last partial wave (e.g. '32x32' = 32 GPUs x batch 32); default: 800 unique only",
+    )
+    parser.add_argument(
+        "--local-geneval2",
+        action="store_true",
+        help="geneval2: score locally with transformers Qwen3-VL-8B (full-vocab softmax, geometric "
+        "mean) instead of --reward-url; required to reproduce the DPPO paper numbers",
+    )
+    parser.add_argument(
+        "--geneval2-model",
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        help="local geneval2 scorer model id/path (used with --local-geneval2)",
+    )
     parser.add_argument("--concurrency", type=int, default=8, help="text: concurrent requests to --endpoint")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, touch nothing")
     return parser.parse_args()
@@ -107,7 +168,11 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
     if args.stage in ("all", "generate"):
         if resolved is None:
             raise SystemExit(f"{spec.name}: --ckpt is required to generate images")
-        gen_kwargs = {T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None}
+        # Spec generation defaults (diffusers kwarg names, e.g. geneval2 -> 512px/40-step/cfg1.0)
+        # under CLI overrides. Without this, t2i benchmarks silently used the diffusers pipeline
+        # defaults (~28 steps / cfg 7.0 / 1024px), a top cause of the issue #221 mismatch.
+        gen_kwargs = dict(spec.gen)
+        gen_kwargs.update({T2I_KWARGS[k_]: v for k_, v in vars(args).items() if k_ in T2I_KWARGS and v is not None})
         shard = tuple(int(x) for x in args.shard.split("/"))
         run_t2i(
             prompts,
@@ -118,12 +183,15 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
             seed=args.seed,
             gen_kwargs=gen_kwargs,
             shard=shard,
+            linspace_sigmas=spec.t2i_linspace_sigmas,
+            prompt_seed=spec.t2i_prompt_seed,
         )
     if args.stage in ("all", "score"):
         if not spec.rewards:
             print(f"[score] {spec.name} is scored externally — see benchmarks/{spec.name}/README.md")
             return
-        if not args.reward_url:
+        local_geneval2 = args.local_geneval2 and "geneval2" in spec.rewards
+        if not local_geneval2 and not args.reward_url:
             raise SystemExit(f"{spec.name}: --reward-url (or REWARD_SERVICE_URL) is required to score")
         pairs, missing = [], 0
         for p in range(len(prompts)):
@@ -135,23 +203,33 @@ def _run_t2i_benchmark(spec: BenchmarkSpec, tag: str, args, resolved: Optional[c
                     missing += 1
         if missing:
             raise SystemExit(f"{spec.name}: {missing} images missing — finish --stage generate (all shards) first")
-        client = RewardServiceClient(args.reward_url)
-        client.check(spec.rewards)
-        if "geneval2" in spec.rewards:
-            check_geneval2_metadata(client)  # fail fast instead of silently scoring non-Soft-TIFA
         metadatas = None
         if spec.send_metadata:
             per_prompt = load_metadata(spec)[: args.num_prompts or None]
             metadatas = [per_prompt[p] for p in range(len(prompts)) for _ in range(k)]  # pairs are prompt-major
-        rows, n_errors = client.score_images(pairs, spec.rewards, metadatas=metadatas)
+        if local_geneval2:
+            # Local transformers Qwen3-VL-8B (full-vocab softmax, GM) -- the DPPO reproduction scorer.
+            rows, n_errors = score_images_local_geneval2(pairs, metadatas=metadatas, model_name=args.geneval2_model)
+        else:
+            client = RewardServiceClient(args.reward_url)
+            client.check(spec.rewards)
+            if "geneval2" in spec.rewards:
+                check_geneval2_metadata(client)  # fail fast instead of silently scoring non-Soft-TIFA
+            rows, n_errors = client.score_images(pairs, spec.rewards, metadatas=metadatas)
         with open(bench_dir / "scores.jsonl", "w") as f:
             for (prompt, path), row in zip(pairs, rows):
                 f.write(json.dumps({"image": path.name, "prompt": prompt, "scores": row}) + "\n")
         scored = [row for row in rows if row]
         keys = sorted({k_ for row in scored for k_ in row})
+        # Config 1 (default): 800 unique prompts, plain mean.
         metrics = {
             k_: sum(row[k_] for row in scored if k_ in row) / max(1, sum(k_ in row for row in scored)) for k_ in keys
         }
+        # Config 2 (optional): simulate a distributed eval of WxB that repeats the last partial wave
+        # of batches to fill the world size, so a fixed prefix of prompts is double-counted.
+        if args.sim_even_batches:
+            world, batch_size = args.sim_even_batches
+            metrics.update(_sim_even_metrics(rows, keys, world=world, batch_size=batch_size))
         _write_summary(
             bench_dir,
             spec,

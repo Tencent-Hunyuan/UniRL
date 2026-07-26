@@ -61,7 +61,11 @@ class QwenImageEditPlusPipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # Trainer-side TE (~15 GiB/rank). False for separate-engine: engine encodes;
+    # trainer replays captured conditions (keeps VRAM for colocated engine boot).
     load_text_encoder: bool = True
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
+    load_vae: bool = True
     meta_init_transformer: bool = False
 
     use_dynamic_shifting: bool = True

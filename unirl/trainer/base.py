@@ -304,15 +304,23 @@ class BaseTrainer:
         if backend is not None:
             backend.wait_for_checkpoint()
 
+    def _cleanup_weight_sync(self) -> None:
+        """Let transports remove run-scoped artifacts before workers are killed."""
+        weight_sync = getattr(self, "weight_sync", None)
+        cleanup = getattr(weight_sync, "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+
     def _finish_wandb(self) -> None:
-        """Flush pending checkpoints and close the wandb run."""
+        """Flush pending work, clean transport artifacts, and close wandb."""
         active_exception = sys.exc_info()[0] is not None
         try:
             self._wait_for_checkpoints()
+            self._cleanup_weight_sync()
         except Exception:
             if not active_exception:
                 raise
-            logger.exception("Failed to flush a pending checkpoint during trainer teardown")
+            logger.exception("Failed to flush checkpoint/weight-sync state during trainer teardown")
         finally:
             if self.wandb_logger is not None:
                 self.wandb_logger.finish()

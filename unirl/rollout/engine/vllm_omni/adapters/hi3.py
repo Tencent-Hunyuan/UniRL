@@ -249,7 +249,7 @@ class Hi3InputAdapter:
     - ``carries_target_size`` — the entry gets the request's generation
       ``height``/``width`` (t2i's target canvas; ar_recaption's recaption
       prompt needs them although THIS engine never renders).
-    - ``bot_task_base`` — when set, ``stage_config["bot_task"]``
+    - ``bot_task_base`` — when set, ``task_config["bot_task"]``
       think/recaption swaps the trigger tag (``f"{base}_{bot}"``). Kept
       separate from ``modality`` (registry keys are family-namespaced; the
       upstream task vocabulary is not). AR-only modalities leave it ``None``
@@ -285,10 +285,10 @@ class Hi3InputAdapter:
         self.vanilla_task = vanilla_task
         self.sys_type = sys_type
 
-    def _resolve_task(self, stage_config: Dict[str, Any]) -> Tuple[str, str]:
-        """Resolve ``(task_key, sys_type)`` with the ``stage_config`` overrides."""
-        sys_type = stage_config.get("sys_type") or self.sys_type
-        bot_task = stage_config.get("bot_task")
+    def _resolve_task(self, task_config: Dict[str, Any]) -> Tuple[str, str]:
+        """Resolve ``(task_key, sys_type)`` with the ``task_config`` overrides."""
+        sys_type = task_config.get("sys_type") or self.sys_type
+        bot_task = task_config.get("bot_task")
         if self.bot_task_base and bot_task:
             if bot_task == "vanilla" and self.vanilla_task is not None:
                 return self.vanilla_task
@@ -298,7 +298,7 @@ class Hi3InputAdapter:
 
     def build_prompts(self, req: RolloutReq) -> List[Dict[str, Any]]:
         """The HI3 chat-templated per-prompt entries (+ the image gates)."""
-        task, sys_type = self._resolve_task(req.stage_config or {})
+        task, sys_type = self._resolve_task(req.task_config or {})
 
         texts = texts_from_req(req)
         n = len(texts.texts)
@@ -438,7 +438,7 @@ class Hi3DitRecaptionInputAdapter:
         if len(cot.texts) != len(texts.texts):
             raise ValueError(f"{self.modality}: cot_text count {len(cot.texts)} != prompt count {len(texts.texts)}.")
 
-        sys_type = (req.stage_config or {}).get("sys_type") or self.sys_type
+        sys_type = (req.task_config or {}).get("sys_type") or self.sys_type
         diff_params = req.sampling_params.get("diffusion")
 
         base_kwargs = core_diff_kwargs(req, diff_params)

@@ -32,6 +32,8 @@ class BenchmarkSpec:
     send_metadata: bool = False  # t2i jsonl specs: ship each record as RewardRequest.metadata (geneval*)
     grader: Optional[str] = None  # text benchmarks: "math_verify" | "mc_letter"
     gen: Dict = field(default_factory=dict)  # generation defaults; CLI flags override
+    t2i_linspace_sigmas: bool = False  # t2i: use explicit sigmas=linspace(1,1/steps,steps) flow-match grid
+    t2i_prompt_seed: bool = False  # t2i: seed each image per prompt content (reproducible), CPU generator
     notes: str = ""
 
     def data_path(self) -> Path:
@@ -88,7 +90,14 @@ _ALL = (
         prompt_field="prompt",
         rewards=("geneval2",),
         send_metadata=True,  # ships each record's vqa_list, so the scorer needs no dataset_path config
-        notes="In-domain compositional T2I (VQAScore soft-TIFA via Qwen3-VL) — the set the GRPO/FlowDPPO recipes train on.",
+        samples_per_prompt=1,  # reproduction protocol: 1 image/prompt
+        # DPPO GenEval2 reproduction regime. Key params: 512px, 40 steps, cfg 1.0,
+        # max_sequence_length 256 (SD3 default; passing 512 halves the score), + the linspace
+        # flow-match sigma grid (t2i_linspace_sigmas). See benchmarks/image/geneval2/README.md.
+        gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512, "max_sequence_length": 256},
+        t2i_linspace_sigmas=True,
+        t2i_prompt_seed=True,
+        notes="In-domain compositional T2I (Soft-TIFA VQAScore via Qwen3-VL); the DPPO GenEval2 train set. Eval at 512px/40-step/cfg1.0; see README for the reproduction configs.",
     ),
     BenchmarkSpec(
         name="image/geneval",

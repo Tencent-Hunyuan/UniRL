@@ -97,14 +97,11 @@ class QwenImagePipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Whether the TRAINER-side bundle loads the Qwen2.5-VL text encoder
-    # (~15 GiB bf16 PER RANK). Trainside rollout requires it (the pipeline
-    # encodes prompts in-process). Separate-engine recipes (vllm-omni)
-    # should set ``false``: the engine encodes prompts in its own workers
-    # and the trainer replays from the CAPTURED conditions — the trainer
-    # copy is dead weight that starves the colocated engine's boot
-    # (LIN-382 qwen probe OOM: 50 MiB free at engine TE load).
+    # Trainer-side TE (~15 GiB/rank). False for separate-engine: engine encodes;
+    # trainer replays captured conditions (keeps VRAM for colocated engine boot).
     load_text_encoder: bool = True
+    # Trainer-side VAE. False for separate-engine recipes (engine owns decode).
+    load_vae: bool = True
     # VeOmniBackend lifecycle: build the transformer on the meta device
     # (architecture only, no weight allocation). VeOmni's parallelize
     # asserts meta init, materializes storage via ``to_empty``, and the
