@@ -102,27 +102,24 @@ class WorkerLocalTransport(TensorTransport):
 
         Ordering invariant: each group's ``keys`` list is reused in the SAME order for the
         send, the recv shapes/dtypes, and ``zip(keys, recv_handles)`` — do not reorder one
-        without the others. All sends + recvs post before any ``ray.get``. Recv shapes are
-        the SLICED span shapes (exactly the rows shipped), not the full handle block.
+        without the others. Device pairs run in sorted order, one at a time; recv posts
+        before send, and both complete before the next pair starts. Recv shapes are the
+        SLICED span shapes (exactly the rows shipped), not the full handle block.
         """
         groups: Dict[Tuple[int, int], List[tuple]] = {}
         for key in to_move:
             groups.setdefault((key[0], key[1]), []).append(key)
 
-        send_refs, recv_refs = [], []
-        for (src_device_id, dst_device_id), keys in groups.items():
-            spans = [to_move[k] for k in keys]
-            send_refs.append(pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, spans))
-            recv_refs.append(
-                pool.slot0_worker(dst_device_id).transport_op.remote(
-                    "nccl_recv", src_device_id, [s.shape for s in spans], [s.dtype for s in spans]
-                )
-            )
-        ray.get(send_refs)
-        recv_results = ray.get(recv_refs)
-
         moved: Dict[tuple, Any] = {}
-        for ((src_device_id, dst_device_id), keys), new_handles in zip(groups.items(), recv_results):
+        for src_device_id, dst_device_id in sorted(groups):
+            keys = groups[(src_device_id, dst_device_id)]
+            spans = [to_move[k] for k in keys]
+            recv_ref = pool.slot0_worker(dst_device_id).transport_op.remote(
+                "nccl_recv", src_device_id, [s.shape for s in spans], [s.dtype for s in spans]
+            )
+            send_ref = pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, spans)
+            new_handles, _ = ray.get([recv_ref, send_ref])
+
             dst_worker = pool.slot0_worker(dst_device_id)
             for key, new_h in zip(keys, new_handles):
                 new_h.rebind(dst_worker)

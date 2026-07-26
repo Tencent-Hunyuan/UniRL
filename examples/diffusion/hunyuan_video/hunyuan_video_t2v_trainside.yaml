@@ -1,5 +1,7 @@
 # @package _global_
-# HunyuanVideo-1.0 T2V GRPO — v2 trainer, in-process (trainside) rollout.
+# HunyuanVideo-1.0 T2V GRPO — 720p in-process (trainside) rollout.
+# LoRA alpha=256 (scale=4x rank) produces a climbing PickScore curve in the
+# controlled run; alpha=rank=64 left the reward flat under bf16 LoRA.
 #
 # Stack:
 #   - rollout engine: TrainsideRolloutEngine (colocated, no separate slab)
@@ -12,8 +14,8 @@
 #   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video/hunyuan_video_t2v_trainside
 
 num_devices: 8
-batch_size: 48                # prompts_per_rollout (v1: 48)
-adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+batch_size: 8                # prompts_per_rollout for the validated 1x8-GPU run
+adv_use_global_std: true    # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 
 logging:
   report_to_wandb: true
@@ -28,11 +30,14 @@ bundle:
     _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
     model_precision: bf16
+    vae_use_tiling: true
     shift: 5.0
+    hidden_state_skip_layer: 2
 
 pipeline:
   _target_: unirl.models.hunyuan_video.pipeline.HunyuanVideoPipeline
   shift: 5.0
+  hidden_state_skip_layer: ${bundle.config.hidden_state_skip_layer}
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
@@ -83,7 +88,7 @@ backend:
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 64
-    alpha: 64
+    alpha: 256    # scale=4x rank; alpha=rank left reward flat in the controlled run
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
@@ -137,8 +142,8 @@ stack:
   # rollout, π_old frozen once). Omitting it defaulted to 1 → a single
   # on-policy update where new_logp==old_logp → ratio_mean≡1 and a diluted
   # GRPO signal.
-  # per-worker batch = samples_per_prompt(16) * prompts_per_rollout(48) /
-  # num_devices(8) = 96; 96 % 2 == 0 → mini-batch 48 (matches v1).
+  # per-worker batch = samples_per_prompt(8) * prompts_per_rollout(8) /
+  # num_devices(8) = 8; two updates therefore use mini-batches of 4.
   num_updates_per_batch: 2
 
 data_source:
@@ -155,29 +160,24 @@ data_source:
     algorithm:
       prompts_per_rollout: ${batch_size}
 
-# Aligned with feat/hunyuan-video-fsdp-training's
-# grpo_hunyuan_video_t2v_videopickscore: 20 steps, cfg=1.0, 480×832, eta=0.7,
-# shift=5.0; SDE on the first half (8 of the first 10 steps).
+# Standard landscape 720p (1280x720), with the validated optimization defaults:
+# 10 denoising steps, cfg=1.0, eta=0.7, shift=5.0, and four SDE/trainable steps.
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 20
+  num_inference_steps: 10
   guidance_scale: 1.0
-  height: 480
-  width: 832
+  height: 720
+  width: 1280
   num_frames: 5
   eta: 0.7
-  samples_per_prompt: 16
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
-    # feat-branch v1 recipe: SDE candidate pool = first half of the schedule
-    # (steps 0..9 at T=20), then 8 of those are drawn as the stochastic /
-    # trainable steps. Dropping timestep_fraction defaulted the pool to the
-    # full [0,20) window AND num_sde_steps=null trained ALL 20 steps — that
-    # diluted the GRPO signal (root cause of the flat-reward curves). With
-    # num_sde_steps=8 the replay still only holds 8 transformer activations
-    # live, so the H20 replay footprint is bounded.
+    # Candidate pool = first half of the 10-step schedule ([0, 5)); draw four
+    # stochastic/trainable steps from those five candidates. This also bounds
+    # the replay to four live transformer activations.
     timestep_fraction: [0.0, 0.5]
-    num_sde_steps: 8
+    num_sde_steps: 4

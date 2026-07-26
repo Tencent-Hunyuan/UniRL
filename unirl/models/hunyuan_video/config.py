@@ -74,6 +74,10 @@ class HunyuanVideoPipelineConfig:
     # before the bundle is loaded.
     latent_channels: Optional[int] = None
 
+    # Decode large frames with the VAE's spatial tiling path. The 720p
+    # recipes enable this to bound fp32 decode activation memory.
+    vae_use_tiling: bool = False
+
     # ------------------------------------------------------------------
     # Text-encoder shape parameters
     # ------------------------------------------------------------------
@@ -85,6 +89,13 @@ class HunyuanVideoPipelineConfig:
     crop_start: int = 95
     # CLIP: standard max_length for CLIPTokenizer.
     clip_max_length: int = 77
+    # LLaMA hidden layer used as the text conditioning: the embedding is taken
+    # from ``hidden_states[-(hidden_state_skip_layer + 1)]``. HunyuanVideo's
+    # canonical recipe is ``2`` -> the 3rd-from-last layer, matching the official
+    # HunyuanVideo release and diffusers' ``HunyuanVideoPipeline``
+    # (``num_hidden_layers_to_skip=2``) and the sglang rollout. (Set ``0`` for the
+    # last hidden state, e.g. to reproduce the legacy skip=0 baseline.)
+    hidden_state_skip_layer: int = 2
 
     # LoRA hints for rollout-side engines (e.g. ``sglang``). Mirrors
     # SD3 / HV15 config; the trainer-side LoRA injection lives in
@@ -94,6 +105,11 @@ class HunyuanVideoPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="HunyuanVideoPipelineConfig.model_precision")
+        self.hidden_state_skip_layer = int(self.hidden_state_skip_layer)
+        if self.hidden_state_skip_layer < 0:
+            raise ValueError(
+                f"HunyuanVideoPipelineConfig.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+            )
 
 
 __all__ = ["HunyuanVideoPipelineConfig"]

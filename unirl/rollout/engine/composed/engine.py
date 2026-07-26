@@ -158,15 +158,15 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             decode_to_condition=None,
         )
 
-        # AR sub-req stage_config: forward parent's "chat" + "ar" subsets
+        # AR sub-req task_config: forward parent's "chat" + "ar" subsets
         # and inject pe_instruction on both — ``sglang`` reads "ar" while
         # ``Qwen3Pipeline`` reads "chat".
-        ar_stage_config: Dict[str, Any] = {
-            key: dict(req.stage_config[key]) for key in ("chat", "ar") if key in req.stage_config
+        ar_task_config: Dict[str, Any] = {
+            key: dict(req.task_config[key]) for key in ("chat", "ar") if key in req.task_config
         }
         if self.cfg.pe_instruction:
             for key in ("ar", "chat"):
-                ar_stage_config.setdefault(key, {})["system_instruction"] = self.cfg.pe_instruction
+                ar_task_config.setdefault(key, {})["system_instruction"] = self.cfg.pe_instruction
 
         ar_sub_req = RolloutReq(
             sample_ids=list(req.sample_ids),
@@ -174,7 +174,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             primitives={"text": text_primitive},
             request_conditions=dict(req.request_conditions),
             sampling_params={"ar": ar_params},
-            stage_config=ar_stage_config,
+            task_config=ar_task_config,
             sigmas=None,
         )
         ar_resp = self._ar.generate(ar_sub_req)
