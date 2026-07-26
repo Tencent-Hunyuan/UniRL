@@ -235,10 +235,22 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                     dim=1,
                 )
 
-        return TextSegment.pack(
+        segment = TextSegment.pack(
             tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
             log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
         )
+        # Cached one-token decode and full-sequence teacher forcing use
+        # different bf16 attention geometries. Even at identical weights, that
+        # numerical gap can put the first on-policy PPO ratio outside a narrow
+        # clip range. Anchor old-policy log-probs with the exact replay geometry
+        # used by training while keeping the extra forward graph-free.
+        with torch.no_grad():
+            segment.log_probs = self.replay(
+                conditions,
+                segment=segment,
+                temperature=float(sampling_params.temperature),
+            ).detach()
+        return segment
 
     def replay(
         self,
