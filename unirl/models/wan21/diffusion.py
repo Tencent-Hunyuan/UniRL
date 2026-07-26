@@ -17,6 +17,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import WAN21Bundle
 from .conditions import WAN21Conditions
 
+
 class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
     """Per-step WAN 2.1 denoising kernel — stateless."""
 

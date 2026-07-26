@@ -1,4 +1,4 @@
-"""FastVideo adapter for UniRL's canonical UniPC solver; see the local README for the runtime patch contract."""
+"""FastVideo adapter for UniRL's canonical UniPC solver."""
 
 from __future__ import annotations
 
