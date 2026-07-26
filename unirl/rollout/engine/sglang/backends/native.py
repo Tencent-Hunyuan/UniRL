@@ -43,7 +43,9 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.sglang.backends.base import (
     _normalize_cuda_visible_devices,
+    _preloaded_cuda_driver_libraries,
     _preserve_cuda_driver_preloads,
+    _run_sglang_scheduler_with_cuda_driver_preload,
     _scheduler_spawn_environment,
 )
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
@@ -207,8 +209,19 @@ class NativeBackend:
         if visible_devices is not None:
             # The restricted list is re-indexed to logical ordinals 0..TP-1.
             engine_kwargs["base_gpu_id"] = 0
-        with _scheduler_spawn_environment(visible_devices), _preserve_cuda_driver_preloads():
-            engine = rt["Engine"](**engine_kwargs)
+        cuda_driver_preloads = _preloaded_cuda_driver_libraries()
+        engine_cls = rt["Engine"]
+        if cuda_driver_preloads:
+
+            class _CudaCompatEngine(engine_cls):
+                run_scheduler_process_func = staticmethod(_run_sglang_scheduler_with_cuda_driver_preload)
+
+            engine_cls = _CudaCompatEngine
+        with (
+            _scheduler_spawn_environment(visible_devices),
+            _preserve_cuda_driver_preloads(cuda_driver_preloads),
+        ):
+            engine = engine_cls(**engine_kwargs)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles

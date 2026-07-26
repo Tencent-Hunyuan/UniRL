@@ -40,7 +40,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from unirl.rollout.engine.sglang.backends.base import (
     _normalize_cuda_visible_devices,
     _preloaded_cuda_driver_libraries,
-    _run_with_cuda_driver_preloads,
+    _preserve_cuda_driver_preloads,
+    _run_sglang_scheduler_with_cuda_driver_preload,
     _scheduler_spawn_environment,
 )
 
@@ -130,6 +131,20 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
         "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
     }
+
+
+def _launch_server_with_cuda_driver_preloads(
+    server_args: Any,
+    driver_libraries: Sequence[str],
+) -> Any:
+    """HTTP server target that preserves driver shims for scheduler spawns."""
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    with _preserve_cuda_driver_preloads(driver_libraries):
+        return launch_server(
+            server_args,
+            run_scheduler_process_func=_run_sglang_scheduler_with_cuda_driver_preload,
+        )
 
 
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
@@ -314,8 +329,8 @@ class HTTPBackend:
         cuda_driver_preloads = _preloaded_cuda_driver_libraries()
         if cuda_driver_preloads:
             process = multiprocessing.Process(
-                target=_run_with_cuda_driver_preloads,
-                args=(rt["launch_server"], (server_args,), cuda_driver_preloads),
+                target=_launch_server_with_cuda_driver_preloads,
+                args=(server_args, cuda_driver_preloads),
             )
         else:
             process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
