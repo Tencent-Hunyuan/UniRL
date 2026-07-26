@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init, stamp_init_state_restore
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenVLPipelineConfig
@@ -50,24 +50,23 @@ class QwenVLBundle(Bundle):
         if getattr(config, "attn_implementation", None):
             load_kwargs["attn_implementation"] = str(config.attn_implementation)
 
+        meta_init_state = None
         if config.meta_init_transformer:
             # Meta-init (FSDP / VeOmni load_sharded path): parameters on the meta
             # device, materialized + loaded by the backend from the checkpoint
             # root after sharding (the embedded ViT is part of the trainable tree,
-            # loaded with it — not a separate aux). init_empty_weights(
-            # include_buffers=False) keeps buffers/attrs real on CPU: HF rotary
-            # inv_freq is a non-persistent buffer computed in __init__ and absent
-            # from the checkpoint, so to_empty later clobbers it -> garbage RoPE.
-            # Capture it straight off the model and stamp a deferred restore
-            # (drained post-load).
-            from accelerate import init_empty_weights
+            # loaded with it — not a separate aux). build_meta_init_transformer
+            # keeps buffers/attrs real on CPU: HF rotary inv_freq is a non-
+            # persistent buffer computed in __init__ and absent from the
+            # checkpoint, so to_empty later clobbers it -> garbage RoPE. It
+            # captures that state; meta_init_state is stashed on the bundle
+            # below and restored by load_trainable_weights.
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
-            with init_empty_weights(include_buffers=False):
-                transformer = Qwen2_5_VLForConditionalGeneration(hf_config)
-            stamp_init_state_restore(transformer)
-            transformer = finalize_meta_init(transformer, dtype=dtype)
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: Qwen2_5_VLForConditionalGeneration(hf_config), dtype=dtype
+            )
         else:
             transformer = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 path,
@@ -113,6 +112,8 @@ class QwenVLBundle(Bundle):
         if config.meta_init_transformer:
             # VL checkpoints store *.safetensors at the root (no subfolder).
             bundle._transformer_weights_path = path
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

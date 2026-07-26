@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import stamp_init_state_restore
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import SD3PipelineConfig
@@ -36,7 +36,7 @@ class SD3Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: nn.Module,
         text_encoder_2: nn.Module,
         text_encoder_3: nn.Module,
@@ -85,31 +85,28 @@ class SD3Bundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
+        meta_init_state = None
         if config.meta_init_transformer:
             # VeOmniBackend lifecycle: parameters on the meta device (no weight
             # allocation); real weights load post-parallelize from the stashed
             # path. SD3's PatchEmbed registers its sincos pos_embed as a
             # NON-PERSISTENT buffer — absent from checkpoints, clobbered by
-            # to_empty. init_empty_weights(include_buffers=False) puts the params
-            # on meta while keeping that buffer real on CPU, so we capture it
-            # straight off the model and stamp the deferred restore the backend
-            # drains after the weight load.
-            from accelerate import init_empty_weights
-
+            # to_empty. build_meta_init_transformer puts the params on meta while
+            # keeping that buffer real on CPU and captures it; meta_init_state
+            # is stashed on the bundle below and restored by load_trainable_weights.
             transformer_config = SD3Transformer2DModel.load_config(path, subfolder="transformer")
-            with init_empty_weights(include_buffers=False):
-                transformer = SD3Transformer2DModel.from_config(transformer_config)
-            captured = stamp_init_state_restore(transformer)
-            logger.info("meta_init_transformer: stamped restore for %d init-computed tensor(s)", captured)
-            transformer = transformer.to(dtype)
-            transformer.init_weights = lambda: None
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: SD3Transformer2DModel.from_config(transformer_config), dtype=dtype
+            )
         else:
             transformer = SD3Transformer2DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype).to(
                 device
             )
 
-        vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        vae = None
+        if config.load_vae:
+            vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         text_encoder = (
             CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder", torch_dtype=te_dtype)
@@ -151,6 +148,8 @@ class SD3Bundle(Bundle):
         if config.meta_init_transformer:
             # Consumed by VeOmniBackend's post-parallelize weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
+            # Ray-robust restore carrier for init-computed non-persistent state.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

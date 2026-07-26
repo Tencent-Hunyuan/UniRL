@@ -898,7 +898,7 @@ class UnifiedModelTrainer(BaseTrainer):
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
-            stage_config={"rollout_id": int(rollout_id)},
+            task_config={"rollout_id": int(rollout_id)},
             sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
             init_noise_group_ids=init_noise_group_ids,

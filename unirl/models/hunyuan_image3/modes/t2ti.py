@@ -126,13 +126,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         "a sampling dict with both 'ar' (ARSamplingParams) and 'diffusion' (DiffusionSamplingParams) entries.",
     )
 
-    ar_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    ar_cfg: Dict[str, Any] = dict(req.task_config.get("ar") or {})
     require(
         "bot_task" not in ar_cfg,
-        "HunyuanImage3Pipeline.generate (t2ti): set the single top-level stage_config['bot_task'] "
-        "(the chain is one semantic mode); stage_config['ar']['bot_task'] is not read.",
+        "HunyuanImage3Pipeline.generate (t2ti): set the single top-level task_config['bot_task'] "
+        "(the chain is one semantic mode); task_config['ar']['bot_task'] is not read.",
     )
-    bot_task = str(req.stage_config.get("bot_task", "think_recaption"))
+    bot_task = str(req.task_config.get("bot_task", "think_recaption"))
     tok_bot_task = _tokenizer_bot_task(bot_task)
     batch = len(texts.texts)
 

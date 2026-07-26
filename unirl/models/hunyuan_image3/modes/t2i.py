@@ -49,7 +49,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
 
     params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-    bot_task: str = str(req.stage_config.get("bot_task", "image"))
+    bot_task: str = str(req.task_config.get("bot_task", "image"))
 
     # Build the upstream multimodal input tensors. CFG-batched [cond, uncond]
     # when guidance > 1; else single batch axis. ``mm`` is

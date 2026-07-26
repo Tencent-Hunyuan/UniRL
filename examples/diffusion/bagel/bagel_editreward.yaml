@@ -48,7 +48,7 @@ workers_per_device: 1
 # source image (dataset `media` entry with role: condition). Pinning the task makes a
 # dataset that is missing source images FAIL LOUDLY (BagelPipeline._extract_input_images
 # raises) instead of silently falling back to t2i and scoring a single-image edit.
-stage_config:
+task_config:
   task: it2i
 
 logging:

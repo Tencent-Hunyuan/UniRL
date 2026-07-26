@@ -1,0 +1,135 @@
+# @package _global_
+# SFT — SD3.5-medium flow-matching finetune on (caption, image) pairs (LoRA).
+#
+# Diffusion SFT = FlowMatchSFT (σ-sampled velocity MSE) over x0-only tracks
+# built by DiffusionSupervisedTrackBuilder: prompts through the pipeline's own
+# build_conditions, target images through the bundle's VAE encode stage
+# (strict inverse of decode). timestep_shift matches SD3's inference schedule
+# (shift=3.0) so training visits the noise band inference uses.
+#
+# Env:
+#   PRETRAINED_MODEL  HF id or local ckpt (default stabilityai/stable-diffusion-3.5-medium)
+#   SFT_DATA          train manifest (.jsonl rows: {"prompt",
+#                     "media": [{"modality": "image", "role": "target", "uri": ...}]})
+#   SFT_EVAL_DATA     eval manifest (defaults to SFT_DATA — supply a real split!)
+#
+# Data prep (HF naruto-blip-captions):
+#   python -m unirl.utils.prepare_sft_t2i --out-dir data/sft_t2i
+#
+# Launch:
+#   ENTRY=train_sft SFT_DATA=data/sft_t2i/train.jsonl SFT_EVAL_DATA=data/sft_t2i/val.jsonl \
+#   bash examples/run_experiment_single_node.sh sft/sd3_sft
+
+num_devices: 8
+batch_size: 32
+num_steps: 300
+eval_interval: 20
+eval_batch_size: 16
+eval_num_samples: -1        # -1 = full eval set
+save_interval: 0
+save_mode: auto
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-sft
+  run_name: sd3_sft_t2i
+  entity: null
+  tags: [sft, sd3, diffusion]
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32              # fp32 LoRA master + Adam states, bf16 compute
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_steps}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+algorithm:
+  _target_: unirl.algorithms.sft.FlowMatchSFT
+  stage_attr: diffusion
+  timestep_sampling: logit_normal
+  timestep_shift: 3.0              # match SD3's inference schedule shift
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 4
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.DiffusionSupervisedTrackBuilder
+  height: 512
+  width: 512
+  guidance_scale: 1.0              # pure conditional branch — no CFG double-forward
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42
+
+# Params object FlowMatchSFT forwards into predict_noise_at_step (only
+# guidance_scale is read; the sampling fields are inert for SFT).
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512

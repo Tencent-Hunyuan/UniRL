@@ -9,7 +9,7 @@ the composed **t2ti** (native think-then-generate: the AR und path plans a
 ``<think>`` caption, then diffusion generates conditioned on it — one bundle, two
 linked tracks).
 
-Task routing (``_resolve_task``): explicit ``req.stage_config["task"]`` wins;
+Task routing (``_resolve_task``): explicit ``req.task_config["task"]`` wins;
 else both ``ar`` + ``diffusion`` sampling entries ⇒ ``t2ti``; ``ar`` only ⇒
 text-out; an ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
 
@@ -71,7 +71,7 @@ from .rl_ops import (
     validate_t2ti_replay_chunk_mode,
     validate_t2ti_replay_execution_order,
 )
-from .vae import BagelVAEDecodeStage, bagel_latent_shape
+from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
     from .bundle import BagelBundle
@@ -130,6 +130,9 @@ class BagelPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
+        # Encode side of the codec (target images → packed clean latents).
+        # Rollout never calls it; diffusion SFT does.
+        self.vae_encode = BagelVAEEncodeStage(bundle)
         # AR (text-out) stage for t2t / i2t / it2t; resolvable via the trainside
         # engine's ``stage_attrs=["ar"]``. Shares the bundle (same MoT root).
         self.ar = BagelARStage(
@@ -380,9 +383,52 @@ class BagelPipeline(Pipeline):
         """Drop the cached T2I prompt contexts (frees their prompt KV caches)."""
         self._t2i_context_cache.clear()
 
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+        image_shape: Tuple[int, int] = (512, 512),
+    ) -> BagelDiffusionConditions:
+        """Encode prompts into T2I ``BagelDiffusionConditions`` (no diffusion run).
+
+        The shared ``build_conditions`` protocol every diffusion pipeline
+        exposes, so SFT / conditioning callers encode prompts exactly like
+        :meth:`generate` does — three frozen KV contexts per prompt via the
+        memoized prefill. Bagel's CFG rides those contexts gated by the params'
+        ``cfg_text_scale`` / ``cfg_img_scale`` at forward time, so
+        ``guidance_scale`` and ``negatives`` do not shape the conditions here:
+        ``negatives`` is rejected (Bagel has no negative-embedding branch) and
+        ``guidance_scale`` is accepted for protocol parity only.
+
+        Deliberately UNCACHED (``_build_contexts``, not the memoized
+        ``_build_contexts_cached``): under an FSDP-wrapped transformer the
+        prefill forward is collective, and a per-rank LRU hit would skip a
+        rank's all-gathers while its peers run them — a cross-rank NCCL
+        deadlock. The GRPO path stays cached because sibling expansion makes
+        hits rank-symmetric; supervised batches have no siblings, and each
+        prompt recurs only once per epoch anyway.
+        """
+        del guidance_scale
+        if negatives is not None:
+            raise ValueError(
+                "BagelPipeline.build_conditions: Bagel CFG uses prefilled cfg contexts, not "
+                "negative prompt embeddings — pass negatives=None and set cfg_*_scale on the params."
+            )
+        contexts = [self._build_contexts(prompt, image=None) for prompt in texts.texts]
+        shape = image_shape
+        return BagelDiffusionConditions(
+            gen_contexts=[c[0] for c in contexts],
+            cfg_text_contexts=[c[1] for c in contexts],
+            cfg_img_contexts=[c[2] for c in contexts],
+            prompts=list(texts.texts),
+            image_shapes=[shape] * len(texts.texts),
+        )
+
     @staticmethod
     def _resolve_task(req: RolloutReq) -> str:
-        """Resolve the task mode: explicit ``stage_config["task"]`` wins, else infer.
+        """Resolve the task mode: explicit ``task_config["task"]`` wins, else infer.
 
         Inference from the modality-keyed ``sampling_params`` dict: both
         ``"ar"`` + ``"diffusion"`` ⇒ ``t2ti`` (think-then-generate); ``"ar"``
@@ -390,7 +436,7 @@ class BagelPipeline(Pipeline):
         ``i2t`` — image, no prompt — must be explicit); ``"diffusion"`` only ⇒
         image-out (``it2i`` with an ``Images`` input, else ``t2i``).
         """
-        task = req.stage_config.get("task")
+        task = req.task_config.get("task")
         if task is not None:
             return str(task)
         sp = req.sampling_params

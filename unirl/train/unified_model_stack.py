@@ -507,7 +507,7 @@ class UnifiedModelTrainStack(Remote):
                 else:
                     image_micro_empty_cache_skip_count += 1
             micros.append(result)
-            total_loss += result.loss
+            total_loss += result.loss * loss_scale
             has_backward = has_backward or result.has_backward
 
         aggregated: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
