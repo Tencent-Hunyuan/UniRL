@@ -9,10 +9,14 @@ generation with training.
 
 ONE single-threaded loop (slime's "one trainer loop; async-depth is a knob"
 principle, implemented with UniRL-native non-blocking Ray dispatch instead of
-slime's thread+asyncio). The async behavior is set by **two numeric knobs**:
+slime's thread+asyncio). The async behavior is set by three orthogonal knobs:
 
 * ``max_inflight`` — how many generations run concurrently (overlap/parallelism
   depth). ``1`` ≈ the classic one-step pipeline; higher fans out more.
+* ``prefetch_batches`` — how many additional batch-equivalents may remain
+  resident while the current batch trains. ``None`` preserves the legacy
+  admission loop, ``0`` disables bounded prefetch, and ``1`` pipelines one
+  successor when the sync-window clamp permits it.
 * ``buffer_max_staleness`` — how many weight-syncs a buffered group may cross
   before it is evicted. ``0`` (default) = **on-policy**: the launch clamp never
   lets a generation cross a weight sync, so ``ratio≈1`` (the colocate-parity
@@ -90,6 +94,7 @@ class AsyncARTrainer(ARTrainer):
         # ---- async knobs ----
         train_fraction: float = 0.5,
         max_inflight: int = 1,
+        prefetch_batches: Optional[int] = None,
         buffer_max_staleness: Optional[int] = None,
     ) -> None:
         # Call BaseTrainer.__init__ directly: ARTrainer.__init__ opens the
@@ -115,6 +120,9 @@ class AsyncARTrainer(ARTrainer):
         # ---- async state ----
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
+        self._prefetch_batches = int(prefetch_batches) if prefetch_batches is not None else None
+        if self._prefetch_batches is not None and self._prefetch_batches < 0:
+            raise ValueError(f"prefetch_batches must be >= 0 or None, got {prefetch_batches}")
         self._buffer_max_staleness = buffer_max_staleness
         self._weight_version = 0  # driver-tracked policy version (# of weight syncs issued)
         # DP size of the TRAIN slab — the divisor for balance_shards (the parent
@@ -223,6 +231,63 @@ class AsyncARTrainer(ARTrainer):
         """
         self._async_scheduler.drain_all(self._score_completed)
 
+    def _drain_runtime_metrics(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Read runtime observability without allowing metrics to stop training."""
+        try:
+            metrics = self._async_scheduler.drain_metrics(current_version=self._weight_version)
+            gen_wait_time_s = metrics.pop("async/gen_wait_time_s", 0.0)
+            quiesce_wait_time_s = metrics.pop("async/quiesce_wait_time_s", 0.0)
+            return metrics, {
+                "gen_wait": float(gen_wait_time_s),
+                "quiesce_wait": float(quiesce_wait_time_s),
+            }
+        except Exception as exc:  # pragma: no cover - observability is non-fatal
+            logger.warning("async runtime metrics failed (non-fatal): %r", exc)
+            return {}, {"gen_wait": 0.0, "quiesce_wait": 0.0}
+
+    def _checkpoint_launch_ceiling(
+        self,
+        *,
+        rollout_id: int,
+        save_interval: int,
+        num_rollouts: int,
+    ) -> Optional[int]:
+        """Exclusive launch-id ceiling that keeps bounded prefetch resumable."""
+        if save_interval <= 0:
+            return None
+        checkpoint_step = ((int(rollout_id) // int(save_interval)) + 1) * int(save_interval)
+        return min(int(num_rollouts), checkpoint_step)
+
+    def _assert_checkpoint_runtime_empty(self) -> None:
+        """Refuse to save runtime state that the checkpoint cannot restore."""
+        if self._async_scheduler.inflight_count or self._async_scheduler.buffer_size:
+            raise RuntimeError(
+                "bounded async runtime is not empty at checkpoint: "
+                f"inflight={self._async_scheduler.inflight_count}, "
+                f"resident_groups={self._async_scheduler.buffer_size}"
+            )
+
+    def _validate_checkpoint_alignment(
+        self,
+        *,
+        num_rollouts: int,
+        save_interval: int,
+        weight_sync_interval: int,
+    ) -> None:
+        """Require every periodic/final checkpoint to follow a rollout-weight sync."""
+        if save_interval <= 0 or self.weight_sync is None:
+            return
+        interval = max(1, int(weight_sync_interval))
+        has_periodic_save = int(save_interval) <= int(num_rollouts)
+        periodic_misaligned = has_periodic_save and int(save_interval) % interval != 0
+        final_misaligned = int(num_rollouts) % interval != 0
+        if periodic_misaligned or final_misaligned:
+            raise ValueError(
+                "async checkpoint steps must align with weight_sync_interval so resumed rollout "
+                "weights match uninterrupted training; require save_interval and num_rollouts "
+                f"to be divisible by {interval}"
+            )
+
     # ------------------------------------------------------------------
     # Train tail (mirrors ar.py:152-182, minus wake/sleep) — reward parity
     # ------------------------------------------------------------------
@@ -233,12 +298,8 @@ class AsyncARTrainer(ARTrainer):
         resp: RolloutResp,
         *,
         training_progress: float,
-        rollout_id: int,
-        t0: Optional[float] = None,
-    ) -> Tuple[TrainStepResult, float]:
+    ) -> Tuple[TrainStepResult, float, float]:
         """Advantage + optimizer step for a SCORED track (rewards already attached)."""
-        if t0 is None:
-            t0 = time.perf_counter()
         mean_reward = 0.0
         if track.rewards is not None:
             track.rewards = hydrate(track.rewards)
@@ -248,18 +309,13 @@ class AsyncARTrainer(ARTrainer):
         resp.tracks[name] = track
         if self.balance_shards:
             track = track.balance_shards(self._train_devices)  # over the TRAIN slab DP size
+        train_start = time.perf_counter()
         result = self.stack.train_track(track, training_progress=float(training_progress))
-        self.wandb_logger.log_rollout_step(
-            rollout_id,
-            result,
-            resp,
-            step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
-        )
+        train_time_s = time.perf_counter() - train_start
         # train_step is bypassed, so BaseTrainer's per-step reset hook never
         # fires; reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
-        return result, mean_reward
+        return result, mean_reward, train_time_s
 
     # ------------------------------------------------------------------
     # Train loop
@@ -280,6 +336,11 @@ class AsyncARTrainer(ARTrainer):
         # is evicted. 0 (default) = on-policy (no generation crosses a sync).
         stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
         M = self._max_inflight
+        self._validate_checkpoint_alignment(
+            num_rollouts=num_rollouts,
+            save_interval=save_interval,
+            weight_sync_interval=interval,
+        )
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
@@ -293,6 +354,7 @@ class AsyncARTrainer(ARTrainer):
             extra={
                 "adv_normalization_scope": self.adv_normalization_scope,
                 "max_inflight": M,
+                "prefetch_batches": self._prefetch_batches,
                 "buffer_max_staleness": stale,
                 "weight_sync_interval": interval,
             },
@@ -300,7 +362,9 @@ class AsyncARTrainer(ARTrainer):
 
         self._async_scheduler = AsyncRolloutScheduler(
             RayGenerationDispatcher(self.rollout),
-            groups_per_step=self.batch_size,
+            groups_per_batch=self.batch_size,
+            groups_per_generation=self.batch_size,
+            prefetch_batches=self._prefetch_batches,
         )
         self._async_scheduler.reset(start_rollout)
 
@@ -312,7 +376,19 @@ class AsyncARTrainer(ARTrainer):
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
-                picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
+                hard_launch_ceiling = self._checkpoint_launch_ceiling(
+                    rollout_id=rollout_id,
+                    save_interval=save_interval,
+                    num_rollouts=num_rollouts,
+                )
+                picked = self._next_batch(
+                    rollout_id,
+                    interval,
+                    M,
+                    stale,
+                    num_rollouts,
+                    hard_launch_ceiling=hard_launch_ceiling,
+                )
                 group_tracks = []
                 for item in picked:
                     (group_track,) = item.resp.tracks.values()
@@ -320,27 +396,58 @@ class AsyncARTrainer(ARTrainer):
                 track = RolloutTrack.concat(group_tracks)
                 resp = RolloutResp(tracks={"ar": track})
                 training_progress = rollout_id / max(1, num_rollouts - 1)
-                result, mean_reward = self._advantage_and_train(
-                    track, resp, training_progress=training_progress, rollout_id=rollout_id, t0=t0
+                result, mean_reward, train_time_s = self._advantage_and_train(
+                    track,
+                    resp,
+                    training_progress=training_progress,
+                )
+
+                step = rollout_id + 1
+                needs_eval = self.eval_interval > 0 and step % self.eval_interval == 0
+                needs_save = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
+                needs_sync = step % interval == 0 and self.weight_sync is not None
+
+                if needs_eval or needs_save or needs_sync:
+                    self._drain_all()
+                if needs_eval:
+                    self.evaluate(rollout_id=rollout_id)
+
+                sync_time_s = 0.0
+                if needs_sync:
+                    sync_start = time.perf_counter()
+                    self.weight_sync.sync()
+                    sync_time_s = time.perf_counter() - sync_start
+                    self._weight_version += 1
+                if needs_save:
+                    self._assert_checkpoint_runtime_empty()
+
+                runtime_metrics, runtime_phases = self._drain_runtime_metrics()
+                phase_times = {"train": train_time_s, **runtime_phases}
+                if needs_sync:
+                    phase_times["weight_sync"] = sync_time_s
+                self.wandb_logger.log_rollout_step(
+                    rollout_id,
+                    result,
+                    resp,
+                    step_time_s=time.perf_counter() - t0,
+                    phase_times=phase_times,
+                    trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+                    extra_metrics=runtime_metrics,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
-                step = rollout_id + 1
-                if self.eval_interval > 0 and step % self.eval_interval == 0:
-                    self._drain_all()  # eval shares the engine
-                    self.evaluate(rollout_id=rollout_id)
-                if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()  # consistent engine + deterministic resume
+                if needs_save:
                     self.maybe_save_checkpoint(
-                        rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                        rollout_id,
+                        num_rollouts,
+                        save_interval=save_interval,
+                        save_dir=save_dir,
+                        save_mode=save_mode,
                     )
-                if step % interval == 0 and self.weight_sync is not None:
-                    self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
-                    self.weight_sync.sync()
-                    self._weight_version += 1
         finally:
-            # Match BaseTrainer._finish_wandb: cleanup failures must not mask
-            # the exception that caused teardown.
+            # Cleanup failures must not hide the exception that initiated
+            # teardown. If training itself succeeded, a drain failure remains
+            # actionable and is re-raised.
             active_exception = sys.exc_info()[0] is not None
             try:
                 self._drain_all()
@@ -351,24 +458,26 @@ class AsyncARTrainer(ARTrainer):
             finally:
                 self._finish_wandb()
 
-    def _next_step(
+    def _next_batch(
         self,
         rollout_id: int,
         interval: int,
         M: int,
         stale: int,
         num_rollouts: int,
+        *,
+        hard_launch_ceiling: Optional[int] = None,
     ) -> List[BufferedRolloutGroup]:
         """Top up launches, reap completed generations, and return the freshest
-        ``groups_per_step`` (``batch_size``) groups for ``rollout_id`` (blocking
-        on the oldest in-flight generation if the buffer is short).
+        ``batch_size`` groups for ``rollout_id`` (blocking on the oldest in-flight
+        generation if the buffer is short).
 
         The launch clamp is the load-bearing on-policy guarantee: a generation
         launched now is consumed later, so bound how far ahead we launch to
         ``stale`` weight-syncs. ``stale=0`` ⇒ never launch into a future
         sync-window ⇒ no generation crosses a sync ⇒ ``ratio≈1`` (on-policy).
         """
-        return self._async_scheduler.next_step(
+        return self._async_scheduler.next_batch(
             rollout_id=rollout_id,
             sync_interval=interval,
             max_inflight=M,
@@ -377,4 +486,5 @@ class AsyncARTrainer(ARTrainer):
             current_version=self._weight_version,
             build_req=self._build_async_req,
             on_complete=self._score_completed,
+            hard_launch_ceiling=hard_launch_ceiling,
         )

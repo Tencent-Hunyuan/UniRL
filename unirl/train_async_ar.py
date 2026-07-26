@@ -17,6 +17,8 @@ Extra config knobs vs the colocate recipe:
     must both be integers, AND ``batch_size * samples_per_prompt`` must be divisible
     by each slab size (DP_SCATTER divisibility).
   * ``max_inflight`` — concurrent generations (overlap depth). ``1`` ≈ one-step pipeline.
+  * ``prefetch_batches`` — completed/in-flight batch-equivalents admitted beyond
+    the current training batch. ``0`` disables prefetch; ``1`` pipelines one successor.
   * ``buffer_max_staleness`` — weight-syncs a buffered group may cross. ``0``/unset =
     on-policy (``ratio≈1``); ``>0`` = off-policy continuous buffer.
 """
@@ -55,6 +57,7 @@ def main(cfg: DictConfig) -> None:
         eval_temperature=float(cfg.get("eval_temperature", 1.0)),
         train_fraction=float(cfg.get("train_fraction", 0.5)),
         max_inflight=int(cfg.get("max_inflight", 1)),
+        prefetch_batches=cfg.get("prefetch_batches"),
         buffer_max_staleness=cfg.get("buffer_max_staleness"),
     )
     trainer.train(

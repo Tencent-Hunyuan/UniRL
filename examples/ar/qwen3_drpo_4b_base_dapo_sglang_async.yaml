@@ -23,10 +23,12 @@ num_rollouts: 800
 
 # Train slab share (rollout gets the rest). 0.5 -> equal split.
 train_fraction: 0.5
-# Async knobs (one unified loop): max_inflight = concurrent generations (overlap
-# depth; 1 ≈ one-step pipeline). buffer_max_staleness = weight-syncs a buffered
-# group may cross: 0 = on-policy (ratio≈1), >0 = off-policy continuous buffer.
+# Async knobs (one unified loop): max_inflight bounds concurrent generations;
+# prefetch_batches independently reserves completed/in-flight batch-equivalents
+# beyond the current batch (1 = pipeline one successor when the sync-window
+# clamp permits it); buffer_max_staleness bounds buffered group age in syncs.
 max_inflight: 1
+prefetch_batches: 1
 buffer_max_staleness: 0
 
 # =1 is the on-policy reward-parity baseline vs the colocate ARTrainer (a sync
