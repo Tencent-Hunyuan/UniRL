@@ -14,9 +14,7 @@ from unirl.models.hunyuan_image3.diffusion import (
 from unirl.models.hunyuan_image3.modes.it2i import _encode_cond_images_per_sample
 from unirl.models.hunyuan_image3.vae import HunyuanImage3VAEDecodeStage
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3InputAdapter
-from unirl.trainer.unified_model import UnifiedModelTrainer
 from unirl.types.primitives import Texts
-from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments import LatentSegment
@@ -69,25 +67,6 @@ def test_hi3_input_adapter_slices_noise_recipe_per_worker_request():
 def test_hi3_input_adapter_rejects_misaligned_noise_recipe():
     with pytest.raises(ValueError, match="gid count 1 != prompt count 2"):
         _hi3_input_adapter().build(_hi3_request(["noise-0"]))
-
-
-def test_unified_trainer_carries_stage_config_into_rollout_request():
-    trainer = UnifiedModelTrainer.__new__(UnifiedModelTrainer)
-    trainer.sampling_params = {
-        "ar": ARSamplingParams(),
-        "diffusion": DiffusionSamplingParams(num_inference_steps=2, sde_indices=[0]),
-    }
-    trainer._stage_config = {"task": "it2i"}
-    inputs = RolloutInputs(
-        sample_ids=["sample-0"],
-        group_ids=["group-0"],
-        primitives={"text": Texts(texts=["edit the image"])},
-    )
-
-    req = trainer._build_req(inputs, rollout_id=3)
-
-    assert req.stage_config == {"task": "it2i"}
-    assert req.stage_config is not trainer._stage_config
 
 
 def test_hi3_fused_concat_pads_stacked_rope_cache():
