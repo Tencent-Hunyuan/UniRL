@@ -102,12 +102,17 @@ rollout:
     top_p: 1.0
     concurrency: 64
     samples_pre_expanded: true
+    # The trainer sleeps SGLang before restoring FSDP onto the same GPUs.
+    # Preserve the latest rollout weights across rounds that intentionally
+    # skip a full sync (including rollout 0 when baseline eval is disabled).
+    enable_memory_saver: true
+    enable_weights_cpu_backup: true
+    skip_server_warmup: false
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
       # SGLang GPU-memory utilization / static-memory fraction.
       mem_fraction_static: 0.15
-      skip_server_warmup: false
       attention_backend: triton
       disable_cuda_graph: false
       cuda_graph_max_bs: 64

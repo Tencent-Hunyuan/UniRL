@@ -27,7 +27,9 @@ Deliberate divergences from the ``sglang_diffusion`` seam:
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
+from glob import glob
 from typing import (
     Any,
     Dict,
@@ -38,6 +40,28 @@ from typing import (
     Sequence,
     runtime_checkable,
 )
+
+
+def _python_cuda_library_dirs() -> List[str]:
+    """Return CUDA library directories shipped with the active Python env."""
+    result: List[str] = []
+
+    def _add(path: str) -> None:
+        path = os.path.abspath(path)
+        if os.path.isdir(path) and path not in result:
+            result.append(path)
+
+    for entry in sys.path:
+        for path in sorted(glob(os.path.join(entry, "nvidia", "*", "lib"))):
+            _add(path)
+
+    try:
+        import torch
+
+        _add(os.path.join(os.path.dirname(torch.__file__), "lib"))
+    except (ImportError, AttributeError):
+        pass
+    return result
 
 
 def _normalize_cuda_visible_devices(
@@ -77,13 +101,21 @@ def _scheduler_spawn_environment(
     Ray Workers inherit environment variables from the already-running Ray
     daemon, not from the command that later submits a job. In particular, a
     stale ``LD_LIBRARY_PATH`` can point at a different CUDA toolkit and make a
-    scheduler fail to load the runtime bundled with the active Python env.
-    Children therefore inherit no ``LD_LIBRARY_PATH``. The Worker's values are
-    restored on both success and failure, so colocated training is unaffected.
+    scheduler load the wrong runtime. Put the active Python environment's CUDA
+    wheel directories first instead of clearing the variable: torch-memory-
+    saver's preload hook is dynamically linked against ``libcudart`` and cannot
+    start if that runtime directory is removed. The Worker's values are restored
+    on both success and failure, so colocated training is unaffected.
     """
     saved_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
     saved_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ.pop("LD_LIBRARY_PATH", None)
+    active_library_dirs = _python_cuda_library_dirs()
+    inherited_library_dirs = (saved_ld_library_path or "").split(os.pathsep)
+    child_library_dirs = list(dict.fromkeys(active_library_dirs + [path for path in inherited_library_dirs if path]))
+    if child_library_dirs:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(child_library_dirs)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
     if cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
     try:
