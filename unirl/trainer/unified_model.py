@@ -147,6 +147,7 @@ class UnifiedModelTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
+        stage_config: Optional[Dict[str, Any]] = None,
         ar_rollout_cfg: Optional[DictConfig] = None,
         dit_rollout_cfg: Optional[DictConfig] = None,
         rollout_cfg: Optional[DictConfig] = None,
@@ -194,6 +195,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        self._stage_config: Dict[str, Any] = dict(stage_config) if stage_config else {}
 
         # Set below from the `sync` block; None means no sync (e.g. trainside).
         self.weight_sync = None
@@ -386,6 +388,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives=dict(inputs.primitives),
             request_conditions={},
             sampling_params=sampling_params,
+            stage_config=dict(self._stage_config),
             metadata=list(inputs.metadata) if inputs.metadata else [],
         )
 
@@ -428,6 +431,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 primitives={"text": Texts(texts=prompts[lo:hi])},
                 request_conditions=dict(req.request_conditions),
                 sampling_params=req.sampling_params,
+                stage_config=dict(req.stage_config),
                 metadata=list(req.metadata[lo:hi]) if req.metadata else [],
             )
             shards.append(self._run_rollout_one(self.ar_rollouts[r], self.dit_rollouts[r], sub_req))
@@ -488,6 +492,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives={"text": ar_texts},
             request_conditions={},
             sampling_params=req.sampling_params,
+            stage_config=dict(req.stage_config),
         )
         ar_resp = ar_engine.generate(ar_req)
         ar_inner = ar_resp.tracks.get(AR_TRACK)
@@ -530,6 +535,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives={"text": dit_prompts, "cot_text": dit_cot},
             request_conditions={},
             sampling_params={"diffusion": diff_params},
+            stage_config=dict(req.stage_config),
             init_noise_group_ids=dit_noise_gids,
         )
         dit_resp = dit_engine.generate(dit_req)
@@ -629,6 +635,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives={"text": reward_texts},
             request_conditions={},
             sampling_params=req.sampling_params,
+            stage_config=dict(req.stage_config),
             metadata=reward_metadata,
         )
         scored = self.reward.score_and_attach(req=reward_req, track=img_track)
@@ -885,6 +892,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 primitives={"text": reward_texts},
                 request_conditions={},
                 sampling_params=req.sampling_params,
+                stage_config=dict(req.stage_config),
                 metadata=reward_metadata,
             )
             for name, reward in scorers:

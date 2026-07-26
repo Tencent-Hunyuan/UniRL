@@ -36,6 +36,7 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
+        stage_config=cfg.get("stage_config"),
         sync_cfg=cfg.get("sync"),
         dump_dir=cfg.get("dump_dir"),
         logging_cfg=cfg.get("logging"),
