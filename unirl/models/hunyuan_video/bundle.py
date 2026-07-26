@@ -118,6 +118,8 @@ class HunyuanVideoBundle(Bundle):
             .to(device)
             .eval()
         )
+        if config.vae_use_tiling:
+            vae.enable_tiling()
         vae.requires_grad_(False)
 
         text_encoder = (

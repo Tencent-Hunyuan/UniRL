@@ -104,7 +104,7 @@ class Qwen3OmniPipeline(Pipeline):
             per_sample_videos = self._videos_to_list(videos_prim)
 
         # Optional per-request system instruction.
-        chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(req.task_config.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3OmniChatTemplateStage(
                 self.bundle,

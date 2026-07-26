@@ -166,7 +166,7 @@ class Qwen3OmniThinkerInputAdapter:
         video_frames = self._extract_videos(req, n)
 
         # Allow a per-request system instruction.
-        chat_overrides = dict(req.stage_config.get("chat") or {})
+        chat_overrides = dict(req.task_config.get("chat") or {})
         sys_instr = chat_overrides.get("system_instruction", self.system_instruction)
 
         prompts: List[Dict[str, Any]] = []

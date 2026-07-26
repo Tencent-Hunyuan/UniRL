@@ -76,20 +76,41 @@ def run_t2i(
     seed: int,
     gen_kwargs: Dict,
     shard: Tuple[int, int] = (0, 1),
+    linspace_sigmas: bool = False,
+    prompt_seed: bool = False,
 ) -> None:
     jobs = t2i_jobs(prompts, images_dir, samples_per_prompt, shard)
     if not jobs:
         print("[t2i] all images present — nothing to generate")
         return
+    import hashlib
+
+    import numpy as np
     import torch
 
     pipe = _load_pipe(ckpt)
+    call_kwargs = dict(gen_kwargs)
+    if linspace_sigmas:
+        # Flow-match sigma grid linspace(1, 1/steps, steps) (endpoint 1/N) instead of the diffusers
+        # pipeline default (endpoint ~0); static shift still applied by the scheduler.
+        steps = int(gen_kwargs.get("num_inference_steps") or 0)
+        if steps <= 0:
+            raise ValueError("linspace_sigmas requires num_inference_steps in gen defaults/CLI")
+        call_kwargs["sigmas"] = list(np.linspace(1.0, 1.0 / steps, steps))
+
+    def _seed(p: int, s: int) -> int:
+        if prompt_seed:  # deterministic per prompt CONTENT (reproducible), CPU generator
+            h = int.from_bytes(hashlib.sha256(prompts[p].encode()).digest()[:4], "big")
+            return (seed + h + s) % (2**31)
+        return seed + 1000 * p + s
+
     images_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     for i in range(0, len(jobs), batch_size):
         batch = jobs[i : i + batch_size]
-        generators = [torch.Generator("cuda").manual_seed(seed + 1000 * p + s) for p, s in batch]
-        images = pipe(prompt=[prompts[p] for p, _ in batch], generator=generators, **gen_kwargs).images
+        gen_dev = "cpu" if prompt_seed else "cuda"
+        generators = [torch.Generator(gen_dev).manual_seed(_seed(p, s)) for p, s in batch]
+        images = pipe(prompt=[prompts[p] for p, _ in batch], generator=generators, **call_kwargs).images
         for (p, s), img in zip(batch, images):
             target = image_path(images_dir, p, s)
             tmp = target.with_suffix(".tmp.png")  # atomic publish: a killed run leaves no half-written PNG
