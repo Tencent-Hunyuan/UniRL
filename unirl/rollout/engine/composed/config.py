@@ -29,7 +29,7 @@ class ComposedRolloutEngineConfig(BaseEngineConfig):
 
     sleep_diffusion_on_start: bool = True
 
-    # System instruction injected into the AR child's ``stage_config`` so
+    # System instruction injected into the AR child's ``task_config`` so
     # the LLM rewrites the user's prompt (PE = prompt enhancement). ``None``
     # forwards the bare user prompt to AR.
     pe_instruction: Optional[str] = None

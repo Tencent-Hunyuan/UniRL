@@ -58,7 +58,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
         eval_rewards_cfg: Optional[Any] = None,
-        stage_config: Optional[Dict[str, Any]] = None,
+        task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -96,7 +96,7 @@ class DiffusionTrainer(BaseTrainer):
         # MISSING source images fail loudly in the pipeline (it2i requires an input
         # image) instead of silently degrading to t2i. Empty ⇒ the pipeline infers
         # the task as before (unchanged for every other recipe).
-        self._stage_config: Dict[str, Any] = dict(stage_config) if stage_config else {}
+        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
         # Set in _build_rollout: True when the rollout is the trainside
         # direct-sampling engine (it reuses the train model → must NOT offload).
         self._rollout_is_trainside = False
@@ -372,7 +372,8 @@ class DiffusionTrainer(BaseTrainer):
         passes its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
         base = base_sampling if base_sampling is not None else self.sampling_params
-        inputs = inputs.expand(total_samples_per_prompt(base))
+        samples_per_prompt = total_samples_per_prompt(base)
+        inputs = inputs.expand(samples_per_prompt)
         diffusion = base.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
@@ -400,7 +401,29 @@ class DiffusionTrainer(BaseTrainer):
         init_noise_group_ids: list = []
         init_noise_latent_shape = self._noise_latent_shape
         if init_noise_latent_shape is not None:
-            if bool(getattr(base.get("diffusion"), "init_same_noise", False)):
+            # Eval (base_sampling is not None): seed x_T per prompt CONTENT plus
+            # sibling-sample ordinal. The same prompt/sample slot is stable across
+            # steps/checkpoints, while K>1 eval siblings still get distinct x_T.
+            # Training keeps per-rollout/per-sample varying noise.
+            is_eval = (
+                base_sampling is not None
+                and "text" in inputs.primitives
+                and hasattr(inputs.primitives["text"], "texts")
+            )
+            if is_eval:
+                from unirl.sde.noise import make_prompt_seed_group_id
+
+                texts = list(inputs.primitives["text"].texts)
+                if len(texts) != len(inputs.sample_ids):
+                    raise ValueError(
+                        f"eval prompt-text count {len(texts)} != sample count "
+                        f"{len(inputs.sample_ids)}; cannot key x_T on prompt content."
+                    )
+                init_noise_group_ids = [
+                    make_prompt_seed_group_id(text, sample_ordinal=index % samples_per_prompt)
+                    for index, text in enumerate(texts)
+                ]
+            elif bool(getattr(base.get("diffusion"), "init_same_noise", False)):
                 init_noise_group_ids = [f"r{rollout_id}:{g}" for g in inputs.group_ids]
             else:
                 init_noise_group_ids = [f"r{rollout_id}:{s}" for s in inputs.sample_ids]
@@ -409,7 +432,7 @@ class DiffusionTrainer(BaseTrainer):
             group_ids=list(inputs.group_ids),
             primitives=dict(inputs.primitives),
             request_conditions={},
-            stage_config=dict(self._stage_config),
+            task_config=dict(self._task_config),
             sampling_params=sampling_params,
             metadata=list(inputs.metadata) if inputs.metadata else [],
             init_noise_group_ids=init_noise_group_ids,
