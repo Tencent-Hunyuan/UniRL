@@ -293,7 +293,11 @@ class AsyncARTrainer(ARTrainer):
         if part.rewards is not None:
             part.rewards = hydrate(part.rewards)
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-        part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+        if self.advantage_mode == "grpo":
+            part = part.compute_advantages(
+                normalize=self.normalize_adv_by_std,
+                scope=self.adv_normalization_scope,
+            )
         sample = sample.with_parts([*sample.parts[:-1], part])
         train_part = part
         if self.balance_shards:

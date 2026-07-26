@@ -192,6 +192,9 @@ class TrainStack(Remote):
         if part.segment is None:
             return
         algorithm = self.algorithm
+        prepare_track = getattr(algorithm, "prepare_rollout_track", None)
+        if prepare_track is not None:
+            prepare_track(resp_track)
         if not algorithm.recomputes_anchor():
             algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return

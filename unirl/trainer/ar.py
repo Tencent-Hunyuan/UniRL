@@ -60,6 +60,7 @@ class ARTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
+        advantage_mode: str = "grpo",
         balance_shards: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
@@ -83,6 +84,8 @@ class ARTrainer(BaseTrainer):
         # group std. False = mean-center only (reward - group_mean), NO std division —
         # removes the difficulty bias that over-amplifies low-std (hard) prompts.
         self.normalize_adv_by_std = normalize_adv_by_std
+        # "grpo" (default) or "gae" (PPO path — GAE runs in PPO.prepare_rollout_track on workers).
+        self.advantage_mode = str(advantage_mode)
         # verl trainer.balance_batch parity: driver-side reorder of the rollout
         # batch so each DP shard receives a similar total-token workload. FSDP
         # collectives sync all ranks every micro, so a step runs at the SLOWEST
@@ -456,7 +459,11 @@ class ARTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+            if self.advantage_mode == "grpo":
+                part = part.compute_advantages(
+                    normalize=self.normalize_adv_by_std,
+                    scope=self.adv_normalization_scope,
+                )
             sample = sample.with_parts([*sample.parts[:-1], part])
 
         self._dump_rollout_samples(sample, rollout_id)

@@ -193,6 +193,27 @@ def _grpo_clip_loss(
     return loss_per_elem, metrics
 
 
+def _ppo_clipped_value_loss(
+    *,
+    values: torch.Tensor,
+    old_values: torch.Tensor,
+    returns: torch.Tensor,
+    clip_range: float,
+) -> torch.Tensor:
+    """PPO clipped value loss. Element-wise; reduction is the caller's job.
+
+    Returns per-token ``0.5 * max((V - R)², (V_clipped - R)²)`` with
+    ``V_clipped = V_old + clip(V - V_old, -clip_range, clip_range)``.
+    """
+    values_f = values.float()
+    old_f = old_values.detach().float()
+    returns_f = returns.detach().float()
+    clipped = old_f + (values_f - old_f).clamp(-clip_range, clip_range)
+    sq1 = (values_f - returns_f).square()
+    sq2 = (clipped - returns_f).square()
+    return 0.5 * torch.maximum(sq1, sq2)
+
+
 # ---------------------------------------------------------------------------
 # Reference-policy KL helpers (FlowGRPO / FlowDPPO ``beta`` term)
 # ---------------------------------------------------------------------------
