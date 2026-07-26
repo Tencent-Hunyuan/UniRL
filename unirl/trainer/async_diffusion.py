@@ -39,6 +39,7 @@ AR path untouched.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -275,6 +276,8 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         mean_reward = 0.0
         if track.rewards is not None:
             track.rewards = hydrate(track.rewards)
+            if isinstance(track.component_rewards, dict):
+                track.component_rewards = {name: hydrate(value) for name, value in track.component_rewards.items()}
             mean_reward = float(track.rewards.to(torch.float32).mean().item())
         track = track.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
         (name,) = resp.tracks.keys()  # single-track diffusion
@@ -358,5 +361,13 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                     self.weight_sync.sync()
                     self._weight_version += 1
         finally:
-            self._drain_all()
-            self._finish_wandb()
+            # Cleanup failures must not mask the exception that stopped training.
+            active_exception = sys.exc_info()[0] is not None
+            try:
+                self._drain_all()
+            except Exception:
+                if not active_exception:
+                    raise
+                logger.exception("Failed to drain in-flight generations during async diffusion teardown")
+            finally:
+                self._finish_wandb()
