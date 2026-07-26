@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from glob import glob
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterator,
     List,
@@ -43,6 +44,10 @@ def _filter_server_args_or_raise(
     return {k: v for k, v in server_intent.items() if k != _REQUIRED_SERVER_ARGS_METADATA_KEY and k in allowed}
 
 
+def _split_preloads(value: str) -> List[str]:
+    return [item for item in re.split(r"[\s:]+", value) if item]
+
+
 def _python_cuda_library_dirs() -> List[str]:
     """Return CUDA library directories shipped with the active Python env."""
     result: List[str] = []
@@ -65,22 +70,76 @@ def _python_cuda_library_dirs() -> List[str]:
     return result
 
 
+def _preloaded_cuda_driver_libraries() -> List[str]:
+    """Return explicitly preloaded CUDA driver shims."""
+    result: List[str] = []
+    for item in _split_preloads(os.environ.get("LD_PRELOAD", "")):
+        if not os.path.basename(item).startswith("libcuda.so"):
+            continue
+        path = os.path.abspath(item)
+        if os.path.isfile(path) and path not in result:
+            result.append(path)
+    return result
+
+
 def _preloaded_cuda_driver_dirs() -> List[str]:
-    """Return directories of explicitly preloaded CUDA driver shims.
+    """Return directories containing explicitly preloaded CUDA driver shims.
 
     ``torch-memory-saver`` replaces ``LD_PRELOAD`` while it starts SGLang
     schedulers. Keeping a preloaded forward-compatibility driver's directory
     in ``LD_LIBRARY_PATH`` lets the child still resolve that same ``libcuda``
     after the preload value changes.
     """
-    result: List[str] = []
-    for item in re.split(r"[\s:]+", os.environ.get("LD_PRELOAD", "")):
-        if not item or not os.path.basename(item).startswith("libcuda.so"):
-            continue
-        directory = os.path.abspath(os.path.dirname(item) or ".")
-        if os.path.isdir(directory) and directory not in result:
-            result.append(directory)
-    return result
+    return list(dict.fromkeys(os.path.dirname(path) for path in _preloaded_cuda_driver_libraries()))
+
+
+@contextmanager
+def _preserve_cuda_driver_preloads(
+    libraries: Optional[Sequence[str]] = None,
+) -> Iterator[None]:
+    """Append CUDA driver shims when torch-memory-saver rewrites LD_PRELOAD."""
+    driver_libraries = list(libraries) if libraries is not None else _preloaded_cuda_driver_libraries()
+    if not driver_libraries:
+        yield
+        return
+
+    try:
+        import torch_memory_saver
+    except ImportError:
+        yield
+        return
+
+    original_configure_subprocess = torch_memory_saver.configure_subprocess
+
+    @contextmanager
+    def _configure_subprocess_with_driver() -> Iterator[None]:
+        with original_configure_subprocess():
+            saved_preload = os.environ.get("LD_PRELOAD")
+            current = _split_preloads(saved_preload or "")
+            os.environ["LD_PRELOAD"] = os.pathsep.join(list(dict.fromkeys(current + driver_libraries)))
+            try:
+                yield
+            finally:
+                if saved_preload is None:
+                    os.environ.pop("LD_PRELOAD", None)
+                else:
+                    os.environ["LD_PRELOAD"] = saved_preload
+
+    torch_memory_saver.configure_subprocess = _configure_subprocess_with_driver
+    try:
+        yield
+    finally:
+        torch_memory_saver.configure_subprocess = original_configure_subprocess
+
+
+def _run_with_cuda_driver_preloads(
+    target: Callable[..., Any],
+    args: tuple[Any, ...],
+    libraries: Sequence[str],
+) -> Any:
+    """Spawn target used by the HTTP backend to patch its scheduler children."""
+    with _preserve_cuda_driver_preloads(libraries):
+        return target(*args)
 
 
 def _normalize_cuda_visible_devices(

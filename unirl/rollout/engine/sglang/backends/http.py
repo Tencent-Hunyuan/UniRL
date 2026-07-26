@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from unirl.rollout.engine.sglang.backends.base import (
     _filter_server_args_or_raise,
     _normalize_cuda_visible_devices,
+    _scheduler_spawn_environment,
 )
 
 logger = logging.getLogger(__name__)
@@ -281,7 +282,8 @@ class HTTPBackend:
             target=_launch_server_with_env,
             args=(server_args, env_overrides),
         )
-        process.start()
+        with _scheduler_spawn_environment(visible_devices):
+            process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
         try:
