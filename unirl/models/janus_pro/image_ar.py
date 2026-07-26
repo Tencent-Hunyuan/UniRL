@@ -274,52 +274,40 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         paired_response_mask = torch.stack([response_mask, response_mask], dim=1).reshape(paired_batch, t_max)
         with self._autocast_ctx(device):
             body = self._language_body()
-            cur_attention_mask = attention_mask
-            out = body(
-                inputs_embeds=inputs_embeds,
-                attention_mask=cur_attention_mask,
-                position_ids=_position_ids_from_attention_mask(cur_attention_mask),
-                use_cache=True,
+            paired_response_tokens = torch.stack([response_tokens, response_tokens], dim=1).reshape(
+                paired_batch,
+                t_max,
             )
-            past_key_values = out.past_key_values
-            if past_key_values is None and t_max > 1:
-                raise RuntimeError(
-                    "JanusProImageARStage.replay requires past_key_values for cached teacher forcing. "
-                    "Disable gradient checkpointing for the Janus-Pro image AR stage."
-                )
+            response_embeds = self.model.model.prepare_gen_img_embeds(paired_response_tokens.reshape(-1)).reshape(
+                paired_batch, t_max, -1
+            )
+
+            # Teacher forcing does not need a token-by-token KV-cache loop: every
+            # generated image token is already known. Feed the prompt plus tokens
+            # [0, ..., T-2] once, then use hidden positions [prompt_last, ...]
+            # to predict tokens [0, ..., T-1]. This is mathematically identical
+            # to cached replay while avoiding 576 graph-retaining forwards.
+            full_inputs_embeds = torch.cat([inputs_embeds, response_embeds[:, :-1]], dim=1)
+            full_attention_mask = torch.cat([attention_mask, paired_response_mask[:, :-1]], dim=1)
+            out = body(
+                inputs_embeds=full_inputs_embeds,
+                attention_mask=full_attention_mask,
+                position_ids=_position_ids_from_attention_mask(full_attention_mask),
+                use_cache=False,
+            )
 
             temp = float(temperature) if float(temperature) > 0.0 else 1.0
-            per_token_logps = torch.empty((batch_size, t_max), dtype=torch.float32, device=device)
-            for i in range(t_max):
-                logits = self.model.model.gen_head(out.last_hidden_state[:, -1, :])
-                cfg_logits = self._cfg_logits(logits, float(conditions.cfg_weight))
-                log_probs_full = F.log_softmax(cfg_logits.float() / temp, dim=-1)
-                per_token_logps[:, i] = log_probs_full.gather(
-                    -1,
-                    response_tokens[:, i].unsqueeze(-1),
-                ).squeeze(-1)
-
-                if i == t_max - 1:
-                    break
-                paired_token = torch.stack([response_tokens[:, i], response_tokens[:, i]], dim=1).reshape(-1)
-                inputs_embeds = self.model.model.prepare_gen_img_embeds(paired_token).unsqueeze(1)
-                cur_attention_mask = torch.cat(
-                    [cur_attention_mask, paired_response_mask[:, i : i + 1]],
-                    dim=1,
+            prompt_len = int(inputs_embeds.shape[1])
+            prediction_hidden = out.last_hidden_state[:, prompt_len - 1 : prompt_len - 1 + t_max, :]
+            if int(prediction_hidden.shape[1]) != t_max:
+                raise RuntimeError(
+                    "JanusProImageARStage.replay produced too few teacher-forced positions: "
+                    f"got {prediction_hidden.shape[1]}, expected {t_max}."
                 )
-                out = body(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=cur_attention_mask,
-                    position_ids=_position_ids_from_attention_mask(cur_attention_mask)[:, -1:],
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                past_key_values = out.past_key_values
-                if past_key_values is None and i < t_max - 2:
-                    raise RuntimeError(
-                        "JanusProImageARStage.replay requires past_key_values for cached teacher forcing. "
-                        "Disable gradient checkpointing for the Janus-Pro image AR stage."
-                    )
+            logits = self.model.model.gen_head(prediction_hidden)
+            cfg_logits = self._cfg_logits(logits, float(conditions.cfg_weight))
+            log_probs_full = F.log_softmax(cfg_logits.float() / temp, dim=-1)
+            per_token_logps = log_probs_full.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1)
 
         flat: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
