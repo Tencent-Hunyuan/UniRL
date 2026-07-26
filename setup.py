@@ -39,6 +39,8 @@ setup(
         ],
         "infer": [
             "accelerate>=0.30",
+            "einops>=0.7",
+            "timm>=0.9.16",
         ],
         "eval": [
             "torchvision>=0.16",

@@ -103,7 +103,7 @@ class JanusProPipeline(Pipeline):
         return cls.from_bundle(bundle, config=config)
 
     def generate(self, req: RolloutReq) -> RolloutResp:
-        task = str(req.stage_config.get("task") or "").strip().lower()
+        task = str(req.task_config.get("task") or "").strip().lower()
         if not task:
             task = "i2t" if isinstance(req.primitives.get("image"), Images) else "t2i"
         if task in {"i2t", "it2t", "understanding", "text"}:
@@ -128,7 +128,7 @@ class JanusProPipeline(Pipeline):
                 f"{type(images_prim).__name__ if images_prim is not None else 'None'}"
             )
 
-        chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(req.task_config.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = JanusProChatTemplateStage(
                 self.bundle,

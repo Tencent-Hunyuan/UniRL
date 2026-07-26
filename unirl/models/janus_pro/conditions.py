@@ -16,8 +16,7 @@ def _pad_seq_tensor(value: Optional[torch.Tensor], target_seq_len: int) -> Optio
         return value
     if int(value.shape[1]) > target_seq_len:
         raise ValueError(
-            f"Cannot pad Janus-Pro sequence tensor with seq_len={value.shape[1]} "
-            f"to shorter target={target_seq_len}"
+            f"Cannot pad Janus-Pro sequence tensor with seq_len={value.shape[1]} to shorter target={target_seq_len}"
         )
     target_shape = list(value.shape)
     target_shape[1] = int(target_seq_len)
