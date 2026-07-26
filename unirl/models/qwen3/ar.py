@@ -208,8 +208,7 @@ def _replay_aware_forward(
 def _require_value_head_for_replay(model: Any, return_values: bool) -> None:
     if return_values and getattr(model, "value_head", None) is None:
         raise ValueError(
-            "Qwen3 replay: return_values=True requires a value head "
-            "(set use_value_head=True in the pipeline config)"
+            "Qwen3 replay: return_values=True requires a value head (set use_value_head=True in the pipeline config)"
         )
 
 
@@ -234,7 +233,6 @@ def _finalize_replay_output(
         if segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError("Qwen3ARStage.replay: segment requires cu_seqlens to flatten values")
         lengths = [int(n) for n in segment.lengths.tolist()]
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
         flat: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
             if n <= 0:
@@ -510,9 +508,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             )
             if packed is not None:
                 return packed
-        return self.padding_replay(
-            conditions, segment=segment, temperature=temperature, return_values=return_values
-        )
+        return self.padding_replay(conditions, segment=segment, temperature=temperature, return_values=return_values)
 
     def packed_replay(
         self,
