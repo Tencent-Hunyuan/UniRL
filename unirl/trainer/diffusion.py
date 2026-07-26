@@ -63,6 +63,7 @@ class DiffusionTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
+        self._train_fraction = float(train_fraction)
         # Colocate memory dance: offload the FSDP train state (params + grads +
         # optimizer) to CPU during the rollout's generate so a colocate
         # vLLM/SGLang engine fits, onload before the train backward. Off by
@@ -526,7 +527,13 @@ class DiffusionTrainer(BaseTrainer):
         self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
 
-    def evaluate(self, step: int) -> float:
+    def evaluate(
+        self,
+        step: int,
+        *,
+        sync_weights: bool = True,
+        sleep_after: bool = True,
+    ) -> float:
         """Periodic eval on the eval set (no training); returns the mean reward.
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
@@ -538,6 +545,11 @@ class DiffusionTrainer(BaseTrainer):
         own-set suite then gets its own generation pass over its own prompts.
         All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
         returns ``eval/reward``.
+
+        ``sync_weights=False`` evaluates the policy already resident in the
+        rollout engine without changing its weight version. ``sleep_after=False``
+        leaves a dedicated rollout engine resident after evaluation. The defaults
+        preserve the synchronous trainer's existing behavior.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
         # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists
@@ -556,7 +568,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         self.rollout.wake_up()
-        if self.weight_sync is not None:
+        if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
         # Default pass: training reward + shared-set suites score the SAME images.
         scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
@@ -565,7 +577,8 @@ class DiffusionTrainer(BaseTrainer):
             if suite.data_source is not None:
                 n = suite.num_prompts or self.eval_num_prompts
                 metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
-        self.rollout.sleep()
+        if sleep_after:
+            self.rollout.sleep()
         logger.info(
             "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
             step,
