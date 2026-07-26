@@ -1,0 +1,190 @@
+# @package _global_
+# HunyuanVideo-1.0 T2V GRPO — SGLang rollout with LoRA-merged weight sync.
+#
+# This is the SGLang counterpart of ``hunyuan_video_t2v_trainside``. Its
+# optimization defaults match the validated 1x8 H20 run: LoRA r64, alpha=256,
+# skip-layer=2, 10 denoising steps, and four SDE steps. Both recipes generate
+# standard landscape 720p video (1280x720x5).
+# SGLang holds a full transformer while FSDP trains LoRA; after every rollout,
+# TensorWeightSync folds the adapter into the base weights and pushes the
+# merged transformer. This avoids the known online-SGLang-LoRA delta mismatch.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video/hunyuan_video_t2v_sglang
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 1000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
+  run_name: ${oc.env:WANDB_RUN_NAME,hunyuan_video_t2v_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [hunyuan_video, t2v, grpo, sglang, loramerge, lora-r64, v2]
+  log_media: false
+  media_max_items: 8
+  media_log_interval: 1
+
+# Shared by the trainside replay pipeline and the SGLang rollout engine.
+model_config:
+  _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
+  model_precision: bf16
+  vae_use_tiling: true
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  shift: 5.0
+  hidden_state_skip_layer: 2
+  # SGLang receives merged full weights, not an online LoRA adapter.
+  use_lora: false
+
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.hunyuan_video.bundle.HunyuanVideoBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.hunyuan_video.pipeline.HunyuanVideoPipeline
+  shift: ${model_config.shift}
+  hidden_state_skip_layer: ${model_config.hidden_state_skip_layer}
+  autocast_precision: ${model_config.autocast_precision}
+  trajectory_precision: ${model_config.trajectory_precision}
+  logprob_precision: ${model_config.logprob_precision}
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: [
+    "HunyuanVideoTransformerBlock",
+    "HunyuanVideoSingleTransformerBlock",
+    "HunyuanVideoTokenReplaceTransformerBlock",
+    "HunyuanVideoTokenReplaceSingleTransformerBlock",
+  ]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 256
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - attn.add_q_proj
+      - attn.add_k_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - ff.net.0.proj
+      - ff.net.2
+      - ff_context.net.0.proj
+      - ff_context.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: hunyuan_video
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    forward_batch_size: 1
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # The validated paired run used SGLang's native rollout log-prob anchor.
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.hunyuan_video.conditions.HunyuanVideoConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: ${sampling.seed}
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 720
+  width: 1280
+  num_frames: 5
+  eta: 0.7
+  samples_per_prompt: 8
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    num_sde_steps: 4
+
+weight_sync_interval: 1
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: true
+  adapter_name: default
+  bucket_size_mb: 512
+  flush_cache: true
+  name_remap: {"*": "transformer.*"}

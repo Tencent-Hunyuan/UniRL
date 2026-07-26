@@ -51,7 +51,7 @@ class PEPipeline(Pipeline):
       (``ARSamplingParams``, ``samples_per_prompt = N`` rewrites/prompt) drives
       the LLM child and the ``"diffusion"`` entry (``DiffusionSamplingParams``,
       ``samples_per_prompt = M`` images/rewrite) drives the diffusion child.
-    - ``stage_config["chat"]: dict`` (optional) — forwarded to the LLM
+    - ``task_config["chat"]: dict`` (optional) — forwarded to the LLM
       chat-template stage as a per-request system-instruction override.
     - ``sigmas: Tensor[T+1]`` — engine-pinned; forwarded to the diffusion
       child only.
@@ -275,7 +275,7 @@ class PEPipeline(Pipeline):
         Carries the (N-replicated) prompts and the AR sampling params; drops
         sigmas, request_conditions, non-text primitives, and diffusion params.
 
-        Forwards the parent's ``stage_config["chat"]`` and, when
+        Forwards the parent's ``task_config["chat"]`` and, when
         ``self.pe_instruction`` is set, injects it as the chat
         ``system_instruction`` (overwriting any inherited value) so the
         rewriter enhances the prompt — matching ComposedRolloutEngine
@@ -283,17 +283,17 @@ class PEPipeline(Pipeline):
         AR/chat ``system_instruction`` so generation always uses the recipe's
         PE prompt.
         """
-        chat_cfg = dict(req.stage_config.get("chat") or {})
+        chat_cfg = dict(req.task_config.get("chat") or {})
         if self.pe_instruction:
             chat_cfg["system_instruction"] = self.pe_instruction
-        stage_config = {"chat": chat_cfg} if chat_cfg else {}
+        task_config = {"chat": chat_cfg} if chat_cfg else {}
         return RolloutReq(
             sample_ids=list(sample_ids),
             group_ids=list(group_ids),
             primitives={"text": texts},
             request_conditions={},
             sampling_params={"ar": req.sampling_params.get("ar")},
-            stage_config=stage_config,
+            task_config=task_config,
             sigmas=None,
         )
 

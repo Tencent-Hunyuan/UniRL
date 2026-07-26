@@ -15,7 +15,7 @@ than a separate text encoder.
 Five task modes, two stages (rollout + replay each): image-out ``t2i`` / ``it2i``
 (editing) ride :class:`BagelDiffusionStage`; text-out ``t2t`` / ``i2t`` / ``it2t``
 ride :class:`BagelARStage` (the und path, ``ar.py`` + the AR adapters in
-``rl_ops.py``). ``BagelPipeline.generate`` routes via ``stage_config["task"]``
+``rl_ops.py``). ``BagelPipeline.generate`` routes via ``task_config["task"]``
 or infers from the sampling-params type + image-input presence.
 
 Kept flash-attn-free at import time: ``import unirl.models.bagel`` must not pull
