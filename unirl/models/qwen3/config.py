@@ -73,6 +73,7 @@ class Qwen3PipelineConfig:
     # Chat-template thinking switch; MUST agree with the rollout engine's
     # chat_template_kwargs.enable_thinking or train/rollout prompts diverge.
     enable_thinking: bool = False
+    max_prompt_length: int = 4096
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3PipelineConfig.model_precision")

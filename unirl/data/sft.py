@@ -11,6 +11,7 @@ Manifest row shapes (JSONL, one object per line; relative media URIs resolve
 against the manifest's directory):
 
 - AR (LLM):   ``{"prompt": str, "response": str}``
+- AR (agent): ``{"messages": [..., {"role": "assistant", ...}], "tools": [...]}``
 - AR (VLM):   ``{"prompt", "response", "media": [{"modality": "image",
   "role": "condition", "uri": "img/0.png"}]}``
 - Diffusion:  ``{"prompt": str, "media": [{"modality": "image",
@@ -18,8 +19,8 @@ against the manifest's directory):
   for ``prompt``)
 
 Rows are OPAQUE records driver-side — media loading and tokenization happen on
-the training workers (``unirl/train/sft/track_builder.py``), so nothing heavy
-crosses the driver/Ray boundary.
+the training workers (``unirl/train/sft/track_builder.py`` track builders), so nothing heavy crosses
+the driver/Ray boundary.
 
 Epoch semantics: :class:`SupervisedDataSource` walks a per-epoch reshuffled
 order and exposes ``state_dict()`` / ``load_state_dict()`` with the exact
@@ -44,6 +45,8 @@ _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
     "caption",
     "response",
+    "messages",
+    "tools",
     "media",
     "media_refs",
     "metadata",
@@ -51,6 +54,55 @@ _SUPERVISED_EXCLUDED_KEYS = {
     "prompt_id",
     *_LEGACY_EMBEDDING_FIELDS,
 }
+
+
+def tokenize_agent_target(
+    record: Dict[str, Any],
+    *,
+    tokenizer: Any,
+    enable_thinking: bool,
+) -> List[int]:
+    """Render an agent record and return only its final assistant-turn tokens."""
+    messages = record["messages"]
+    history = messages[:-1]
+    tools = record.get("tools")
+
+    def apply_template(turns: List[Dict[str, Any]], *, add_generation_prompt: bool) -> List[int]:
+        rendered = tokenizer.apply_chat_template(
+            turns,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            tokenize=True,
+            return_dict=False,
+            truncation=False,
+        )
+        if isinstance(rendered, dict):
+            rendered = rendered["input_ids"]
+        if hasattr(rendered, "tolist"):
+            rendered = rendered.tolist()
+        if rendered and isinstance(rendered[0], list):
+            rendered = rendered[0]
+        return [int(token_id) for token_id in rendered]
+
+    prompt_ids = apply_template(history, add_generation_prompt=True)
+    full_ids = apply_template(messages, add_generation_prompt=False)
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        raise ValueError(
+            "Agent target is not a suffix of its rendered history. "
+            "Ensure enable_thinking matches the dataset's assistant reasoning format."
+        )
+
+    target_ids = full_ids[len(prompt_ids) :]
+    eos_id = tokenizer.eos_token_id
+    if isinstance(eos_id, (list, tuple)):
+        eos_id = eos_id[0] if eos_id else None
+    if eos_id is not None and eos_id in target_ids:
+        # Templates commonly append a newline after <|im_end|>. It is not part
+        # of the assistant turn and follows the model's stop token.
+        last_eos = len(target_ids) - 1 - target_ids[::-1].index(eos_id)
+        target_ids = target_ids[: last_eos + 1]
+    return target_ids
 
 
 def normalize_supervised_example(
@@ -61,10 +113,11 @@ def normalize_supervised_example(
 ) -> Dict[str, Any]:
     """Normalize one raw manifest row into the supervised record shape.
 
-    Returns ``{"sample_id", "prompt", ["response"], ["media_refs"],
-    ["metadata"]}``. ``response`` stays optional here — whether it is required
-    is a per-domain decision the worker-side track builder enforces (AR
-    requires it; diffusion requires a ``role="target"`` media ref instead).
+    Returns either a legacy ``{"sample_id", "prompt", ...}`` record or an
+    agent ``{"sample_id", "messages", ["tools"], ...}`` record. Agent rows
+    carry the target assistant turn as the final message; the worker-side
+    builder renders the preceding history as the prompt and supervises only
+    that final turn.
     """
     if not isinstance(item, dict):
         raise TypeError(f"Supervised example must be a dict, got {type(item).__name__}.")
@@ -74,22 +127,59 @@ def normalize_supervised_example(
             f"Supervised manifests must be raw-data-first and may not include legacy embedding fields: {legacy}."
         )
 
-    prompt = item.get("prompt", item.get("caption", ""))
-    if not isinstance(prompt, str) or not prompt:
-        raise ValueError("Supervised example is missing a non-empty 'prompt' or 'caption' field.")
-
     record: Dict[str, Any] = {
         "sample_id": str(item.get("sample_id", item.get("prompt_id", default_sample_id))),
-        "prompt": prompt,
     }
+    messages = item.get("messages")
+    if messages is not None:
+        if "prompt" in item or "caption" in item or "response" in item:
+            raise ValueError("Agent supervised examples use 'messages' and may not also set prompt/response fields.")
+        if not isinstance(messages, list) or len(messages) < 2:
+            raise ValueError("Agent supervised example 'messages' must be a list with at least two turns.")
+        normalized_messages: List[Dict[str, Any]] = []
+        for turn, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise TypeError(f"Agent message {turn} must be a dict, got {type(message).__name__}.")
+            role = message.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError(f"Agent message {turn} has unsupported role {role!r}.")
+            content = message.get("content")
+            tool_calls = message.get("tool_calls")
+            if content is not None and not isinstance(content, str):
+                raise TypeError(
+                    f"Agent message {turn} 'content' must be a string or null, got {type(content).__name__}."
+                )
+            if tool_calls is not None and (role != "assistant" or not isinstance(tool_calls, list)):
+                raise TypeError(f"Agent message {turn} 'tool_calls' must be a list on an assistant turn.")
+            if role == "assistant" and not content and not tool_calls:
+                raise ValueError(f"Agent assistant message {turn} has neither content nor tool_calls.")
+            normalized_messages.append(dict(message))
+        if normalized_messages[-1]["role"] != "assistant":
+            raise ValueError("Agent supervised example must end with the target assistant turn.")
+        if not any(message["role"] == "user" for message in normalized_messages[:-1]):
+            raise ValueError("Agent supervised example has no user turn before the target assistant turn.")
+        record["messages"] = normalized_messages
 
-    response = item.get("response")
-    if response is not None:
-        if not isinstance(response, str) or not response:
+        tools = item.get("tools")
+        if tools is not None:
+            if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
+                raise TypeError("Agent supervised example 'tools' must be a list of tool-schema objects.")
+            record["tools"] = list(tools)
+    else:
+        prompt = item.get("prompt", item.get("caption", ""))
+        if not isinstance(prompt, str) or not prompt:
             raise ValueError(
-                f"Supervised example 'response' must be a non-empty string, got {type(response).__name__}."
+                "Supervised example needs either a non-empty 'prompt'/'caption' field or agent 'messages'."
             )
-        record["response"] = response
+        record["prompt"] = prompt
+
+        response = item.get("response")
+        if response is not None:
+            if not isinstance(response, str) or not response:
+                raise ValueError(
+                    f"Supervised example 'response' must be a non-empty string, got {type(response).__name__}."
+                )
+            record["response"] = response
 
     media_refs = _normalize_media_refs(item.get("media_refs", item.get("media")), base_dir=base_dir)
     if media_refs:
@@ -249,4 +339,5 @@ __all__ = [
     "SupervisedDataSource",
     "SupervisedDataset",
     "normalize_supervised_example",
+    "tokenize_agent_target",
 ]

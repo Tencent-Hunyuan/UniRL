@@ -195,13 +195,13 @@ class HunyuanImage3Pipeline(Pipeline):
     def generate(self, req: RolloutReq) -> RolloutResp:
         """Dispatch to the per-task generate function in ``modes/``.
 
-        ``stage_params["task"]`` selects the topology. Lazy-imports the
+        ``task_config["task"]`` selects the topology. Lazy-imports the
         modes package to avoid the circular ``modes -> pipeline`` ref
         (mode files type-annotate ``pipeline: "HunyuanImage3Pipeline"``).
         """
         from .modes import i2t, it2i, t2i, t2t, t2ti
 
-        task = req.stage_config.get("task", "t2i")
+        task = req.task_config.get("task", "t2i")
         if task == "t2t":
             return t2t.generate(self, req)
         if task == "i2t":

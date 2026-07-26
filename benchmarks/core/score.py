@@ -71,6 +71,126 @@ class RewardServiceClient:
         return rows, n_errors
 
 
+_WORD_TO_DIGIT = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+_YES_SURFACE_FORMS = ("Yes", "yes", " Yes", " yes")
+
+
+def _geneval2_answer_forms(question: str, expected: str) -> Tuple[str, ...]:
+    """Expected-answer surface forms scored at the first token (GenEval2 Soft-TIFA convention):
+    counting atoms score the number word + its digit; every other atom expects 'Yes'."""
+    expected = (expected or "").strip()
+    if question.startswith("How many"):
+        forms = [expected, expected.capitalize(), " " + expected, " " + expected.capitalize()]
+        digit = _WORD_TO_DIGIT.get(expected.lower())
+        if digit is not None:
+            forms += [digit, " " + digit]
+        return tuple(forms)
+    return _YES_SURFACE_FORMS
+
+
+def _geneval2_answer_token_ids(tokenizer, question: str, expected: str) -> List[int]:
+    """First answer-token ids without BOS/EOS injection or duplicate probability mass."""
+    token_ids: List[int] = []
+    seen: set[int] = set()
+    for form in _geneval2_answer_forms(question, expected):
+        encoded = tokenizer.encode(form, add_special_tokens=False)
+        if not encoded:
+            continue
+        token_id = int(encoded[0])
+        if token_id not in seen:
+            seen.add(token_id)
+            token_ids.append(token_id)
+    return token_ids
+
+
+def score_images_local_geneval2(
+    pairs: Sequence[Tuple[str, Path]],
+    metadatas: Optional[Sequence[Optional[Dict]]] = None,
+    *,
+    model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
+    aggregation: str = "gm",
+    device: str = "cuda",
+) -> Tuple[List[Optional[Dict[str, float]]], int]:
+    """Score (prompt, image) pairs with a self-contained transformers Qwen3-VL Soft-TIFA scorer.
+
+    Only needs ``torch`` + ``transformers`` + ``PIL`` (no reward service, no heavy ``unirl``
+    runtime): for each ``vqa_list`` atom it reads the full-vocab softmax at the first generated
+    token and sums the probability over the expected answer's surface forms, then aggregates atoms
+    by geometric mean. This is the scorer required to reproduce the DPPO paper numbers (the vLLM
+    reward service reads only top-k logprobs). Returns rows keyed ``geneval2/vqascore`` (same shape
+    as :meth:`RewardServiceClient.score_images`) and the count of prompts with no ``vqa_list``.
+    """
+    import math
+
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+    dev = "cuda" if device in ("auto", "") else device
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, torch_dtype="auto").to(dev)
+    model.eval()
+
+    def _answer_prob(question: str, image: "Image.Image", token_ids: List[int]) -> float:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": f"{question} Answer in one word."},
+                ],
+            }
+        ]
+        inputs = processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+        ).to(dev)
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs, max_new_tokens=1, do_sample=False, output_scores=True, return_dict_in_generate=True
+            )
+        probs = torch.nn.functional.softmax(out.scores[0], dim=-1)
+        return sum(probs[0, tid].item() for tid in token_ids)
+
+    def _soft_tifa(vqa_list: List, image: "Image.Image") -> float:
+        scores: List[float] = []
+        for q, a in ((v[0], v[1]) for v in vqa_list):
+            tids = _geneval2_answer_token_ids(processor.tokenizer, q, a)
+            if tids:
+                scores.append(_answer_prob(q, image, tids))
+        if not scores:
+            return 0.0
+        if aggregation == "gm":
+            scores = [max(s, 1e-300) for s in scores]
+            return float(math.exp(sum(math.log(s) for s in scores) / len(scores)))
+        return sum(scores) / len(scores)
+
+    rows: List[Optional[Dict[str, float]]] = []
+    n_errors = 0
+    for i, (prompt, path) in enumerate(pairs):
+        md = metadatas[i] if metadatas is not None and i < len(metadatas) else None
+        vqa = md.get("vqa_list") if isinstance(md, dict) else None
+        if not isinstance(vqa, list) or not vqa:
+            rows.append(None)
+            n_errors += 1
+            continue
+        rows.append({"geneval2/vqascore": float(_soft_tifa(vqa, Image.open(path).convert("RGB")))})
+        if (i + 1) % 50 == 0:
+            print(f"[score-local] {i + 1}/{len(pairs)}", flush=True)
+    return rows, n_errors
+
+
 # geneval2 metadata canary: a 64x64 white PNG plus one deliberately false VQA
 # question about it. A scorer that honors request-metadata vqa_lists (Soft-TIFA)
 # scores ~0; a pre-metadata scorer ignores it and answers its generic
