@@ -12,7 +12,9 @@
 #   BAGEL_PATH      HF id or local ckpt (default ByteDance-Seed/BAGEL-7B-MoT)
 #   SFT_DATA        train manifest (.jsonl rows: {"prompt",
 #                   "media": [{"modality": "image", "role": "target", "uri": ...}]})
-#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#   SFT_EVAL_DATA   optional eval manifest (validation is disabled when unset)
+#   SFT_CACHE_DIR / SFT_CACHE_FINGERPRINT
+#                   optional cache root + explicit model/config revision
 #
 # Data prep: shared with sd3_sft (python -m unirl.utils.prepare_sft_t2i).
 #
@@ -119,11 +121,16 @@ track_builder:
   height: 512
   width: 512
   guidance_scale: 1.0
+  cache_dir: ${oc.env:SFT_CACHE_DIR,null}
+  cache_fingerprint: ${oc.env:SFT_CACHE_FINGERPRINT,null}
+  cache_text_conditions: ${oc.decode:${oc.env:SFT_CACHE_TEXT_CONDITIONS,false}}
+  cache_vae_latents: ${oc.decode:${oc.env:SFT_CACHE_VAE_LATENTS,false}}
+  cache_max_entries: ${oc.decode:${oc.env:SFT_CACHE_MAX_ENTRIES,4096}}
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
   manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42
 
 # Params object FlowMatchSFT forwards into predict_noise_at_step. cfg scales

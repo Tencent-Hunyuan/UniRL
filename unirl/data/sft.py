@@ -31,15 +31,30 @@ has no such notion, which is why this is a separate class).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import random
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs
 
 logger = logging.getLogger(__name__)
+
+
+def _manifest_fingerprint(path: str) -> str:
+    """Stable content fingerprint used to reject resume against changed data."""
+    before = os.stat(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    after = os.stat(path)
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(f"Supervised manifest changed while it was being read: {path}")
+    return f"sha256:{digest.hexdigest()}"
+
 
 _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
@@ -204,6 +219,7 @@ class SupervisedDataset:
 
     def __init__(self, file_path: str) -> None:
         self.file_path = file_path
+        initial_stat = os.stat(file_path)
         self._base_dir = os.path.dirname(os.path.abspath(file_path))
         prefix = os.path.basename(file_path) or "sft_source"
         self.records: List[Dict[str, Any]] = []
@@ -212,6 +228,12 @@ class SupervisedDataset:
             self.records.append(record)
         if not self.records:
             raise ValueError(f"No supervised examples found in {file_path}")
+        self.fingerprint = _manifest_fingerprint(file_path)
+        final_stat = os.stat(file_path)
+        if (initial_stat.st_size, initial_stat.st_mtime_ns) != (final_stat.st_size, final_stat.st_mtime_ns):
+            raise RuntimeError(f"Supervised manifest changed while it was being parsed: {file_path}")
+        for record in self.records:
+            record["_manifest_fingerprint"] = self.fingerprint
         logger.info("Loaded %d supervised examples from %s", len(self.records), file_path)
 
     @staticmethod
@@ -263,14 +285,15 @@ class SupervisedDataSource:
         self.eval_dataset = SupervisedDataset(eval_manifest_path) if eval_manifest_path else None
         if self.eval_dataset is None:
             logger.warning(
-                "SupervisedDataSource: no eval_manifest_path — eval batches fall back to the "
-                "TRAIN set (eval loss then measures training data)."
+                "SupervisedDataSource: no eval_manifest_path — validation is disabled. "
+                "Set SFT_EVAL_DATA or eval_manifest_path explicitly to enable it."
             )
         self.seed = seed
         self.shuffle = shuffle
         self._epoch = 0
         self._pos = 0
         self._order = self._make_order()
+        self._peeked: Optional[Tuple[List[Dict[str, Any]], int, int]] = None
 
     # ---- train stream --------------------------------------------------
 
@@ -281,6 +304,8 @@ class SupervisedDataSource:
         return order
 
     def get_samples(self, batch_size: int) -> List[Dict[str, Any]]:
+        if self._peeked is not None:
+            raise RuntimeError("SupervisedDataSource.get_samples: commit the pending peeked batch before advancing.")
         batch: List[Dict[str, Any]] = []
         while len(batch) < batch_size:
             if self._pos >= len(self._order):
@@ -291,17 +316,68 @@ class SupervisedDataSource:
             self._pos += 1
         return batch
 
+    def peek_samples(self, batch_size: int) -> List[Dict[str, Any]]:
+        """Prepare the next batch without advancing the checkpointed cursor."""
+        if self._peeked is not None:
+            raise RuntimeError("SupervisedDataSource.peek_samples: a batch is already pending.")
+        before_epoch, before_pos = self._epoch, self._pos
+        batch = self.get_samples(batch_size)
+        after_epoch, after_pos = self._epoch, self._pos
+        self._epoch, self._pos = before_epoch, before_pos
+        self._order = self._make_order()
+        self._peeked = (batch, after_epoch, after_pos)
+        return batch
+
+    def commit_peeked_samples(self) -> List[Dict[str, Any]]:
+        """Advance to and return the batch previously produced by ``peek_samples``."""
+        if self._peeked is None:
+            raise RuntimeError("SupervisedDataSource.commit_peeked_samples: no batch is pending.")
+        batch, epoch, position = self._peeked
+        self._peeked = None
+        self._epoch, self._pos = epoch, position
+        self._order = self._make_order()
+        return batch
+
     @property
     def epoch(self) -> float:
         """Fractional epochs consumed — for logging."""
         return self._epoch + self._pos / max(1, len(self.dataset))
 
+    @property
+    def has_eval_data(self) -> bool:
+        return self.eval_dataset is not None
+
     # ---- resume cursor --------------------------------------------------
 
-    def state_dict(self) -> Dict[str, int]:
-        return {"epoch": self._epoch, "position": self._pos, "seed": self.seed}
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "epoch": self._epoch,
+            "position": self._pos,
+            "seed": self.seed,
+            "manifest_fingerprint": self.dataset.fingerprint,
+            "num_records": len(self.dataset),
+        }
 
-    def load_state_dict(self, state: Dict[str, int]) -> None:
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self._peeked = None
+        checkpoint_fingerprint = state.get("manifest_fingerprint")
+        if checkpoint_fingerprint is None:
+            logger.warning(
+                "SupervisedDataSource.load_state_dict: legacy checkpoint has no manifest fingerprint; "
+                "dataset identity cannot be verified."
+            )
+        elif checkpoint_fingerprint != self.dataset.fingerprint:
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: manifest fingerprint mismatch "
+                f"(checkpoint={checkpoint_fingerprint}, current={self.dataset.fingerprint}) — "
+                "refusing to resume against changed data."
+            )
+        checkpoint_size = state.get("num_records")
+        if checkpoint_size is not None and int(checkpoint_size) != len(self.dataset):
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: dataset size mismatch "
+                f"(checkpoint={checkpoint_size}, current={len(self.dataset)})."
+            )
         if state.get("seed", self.seed) != self.seed:
             logger.warning(
                 "SupervisedDataSource.load_state_dict: checkpoint seed %s != configured seed %s — "
@@ -328,7 +404,9 @@ class SupervisedDataSource:
         the trainer pads it to the DP width with ``_eval_pad`` rows the loss
         masks out, so the full set is covered exactly.
         """
-        pool = self.eval_dataset if self.eval_dataset is not None else self.dataset
+        if self.eval_dataset is None:
+            return
+        pool = self.eval_dataset
         n = len(pool)
         limit = n if eval_num_samples < 0 else min(eval_num_samples, n)
         for start in range(0, limit, batch_size):

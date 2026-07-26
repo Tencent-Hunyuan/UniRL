@@ -103,11 +103,16 @@ track_builder:
   height: 512
   width: 512
   guidance_scale: 1.0
+  cache_dir: ${oc.env:SFT_CACHE_DIR,null}
+  cache_fingerprint: ${oc.env:SFT_CACHE_FINGERPRINT,null}
+  cache_text_conditions: ${oc.decode:${oc.env:SFT_CACHE_TEXT_CONDITIONS,false}}
+  cache_vae_latents: ${oc.decode:${oc.env:SFT_CACHE_VAE_LATENTS,false}}
+  cache_max_entries: ${oc.decode:${oc.env:SFT_CACHE_MAX_ENTRIES,4096}}
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
   manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42
 
 sampling:

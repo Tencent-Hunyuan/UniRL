@@ -32,6 +32,7 @@ def main(cfg: DictConfig) -> None:
         eval_interval=int(cfg.get("eval_interval", 0)),
         eval_batch_size=int(cfg.get("eval_batch_size", 8)),
         eval_num_samples=int(cfg.get("eval_num_samples", -1)),
+        prefetch_next_batch=bool(cfg.get("prefetch_next_batch", False)),
     )
     trainer.train(
         num_steps=int(cfg.get("num_steps", 100)),

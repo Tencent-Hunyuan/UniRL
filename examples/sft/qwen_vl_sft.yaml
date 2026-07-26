@@ -9,7 +9,7 @@
 #   QWEN_VL_PATH    HF id or local checkpoint (default Qwen/Qwen2.5-VL-7B-Instruct)
 #   SFT_DATA        train manifest (.jsonl rows: {"prompt", "response",
 #                   "media": [{"modality": "image", "role": "condition", "uri": ...}]})
-#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#   SFT_EVAL_DATA   optional eval manifest (validation is disabled when unset)
 #
 # Data prep (HF llava-instruct sample):
 #   python -m unirl.utils.prepare_sft_vlm --out-dir data/sft_vlm
@@ -24,6 +24,7 @@ num_steps: 200
 eval_interval: 20
 eval_batch_size: 16
 eval_num_samples: -1        # -1 = full eval set
+prefetch_next_batch: true    # overlap next-batch CPU tokenize/image I/O with GPU train
 save_interval: 0
 save_mode: auto
 
@@ -48,6 +49,7 @@ bundle:
 pipeline:
   _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
   max_prompt_length: 2048
+  pad_to_max_length: false
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -93,9 +95,10 @@ stack:
 track_builder:
   _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
   max_response_length: 1024
+  prefetch_cpu: true
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
   manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42

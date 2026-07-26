@@ -94,5 +94,5 @@ track_builder:
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
   manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42
