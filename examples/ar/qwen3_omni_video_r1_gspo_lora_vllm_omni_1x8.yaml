@@ -49,15 +49,15 @@ bundle:
     use_gradient_checkpointing: true
     max_prompt_length: 12288
     video_fps: 1.0
+    video_max_frames: 64
     video_max_pixels: 262144
-    use_audio_in_video: false
 
 pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 12288
   video_fps: 1.0
+  video_max_frames: 64
   video_max_pixels: 262144
-  use_audio_in_video: false
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend

@@ -4,7 +4,8 @@
 # 4-GPU single-replica sibling of qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8.yaml.
 # TP=4 (required — TP must divide the audio tower's 20 attention heads) uses all
 # 4 GPUs for the rollout engine; training FSDP DP=4 time-shares the same cards via
-# sleep/wake (enable_fsdp_offload). Video-only MCQA (use_audio_in_video=false).
+# sleep/wake (enable_fsdp_offload). This adapter supports video-only MCQA;
+# video audio-track conditioning is intentionally not exposed.
 #
 # Launch:
 #   bash run_vllm_omni.sh video
@@ -60,15 +61,15 @@ bundle:
     use_gradient_checkpointing: true
     max_prompt_length: 16384
     video_fps: 1.0
+    video_max_frames: 64
     video_max_pixels: 262144
-    use_audio_in_video: false
 
 pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 16384
   video_fps: 1.0
+  video_max_frames: 64
   video_max_pixels: 262144
-  use_audio_in_video: false
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -141,13 +142,13 @@ reward:
   overlong_buffer_len: 4096
   overlong_penalty_factor: 1.0
   backend:
-    # video_r1 mandates <answer>X</answer>; graded_format_reward:false is strict —
+    # video_r1 mandates <answer>X</answer>; require_answer_tag is strict —
     # 1.0 only for a well-formed <answer>X</answer> matching gt, else 0.
     _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
     base_device: cpu
     config:
       _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
-      graded_format_reward: false
+      require_answer_tag: true
 
 algorithm:
   _target_: unirl.algorithms.gspo.GSPO
@@ -161,8 +162,8 @@ algorithm:
   sampling_temperature: 1.0
   # π_old anchor from a pre-update train-side replay (ratio starts ≈1 and the
   # tiny GSPO clip only bites on optimizer drift). Under this mode the true
-  # training↔rollout KL is exposed via ``train_rollout_k3`` in the metrics,
-  # computed against the immutable ``segment.rollout_log_probs``.
+  # training↔rollout drift remains visible in the rollout_replay/k3 metrics,
+  # computed against the preserved ``segment.rollout_log_probs``.
   old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class

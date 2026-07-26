@@ -43,8 +43,6 @@ class Qwen3OmniPipelineConfig:
     video_max_frames: Optional[int] = None
     # Per-frame pixel cap passed to the processor as ``size.longest_edge``.
     video_max_pixels: Optional[int] = None
-    # Whether to include the video's audio track in TMRoPE inputs.
-    use_audio_in_video: bool = False
 
     # Unsupported until the FSDP loader remaps checkpoint ``thinker.`` keys.
     meta_init_transformer: bool = False
@@ -53,6 +51,12 @@ class Qwen3OmniPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3OmniPipelineConfig.model_precision")
+        if float(self.video_fps) <= 0.0:
+            raise ValueError(f"Qwen3OmniPipelineConfig.video_fps must be > 0, got {self.video_fps!r}")
+        if self.video_max_frames is not None and int(self.video_max_frames) < 1:
+            raise ValueError(f"Qwen3OmniPipelineConfig.video_max_frames must be >= 1, got {self.video_max_frames!r}")
+        if self.video_max_pixels is not None and int(self.video_max_pixels) < 1:
+            raise ValueError(f"Qwen3OmniPipelineConfig.video_max_pixels must be >= 1, got {self.video_max_pixels!r}")
 
 
 __all__ = ["Qwen3OmniPipelineConfig"]

@@ -78,6 +78,11 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
     return "", 0.0
 
 
+def _extract_tagged_answer_letter(text: str) -> str:
+    matches = _ANSWER_TAG.findall(text.strip())
+    return matches[-1].upper() if matches else ""
+
+
 class MCExactMatchRewardScorer(LocalRewardBackend):
     """Multiple-choice exact-match reward for VLM QA tasks."""
 
@@ -88,6 +93,7 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
         del base_device
         super().__init__()
         self.graded_format_reward = bool(getattr(config, "graded_format_reward", False))
+        self.require_answer_tag = bool(getattr(config, "require_answer_tag", False))
 
     def _load_model(self) -> None:
         self.model = "mc_exact_match"
@@ -103,7 +109,10 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
                 rewards.append(0.0)
                 continue
             gt = _normalize_answer(str(meta["answer"]))
-            if self.graded_format_reward:
+            if self.require_answer_tag:
+                predicted = _extract_tagged_answer_letter(text)
+                rewards.append(1.0 if predicted == gt else 0.0)
+            elif self.graded_format_reward:
                 predicted, fmt_weight = _extract_answer_letter_graded(text)
                 rewards.append(fmt_weight if predicted == gt else 0.0)
             else:
@@ -118,3 +127,8 @@ class MCExactMatchSpec(BaseRewardComponentSpec):
     """Configure exact match and optional graded answer formatting."""
 
     graded_format_reward: bool = False
+    require_answer_tag: bool = False
+
+    def __post_init__(self) -> None:
+        if self.graded_format_reward and self.require_answer_tag:
+            raise ValueError("MCExactMatchSpec graded_format_reward and require_answer_tag are mutually exclusive")

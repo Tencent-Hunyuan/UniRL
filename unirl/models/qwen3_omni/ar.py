@@ -32,15 +32,20 @@ def _fuse_video_embeds(
 ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
     """Prepare video and DeepStack inputs inside the root FSDP forward."""
     inputs_embeds = transformer.get_input_embeddings()(full_ids)
-    video_embeds, video_embeds_multiscale = transformer.get_video_features(pixel_values_videos, video_grid_thw)
+    video_outputs = transformer.get_video_features(
+        pixel_values_videos,
+        video_grid_thw,
+        return_dict=True,
+    )
+    video_embeds = video_outputs.pooler_output
+    video_embeds_multiscale = video_outputs.deepstack_features
     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
     _, video_mask, _ = transformer.get_placeholder_mask(
         full_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
     )
     inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-    # Keep the expanded mask; the text model reduces it for DeepStack.
     deepstack_embeds = list(video_embeds_multiscale)
-    visual_pos_masks = video_mask
+    visual_pos_masks = video_mask[..., 0]
     return inputs_embeds, deepstack_embeds, visual_pos_masks
 
 

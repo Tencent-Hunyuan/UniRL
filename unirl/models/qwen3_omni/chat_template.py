@@ -11,27 +11,7 @@ from unirl.types.primitives import Texts
 
 from .bundle import Qwen3OmniBundle
 from .conditions import Qwen3OmniARConditions
-
-
-def _sample_video_frames_pyav(path: str, target_fps: float) -> "torch.Tensor":
-    """Decode and sample ``[T, C, H, W]`` frames at the TMRoPE processor rate."""
-    import av
-    import numpy as np
-
-    container = av.open(path)
-    try:
-        stream = container.streams.video[0]
-        src_fps = float(stream.average_rate) if stream.average_rate else target_fps
-        step = max(1, round(src_fps / float(target_fps)))
-        frames = [
-            frame.to_ndarray(format="rgb24") for i, frame in enumerate(container.decode(video=0)) if i % step == 0
-        ]
-    finally:
-        container.close()
-    if not frames:
-        raise ValueError(f"pyav decoded no frames from video: {path}")
-    arr = np.stack(frames)  # [T, H, W, C] uint8
-    return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()  # [T, C, H, W]
+from .video import limit_video_frames, sample_video_frames_pyav
 
 
 class Qwen3OmniChatTemplateStage:
@@ -43,8 +23,8 @@ class Qwen3OmniChatTemplateStage:
         max_prompt_length: int = 4096,
         pad_to_max_length: bool = False,
         video_fps: float = 1.0,
+        video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
-        use_audio_in_video: bool = False,
     ) -> None:
         self.bundle = bundle
         self.system_instruction = system_instruction
@@ -52,8 +32,8 @@ class Qwen3OmniChatTemplateStage:
         # Cross-worker CONCAT requires a common sequence length when enabled.
         self.pad_to_max_length = bool(pad_to_max_length)
         self.video_fps = float(video_fps)
+        self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
-        self.use_audio_in_video = bool(use_audio_in_video)
 
     def embed(
         self,
@@ -74,13 +54,22 @@ class Qwen3OmniChatTemplateStage:
         for i, text in enumerate(texts.texts):
             content: list = []
             sample_video = None
+            sample_video_fps = self.video_fps
             if videos is not None and i < len(videos) and videos[i] is not None:
                 raw_video = videos[i]
                 # Decode paths here; decoded tensors/arrays pass through.
                 if isinstance(raw_video, str):
-                    sample_video = _sample_video_frames_pyav(raw_video, self.video_fps)
+                    sample_video, sample_video_fps = sample_video_frames_pyav(
+                        raw_video,
+                        target_fps=self.video_fps,
+                        max_frames=self.video_max_frames,
+                    )
                 else:
-                    sample_video = raw_video
+                    sample_video, sample_video_fps = limit_video_frames(
+                        raw_video,
+                        fps=self.video_fps,
+                        max_frames=self.video_max_frames,
+                    )
                 # The processor materializes the video placeholder.
                 content.append({"type": "video", "video": sample_video})
             content.append({"type": "text", "text": text})
@@ -97,8 +86,8 @@ class Qwen3OmniChatTemplateStage:
                 return_tensors="pt",
             )
             if sample_video is not None:
-                # Keep processor ``fps`` equal to the decode rate for TMRoPE.
-                template_kwargs["fps"] = self.video_fps
+                # Keep processor timing equal to the retained frame rate for TMRoPE.
+                template_kwargs["fps"] = sample_video_fps
                 template_kwargs["do_sample_frames"] = False
                 if self.video_max_pixels is not None:
                     # The processor accepts the pixel cap through per-call ``size``.
@@ -106,10 +95,17 @@ class Qwen3OmniChatTemplateStage:
                         "shortest_edge": int(processor.video_processor.size["shortest_edge"]),
                         "longest_edge": self.video_max_pixels,
                     }
-                if self.use_audio_in_video:
-                    template_kwargs["use_audio_in_video"] = True
             inputs = processor.apply_chat_template(messages, **template_kwargs)
             per_sample_inputs.append(inputs)
+
+        for inp in per_sample_inputs:
+            prompt_len = int(inp["input_ids"].shape[-1])
+            if prompt_len > self.max_prompt_length and inp.get("pixel_values_videos") is not None:
+                raise ValueError(
+                    "Qwen3OmniChatTemplateStage: multimodal prompt produced "
+                    f"{prompt_len} tokens, exceeding max_prompt_length={self.max_prompt_length}. "
+                    "Reduce video_max_frames, video_max_pixels, or video_fps, or raise max_prompt_length."
+                )
 
         if self.pad_to_max_length:
             max_len = self.max_prompt_length

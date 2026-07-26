@@ -48,8 +48,8 @@ class Qwen3OmniPipeline(Pipeline):
         system_instruction: Optional[str] = None,
         max_prompt_length: int = 4096,
         video_fps: float = 1.0,
+        video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
-        use_audio_in_video: bool = False,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
     ) -> "Qwen3OmniPipeline":
@@ -59,8 +59,8 @@ class Qwen3OmniPipeline(Pipeline):
             system_instruction=system_instruction,
             max_prompt_length=max_prompt_length,
             video_fps=video_fps,
+            video_max_frames=video_max_frames,
             video_max_pixels=video_max_pixels,
-            use_audio_in_video=use_audio_in_video,
         )
         ar = Qwen3OmniARStage(model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision)
         return cls(
@@ -79,8 +79,8 @@ class Qwen3OmniPipeline(Pipeline):
             system_instruction=config.system_instruction,
             max_prompt_length=config.max_prompt_length,
             video_fps=config.video_fps,
+            video_max_frames=config.video_max_frames,
             video_max_pixels=config.video_max_pixels,
-            use_audio_in_video=config.use_audio_in_video,
         )
         ar = Qwen3OmniARStage(
             model=bundle,
@@ -111,8 +111,8 @@ class Qwen3OmniPipeline(Pipeline):
                 system_instruction=chat_overrides["system_instruction"],
                 max_prompt_length=self.chat_template.max_prompt_length,
                 video_fps=self.chat_template.video_fps,
+                video_max_frames=self.chat_template.video_max_frames,
                 video_max_pixels=self.chat_template.video_max_pixels,
-                use_audio_in_video=self.chat_template.use_audio_in_video,
             )
         else:
             chat_stage = self.chat_template
@@ -159,6 +159,8 @@ class Qwen3OmniPipeline(Pipeline):
         uris = getattr(videos, "uris", None)
         if uris:
             return list(uris)
+        if videos.frames is not None and videos.cu_frames is not None:
+            return [video.frames for video in videos.to_list()]
         for attr in ("to_list", "frames", "videos"):
             v = getattr(videos, attr, None)
             if callable(v):

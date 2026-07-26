@@ -15,10 +15,12 @@ from unirl.models.qwen_image_edit_plus.bundle import QwenImageEditPlusBundle
 from unirl.models.qwen_image_edit_plus.conditions import QwenImageEditPlusConditions
 from unirl.models.qwen_image_edit_plus.config import QwenImageEditPlusPipelineConfig
 from unirl.models.qwen_image_edit_plus.pipeline import QwenImageEditPlusPipeline
+from unirl.models.qwen_image_edit_plus.text_embed import QwenImageEditPlusTextEmbedStage
 
 __all__ = [
     "QwenImageEditPlusBundle",
     "QwenImageEditPlusConditions",
     "QwenImageEditPlusPipeline",
     "QwenImageEditPlusPipelineConfig",
+    "QwenImageEditPlusTextEmbedStage",
 ]
