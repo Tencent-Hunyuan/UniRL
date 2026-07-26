@@ -71,10 +71,12 @@ from torch.utils.checkpoint import checkpoint
 
 __all__ = [
     "decode_text",
+    "decode_text_batched",
     "disable_inference_cache",
     "forward_flow",
     "init_und_context",
     "pack_und_forward_inputs",
+    "prefill_text_batched",
     "prefill_text_split",
     "prefill_vit_split",
     "require_inference_dispatch",
@@ -334,6 +336,124 @@ def decode_text(
             if tid in stop_set:
                 done = True
         curr = token_id.to(device=device, dtype=torch.long).reshape(1)
+    return tokens, logps
+
+
+def prefill_text_batched(
+    model: Any,
+    id_lists: List[torch.Tensor],
+    *,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Prefill text-only prompts into one block-diagonal KV context."""
+    if not id_lists:
+        raise ValueError("prefill_text_batched: id_lists must be non-empty.")
+
+    packed_text_ids: List[int] = []
+    packed_position_ids: List[int] = []
+    packed_text_indexes: List[int] = []
+    text_token_lens: List[int] = []
+    kv_lens: List[int] = []
+    base = 0
+    for ids in id_lists:
+        flat = torch.as_tensor(ids, dtype=torch.long).reshape(-1).tolist()
+        length = len(flat)
+        if length == 0:
+            raise ValueError("prefill_text_batched: empty prompt id list.")
+        packed_text_ids.extend(int(token) for token in flat)
+        packed_position_ids.extend(range(length))
+        packed_text_indexes.extend(range(base, base + length))
+        text_token_lens.append(length)
+        kv_lens.append(length)
+        base += length
+
+    inputs = _to_device(
+        {
+            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
+            "packed_text_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
+            "packed_key_value_indexes": torch.zeros(0, dtype=torch.long),
+            "key_values_lens": torch.zeros(len(id_lists), dtype=torch.int),
+        },
+        device,
+    )
+    fresh_cache = init_und_context(model)["past_key_values"]
+    past = _raw(type(model).forward_cache_update_text)(model, fresh_cache, **inputs)
+    return {"kv_lens": kv_lens, "ropes": list(kv_lens), "past_key_values": past}
+
+
+def decode_text_batched(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    start_token_id: int,
+    sample_fn: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+    max_new_tokens: int,
+    stop_ids: List[int],
+    device: torch.device,
+) -> Tuple[List[List[int]], List[List[float]]]:
+    """Decode a text-only batch with block-diagonal KV indexing."""
+    require_inference_dispatch(model)
+    disable_inference_cache(model)
+    lm = model.language_model
+    batch_size = len(ctx["kv_lens"])
+    if batch_size < 1:
+        raise ValueError("decode_text_batched: empty context batch.")
+
+    kv_lens = torch.tensor(ctx["kv_lens"], dtype=torch.int, device=device)
+    positions = torch.tensor(ctx["ropes"], dtype=torch.long, device=device)
+    packed_kv_indexes = torch.arange(int(kv_lens.sum().item()), dtype=torch.long, device=device)
+    past = ctx["past_key_values"]
+    stop_set = {int(token) for token in stop_ids}
+
+    current = torch.full((batch_size,), int(start_token_id), dtype=torch.long, device=device)
+    tokens: List[List[int]] = [[] for _ in range(batch_size)]
+    logps: List[List[float]] = [[] for _ in range(batch_size)]
+    done = [False] * batch_size
+
+    for _ in range(int(max_new_tokens)):
+        embeddings = lm.model.embed_tokens(current)
+        query_lens = torch.ones(batch_size, dtype=torch.int, device=device)
+        query_indexes = torch.cumsum(kv_lens, dim=0) + torch.arange(batch_size, dtype=kv_lens.dtype, device=device)
+
+        blocks = list(packed_kv_indexes.split(kv_lens.tolist(), dim=0))
+        shifted_blocks = [block + i for i, block in enumerate(blocks)]
+        shifted_kv_indexes = torch.cat(shifted_blocks, dim=0)
+        out = lm.forward_inference(
+            packed_query_sequence=embeddings,
+            query_lens=query_lens,
+            packed_query_position_ids=positions,
+            packed_query_indexes=query_indexes,
+            past_key_values=past,
+            key_values_lens=kv_lens,
+            packed_key_value_indexes=shifted_kv_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        past = out.past_key_values
+        logits = lm.lm_head(out.packed_query_sequence)
+        token_ids, token_logps = sample_fn(logits)
+
+        for row in range(batch_size):
+            if done[row]:
+                continue
+            token = int(token_ids[row].item())
+            tokens[row].append(token)
+            logps[row].append(float(token_logps[row].item()))
+            if token in stop_set:
+                done[row] = True
+
+        current = token_ids.to(device=device, dtype=torch.long).reshape(batch_size)
+        old_blocks = list(shifted_kv_indexes.split(kv_lens.tolist(), dim=0))
+        packed_kv_indexes = torch.cat(
+            [torch.cat([block, block[-1:] + 1], dim=0) for block in old_blocks],
+            dim=0,
+        )
+        kv_lens = kv_lens + 1
+        positions = positions + 1
+
     return tokens, logps
 
 

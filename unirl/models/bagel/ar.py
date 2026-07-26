@@ -30,6 +30,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -75,7 +76,12 @@ class BagelARStep(ARStep):
         self.top_p = float(top_p)
         self.top_k = int(top_k)
 
-    def step(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def step(
+        self,
+        logits: torch.Tensor,
+        *,
+        generators: Optional[List[torch.Generator]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if logits.dim() != 2:
             raise ValueError(f"BagelARStep.step: expected logits shape [B, vocab], got {tuple(logits.shape)}")
 
@@ -107,7 +113,18 @@ class BagelARStep(ARStep):
             scaled = torch.full_like(scaled, float("-inf")).scatter(-1, sorted_idx, sorted_vals)
 
         probs = F.softmax(scaled, dim=-1)
-        token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        if generators is None:
+            token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        else:
+            if len(generators) != int(probs.shape[0]):
+                raise ValueError(f"BagelARStep.step: got {len(generators)} generators for batch {int(probs.shape[0])}.")
+            token_id = torch.cat(
+                [
+                    torch.multinomial(probs[row], num_samples=1, generator=generator)
+                    for row, generator in enumerate(generators)
+                ],
+                dim=0,
+            )
         log_prob = log_probs_full.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
         return token_id, log_prob
 
@@ -128,10 +145,17 @@ class BagelARStage(ARStage[BagelARConditions]):
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
         replay_mode: str = "train",
+        forward_batch_size: Optional[int] = 1,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="BagelARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="BagelARStage.logprob_precision")
+        forward_batch_size = 1 if forward_batch_size is None else int(forward_batch_size)
+        require(
+            forward_batch_size >= 1,
+            f"BagelARStage.forward_batch_size must be >= 1; got {forward_batch_size!r}.",
+        )
+        self.forward_batch_size = forward_batch_size
         # Replay scorer for the GRPO ratio's new_logp:
         #   "train"     — one grad forward_train per sample (nested mask: image full +
         #                 text causal); the und path INCLUDING the image is trained.
@@ -199,6 +223,21 @@ class BagelARStage(ARStage[BagelARConditions]):
         ids.append(int(self.model.new_token_ids["eos_token_id"]))  # <|im_end|>, as in the vendored gen_text
         return list(dict.fromkeys(ids))
 
+    @staticmethod
+    def _batched_text_ids(prompt_splits: List[List[Dict[str, Any]]]) -> Optional[List[torch.Tensor]]:
+        """Concatenate each sample's text splits, or decline packing for ViT/empty inputs."""
+        out: List[torch.Tensor] = []
+        for splits in prompt_splits:
+            ids: List[torch.Tensor] = []
+            for split in splits:
+                if split.get("kind") != "text":
+                    return None
+                ids.append(split["ids"].reshape(-1).to(dtype=torch.long))
+            if not ids:
+                return None
+            out.append(torch.cat(ids, dim=0))
+        return out
+
     # ------------------------------------------------------------------
     # Rollout
     # ------------------------------------------------------------------
@@ -225,22 +264,57 @@ class BagelARStage(ARStage[BagelARConditions]):
         stop_ids = self._resolve_stop_ids(params, sampling_params)
         start_id = int(self.model.new_token_ids["bos_token_id"])
 
+        text_id_lists = self._batched_text_ids(conditions.prompt_splits)
+        use_batched = self.forward_batch_size > 1 and text_id_lists is not None and len(text_id_lists) > 1
+
         generated: List[List[int]] = []
         logps: List[List[float]] = []
         with torch.no_grad(), self._autocast_ctx(device):
-            for splits in conditions.prompt_splits:
-                ctx = self._prefill(splits, device=device)
-                tokens_i, logps_i = rl_ops.decode_text(
-                    bagel,
-                    ctx,
-                    start_token_id=start_id,
-                    sample_fn=step.step,
-                    max_new_tokens=int(sampling_params.max_new_tokens),
-                    stop_ids=stop_ids,
-                    device=device,
-                )
-                generated.append(tokens_i)
-                logps.append(logps_i)
+            if use_batched:
+                for start in range(0, len(text_id_lists), self.forward_batch_size):
+                    id_chunk = text_id_lists[start : start + self.forward_batch_size]
+                    generator_chunk: Optional[List[torch.Generator]] = None
+                    if step.temperature > 0.0 and len(id_chunk) > 1:
+                        seeds = torch.randint(
+                            0,
+                            (1 << 63) - 1,
+                            (len(id_chunk),),
+                            dtype=torch.int64,
+                            device=device,
+                        ).cpu()
+                        generator_chunk = []
+                        for seed in seeds.tolist():
+                            generator = torch.Generator(device=device)
+                            generator.manual_seed(int(seed))
+                            generator_chunk.append(generator)
+                    ctx = rl_ops.prefill_text_batched(bagel, id_chunk, device=device)
+                    tokens, token_logps = rl_ops.decode_text_batched(
+                        bagel,
+                        ctx,
+                        start_token_id=start_id,
+                        sample_fn=(
+                            partial(step.step, generators=generator_chunk) if generator_chunk is not None else step.step
+                        ),
+                        max_new_tokens=int(sampling_params.max_new_tokens),
+                        stop_ids=stop_ids,
+                        device=device,
+                    )
+                    generated.extend(tokens)
+                    logps.extend(token_logps)
+            else:
+                for splits in conditions.prompt_splits:
+                    ctx = self._prefill(splits, device=device)
+                    tokens_i, logps_i = rl_ops.decode_text(
+                        bagel,
+                        ctx,
+                        start_token_id=start_id,
+                        sample_fn=step.step,
+                        max_new_tokens=int(sampling_params.max_new_tokens),
+                        stop_ids=stop_ids,
+                        device=device,
+                    )
+                    generated.append(tokens_i)
+                    logps.append(logps_i)
 
         return TextSegment.pack(
             tokens=[torch.tensor(t, dtype=torch.long, device=device) for t in generated],

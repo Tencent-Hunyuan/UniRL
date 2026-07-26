@@ -172,6 +172,8 @@ class BagelDiffusionStep:
         sigma_max: torch.Tensor,
         eta: float,
         prev_sample: Optional[torch.Tensor] = None,
+        n_samples: int = 1,
+        generators: Optional[List[torch.Generator]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """One SDE transition via the shared ``strategy.denoise`` over packed latents.
 
@@ -184,19 +186,67 @@ class BagelDiffusionStep:
         ``log_prob`` / ``prev_sample_mean`` are ``None`` for deterministic
         (``eta < 1e-7``) steps.
         """
-        prev, log_prob, prev_mean = strategy.denoise(
-            noise_pred=v_t.unsqueeze(0),
-            sample=x_t.unsqueeze(0),
-            sigma=sigma,
-            sigma_next=sigma_next,
-            eta=float(eta),
-            prev_sample=None if prev_sample is None else prev_sample.unsqueeze(0),
-            sigma_max=float(sigma_max),
+        require(n_samples >= 1, f"BagelDiffusionStep.denoise: n_samples must be >= 1; got {n_samples}.")
+        require(
+            int(x_t.shape[0]) % int(n_samples) == 0,
+            f"BagelDiffusionStep.denoise: packed token count {int(x_t.shape[0])} "
+            f"is not divisible by n_samples={n_samples}.",
         )
+        seq = int(x_t.shape[0]) // int(n_samples)
+        channels = int(x_t.shape[-1])
+        sample = x_t.reshape(int(n_samples), seq, channels)
+        noise_pred = v_t.reshape(int(n_samples), seq, channels)
+        replay_sample = None if prev_sample is None else prev_sample.reshape(int(n_samples), seq, channels)
+        if generators is None or replay_sample is not None:
+            prev, log_prob, prev_mean = strategy.denoise(
+                noise_pred=noise_pred,
+                sample=sample,
+                sigma=sigma,
+                sigma_next=sigma_next,
+                eta=float(eta),
+                prev_sample=replay_sample,
+                sigma_max=float(sigma_max),
+            )
+        else:
+            if len(generators) != int(n_samples):
+                raise ValueError(
+                    f"BagelDiffusionStep.denoise: got {len(generators)} generators for n_samples={n_samples}."
+                )
+            input_dtype = sample.dtype
+            noise_pred_f32 = noise_pred.float()
+            sample_f32 = sample.float()
+            sigma_f32 = sigma.float().reshape(1)
+            sigma_next_f32 = sigma_next.float().reshape(1)
+            while sigma_f32.dim() < sample_f32.dim():
+                sigma_f32 = sigma_f32.unsqueeze(-1)
+                sigma_next_f32 = sigma_next_f32.unsqueeze(-1)
+            prev, prev_mean, std_var = strategy.step(
+                noise_pred=noise_pred_f32,
+                sample=sample_f32,
+                sigma=sigma_f32,
+                sigma_next=sigma_next_f32,
+                eta=float(eta),
+                prev_sample=None,
+                generator=generators,
+                sigma_max=float(sigma_max),
+            )
+            prev, log_prob = strategy._finalize_logp(
+                prev_sample=prev,
+                prev_sample_mean=prev_mean,
+                std_var=std_var,
+                eta=float(eta),
+                input_dtype=input_dtype,
+            )
+        if n_samples == 1:
+            return (
+                prev.reshape(seq, channels),
+                None if log_prob is None else log_prob.reshape(()),
+                None if prev_mean is None else prev_mean.reshape(seq, channels),
+            )
         return (
-            prev.squeeze(0),
-            None if log_prob is None else log_prob.reshape(()),
-            None if prev_mean is None else prev_mean.squeeze(0),
+            prev.reshape(int(n_samples) * seq, channels),
+            None if log_prob is None else log_prob.reshape(int(n_samples)),
+            None if prev_mean is None else prev_mean.reshape(int(n_samples) * seq, channels),
         )
 
     def step_with_logp(
@@ -213,6 +263,8 @@ class BagelDiffusionStep:
         cfg_text_scale: float,
         cfg_img_scale: float,
         forward_kwargs: Dict[str, Any],
+        n_samples: int = 1,
+        generators: Optional[List[torch.Generator]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run ``predict_velocity`` then ``denoise`` for one step.
 
@@ -237,6 +289,8 @@ class BagelDiffusionStep:
             sigma_max=sigma_max,
             eta=eta,
             prev_sample=prev_sample,
+            n_samples=n_samples,
+            generators=generators,
         )
 
 
@@ -284,6 +338,25 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
             return torch.autocast("cuda", self.autocast_dtype)
         return nullcontext()
+
+    @staticmethod
+    def _sampling_generators(device: torch.device, count: int) -> List[torch.Generator]:
+        """Fork stable per-sequence RNG streams from the current device RNG."""
+        generators: List[torch.Generator] = []
+        for _ in range(int(count)):
+            seed = int(
+                torch.randint(
+                    0,
+                    (1 << 63) - 1,
+                    (),
+                    dtype=torch.int64,
+                    device=device,
+                ).item()
+            )
+            generator = torch.Generator(device=device)
+            generator.manual_seed(seed)
+            generators.append(generator)
+        return generators
 
     def _build_contexts_from_prompt(self, prompt: str) -> Tuple[Any, Any, Any]:
         """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from a prompt.
@@ -443,6 +516,21 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             indices      : [K]              stored frame step indices
             sigmas       : [T+1]            the full schedule
         """
+        if conditions.batch_size > 1:
+            if self._can_pack_conditions(conditions):
+                return self._diffuse_batched(
+                    conditions,
+                    schedule=schedule,
+                    params=params,
+                    initial_latents=initial_latents,
+                )
+            return self._diffuse_serial_batch(
+                conditions,
+                schedule=schedule,
+                params=params,
+                initial_latents=initial_latents,
+            )
+
         bagel = self.model.model
         device = torch.device(self.model.device)
         schedule = schedule.to(device)
@@ -524,6 +612,234 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             sde_logp=sde_logp,
             sde_means=sde_means,
             sde_indices=sde_indices,
+        )
+
+    # ------------------------------------------------------------------
+    # Block-diagonal rollout batching
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _can_pack_conditions(conditions: BagelDiffusionConditions) -> bool:
+        """Only opaque, same-shape contexts have an unambiguous packed latent geometry."""
+        if not conditions.has_contexts() or conditions.batch_size < 2:
+            return False
+        if len(conditions.gen_contexts) != conditions.batch_size:
+            return False
+        shapes = [tuple(shape) for shape in conditions.image_shapes]
+        return len(shapes) == conditions.batch_size and len(set(shapes)) == 1
+
+    @staticmethod
+    def _stack_segments(segments: List[LatentSegment]) -> LatentSegment:
+        if len(segments) == 1:
+            return segments[0]
+        return LatentSegment(
+            latents=torch.cat([segment.latents for segment in segments], dim=0),
+            sigmas=segments[0].sigmas,
+            indices=segments[0].indices,
+            sde_logp=(
+                torch.cat([segment.sde_logp for segment in segments], dim=0)
+                if segments[0].sde_logp is not None
+                else None
+            ),
+            sde_means=(
+                torch.cat([segment.sde_means for segment in segments], dim=0)
+                if segments[0].sde_means is not None
+                else None
+            ),
+            sde_indices=segments[0].sde_indices,
+        )
+
+    def _diffuse_serial_batch(
+        self,
+        conditions: BagelDiffusionConditions,
+        *,
+        schedule: torch.Tensor,
+        params: BagelDiffusionParams,
+        initial_latents: Optional[torch.Tensor],
+    ) -> LatentSegment:
+        """Fallback for deferred contexts or mixed image shapes."""
+        segments: List[LatentSegment] = []
+        for index in range(conditions.batch_size):
+            if conditions.has_contexts():
+                gen = conditions.gen_contexts[index]
+                cfg_text = (
+                    conditions.cfg_text_contexts[index]
+                    if conditions.cfg_text_contexts and conditions.cfg_text_contexts[index] is not None
+                    else gen
+                )
+                cfg_img = (
+                    conditions.cfg_img_contexts[index]
+                    if conditions.cfg_img_contexts and conditions.cfg_img_contexts[index] is not None
+                    else gen
+                )
+                condition = BagelDiffusionConditions.for_sample(
+                    gen_context=gen,
+                    cfg_text_context=cfg_text,
+                    cfg_img_context=cfg_img,
+                    prompt=conditions.prompts[index] if conditions.prompts else None,
+                    image_shape=tuple(conditions.image_shapes[index]),
+                )
+            else:
+                condition = BagelDiffusionConditions(
+                    prompts=[conditions.prompts[index]],
+                    image_shapes=[tuple(conditions.image_shapes[index])],
+                )
+            initial = initial_latents[index] if initial_latents is not None else None
+            segments.append(self.diffuse(condition, schedule=schedule, params=params, initial_latents=initial))
+        return self._stack_segments(segments)
+
+    @staticmethod
+    def _merge_contexts(contexts: List[Any]) -> Dict[str, Any]:
+        """Merge per-sample NaiveCache objects while preserving empty CFG branches."""
+        kv_lens = [int(context["kv_lens"][0]) for context in contexts]
+        ropes = [int(context["ropes"][0]) for context in contexts]
+        caches = [context["past_key_values"] for context in contexts]
+        merged = type(caches[0])(int(caches[0].num_layers))
+        for layer in range(int(caches[0].num_layers)):
+            keys = [cache.key_cache[layer] for cache in caches if cache.key_cache[layer] is not None]
+            values = [cache.value_cache[layer] for cache in caches if cache.value_cache[layer] is not None]
+            merged.key_cache[layer] = torch.cat(keys, dim=0) if keys else None
+            merged.value_cache[layer] = torch.cat(values, dim=0) if values else None
+        return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": merged}
+
+    def _build_generation_inputs_batched(
+        self,
+        gen: Any,
+        cfg_text: Any,
+        cfg_img: Any,
+        image_shapes: List[Tuple[int, int]],
+        *,
+        device: torch.device,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Build the vendor's packed latent indexes for a multi-sequence context."""
+        bagel = self.model.model
+        gi = bagel.prepare_vae_latent(
+            curr_kvlens=gen["kv_lens"],
+            curr_rope=gen["ropes"],
+            image_sizes=image_shapes,
+            new_token_ids=self.model.new_token_ids,
+        )
+        gi_cfg_text = bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_text["kv_lens"],
+            curr_rope=cfg_text["ropes"],
+            image_sizes=image_shapes,
+        )
+        gi_cfg_img = bagel.prepare_vae_latent_cfg(
+            curr_kvlens=cfg_img["kv_lens"],
+            curr_rope=cfg_img["ropes"],
+            image_sizes=image_shapes,
+        )
+        return _to_device(gi, device), _to_device(gi_cfg_text, device), _to_device(gi_cfg_img, device)
+
+    def _diffuse_batched(
+        self,
+        conditions: BagelDiffusionConditions,
+        *,
+        schedule: torch.Tensor,
+        params: BagelDiffusionParams,
+        initial_latents: Optional[torch.Tensor] = None,
+    ) -> LatentSegment:
+        """Run one block-diagonal navit forward per step for same-shape images."""
+        bagel = self.model.model
+        device = torch.device(self.model.device)
+        schedule = schedule.to(device)
+        num_steps = int(schedule.shape[0]) - 1
+        require(
+            num_steps == int(params.num_inference_steps),
+            f"BagelDiffusionStage._diffuse_batched: schedule length {schedule.shape[0]} != "
+            f"num_inference_steps+1 ({int(params.num_inference_steps) + 1})",
+        )
+        sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
+        sde_set = {int(index) for index in (params.sde_indices or [])}
+        sde_sorted = sorted(sde_set)
+        batch_size = int(conditions.batch_size)
+
+        gen_contexts = list(conditions.gen_contexts)
+        cfg_text_contexts = [
+            conditions.cfg_text_contexts[index]
+            if conditions.cfg_text_contexts and conditions.cfg_text_contexts[index] is not None
+            else gen_contexts[index]
+            for index in range(batch_size)
+        ]
+        cfg_img_contexts = [
+            conditions.cfg_img_contexts[index]
+            if conditions.cfg_img_contexts and conditions.cfg_img_contexts[index] is not None
+            else gen_contexts[index]
+            for index in range(batch_size)
+        ]
+        image_shapes = [tuple(shape) for shape in conditions.image_shapes]
+        gen = self._merge_contexts(gen_contexts)
+        cfg_text = self._merge_contexts(cfg_text_contexts)
+        cfg_img = self._merge_contexts(cfg_img_contexts)
+        gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs_batched(
+            gen,
+            cfg_text,
+            cfg_img,
+            image_shapes,
+            device=device,
+        )
+        forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
+
+        if initial_latents is None:
+            x_t = gi["packed_init_noises"].to(device=device, dtype=self.trajectory_dtype)
+        else:
+            x_t = initial_latents.to(device=device, dtype=self.trajectory_dtype).reshape(
+                -1, int(initial_latents.shape[-1])
+            )
+        channels = int(x_t.shape[-1])
+        require(
+            int(x_t.shape[0]) % batch_size == 0,
+            "BagelDiffusionStage._diffuse_batched: packed latent tokens must divide evenly by batch size.",
+        )
+        seq = int(x_t.shape[0]) // batch_size
+
+        sampling_generators = self._sampling_generators(device, batch_size)
+        self.strategy.init_schedule(schedule)
+        needed = set(compute_trajectory_positions(sde_set, num_steps))
+        needed.add(num_steps)
+        stored_pairs: List[Tuple[int, torch.Tensor]] = []
+        if 0 in needed:
+            stored_pairs.append((0, x_t.detach().clone().reshape(batch_size, seq, channels)))
+        sde_logps: List[torch.Tensor] = []
+        sde_means: List[torch.Tensor] = []
+
+        with torch.no_grad(), self._autocast_ctx(device):
+            for index in range(num_steps):
+                t_cur = schedule[index]
+                t_next = schedule[index + 1]
+                cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
+                x_t, log_prob, prev_mean = self.step.step_with_logp(
+                    bagel,
+                    self.strategy,
+                    x_t=x_t,
+                    prev_sample=None,
+                    t_cur=t_cur,
+                    t_next=t_next,
+                    sigma_max=sigma_max,
+                    eta=float(params.eta) if index in sde_set else 0.0,
+                    cfg_text_scale=cfg_text_scale,
+                    cfg_img_scale=cfg_img_scale,
+                    forward_kwargs=forward_kwargs,
+                    n_samples=batch_size,
+                    generators=sampling_generators,
+                )
+                x_t = x_t.to(dtype=self.trajectory_dtype)
+                if (index + 1) in needed:
+                    stored_pairs.append((index + 1, x_t.detach().clone().reshape(batch_size, seq, channels)))
+                if log_prob is not None:
+                    sde_logps.append(log_prob.to(dtype=self.logprob_dtype))
+                    if prev_mean is not None:
+                        sde_means.append(
+                            prev_mean.detach().reshape(batch_size, seq, channels).to(dtype=self.trajectory_dtype)
+                        )
+
+        return LatentSegment(
+            latents=torch.stack([tensor for _, tensor in stored_pairs], dim=1),
+            sigmas=schedule,
+            indices=torch.tensor([index for index, _ in stored_pairs], dtype=torch.long, device=device),
+            sde_logp=torch.stack(sde_logps, dim=1) if sde_logps else None,
+            sde_means=torch.stack(sde_means, dim=1) if sde_means else None,
+            sde_indices=(torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None),
         )
 
     # ------------------------------------------------------------------

@@ -104,8 +104,13 @@ class BagelPipeline(Pipeline):
         replay_mode: str = "train",
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
+        forward_batch_size: Optional[int] = 1,
     ) -> None:
         super().__init__()
+        forward_batch_size = 1 if forward_batch_size is None else int(forward_batch_size)
+        if forward_batch_size < 1:
+            raise ValueError(f"BagelPipeline.forward_batch_size must be >= 1; got {forward_batch_size!r}.")
+        self.forward_batch_size = forward_batch_size
         self.bundle = bundle
         if diffusion is None:
             diffusion = BagelDiffusionStage(
@@ -127,6 +132,7 @@ class BagelPipeline(Pipeline):
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
             replay_mode=replay_mode,
+            forward_batch_size=self.forward_batch_size,
         )
         self.autocast_precision = autocast_precision
         # FlowMatch time-shift for the σ schedule policy (read by the hosting engine
@@ -510,28 +516,44 @@ class BagelPipeline(Pipeline):
         """
         device = torch.device(self.bundle.device)
         schedule = req.sigmas.to(device)
-        initial = NoiseRecipe.from_rollout_req(req).resolve(device=device, dtype=torch.float32)
+        initial = NoiseRecipe.from_rollout_req(req).for_batch(len(contexts)).resolve(device=device, dtype=torch.float32)
+        if initial is not None and int(initial.shape[0]) != len(contexts):
+            if len(contexts) % int(initial.shape[0]) != 0:
+                raise ValueError(
+                    "BagelPipeline._diffuse_and_decode: initial latent batch "
+                    f"{int(initial.shape[0])} cannot align to {len(contexts)} image samples."
+                )
+            initial = initial.repeat_interleave(len(contexts) // int(initial.shape[0]), dim=0)
 
         gen_list: List[Any] = []
         cfg_text_list: List[Any] = []
         cfg_img_list: List[Any] = []
         shapes: List[Tuple[int, int]] = []
-        segments: List[LatentSegment] = []
-        for i, (gen_ctx, cfg_text_ctx, cfg_img_ctx) in enumerate(contexts):
-            cond_i = BagelDiffusionConditions.for_sample(
-                gen_context=gen_ctx,
-                cfg_text_context=cfg_text_ctx,
-                cfg_img_context=cfg_img_ctx,
-                image_shape=image_shape,
-                prompt=prompts[i],
-            )
-            x0_i = initial[i] if initial is not None else None
-            seg_i = self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=x0_i)
-            segments.append(seg_i)
+        for gen_ctx, cfg_text_ctx, cfg_img_ctx in contexts:
             gen_list.append(gen_ctx)
             cfg_text_list.append(cfg_text_ctx)
             cfg_img_list.append(cfg_img_ctx)
             shapes.append(image_shape)
+
+        segments: List[LatentSegment] = []
+        for start in range(0, len(contexts), self.forward_batch_size):
+            end = min(start + self.forward_batch_size, len(contexts))
+            cond_chunk = BagelDiffusionConditions(
+                gen_contexts=gen_list[start:end],
+                cfg_text_contexts=cfg_text_list[start:end],
+                cfg_img_contexts=cfg_img_list[start:end],
+                prompts=list(prompts[start:end]),
+                image_shapes=shapes[start:end],
+            )
+            initial_chunk = initial[start:end] if initial is not None else None
+            segments.append(
+                self.diffusion.diffuse(
+                    cond_chunk,
+                    schedule=schedule,
+                    params=params,
+                    initial_latents=initial_chunk,
+                )
+            )
 
         segment = self._batch_segments(segments)
         conditions = BagelDiffusionConditions(
@@ -789,8 +811,8 @@ class BagelUniPipeline(BagelPipeline):
     (:meth:`_build_think_contexts` for the gen/cfg KV contexts, :meth:`_detokenize`,
     ``self.ar`` / ``self.diffusion`` / ``self.vae_decode``, :meth:`_batch_segments`,
     :meth:`build_schedule_policy`); only the prompt-level N×M fan-out + lineage is
-    layered on top of the single-sample ``_generate_t2ti``. Per-sample navit ``bs=1``
-    (no pack-B); each image draws its own x_T inside ``diffuse``.
+    layered on top of the single-sample ``_generate_t2ti``. ``forward_batch_size``
+    optionally packs text-only thinking chains and same-shape images block-diagonally.
     """
 
     def generate(self, req: RolloutReq) -> RolloutResp:
@@ -859,40 +881,16 @@ class BagelUniPipeline(BagelPipeline):
         img_prompts = [prompts[i // n_rewrites] for i in range(n_ar) for _ in range(n_images)]
         img_thinks = [thinking.texts[i] for i in range(n_ar) for _ in range(n_images)]
 
-        device = torch.device(self.bundle.device)
-        schedule = req.sigmas.to(device)
-
-        # Diffuse per image (navit bs=1; each draws its own x_T inside diffuse) over the
-        # native think contexts, then batch the per-sample segments into the image track.
-        gen_list: List[Any] = []
-        cfg_text_list: List[Any] = []
-        cfg_img_list: List[Any] = []
-        shapes: List[Tuple[int, int]] = []
-        segments: List[LatentSegment] = []
+        contexts: List[Tuple[Any, Any, Any]] = []
         for prompt, think in zip(img_prompts, img_thinks):
-            gen_ctx, cfg_text_ctx, cfg_img_ctx = self._build_think_contexts(GEN_THINK_SYSTEM_PROMPT, prompt, think)
-            cond_i = BagelDiffusionConditions.for_sample(
-                gen_context=gen_ctx,
-                cfg_text_context=cfg_text_ctx,
-                cfg_img_context=cfg_img_ctx,
-                image_shape=image_shape,
-                prompt=prompt,
-            )
-            segments.append(self.diffusion.diffuse(cond_i, schedule=schedule, params=diff_params, initial_latents=None))
-            gen_list.append(gen_ctx)
-            cfg_text_list.append(cfg_text_ctx)
-            cfg_img_list.append(cfg_img_ctx)
-            shapes.append(image_shape)
-
-        segment = self._batch_segments(segments)
-        conditions = BagelDiffusionConditions(
-            gen_contexts=gen_list,
-            cfg_text_contexts=cfg_text_list,
-            cfg_img_contexts=cfg_img_list,
-            prompts=list(img_prompts),
-            image_shapes=shapes,
+            contexts.append(self._build_think_contexts(GEN_THINK_SYSTEM_PROMPT, prompt, think))
+        segment, conditions, images = self._diffuse_and_decode(
+            contexts,
+            prompts=img_prompts,
+            params=diff_params,
+            req=req,
+            image_shape=image_shape,
         )
-        images = self.vae_decode.decode(segment, image_shape=image_shape)
 
         image_track = _track_with_field(img_shell, "segment", segment)
         image_track = _track_with_field(image_track, "decoded", images)
