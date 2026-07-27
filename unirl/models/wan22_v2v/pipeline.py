@@ -1,4 +1,4 @@
-"""WAN22V2VPipeline — RolloutReq → RolloutResp for WAN 2.2 video-to-video."""
+"""WAN22V2VPipeline — ``Sample → Sample`` for WAN 2.2 video-to-video."""
 
 from __future__ import annotations
 
@@ -17,8 +17,7 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.sde.noise import generate_latents
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, Videos
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .config import DEFAULT_V2V_STRENGTH
@@ -116,43 +115,61 @@ class WAN22V2VPipeline(Pipeline):
             max_sequence_length=int(config.max_sequence_length),
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"WAN22V2VPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> WAN21Conditions:
+        """Build WAN text conditions; source-video encoding stays in generate."""
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"WAN22V2VPipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
-        videos = req.primitives.get("video")
-        if not isinstance(videos, Videos):
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        text_cond = self.text_embed.embed(texts)
+        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+
+    def generate(self, sample: Sample) -> Sample:
+        """Run V2V over the trimmed denoising tail and fill the frontier Part."""
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
             raise TypeError(
-                f"WAN22V2VPipeline.generate: req.primitives['video'] must be Videos, "
-                f"got {type(videos).__name__ if videos is not None else 'None'}."
+                "WAN22V2VPipeline.generate: frontier gen Part must carry "
+                f"DiffusionSamplingParams, got {type(params).__name__ if params is not None else 'None'}"
             )
+        if params.sigmas is None:
+            raise ValueError(
+                "WAN22V2VPipeline.generate: frontier sampling_params.sigmas is None; "
+                "the hosting engine must pin the schedule before pipeline.generate."
+            )
+
+        conditioning = sample.conditioning()
+        text_inputs = [value for value in conditioning if isinstance(value, Texts)]
+        video_inputs = [value for value in conditioning if isinstance(value, Videos)]
+        if len(text_inputs) != 1:
+            raise TypeError(
+                f"WAN22V2VPipeline.generate: expected exactly one Texts conditioning primitive, got {len(text_inputs)}"
+            )
+        if len(video_inputs) != 1:
+            raise TypeError(
+                f"WAN22V2VPipeline.generate: expected exactly one Videos conditioning primitive, "
+                f"got {len(video_inputs)}"
+            )
+        texts, videos = text_inputs[0], video_inputs[0]
         if len(videos) != len(texts.texts):
             raise ValueError(f"WAN22V2VPipeline.generate: video count {len(videos)} != text count {len(texts.texts)}")
 
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"WAN22V2VPipeline.generate: negative_text length {len(negatives.texts)} "
-                f"!= text length {len(texts.texts)}"
-            )
-
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-        if params is None:
-            raise ValueError("WAN22V2VPipeline.generate: req.sampling_params must contain 'diffusion'.")
-        device = self.bundle.device
-
-        text_cond = self.text_embed.embed(texts)
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
-        if negatives is None and max(primary_g, low_g) > 1.0:
-            negatives = Texts(texts=[""] * len(texts.texts))
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        wan_conds = WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+        wan_conds = self.build_conditions(texts, guidance_scale=max(primary_g, low_g))
 
+        device = self.bundle.device
         video_latent_cond = WAN22VideoLatentEncodeStage(
             self.bundle,
             num_frames=int(params.num_frames),
@@ -162,13 +179,13 @@ class WAN22V2VPipeline(Pipeline):
         video_latents = video_latent_cond.latents.to(device=device, dtype=torch.float32)
         batch_size = int(video_latents.shape[0])
 
-        if req.sigmas is None:
-            raise ValueError(
-                "WAN22V2VPipeline.generate: req.sigmas is None. Engine adapter must call "
-                "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
-            )
-        full_schedule = req.sigmas.to(device)
+        full_schedule = params.sigmas.to(device)
         t_full = int(full_schedule.shape[0]) - 1
+        if t_full < 1:
+            raise ValueError(
+                f"WAN22V2VPipeline.generate: sigma schedule must contain at least two points, "
+                f"got {int(full_schedule.shape[0])}"
+            )
         strength = float(params.strength) if params.strength is not None else self.strength
         if not 0.0 < strength <= 1.0:
             raise ValueError(f"WAN22V2VPipeline.generate: strength must be in (0, 1], got {strength}")
@@ -177,17 +194,18 @@ class WAN22V2VPipeline(Pipeline):
         trimmed_schedule = full_schedule[t_start:].contiguous()
         sigma_start = trimmed_schedule[0].to(torch.float32)
 
-        noise_recipe = NoiseRecipe.from_rollout_req(req)
+        noise_recipe = NoiseRecipe.from_sample(sample)
         if noise_recipe.initial_latents is not None:
             raise ValueError(
-                "WAN22V2VPipeline.generate: V2V video primitive cannot be combined with "
-                "request_conditions['initial_latents']."
+                "WAN22V2VPipeline.generate: source-video conditioning cannot be combined "
+                "with initial latents on the generation Part."
             )
-        noise = noise_recipe.for_batch(batch_size, latent_shape=tuple(video_latents.shape[1:])).resolve(
-            device=device,
-            dtype=torch.float32,
-        )
+        noise = noise_recipe.for_batch(
+            batch_size,
+            latent_shape=tuple(video_latents.shape[1:]),
+        ).resolve(device=device, dtype=torch.float32)
         if noise is None:
+            noise_ids = list(frontier.group_ids) if params.init_same_noise else list(frontier.sample_ids)
             noise = generate_latents(
                 batch_size=batch_size,
                 latent_shape=tuple(video_latents.shape[1:]),
@@ -195,19 +213,29 @@ class WAN22V2VPipeline(Pipeline):
                 dtype=torch.float32,
                 init_same_noise=bool(params.init_same_noise),
                 samples_per_prompt=int(params.samples_per_prompt),
-                noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                noise_group_ids=noise_ids,
+                base_seed=int(params.seed or 0),
             )
-        if int(noise.shape[0]) != batch_size or tuple(noise.shape[1:]) != tuple(video_latents.shape[1:]):
+        if tuple(noise.shape) != tuple(video_latents.shape):
             raise ValueError(
                 f"WAN22V2VPipeline.generate: noise shape {tuple(noise.shape)} incompatible with "
-                f"video latents {tuple(video_latents.shape)}."
+                f"video latents {tuple(video_latents.shape)}"
             )
 
         x_start = (1.0 - sigma_start) * video_latents + sigma_start * noise
-        sde_indices = self._sde_indices_in_trimmed_frame(params.sde_indices, t_full=t_full, t_eff=t_eff)
-        v2v_params = dataclasses.replace(params, num_inference_steps=t_eff, sde_indices=sde_indices)
-
+        sde_indices = self._sde_indices_in_trimmed_frame(
+            params.sde_indices,
+            t_full=t_full,
+            t_eff=t_eff,
+        )
+        # The returned Part must describe the trajectory that actually ran, not
+        # the discarded full schedule.
+        v2v_params = dataclasses.replace(
+            params,
+            num_inference_steps=t_eff,
+            sde_indices=sde_indices,
+            sigmas=trimmed_schedule,
+        )
         latent_seg = self.diffusion.diffuse(
             wan_conds,
             schedule=trimmed_schedule,
@@ -216,17 +244,13 @@ class WAN22V2VPipeline(Pipeline):
         )
         decoded = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "video": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=wan_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=decoded,
-                ),
-            }
+        effective_frontier = dataclasses.replace(frontier, sampling_params=v2v_params)
+        filled = effective_frontier.fill(
+            segment=latent_seg,
+            primitives={"video": decoded},
+            conditions=wan_conds.to_dict(),
         )
+        return sample.replace_frontier(filled)
 
 
 __all__ = ["WAN22V2VPipeline"]

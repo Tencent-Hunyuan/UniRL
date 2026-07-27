@@ -5,13 +5,14 @@ this module owns the *noise* side of the sampling loop — per-sample x_T
 generation, per-group noise sharing, and the deterministic per-group seed
 derivation (``_derive_group_seed``) that keys each sample's x_T.
 
-The driver (``DiffusionTrainer._build_req``) ships only a deterministic x_T
-RECIPE — per-sample ``init_noise_group_ids`` + ``init_noise_latent_shape`` on
-the ``RolloutReq`` — and every engine regenerates the byte-identical x_T from
-it via :func:`regen_initial_noise` (a CPU-fp32 wrapper over
-:func:`generate_shared_noise`). The plain ``generate_latents`` fallback runs
-only when neither a recipe nor ``request_conditions['initial_latents']`` is
-present, i.e. the engine draws its own noise.
+The driver ships only a deterministic x_T recipe on the request ``Sample``'s
+diffusion generation Part: lineage-derived sample/group ids plus
+``DiffusionSamplingParams.init_noise_latent_shape``. Every engine regenerates
+the byte-identical x_T from it via :func:`regen_initial_noise` (a CPU-fp32
+wrapper over :func:`generate_shared_noise`). The plain ``generate_latents``
+fallback runs only when :class:`unirl.types.noise_recipe.NoiseRecipe` resolves
+neither a recipe nor a Part-carried ``initial_latents`` tensor, so the engine
+must draw its own noise.
 """
 
 import hashlib

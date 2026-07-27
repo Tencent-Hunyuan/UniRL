@@ -1,8 +1,8 @@
-"""Advantage computation helpers for rollout tracks.
+"""Advantage computation helpers for generated parts.
 
-GRPO-style group normalization lives on :meth:`RolloutTrack.compute_advantages`
-in :mod:`unirl.types.rollout_resp`. GAE and other per-step estimators live here
-as pure tensor utilities consumed by trainers before the train step.
+GRPO-style group normalization lives on :meth:`Part.compute_advantages` in
+:mod:`unirl.types.sample`. GAE and other per-step estimators live here as pure
+tensor utilities consumed by trainers before the train step.
 """
 
 from __future__ import annotations

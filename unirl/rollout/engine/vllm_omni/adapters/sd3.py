@@ -14,46 +14,45 @@ from typing import Any, Dict, List
 import torch
 
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
-from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
-from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs, grouped_texts_from_req
+from unirl.rollout.engine.vllm_omni.adapters.dit import (
+    DitInputAdapter,
+    DitOutputAdapter,
+    _grouped_texts_from_sample,
+    _negative_prompt_from_params,
+)
+from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 class Sd3InputAdapter(DitInputAdapter):
     """SD3 request builder using vLLM-Omni's native multi-output prompt shape."""
 
-    def _spp(self, req: RolloutReq) -> int:
-        diff_params = req.sampling_params.get("diffusion")
-        return int(getattr(diff_params, "samples_per_prompt", 1) or 1)
-
-    def build_prompts(self, req: RolloutReq) -> List[Any]:
-        grouped_texts, _ = grouped_texts_from_req(
-            req,
-            samples_per_prompt=self._spp(req),
+    def build_prompts(self, sample: Sample) -> List[Any]:
+        grouped_texts, _ = _grouped_texts_from_sample(
+            sample,
             caller=f"{self.modality}.build_prompts",
         )
-        diff_params = req.sampling_params.get("diffusion")
-        negative_prompt = str(getattr(diff_params, "negative_prompt", "") or "")
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
+        negative_prompt = _negative_prompt_from_params(diff_params, default="")
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
 
-    def build_sampling(self, req: RolloutReq):
-        grouped_texts_from_req(
-            req,
-            samples_per_prompt=self._spp(req),
+    def build_sampling(self, sample: Sample) -> List[StageSampling]:
+        _, spp = _grouped_texts_from_sample(
+            sample,
             caller=f"{self.modality}.build_sampling",
         )
-        sampling = super().build_sampling(req)
-        sampling[0].kwargs["num_outputs_per_prompt"] = self._spp(req)
+        sampling = super().build_sampling(sample)
+        sampling[0].kwargs["num_outputs_per_prompt"] = spp
         return sampling
 
 
 class Sd3OutputAdapter(DitOutputAdapter):
-    """Single-"image"-track response with the SD3 text-capture conditions."""
+    """Single diffusion-Part response with SD3 text-capture conditions."""
 
-    def build_conditions(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
+    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Concat the per-request SD3 ``text_capture`` dicts into one condition.
 
         Written by ``RLStableDiffusion3Pipeline`` after intercepting
@@ -93,9 +92,10 @@ class Sd3OutputAdapter(DitOutputAdapter):
             if factor > 1:
                 embeds = embeds.repeat_interleave(factor, dim=0)
                 pooled = pooled.repeat_interleave(factor, dim=0)
-        if req.sample_ids and int(embeds.shape[0]) != len(req.sample_ids):
+        n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
+        if int(embeds.shape[0]) != n_samples:
             raise RuntimeError(
-                f"SD3 text condition batch {int(embeds.shape[0])} != sample count {len(req.sample_ids)}."
+                f"SD3 text condition batch {int(embeds.shape[0])} != diffusion sample count {n_samples}."
             )
         text_cond = TextEmbedCondition(embeds=embeds, pooled=pooled, attn_mask=None)
         return {"text": text_cond}
@@ -116,17 +116,17 @@ class Sd3T2iAdapter(ModelAdapter):
         self.input_adapter = Sd3InputAdapter(self.modality)
         self.output_adapter = Sd3OutputAdapter(self.modality)
 
-    def validate_request(self, req: RolloutReq) -> None:
-        if req.primitives.get("image") is not None:
+    def validate_request(self, sample: Sample) -> None:
+        if sample.has_image_input():
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use an image-conditioned modality instead."
             )
 
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        return self.input_adapter.build(sample)
 
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        return self.output_adapter.build(req, per_request)
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        return self.output_adapter.build(sample, per_request)
 
 
 __all__ = ["Sd3InputAdapter", "Sd3OutputAdapter", "Sd3T2iAdapter"]

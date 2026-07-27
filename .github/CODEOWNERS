@@ -1,0 +1,92 @@
+# CODEOWNERS — automatic reviewer assignment.
+#
+# GitHub requests review from the owners of the LAST pattern that matches a
+# changed file; rules do not union, so a specific rule replaces the fallback
+# below rather than adding to it. Keep general patterns above specific ones.
+# The PR author is never requested, so every rule names at least two owners.
+# Owners must have write access or GitHub silently skips them.
+
+# --- fallback ---------------------------------------------------------------
+*                                       @haonan3 @CjhHa1 @leviking98z-rgb @celve
+
+# --- build, packaging, CI ---------------------------------------------------
+/pyproject.toml                         @CjhHa1 @celve
+/setup.py                               @CjhHa1 @celve
+/requirements.txt                       @CjhHa1 @celve
+/.pre-commit-config.yaml                @haonan3 @celve
+/.github/                               @celve @haonan3
+
+# --- docs ------------------------------------------------------------------
+/README.md                              @haonan3 @CjhHa1 @celve
+/INSTALL.md                             @haonan3 @CjhHa1
+/CLAUDE.md                              @celve @haonan3
+/AGENTS.md                              @celve @haonan3
+
+# --- algorithms and sampling ------------------------------------------------
+/unirl/algorithms/                      @CjhHa1 @haonan3 @Ideny42
+/unirl/sde/                             @Jayce-Ping @haonan3
+
+# --- rollout ---------------------------------------------------------------
+/unirl/rollout/                         @celve @zzhuoxin1508 @leviking98z-rgb
+/unirl/rollout/async_runtime.py         @CjhHa1 @celve
+/unirl/rollout/engine/sglang/           @celve @leviking98z-rgb
+/unirl/rollout/engine/sglang_diffusion/ @celve @leviking98z-rgb
+/unirl/rollout/engine/vllm_omni/        @celve @zzhuoxin1508
+/unirl/rollout/engine/fastvideo/        @Zcchill @leviking98z-rgb
+/unirl/rollout/engine/trainside/        @celve @CjhHa1
+/unirl/rollout/engine/composed/         @Jayce-Ping @celve
+
+# --- training and backends --------------------------------------------------
+/unirl/train/                           @CjhHa1 @celve @haonan3
+/unirl/train/backend/                   @celve @zzhuoxin1508 @CjhHa1
+/unirl/train/stack/                     @leviking98z-rgb @haonan3
+/unirl/train/refl/                      @celve @Ideny42
+/unirl/train/sft/                       @haonan3 @xshrz
+/unirl/train/unified_model_stack.py     @Ideny42 @zzhuoxin1508
+/unirl/trainer/                         @celve @Ideny42 @CjhHa1
+/unirl/train_sft.py                     @haonan3 @xshrz
+/unirl/train_refl.py                    @celve @Ideny42
+/unirl/train_pe.py                      @Jayce-Ping @Ideny42
+/unirl/train_unified_model.py           @Ideny42 @zzhuoxin1508
+
+# --- distributed -----------------------------------------------------------
+/unirl/distributed/                     @celve @CjhHa1
+/unirl/distributed/weight_sync/         @Zcchill @Jayce-Ping @celve
+
+# --- model bundles ---------------------------------------------------------
+/unirl/models/                          @celve @CjhHa1 @haonan3
+/unirl/models/bagel/                    @celve @Ideny42 @heguangxin
+/unirl/models/ltx2/                     @KemingWu @leviking98z-rgb
+/unirl/models/z_image/                  @xshrz @celve
+/unirl/models/wan22_v2v/                @xshrz @celve
+/unirl/models/pe/                       @Jayce-Ping @celve
+/unirl/models/qwen3/                    @celve @haonan3
+/unirl/models/qwen_vl/                  @haonan3 @celve
+/unirl/models/qwen3_omni/               @CjhHa1 @zzhuoxin1508
+/unirl/models/qwen_image_edit_plus/     @CjhHa1 @xshrz
+
+# --- reward ----------------------------------------------------------------
+/unirl/reward/                          @KemingWu @Zcchill @haonan3
+/unirl-reward-service/                  @KemingWu @haonan3
+
+# --- shared plumbing -------------------------------------------------------
+/unirl/types/                           @celve @haonan3
+/unirl/config/                          @celve @haonan3
+/unirl/utils/                           @zzhuoxin1508 @haonan3
+/unirl/tools/                           @CjhHa1 @zzhuoxin1508
+/unirl/data/                            @haonan3 @xshrz
+
+# --- data and benchmarks ---------------------------------------------------
+/datasets/                              @KemingWu @haonan3
+/benchmarks/                            @haonan3 @Jayce-Ping
+
+# --- recipes ---------------------------------------------------------------
+/examples/                              @celve @leviking98z-rgb @haonan3
+/examples/sft/                          @haonan3 @xshrz
+/examples/pe/                           @Jayce-Ping @celve
+/examples/unified_model/                @zzhuoxin1508 @Ideny42
+
+# --- paper artifacts -------------------------------------------------------
+/CPPO/                                  @haonan3 @CjhHa1
+/DRPO/                                  @celve @haonan3
+/FlowDPPO/                              @haonan3 @CjhHa1

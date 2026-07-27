@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from unirl.config.validation import validate_precision_type
 
@@ -48,6 +48,10 @@ class Qwen3OmniPipelineConfig:
     meta_init_transformer: bool = False
 
     system_instruction: Optional[str] = None
+    # Extra non-structural kwargs forwarded to the processor chat template
+    # (for example tool schemas). Required tensor/tokenization return-shape
+    # kwargs are enforced by the chat-template stage.
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3OmniPipelineConfig.model_precision")

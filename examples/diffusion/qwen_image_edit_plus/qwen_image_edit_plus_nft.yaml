@@ -33,7 +33,7 @@
 #   - conditions_cls → QwenImageEditPlusConditions (carries image_latent).
 #     DiffusionNFT resolves typed conditions via conditions_cls.from_dict(
 #     dict(conditions)) on each train step; the dict is what
-#     RolloutResp.tracks["image"].conditions emits (text / negative_text /
+#     the generated image Part's conditions map emits (text / negative_text /
 #     image_latent).
 
 num_devices: 8

@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Texts, Videos
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample, Turn
+from unirl.types.sampling import ARSamplingParams
 
 from .ar import Qwen3OmniARParams, Qwen3OmniARStage
 from .bundle import Qwen3OmniBundle
@@ -18,7 +17,13 @@ from .config import Qwen3OmniPipelineConfig
 
 
 class Qwen3OmniPipeline(Pipeline):
-    """Generate the ``ar`` rollout track from text and optional video inputs."""
+    """Qwen3-Omni thinker generation pipeline: ``Sample → Sample``.
+
+    The input Sample carries a pre-forked AR frontier. Role-aware text and one
+    optional persistent source-video turn are rendered from the frontier's
+    ancestor chain. The generated text, behavior log-probs, and exact processor
+    conditions are written back to that frontier for per-turn replay.
+    """
 
     def __init__(
         self,
@@ -52,6 +57,7 @@ class Qwen3OmniPipeline(Pipeline):
         video_max_pixels: Optional[int] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "Qwen3OmniPipeline":
         """Build stages around a shared, potentially FSDP-wrapped bundle."""
         chat_template = Qwen3OmniChatTemplateStage(
@@ -61,6 +67,7 @@ class Qwen3OmniPipeline(Pipeline):
             video_fps=video_fps,
             video_max_frames=video_max_frames,
             video_max_pixels=video_max_pixels,
+            chat_template_kwargs=chat_template_kwargs,
         )
         ar = Qwen3OmniARStage(model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision)
         return cls(
@@ -81,6 +88,7 @@ class Qwen3OmniPipeline(Pipeline):
             video_fps=config.video_fps,
             video_max_frames=config.video_max_frames,
             video_max_pixels=config.video_max_pixels,
+            chat_template_kwargs=config.chat_template_kwargs,
         )
         ar = Qwen3OmniARStage(
             model=bundle,
@@ -89,85 +97,72 @@ class Qwen3OmniPipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"Qwen3OmniPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-
-        # Optional per-sample videos.
-        videos_prim = req.primitives.get("video")
-        per_sample_videos: Optional[List[Any]] = None
-        if isinstance(videos_prim, Videos):
-            per_sample_videos = self._videos_to_list(videos_prim)
-
-        # Optional per-request system instruction.
-        chat_overrides: Dict[str, Any] = dict(req.task_config.get("chat") or {})
-        if "system_instruction" in chat_overrides:
+    def _conditions_for(
+        self,
+        turns: List[Turn],
+        control: Optional[Dict[str, Any]] = None,
+    ) -> Qwen3OmniARConditions:
+        """Render the trajectory using config plus root-Part chat overrides."""
+        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        system_instruction = chat_overrides.get(
+            "system_instruction",
+            self.chat_template.system_instruction,
+        )
+        template_kwargs = dict(self.chat_template.chat_template_kwargs)
+        template_kwargs.update(dict(chat_overrides.get("template_kwargs") or {}))
+        if (
+            system_instruction != self.chat_template.system_instruction
+            or template_kwargs != self.chat_template.chat_template_kwargs
+        ):
             chat_stage = Qwen3OmniChatTemplateStage(
                 self.bundle,
-                system_instruction=chat_overrides["system_instruction"],
+                system_instruction=system_instruction,
                 max_prompt_length=self.chat_template.max_prompt_length,
+                pad_to_max_length=self.chat_template.pad_to_max_length,
                 video_fps=self.chat_template.video_fps,
                 video_max_frames=self.chat_template.video_max_frames,
                 video_max_pixels=self.chat_template.video_max_pixels,
+                chat_template_kwargs=template_kwargs,
             )
         else:
             chat_stage = self.chat_template
+        return chat_stage.embed(turns)
 
-        conds: Qwen3OmniARConditions = chat_stage.embed(texts, videos=per_sample_videos)
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""
+        frontier = sample.frontier_gen_part(ARSamplingParams)
+        ar = frontier.sampling_params
+        assert isinstance(ar, ARSamplingParams)
 
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = Qwen3OmniARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
-            )
-        else:
-            params = Qwen3OmniARParams()
+        turns = sample.turns()
+        conds = self._conditions_for(turns, sample.parts[0].control)
+
+        params = Qwen3OmniARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+            stop_token_ids=([int(ar.stop_token_id)] if ar.stop_token_id is not None else []),
+        )
 
         sampling_params = ARSamplingParams(
+            samples_per_prompt=int(ar.samples_per_prompt),
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
             top_p=float(params.top_p),
             top_k=int(params.top_k),
-            stop_token_id=None,
+            stop_token_id=ar.stop_token_id,
         )
 
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
-
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
+        return sample.replace_frontier(
+            frontier.fill(
+                segment=segment,
+                primitives={"text": decoded},
+                conditions=conds.to_dict(),
+            )
         )
-
-    @staticmethod
-    def _videos_to_list(videos: Videos) -> List[Any]:
-        """Return per-sample paths or decoded frames for TMRoPE preprocessing."""
-        uris = getattr(videos, "uris", None)
-        if uris:
-            return list(uris)
-        if videos.frames is not None and videos.cu_frames is not None:
-            return [video.frames for video in videos.to_list()]
-        for attr in ("to_list", "frames", "videos"):
-            v = getattr(videos, attr, None)
-            if callable(v):
-                return list(v())
-            if v is not None:
-                return list(v)
-        raise TypeError("Qwen3OmniPipeline: could not extract per-sample videos from the Videos primitive")
 
     def _detokenize(self, segment) -> Texts:
         if segment.tokens is None or segment.cu_seqlens is None:

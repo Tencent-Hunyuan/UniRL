@@ -167,8 +167,8 @@ include = [
 line-length = 120
 target-version = "py312"
 # unirl-reward-service/ is a vendored standalone sub-project with its own pyproject and
-# lint/test tooling; it is not governed by this repo's lint (mirrors its
-# exclusion from this repo's pytest). Its vendored upstream model code carries
+# lint/test tooling; it is not governed by this repo's lint. Its vendored
+# upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
 extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]

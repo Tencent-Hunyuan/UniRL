@@ -1,7 +1,7 @@
-"""Worker-side supervised track builders for the SFT domain.
+"""Worker-side supervised Part builders for the SFT domain.
 
 In the RL loop the rollout engine is the data producer: it turns a request
-into a ``RolloutTrack`` (conditions + segment) that ``TrainStack.train_track``
+into a training ``Part`` (conditions + segment) that ``TrainStack.train_track``
 consumes. SFT swaps that producer for a dataset-backed one and keeps the whole
 consumer side (stack / algorithm / backend) unchanged — these classes are the
 swap, mirroring :class:`~unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine`'s
@@ -10,9 +10,9 @@ shape (a ``Remote`` sibling holding the trainer-injected ``pipeline``, one
 
 Per-model logic stays in the model packages: prompts go through the bundle's
 own chat-template / text-embed stages, targets through the bundle's VAE encode
-stage — a supervised track is indistinguishable from a rollout-built one to
+stage — a supervised Part is indistinguishable from a rollout-built one to
 ``ARStage.replay`` / ``predict_noise_at_step``. A new modality plugs in as
-(bundle stages) + (a track builder here) + (a loss in ``unirl/algorithms``)
+(bundle stages) + (a Part builder here) + (a loss in ``unirl/algorithms``)
 only when its record→(conditions, segment) mapping or loss math is genuinely
 new — never as a per-model SFT file.
 
@@ -34,7 +34,7 @@ from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment
 from unirl.types.segments.text import TextSegment
 
@@ -75,14 +75,14 @@ def _pad_flags(records: Sequence[Record]) -> List[bool]:
 
 
 class SupervisedTrackBuilder(Remote):
-    """Worker-side interface for converting normalized records into tracks."""
+    """Worker-side interface for converting normalized records into Parts."""
 
-    def build(self, records: List[Record]) -> RolloutTrack:
+    def build(self, records: List[Record]) -> Part:
         raise NotImplementedError
 
 
 class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → AR ``RolloutTrack`` (LLM + VLM), via the bundle's stages.
+    """Dataset records → AR ``Part`` (LLM + VLM), via the bundle's stages.
 
     Prompt side: the pipeline's chat-template stage (``add_generation_prompt``
     baked in, byte-identical to what rollout engines render — the SFT model is
@@ -131,27 +131,26 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self._warned_truncation = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def build(self, records: List[Record]) -> RolloutTrack:
-        """Tokenize + embed one shard of supervised records into a root track."""
+    def build(self, records: List[Record]) -> Part:
+        """Tokenize + embed one shard of supervised records into a training Part."""
         if not records:
             raise ValueError("ARSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
             conditions = self._embed_prompts(records)
             tokens, loss_masks = self._tokenize_responses(records)
         segment = TextSegment.pack(tokens=tokens, loss_mask=loss_masks)
-        track = RolloutTrack(
+        part = Part(
             sample_ids=_sample_ids(records),
-            parent_ids=None,
-            parent_track=None,
             conditions=conditions.to_dict(),
             segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
         )
-        if track.batch_size != len(records):
+        if part.batch_size != len(records):
             raise RuntimeError(
-                f"ARSupervisedTrackBuilder.build: built {track.batch_size} rows from {len(records)} "
+                f"ARSupervisedTrackBuilder.build: built {part.batch_size} rows from {len(records)} "
                 "records — token accounting is broken."
             )
-        return track
+        return part
 
     # ------------------------------------------------------------------
     # Internals
@@ -258,7 +257,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
 
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → diffusion ``RolloutTrack`` with an x0-only segment.
+    """Dataset records → diffusion ``Part`` with an x0-only segment.
 
     Prompt side: the pipeline's own ``build_conditions`` (the exact conditions
     ``diffuse``/``replay`` consume — CFG defaults included). Target side: the
@@ -317,8 +316,8 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             self._conditions_kwargs["image_shape"] = (self.height, self.width)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def build(self, records: List[Record]) -> RolloutTrack:
-        """Encode one shard of (prompt, target image) records into a root track."""
+    def build(self, records: List[Record]) -> Part:
+        """Encode one shard of (prompt, target image) records into a training Part."""
         if not records:
             raise ValueError("DiffusionSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
@@ -336,12 +335,11 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             latents=latents.unsqueeze(1),  # [B, 1, ...] — clean x0 at the last (only) position
             loss_mask=pad.to(latents.device),
         )
-        return RolloutTrack(
+        return Part(
             sample_ids=_sample_ids(records),
-            parent_ids=None,
-            parent_track=None,
             conditions=conditions.to_dict(),
             segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
         )
 
     # ------------------------------------------------------------------
