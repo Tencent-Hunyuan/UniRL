@@ -89,7 +89,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         }
 
     # 4. Build the unified-MM tensors with cond-image markers spliced in.
-    bot_task = str(req.stage_config.get("bot_task", "image"))
+    bot_task = str(req.task_config.get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,

@@ -54,8 +54,7 @@ parent ordering so per-group ops in downstream code reduce to single
 
 from __future__ import annotations
 
-import warnings
-from dataclasses import InitVar, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
@@ -76,7 +75,6 @@ class RolloutReq(Batch):
     request_conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
     sampling_params: Dict[str, BaseSamplingParams] = shared_field(default_factory=dict)
     task_config: Dict[str, Any] = shared_field(default_factory=dict)
-    stage_config: InitVar[Optional[Dict[str, Any]]] = None
     # σ schedule is shared across all samples in the request — every
     # sample runs the same num_inference_steps / shift / dynamic-shift μ
     # by construction (geometry varies per-sample only via height/width,
@@ -97,19 +95,6 @@ class RolloutReq(Batch):
     # its own).
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
     init_noise_latent_shape: Optional[List[int]] = shared_field(default=None)
-
-    def __post_init__(self, stage_config: Optional[Dict[str, Any]]) -> None:
-        if stage_config is None:
-            return
-        if self.task_config and self.task_config != stage_config:
-            raise ValueError("RolloutReq received conflicting task_config and deprecated stage_config values")
-        warnings.warn(
-            "RolloutReq.stage_config is deprecated; pass task_config instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if not self.task_config:
-            self.task_config = stage_config
 
     @property
     def batch_size(self) -> int:
@@ -175,22 +160,6 @@ class RolloutReq(Batch):
             segment=new_segment,
             decoded=None,
         )
-
-
-def _get_deprecated_stage_config(req: RolloutReq) -> Dict[str, Any]:
-    return req.task_config
-
-
-def _set_deprecated_stage_config(req: RolloutReq, value: Dict[str, Any]) -> None:
-    req.task_config = value
-
-
-# Keep source-compatible reads and assignments during the task_config migration
-# without serializing a second field on Batch transports.
-RolloutReq.stage_config = property(  # type: ignore[assignment]
-    _get_deprecated_stage_config,
-    _set_deprecated_stage_config,
-)
 
 
 __all__ = ["RolloutReq", "PrimitiveValue"]
