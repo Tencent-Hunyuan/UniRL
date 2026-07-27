@@ -43,7 +43,7 @@
 #     num_rollouts=100 backend.scheduler_cfg.total_steps=100
 
 num_devices: 2
-devices_per_node: 2 # single-node 2-GPU smoke (default is 8/node)
+devices_per_node: 2 
 batch_size: 2
 
 num_rollouts: 2
@@ -146,14 +146,20 @@ reward:
 algorithm:
   _target_: unirl.algorithms.gspo.GSPO
   stage_attr: ar
-  # Paper defaults, unlike the vLLM-Omni recipes: trainside rollout and replay
-  # run the same module, so there is no engine numerics drift to absorb.
   clip_range: 3.0e-4
   clip_range_high: 4.0e-4
   clip_schedule: constant
   # sampling_temperature MUST equal sampling.temperature so replay's
   # log_softmax(logits/T) matches the autoregress sampler (ratio≈1 on-policy).
   sampling_temperature: 1.0
+  # Anchor π_old to a pre-update trainside replay, as the vLLM-Omni 1x4 recipe
+  # does. Sharing one module with the sampler is NOT enough to keep the ratio
+  # inside the paper clip: the KV-cached incremental decode and the dense
+  # teacher-forced replay reduce differently in bf16, which measured |1-ratio|
+  # at 1e-3..7e-3 here — 3-20x the 3e-4 clip, pinning clip_fraction at 1.0.
+  # Replaying both sides removes that numerical gap; the real rollout drift
+  # stays visible in the rollout_replay/k3 metrics.
+  old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
