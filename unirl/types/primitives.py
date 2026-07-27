@@ -48,7 +48,7 @@ framework's default machinery already handles.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import PIL.Image
 import torch
@@ -207,6 +207,10 @@ class Videos(Batch):
 
     frames: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
+    # Batch-aligned source URIs for processors that load videos directly.
+    # ``frames`` and ``uris`` are mutually exclusive per batch.
+    uris: Optional[List[str]] = concat_field(default=None)
+
     @property
     def cu_frames(self) -> Optional[torch.Tensor]:
         """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`.
@@ -249,6 +253,13 @@ class Videos(Batch):
         # per-sample frames along dim 0 internally.
         return cls.pack(frames=frames_list)
 
+    @classmethod
+    def from_uris(cls, uris: List[str]) -> "Videos":
+        """Build frame-less videos carrying batch-aligned source paths."""
+        if not uris:
+            raise ValueError("Cannot build Videos from an empty uris list")
+        return cls(uris=list(uris))
+
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens
         if cu is None or self.frames is None:
@@ -257,7 +268,9 @@ class Videos(Batch):
 
     def __len__(self) -> int:
         cu = self.cu_seqlens
-        return int(cu.shape[0]) - 1 if cu is not None else 0
+        if cu is not None:
+            return int(cu.shape[0]) - 1
+        return len(self.uris) if self.uris is not None else 0
 
 
 @dataclass
@@ -314,6 +327,32 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
+# The batched single-modality primitive union — a Part's raw content (text /
+# image / video / audio). Mirrors ``sample.Primitive`` without importing the
+# Sample module and creating a cycle.
+PrimitiveValue = Union[Texts, Images, Videos, Audios]
+
+
+def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
+    """Map a batched primitive to its modality slot key.
+
+    ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
+    ``Audios -> "audio"`` — the keying convention shared by
+    ``RewardRequest.primitives`` / ``generated`` and the slots
+    :meth:`Sample.conditioning` surfaces. Inverse of a backend's
+    ``preferred_input_kind``.
+    """
+    if isinstance(prim, Texts):
+        return "text"
+    if isinstance(prim, Images):
+        return "image"
+    if isinstance(prim, Videos):
+        return "video"
+    if isinstance(prim, Audios):
+        return "audio"
+    raise TypeError(f"primitive_modality_key: unknown primitive type {type(prim).__name__!r}")
+
+
 __all__ = [
     "Audio",
     "Audios",
@@ -324,6 +363,8 @@ __all__ = [
     "TextAndImage",
     "TextAndVideo",
     "Texts",
+    "PrimitiveValue",
     "Video",
     "Videos",
+    "primitive_modality_key",
 ]

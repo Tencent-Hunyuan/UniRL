@@ -179,6 +179,8 @@ sampling:
   eta: 0.7
   samples_per_prompt: 16
   seed: 42
+  # Keep false until FastVideo accepts separate driver-authored x_T and
+  # sample-specific SDE streams; one seed currently controls both.
   init_same_noise: false
   # SDE step schedule inherited verbatim from wan21_t2v (DanceGRPO swaps only
   # the kernel, not the schedule).

@@ -60,7 +60,32 @@ def _extract_answer(row: dict) -> str | None:
     return None
 
 
-def _convert(hf_id: str, split: str, out_path: str, append_boxed: bool, retry_columns: list[str] | None = None) -> int:
+def _dedup_key(row: dict, prompt: str, answer: str) -> tuple[str, ...]:
+    """Return a stable identity for replicated source rows.
+
+    The public DAPO-Math-17k train split is materialized as 100 repeats of the
+    same 17,917 source ids.  Prefer that source id so distinct records with the
+    same prompt are preserved; schema-pruned fallbacks use the converted record
+    itself.
+    """
+    extra_info = row.get("extra_info")
+    if isinstance(extra_info, dict):
+        for field in ("index", "id", "idx"):
+            value = extra_info.get(field)
+            if value not in (None, ""):
+                return ("source", field, str(value))
+    return ("record", prompt, answer)
+
+
+def _convert(
+    hf_id: str,
+    split: str,
+    out_path: str,
+    append_boxed: bool,
+    retry_columns: list[str] | None = None,
+    *,
+    deduplicate: bool = True,
+) -> int:
     from datasets import load_dataset
 
     try:
@@ -76,6 +101,8 @@ def _convert(hf_id: str, split: str, out_path: str, append_boxed: bool, retry_co
         print(f"  full-schema load failed ({type(e).__name__}); retrying with pruned columns")
         ds = load_dataset(hf_id, split=split, columns=retry_columns)
     n = 0
+    duplicates = 0
+    seen: set[tuple[str, ...]] = set()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w") as f:
         for row in ds:
@@ -83,9 +110,16 @@ def _convert(hf_id: str, split: str, out_path: str, append_boxed: bool, retry_co
             answer = _extract_answer(row)
             if not prompt or answer is None:
                 continue  # skip rows we cannot rule-verify
+            if deduplicate:
+                key = _dedup_key(row, prompt, answer)
+                if key in seen:
+                    duplicates += 1
+                    continue
+                seen.add(key)
             f.write(json.dumps({"prompt": prompt, "metadata": {"answer": answer}}, ensure_ascii=False) + "\n")
             n += 1
-    print(f"  wrote {n} records -> {out_path}  (from {hf_id}:{split})")
+    duplicate_note = f", dropped {duplicates} replicated rows" if duplicates else ""
+    print(f"  wrote {n} records{duplicate_note} -> {out_path}  (from {hf_id}:{split})")
     return n
 
 
@@ -97,6 +131,11 @@ def main() -> None:
     ap.add_argument("--aime24-hf", default="Maxwell-Jia/AIME_2024", help="HF id for AIME 2024 (eval)")
     ap.add_argument("--aime25-hf", default="yentinglin/aime_2025", help="HF id for AIME 2025 (eval)")
     ap.add_argument("--aime-split", default="train")
+    ap.add_argument(
+        "--keep-duplicates",
+        action="store_true",
+        help="preserve repeated source ids/records (default: emit each source example once)",
+    )
     ap.add_argument(
         "--append-boxed-template",
         action="store_true",
@@ -117,6 +156,7 @@ def main() -> None:
         os.path.join(args.out_dir, "train.jsonl"),
         args.append_boxed_template,
         retry_columns=["prompt", "reward_model"],  # verl schema; pruning drops the conflicting extra_info
+        deduplicate=not args.keep_duplicates,
     )
 
     print("Building AIME eval set (2024 + 2025):")
@@ -126,7 +166,13 @@ def main() -> None:
     with open(eval_path, "w") as out:
         for hf_id in (args.aime24_hf, args.aime25_hf):
             tmp = eval_path + ".part"
-            total += _convert(hf_id, args.aime_split, tmp, args.append_boxed_template)
+            total += _convert(
+                hf_id,
+                args.aime_split,
+                tmp,
+                args.append_boxed_template,
+                deduplicate=not args.keep_duplicates,
+            )
             with open(tmp) as part:
                 out.write(part.read())
             os.remove(tmp)

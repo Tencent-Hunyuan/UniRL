@@ -18,9 +18,13 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "RewardType": ("unirl.types.reward", "RewardType"),
     "EngineConfig": ("unirl.types.engine", "EngineConfig"),
     "MediaPreview": ("unirl.types.media_preview", "MediaPreview"),
-    "RolloutReq": ("unirl.types.rollout_req", "RolloutReq"),
-    "RolloutResp": ("unirl.types.rollout_resp", "RolloutResp"),
-    "RolloutTrack": ("unirl.types.rollout_resp", "RolloutTrack"),
+    # Endomorphism rollout types (LIN-446; the Sample/Part model that replaced
+    # the retired RolloutReq / RolloutResp / RolloutTrack triplet).
+    "Sample": ("unirl.types.sample", "Sample"),
+    "Part": ("unirl.types.sample", "Part"),
+    "Primitive": ("unirl.types.sample", "Primitive"),
+    "PrimitiveMap": ("unirl.types.sample", "PrimitiveMap"),
+    "PrimitiveMetadata": ("unirl.types.sample", "PrimitiveMetadata"),
     "ARSamplingParams": ("unirl.types.sampling", "ARSamplingParams"),
     "BaseSamplingParams": ("unirl.types.sampling", "BaseSamplingParams"),
     "DiffusionSamplingParams": ("unirl.types.sampling", "DiffusionSamplingParams"),

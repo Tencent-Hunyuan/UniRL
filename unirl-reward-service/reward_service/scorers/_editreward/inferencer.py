@@ -139,9 +139,8 @@ class EditRewardInferencer:
                 is_train=False,
             )
         )
-        training_args.output_dir = os.path.join(
-            training_args.output_dir, config_path.split("/")[-1].split(".")[0]
-        )
+        output_root = training_args.output_dir or "/tmp/editreward_output"
+        training_args.output_dir = os.path.join(output_root, config_path.split("/")[-1].split(".")[0])
 
         model, processor, _ = _create_model_and_processor(
             model_config=model_config,

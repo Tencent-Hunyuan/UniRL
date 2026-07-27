@@ -8,10 +8,13 @@ vs ``16`` for the wider input projection that absorbs the source-image
 latent concat). The bundle reads ``in_channels`` automatically, so no new
 field is needed here.
 
-V1 scope: the low-resolution 384² condition-image path into the Qwen2.5-VL
-text encoder (``encode_prompt(image=...)``) is deferred — V1 does standard
-text encoding + VAE latent concat only. When V2 adds that path, a
-``condition_image_size`` field will land here.
+Condition-image conditioning: ``use_condition_image_prompt`` (default True)
+feeds the source image into the Qwen2.5-VL text encoder — the correct
+Edit-Plus behavior (mirrors upstream ``encode_prompt(image=...)`` and the
+SGLang rollout path). Set it False for Edit **text-only** encoding: same
+edit chat template / drop-64, empty image prefix (upstream
+``_get_qwen_prompt_embeds(..., image=None)``). This is **not** a switch to
+base Qwen-Image's text-only stage (different system prompt / drop-34).
 """
 
 from __future__ import annotations
@@ -57,6 +60,10 @@ class QwenImageEditPlusPipelineConfig:
     weight_sync_param_name_prefix: str = "transformer."
 
     max_sequence_length: int = 512
+
+    # True: source image → Qwen2.5-VL (Picture 1 + vision tokens).
+    # False: Edit text-only (edit template, drop 64, no vision tokens).
+    use_condition_image_prompt: bool = True
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None

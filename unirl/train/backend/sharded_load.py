@@ -215,34 +215,39 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
     try:
         from accelerate import init_empty_weights
         from transformers import PreTrainedModel
-        from transformers.conversion_mapping import (
-            get_checkpoint_conversion_mapping,
-            get_model_conversion_mapping,
-        )
+        from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import WeightRenaming
     except Exception as exc:  # older / patched transformers without the API
         logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
         return state_dict
 
-    # The backend wraps the HF model in an FSDP subclass, but HF registers its
-    # renaming rules by class name — look up the original class via the MRO.
+    # The backend may wrap the HF model in an FSDP subclass, while the reference
+    # build still needs the original HF class.  Ask Transformers for the rules
+    # from that reference model instead of pre-gating on
+    # ``get_checkpoint_conversion_mapping(config.model_type)``: newer
+    # Transformers releases can register the rules on the model/converter even
+    # when that legacy lookup returns ``None``.
     unwrapped = getattr(model, "module", model)
-    hf_cls = next(
-        (
-            cls
-            for cls in type(unwrapped).__mro__
-            if issubclass(cls, PreTrainedModel) and get_checkpoint_conversion_mapping(cls.__name__) is not None
-        ),
-        None,
-    )
-    if hf_cls is None or getattr(unwrapped, "config", None) is None:
+    config = getattr(unwrapped, "config", None)
+    if config is None:
+        return state_dict
+
+    hf_cls = type(unwrapped)
+    try:
+        from torch.distributed.fsdp import FSDPModule
+
+        if isinstance(unwrapped, FSDPModule):
+            hf_cls = type(unwrapped).__mro__[FSDPModule._orig_cls_mro_index]
+    except (ImportError, IndexError):
+        pass
+    if not issubclass(hf_cls, PreTrainedModel):
         return state_dict
 
     # The live module is sharded and restructured, so take the rules and the
     # canonical key set from a meta-built reference model (no weights, cheap).
     try:
         with init_empty_weights(include_buffers=False):
-            ref = hf_cls(unwrapped.config)
+            ref = hf_cls(config)
         rules = [
             (re.compile(t.source_patterns[0]), t.target_patterns[0])
             for t in get_model_conversion_mapping(ref, add_legacy=True)

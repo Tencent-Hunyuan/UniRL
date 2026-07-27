@@ -7,7 +7,7 @@ holds no runtime code at all, so it is trivially CPU-importable.
 
 **No RL types cross this seam.** ``generate`` takes a plain ``dict`` of SGLang
 sampling kwargs and returns ``list[RawResult]`` (a structural view of SGLang's
-``GenerationResult``); the engine core + adapters do the ``RolloutReq``↔``RolloutResp``
+``GenerationResult``); the engine core + adapters do the ``Sample``↔wire
 translation. Implementations absorb their transport asymmetries (in-process tensors
 vs. HTTP-serialized payloads) behind these signatures.
 """

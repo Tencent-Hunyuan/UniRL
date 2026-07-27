@@ -361,10 +361,16 @@ class StageAlgorithm(Remote, ABC):
             (verl ``bypass_mode`` parity — the ratio then also carries the
             rollout-vs-train engine gap), and ``DRPO`` under
             ``old_logp_source='replay'`` instead freezes a train-side anchor in
-            :meth:`prepare_segment`. Default False — e.g. DiffusionNFT's multi-update
-            path is unvalidated, and anchor-free algorithms (SFT) have nothing
-            to freeze. ``TrainStack`` raises when a False algorithm is paired
-            with ``num_updates_per_batch > 1``.
+            :meth:`prepare_segment`. Anchor-free algorithms may also opt in when
+            disjoint updates are semantically ordinary SGD; SFT does so, although
+            its current trainer deliberately exposes one update per outer step.
+            Default False — e.g. DiffusionNFT's multi-update path is unvalidated.
+            ``TrainStack`` raises when a False algorithm is paired with
+            ``num_updates_per_batch > 1``.
+        requires_advantages: Whether ``TrainStack`` must receive a populated
+            ``Part.advantages`` field. Supervised algorithms set this to False.
+        loss_weighting: ``"sample"`` for equal per-sample weighting or ``"token"``
+            for exact global valid-token weighting across micros and data ranks.
     """
 
     requires_ema_rollout: bool = False
@@ -420,14 +426,14 @@ class StageAlgorithm(Remote, ABC):
         keeps the rollout engine's best-effort emission (raising if it emitted
         nothing); ``"replay"`` recomputes via a ``torch.no_grad``
         ``stage.replay`` and overwrites it. Because this hook fires ONCE per
-        ``RolloutResp`` — before the trainer's ``num_updates_per_batch`` train
+        the filled ``Sample`` — before the trainer's ``num_updates_per_batch`` train
         loop — the anchor is frozen at pre-update weights across all N updates,
         matching the on-policy ratio semantics of PPO-style algorithms.
 
         Args:
-            conditions: ``RolloutResp.tracks[slot].conditions`` — stage-typed conditions
+            conditions: ``Part.conditions`` — stage-typed conditions
                 are reconstructed inside the algorithm if needed.
-            segment: ``RolloutResp.tracks[slot].segment`` for this algorithm's
+            segment: ``Part.segment`` for this algorithm's
                 slot. Implementations may mutate field defaults that were
                 left ``None`` by the rollout (lazy initialization); they
                 must NOT mutate fields that the rollout already populated.
@@ -440,20 +446,21 @@ class StageAlgorithm(Remote, ABC):
         *,
         conditions: Mapping[str, "Condition"],
         segment: "Segment",
-        advantages: torch.Tensor,
+        advantages: Optional[torch.Tensor],
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
         """Compute loss for one micro-batch and call ``.backward()``.
 
         Args:
-            conditions: ``RolloutResp.tracks[slot].conditions`` — stage-typed conditions
+            conditions: ``Part.conditions`` — stage-typed conditions
                 are reconstructed inside the algorithm if needed.
-            segment: ``RolloutResp.tracks[slot].segment`` — diffusion algorithms
+            segment: ``Part.segment`` — diffusion algorithms
                 read ``segment.sde_logp`` / ``segment.sde_indices`` /
                 ``segment.sigmas``; AR algorithms read ``segment.log_probs`` /
                 ``segment.cu_seqlens``.
-            advantages: per-sample advantage signal ``[B]``.
+            advantages: per-sample advantage signal ``[B]``, or ``None`` for an
+                algorithm declaring ``requires_advantages=False``.
             training_progress: training progress in ``[0, 1]`` for
                 clip-range or other schedules.
             loss_scale: gradient accumulation factor (typically

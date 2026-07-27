@@ -409,7 +409,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         Matches ``HunyuanImage3DiffusionStage.trainable_module`` (returns
         the same ``self.model.transformer.model`` object). HI3 is a
         unified MoE: AR (``mode='gen_text'``) and diffusion
-        (``mode='gen_image'``) share the SAME decoder, so the multi-track
+        (``mode='gen_image'``) share the SAME decoder, so the multi-stage
         builder's ``source_stage.trainable_module()`` resolves to the
         same nn.Module either way — LoRA injected via one stage is
         visible to the other.

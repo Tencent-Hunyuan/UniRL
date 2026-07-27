@@ -345,17 +345,19 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         )
         max_new = int(sampling_params.max_new_tokens)
 
-        # HF transformers >= 4.47 require ``cache_position`` to be present in
-        # model_kwargs across the per-token loop (``_update_model_kwargs_for_generation``
-        # reads model_kwargs["cache_position"][-1:] and bumps it by num_new_tokens).
-        # Mirror what ``GenerationMixin._get_initial_cache_position`` would do.
+        # Transformers 5.6 no longer maintains ``cache_position`` in
+        # ``_update_model_kwargs_for_generation``. Instead,
+        # ``prepare_inputs_for_generation`` requires ``next_sequence_length`` to
+        # slice a cached decode down to the newly appended token. Without it,
+        # every iteration re-feeds the whole growing sequence and appends that
+        # sequence to the KV cache again (quadratic cache growth).
         model_kwargs = {
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
         cur_input_ids = input_ids
+        next_sequence_length = int(input_ids.shape[1])
 
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
@@ -373,9 +375,9 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         for _ in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
+                next_sequence_length=next_sequence_length,
                 past_key_values=model_kwargs.get("past_key_values"),
                 attention_mask=model_kwargs.get("attention_mask"),
-                cache_position=model_kwargs.get("cache_position"),
                 use_cache=True,
             )
             with torch.no_grad():
@@ -410,6 +412,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             cur_input_ids = torch.cat([cur_input_ids, token_id.unsqueeze(-1)], dim=1)
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
+            next_sequence_length = 1
         return _pack_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
