@@ -26,7 +26,7 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  shift: 5.0
+  shift: 3.0
   max_sequence_length: 512
   # SGLang decodes videos and returns them for video_pickscore. The train-side
   # WAN pipeline only replays latent transitions, so avoid loading a duplicate VAE.
@@ -48,7 +48,7 @@ bundle:
 
 pipeline:
   _target_: unirl.models.wan21.pipeline.WAN21Pipeline
-  shift: 5.0
+  shift: 3.0
   autocast_precision: bf16
   trajectory_precision: fp16
   logprob_precision: fp32
