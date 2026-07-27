@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from typing import Any, Dict
+
 import numpy as np
 
 from recipes.common.trainer import Trainer
@@ -44,7 +45,7 @@ class REFLTrainer(Trainer):
             group_ids=list(inputs.group_ids),
             primitives=primitives,
             request_conditions={},
-            stage_config={},
+            task_config={},
             sampling_params=dict(self.sampling_params),
             metadata=list(inputs.metadata) if inputs.metadata else [],
             init_noise_group_ids=[],
@@ -76,5 +77,6 @@ class REFLTrainer(Trainer):
             "training_progress": float(training_progress),
         }
         return metrics
+
 
 __all__ = ["REFLTrainer"]

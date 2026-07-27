@@ -93,9 +93,7 @@ def create_model_and_processor(
     special_token_ids = None
     if model_config.use_special_tokens:
         special_tokens = ["<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>"]
-        processor.tokenizer.add_special_tokens(
-            {"additional_special_tokens": special_tokens}
-        )
+        processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
     # Build the reward model. Quantisation is intentionally not supported
@@ -114,9 +112,7 @@ def create_model_and_processor(
         reward_token=model_config.reward_token,
         special_token_ids=special_token_ids,
         torch_dtype=torch_dtype,
-        attn_implementation=(
-            "flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa"
-        ),
+        attn_implementation=("flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa"),
         cache_dir=cache_dir,
         revision=getattr(model_config, "model_revision", "main"),
         use_cache=True if training_args.gradient_checkpointing else False,

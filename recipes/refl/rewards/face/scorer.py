@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Reference-video loader (imageio + resize-to-cover + center_crop)
 # ---------------------------------------------------------------------------
 
+
 def _load_ref_video_frames(
     video_path: str,
     *,
@@ -66,8 +67,8 @@ def _load_ref_video_frames(
             interpolation=TF.InterpolationMode.BILINEAR,
         )
         frame = TF.center_crop(frame, (target_h, target_w))
-        t = TF.to_tensor(frame)            # (C, H, W) [0, 1]
-        frame = TF.to_pil_image(t)         # round-trip PIL to match training-time preprocessing
+        t = TF.to_tensor(frame)  # (C, H, W) [0, 1]
+        frame = TF.to_pil_image(t)  # round-trip PIL to match training-time preprocessing
         frames.append(TF.to_tensor(frame) * 2.0 - 1.0)
     reader.close()
 
@@ -78,6 +79,7 @@ def _load_ref_video_frames(
 # ---------------------------------------------------------------------------
 # Reward scorer
 # ---------------------------------------------------------------------------
+
 
 class FaceRewardScorer(LocalRewardBackend):
     """SCRFD detection + ArcFace embedding + pool cosine similarity for REFL."""
@@ -107,9 +109,7 @@ class FaceRewardScorer(LocalRewardBackend):
         self._ref_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        raise NotImplementedError(
-            "FaceRewardScorer is REFL-only; use compute_rewards_differentiable()."
-        )
+        raise NotImplementedError("FaceRewardScorer is REFL-only; use compute_rewards_differentiable().")
 
     # ------------------------------------------------------------------
     # Per-video face embedding (recipe-local REFL implementation)
@@ -171,7 +171,7 @@ class FaceRewardScorer(LocalRewardBackend):
                 embeddings.append(zero_emb)
                 mask.append(0)
 
-        emb_stack = torch.stack(embeddings).unsqueeze(0)                       # (1, T, 512)
+        emb_stack = torch.stack(embeddings).unsqueeze(0)  # (1, T, 512)
         mask_tensor = torch.tensor(mask, device=self.device).unsqueeze(0).float()  # (1, T)
         return emb_stack, mask_tensor
 
@@ -228,9 +228,7 @@ class FaceRewardScorer(LocalRewardBackend):
             ref_emb, ref_mask = self._get_ref_embeddings(str(ref_path))
 
             gen_video = torch.clamp(media_tensor[i], -1, 1).to(self.device)
-            gen_emb, gen_mask = self._extract_face_embeddings(
-                gen_video, with_grad=self._differentiable
-            )
+            gen_emb, gen_mask = self._extract_face_embeddings(gen_video, with_grad=self._differentiable)
 
             if int(gen_mask.sum().item()) == 0:
                 rewards.append(gen_video.sum() * 0.0)

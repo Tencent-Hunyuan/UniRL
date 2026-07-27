@@ -327,10 +327,7 @@ class Trainer(BaseTrainer):
 
     def log_metrics(self, metrics: Dict[str, Any], *, rollout_id: int, num_rollouts: int) -> None:
         trainer_name = self.__class__.__name__.removesuffix("Trainer") or self.__class__.__name__
-        metric_text = " ".join(
-            f"{key}={self._format_metric_for_log(value)}"
-            for key, value in metrics.items()
-        )
+        metric_text = " ".join(f"{key}={self._format_metric_for_log(value)}" for key, value in metrics.items())
         if metric_text:
             logger.info("%s rollout %d/%d  %s", trainer_name, rollout_id + 1, num_rollouts, metric_text)
         else:

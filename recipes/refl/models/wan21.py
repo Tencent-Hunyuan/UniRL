@@ -64,7 +64,9 @@ class Wan21ReflDiffusionStep(WAN21DiffusionStep):
             branch_embeds = prompt_embeds
         else:
             neg = conditions.negative_text
-            branch_embeds = neg.embeds if neg is not None and neg.embeds is not None else torch.zeros_like(prompt_embeds)
+            branch_embeds = (
+                neg.embeds if neg is not None and neg.embeds is not None else torch.zeros_like(prompt_embeds)
+            )
 
         batch_size = int(sample.shape[0])
         timestep = sigma * _WAN_TIMESTEP_SCALE
@@ -179,9 +181,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         bypassed.
         """
         if conditions.text is None or conditions.text.embeds is None:
-            raise ValueError(
-                "Wan21ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None"
-            )
+            raise ValueError("Wan21ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None")
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
@@ -189,8 +189,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         schedule = schedule.to(device)
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(
-                f"Wan21ReflDiffusionStage.diffuse_with_grad: "
-                f"schedule length {schedule.shape[0]} != T+1={T + 1}"
+                f"Wan21ReflDiffusionStage.diffuse_with_grad: schedule length {schedule.shape[0]} != T+1={T + 1}"
             )
         self.strategy.init_schedule(schedule)
 
@@ -244,8 +243,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         step = self.step
         if not isinstance(step, Wan21ReflDiffusionStep):
             raise TypeError(
-                f"Wan21ReflDiffusionStage.diffuse_with_grad requires Wan21ReflDiffusionStep, "
-                f"got {type(step).__name__}."
+                f"Wan21ReflDiffusionStage.diffuse_with_grad requires Wan21ReflDiffusionStep, got {type(step).__name__}."
             )
 
         for i in range(T):
@@ -305,7 +303,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
                         branch="cond",
                     )
                 sigma_f32 = sigma.to(dtype=torch.float32)
-                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32 ** 2)).mean()
+                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).mean()
                 kl_total = kl_total + kl_step
                 kl_steps += 1
 
@@ -345,8 +343,7 @@ class Wan21ReflPipeline(WAN21Pipeline):
         super().__init__(*args, **kwargs)
         old = self.diffusion
         assert isinstance(old, WAN21DiffusionStage), (
-            f"Wan21ReflPipeline expects parent to build WAN21DiffusionStage, "
-            f"got {type(old).__name__}"
+            f"Wan21ReflPipeline expects parent to build WAN21DiffusionStage, got {type(old).__name__}"
         )
         self.diffusion = Wan21ReflDiffusionStage(
             model=old.model,

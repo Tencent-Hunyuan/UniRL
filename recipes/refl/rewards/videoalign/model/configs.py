@@ -141,15 +141,11 @@ class ModelConfig:
     # Bradley-Terry / regression flavour — train-only. Inference ignores
     # this entirely; kept for round-trip compatibility with
     # ``model_config.json``.
-    loss_type: Literal[
-        "bt", "reg", "btt", "margin", "constant_margin", "scaled", "regular"
-    ] = "regular"
+    loss_type: Literal["bt", "reg", "btt", "margin", "constant_margin", "scaled", "regular"] = "regular"
 
     def __post_init__(self) -> None:
         if self.load_in_8bit and self.load_in_4bit:
-            raise ValueError(
-                "You can't use 8 bit and 4 bit precision at the same time"
-            )
+            raise ValueError("You can't use 8 bit and 4 bit precision at the same time")
 
 
 __all__ = ["ModelConfig", "PEFTLoraConfig", "TrainingConfig"]

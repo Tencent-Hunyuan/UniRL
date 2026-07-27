@@ -81,7 +81,8 @@ def _pick_checkpoint_dir(checkpoint_dir: str, checkpoint_step: Optional[int]) ->
     chosen = candidates[0]
     logger.warning(
         "Requested VideoAlign checkpoint-%s not found; falling back to latest %s",
-        checkpoint_step, chosen,
+        checkpoint_step,
+        chosen,
     )
     return chosen
 
@@ -121,18 +122,17 @@ def load_model_from_checkpoint(
         # the target model's own state_dict keys and remap when needed.
         target_keys = model.state_dict().keys()
         needs_remap = any(
-            k.startswith("base_model.model.model.language_model.")
-            or k.startswith("base_model.model.model.visual.")
+            k.startswith("base_model.model.model.language_model.") or k.startswith("base_model.model.model.visual.")
             for k in target_keys
         )
         if needs_remap:
             new_state_dict: Dict[str, torch.Tensor] = {}
             for key, value in model_state_dict.items():
                 if key.startswith("base_model.model.model"):
-                    new_key = "base_model.model.model.language_model" + key[len("base_model.model.model"):]
+                    new_key = "base_model.model.model.language_model" + key[len("base_model.model.model") :]
                     new_state_dict[new_key] = value
                 elif key.startswith("base_model.model.visual"):
-                    new_key = "base_model.model.model.visual" + key[len("base_model.model.visual"):]
+                    new_key = "base_model.model.model.visual" + key[len("base_model.model.visual") :]
                     new_state_dict[new_key] = value
                 else:
                     new_state_dict[key] = value
@@ -151,7 +151,9 @@ def load_model_from_checkpoint(
         non_lora_state_dict = torch.load(non_lora_ckpt, map_location="cpu")
 
         lora_state_dict = _insert_adapter_name_into_state_dict(
-            lora_state_dict, adapter_name="default", parameter_prefix="lora_",
+            lora_state_dict,
+            adapter_name="default",
+            parameter_prefix="lora_",
         )
 
         model_state_dict = model.state_dict()

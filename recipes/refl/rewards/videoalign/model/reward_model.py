@@ -45,10 +45,7 @@ def _cfg_get(config: Any, name: str) -> Any:
     # that tolerate ``None`` (e.g. ``pad_token_id``) keep working.
     if hasattr(config, name):
         return getattr(config, name)
-    raise AttributeError(
-        f"{type(config).__name__} has no attribute {name!r} "
-        f"(checked top-level and .text_config)."
-    )
+    raise AttributeError(f"{type(config).__name__} has no attribute {name!r} (checked top-level and .text_config).")
 
 
 class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
@@ -152,13 +149,9 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,  # noqa: ARG002 — kept for API parity
     ):
-        output_attentions = (
-            output_attentions if output_attentions is not None
-            else self.config.output_attentions
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None
-            else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -194,9 +187,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             inputs_embeds = self.get_input_embeddings()(input_ids)
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.get_dtype())
-                image_embeds = _as_tensor(
-                    self.visual(pixel_values, grid_thw=image_grid_thw)
-                )
+                image_embeds = _as_tensor(self.visual(pixel_values, grid_thw=image_grid_thw))
                 image_token_id = _cfg_get(self.config, "image_token_id")
                 image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -204,9 +195,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
-                video_embeds = _as_tensor(
-                    self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                )
+                video_embeds = _as_tensor(self.visual(pixel_values_videos, grid_thw=video_grid_thw))
                 video_token_id = _cfg_get(self.config, "video_token_id")
                 video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -227,8 +216,8 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0]                    # (B, L, D)
-        logits = self.rm_head(hidden_states)          # (B, L, output_dim)
+        hidden_states = outputs[0]  # (B, L, D)
+        logits = self.rm_head(hidden_states)  # (B, L, output_dim)
 
         if input_ids is not None:
             batch_size = input_ids.shape[0]
@@ -241,9 +230,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         except AttributeError:
             pad_token_id = None
         if pad_token_id is None and batch_size != 1:
-            raise ValueError(
-                "Cannot handle batch sizes > 1 if no padding token is defined."
-            )
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
         if pad_token_id is None:
             sequence_lengths = -1
         else:
@@ -260,9 +247,7 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
         elif self.reward_token == "mean":
             valid_lengths = torch.clamp(sequence_lengths, min=0, max=logits.size(1) - 1)
-            pooled_logits = torch.stack(
-                [logits[i, : valid_lengths[i]].mean(dim=0) for i in range(batch_size)]
-            )
+            pooled_logits = torch.stack([logits[i, : valid_lengths[i]].mean(dim=0) for i in range(batch_size)])
         elif self.reward_token == "special":
             special_token_mask = torch.zeros_like(input_ids, dtype=torch.bool)
             for special_token_id in self.special_token_ids:

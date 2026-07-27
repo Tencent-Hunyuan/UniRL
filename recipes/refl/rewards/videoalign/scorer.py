@@ -102,9 +102,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         )
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        raise NotImplementedError(
-            "VideoAlignRewardScorer is REFL-only; use compute_rewards_differentiable()."
-        )
+        raise NotImplementedError("VideoAlignRewardScorer is REFL-only; use compute_rewards_differentiable().")
 
     # ------------------------------------------------------------------
     # Differentiable REFL reward entry point
@@ -121,8 +119,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             raise ValueError(f"VideoAlignRewardScorer expects [B,C,T,H,W], got {tuple(media_tensor.shape)}")
         if len(prompts) != int(media_tensor.shape[0]):
             raise ValueError(
-                f"VideoAlignRewardScorer: prompts length {len(prompts)} "
-                f"!= batch size {int(media_tensor.shape[0])}."
+                f"VideoAlignRewardScorer: prompts length {len(prompts)} != batch size {int(media_tensor.shape[0])}."
             )
 
         # The wrapper expects per-sample [T, C, H, W] in [-1, 1].
@@ -134,12 +131,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         # with the mmrl baseline.
         per_sample_videos: List[torch.Tensor] = []
         for v in media_tensor:
-            v = (
-                v.to(self.device)
-                .permute(1, 0, 2, 3)
-                .clamp(-1.0, 1.0)
-                .contiguous()
-            )  # → (T, C, H, W)
+            v = v.to(self.device).permute(1, 0, 2, 3).clamp(-1.0, 1.0).contiguous()  # → (T, C, H, W)
             per_sample_videos.append(v)
 
         if self._reward_num_frames > 0:
@@ -147,7 +139,9 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             for v in per_sample_videos:
                 if v.shape[0] > self._reward_num_frames:
                     idx = torch.linspace(
-                        0, v.shape[0] - 1, self._reward_num_frames,
+                        0,
+                        v.shape[0] - 1,
+                        self._reward_num_frames,
                         device=v.device,
                     ).long()
                     v = v[idx]
@@ -157,14 +151,12 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         autograd_ctx = torch.enable_grad if self._differentiable else torch.no_grad
         with autograd_ctx():
             scores = self.model.forward_scores(
-                per_sample_videos, prompts, use_norm=self._use_norm,
+                per_sample_videos,
+                prompts,
+                use_norm=self._use_norm,
             )
 
-        reward = (
-            self._w_vq * scores["VQ"]
-            + self._w_mq * scores["MQ"]
-            + self._w_ta * scores["TA"]
-        )
+        reward = self._w_vq * scores["VQ"] + self._w_mq * scores["MQ"] + self._w_ta * scores["TA"]
         return reward.float()
 
     # ------------------------------------------------------------------
@@ -190,6 +182,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 # ---------------------------------------------------------------------------
 # Spec
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class VideoAlignSpec(BaseRewardComponentSpec):

@@ -48,7 +48,9 @@ class Wan22ReflDiffusionStep(WAN22DiffusionStep):
             branch_embeds = prompt_embeds
         else:
             neg = conditions.negative_text
-            branch_embeds = neg.embeds if neg is not None and neg.embeds is not None else torch.zeros_like(prompt_embeds)
+            branch_embeds = (
+                neg.embeds if neg is not None and neg.embeds is not None else torch.zeros_like(prompt_embeds)
+            )
 
         if use_high_noise is None:
             use_high_noise, _ = self._select_for_sigma(
@@ -148,9 +150,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         """
 
         if conditions.text is None or conditions.text.embeds is None:
-            raise ValueError(
-                "Wan22ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None"
-            )
+            raise ValueError("Wan22ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None")
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
@@ -158,8 +158,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         schedule = schedule.to(device)
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(
-                f"Wan22ReflDiffusionStage.diffuse_with_grad: "
-                f"schedule length {schedule.shape[0]} != T+1={T + 1}"
+                f"Wan22ReflDiffusionStage.diffuse_with_grad: schedule length {schedule.shape[0]} != T+1={T + 1}"
             )
         self.strategy.init_schedule(schedule)
 
@@ -191,7 +190,6 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                 base_seed=int(params.seed),
             )
 
-
         # BPTT knobs.
         sk: Dict[str, Any] = dict(getattr(params, "sampler_kwargs", {}) or {})
         mid_timestep = int(sk.get("mid_timestep", 0))
@@ -213,8 +211,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         step = self.step
         if not isinstance(step, Wan22ReflDiffusionStep):
             raise TypeError(
-                f"Wan22ReflDiffusionStage.diffuse_with_grad requires Wan22ReflDiffusionStep, "
-                f"got {type(step).__name__}."
+                f"Wan22ReflDiffusionStage.diffuse_with_grad requires Wan22ReflDiffusionStep, got {type(step).__name__}."
             )
 
         dual = self.model.transformer
@@ -286,7 +283,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                         use_high_noise=use_high_noise,
                     )
                 sigma_f32 = sigma.to(dtype=torch.float32)
-                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32 ** 2)).mean()
+                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).mean()
                 kl_total = kl_total + kl_step
                 kl_steps += 1
 
@@ -321,8 +318,7 @@ class Wan22ReflPipeline(WAN22Pipeline):
         super().__init__(*args, **kwargs)
         old = self.diffusion
         assert isinstance(old, WAN22DiffusionStage), (
-            f"Wan22ReflPipeline expects parent to build WAN22DiffusionStage, "
-            f"got {type(old).__name__}"
+            f"Wan22ReflPipeline expects parent to build WAN22DiffusionStage, got {type(old).__name__}"
         )
         self.diffusion = Wan22ReflDiffusionStage(
             model=old.model,

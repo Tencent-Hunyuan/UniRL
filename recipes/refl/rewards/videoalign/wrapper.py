@@ -123,8 +123,9 @@ class VideoRewardWrapper:
                 "by the upstream VideoAlign trainer)."
             )
 
-        data_config_dict, model_config_dict, peft_lora_config_dict, inference_config = \
-            _load_configs_from_json(config_path)
+        data_config_dict, model_config_dict, peft_lora_config_dict, inference_config = _load_configs_from_json(
+            config_path
+        )
 
         # We only need two fields out of the data_config block — the
         # template type and the eval-dim list. Stash them directly without
@@ -160,9 +161,7 @@ class VideoRewardWrapper:
         # check. The fast variant operates on torch tensors end-to-end via
         # torchvision.transforms.v2.functional.resize, so gradients flow
         # from pixels through the processor into the vision encoder.
-        fast_ip = AutoImageProcessor.from_pretrained(
-            model_config.model_name_or_path, use_fast=True
-        )
+        fast_ip = AutoImageProcessor.from_pretrained(model_config.model_name_or_path, use_fast=True)
         processor.image_processor = fast_ip
 
         model.to(self.device)
@@ -174,10 +173,14 @@ class VideoRewardWrapper:
         self.data_config = data_config_dict  # raw dict, kept for debugging
 
         logger.info(
-            "VideoRewardWrapper loaded: ckpt=%s device=%s dtype=%s "
-            "resize=%dx%d micro_bs=%d use_norm=%s template=%s",
-            checkpoint_dir, self.device, self.dtype, self.resize_height,
-            self.resize_width, self.micro_batch_size, self.use_norm,
+            "VideoRewardWrapper loaded: ckpt=%s device=%s dtype=%s resize=%dx%d micro_bs=%d use_norm=%s template=%s",
+            checkpoint_dir,
+            self.device,
+            self.dtype,
+            self.resize_height,
+            self.resize_width,
+            self.micro_batch_size,
+            self.use_norm,
             self.prompt_template_type,
         )
 
@@ -249,9 +252,7 @@ class VideoRewardWrapper:
         processed: List[torch.Tensor] = []
         for video in video_tensors:
             if video.dim() != 4:
-                raise ValueError(
-                    f"Expected video tensor shape [T,C,H,W], got {tuple(video.shape)}"
-                )
+                raise ValueError(f"Expected video tensor shape [T,C,H,W], got {tuple(video.shape)}")
             # Auto-transpose if caller passed [C,T,H,W] with T > 3.
             if video.shape[0] == 3 and video.shape[1] > 3:
                 video = video.permute(1, 0, 2, 3)
@@ -261,7 +262,9 @@ class VideoRewardWrapper:
 
         batch = self.processor(
             text=self.processor.apply_chat_template(
-                chat_data, tokenize=False, add_generation_prompt=True,
+                chat_data,
+                tokenize=False,
+                add_generation_prompt=True,
             ),
             images=None,
             videos=processed,
@@ -303,17 +306,13 @@ class VideoRewardWrapper:
             Gradients flow back into ``video_tensors`` when they require grad.
         """
         if len(video_tensors) != len(prompts):
-            raise ValueError(
-                "video_tensors and prompts must have the same batch size."
-            )
+            raise ValueError("video_tensors and prompts must have the same batch size.")
         use_norm = self.use_norm if use_norm is None else use_norm
 
         all_vq, all_mq, all_ta = [], [], []
         for start in range(0, len(video_tensors), self.micro_batch_size):
             end = start + self.micro_batch_size
-            batch = self.prepare_batch_from_frames(
-                video_tensors[start:end], prompts[start:end]
-            )
+            batch = self.prepare_batch_from_frames(video_tensors[start:end], prompts[start:end])
             # Aligned with mmrl's wrapper: pass the processor batch
             # straight through to the model. transformers 4.54 (current
             # pinned version) does not inject ``mm_token_type_ids``, so

@@ -76,7 +76,7 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
                 f"[B, C, T_lat, H_lat, W_lat], got {tuple(clean.shape)}"
             )
 
-        with torch.no_grad():
+        with nullcontext() if grad else torch.no_grad():
             decoded = self._vae_decode(clean)
 
         # Decoded layout is [B, C, T_dec, H_dec, W_dec] in [-1, 1].

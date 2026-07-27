@@ -1,19 +1,20 @@
 """A simple, flexible implementation of a face analysis tool."""
+
 import math
 import os
 
 import onnx
 import torch
 import torch.nn.functional as F
+import torchvision.ops as ops
 from onnx2torch import convert
 from skimage import transform as trans
 from torchvision.transforms.functional import resize
-import torchvision.ops as ops
-
 
 arcface_dst = torch.tensor(
-    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
-     [41.5493, 92.3655], [70.7299, 92.2041]]).float()
+    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]]
+).float()
+
 
 def distance2bbox(points, distance, max_shape=None):
     """Decode distance prediction to bounding box."""
@@ -27,6 +28,7 @@ def distance2bbox(points, distance, max_shape=None):
         x2 = x2.clamp(min=0, max=max_shape[1])
         y2 = y2.clamp(min=0, max=max_shape[0])
     return torch.stack([x1, y1, x2, y2], axis=-1)
+
 
 def distance2kps(points, distance, max_shape=None):
     """Decode distance prediction to keypoints."""
@@ -44,7 +46,8 @@ def distance2kps(points, distance, max_shape=None):
 
 def face_transform(data, center, output_size, scale, rotation, device):
     def to_homogeneous(mat):
-        return torch.vstack([mat, torch.tensor([0., 0., 1.])])
+        return torch.vstack([mat, torch.tensor([0.0, 0.0, 1.0])])
+
     scale_ratio = scale
     rot = float(rotation) * math.pi / 180.0
     cx = center[0] * scale_ratio
@@ -52,29 +55,15 @@ def face_transform(data, center, output_size, scale, rotation, device):
 
     C, H, W = data.shape
 
-    t1 = to_homogeneous(torch.tensor([
-        [scale_ratio, 0, 0],
-        [0, scale_ratio, 0]
-    ])).float()
-    t2 = to_homogeneous(torch.tensor([
-        [1, 0, -cx],
-        [0, 1, -cy]
-    ])).float()
+    t1 = to_homogeneous(torch.tensor([[scale_ratio, 0, 0], [0, scale_ratio, 0]])).float()
+    t2 = to_homogeneous(torch.tensor([[1, 0, -cx], [0, 1, -cy]])).float()
     cos_theta = math.cos(rot)
     sin_theta = math.sin(rot)
-    t3 = to_homogeneous(torch.tensor([
-        [cos_theta, -sin_theta, 0],
-        [sin_theta, cos_theta, 0]
-    ])).float()
-    t4 = to_homogeneous(torch.tensor([
-        [1, 0, output_size / 2],
-        [0, 1, output_size / 2]
-    ])).float()
+    t3 = to_homogeneous(torch.tensor([[cos_theta, -sin_theta, 0], [sin_theta, cos_theta, 0]])).float()
+    t4 = to_homogeneous(torch.tensor([[1, 0, output_size / 2], [0, 1, output_size / 2]])).float()
     M_homogeneous = t4 @ t3 @ t2 @ t1
     M = M_homogeneous[:2, :]
-    T = torch.tensor([[2 / W, 0, -1],
-                      [0, 2 / H, -1],
-                      [0, 0, 1]])
+    T = torch.tensor([[2 / W, 0, -1], [0, 2 / H, -1], [0, 0, 1]])
     theta = torch.inverse(T @ M_homogeneous @ torch.inverse(T))
     theta = theta[:2, :].unsqueeze(0).to(device)
     grid = F.affine_grid(theta, data.unsqueeze(0).size(), align_corners=True)
@@ -93,7 +82,7 @@ def trans_points2d(pts, M):
     return transformed
 
 
-def estimate_norm(lmk, image_size=112, mode='arcface'):
+def estimate_norm(lmk, image_size=112, mode="arcface"):
     assert lmk.shape == (5, 2)
     assert image_size % 112 == 0 or image_size % 128 == 0
     if image_size % 112 == 0:
@@ -110,7 +99,7 @@ def estimate_norm(lmk, image_size=112, mode='arcface'):
     return M
 
 
-def norm_crop(img, landmark, image_size=112, mode='arcface'):
+def norm_crop(img, landmark, image_size=112, mode="arcface"):
     """Align an image into ArcFace canonical 112x112 using a similarity transform.
 
     Differentiable in ``img`` — the only non-grad path is ``landmark``, which
@@ -120,9 +109,7 @@ def norm_crop(img, landmark, image_size=112, mode='arcface'):
     M_homogeneous = estimate_norm(landmark, image_size, mode)
     C, H, W = img.shape
     img = img.unsqueeze(0)
-    T = torch.tensor([[2 / W, 0, -1],
-                      [0, 2 / H, -1],
-                      [0, 0, 1]])
+    T = torch.tensor([[2 / W, 0, -1], [0, 2 / H, -1], [0, 0, 1]])
     T_inv = torch.inverse(T)
     theta = torch.inverse(T @ M_homogeneous @ T_inv)
     theta = theta[:2, :].unsqueeze(0).to(img.device)
@@ -140,17 +127,15 @@ def invert_affine_transform(matrix):
     c, d = L[..., 1, 0], L[..., 1, 1]
     det = a * d - b * c
     inv_det = 1.0 / det
-    inv_L = torch.stack([
-        torch.stack([d * inv_det, -b * inv_det], dim=-1),
-        torch.stack([-c * inv_det, a * inv_det], dim=-1)
-    ], dim=-2)
+    inv_L = torch.stack(
+        [torch.stack([d * inv_det, -b * inv_det], dim=-1), torch.stack([-c * inv_det, a * inv_det], dim=-1)], dim=-2
+    )
     inv_T = -torch.matmul(inv_L, T)
     inv_matrix = torch.cat([inv_L, inv_T], dim=-1)
     return inv_matrix
 
 
 class Face(dict):
-
     def __init__(self, d=None, **kwargs):
         if d is None:
             d = {}
@@ -161,8 +146,7 @@ class Face(dict):
 
     def __setattr__(self, name, value):
         if isinstance(value, (list, tuple)):
-            value = [self.__class__(x)
-                    if isinstance(x, dict) else x for x in value]
+            value = [self.__class__(x) if isinstance(x, dict) else x for x in value]
         elif isinstance(value, dict) and not isinstance(value, self.__class__):
             value = self.__class__(value)
         super(Face, self).__setattr__(name, value)
@@ -219,14 +203,13 @@ class SCRFD:
 
             height = input_height // stride
             width = input_width // stride
-            K = height * width
             key = (height, width, stride)
             if key in self.center_cache:
                 anchor_centers = self.center_cache[key]
             else:
                 rows = torch.arange(height)
                 cols = torch.arange(width)
-                grid_y, grid_x = torch.meshgrid(rows, cols, indexing='ij')
+                grid_y, grid_x = torch.meshgrid(rows, cols, indexing="ij")
                 anchor_centers = torch.stack([grid_x, grid_y], dim=-1).float()
                 anchor_centers = (anchor_centers * stride).reshape((-1, 2))
                 if self._num_anchors > 1:
@@ -253,7 +236,7 @@ class SCRFD:
         return scores_list, bboxes_list, kpss_list
 
     @torch.no_grad()
-    def detect(self, image, input_size=None, max_num=0, metric='default', nms_thresh=0.4, det_thresh=0.5):
+    def detect(self, image, input_size=None, max_num=0, metric="default", nms_thresh=0.4, det_thresh=0.5):
         assert input_size is not None or self.input_size is not None
         input_size = self.input_size if input_size is None else input_size
 
@@ -308,7 +291,7 @@ class ArcFace:
         self.torch_model.to(self.device)
         # Frozen weights — gradient flows through inputs only.
         self.torch_model.requires_grad_(False)
-        self.taskname = 'recognition'
+        self.taskname = "recognition"
         self.input_size = (112, 112)
 
     def get(self, img, face, input_size=(112, 112)):
@@ -348,7 +331,7 @@ class Landmark:
         self.torch_model.requires_grad_(False)
         self.lmk_dim = 2
         self.lmk_num = 106
-        self.taskname = 'landmark_%dd_%d' % (self.lmk_dim, self.lmk_num)
+        self.taskname = "landmark_%dd_%d" % (self.lmk_dim, self.lmk_num)
         self.input_size = (192, 192)
 
     def get(self, img, face, input_size=(192, 192)):
@@ -358,7 +341,7 @@ class Landmark:
         rotate = 0
         _scale = self.input_size[0] / (max(w, h) * 1.5)
         aimg, M = face_transform(img, center, self.input_size[0], _scale, rotate, img.device)
-        aimg = (aimg + 1) / 2 * 255.
+        aimg = (aimg + 1) / 2 * 255.0
         aimg = aimg[:, [2, 1, 0], :, :]
 
         input_size = self.input_size if input_size is None else input_size
@@ -370,7 +353,6 @@ class Landmark:
         else:
             new_width = input_size[0]
             new_height = int(new_width * im_ratio)
-        det_scale = float(new_height) / aimg.shape[2]
         resized_img = resize(aimg, (new_height, new_width), antialias=False)
         det_img = torch.zeros((aimg.shape[0], 3, input_size[1], input_size[0]), device=self.device)
         det_img[:, :, :new_height, :new_width] = resized_img
@@ -378,9 +360,9 @@ class Landmark:
         pred = self.torch_model(det_img)[0]
         pred = pred.reshape((-1, 2))
         if self.lmk_num < pred.shape[0]:
-            pred = pred[self.lmk_num * -1:, :]
+            pred = pred[self.lmk_num * -1 :, :]
         pred[:, 0:2] += 1
-        pred[:, 0:2] *= (self.input_size[0] // 2)
+        pred[:, 0:2] *= self.input_size[0] // 2
 
         IM = invert_affine_transform(M).to(img.device)
         pred = trans_points2d(pred, IM)
