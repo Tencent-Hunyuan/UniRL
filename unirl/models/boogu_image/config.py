@@ -81,6 +81,9 @@ class BooguImagePipelineConfig:
     # on actors that never embed text (qwen_image precedent).
     load_text_encoder: bool = True
 
+    # Trainer-side VAE. False for separate-engine recipes (engine owns decode).
+    load_vae: bool = True
+
     # Build the 10.29B DiT on the meta device and materialize per-rank
     # shards after FSDP wrapping (avoids the per-rank full-model load
     # spike). Boogu's transformer has no registered buffers or

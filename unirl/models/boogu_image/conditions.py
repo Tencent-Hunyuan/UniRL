@@ -10,8 +10,8 @@ consumes directly (no unpad/repack — see ``BooguImageTextEmbedStage``).
 
 The CFG negative branch is a sibling ``negative_text`` field so the schema
 is honest about which slots travel on the wire — a reader of
-``RolloutResp.tracks["image"].conditions`` sees ``"text"`` and
-``"negative_text"`` as two equal-status entries.
+``Part.conditions`` sees ``"text"`` and ``"negative_text"`` as two
+equal-status entries.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ class BooguImageConditions(Batch):
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.tracks["image"].conditions``.
+        packing into ``Part.conditions``.
 
         Emits ``"negative_text"`` only when ``negative_text is not None``
         so the dict shape stays minimal for CFG-off rollouts.

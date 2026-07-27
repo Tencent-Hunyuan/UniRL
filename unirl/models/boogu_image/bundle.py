@@ -39,7 +39,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import BooguImagePipelineConfig
@@ -92,7 +92,7 @@ class BooguImageBundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
+        vae: Optional[nn.Module],
         text_encoder: Optional[nn.Module],
         processor: Any,
         dtype: torch.dtype,
@@ -156,19 +156,19 @@ class BooguImageBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
+        meta_init_state = None
         if config.meta_init_transformer:
             # Architecture only, on the meta device; the backend materializes
             # per-rank shards after wrapping and loads weights from the
             # stashed path. Boogu's vendored tree has zero registered buffers
             # and zero init-computed plain-tensor attrs (rope freqs_cis is a
-            # per-call input), so this is the trivial finalize_meta_init case
-            # — its non-persistent-buffer warning must come out EMPTY; if it
-            # ever fires after a re-vendor, that is the signal to add a
-            # stamp_init_state_restore quirk fix.
+            # per-call input), so the captured init state must come out EMPTY;
+            # if it ever grows after a re-vendor, that is the signal a quirk
+            # restore became load-bearing.
             transformer_config = BooguImageTransformer2DModel.load_config(path, subfolder="transformer")
-            with torch.device("meta"):
-                transformer = BooguImageTransformer2DModel.from_config(transformer_config)
-            transformer = finalize_meta_init(transformer, dtype=dtype)
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: BooguImageTransformer2DModel.from_config(transformer_config), dtype=dtype
+            )
         else:
             transformer = BooguImageTransformer2DModel.from_pretrained(
                 path, subfolder="transformer", torch_dtype=dtype
@@ -185,8 +185,10 @@ class BooguImageBundle(Bundle):
             swapped = _swap_attention_processors_to_flash(transformer)
             logger.info("attention_backend=flash2_varlen: swapped %d processor(s)", swapped)
 
-        vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
-        vae.requires_grad_(False)
+        vae = None
+        if config.load_vae:
+            vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae.requires_grad_(False)
 
         # Separate-engine recipes can skip the frozen encoder copy on actors
         # that never embed text (qwen_image precedent).
@@ -219,6 +221,7 @@ class BooguImageBundle(Bundle):
         if config.meta_init_transformer:
             # Consumed by the backends' post-wrap sharded weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._meta_init_state = meta_init_state
         return bundle
 
 

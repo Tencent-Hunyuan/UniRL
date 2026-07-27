@@ -368,8 +368,8 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
     ) -> LatentSegment:
         """Run full Boogu-Image sampling. Returns a ``LatentSegment``.
 
-        ``initial_latents`` (optional) — driver-shipped x_T per
-        ``req.request_conditions['initial_latents']``.
+        ``initial_latents`` (optional) — x_T resolved from the request
+        ``Sample``'s diffusion generation Part.
         """
         from unirl.sde.noise import generate_latents
 
