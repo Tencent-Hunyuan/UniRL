@@ -32,13 +32,11 @@ import logging
 import sys
 import time
 from collections import Counter
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional
 
-import torch
-
-from unirl.distributed.tensor import hydrate
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.agentic_async import _GroupAssembler, _GroupBuffer
+from unirl.trainer.agentic_env import _EnvRewardSource
 from unirl.types.sample import Part, Sample
 
 logger = logging.getLogger(__name__)
@@ -321,36 +319,12 @@ class AgenticPartialTrainer(AgenticTrainer):
                 self._finish_wandb()
 
 
-class AgenticEnvPartialTrainer(AgenticPartialTrainer):
+class AgenticEnvPartialTrainer(_EnvRewardSource, AgenticPartialTrainer):
     """Colocate partial-rollout trainer whose reward is the environment's per-trajectory return
-    (ALFWorld etc.). Reward SOURCE only — the partial-rollout machinery is inherited. Recipes use
-    ``tail_policy: drop`` because stateful-episode envs restart a carried partial."""
-
-    def _rewards_and_groups(
-        self, sample: Sample, trajs: List[Sample], rollout_id: int
-    ) -> Tuple[torch.Tensor, List[str]]:
-        """Read the env-sourced scalar reward off each trajectory's last gen Part; group by root
-        id. No reward backend, no scoring Sample (mirrors :meth:`AgenticEnvTrainer._rewards_and_groups`)."""
-        del sample, rollout_id  # env reward is already on the trajectories
-        values: List[float] = []
-        group_ids: List[str] = []
-        missing = 0
-        for tr in trajs:
-            gens = tr.gen_parts()
-            reward: Optional[torch.Tensor] = gens[-1].rewards if gens else None
-            if reward is not None:
-                values.append(float(hydrate(reward).to(torch.float32).flatten()[0].item()))
-            else:
-                values.append(0.0)
-                missing += 1
-            group_ids.append(tr.parts[0].sample_ids[0])
-        if missing:
-            logger.warning(
-                "AgenticEnvPartialTrainer: %d/%d trajectories had no env reward (scored 0.0).",
-                missing,
-                len(trajs),
-            )
-        return torch.tensor(values, dtype=torch.float32), group_ids
+    (ALFWorld etc.). Reward SOURCE only (the shared
+    :class:`~unirl.trainer.agentic_env._EnvRewardSource`) — the partial-rollout machinery is
+    inherited. Recipes use ``tail_policy: drop`` because stateful-episode envs restart a carried
+    partial."""
 
 
 __all__ = ["AgenticPartialTrainer", "AgenticEnvPartialTrainer"]

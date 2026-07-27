@@ -13,6 +13,11 @@ calling the reward backend (``RewardService`` even rejects precomputed rewards).
 GRPO tail — group-relative advantage → ``Part.concat`` of every assistant turn → one
 on-policy ``train_track`` — is inherited unchanged, so ``ratio≈1`` and the
 learn-from-all-turns behavior hold exactly as validated for the deep-research task.
+
+:class:`_EnvRewardSource` holds that one method so the colocate-partial
+(:class:`~unirl.trainer.agentic_partial.AgenticEnvPartialTrainer`) and fully-async
+(:class:`~unirl.trainer.agentic_env_async.AsyncAgenticEnvTrainer`) variants share it
+instead of each carrying a copy.
 """
 
 from __future__ import annotations
@@ -29,11 +34,14 @@ from unirl.types.sample import Sample
 logger = logging.getLogger(__name__)
 
 
-class AgenticEnvTrainer(AgenticTrainer):
-    """Agentic trainer whose reward is the environment's per-trajectory return.
+class _EnvRewardSource:
+    """Reward SOURCE mixin: the reward is the environment's per-trajectory return.
 
-    The recipe still carries a (built-but-unused) ``reward`` backend so the shared
-    ``ARTrainer`` construction path is happy; this trainer never calls it.
+    Mixed in ahead of a trainer base so it overrides that base's answer-graded
+    ``_rewards_and_groups`` while the entire GRPO tail is inherited untouched. Shared by
+    the barrier, colocate-partial, and fully-async env-reward trainers — one
+    implementation, so a change to the failure sentinel cannot land on some paths and
+    miss others (it did: LIN-531's variants kept a pre-``7ad5b349`` ``0.0``).
     """
 
     def _rewards_and_groups(
@@ -50,6 +58,9 @@ class AgenticEnvTrainer(AgenticTrainer):
             gens = tr.gen_parts()
             reward: Optional[torch.Tensor] = gens[-1].rewards if gens else None
             if reward is not None:
+                # Already NaN when the engine marked a fault AFTER the first turn
+                # (``_run_one`` attaches NaN to the terminal Part); passes straight
+                # through to the same exclusion below.
                 values.append(float(hydrate(reward).to(torch.float32).flatten()[0].item()))
             else:
                 # Gen-less trajectory = engine-marked failure (the fault hit before the
@@ -61,11 +72,20 @@ class AgenticEnvTrainer(AgenticTrainer):
             group_ids.append(tr.parts[0].sample_ids[0])
         if missing:
             logger.warning(
-                "AgenticEnvTrainer: %d/%d trajectories had no env reward (marked failed).",
+                "%s: %d/%d trajectories had no env reward (marked failed).",
+                type(self).__name__,
                 missing,
                 len(trajs),
             )
         return torch.tensor(values, dtype=torch.float32), group_ids
+
+
+class AgenticEnvTrainer(_EnvRewardSource, AgenticTrainer):
+    """Agentic trainer whose reward is the environment's per-trajectory return.
+
+    The recipe still carries a (built-but-unused) ``reward`` backend so the shared
+    ``ARTrainer`` construction path is happy; this trainer never calls it.
+    """
 
 
 __all__ = ["AgenticEnvTrainer"]
