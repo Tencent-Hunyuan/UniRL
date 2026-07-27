@@ -38,9 +38,7 @@ def _request(
     )
     parts = [root]
     if with_video:
-        video = root.input_child(
-            {"video": Videos.from_uris([f"/videos/{i}.mp4" for i in range(len(prompts))])}
-        )
+        video = root.input_child({"video": Videos.from_uris([f"/videos/{i}.mp4" for i in range(len(prompts))])})
         parts.append(video)
     return Sample.request(*parts).fork(
         fanout,
@@ -264,9 +262,7 @@ class _FakeARStage:
 def test_trainside_pipeline_is_sample_endomorphism() -> None:
     request = _request(fanout=2)
     chat = _FakeChatStage()
-    bundle = SimpleNamespace(
-        tokenizer=SimpleNamespace(decode=lambda ids, skip_special_tokens: f"decoded:{ids[0]}")
-    )
+    bundle = SimpleNamespace(tokenizer=SimpleNamespace(decode=lambda ids, skip_special_tokens: f"decoded:{ids[0]}"))
     pipeline = Qwen3OmniPipeline(bundle=bundle, chat_template=chat, ar=_FakeARStage())
 
     generated = pipeline.generate(request)

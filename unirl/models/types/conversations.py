@@ -112,16 +112,12 @@ def _video_rows(videos: Videos) -> List[Any]:
         if videos.frames is not None:
             raise ValueError("build_video_messages: Videos cannot carry both uris and packed frames.")
         if len(videos.uris) != len(videos):
-            raise ValueError(
-                f"build_video_messages: video URI count {len(videos.uris)} != video batch {len(videos)}."
-            )
+            raise ValueError(f"build_video_messages: video URI count {len(videos.uris)} != video batch {len(videos)}.")
         return list(videos.uris)
 
     rows = videos.to_list()
     if len(rows) != len(videos):
-        raise ValueError(
-            "build_video_messages: Videos carries neither batch-aligned uris nor valid packed frames."
-        )
+        raise ValueError("build_video_messages: Videos carries neither batch-aligned uris nor valid packed frames.")
     return [row.frames for row in rows]
 
 
@@ -143,8 +139,7 @@ def build_video_messages(
     unsupported = [type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, Videos))]
     if unsupported:
         raise ValueError(
-            "build_video_messages: Qwen3-Omni requires text/video turns only; "
-            f"got unsupported content {unsupported}."
+            f"build_video_messages: Qwen3-Omni requires text/video turns only; got unsupported content {unsupported}."
         )
 
     video_turns = sum(isinstance(turn.content, Videos) for turn in turns)
@@ -156,10 +151,7 @@ def build_video_messages(
 
     roles = [turn.role for turn in turns]
     is_video = [isinstance(turn.content, Videos) for turn in turns]
-    cols = [
-        _video_rows(turn.content) if video else list(turn.content.texts)
-        for turn, video in zip(turns, is_video)
-    ]
+    cols = [_video_rows(turn.content) if video else list(turn.content.texts) for turn, video in zip(turns, is_video)]
     n_rows = len(turns[0].content)
     mismatched = [i for i, turn in enumerate(turns) if len(turn.content) != n_rows]
     if mismatched:

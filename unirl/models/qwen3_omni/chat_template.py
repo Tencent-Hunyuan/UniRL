@@ -60,8 +60,7 @@ class Qwen3OmniChatTemplateStage:
             video_rows = [None] * batch_size if videos is None else list(videos)
             if len(video_rows) != batch_size:
                 raise ValueError(
-                    f"Qwen3OmniChatTemplateStage.embed: videos length {len(video_rows)} "
-                    f"!= text batch {batch_size}."
+                    f"Qwen3OmniChatTemplateStage.embed: videos length {len(video_rows)} != text batch {batch_size}."
                 )
             conversations = []
             for text, video in zip(value.texts, video_rows):
@@ -119,8 +118,7 @@ class Qwen3OmniChatTemplateStage:
                     video_count += 1
                     if video_count > 1:
                         raise ValueError(
-                            "Qwen3OmniChatTemplateStage supports at most one persistent "
-                            "source video per conversation."
+                            "Qwen3OmniChatTemplateStage supports at most one persistent source video per conversation."
                         )
                     raw_video = block.get("video")
                     if isinstance(raw_video, str):
