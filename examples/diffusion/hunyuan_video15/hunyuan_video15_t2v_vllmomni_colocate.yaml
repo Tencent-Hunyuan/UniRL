@@ -60,6 +60,7 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
     shift: 5.0
+    load_vae: false
 
 pipeline:
   _target_: unirl.models.hunyuan_video15.pipeline.HunyuanVideo15Pipeline

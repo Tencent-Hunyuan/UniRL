@@ -9,7 +9,7 @@ the composed **t2ti** (native think-then-generate: the AR und path plans a
 ``<think>`` caption, then diffusion generates conditioned on it — one bundle, two
 linked tracks).
 
-Task routing (``_resolve_task``): explicit ``req.stage_config["task"]`` wins;
+Task routing (``_resolve_task``): explicit ``req.task_config["task"]`` wins;
 else both ``ar`` + ``diffusion`` sampling entries ⇒ ``t2ti``; ``ar`` only ⇒
 text-out; an ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
 
@@ -401,7 +401,7 @@ class BagelPipeline(Pipeline):
 
     @staticmethod
     def _resolve_task(req: RolloutReq) -> str:
-        """Resolve the task mode: explicit ``stage_config["task"]`` wins, else infer.
+        """Resolve the task mode: explicit ``task_config["task"]`` wins, else infer.
 
         Inference from the modality-keyed ``sampling_params`` dict: both
         ``"ar"`` + ``"diffusion"`` ⇒ ``t2ti`` (think-then-generate); ``"ar"``
@@ -409,7 +409,7 @@ class BagelPipeline(Pipeline):
         ``i2t`` — image, no prompt — must be explicit); ``"diffusion"`` only ⇒
         image-out (``it2i`` with an ``Images`` input, else ``t2i``).
         """
-        task = req.stage_config.get("task")
+        task = req.task_config.get("task")
         if task is not None:
             return str(task)
         sp = req.sampling_params

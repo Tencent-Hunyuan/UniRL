@@ -1,7 +1,8 @@
 import inspect
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from contextlib import contextmanager
+from typing import Dict, Iterator, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -58,6 +59,8 @@ class ARTrainer(BaseTrainer):
         eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
+        rollout_anchor_device: Optional[int] = None,
+        enable_fsdp_offload: bool = True,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -73,8 +76,7 @@ class ARTrainer(BaseTrainer):
         # rank's pace — without balancing, the rank that drew the longest
         # sequences straggles (~+/-11%% rank-total variance at heavy lengths).
         self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
-        # AIME-style periodic eval — avg@k accuracy on the eval prompt set
-        # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
+        # Periodic avg@k evaluation; eval_interval=0 disables it.
         # ``eval_num_prompts`` sentinel:
         #   -1 (default, or any negative)  → full eval set
         #    0                             → yield nothing (explicit skip)
@@ -89,6 +91,15 @@ class ARTrainer(BaseTrainer):
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
+        # None uses the SPMD rollout path; an integer anchors one TP-capable actor.
+        self._rollout_anchor_device: Optional[int] = (
+            int(rollout_anchor_device) if rollout_anchor_device is not None else None
+        )
+        # Meaningful only for the anchored rollout path.
+        self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        self._anchored_backend_offloaded: Optional[bool] = False
+        self._anchored_rollout_awake: Optional[bool] = None
+
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
@@ -102,18 +113,146 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
-            else:
-                self.rollout = remote(**rollout_parsed)  # for vllm / sglang
-
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            rollout_parsed = parse_hydra_cfg(rollout_cfg)
+            if self._rollout_anchor_device is None:
+                # Default SPMD rollout path.
+                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                else:
+                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang TP=1
+                if sync_cfg is not None:
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            else:
+                # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
+                # unified models; replace it with first-class TP/DP/PP support.
+                if sync_cfg is not None and self._rollout_anchor_device == 0:
+                    raise ValueError(
+                        "rollout_anchor_device=0 would colocate the TP engine with "
+                        "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
+                        "use a nonzero anchor device."
+                    )
+                # Free training memory before starting the anchored rollout actor.
+                if self._enable_fsdp_offload:
+                    self._anchored_backend_offloaded = None
+                    self.backend.offload()
+                    self._anchored_backend_offloaded = True
+
+                role_cls = rollout_parsed.pop("role_cls")
+                self.rollout = self.pool.create_remote(
+                    role_cls,
+                    device_ids=[self._rollout_anchor_device],
+                    init_kwargs=rollout_parsed,
+                )
+                self._anchored_rollout_awake = None
+                if self._enable_fsdp_offload:
+                    self.rollout.sleep()
+                    self._anchored_rollout_awake = False
+                else:
+                    # Resident colocate: enable_fsdp_offload=false keeps the
+                    # training FSDP shards on-GPU, so keep the rollout engine
+                    # awake alongside them (both resident, no per-step swap).
+                    # vLLM's low gpu_memory_utilization leaves room for both.
+                    self._anchored_rollout_awake = True
+
+                if sync_cfg is not None:
+                    # The anchored engine is not a sibling of every train worker.
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+
+    def _ensure_anchored_backend_loaded(self) -> None:
+        if not self._enable_fsdp_offload or self._anchored_backend_offloaded is False:
+            return
+        self._anchored_backend_offloaded = None
+        self.backend.onload()
+        self._anchored_backend_offloaded = False
+
+    def _ensure_anchored_backend_offloaded(self) -> None:
+        if not self._enable_fsdp_offload or self._anchored_backend_offloaded is True:
+            return
+        self._anchored_backend_offloaded = None
+        self.backend.offload()
+        self._anchored_backend_offloaded = True
+
+    def _ensure_anchored_rollout_awake(self) -> None:
+        if not self._enable_fsdp_offload:
+            return  # resident colocate: engine stays awake
+        if self._anchored_rollout_awake is True:
+            return
+        self._anchored_rollout_awake = None
+        self.rollout.wake_up()
+        self._anchored_rollout_awake = True
+
+    def _ensure_anchored_rollout_asleep(self) -> None:
+        if not self._enable_fsdp_offload:
+            return  # resident colocate: never sleep the engine
+        if self._anchored_rollout_awake is False:
+            return
+        self._anchored_rollout_awake = None
+        self.rollout.sleep()
+        self._anchored_rollout_awake = False
+
+    @contextmanager
+    def _anchored_rollout_session(
+        self,
+        *,
+        sync_weights: bool,
+        restore_backend: bool = True,
+    ) -> Iterator[None]:
+        """Run one anchored rollout phase and restore the requested steady state.
+
+        ``enable_fsdp_offload`` controls the trainer's *manual* placement dance;
+        it is independent from FSDP's ``CPUOffloadPolicy`` (``fsdp_cfg.cpu_offload``).
+        Callers doing a backward pass request ``restore_backend=True``. Eval and
+        pre-backward reward processing keep the backend offloaded so only the
+        vLLM subprocess owns GPU memory.
+        """
+        original_error: Optional[BaseException] = None
+        try:
+            if sync_weights and self.weight_sync is not None:
+                self._ensure_anchored_backend_loaded()
+                self.weight_sync.extract()
+            self._ensure_anchored_backend_offloaded()
+            self._ensure_anchored_rollout_awake()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.push()
+            yield
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            cleanup_ops = [("sleep rollout", self._ensure_anchored_rollout_asleep)]
+            if restore_backend:
+                cleanup_ops.append(("onload backend", self._ensure_anchored_backend_loaded))
+            for operation, cleanup in cleanup_ops:
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    cleanup_errors.append((operation, exc))
+
+            if cleanup_errors:
+                if original_error is not None:
+                    for operation, cleanup_error in cleanup_errors:
+                        original_error.add_note(
+                            f"anchored cleanup failed while trying to {operation}: {cleanup_error!r}"
+                        )
+                        logger.error(
+                            "Anchored cleanup failed while trying to %s",
+                            operation,
+                            exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+                        )
+                else:
+                    operation, cleanup_error = cleanup_errors[0]
+                    for later_operation, later_error in cleanup_errors[1:]:
+                        cleanup_error.add_note(
+                            f"additional anchored cleanup failure while trying to {later_operation}: {later_error!r}"
+                        )
+                    cleanup_error.add_note(f"anchored cleanup operation: {operation}")
+                    raise cleanup_error
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -149,11 +288,23 @@ class ARTrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        anchored = self._rollout_anchor_device is not None
+        if not anchored:
+            # SPMD path: rollout sibling of every train rank; sync + generate + sleep in-place.
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            resp = self.rollout.generate(req)
+            self.rollout.sleep()
+        else:
+            # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
+            # unified models; replace it with first-class TP/DP/PP support.
+            with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
+                resp = self.rollout.generate(req)
+                # DP_SCATTER consumers require materialized tensors.
+                from unirl.trainer.unified_model import deep_hydrate
+
+                resp = deep_hydrate(resp)
 
         for name, track in list(resp.tracks.items()):
             if track.segment is not None:
@@ -182,7 +333,16 @@ class ARTrainer(BaseTrainer):
         # token load before DP_SCATTER (no-op when already balanced).
         if self.balance_shards:
             track = track.balance_shards(int(self.num_devices))
-        result = self.stack.train_track(track, training_progress=float(training_progress))
+        if anchored:
+            self._ensure_anchored_backend_loaded()
+        try:
+            result = self.stack.train_track(track, training_progress=float(training_progress))
+        finally:
+            # Match UnifiedModelTrainer's steady state: FSDP on CPU and the
+            # rollout asleep between steps.  This also reclaims every rank's
+            # eager-load/activation allocator cache, not only the anchor rank.
+            if anchored:
+                self._ensure_anchored_backend_offloaded()
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
@@ -222,10 +382,16 @@ class ARTrainer(BaseTrainer):
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        self.rollout.wake_up()
-        try:
+        anchored = self._rollout_anchor_device is not None
+        # TODO: The anchored branch is temporarily migrated from unified models;
+        # replace it with first-class TP/DP/PP support.
+
+        if not anchored:
+            self.rollout.wake_up()
             if self.weight_sync is not None:
                 self.weight_sync.sync()
+        sync_anchored_weights = anchored and self.weight_sync is not None
+        try:
             for eval_inputs in eval_batches:
                 batch_n += 1
                 prompt_n += len(eval_inputs.sample_ids)
@@ -238,7 +404,22 @@ class ARTrainer(BaseTrainer):
                     sampling_params=eval_sp,
                     metadata=list(inputs.metadata) if inputs.metadata else [],
                 )
-                resp = self.rollout.generate(req)
+                if anchored:
+                    # Keep the manual FSDP state offloaded throughout eval and
+                    # release the TP engine between batches.  Only the first
+                    # batch needs an adapter extract/push.
+                    with self._anchored_rollout_session(
+                        sync_weights=sync_anchored_weights,
+                        restore_backend=False,
+                    ):
+                        sync_anchored_weights = False
+                        resp = self.rollout.generate(req)
+                        # DP_SCATTER reward scoring requires materialized tensors.
+                        from unirl.trainer.unified_model import deep_hydrate
+
+                        resp = deep_hydrate(resp)
+                else:
+                    resp = self.rollout.generate(req)
                 for track in resp.tracks.values():
                     if track.segment is not None:
                         track = self.reward.score_and_attach(req=req, track=track)
@@ -248,7 +429,8 @@ class ARTrainer(BaseTrainer):
                         reward_n += int(rewards.numel())
                         break  # single-track for now; revisit if multi-track lands
         finally:
-            self.rollout.sleep()
+            if not anchored:
+                self.rollout.sleep()
 
         acc = reward_sum / max(1, reward_n)
         logger.info(
@@ -272,7 +454,6 @@ class ARTrainer(BaseTrainer):
         ``rollout_<id>.jsonl`` per rollout (``ROLLOUT_DUMP_N`` samples, default
         4) so rollout-engine quality can be eyeballed without keeping the full
         decoded batch alive. Must run BEFORE ``_drop_decoded``. Never raises.
-        (Ported from the b182a511 LIN-371 lineage — lost in the rebase.)
         """
         import json
         import os
@@ -345,7 +526,7 @@ class ARTrainer(BaseTrainer):
         )
         try:
             if self.eval_interval > 0:
-                self.evaluate(rollout_id=-1)  # baseline AIME accuracy, logged at eval step 0
+                self.evaluate(rollout_id=-1)  # baseline evaluation at step 0
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
@@ -369,4 +550,24 @@ class ARTrainer(BaseTrainer):
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
-            self._finish_wandb()
+            try:
+                self._finish_wandb()
+            finally:
+                self._shutdown_runtime()
+
+    def _shutdown_runtime(self) -> None:
+        """Best-effort ordered teardown for rollout children and Ray actors."""
+        rollout = getattr(self, "rollout", None)
+        shutdown = getattr(rollout, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:
+                logger.exception("Failed to shut down AR rollout engine")
+
+        pool = getattr(self, "pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:
+                logger.exception("Failed to shut down AR trainer device pool")

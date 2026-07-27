@@ -908,6 +908,17 @@ class UniRLWandBLogger:
                     parts += f"±{ratio_std:.4f}"
             if clip_fraction is not None:
                 parts += f" clip={clip_fraction:.2f}"
+            # Rollout↔replay alignment gate (AR): k3 KL surrogate + |Δlogp|. On an
+            # on-policy first update both are ~0; they surface a temperature /
+            # weight-sync / position-encoding mismatch that ratio alone hides.
+            # Printed to the console (not just wandb) so the gate is visible when
+            # reporting is off.
+            k3_mean = _metric(metrics, "k3_mean")
+            absdiff_mean = _metric(metrics, "rollout_replay_logp_absdiff_mean")
+            if k3_mean is not None:
+                parts += f" k3={k3_mean:.2e}"
+            if absdiff_mean is not None:
+                parts += f" |Δlogp|={absdiff_mean:.2e}"
             return parts
 
         if isinstance(results, dict):

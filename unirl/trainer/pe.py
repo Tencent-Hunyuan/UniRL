@@ -484,10 +484,13 @@ class PETrainer(BaseTrainer):
             sides.append(("ar", self.ar))
         return sides
 
-    def _wait_for_checkpoints(self) -> None:
+    def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
         """Flush both side backends before another save or worker teardown."""
         for _, side in self._ckpt_sides():
-            side.backend.wait_for_checkpoint()
+            if timeout is None:
+                side.backend.wait_for_checkpoint()
+            else:
+                side.backend.wait_for_checkpoint(_ray_get_timeout=timeout)
 
     def maybe_save_checkpoint(
         self,

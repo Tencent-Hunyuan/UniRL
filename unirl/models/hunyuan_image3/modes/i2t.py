@@ -51,9 +51,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
             f"got {type(images).__name__ if images is not None else 'None'}"
         )
 
-    # Build HunyuanImage3ARParams from typed sampling params + model-specific stage_config.
+    # Build HunyuanImage3ARParams from typed sampling params + model-specific task_config.
     ar = req.sampling_params.get("ar")
-    model_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    model_cfg: Dict[str, Any] = dict(req.task_config.get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
         temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),
