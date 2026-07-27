@@ -46,7 +46,7 @@ bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen3_agent_sft_lora
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
-ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_calc_mathverify
+ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
 
 # 2. Multi-node (taiji)
 bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate

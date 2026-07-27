@@ -12,11 +12,13 @@ The reward grades each trajectory's terminal ``<answer>`` through the reward bac
 per-trajectory return.
 
 Launch (per node, SPMD; rank 0 owns the driver + the agentic coordinator):
-  QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=/path/to/train.jsonl \
-  python -m unirl.train_agentic --config-name=deep_research/deep_research_calc_mathverify
+  QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=data/asearcher/train.jsonl \
+  SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
+  python -m unirl.train_agentic --config-name=deep_research/deep_research_search_judge
 
 This entrypoint serves every answer-graded agentic recipe under
-``examples/deep_research/`` (e.g. ``--config-name=deep_research/deep_research_search_judge``).
+``examples/deep_research/``; ``train_agentic_partial.py`` and ``train_agentic_async.py``
+are the same reward source under the other two execution topologies.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from omegaconf import DictConfig
 from unirl.trainer.agentic import AgenticTrainer
 
 
-@hydra.main(version_base=None, config_path="../examples", config_name="deep_research/deep_research_calc_mathverify")
+@hydra.main(version_base=None, config_path="../examples", config_name="deep_research/deep_research_search_judge")
 def main(cfg: DictConfig) -> None:
     trainer = AgenticTrainer(
         cfg=cfg,

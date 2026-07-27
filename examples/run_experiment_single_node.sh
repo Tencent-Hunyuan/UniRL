@@ -32,7 +32,7 @@
 #   REPORT_TO_WANDB=true bash examples/run_experiment_single_node.sh diffusion/qwen_image/qwen_image_trainside
 #   ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #   ENTRY=train_pe bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
-#   ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_calc_mathverify
+#   ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
 #
 set -euo pipefail
 

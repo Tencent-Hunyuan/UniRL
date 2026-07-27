@@ -6,7 +6,7 @@ producer/consumer sibling of ``train_agentic`` (:class:`AgenticTrainer`).
 Training and the agentic rollout engine run on DISJOINT GPU slabs (``train_fraction``);
 the engine stays resident and weights cross the slab boundary via ``NCCLWeightSync``
 (not the colocate ``TensorWeightSync``). Partial rollout checkpoints the in-flight tail
-at a turn boundary on each sync. This calculator recipe uses ``tail_policy=carry``
+at a turn boundary on each sync. The search/visit recipe uses ``tail_policy=carry``
 because its stateless tool state is fully represented by the carried ``Sample``;
 ``buffer_max_staleness`` bounds completed groups in the consumer buffer, while the
 per-token ratio corrects turns carried across weight versions. Stateful tool sessions
@@ -16,9 +16,10 @@ from both the colocate agentic loop and the async-AR DP_SCATTER loop.
 
 Launch (per node, SPMD; rank 0 owns the driver + the agentic coordinator on the
 rollout slab):
-  QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=/path/to/train.jsonl \
+  QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=data/asearcher/train.jsonl \
+  SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
   python -m unirl.train_agentic_async \
-    --config-name=deep_research/deep_research_calc_mathverify_async num_devices=2
+    --config-name=deep_research/deep_research_search_judge_async num_devices=2
 
 This entrypoint serves every answer-graded fully-async recipe under
 ``examples/deep_research/``; ``train_agentic_env_async.py`` is the env-reward sibling.
@@ -35,7 +36,7 @@ from unirl.trainer.agentic_async import AsyncAgenticTrainer
 @hydra.main(
     version_base=None,
     config_path="../examples",
-    config_name="deep_research/deep_research_calc_mathverify_async",
+    config_name="deep_research/deep_research_search_judge_async",
 )
 def main(cfg: DictConfig) -> None:
     trainer = AsyncAgenticTrainer(

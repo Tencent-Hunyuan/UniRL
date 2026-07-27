@@ -4,13 +4,15 @@
 Drives :class:`unirl.trainer.agentic_partial.AgenticPartialTrainer` — the colocate/synchronous
 partial-rollout sibling of ``train_agentic`` (barrier `AgenticTrainer`). Train and rollout
 still time-share each GPU; the trainer over-samples, commits the freshest `batch_size` complete
-GRPO groups, and checkpoints the in-flight tail at a turn boundary (carried and resumed next round
-for this recipe's stateless CalculatorTool) instead of waiting for the slowest trajectory.
+GRPO groups, and checkpoints the in-flight tail at a turn boundary (carried and resumed next
+round when the tools are stateless, as search/visit are) instead of waiting for the slowest
+trajectory.
 
 Launch (single node; rank 0 owns the driver + the agentic coordinator):
-  QWEN3_INSTRUCT_PATH=... DATA_PATH=data/calc_math/train.jsonl \
+  QWEN3_INSTRUCT_PATH=... DATA_PATH=data/asearcher/train.jsonl \
+  SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
   python -m unirl.train_agentic_partial \
-    --config-name=deep_research/deep_research_calc_mathverify_partial num_devices=8
+    --config-name=deep_research/deep_research_search_judge_partial num_devices=8
 
 This entrypoint serves every answer-graded partial-rollout recipe under
 ``examples/deep_research/``; ``train_agentic_env_partial.py`` is the env-reward sibling.
@@ -27,7 +29,7 @@ from unirl.trainer.agentic_partial import AgenticPartialTrainer
 @hydra.main(
     version_base=None,
     config_path="../examples",
-    config_name="deep_research/deep_research_calc_mathverify_partial",
+    config_name="deep_research/deep_research_search_judge_partial",
 )
 def main(cfg: DictConfig) -> None:
     trainer = AgenticPartialTrainer(
