@@ -137,6 +137,22 @@ case "${PROFILE}" in
         export CUDACXX="${CUDA_TOOLKIT_DIR}/bin/nvcc"
         export NVCC="${CUDACXX}"
         export PATH="${CUDA_TOOLKIT_DIR}/bin:${PATH}"
+        CUDA_RUNTIME_LIB_DIR=""
+        for candidate in "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib"; do
+            if compgen -G "${candidate}/libcudart.so*" >/dev/null; then
+                CUDA_RUNTIME_LIB_DIR="${candidate}"
+                break
+            fi
+        done
+        if [ -z "${CUDA_RUNTIME_LIB_DIR}" ]; then
+            echo "CUDA 13 runtime libraries are missing from ${CUDA_TOOLKIT_DIR}." >&2
+            exit 2
+        fi
+        # NVIDIA's pip toolkit has lib/libcudart.so.13 but no conventional
+        # lib64/libcudart.so linker name. The multinode launcher creates this
+        # small per-node shim before Ray starts, so SGLang TVM-FFI JIT links.
+        export CUDA_RUNTIME_LIB_DIR
+        export CUDA_RUNTIME_LINK_DIR="${CUDA_RUNTIME_LINK_DIR:-/tmp/unirl-cuda-runtime-${UID}}"
         CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-}"
         if [ -z "${CUDA_COMPAT_DIR}" ]; then
             for candidate in \
@@ -194,6 +210,7 @@ if [ "${PROFILE}" = "ar-drpo" ]; then
     require_dist_version "nvidia-cuda-crt" "13.0.88"
     require_dist_version "nvidia-nvvm" "13.0.88"
     require_dist_version "nvidia-cuda-cccl" "13.0.85"
+    require_dist_version "nvidia-cuda-runtime" "13.0.96"
     if ! "${CUDACXX}" --version | grep -q "release 13.0"; then
         echo "SGLang JIT compilation requires CUDA 13.0 nvcc; found $(${CUDACXX} --version | tail -1)." >&2
         exit 2

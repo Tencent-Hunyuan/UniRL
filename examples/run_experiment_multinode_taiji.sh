@@ -80,6 +80,31 @@ elif [ -n "${VENV_DIR:-}" ] && [ -f "${VENV_DIR}/bin/activate" ]; then
     source "${VENV_DIR}/bin/activate"
 fi
 
+# NVIDIA's pip CUDA toolkit stores the versioned runtime in ``lib/`` without
+# the unversioned ``libcudart.so`` name expected by TVM-FFI's ``-lcudart``
+# link step. Build a disposable linker shim on every node before Ray starts.
+# The reward-curve launcher supplies these paths for its pinned SGLang env;
+# other launchers are unaffected.
+if [ -n "${CUDA_RUNTIME_LIB_DIR:-}" ] && [ -n "${CUDA_RUNTIME_LINK_DIR:-}" ]; then
+    cuda_runtime_lib=""
+    for candidate in \
+        "${CUDA_RUNTIME_LIB_DIR}/libcudart.so" \
+        "${CUDA_RUNTIME_LIB_DIR}"/libcudart.so.*; do
+        if [ -e "${candidate}" ]; then
+            cuda_runtime_lib="${candidate}"
+            break
+        fi
+    done
+    if [ -z "${cuda_runtime_lib}" ]; then
+        echo "CUDA runtime not found in CUDA_RUNTIME_LIB_DIR=${CUDA_RUNTIME_LIB_DIR}." >&2
+        exit 2
+    fi
+    mkdir -p "${CUDA_RUNTIME_LINK_DIR}"
+    ln -sfn "${cuda_runtime_lib}" "${CUDA_RUNTIME_LINK_DIR}/libcudart.so"
+    export LIBRARY_PATH="${CUDA_RUNTIME_LINK_DIR}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 # --- ssh fan-out worker join (LAUNCH=ssh) -----------------------------------
 # In LAUNCH=ssh the head ssh-invokes THIS script with RAY_JOIN_ONLY=1 on each
 # worker. The Python env is already activated above; here we just join Ray with
@@ -194,7 +219,7 @@ if [ "${LAUNCH}" = "ssh" ]; then
     done < <(
         env |
             grep -E \
-                '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF|^LD_LIBRARY_PATH=|^CUDA_COMPAT_DIR=|^CUDA_HOME=|^CUDA_PATH=|^CUDACXX=|^NVCC=' ||
+                '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF|^LD_LIBRARY_PATH=|^LIBRARY_PATH=|^CUDA_COMPAT_DIR=|^CUDA_RUNTIME_|^CUDA_HOME=|^CUDA_PATH=|^CUDACXX=|^NVCC=' ||
             true
     )
     IFS=',' read -ra _NODE_ENTRIES <<< "${NODE_IP_LIST}"
