@@ -191,7 +191,7 @@ if [ "${LAUNCH}" = "ssh" ]; then
     ssh_nccl_env=""
     while IFS='=' read -r _k _v; do
         [ -n "${_k}" ] && ssh_nccl_env+="${_k}='${_v}' "
-    done < <(env | grep -E '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF' || true)
+    done < <(env | grep -E '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF|^LD_LIBRARY_PATH=|^CUDA_COMPAT_DIR=' || true)
     IFS=',' read -ra _NODE_ENTRIES <<< "${NODE_IP_LIST}"
     worker_n=0
     for entry in "${_NODE_ENTRIES[@]}"; do

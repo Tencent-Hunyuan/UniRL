@@ -118,6 +118,23 @@ case "${PROFILE}" in
         ENTRY=train_ar
         EXPERIMENT=ar/qwen3_drpo_4b_base_dapo_sglang
         VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv-sglang}"
+        CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-}"
+        if [ -z "${CUDA_COMPAT_DIR}" ]; then
+            for candidate in \
+                "${REPO_ROOT}"/.cuda-compat-13/usr/local/cuda-13.*/compat \
+                /root/lin383/compat13/usr/local/cuda-13.*/compat; do
+                if [ -d "${candidate}" ]; then
+                    CUDA_COMPAT_DIR="${candidate}"
+                    break
+                fi
+            done
+        fi
+        if [ -z "${CUDA_COMPAT_DIR}" ] || [ ! -d "${CUDA_COMPAT_DIR}" ]; then
+            echo "CUDA 13 forward-compat libraries are missing; set CUDA_COMPAT_DIR." >&2
+            exit 2
+        fi
+        export CUDA_COMPAT_DIR
+        export LD_LIBRARY_PATH="${CUDA_COMPAT_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         export QWEN3_PATH="${QWEN3_PATH:-${REPO_ROOT}/models/local/Qwen3-4B-Base}"
         export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/data/dapo_math/train.jsonl}"
         export EVAL_DATA_PATH="${EVAL_DATA_PATH:-${REPO_ROOT}/data/dapo_math/aime_eval.jsonl}"
