@@ -14,7 +14,7 @@
 #   qwen-omni        1x8, .venv,        ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
 #
 # Example:
-#   tmux new-session -d -s lin560-sd3 \
+#   tmux new-session -d -s unirl-sd3 \
 #     'bash examples/run_reward_curve_verification_taiji.sh sd3-trainside'
 #
 set +u
@@ -58,7 +58,7 @@ fi
 PROFILE="$1"
 shift
 RUN_STAMP="${RUN_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
-RUN_NAME="${WANDB_RUN_NAME:-lin560-${PROFILE}-${RUN_STAMP}}"
+RUN_NAME="${WANDB_RUN_NAME:-unirl-${PROFILE}-${RUN_STAMP}}"
 
 require_file() {
     if [ ! -f "$1" ]; then
@@ -162,7 +162,7 @@ case "${PROFILE}" in
         if [ -z "${CUDA_COMPAT_DIR}" ]; then
             for candidate in \
                 "${REPO_ROOT}"/.cuda-compat-13/usr/local/cuda-13.*/compat \
-                /root/lin383/compat13/usr/local/cuda-13.*/compat; do
+                /usr/local/cuda-13.*/compat; do
                 if [ -d "${candidate}" ]; then
                     CUDA_COMPAT_DIR="${candidate}"
                     break
