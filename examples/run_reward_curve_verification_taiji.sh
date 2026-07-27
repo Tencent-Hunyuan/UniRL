@@ -17,6 +17,7 @@
 #   tmux new-session -d -s lin560-sd3 \
 #     'bash examples/run_reward_curve_verification_taiji.sh sd3-trainside'
 #
+set +u
 if [ -r /etc/bashrc ]; then
     # Taiji's non-interactive shell does not otherwise get network credentials.
     # shellcheck disable=SC1091
