@@ -1720,4 +1720,239 @@ PYTHONPATH=. PYTHONPYCACHEPREFIX=./.pycache python3.12 -m pytest tests/test_conf
 - 仍未做（不变）：真机 GPU 验证 `ocr` / `videoalign` / `geneval2`、远程 video 端到端、经典 `geneval` 的 py3.10 路线。
 - 失败处理走 **fail-fast**（别改回 mask）；改 wire 协议必须同步 `DiffusionRL_main/tests/reward/test_wire_contract.py`。
 
-*§18.1 是当前 Resume 入口。再有新 session 请覆盖本节。*
+*§18.1 已被 §19.7 覆盖（见下）。*
+
+---
+
+## §19 新增 `videohpsv3` T2V reward（对齐上游 Flash-GRPO）（2026-07-26）
+
+### 19.0 时间线与目标
+用户原话：**"要跟上游 videohpsv3 一样跑视频帧，得新写抽帧+top-30% 聚合代码。使用这种并且符合当前仓库的 reward service 的服务的规范来写个 reward service 放到仓库里放到 flashgrpo 的 worktree 中"**，随后追问 "我们现在的 hpsv3 的 reward 的步骤是什么样的"、"那我们新增个 reward service 呢最小改动和复用应该怎么做"，最后 **"实施把"** 批准。
+
+背景：FlashGRPO 对齐上游 `Shredded-Pork/Flash-GRPO` 期间，训练 reward 不涨。上游 WAN2.1 T2V recipe 用的是 `video_hpsv3_remote`——逐帧 HPSv3 + top-30% 均值——而本仓库当时只有图像版 `hpsv3` 和 `videoalign`，没有对应实现。
+
+**注意**：本次工作发生在 `UniRL` 仓库的 worktree `feature/flashgrpo-unirl` 下的 `unirl-reward-service/`。§18.1 记录的 canonical 位置（`DiffusionRL_main/RewardService/`）是当时的历史状态，本次不动它；**以本节所述位置为准**。
+
+### 19.1 上游语义与本仓差异
+上游聚合逻辑（`flow_grpo/rewards.py`）：
+```python
+l = len(outputs); outputs.sort(reverse=True)
+score = sum(outputs[:int(l*0.3)]) / int(l*0.3)
+```
+两点有意的差异：
+- **拆分方式**：上游把工作切在网线两侧（client 抽帧 + JPEG 压缩，专用 server 只看"一批图"）。本仓约定"一个 reward 名 = 一个自包含 scorer"，所以两半都放进同一个 scorer。
+- **短片段**：本实现保留 `max(1, int(n * top_ratio))`，≤ 3 帧的片段取单帧最高分；上游 `int(l*0.3)` 为 0 会 `ZeroDivisionError`。凡上游能跑的场景结果 bit-identical。
+
+### 19.2 plan 演进（关键决策）
+- **初版 plan** 打算从 `hpsv3_scorer.py` 抽一个 `load_hpsv3_inferencer` 公共函数出来复用 → **放弃**。改用**组合**：内部持有一个 `HPSv3Scorer`，把每帧包成单轮 `ScoreItem` 喂给它。这样 checkpoint 解析、`max_batch_size` 分块、块间 `empty_cache()` 全部白拿，`hpsv3_scorer.py` **零改动**。
+- **不新建 `envs/videohpsv3.txt`**：deps 与 `hpsv3` 完全一致（`envs/hpsv3.txt` 本就带 `opencv-python-headless`），Ray 按内容缓存 venv，两个 reward 共用一个。
+- **抽帧用 `cv2` 而非 `decord`**：decord 只存在于 videoalign 的 venv，而那个 venv 钉 `transformers==4.45.2`，与 hpsv3 冲突。
+- **不 `from ...videoalign import ...`**：import 那个模块会触发 `register("videoalign", ...)`，污染 registry 且可能重复注册报错。故把 `_materialize_video` 提升到 `_common.py`。
+
+### 19.3 文件改动清单
+**新增**：
+- `reward_service/scorers/video_hpsv3.py`：`top_ratio_mean` / `extract_frames` / `VideoHPSv3Scorer`。
+- `tests/scorers/test_video_hpsv3.py`（40 例）。
+- `tests/scorers/test_common.py`（5 例，覆盖 `materialize_video` 的所有权语义）。
+
+**修改**：
+- `reward_service/scorers/_common.py`：新增共享 `materialize_video`（从 videoalign 私有 staticmethod 提升，行为等价）。
+- `reward_service/scorers/videoalign.py`：删掉 24 行私有 `_materialize_video`，改调共享helper；移除随之无用的 `import tempfile`。
+- `reward_service/scorers/registry.py`：`SCORER_MODULES` 加一行。
+- `configs/service.example.yaml`：注释掉的 `videohpsv3` 块（与其他 T2V reward 一样 opt-in）。
+- `README.md` / `CHANGELOG.md` / `docs/ARCHITECTURE.md`：同步 reward 清单。
+
+### 19.4 测试状态
+- `pytest tests/ -q` → **45 passed**（`test_video_hpsv3.py` 40 + `test_common.py` 5），4.8s。
+- ruff 在本次触碰的所有文件上 **clean**。
+- 数值对齐已验证：`top_ratio_mean([1,5,3,10,2,9,4,8,6,7], 0.3) == 9.0` = mean(10,9,8)，与上游 `int(10*0.3)==3` 一致。
+- 未跑：真机 GPU（需 HPSv3 权重 + 空闲卡；8 卡当时全被训练占用）。
+- **未修**：仓库内 27 个**既有** ruff 错误（`_editreward/*`、`_videoalign/prompt_template.py`、`hpsv2_scorer.py`、`ocr.py`、`geneval.py`、`editreward.py`）——均在本次未触碰的文件里，按 CLAUDE.md §3「surgical changes」不动。
+
+### 19.5 simplify / review 结论
+- **simplify**：纯风格改动，无行为变化。`extract_frames` 补 `list["Image.Image"]` 返回注解（配 `TYPE_CHECKING` 导入，保留函数内 lazy `import cv2`）；`ok` → `is_read`；`_score_one` → `_score_clip`；测试里把复制两遍的 tempfile 泄漏断言抽成 `assert_no_leaked_tempfiles` fixture（并用"故意泄漏"探针验证过该 fixture 真的会红，不是静默通过）。
+- **review**：2 个必改，**均已修**（见 19.6）；3 个建议改已修；5 个 Consider 中采纳 3 个（log 移到耗时操作之前、`pytest.raises` 补 `match`、fake scorer 补长度断言），2 个记录未做（见 19.6 末）。
+
+### 19.6 review 的两个必改（已修 + 已验证）
+1. **`_common.py` tempfile 泄漏**：`owned_tempfiles.append(...)` 原本在 `try/finally` 写入**之后**。`NamedTemporaryFile(delete=False)` 在写入前文件就已落盘，所以写入失败（ENOSPC/EDQUOT）会留下一个**调用方永远看不到**的孤儿文件——正好是磁盘满时最不该泄漏的场景。这个 bug 是从 videoalign 私有方法**原样继承**的，但提升为两个 scorer 共用的公共 helper 后影响面翻倍。修法：`append` 提到创建之后、写入之前。
+   - **验证**：写了回归测试 `test_materialize_video_records_the_tempfile_before_writing_it`（monkeypatch `write` 抛 ENOSPC），并**临时把代码改回旧顺序确认该测试会红**（1 failed），再恢复（45 passed）。旧顺序那次确实在 `/tmp` 留了个孤儿文件，实证了 bug 真实存在。
+2. **per-item 失败语义**：`_score_clip` 原本让 `extract_frames` 的 `ValueError` 直接冒出 `score()`，于是 64 个片段里**一个**坏视频会让整桶 64 项全进 `errors[i]`，白烧掉数 GPU-分钟。这违反 `base.py:74-80` 明文契约，也违反 §17.7「绝对不要做的事」里那条 **"不要让 scorer 对 per-item 推理失败 raise——会拖垮整批；用 NaN"**。
+   - 修法：**只**给"片段内容解不开"这一类返回 `float("nan")`；"缺 video / 类型不对"这类**调用方接线 bug** 继续 `raise`（与 `videoalign` 一致，也符合 base.py 的 "required metadata not wired → raise"）。
+   - **与 `videoalign` 有意不同**：videoalign 把整个 `video_paths` 列表交给单次 `self._inferencer.reward(...)`，根本没有 per-item 边界可切，raise 是它唯一选择；videohpsv3 本就逐片段循环，隔离几乎零成本。
+   - 新增两个测试：坏片段返回 NaN；坏片段夹在两个好片段中间时，**好片段仍拿到真实分数**（后者才是这条契约的意义）。
+- **记录但未做的 2 个 Consider**：① `extract_frames` 没有帧数上限，理论上一个超长片段能 OOM 掉整个 Ray actor（连带整个 reward group），不只是单个请求——目前判断为 YAGNI（内部可信部署，上游也没有），但失败模式确实从"一个请求坏"升级成"reward group 挂"，值得下次真机压测时复评。② `frame_stride`/`top_ratio` 的校验在构造函数与模块级函数里各写一份（消息字面量重复），两处都是 load-bearing（构造期失败早于占卡；公共函数需自校验），抽 helper 反而更啰嗦，保持现状。
+
+### 19.7 Resume 入口（已被 §19.10 覆盖，保留作历史记录）
+
+**当前状态**（2026-07-26）：
+- 位置：`UniRL` 仓库 worktree `feature/flashgrpo-unirl` → `unirl-reward-service/`。
+- `videohpsv3` scorer 已实现、已测（45 passed）、ruff clean、文档已同步。**改动未 commit**。
+- reward **默认关闭**（example config 里是注释块），所以对现有部署零影响。
+- 尚未真机验证：需要 HPSv3 权重 + 至少 1 张空闲卡。
+
+**下次进来先做的事**（按优先级）：
+1. **把 sglang recipe 的 reward 从 `VideoPickScoreScorer` 改成 `RemoteRewardBackend`** 指向本 service 的 `videohpsv3`——这才是"让 reward 涨起来"这条主线的下一步，本次只交付了 service 侧。
+2. 下载 HPSv3 权重；决定 GPU 分配（当时 8 卡全被训练占满，需停 PID 1691465 + Ray 集群才能腾卡）。
+3. 真机 smoke：先 `frame_stride: 8` 跑通，再决定是否降到 1（成本约 8 倍）。**同时把 `server.score_timeout_s` 调到 1800**——默认 120 一定超时，且超时后 Ray task 仍在跑（`server._await_ref`），GPU 时间照烧然后被丢弃。
+4. 未决：`wan21_t2v_flashgrpo_sglang.yaml:70` 的 `use_torch_compile: true` 仍未定论。
+5. 复评 19.6 末尾那条帧数上限（真机压测时）。
+
+**绝对不要做的事**（继承 §17.7 / §18.1，本次新增）：
+- 不要把 `videohpsv3` 的 per-item NaN 改回 raise——一个坏片段不该拖垮整桶（见 19.6 第 2 条）。反之，"缺 video / 类型不对"必须继续 raise，别改成 NaN 掩盖接线 bug。
+- 不要把 `owned_tempfiles.append` 挪回写入之后（见 19.6 第 1 条，有回归测试钉着）。
+- 不要为了"对称"给 `videohpsv3` 单独建 `envs/videohpsv3.txt`——与 `envs/hpsv3.txt` 内容一致才能共用 Ray 缓存的 venv。
+- 不要改成继承 `HPSv3Scorer` 或从它里面抽公共函数——组合是有意选择，正是它让 `hpsv3_scorer.py` 零改动。
+- 不要在 `video_hpsv3.py` 顶层 `import cv2`：`registry._try_import` 会把 `ImportError` 咽成 warning，顶层导入会让这个 reward 在 base venv 里**静默未注册**，而且单元测试就跑不了解码逻辑了。
+- 不要把 reward 名 `videohpsv3` 改成 `video_hpsv3`（见 19.8）——文件名是 `video_hpsv3.py`，但注册名/YAML `scorer:` 字段是**线协议标识符**，必须与上游 Flash-GRPO 的 config key 一致。
+- 不要顺手修那 27 个既有 ruff 错误（不在本次范围，见 19.4）。
+
+*§19.7 已过期。当前 Resume 入口是 §19.10。*
+
+### 19.8 模块命名（用户要求 · 2026-07-27）
+
+用户先问"命名是否符合规范，参考其他 reward service 的命名规范呢"，随后指定 **"叫做 video_hpsv3 这样的应该好一点"**。
+
+**`_scorer` 后缀的真实规则**（扫全部 13 个 scorer 模块得出，相关性 100%）：后缀只用来**避免遮蔽自己 import 的同名 pip 包**。只有 2 个带后缀——`hpsv2_scorer.py`（`from hpsv2.img_score import ...`，`envs/hpsv2.txt` 装 `hpsv2`）和 `hpsv3_scorer.py`（`from hpsv3 import HPSv3RewardInferencer`）。另外 11 个（clip / pickscore / imagereward / geneval / geneval2 / wise / editreward / videoalign / ocr / unified_reward）都不 import 同名包，也都不带后缀。本模块不 import 名为 `videohpsv3` 的包，所以**不该带后缀**，对齐 `videoalign.py`。
+
+**最终命名，分两层**：
+
+| 层 | 标识符 | 理由 |
+| --- | --- | --- |
+| Python 模块 / 测试文件 | `video_hpsv3.py` / `test_video_hpsv3.py` | 用户指定；`snake_case` 符合 §1.1，也与上游的 Python 符号 `def video_hpsv3_remote(device)`（`flow_grpo/rewards.py:93`）同风格 |
+| 类名 | `VideoHPSv3Scorer` | 不变，全仓 `<Name>Scorer` |
+| 注册名 / `sub_metric_names` / `SCORER_MODULES` key / YAML `name:`+`scorer:` | `videohpsv3`（**不加下划线**） | **线协议标识符**。上游把它注册成 `"videohpsv3"`（`flow_grpo/rewards.py:424`）、config 里也写 `"videohpsv3": 1.0`（`config/dgx.py:73,125`）。改这个等于与上游 config key 分叉，而只改文件名不会 |
+
+即上游本身就是"Python 符号 snake_case、wire key 不带下划线"，本次命名与之一致。
+
+**改动**：`reward_service/scorers/videohpsv3_scorer.py` → `video_hpsv3.py`；`tests/scorers/test_videohpsv3_scorer.py` → `test_video_hpsv3.py`；`registry.py` 的 `SCORER_MODULES` value（key 不变）；测试文件的 3 处 import / `monkeypatch.setattr` 目标。`register()` 名、`name`、`sub_metric_names`、`configs/service.example.yaml`、`README.md` 表格里的 reward 名**均未动**。
+
+**验证**：`pytest tests/ -q` → 45 passed；ruff clean；`importlib.util.find_spec(SCORER_MODULES["videohpsv3"])` 解析成功（确认 registry 映射没断）。`docs/` 里 8 处旧文件名引用已同步。
+
+### 19.9 训练侧接线：新增 `videohpsv3` service config + WAN recipe（2026-07-27）
+
+#### 19.9.1 时间线与目标
+
+§19.7 的第一优先级。用户三条指令依次收敛了设计：
+
+1. 先问 **"为什么我们不能使用 ray 像其他脚本一样直接启动 rewardservice"**（纯问答，未改代码）。
+2. **"按照其他 reward service 怎么接入的我们就怎么接入，保证规范性和可移植性，不需要参考 flashgrpo 的上游代码"** —— 这一条否掉了我的初版设计。
+3. **"新增 yaml，wan 和 videohps 的 yaml，而不是修改"** —— 定了"新文件"而非"改原文件"。
+
+#### 19.9.2 plan 演进（一次被用户推翻的设计）
+
+**初版（错的）**：给新 service config 加 `cluster: ray_address: auto`，再配一个专用启动脚本。理由是"训练侧已经有 Ray 集群，接进去更省事"。
+
+**被否的原因**：这是照着 FlashGRPO 上游的部署形状想的，不是本仓的约定。读 `configs/editreward_service.yaml` 后确认——**它根本没有 `cluster:` 段**。本仓单 reward config 的规范形状是：header 里写清 `ray start --head --port=6379 --num-gpus=1`，然后 `python -m reward_service --config ...`，由 `workers/pool.py::_init_ray` 的"已有集群则接入"分支自动接上。多余的 `cluster:` 段、多余的启动脚本、以及 `stop_videoalign.sh:53-57` 那个 `ray stop --force` 的坑，全都不需要。
+
+**"新增而非修改"的仓内先例**：`configs/service.example.yaml` 之外，recipe 侧有 `sd3_nft.yaml` → `sd3_nft_reward_service.yaml`——逐行复制原 recipe，只换 reward backend，header 写一句 "Identical to X except the reward backend"。本次照此办理，diff 可审。
+
+#### 19.9.3 文件改动清单
+
+**新增（2 个，都是新文件，原 recipe 零改动）**：
+- `configs/videohpsv3_service.yaml`（本仓）—— 对齐 `editreward_service.yaml` 的形状。`score_timeout_s: 1800`。
+- `examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`（UniRL 仓根，225 行）—— 逐行复制 `wan21_t2v_flashgrpo_sglang.yaml`，只改 header / 一处注释 / reward 块 / `run_name` / `tags`。
+
+**修改**：无代码改动。仅 `CHANGELOG.md` + 本文件 + `docs/RESUME_PROMPT.md`。
+
+#### 19.9.4 接线正确性（无 GPU 验证链）
+
+最大的风险是"SGLang 侧 `load_vae: false`，reward 还拿得到解码后的视频吗"。逐段验证：
+
+| 环节 | 证据 |
+| --- | --- |
+| adapter 注册 | `rollout/engine/sglang_diffusion/adapters/video.py:203` `@register_adapter("wan21") class Wan21T2VAdapter(VideoAdapter)` |
+| track 名 | `VideoAdapter.track_name = "video"` |
+| RewardService 路由 | `reward/service.py::_KIND_TO_KEY["video"] == "video"`，运行时比对 **MATCH: True** |
+| 布局 | 轨道是 frame-major `[T,C,H,W]`（`utils.stack_decoded_videos`），`_encode_video_b64` 要 `(C,T,H,W)`——`types/reward.py:73-77` 的 `permute(1,0,2,3)` 正好桥接。**不是 bug，无需修** |
+| `load_vae: false` | 解码发生在 SGLang engine 侧，训练侧 pipeline 只回放 latent transition，两者不冲突 |
+
+`input_kind: video` 是让 `RewardService` 去填 `generated["video"]` 的开关，必须显式写（默认 `"image"`）。
+
+#### 19.9.5 三个把细节搞对的点
+
+1. **client timeout 1900 > server 1800**：一开始我把因果写反了，说"这样服务端超时才会返回结构化错误"。实际 `server.py:119-138` 的 `_await_ref` **无条件**把超时包成 `TimeoutError` 塞进 `errors[i][reward]`。ordering 真正买到的是：客户端不会先放弃、然后按 `max_retries: 3` 把整批重新 POST 三遍（`unirl/reward/remote.py:436-460`）。注释已改成这个说法。
+2. **单机共卡要两个 override，且其中一个必须用 `++`**：`DevicePool`（`unirl/distributed/group/device_pool.py:143-148`）会用 STRICT_PACK PlacementGroup 把 `num_devices` 张卡全占掉，reward actor 再要 `num_gpus: 1` 就**永久 PENDING 且不报错**。所以要 `num_devices=7`；又因 `device_pool.py:56` 有整除断言，`devices_per_node` 也得跟着改。但 `devices_per_node` **不在这个 config 里**，Hydra 会报 `Key 'devices_per_node' is not in struct`——必须 `++devices_per_node=7`。已实测：`num_devices=7 ++devices_per_node=7` 正常 resolve。（先例：`examples/pe/pe_sglang_full_wise.yaml:26` 也用 `++`。）
+3. **默认值不是上游语义，已在 recipe header 写明**：`frame_stride: 8` → 81 帧里只打 11 帧，top-30% 池子只有 **3 帧**；`frame_stride: 1` → 81 帧、池子 24 帧，才是上游。3 帧 vs 24 帧是**不同的估计量**，不是"便宜一点的同一个东西"，所以必须写在 header 里而不是埋在 service config。成本：一桶 8 clip 在 stride 1 下是 648 次逐帧打分 / `max_batch_size=4` 下 168 次 batched forward；stride 8 是 88 次 / 24 次。
+
+#### 19.9.6 测试状态
+无新增代码 ⇒ 按 §4.5.2 免测（纯配置，且已有 45 例覆盖 scorer 本身）。改为跑配置层验证：
+
+- `load_config("configs/videohpsv3_service.yaml")` → `score_timeout_s=1800.0`、`frame_stride=8`。
+- **scorer `__init__` 签名 vs YAML `params` 交叉比对：unknown keys = none**（这一步能挡住"YAML 写了个 scorer 不认的参数、Ray actor 起来才炸"）。
+- Hydra compose：`python -m unirl.train_diffusion --config-name ... --cfg job --resolve` 通过。
+- `hydra.utils.instantiate` 实例化 `RemoteRewardSpec`（会跑它 `__post_init__` 的校验器）通过。
+- `diff -u` 原 recipe vs 新 recipe：改动只落在预期的 5 处。
+- `pytest tests/ -q` → **45 passed**（simplify 前后各跑一次）。
+- **编解码全链路 roundtrip（CPU，无 GPU）**：造一个 `[81,3,480,832]` frame-major 张量 → `permute(1,0,2,3)` → `_encode_video_b64` → 16.8 MB mp4（`ftypisom`）→ 交给 scorer 的 `extract_frames` 解回来。stride 1 得 81 帧、top-30% = 24；stride 8 得 11 帧、top-30% = 3——与文档里的数字逐一吻合，分辨率 832x480 / mode RGB 也对。这一步值得单跑，因为 **本 recipe 是整个 `examples/` 树里第一个用 `input_kind: video` 的**（另一处 `pe_sglang_full_wise.yaml:286` 是 `image`），`_encode_video_b64` 此前从未被任何 recipe 走过。
+
+#### 19.9.6b DP_SCATTER：timeout 预算的真正约束（自查发现，修正了我先写的注释）
+
+我最初在 service config 里把 `score_timeout_s` 的成本注释写成"一桶 8 clip = 88 次逐帧打分"——那是**单个 rank 的份额**，不是超时真正要覆盖的量。实际：
+
+- `RewardService.score_and_attach` 带 `@distributed(dispatch_mode=Dispatch.DP_SCATTER)`（`unirl/reward/service.py:189`），而 `reward_fraction` 默认 0（`unirl/trainer/diffusion.py:51`，本 recipe 未设），所以 reward 就是训练 workgroup 的 train-side sibling——**每个训练 rank 各自持有一个 `RemoteRewardBackend`，各自 POST**。
+- 视频路径 `_compute_video_rewards`（`unirl/reward/remote.py:371`）把整个 shard 一次性发出去，不按 `batch_size` 切块。
+- service 侧 `num_replicas: 1` + `max_concurrency: 1` ⇒ 这些并发请求**在同一个 actor 上串行**。
+- `_await_ref` 的 `asyncio.wait_for` 时钟从 dispatch 起算（`reward_service/server.py:129`），**排队时间照算进 `score_timeout_s`**。
+
+结论：`score_timeout_s` 必须覆盖**整个 rollout step 的 reward 总时长**，而不是一个 rank 的份额。一步 64 clip（8 prompt × 8 sample × 81 帧）在 stride 8 下是 704 次逐帧打分 / 176 次 batched forward；stride 1 下是 5184 / 1296。**stride 1 时 1800s 是有可能不够的**——要么调大，要么加 `num_replicas`。注释已按这个口径重写。
+
+#### 19.9.7 simplify 结论
+
+3 项，全部采纳：
+1. **必改**：header 里的启动命令写了 `devices_per_node=7`，会在启动时直接报错——改 `++devices_per_node=7`。我独立复验过报错文本，确认这条是真的（不是 agent 幻觉）。
+2. **必改**：上面 19.9.5 第 1 条那个反了的因果关系。
+3. **建议改**：`server:` 段里 7 行注释夹在 `host:` 和 `port:` 之间，把 `port` 从它自己的块里挤了出去；内容还与 `service.example.yaml:115-125` 和 scorer docstring 重复，并把 300s 说成"图像 service 的默认值"（真实默认是 `config.py:25` 的 **120.0**）。移到 `port:` 之后并收紧。
+
+另有一条 Consider（上游 parity 应写进 recipe）已采纳 → 19.9.5 第 3 条那段 NOTE。
+
+#### 19.9.8 遗留
+
+- **未真机验证**：HPSv3 权重仍未落盘（`weights_path` 是占位符，与 `editreward_service.yaml` 写 HF id 同理）；GPU 当时仍被训练 PID 1691465 + Ray 占满。
+- **`use_torch_compile: true`**（新 recipe 第 87 行）继承自原 recipe，仍未定论。
+- **未决问题**：`examples/diffusion/wan21/wan21_t2v_flashgrpo.yaml`（trainside 变体，reward 块在 `:91-101`）是否也要配一个 `_videohpsv3` 兄弟文件。我倾向要，否则两个 flashgrpo recipe 在 reward 上分叉。用户未回复。
+- **commit 时**：`reward_service/scorers/video_hpsv3.py` 和 `tests/` 还是 untracked，需要 `git add`；`.gitignore` 里 `/Flash-GRPO/` 那行**不提交**（用户明确要求）。
+
+### 19.10 Resume 入口（覆盖 §19.7，以本节为准）
+
+**当前状态**（2026-07-27）：
+- 位置：`UniRL` 仓库 worktree `feature/flashgrpo-unirl` → `unirl-reward-service/`。
+- `videohpsv3` scorer 已实现、已测（45 passed）、ruff clean。
+- **训练侧已接线**（§19.9）：`configs/videohpsv3_service.yaml` + `examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`，两个都是**新文件**，原 recipe 零改动。配置层全部验证通过，**真机未跑**。
+- 改动**未 commit**。
+
+**启动链（两步，规范形状）**：
+```
+# 节点 1（reward）
+cd unirl-reward-service
+ray start --head --port=6379 --num-gpus=1
+python -m reward_service --config configs/videohpsv3_service.yaml
+
+# 节点 2（train）
+export REWARD_SERVICE_URL=http://<node1_ip>:8080
+bash examples/run_experiment_single_node.sh \
+  diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3
+
+# 单机共卡：必须留一张卡给 scorer actor，且两个 override 都要
+bash examples/run_experiment_single_node.sh \
+  diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3 \
+  num_devices=7 ++devices_per_node=7
+```
+
+**下次进来先做的事**（按优先级）：
+1. 下载 HPSv3 权重，填进 `configs/videohpsv3_service.yaml` 的 `weights_path`（现在是占位符）。
+2. 腾 GPU（当时训练 PID 1691465 + Ray 占满 8 卡），按上面的启动链跑真机 smoke。先 `frame_stride: 8` 跑通链路，再决定是否降到 1 拿上游语义（成本 ~8 倍，见 §19.9.5 第 3 条）。
+3. 决定 `wan21_t2v_flashgrpo.yaml` 要不要配 `_videohpsv3` 兄弟文件（§19.9.8 未决问题）。
+4. `use_torch_compile: true` 仍未定论。
+5. 复评 §19.6 末尾那条帧数上限（真机压测时）。
+
+**绝对不要做的事**（§19.7 全部继续有效，本次新增）：
+- 不要给新 service config 加 `cluster:` 段——本仓单 reward config 的规范是先 `ray start --head` 再起 service，`editreward_service.yaml` 就没有这一段（§19.9.2）。
+- 不要在启动命令里写光秃秃的 `devices_per_node=7`——这个 key 不在 recipe 里，Hydra 会报 `not in struct`，必须 `++`（§19.9.5 第 2 条）。
+- 不要把 client `timeout` 降到 ≤ server `score_timeout_s`——客户端会先放弃并按 `max_retries: 3` 重 POST 整批，把已经在烧的 GPU 时间又乘以 3（§19.9.5 第 1 条）。
+- 不要以为 `frame_stride: 8` 是"上游的便宜版"——它把 top-30% 池子从 24 帧砍到 3 帧，是另一个估计量（§19.9.5 第 3 条）。
+- 不要按"单个 rank 的份额"去估 `score_timeout_s`——reward 是 DP_SCATTER 的，每个 rank 各发一个请求、在单 actor 上串行，且排队时间算进超时。要按整步总量估（§19.9.6b）。
+- 不要假设 `imageio` / `imageio-ffmpeg` 一定在——`export_to_video` 靠它们，但 UniRL 的 `pyproject.toml` 没声明（当前 venv 里恰好有：imageio 2.36.0 / imageio-ffmpeg 0.5.1）。换环境跑不通先查这个。
+- 不要去"修" `[T,C,H,W]` 和 `(C,T,H,W)` 的差异——`types/reward.py:73-77` 的 permute 已经桥接了（§19.9.4）。
+- 不要改原来那两个 flashgrpo recipe 来接 remote reward——用户明确要求新增文件（§19.9.1 第 3 条）。
+
+*§19.10 是当前 Resume 入口。再有新 session 请覆盖本节。*

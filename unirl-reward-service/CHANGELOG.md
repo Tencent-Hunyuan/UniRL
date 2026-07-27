@@ -8,6 +8,89 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+### Added (2026-07-27) — `videohpsv3` deployment + training wiring
+
+- **`configs/videohpsv3_service.yaml`** — single-reward deployment config for
+  `videohpsv3`, following `editreward_service.yaml`'s shape (header with the
+  `ray start` + `python -m reward_service` invocation, `server:`, one `rewards:`
+  entry). No `cluster:` section: like the other single-reward configs it relies
+  on `ray start --head` first, which `_init_ray`'s already-running-cluster path
+  picks up. `score_timeout_s: 1800` — the 120 s default is unusable here, and on
+  timeout `server._await_ref` leaves the Ray task running, so the GPU work is
+  spent and then discarded. Ships `frame_stride: 8`.
+- **`examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`**
+  (in the UniRL repo) — the Flash-GRPO WAN2.1 T2V SGLang recipe with its reward
+  swapped from the local `VideoPickScoreScorer` to `RemoteRewardBackend` +
+  `input_kind: video`. A new file rather than an edit, per the
+  `sd3_nft.yaml` → `sd3_nft_reward_service.yaml` precedent; the two original
+  flashgrpo recipes are untouched.
+- **Wiring verified end to end without a GPU**: the SGLang `wan21` rollout uses
+  `Wan21T2VAdapter(VideoAdapter)`, whose `track_name` is `"video"` — the same key
+  `RewardService._KIND_TO_KEY["video"]` reads — and `RewardRequest.videos`
+  permutes the tracks' frame-major `[T,C,H,W]` into the `(C,T,H,W)` that
+  `_encode_video_b64` requires, so no layout fix was needed.
+- **Client timeout (1900) deliberately exceeds the server's (1800)** so a slow
+  reward returns a structured per-reward error instead of the client giving up
+  first and spending its `max_retries` re-POSTing the whole batch.
+- **`score_timeout_s` covers the whole rollout step, not one request.**
+  `score_and_attach` is DP_SCATTER-dispatched and `reward_fraction` defaults to
+  0, so every training rank POSTs its own shard; with `num_replicas` and
+  `max_concurrency` both 1 they serialize on one actor, and `_await_ref` starts
+  its clock at dispatch — so the tail request's queue wait counts against the
+  deadline. A 64-clip step is 704 frame scorings at `frame_stride: 8`, 5184 at
+  stride 1. Stride 1 can approach the 1800 s budget.
+- **Not exact upstream parity at the shipped defaults**: `frame_stride: 8`
+  scores 11 of 81 frames, making the top-30% pool 3 frames rather than
+  upstream's 24-of-81. The recipe header says so; `frame_stride: 1` restores
+  upstream semantics at ~8x the reward cost.
+- **First consumer of `input_kind: video`** anywhere in `examples/`, so
+  `_encode_video_b64` had never been exercised by a shipped recipe. Verified by
+  a CPU roundtrip: an `[81,3,480,832]` frame-major tensor encodes to mp4 and
+  decodes back through the scorer's `extract_frames` to 81 RGB frames at
+  832x480 (11 at stride 8) — the documented pool sizes hold. Note `imageio` /
+  `imageio-ffmpeg`, which `export_to_video` needs, are not declared in UniRL's
+  `pyproject.toml`.
+
+### Added (2026-07-26) — `videohpsv3` T2V reward
+
+- **New `videohpsv3` scorer** (`reward_service/scorers/video_hpsv3.py`)
+  reproducing Flash-GRPO's `video_hpsv3_remote` reward for WAN2.1 T2V: decode
+  every frame, score each with HPSv3, return the mean of the top 30%. Upstream
+  splits this across the wire (client extracts frames, dedicated server scores
+  images); here both halves live in one scorer, per this repo's one-reward
+  one-module convention.
+- **Composes `HPSv3Scorer` rather than extending it.** Each frame is wrapped in
+  a single-turn `ScoreItem` and handed to an internal `HPSv3Scorer`, so
+  checkpoint resolution, `max_batch_size` chunking, and the inter-chunk
+  `empty_cache()` are inherited and `hpsv3_scorer.py` needed **zero changes**.
+- **Deps unchanged**: points `runtime_env` at the existing `envs/hpsv3.txt`
+  (which already carries `opencv-python-headless`), so Ray reuses one cached
+  venv for both `hpsv3` and `videohpsv3`.
+- **Short-clip divergence from upstream, deliberate**: aggregation keeps
+  `max(1, int(n * top_ratio))` frames, so clips of ≤ 3 frames score their single
+  best frame where upstream's bare `int(l * 0.3)` raises `ZeroDivisionError`.
+  Bit-identical to upstream everywhere upstream works.
+- **Per-item failure isolation**: an undecodable clip scores `float("nan")` per
+  `BaseScorer.score`'s contract instead of failing the whole reward bucket.
+  Scoring one clip at a time makes this free — unlike `videoalign`, which hands
+  its entire batch to one inferencer call and has no per-item boundary.
+- **`materialize_video` promoted to `scorers/_common.py`** from `videoalign`'s
+  private staticmethod (behaviour-preserving) and now shared by both T2V
+  scorers. Fixed a latent leak while promoting it: the tempfile is recorded in
+  `owned_tempfiles` *before* the write, so a failing write (ENOSPC) no longer
+  strands a file where the caller's cleanup loop cannot see it.
+- **Disabled by default** in `configs/service.example.yaml`, like the other T2V
+  rewards. Costs one Qwen2-VL-7B forward *per frame* (~1.3k batched forwards for
+  a 64-clip bucket at `frame_stride=1`), so the commented block documents
+  raising `server.score_timeout_s` to 1800 or starting at `frame_stride: 8`.
+- **Naming, two layers**: the module is `video_hpsv3.py` (snake_case, no
+  `_scorer` suffix — that suffix exists only in `hpsv2_scorer.py` /
+  `hpsv3_scorer.py` to avoid shadowing the same-named pip packages they
+  import). The reward *name* stays `videohpsv3` — it is the wire identifier and
+  matches upstream Flash-GRPO's registry and config key
+  (`flow_grpo/rewards.py:424`, `config/dgx.py:73`). Upstream itself spells its
+  Python symbol `video_hpsv3_remote` and its config key `videohpsv3`.
+
 ### Changed (2026-05-31) — cross-repo reward calling contract (with UniRL)
 
 - **Failure contract made explicit.** `BaseScorer.score` docstring now defines

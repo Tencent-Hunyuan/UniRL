@@ -17,6 +17,7 @@ A unified T2I reward inference service: a FastAPI gateway in front of Ray worker
 | `wise` | vLLM | A MoE VLM (e.g. Qwen3.5-35B-A3B) used as a generic WISE-rubric reward judge. Default sub-metrics: a derived `wiscore` headline plus Consistency / Realism / Aesthetic Quality (template overridable in YAML) |
 | `geneval` | mmdet / mmcv | Compositional GenEval (Mask2Former detection + CLIP color classification). **Disabled by default** — its stack needs Python 3.10 and cannot run under this service's Python-3.13 Ray cluster (see `envs/geneval.txt`) |
 | `videoalign` | transformers (vendored `_videoalign/`) | T2V reward: scores generated **videos** along Overall / VQ / MQ / TA. Requires a video (`video_b64` or `video_path`) on the request. **Disabled by default** in the example config |
+| `videohpsv3` | official `hpsv3` pip package + OpenCV | T2V reward: scores every frame with HPSv3 and averages the top 30% (reproduces Flash-GRPO's `videohpsv3`). Requires a video on the request. **Disabled by default** — costs one Qwen2-VL-7B forward *per frame*, so raise `frame_stride` and `server.score_timeout_s` before enabling |
 
 ## Architecture
 

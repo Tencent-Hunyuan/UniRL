@@ -78,7 +78,7 @@ One diagram for the entire process structure:
 | ScorerActor | `reward_service/workers/actor.py` | `@ray.remote` thin shell: constructs the scorer, forwards `score()` |
 | BaseScorer | `reward_service/scorers/base.py` | The abstract contract: `score(items) -> list[dict]` + `sub_metric_names` |
 | Registry | `reward_service/scorers/registry.py` | `register(name, cls)` + optional-dep tolerance (`_try_import`) |
-| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,videoalign}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
+| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,videoalign,video_hpsv3}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
 
 ---
 
@@ -432,7 +432,7 @@ reward_service/
 └── scorers/             #  Model layer
     ├── base.py          #  BaseScorer + ScoreItem
     ├── registry.py      #  register / get_scorer_cls / _try_import
-    ├── _common.py       #  shared helpers: dtype, path, data_url, vLLM kwargs
+    ├── _common.py       #  shared helpers: dtype, path, video spill, data_url, vLLM kwargs
     ├── clip.py          # ─┐
     ├── pickscore.py     #  │ transformers-style
     ├── imagereward.py   #  │
@@ -443,7 +443,8 @@ reward_service/
     ├── geneval2.py      #  │ vLLM-style
     ├── wise.py          # ─┘
     ├── geneval.py       #  mmdet/mmcv-style (disabled by default)
-    └── videoalign.py    #  T2V reward (vendored _videoalign/)
+    ├── videoalign.py    #  T2V reward (vendored _videoalign/)
+    └── video_hpsv3.py  #  T2V reward: per-frame hpsv3 + top-30% (composes HPSv3Scorer)
 ```
 
 ---

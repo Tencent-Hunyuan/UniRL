@@ -12,16 +12,31 @@ resume RewardService（在你的本地 checkout 根目录打开）
 ## 项目状态速查
 请先按顺序读这 3 份文件，进入状态再问我要做什么：
 
-1. docs/DEVELOPMENT_LOG.md §17.7 "Resume 入口（覆盖 §16.10，以本节为准）" — 最新状态
-2. docs/DEVELOPMENT_LOG.md §17 "跨 repo 调用契约修复（RewardService ↔ DiffusionRL_main）" — 最近一次 session 的完整记录
-3. docs/DEVELOPMENT_LOG.md §16 "集成 geneval + ocr + videoalign scorer（两层隔离调查）" — 上一次 session
-4. docs/ARCHITECTURE.md — 系统架构全貌（进程拓扑 / 数据流 / 4 层抽象 / 扩展点）
+1. docs/DEVELOPMENT_LOG.md §19.10 "Resume 入口（覆盖 §19.7，以本节为准）" — 最新状态
+2. docs/DEVELOPMENT_LOG.md §19.9 "训练侧接线：新增 videohpsv3 service config + WAN recipe" — 最近一次 session
+3. docs/DEVELOPMENT_LOG.md §19.0–19.8 "新增 videohpsv3 T2V reward（对齐上游 Flash-GRPO）" — scorer 本身的完整记录
+4. docs/DEVELOPMENT_LOG.md §17 "跨 repo 调用契约修复" + §18 "并入单仓" — 之前两次 session
+5. docs/ARCHITECTURE.md — 系统架构全貌（进程拓扑 / 数据流 / 4 层抽象 / 扩展点）
+
+**位置注意**：当前工作副本在 `UniRL` 仓库 worktree `feature/flashgrpo-unirl` 下的 `unirl-reward-service/`。§18.1 提到的 `DiffusionRL_main/RewardService/` 是更早的历史状态，以 §19.10 为准。
 
 ## 当前第一优先级
 
-**统一主线 `integration/geneval-ocr-clean` 的收尾**（已含 geneval+ocr+videoalign + 跨-repo 调用契约修复，两 repo 改动均未 commit）：设 git 身份 → 两 repo 本地 commit（不 push）→ 真机验证 `ocr`（GOT-OCR）+ `videoalign`（VideoReward 权重 + flash-attn venv + 经 `input_kind: video` 的远程 video 端到端）→ 定 `geneval` 长期路线（py3.10 sidecar vs 移植检测栈；py3.13 集群无法经 runtime_env 托管，详见 §16.2 / ARCHITECTURE §5.1.1）。
+**让 `videohpsv3` 在真机上跑起来**。service 侧（逐帧 HPSv3 + top-30% 聚合，45 tests passed、ruff clean）和训练侧接线（§19.9）都已交付，但**没有任何真机验证**——只做了配置层校验。
 
-**调用契约已修复并被契约测试钉死（详见 §17）**：image/video payload 形状、finite-guard（NaN/None/inf→样本失败）、`input_kind` 路由、geneval 缺 metadata raise、videoalign Overall-first，全部 CPU 测试绿。失败处理走 **fail-fast**（用户明确否决"mask 出 advantage"，不要改回去，见 §17.7）。`ocr`/`geneval2` per-item 失败返回 NaN，由 caller 的 finite-guard 翻成失败、fail-fast 停训。
+已交付的两个新文件（都是新增，原 recipe 零改动）：
+- `configs/videohpsv3_service.yaml`
+- `examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`（相对 UniRL 仓库根）
+
+剩下的事：
+
+1. 下载 HPSv3 权重，填进 `configs/videohpsv3_service.yaml` 的 `weights_path`（现在是占位符）。
+2. 腾 GPU（上次 8 卡全被训练占满，需停 PID 1691465 + Ray 集群）。
+3. 真机 smoke，按下面"启动命令"里的两步链路。先 `frame_stride: 8` 跑通再决定是否降到 1——**注意这不是"便宜版"而是另一个估计量**：stride 8 时 top-30% 池子只有 3 帧，stride 1 是 24 帧（§19.9.5）。
+4. 未决：`wan21_t2v_flashgrpo.yaml`（trainside 变体）要不要也配一个 `_videohpsv3` 兄弟文件；`wan21_t2v_flashgrpo_sglang.yaml` 的 `use_torch_compile: true`。
+5. commit 时：`reward_service/scorers/video_hpsv3.py` 和 `tests/` 仍是 untracked，需要 `git add`。
+
+失败处理走 **fail-fast**（用户明确否决"mask 出 advantage"，不要改回去，见 §17.7）。scorer 侧 per-item 失败返回 NaN，由 caller 的 finite-guard 翻成样本失败。
 （§15.6 遗留的"多机验证"仍未完成，可一并处理。）
 
 ## 工作流约束（必须遵守）
@@ -47,6 +62,15 @@ resume RewardService（在你的本地 checkout 根目录打开）
 - 不要跳过 plan 直接动代码 — 单行修复除外，其他都必须先出 plan
 - 不要在仓库内的文档/脚本/skill 里写仓库根的绝对路径 — 用相对路径
 - 不要随意调整 configs/service.cluster.example.yaml 里 rewards 的顺序 — 多 GPU actor 必须排最前避免碎片化（§12.15）
+- 不要把 `videohpsv3` 的 per-item NaN 改回 raise — 一个坏片段不该拖垮整桶 64 项（§19.6）；但"缺 video / 类型不对"必须继续 raise，别用 NaN 掩盖接线 bug
+- 不要在 `video_hpsv3.py` 顶层 `import cv2` — `registry._try_import` 会把 ImportError 咽成 warning，顶层导入会让这个 reward 静默未注册（§19.7）
+- 不要给 `videohpsv3` 单独建 `envs/videohpsv3.txt` — 必须与 `envs/hpsv3.txt` 内容一致才能共用 Ray 缓存的 venv
+- 不要把 reward 名 `videohpsv3` 改成 `video_hpsv3` — 文件名是 `video_hpsv3.py`，但注册名 / YAML `scorer:` 是线协议标识符，必须与上游 Flash-GRPO 的 config key 一致（§19.8）
+- 不要给 `configs/videohpsv3_service.yaml` 加 `cluster:` 段 — 本仓单 reward config 的规范是先 `ray start --head` 再起 service，`editreward_service.yaml` 就没这一段（§19.9.2）
+- 不要在 Hydra 启动命令里写光秃秃的 `devices_per_node=7` — 这个 key 不在 recipe 里，会报 `not in struct`，必须 `++devices_per_node=7`（§19.9.5）
+- 不要把 client `timeout` 降到 ≤ server `score_timeout_s` — 客户端会先放弃并按 `max_retries: 3` 把整批重 POST，把已经在烧的 GPU 时间乘以 3（§19.9.5）
+- 不要去"修" 视频轨道 `[T,C,H,W]` 与 `_encode_video_b64` 要的 `(C,T,H,W)` 的差异 — `unirl/types/reward.py:73-77` 的 permute 已经桥接了（§19.9.4）
+- 不要改原来那两个 flashgrpo recipe 去接 remote reward — 用户明确要求新增文件（§19.9.1）
 
 ## 启动命令
 
@@ -66,6 +90,21 @@ resume RewardService（在你的本地 checkout 根目录打开）
   PYTHONPATH=. python3.12 -m reward_service --config configs/service.cluster.example.yaml
   # 停：
   bash scripts/ray_stop.sh
+
+FlashGRPO videohpsv3 链路（两步，§19.9）：
+  # 节点 1（reward）
+  ray start --head --port=6379 --num-gpus=1
+  python -m reward_service --config configs/videohpsv3_service.yaml
+
+  # 节点 2（train，在 UniRL 仓库根）
+  export REWARD_SERVICE_URL=http://<node1_ip>:8080
+  bash examples/run_experiment_single_node.sh \
+    diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3
+
+  # 单机共卡：必须留一张卡给 scorer actor，两个 override 都要（第二个必须 ++）
+  bash examples/run_experiment_single_node.sh \
+    diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3 \
+    num_devices=7 ++devices_per_node=7
 
 压测：
   PYTHONPATH=. python3.12 scripts/smoke_client.py --url http://localhost:8080
@@ -91,6 +130,7 @@ resume RewardService（在你的本地 checkout 根目录打开）
 - `reward_service/workers/group.py::_actor_options` — scheduling + runtime_env 透传
 - `configs/service.example.yaml` — 单机 8 GPU
 - `configs/service.cluster.example.yaml` — 双机 16 GPU
+- `configs/videohpsv3_service.yaml` — FlashGRPO WAN T2V 专用（单 reward、1 GPU），消费方是 `examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`（相对 UniRL 仓库根）
 - `scripts/ray_{start,stop,smoke}.sh` + `_ray_lib.sh` — 多机启动/回收/smoke
 
 **测试**：
@@ -101,7 +141,7 @@ resume RewardService（在你的本地 checkout 根目录打开）
 **文档**：
 - `README.md` — 用户手册
 - `docs/ARCHITECTURE.md` — 架构稳定概念
-- `docs/DEVELOPMENT_LOG.md` — 历史档案（§16 是最新 session，Resume 入口在 §16.8）
+- `docs/DEVELOPMENT_LOG.md` — 历史档案（§19 是最新 session，Resume 入口在 §19.7）
 - `CHANGELOG.md` — 用户视角变更表
 - `docs/RESUME_PROMPT.md` — 本文件
 
