@@ -13,6 +13,7 @@ queue client for transfer_queue).
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 from typing import Dict, Optional
@@ -25,6 +26,8 @@ from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
 from unirl.distributed.tensor.factory import build_transport
 from unirl.distributed.utils import collect_leaves
+
+logger = logging.getLogger(__name__)
 
 
 class Worker:
@@ -371,6 +374,33 @@ class Worker:
         world_size) that the controller does not pass.
         """
         self.transport.setup_transfer(self.nccl_rank, self.world_size)
+
+    # ── Teardown ──
+
+    def teardown(self) -> None:
+        """Release everything this actor owns. Idempotent, best effort.
+
+        ``DevicePool.shutdown`` calls this before ``ray.kill``, which is a
+        SIGKILL: without a pass through here, a role holding an inference
+        engine loses its only chance to close it, and the engine's subprocess
+        tree is abandoned still holding device memory.
+
+        Roles are released in reverse construction order because later ones
+        were handed references to earlier ones (``get_sibling``).
+        """
+        for role_name, role in reversed(list(getattr(self, "_roles", {}).items())):
+            closer = getattr(role, "shutdown", None) or getattr(role, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except Exception:
+                logger.exception("Role %s failed to shut down on worker %s", role_name, self.worker_id)
+        if hasattr(self, "_roles"):
+            self._roles.clear()
+
+        for port in list(getattr(self, "_reserved_sockets", {})):
+            self._release_port(port)
 
     # ── Info queries ──
 
