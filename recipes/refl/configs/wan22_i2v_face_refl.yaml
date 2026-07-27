@@ -81,7 +81,7 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: recipes.common.roles.RewardRole
+    _target_: unirl.reward.service.RewardService
     placement:
       share_with: actor
 

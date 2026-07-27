@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -10,8 +11,8 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from recipes.common.roles import Role
-from unirl.distributed.group.dispatch import distributed
+from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import Batch, concat_field, shared_field
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.primitives import Images, Texts
@@ -42,7 +43,16 @@ def _maybe_instantiate(value: Any) -> Any:
     return value
 
 
-class ReflActorRole(Role):
+@dataclass(frozen=True)
+class RoleStepResult:
+    """Generic result of one role-local optimizer step."""
+
+    metrics: Mapping[str, object]
+    grad_norm: float
+    lr: float
+
+
+class ReflActorRole(Remote):
     """Actor role: bundle + pipeline + backend + REFL BPTT logic."""
 
     bundle: Any
@@ -51,10 +61,54 @@ class ReflActorRole(Role):
     algo_cfg: Any
     sampling_params: Any
 
+    def __init__(self, cfg: Any) -> None:
+        super().__init__()
+        self.cfg = cfg
+
     def initialize(self) -> None:
-        super().initialize()
+        self.bundle = instantiate(self.cfg.get("model"))
+        self.pipeline = instantiate(self.cfg.get("pipeline"), bundle=self.bundle)
+        self.backend = instantiate(
+            self.cfg.get("backend"),
+            bundle=self.bundle,
+            device=torch.device(self.device),
+            rank=int(self.rank_info.rank),
+        )
         self.algo_cfg = self.cfg.algorithm
         self.sampling_params = _maybe_instantiate(self.algo_cfg.get("sampling_params"))
+
+    @distributed
+    def step(self) -> RoleStepResult:
+        """Clip gradients and run one backend optimizer step."""
+        if not hasattr(self, "backend") or not hasattr(self.backend, "optimizer_step"):
+            raise RuntimeError(f"{type(self).__name__}.step requires a backend with optimizer_step(...).")
+        grad_norm = float(self.backend.optimizer_step(max_grad_norm=float(self.algo_cfg.get("max_grad_norm", 1.0))))
+        lr = 0.0
+        try:
+            sched = getattr(self.backend, "scheduler", None)
+            if sched is not None:
+                last = sched.get_last_lr()
+                lr = float(last[0]) if last else 0.0
+        except Exception:
+            lr = 0.0
+        return RoleStepResult(
+            metrics={"grad_norm": grad_norm, "lr": lr},
+            grad_norm=grad_norm,
+            lr=lr,
+        )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def save_checkpoint(self, path: str, step: Optional[int] = None, mode: str = "auto") -> None:
+        """Save backend checkpoint when the role backend supports it."""
+        if hasattr(self, "backend") and hasattr(self.backend, "save"):
+            self.backend.save(path, step=step, mode=mode)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def load_checkpoint(self, path: str) -> int:
+        """Load backend checkpoint when the role backend supports it."""
+        if hasattr(self, "backend") and hasattr(self.backend, "load"):
+            return int(self.backend.load(path) or 0)
+        return 0
 
     @distributed
     def generate_samples(self, req: RolloutReq) -> REFLGenerated:
@@ -173,4 +227,4 @@ class ReflActorRole(Role):
         )
 
 
-__all__ = ["ReflActorRole"]
+__all__ = ["ReflActorRole", "RoleStepResult"]

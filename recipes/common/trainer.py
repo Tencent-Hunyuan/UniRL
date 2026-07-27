@@ -12,6 +12,7 @@ from hydra.utils import get_method
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 from unirl.distributed.group.remote import Remote
+from unirl.reward.service import RewardService
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 
 logger = logging.getLogger(__name__)
@@ -238,12 +239,21 @@ class Trainer(BaseTrainer):
         return OmegaConf.create(container)
 
     def create_remote_role(self, spec: RoleSpec, *, device_ids: List[int], slot_id: int):
+        role_cls = self.resolve_role_cls(spec.target)
+        if issubclass(role_cls, RewardService):
+            # RewardService takes a materialized ``backend`` (not a ``cfg`` blob):
+            # pass the role's own fields as plain-dict kwargs so the worker's
+            # ``_resolve_init_kwargs`` walker instantiates the nested ``_target_``
+            # backend in its own CUDA context.
+            init_kwargs = OmegaConf.to_container(self.prepare_role_cfg(spec), resolve=True)
+        else:
+            init_kwargs = {"cfg": self.prepare_role_cfg(spec)}
         return self.pool.create_remote(
-            self.resolve_role_cls(spec.target),
+            role_cls,
             device_ids=device_ids,
             slot_id=slot_id,
             role_name=spec.name,
-            init_kwargs={"cfg": self.prepare_role_cfg(spec)},
+            init_kwargs=init_kwargs,
         )
 
     def initialize_roles(self) -> None:

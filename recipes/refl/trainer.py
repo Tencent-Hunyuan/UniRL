@@ -7,8 +7,8 @@ from collections.abc import Mapping
 from typing import Any, Dict
 import numpy as np
 
+from recipes.common.trainer import Trainer
 from unirl.distributed.tensor.grad_context import enable_grad
-from unirl.trainer.trainer import Trainer
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import total_samples_per_prompt
@@ -54,9 +54,11 @@ class REFLTrainer(Trainer):
     def train_step(self, req: RolloutReq, *, training_progress: float = 0.0, rollout_id: int = 0) -> Dict[str, Any]:
         """One REFL step: actor generate → reward score → actor backward → actor step."""
         t0 = time.perf_counter()
+        prompts = list(req.primitives["text"].texts)
+        records = list(req.metadata) if req.metadata else None
         with enable_grad():
             gen = self.actor.generate_samples(req)
-            rewards = self.reward.score_differentiable(req=req, generated=gen)
+            rewards = self.reward.score_differentiable(gen.decoded, prompts, records)
             loss_metrics = self.actor.forward_backward_loss(
                 rewards=rewards,
                 kl_loss=gen.kl_loss,

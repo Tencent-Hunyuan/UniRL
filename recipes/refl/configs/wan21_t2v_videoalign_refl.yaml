@@ -84,10 +84,11 @@ roles:
     algorithm: ${algorithm}
 
   - name: reward
-    _target_: recipes.common.roles.RewardRole
+    _target_: unirl.reward.service.RewardService
     placement:
-      # BPTT gradients must live on the same worker — no cross-process
-      # autograd. VideoAlign co-locates with the actor.
+      # Co-locate reward with the actor to avoid shipping decoded video
+      # across processes. NOT an autograd requirement — GradContext
+      # backprops rewards across workers via RPC — purely an efficiency choice.
       share_with: actor
 
     backend:
