@@ -109,6 +109,11 @@ case "${PROFILE}" in
         ENTRY=train_pe
         EXPERIMENT=pe/pe_trainside_pickscore
         VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv}"
+        # The colocated SD3 + Qwen FSDP stacks run close to the H20 memory
+        # ceiling.  Variable AR sequence lengths can otherwise fragment the
+        # caching allocator across rollouts until a small unshard allocation
+        # fails despite substantial reserved-but-unused memory.
+        export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
         export PRETRAINED_MODEL="${PRETRAINED_MODEL:-${REPO_ROOT}/models/local/stable-diffusion-3.5-medium}"
         export LLM_MODEL="${LLM_MODEL:-${REPO_ROOT}/models/local/Qwen3-0.6B}"
         require_file "${PRETRAINED_MODEL}/model_index.json"
