@@ -52,8 +52,8 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
-    use_torch_compile: false
+    activation_checkpointing: true
+    use_torch_compile: true
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-4
