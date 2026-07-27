@@ -47,6 +47,10 @@ from unirl.rollout.engine.vllm_omni.adapters.hv15 import (
     Hv15T2vAdapter,
     Hv15VideoOutputAdapter,
 )
+from unirl.rollout.engine.vllm_omni.adapters.qwen3_omni import (
+    Qwen3OmniThinkerAdapter,
+    Qwen3OmniThinkerInputAdapter,
+)
 from unirl.rollout.engine.vllm_omni.adapters.qwen_image import (
     QwenImageGroupedInputAdapter,
     QwenImageInputAdapter,
@@ -78,6 +82,8 @@ __all__ = [
     "Hv15VideoOutputAdapter",
     "ModelAdapter",
     "QwenImageGroupedInputAdapter",
+    "Qwen3OmniThinkerAdapter",
+    "Qwen3OmniThinkerInputAdapter",
     "QwenImageInputAdapter",
     "QwenImageOutputAdapter",
     "QwenImageT2iAdapter",

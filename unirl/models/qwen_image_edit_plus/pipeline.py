@@ -11,11 +11,14 @@ Text+image → image editing flow::
                                                                          ▼
                                                                        Images
 
-The text-embed and VAE-decode stages are reused from
-:mod:`unirl.models.qwen_image` (V1 does standard text encoding — the
-low-res 384² condition-image path into the Qwen2.5-VL text encoder is
-deferred to V2). The VAE-encode stage and the diffusion step/stage are
-Edit-Plus-specific.
+The text-embed stage is always :class:`QwenImageEditPlusTextEmbedStage` (edit
+chat template, drop 64). With ``use_condition_image_prompt=True`` (default) it
+also feeds the source image into Qwen2.5-VL; with ``False`` it keeps the edit
+template but omits vision tokens — matching upstream
+``_get_qwen_prompt_embeds(..., image=None)``, **not** base Qwen-Image's
+text-only stage. The VAE-decode stage is reused from
+:mod:`unirl.models.qwen_image`; the VAE-encode stage and the diffusion
+step/stage are Edit-Plus-specific.
 
 σ schedule contract: identical to :class:`QwenImagePipeline` — the hosting
 engine pins the frontier sampling params' ``sigmas`` before calling ``generate(sample)``. The schedule's
@@ -28,7 +31,6 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from unirl.models.qwen_image.text_embed import QwenImageTextEmbedStage
 from unirl.models.qwen_image.vae import QwenImageVAEDecodeStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
@@ -44,6 +46,7 @@ from .diffusion import (
     QwenImageEditPlusDiffusionStage,
     QwenImageEditPlusDiffusionStep,
 )
+from .text_embed import QwenImageEditPlusTextEmbedStage
 from .vae import QwenImageEditPlusVAEEncodeStage
 
 
@@ -55,6 +58,9 @@ class QwenImageEditPlusPipeline(Pipeline):
     - ``primitives["text"]: Texts`` — required edit instructions.
     - ``primitives["image"]: Images`` — **required** source images (Edit-Plus
       is edit-only; raises ``TypeError`` if absent — fail-fast, constraint #27).
+      The source remains required for VAE latent concatenation even when
+      ``use_condition_image_prompt=False``; that switch only controls whether
+      the text encoder also sees the source image.
     - CFG negatives are accepted by ``build_conditions`` for direct callers,
       but are not transported as Sample conditioning Parts.
     - The frontier ``sampling_params.sigmas`` schedule is required.
@@ -71,7 +77,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         self,
         *,
         bundle: QwenImageEditPlusBundle,
-        text_embed: Optional[QwenImageTextEmbedStage] = None,
+        text_embed: Optional[QwenImageEditPlusTextEmbedStage] = None,
         diffusion: Optional[QwenImageEditPlusDiffusionStage] = None,
         vae_encode: Optional[QwenImageEditPlusVAEEncodeStage] = None,
         vae_decode: Optional[QwenImageVAEDecodeStage] = None,
@@ -81,11 +87,18 @@ class QwenImageEditPlusPipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
+        use_condition_image_prompt: bool = True,
+        processor_path: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
+        self.use_condition_image_prompt = bool(use_condition_image_prompt)
         if text_embed is None and bundle.text_encoder is not None:
-            text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
+            text_embed = QwenImageEditPlusTextEmbedStage(
+                bundle,
+                max_sequence_length=max_sequence_length,
+                processor_path=processor_path,
+            )
         self.text_embed = text_embed
         if diffusion is None:
             diffusion = QwenImageEditPlusDiffusionStage(
@@ -141,11 +154,15 @@ class QwenImageEditPlusPipeline(Pipeline):
     ) -> "QwenImageEditPlusPipeline":
         """Build the full Edit-Plus pipeline from a config."""
         bundle = QwenImageEditPlusBundle.from_config(config)
-        text_embed = (
-            QwenImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
-            if bundle.text_encoder is not None
-            else None
-        )
+        text_embed: Optional[QwenImageEditPlusTextEmbedStage] = None
+        if bundle.text_encoder is not None:
+            text_embed = QwenImageEditPlusTextEmbedStage(
+                bundle,
+                max_sequence_length=config.max_sequence_length,
+                # Honor a text-encoder override so the processor tracks the
+                # tokenizer/text encoder, not just the main checkpoint.
+                processor_path=config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path,
+            )
         step = QwenImageEditPlusDiffusionStep()
         diffusion = QwenImageEditPlusDiffusionStage(
             model=bundle,
@@ -164,6 +181,9 @@ class QwenImageEditPlusPipeline(Pipeline):
             vae_encode=vae_encode,
             vae_decode=vae_decode,
             shift=float(config.shift),
+            max_sequence_length=config.max_sequence_length,
+            use_condition_image_prompt=config.use_condition_image_prompt,
+            processor_path=config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path,
         )
 
     def build_conditions(
@@ -171,6 +191,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         texts: Texts,
         *,
         negatives: Optional[Texts] = None,
+        images: Optional[Images] = None,
         guidance_scale: float = 1.0,
     ) -> QwenImageEditPlusConditions:
         """Build the text side of Edit-Plus conditions.
@@ -188,10 +209,16 @@ class QwenImageEditPlusPipeline(Pipeline):
                 "QwenImageEditPlusPipeline.build_conditions: no text_embed stage "
                 "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
+        # CFG empty negative: single-space " " (mirrors base Qwen-Image —
+        # the chat-template prefix strip makes "" unsafe).
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[" "] * len(texts.texts))
-        text_cond = self.text_embed.embed(texts)
-        negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
+        # Both CFG branches share the source image when multimodal prompt
+        # conditioning is enabled. Disabling it preserves the Edit-Plus
+        # template/drop-64 path while passing no image to the text encoder.
+        embed_images = images if self.use_condition_image_prompt else None
+        text_cond = self.text_embed.embed(texts, embed_images)
+        negative_text_cond = self.text_embed.embed(negatives, embed_images) if negatives is not None else None
         return QwenImageEditPlusConditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
@@ -230,7 +257,11 @@ class QwenImageEditPlusPipeline(Pipeline):
                 f"!= text batch {len(texts.texts)}"
             )
 
-        edit_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        edit_conds = self.build_conditions(
+            texts,
+            images=images,
+            guidance_scale=float(params.guidance_scale),
+        )
         image_latent = self.vae_encode.encode(
             images,
             height=int(params.height),

@@ -206,6 +206,7 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
     def health_check(self) -> bool:
         return self._backend.ping()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
         with self._shutdown_lock:
             if self._shutdown_complete:

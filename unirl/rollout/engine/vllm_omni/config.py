@@ -72,8 +72,16 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     # Required for ``cfg.training.execution.offload_rollout = True``.
     enable_sleep_mode: bool = True
 
+    # Optional override for the adapter's default stage YAML.
+    stage_yaml_override: Optional[str] = None
+
     # Passthrough for advanced ``Omni`` kwargs not surfaced as typed fields.
     omni_extra: Dict[str, Any] = field(default_factory=dict)
+
+    # Model chat-template kwargs. AgenticRolloutEngine injects environment tool
+    # schemas here before constructing the inner engine; adapters that do not
+    # use a chat template ignore the field.
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
@@ -124,6 +132,10 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         # Adapter boot extras: stage_yaml / stage_yaml_source /
         # needs_driver_tokenizer / clear_cuda_visible.
         intent.update(extra)
+
+        # A per-run override takes precedence over the adapter default.
+        if self.stage_yaml_override:
+            intent["stage_yaml"] = str(self.stage_yaml_override)
 
         omni_kwargs: Dict[str, Any] = dict(
             # HI3 weights are ~150GB; loading from cephfs over the network

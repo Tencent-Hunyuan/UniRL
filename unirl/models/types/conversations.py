@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, Texts, Videos
 from unirl.types.sample import Turn
 
 # One sample's chat conversation: an ordered list of role-tagged messages.
@@ -106,8 +106,89 @@ def build_vision_messages(
     return conversations
 
 
+def _video_rows(videos: Videos) -> List[Any]:
+    """Return one URI or packed-frame tensor per row of a ``Videos`` batch."""
+    if videos.uris is not None:
+        if videos.frames is not None:
+            raise ValueError("build_video_messages: Videos cannot carry both uris and packed frames.")
+        if len(videos.uris) != len(videos):
+            raise ValueError(
+                f"build_video_messages: video URI count {len(videos.uris)} != video batch {len(videos)}."
+            )
+        return list(videos.uris)
+
+    rows = videos.to_list()
+    if len(rows) != len(videos):
+        raise ValueError(
+            "build_video_messages: Videos carries neither batch-aligned uris nor valid packed frames."
+        )
+    return [row.frames for row in rows]
+
+
+def build_video_messages(
+    turns: List[Turn],
+    system_instruction: Optional[str] = None,
+) -> List[Conversation]:
+    """One text+optional-video conversation per frontier row.
+
+    Qwen3-Omni's current agentic contract permits one persistent source-video
+    turn plus arbitrary role-aware text turns. Consecutive same-role turns are
+    fused, with the video block placed before text blocks so the initial
+    ``text input Part -> video input child`` dataset shape renders to the
+    checkpoint's canonical ``[video, text]`` user message.
+    """
+    if not turns:
+        return []
+
+    unsupported = [type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, Videos))]
+    if unsupported:
+        raise ValueError(
+            "build_video_messages: Qwen3-Omni requires text/video turns only; "
+            f"got unsupported content {unsupported}."
+        )
+
+    video_turns = sum(isinstance(turn.content, Videos) for turn in turns)
+    if video_turns > 1:
+        raise ValueError(
+            "build_video_messages: Qwen3-Omni currently supports at most one persistent "
+            f"source-video turn per trajectory, got {video_turns}."
+        )
+
+    roles = [turn.role for turn in turns]
+    is_video = [isinstance(turn.content, Videos) for turn in turns]
+    cols = [
+        _video_rows(turn.content) if video else list(turn.content.texts)
+        for turn, video in zip(turns, is_video)
+    ]
+    n_rows = len(turns[0].content)
+    mismatched = [i for i, turn in enumerate(turns) if len(turn.content) != n_rows]
+    if mismatched:
+        raise ValueError(
+            f"build_video_messages: frontier-aligned turns must share batch size {n_rows}; "
+            f"mismatched turn indices {mismatched}."
+        )
+
+    role_groups = _group_consecutive_roles(roles)
+    prefix = _system_prefix(system_instruction, roles)
+    conversations: List[Conversation] = []
+    for row in range(n_rows):
+        messages: Conversation = list(prefix)
+        for role, indices in role_groups:
+            video_blocks: List[Dict[str, Any]] = []
+            text_blocks: List[Dict[str, Any]] = []
+            for index in indices:
+                if is_video[index]:
+                    video_blocks.append({"type": "video", "video": cols[index][row]})
+                else:
+                    text_blocks.append({"type": "text", "text": cols[index][row]})
+            messages.append({"role": role, "content": video_blocks + text_blocks})
+        conversations.append(messages)
+    return conversations
+
+
 __all__ = [
     "Conversation",
     "build_text_messages",
+    "build_video_messages",
     "build_vision_messages",
 ]

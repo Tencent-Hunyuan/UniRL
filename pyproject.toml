@@ -65,6 +65,7 @@ vllm = [
   "torch==2.11.0+cu129 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
   "wandb>=0.16,<0.20",
