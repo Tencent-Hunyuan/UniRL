@@ -193,6 +193,7 @@ if [ "${PROFILE}" = "ar-drpo" ]; then
     require_dist_version "nvidia-cuda-nvcc" "13.0.88"
     require_dist_version "nvidia-cuda-crt" "13.0.88"
     require_dist_version "nvidia-nvvm" "13.0.88"
+    require_dist_version "nvidia-cuda-cccl" "13.0.85"
     if ! "${CUDACXX}" --version | grep -q "release 13.0"; then
         echo "SGLang JIT compilation requires CUDA 13.0 nvcc; found $(${CUDACXX} --version | tail -1)." >&2
         exit 2

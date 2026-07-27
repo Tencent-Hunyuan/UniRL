@@ -134,6 +134,12 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # SGLang's FSDP on-policy mode is part of the rollout/replay contract,
+      # not merely a performance switch. It selects deterministic PyTorch
+      # sampling/log-softmax and native activations/layernorms that match the
+      # FSDP trainer. Without it, rollout logprobs drift from replay and
+      # SGLang 0.5.12.post1 also tries to JIT an incompatible activation kernel.
+      rl_on_policy_target: fsdp
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
