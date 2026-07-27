@@ -181,7 +181,12 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        self._backend.shutdown()
+        # Reachable on a partially constructed role: Worker.teardown sweeps
+        # every role it holds, including one whose __init__ raised before the
+        # backend was attached.
+        backend = getattr(self, "_backend", None)
+        if backend is not None:
+            backend.shutdown()
 
     # ------------------------------------------------------------------ #
     # Stage topology

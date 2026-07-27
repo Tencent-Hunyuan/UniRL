@@ -42,8 +42,14 @@ from unirl.rollout.engine.vllm_omni.backends.base import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.utils.graceful_shutdown import terminate_descendants
 
 logger = logging.getLogger(__name__)
+
+#: vllm-omni renames its engine processes via setproctitle, so both the stage
+#: engine core and the TP workers carry this prefix. Matching on it keeps the
+#: reaper away from anything else the host actor may have spawned.
+_ENGINE_PROC_PREFIX = "VLLM::"
 
 
 def _import_omni_runtime() -> Dict[str, Any]:
@@ -255,20 +261,36 @@ class VLLMOmniBackend:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
                 lock_file.close()
 
-        # Driver-side tokenizer for AR prompt-token construction (workers
-        # reload their own from the model path). Pure-DiT modalities skip it.
-        tokenizer = None
-        if intent.get("needs_driver_tokenizer"):
-            tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
+        # From here on ``omni`` owns a live subprocess tree holding device
+        # memory, but no backend instance exists yet to shut it down. Anything
+        # that raises before the successful return — a tokenizer that fails to
+        # load, an unparseable stage config — would strand that tree with no
+        # owner, so unwind it by hand.
+        try:
+            # Driver-side tokenizer for AR prompt-token construction (workers
+            # reload their own from the model path). Pure-DiT modalities skip it.
+            tokenizer = None
+            if intent.get("needs_driver_tokenizer"):
+                tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
 
-        return cls(
-            omni,
-            rt,
-            tokenizer=tokenizer,
-            # The runtime's own merged per-stage configs — authoritative,
-            # no YAML re-read.
-            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
-        )
+            return cls(
+                omni,
+                rt,
+                tokenizer=tokenizer,
+                # The runtime's own merged per-stage configs — authoritative,
+                # no YAML re-read.
+                tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
+            )
+        except BaseException:
+            logger.exception("VLLM-Omni boot failed after the engine started; tearing its processes down")
+            try:
+                close = getattr(omni, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                logger.exception("Failed to close the half-booted vLLM-Omni engine")
+            terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+            raise
 
     def _require_omni(self) -> Any:
         if self._omni is None:
@@ -416,6 +438,15 @@ class VLLMOmniBackend:
                     close()
             finally:
                 self._omni = None
+
+        # close() returning is not proof the tree is gone: the orchestrator
+        # acknowledges the shutdown message before the stage engine's TP
+        # workers have actually exited, and a worker parked in a collective
+        # never gets to process it at all. Whatever is left here is holding
+        # device memory that the next boot on this GPU will need.
+        reaped = terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+        if reaped:
+            logger.warning("Reaped %d engine process(es) that outlived the vLLM-Omni shutdown", reaped)
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — per-stage collective_rpc fan-out lives here

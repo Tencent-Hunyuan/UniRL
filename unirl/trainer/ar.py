@@ -15,9 +15,15 @@ from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.utils.graceful_shutdown import run_with_timeout
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+#: Generous enough for a healthy engine — a TP group tearing down NCCL and its
+#: CUDA contexts takes tens of seconds — while still bounded well under the
+#: driver's own hard deadline so the pool teardown that follows gets to run.
+_ROLLOUT_SHUTDOWN_TIMEOUT_S = 60.0
 
 
 class ARTrainer(BaseTrainer):
@@ -555,15 +561,31 @@ class ARTrainer(BaseTrainer):
             finally:
                 self._shutdown_runtime()
 
+    def shutdown(self) -> None:
+        """Release every runtime resource this trainer owns. Idempotent.
+
+        Public entry point for callers outside the training loop — notably the
+        driver's signal handler, which can fire before ``train()`` is reached
+        or while its own ``finally`` is already running.
+        """
+        self._shutdown_runtime()
+
     def _shutdown_runtime(self) -> None:
         """Best-effort ordered teardown for rollout children and Ray actors."""
+        # train()'s finally and the entrypoint's teardown both land here; the
+        # second pass must not re-enter shutdown on already-dead Ray actors.
+        if getattr(self, "_runtime_shutdown_done", False):
+            return
+        self._runtime_shutdown_done = True
+
         rollout = getattr(self, "rollout", None)
         shutdown = getattr(rollout, "shutdown", None)
         if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                logger.exception("Failed to shut down AR rollout engine")
+            # Bounded: this is a blocking call into a single-threaded Ray actor,
+            # so it queues behind whatever that actor is still doing. An engine
+            # wedged mid-generate would otherwise keep us out of pool.shutdown()
+            # indefinitely — and that is the step that frees the GPUs.
+            run_with_timeout(shutdown, timeout=_ROLLOUT_SHUTDOWN_TIMEOUT_S, what="AR rollout engine shutdown")
 
         pool = getattr(self, "pool", None)
         if pool is not None:
