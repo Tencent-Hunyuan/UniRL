@@ -15,7 +15,7 @@
 #
 # Run (single node, whole 8-GPU node):
 #   QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
-#   python -m unirl.train_alfworld --config-name=alfworld/alfworld_grpo num_devices=8
+#   python -m unirl.train_agentic_env --config-name=alfworld/alfworld_grpo num_devices=8
 
 num_devices: 8
 batch_size: 8 # P prompts_per_rollout; P*n must be divisible by num_devices

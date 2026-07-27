@@ -109,21 +109,22 @@ schema, and how to add a recipe.
 ## Agentic Workflows 🤖
 
 The agentic rollout engine repeatedly performs model generation followed by a
-tool or environment step, returning a trajectory of `Sample` objects. Two
-workflow families are included:
+tool or environment step, returning a trajectory of `Sample` objects. Entrypoints
+are named for their reward source and execution topology, not for a benchmark —
+each serves any recipe with a matching contract:
 
-| Workflow | Entrypoints | Examples |
+| Reward source | Entrypoints | Example recipes |
 |---|---|---|
-| ALFWorld environment interaction | `train_alfworld`, `train_partial_alfworld`, `train_async_alfworld` | [`examples/alfworld/`](examples/alfworld/) |
-| Deep-research tools and judging | `train_deep_research`, `train_partial_deep_research`, `train_async_deep_research` | [`examples/deep_research/`](examples/deep_research/) |
+| Environment's per-trajectory return | `train_agentic_env`, `train_agentic_env_partial`, `train_agentic_env_async` | [`examples/alfworld/`](examples/alfworld/) |
+| Graded terminal answer | `train_agentic`, `train_agentic_partial`, `train_agentic_async` | [`examples/deep_research/`](examples/deep_research/) |
 
 The base entrypoint waits for a complete rollout batch. The `partial` variant
 keeps training and rollout colocated, while the `async` variant places training
 and rollout on separate GPU slabs and overlaps their producer/consumer loops.
 Both use an explicit tail policy: stateless tool trajectories may be carried when
-their `Sample` contains everything needed to resume, while ALFWorld episodes and
-stateful tool sessions must currently be dropped. Cross-worker stateful resume is
-deferred until its resource ownership and teardown contract is implemented.
+their `Sample` contains everything needed to resume, while stateful environment
+episodes and tool sessions must currently be dropped. Cross-worker stateful resume
+is deferred until its resource ownership and teardown contract is implemented.
 
 See the [agent-loop guide](unirl/rollout/loop/README.md) for the environment,
 tool, trajectory, and partial-resume contracts.

@@ -1,16 +1,19 @@
 #!/usr/bin/env python
-"""UniRL colocate PARTIAL-ROLLOUT deep-research (agentic) training entry point (LIN-531).
+"""UniRL colocate PARTIAL-ROLLOUT agentic ENV-reward training entry point (LIN-531).
 
-Drives :class:`unirl.trainer.agentic_partial.AgenticPartialTrainer` — the colocate/synchronous
-partial-rollout sibling of ``train_deep_research`` (barrier `AgenticTrainer`). Train and rollout
-still time-share each GPU; the trainer over-samples, commits the freshest `batch_size` complete
-GRPO groups, and checkpoints the in-flight tail at a turn boundary (carried and resumed next round
-for this recipe's stateless CalculatorTool) instead of waiting for the slowest trajectory.
+Drives :class:`unirl.trainer.agentic_partial.AgenticEnvPartialTrainer` — the colocate/synchronous
+partial-rollout sibling of ``train_agentic_env`` (barrier `AgenticEnvTrainer`). Over-samples
+episodes, commits the fastest `batch_size` complete GRPO groups, and `abort`s the slow tail at a
+turn boundary. Stateful-episode envs use ``tail_policy: drop`` because a carried partial restarts.
+Keeps all GPUs for generation (colocate) while cutting the straggler — the sweet spot the
+fully-async trainer missed on ALFWorld.
 
-Launch (single node; rank 0 owns the driver + the agentic coordinator):
-  QWEN3_INSTRUCT_PATH=... DATA_PATH=data/calc_math/train.jsonl \
-  python -m unirl.train_partial_deep_research \
-    --config-name=deep_research/deep_research_calc_mathverify_partial num_devices=8
+Launch (single node, whole 8-GPU node):
+  QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
+  python -m unirl.train_agentic_env_partial --config-name=alfworld/alfworld_grpo_partial num_devices=8
+
+This entrypoint serves every env-reward partial-rollout recipe; ALFWorld
+(``examples/alfworld/``) is the reference environment.
 """
 
 from __future__ import annotations
@@ -18,19 +21,14 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from unirl.trainer.agentic_partial import AgenticPartialTrainer
+from unirl.trainer.agentic_partial import AgenticEnvPartialTrainer
 
 
-@hydra.main(
-    version_base=None,
-    config_path="../examples",
-    config_name="deep_research/deep_research_calc_mathverify_partial",
-)
+@hydra.main(version_base=None, config_path="../examples", config_name="alfworld/alfworld_grpo_partial")
 def main(cfg: DictConfig) -> None:
-    trainer = AgenticPartialTrainer(
+    trainer = AgenticEnvPartialTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,
-        # Must equal the engine's episode_sampling.samples_per_prompt (the GRPO group size n).
         samples_per_prompt=cfg.sampling.samples_per_prompt,
         bundle_cfg=cfg.bundle,
         pipeline_cfg=cfg.pipeline,
@@ -50,7 +48,7 @@ def main(cfg: DictConfig) -> None:
         stop=cfg.get("stop"),
         oversample_batch_size=cfg.get("oversample_batch_size"),
         buffer_max_staleness=cfg.get("buffer_max_staleness"),
-        tail_policy=cfg.get("tail_policy", "carry"),
+        tail_policy=cfg.get("tail_policy", "drop"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

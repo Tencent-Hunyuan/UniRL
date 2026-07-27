@@ -15,7 +15,7 @@
 #
 # Run (single node, >=2 GPUs; rank 0 owns the driver + the agentic coordinator):
 #   QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=data/calc_math/train.jsonl \
-#   python -m unirl.train_deep_research --config-name=deep_research/deep_research_calc_mathverify num_devices=2
+#   python -m unirl.train_agentic --config-name=deep_research/deep_research_calc_mathverify num_devices=2
 
 num_devices: 2
 batch_size: 4 # P prompts_per_rollout; P*n = 8 must be divisible by num_devices

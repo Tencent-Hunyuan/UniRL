@@ -17,7 +17,7 @@
 # Run (single node, >=2 GPUs; train_fraction=0.5 → 1 train GPU + 1 rollout GPU; rank 0
 # owns the driver + the agentic coordinator on the rollout slab):
 #   QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=data/calc_math/train.jsonl \
-#   python -m unirl.train_async_deep_research \
+#   python -m unirl.train_agentic_async \
 #     --config-name=deep_research/deep_research_calc_mathverify_async num_devices=2
 
 num_devices: 2

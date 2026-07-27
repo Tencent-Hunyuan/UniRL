@@ -1,18 +1,21 @@
 #!/usr/bin/env python
-"""UniRL fully-async ALFWorld (env-reward agentic) training entry point (LIN-531).
+"""UniRL fully-async agentic ENV-reward training entry point (LIN-531).
 
 Drives :class:`unirl.trainer.agentic_env_async.AsyncAgenticEnvTrainer` — the
-disaggregated producer/consumer sibling of ``train_alfworld`` (AgenticEnvTrainer).
-ALFWorld's variable-depth episodes (2 vs 15 turns) are the workload the partial-rollout
+disaggregated producer/consumer sibling of ``train_agentic_env`` (AgenticEnvTrainer).
+Variable-depth episodes (ALFWorld runs 2 vs 15 turns) are the workload the partial-rollout
 overlap targets: the async trainer overlaps generation with training on disjoint slabs
 and checkpoints the in-flight tail at a turn boundary on each weight sync, instead of a
 full barrier that waits for the slowest episode. ``tail_policy=drop`` is required because
-an ALFWorld episode is worker-local state and cannot currently resume from a carried
+a stateful episode is worker-local state and cannot currently resume from a carried
 ``Sample`` after checkpoint teardown.
 
 Launch (single node, whole 8-GPU node; train_fraction=0.5 -> 4 train + 4 rollout):
   QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
-  python -m unirl.train_async_alfworld --config-name=alfworld/alfworld_grpo_async num_devices=8
+  python -m unirl.train_agentic_env_async --config-name=alfworld/alfworld_grpo_async num_devices=8
+
+This entrypoint serves every env-reward fully-async recipe; ALFWorld
+(``examples/alfworld/``) is the reference environment.
 """
 
 from __future__ import annotations

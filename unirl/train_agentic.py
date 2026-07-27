@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""UniRL deep-research (multi-turn agentic) training entry point (LIN-519).
+"""UniRL agentic (multi-turn, answer-graded reward) training entry point (LIN-519).
 
 Drives :class:`unirl.trainer.agentic.AgenticTrainer` over the
 :class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`. Sibling of
@@ -7,9 +7,16 @@ Drives :class:`unirl.trainer.agentic.AgenticTrainer` over the
 ``List[Sample]`` of variable-depth trajectories (the trainer is hard-coded per
 entrypoint, per the repo pattern).
 
+The reward grades each trajectory's terminal ``<answer>`` through the reward backend;
+``train_agentic_env.py`` is the sibling whose reward is the environment's own
+per-trajectory return.
+
 Launch (per node, SPMD; rank 0 owns the driver + the agentic coordinator):
   QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=/path/to/train.jsonl \
-  python -m unirl.train_deep_research --config-name=deep_research/deep_research_calc_mathverify
+  python -m unirl.train_agentic --config-name=deep_research/deep_research_calc_mathverify
+
+This entrypoint serves every answer-graded agentic recipe under
+``examples/deep_research/`` (e.g. ``--config-name=deep_research/deep_research_search_judge``).
 """
 
 from __future__ import annotations

@@ -21,12 +21,13 @@ entrypoint's built-in `config_name` — a safe place to start.
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
-Agentic workflows use separate entrypoints for their execution topology:
+Agentic workflows use separate entrypoints for their reward source and execution topology.
+The entrypoint names the capability; the recipe names the task:
 
-| Workflow | Barrier | Colocated partial rollout | Disaggregated async |
+| Reward source | Barrier | Colocated partial rollout | Disaggregated async |
 |---|---|---|---|
-| [`alfworld/`](alfworld/) | `python -m unirl.train_alfworld` | `python -m unirl.train_partial_alfworld` | `python -m unirl.train_async_alfworld` |
-| [`deep_research/`](deep_research/) | `python -m unirl.train_deep_research` | `python -m unirl.train_partial_deep_research` | `python -m unirl.train_async_deep_research` |
+| Environment return (e.g. [`alfworld/`](alfworld/)) | `python -m unirl.train_agentic_env` | `python -m unirl.train_agentic_env_partial` | `python -m unirl.train_agentic_env_async` |
+| Graded answer (e.g. [`deep_research/`](deep_research/)) | `python -m unirl.train_agentic` | `python -m unirl.train_agentic_partial` | `python -m unirl.train_agentic_async` |
 
 ## Running a recipe
 
@@ -45,7 +46,7 @@ bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen3_agent_sft_lora
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
-ENTRY=train_deep_research bash examples/run_experiment_single_node.sh deep_research/deep_research_calc_mathverify
+ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_calc_mathverify
 
 # 2. Multi-node (taiji)
 bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate

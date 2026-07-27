@@ -20,7 +20,7 @@ is a trainable unit of a model pipeline — `DiffusionStage` / `ARStage`, see
 As source, the package falls into four groups:
 
 - **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
-  `train_unified_model.py`, plus the ALFWorld and deep-research agentic variants)
+  `train_unified_model.py`, plus the `train_agentic*.py` multi-turn variants)
   — each composes and validates a Hydra recipe, then hands off to its trainer.
 - **Orchestration** (`trainer/`) — the per-domain `<Domain>Trainer` owns GPU
   placement, builds the rollout and train workers, and runs the

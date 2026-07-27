@@ -1,17 +1,21 @@
 #!/usr/bin/env python
-"""UniRL ALFWorld (multi-turn agentic, env-sourced reward) training entry point (LIN-519).
+"""UniRL agentic ENV-reward (multi-turn, env-sourced reward) training entry point (LIN-519).
 
 Drives :class:`unirl.trainer.agentic_env.AgenticEnvTrainer` over the
-:class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine` with an
-:class:`~unirl.rollout.loop.alfworld_env.AlfworldEnv`. Sibling of
-``train_deep_research.py``; the reward is the ALFWorld environment's terminal
-task-success (attached to each trajectory by the engine), so no reward backend is
-scored — the recipe's ``reward`` block is built but unused.
+:class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine` with an interactive
+:class:`~unirl.rollout.loop.environment.Environment`. Sibling of ``train_agentic.py``;
+the reward is the environment's own per-trajectory return — task-success or a shaped
+signal, attached to each trajectory by the engine — so no reward backend is scored and
+the recipe's ``reward`` block is built but unused.
 
 Launch (single node; rank 0 owns the driver + the agentic coordinator):
   QWEN3_INSTRUCT_PATH=/path/to/Qwen3-8B DATA_PATH=/path/to/alfworld_games.jsonl \
   ALFWORLD_DATA=/path/to/alfworld/data \
-  python -m unirl.train_alfworld --config-name=alfworld/alfworld_grpo num_devices=8
+  python -m unirl.train_agentic_env --config-name=alfworld/alfworld_grpo num_devices=8
+
+This entrypoint serves every env-reward agentic recipe; ALFWorld
+(:class:`~unirl.rollout.loop.alfworld_env.AlfworldEnv`, ``examples/alfworld/``) is the
+reference environment.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""UniRL fully-async deep-research (agentic) training entry point (LIN-531).
+"""UniRL fully-async agentic (answer-graded) training entry point (LIN-531).
 
 Drives :class:`unirl.trainer.agentic_async.AsyncAgenticTrainer` — the disaggregated
-producer/consumer sibling of ``train_deep_research`` (:class:`AgenticTrainer`).
+producer/consumer sibling of ``train_agentic`` (:class:`AgenticTrainer`).
 Training and the agentic rollout engine run on DISJOINT GPU slabs (``train_fraction``);
 the engine stays resident and weights cross the slab boundary via ``NCCLWeightSync``
 (not the colocate ``TensorWeightSync``). Partial rollout checkpoints the in-flight tail
@@ -17,8 +17,11 @@ from both the colocate agentic loop and the async-AR DP_SCATTER loop.
 Launch (per node, SPMD; rank 0 owns the driver + the agentic coordinator on the
 rollout slab):
   QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=/path/to/train.jsonl \
-  python -m unirl.train_async_deep_research \
+  python -m unirl.train_agentic_async \
     --config-name=deep_research/deep_research_calc_mathverify_async num_devices=2
+
+This entrypoint serves every answer-graded fully-async recipe under
+``examples/deep_research/``; ``train_agentic_env_async.py`` is the env-reward sibling.
 """
 
 from __future__ import annotations

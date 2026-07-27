@@ -14,7 +14,7 @@
 #
 # Run (single node, whole 8-GPU node; train_fraction=0.5 -> 4 train + 4 rollout):
 #   QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
-#   python -m unirl.train_async_alfworld --config-name=alfworld/alfworld_grpo_async num_devices=8
+#   python -m unirl.train_agentic_env_async --config-name=alfworld/alfworld_grpo_async num_devices=8
 
 num_devices: 8
 batch_size: 8 # P complete GRPO groups (games) trained per rollout step

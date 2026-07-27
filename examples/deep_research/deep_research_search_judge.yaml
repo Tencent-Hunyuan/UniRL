@@ -17,7 +17,7 @@
 # Run (single node, >=2 GPUs; scale num_devices / batch_size / n up for real training):
 #   QWEN3_INSTRUCT_PATH=... DATA_PATH=data/asearcher/train.jsonl \
 #   SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
-#   python -m unirl.train_deep_research --config-name=deep_research/deep_research_search_judge num_devices=2
+#   python -m unirl.train_agentic --config-name=deep_research/deep_research_search_judge num_devices=2
 
 num_devices: 2
 batch_size: 4 # P prompts_per_rollout; P*n = 8 must be divisible by num_devices
