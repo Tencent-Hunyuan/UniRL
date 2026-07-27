@@ -118,6 +118,25 @@ case "${PROFILE}" in
         ENTRY=train_ar
         EXPERIMENT=ar/qwen3_drpo_4b_base_dapo_sglang
         VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv-sglang}"
+        CUDA_TOOLKIT_DIR="${CUDA_TOOLKIT_DIR:-}"
+        if [ -z "${CUDA_TOOLKIT_DIR}" ]; then
+            for candidate in \
+                "${VENV_DIR}"/lib/python*/site-packages/nvidia/cu13; do
+                if [ -x "${candidate}/bin/nvcc" ]; then
+                    CUDA_TOOLKIT_DIR="${candidate}"
+                    break
+                fi
+            done
+        fi
+        if [ -z "${CUDA_TOOLKIT_DIR}" ] || [ ! -x "${CUDA_TOOLKIT_DIR}/bin/nvcc" ]; then
+            echo "CUDA 13.0 toolkit is missing from ${VENV_DIR}; install the pinned nvidia CUDA compiler wheels." >&2
+            exit 2
+        fi
+        export CUDA_HOME="${CUDA_TOOLKIT_DIR}"
+        export CUDA_PATH="${CUDA_TOOLKIT_DIR}"
+        export CUDACXX="${CUDA_TOOLKIT_DIR}/bin/nvcc"
+        export NVCC="${CUDACXX}"
+        export PATH="${CUDA_TOOLKIT_DIR}/bin:${PATH}"
         CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-}"
         if [ -z "${CUDA_COMPAT_DIR}" ]; then
             for candidate in \
@@ -171,6 +190,13 @@ export PATH="${VENV_DIR}/bin:${PATH}"
 if [ "${PROFILE}" = "ar-drpo" ]; then
     require_torch_flavor "2.11.0+cu130"
     require_dist_version "sglang" "0.5.12.post1"
+    require_dist_version "nvidia-cuda-nvcc" "13.0.88"
+    require_dist_version "nvidia-cuda-crt" "13.0.88"
+    require_dist_version "nvidia-nvvm" "13.0.88"
+    if ! "${CUDACXX}" --version | grep -q "release 13.0"; then
+        echo "SGLang JIT compilation requires CUDA 13.0 nvcc; found $(${CUDACXX} --version | tail -1)." >&2
+        exit 2
+    fi
 else
     require_torch_flavor "2.11.0+cu129"
 fi
