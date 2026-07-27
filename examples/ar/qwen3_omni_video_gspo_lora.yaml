@@ -43,7 +43,7 @@
 #     num_rollouts=100 backend.scheduler_cfg.total_steps=100
 
 num_devices: 2
-devices_per_node: 2 
+devices_per_node: 2
 batch_size: 2
 
 num_rollouts: 2
