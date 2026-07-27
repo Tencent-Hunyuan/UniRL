@@ -14,7 +14,7 @@ stage's ``autoregress`` / ``replay`` read it.
 
 Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
 form (used inside the pipeline at stage call sites) and the generic
-``Conditions = Dict[str, Condition]`` shape on ``RolloutResp``.
+generic ``Dict[str, Condition]`` shape on a ``Part``.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class Qwen3ARConditions(Batch):
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.tracks["ar"].conditions``.
+        packing into ``Part.conditions``.
         """
         if self.prompt is None:
             raise ValueError("Qwen3ARConditions.to_dict: prompt field is None")

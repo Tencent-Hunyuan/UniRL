@@ -42,16 +42,16 @@ def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
     tag_matches = _ANSWER_TAG.findall(text)
     if tag_matches:
         return tag_matches[-1].upper()
-    phrase = _ANSWER_PATTERN.search(text)
+    phrase_matches = _ANSWER_PATTERN.findall(text)
     if require_phrase:
-        return phrase.group(1).upper() if phrase else ""
+        return phrase_matches[-1].upper() if phrase_matches else ""
     # Handle numeric answers: "1"→"A", "2"→"B", "3"→"C", "4"→"D"
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1"))
     if len(text) == 1 and text.upper() in "ABCD":
         return text.upper()
-    if phrase:
-        return phrase.group(1).upper()
+    if phrase_matches:
+        return phrase_matches[-1].upper()
     matches = _STANDALONE_LETTER.findall(text)
     if matches:
         return matches[-1].upper()
@@ -67,9 +67,9 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
     if tag_matches:
         return tag_matches[-1].upper(), 1.0
 
-    m = _ANSWER_PATTERN.search(text)
-    if m:
-        return m.group(1).upper(), 0.5
+    phrase_matches = _ANSWER_PATTERN.findall(text)
+    if phrase_matches:
+        return phrase_matches[-1].upper(), 0.5
 
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1")), 0.5

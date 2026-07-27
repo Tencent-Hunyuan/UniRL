@@ -33,7 +33,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import make_video_segment
 
 
@@ -47,14 +48,12 @@ class VideoAdapter(ImageAdapter):
     and the decoded media is packed as ``Videos`` rather than dropped.
     """
 
-    #: RolloutResp track key (video, not image).
-    track_name: str = "video"
     #: Modality stamp for the latent segment.
     segment_factory = staticmethod(make_video_segment)
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -78,14 +77,15 @@ class VideoAdapter(ImageAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
 
-    def build_decoded(self, req: RolloutReq, results: List[RawResult]):
+    def build_decoded(self, sample: Sample, results: List[RawResult]):
+        del sample
         return utils.stack_decoded_videos(results)
 
 
@@ -192,8 +192,8 @@ class Wan22T2VAdapter(VideoAdapter):
     ``guidance_scale``) when unset, so a ``guidance_scale=1.0`` smoke is unaffected.
     """
 
-    def build_sampling(self, req: RolloutReq, *, diffusion: Any) -> Dict[str, Any]:
-        kwargs = super().build_sampling(req, diffusion=diffusion)
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
         g2 = getattr(diffusion, "guidance_scale_2", None)
         if g2 is not None:
             kwargs["guidance_scale_2"] = float(g2)

@@ -1,0 +1,233 @@
+# @package _global_
+# M2 ASYNC — Deep-research agentic RL, DISAGGREGATED: AsyncAgenticTrainer over the
+# AgenticRolloutEngine. The fully-async sibling of deep_research_search_judge.yaml
+# (colocate barrier AgenticTrainer): training (FSDP) and the agentic rollout engine run on
+# DISJOINT GPU slabs (train_fraction), the engine stays RESIDENT, and weights cross the
+# slab boundary via NCCLWeightSync (not the colocate TensorWeightSync).
+#
+# Partial rollout: on each weight sync the trainer abort()s the in-flight tail at a TURN
+# boundary (single-version Parts), syncs, and resumes the carried partials under the new
+# weights. Safe here because SearchTool/VisitTool are stateless and the Sample contains the
+# whole conversation. StatefulTool sessions (SandboxTool) must use tail_policy=drop until
+# cross-worker stateful resume is implemented. buffer_max_staleness bounds staleness.
+#
+# Same tools (search + visit) and reward (LLM-as-judge) as the barrier recipe -- only the
+# execution topology differs. Note the tradeoff: disaggregation halves the generation GPUs,
+# which is why the colocate partial recipe is often the better lever for tool-bound work.
+#
+# Prerequisites (operational -- set on the pod):
+#   - QWEN3_INSTRUCT_PATH : local Qwen3-Instruct checkpoint dir
+#   - DATA_PATH           : ASearcher jsonl (python -m unirl.utils.prepare_asearcher --out-dir data/asearcher)
+#   - SERPER_KEY_ID       : Serper web-search API key (search tool)
+#   - JINA_API_KEYS       : Jina reader key (visit tool)
+#   - JUDGE_URL/JUDGE_MODEL: an OpenAI-compatible judge endpoint (e.g. a separate
+#                            SGLang/vLLM server hosting Qwen2.5-72B-Instruct)
+#   - SUMMARY_URL/SUMMARY_MODEL (optional): summarizer for the visit tool (the judge
+#                            endpoint works); without it, visit returns raw page text.
+#
+# Run (single node, >=2 GPUs; train_fraction=0.5 -> 1 train + 1 rollout at num_devices=2):
+#   QWEN3_INSTRUCT_PATH=... DATA_PATH=data/asearcher/train.jsonl \
+#   SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
+#   python -m unirl.train_agentic_async \
+#     --config-name=deep_research/deep_research_search_judge_async num_devices=2
+
+num_devices: 2
+batch_size: 4 # P complete GRPO groups trained per rollout step
+num_rollouts: 200
+weight_sync_interval: 1 # abort->NCCL-sync->resume every rollout
+eval_interval: 0 # agentic eval not implemented yet (AgenticTrainer.evaluate raises)
+
+# ---- async / disaggregation knobs (LIN-531) ----
+train_fraction: 0.5 # 0.5 * num_devices GPUs train (FSDP); the rest run the resident engine
+# Over-sample the rollout slab: submit oversample_batch_size prompt-groups per drive so
+# the slab stays busy across the sync-cycle (>= batch_size).
+oversample_batch_size: 8
+# Off-policy staleness budget: a buffered complete group may be up to this many weight
+# syncs old before it is evicted. 0 = on-policy (ratio≈1); >0 = bounded off-policy.
+buffer_max_staleness: 1
+tail_policy: carry # SearchTool/VisitTool are stateless; the carried Sample resumes exactly
+
+# rank-0 coordinator runs the background drain + serves next_task pulls + the
+# poll/abort/drained control RPCs concurrently on a threaded Worker — needs >=3.
+worker_max_concurrency: 8
+
+# Per-turn stop: a tool-call turn ends at </tool_call> and yields to the tool.
+stop: ["</tool_call>"]
+
+# Group-relative GRPO (per-prompt mean/std over the n siblings).
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: false # flip on for real runs; async metrics: async/version_span, async/buffer_groups
+  project_name: unirl-deep-research
+  run_name: deepresearch_search_judge_qwen3_async
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [deep-research, agentic, search, visit, llm-judge, qwen3, async, partial-rollout, carry, lin-531]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+    model_precision: fp32
+    use_gradient_checkpointing: true
+    attn_implementation: flex_attention
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2000
+
+rollout:
+  # Resident agentic engine on its own slab: the trainer submits drives, then reaps (poll)
+  # and interrupts (abort). partial_rollout=true enables the turn-boundary
+  # checkpoint/resume on each weight sync.
+  _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig
+    max_turns: 8 # research trajectories need more turns than the calculator smoke
+    per_worker_concurrency: 8
+    partial_rollout: true # LIN-531: abort->checkpoint->resume at turn boundaries
+    inner:
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
+      pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+      tp_size: 1
+      max_new_tokens: 2048 # per TURN (reasoning + a tool call / the final answer)
+      temperature: 1.0
+      top_p: 1.0
+      concurrency: 8
+      # The deep-research framing — verbatim from AReaL's tongyi_deepresearch
+      # SYSTEM_PROMPT, adapted for UniRL: the <tools> JSON block is dropped because
+      # the tool SCHEMAS are auto-injected into the chat template from the env.
+      # Set on the inner engine, so it is frozen into the stored rollout
+      # conditions the trainer replays -> one edit covers generation AND training.
+      system_instruction: |-
+        You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
+
+        You may call one or more functions to assist with the user query. For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+        <tool_call>
+        {"name": <function-name>, "arguments": <args-json-object>}
+        </tool_call>
+      chat_template_kwargs:
+        enable_thinking: false
+        # `tools` is auto-injected from the env's tool_schemas() at engine build.
+      engine_kwargs:
+        mem_fraction_static: 0.8 # dedicated rollout slab: no FSDP shard to share the GPU with
+        skip_server_warmup: true
+        attention_backend: triton
+        disable_cuda_graph: false
+        cuda_graph_max_bs: 16
+        enable_lora: false
+    env:
+      _target_: unirl.rollout.loop.tool_environment.ToolEnvironment
+      max_turns: 8 # keep == config.max_turns
+      tools:
+        - _target_: unirl.rollout.loop.tools.search.SearchTool
+          top_k: 10
+        - _target_: unirl.rollout.loop.tools.visit.VisitTool
+          endpoint: ${oc.env:SUMMARY_URL,""}
+          model: ${oc.env:SUMMARY_MODEL,""}
+    episode_sampling:
+      _target_: unirl.types.sampling.ARSamplingParams
+      samples_per_prompt: 2
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 0
+      max_new_tokens: 2048
+
+reward:
+  # LLM-as-judge over text: the judge decides whether the trajectory's <answer> is
+  # equivalent to the reference answer (metadata["answer"]) -> 1.0 / 0.0. Hosted
+  # out-of-band; the scorer only POSTs to $JUDGE_URL.
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.llm_judge.LLMJudgeRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.llm_judge.LLMJudgeSpec
+      endpoint: ${oc.env:JUDGE_URL,""}
+      model: ${oc.env:JUDGE_MODEL,""}
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: null
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-mean
+  horizon: 2048
+  # MUST equal episode_sampling.temperature so replay's tempered log-softmax matches the
+  # rollout sampler; with staleness>0 the rollout-anchored ratio absorbs the version gap.
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  # Cross-slab full-weight sync (disaggregated): train rank 0 NCCL-broadcasts the full
+  # dense FSDP weights into the resident agentic engine's inner SGLang
+  # (init_weights_update_group + update_weights_from_distributed). flush_cache resets
+  # SRT KV/prefix on the last bucket. Wired one-time by AsyncAgenticTrainer._connect_separate.
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  group_name: weight_sync
+  lora_merged: false
+  bucket_size_mb: 512
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # With buffer_max_staleness>0 a batch may be off-policy; the rollout-anchored ratio
+  # makes multi-update safe. Kept at 1 here for a clean async baseline.
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # ASearcher jsonl: {"prompt": ..., "metadata": {"answer": ...}}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}} # unused (eval_interval=0); defaults to train
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 8 # == oversample_batch_size (the producer's per-drive pool)
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 2
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 2048

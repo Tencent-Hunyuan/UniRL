@@ -1,4 +1,4 @@
-"""Assemble ``RolloutResp`` track pieces (segment / decoded / conditions) from raw results.
+"""Assemble ``Sample`` Part pieces (segment / decoded / conditions) from raw results.
 
 Pure: operates on already-fetched wire data (SGLang ``GenerationResult`` objects)
 and ``unirl.types`` — no SGLang import, no engine state. The model-specific
@@ -12,7 +12,7 @@ branches (those move to adapter overrides).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -25,7 +25,6 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images, Video, Videos
-from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 
@@ -48,7 +47,7 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
 
 def validate_packed_trajectory(
     traj: torch.Tensor,
-    req: RolloutReq,
+    diffusion: Any,
     *,
     family: str,
     downsample: int,
@@ -69,12 +68,11 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    diffusion = req.sampling_params.get("diffusion")
     height = int(diffusion.height) if diffusion.height is not None else None
     width = int(diffusion.width) if diffusion.width is not None else None
     require(
         height is not None and width is not None,
-        f"{family}: need height/width from req.sampling_params to unpack the packed "
+        f"{family}: need height/width from the diffusion sampling params to unpack the packed "
         f"[B, T, S, C] trajectory; both must be set.",
     )
     if require_divisible:
@@ -103,7 +101,7 @@ def derive_timestep_alignment(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate the T+1 trajectory shape and verify SGLang used the σ we sent.
 
-    ``expected_sigmas`` is the schedule the engine pinned on ``RolloutReq.sigmas``
+    ``expected_sigmas`` is the schedule the engine pinned on the gen Part's ``sigmas``
     and forwarded to SGLang; SGLang echoes it back per result via
     ``trajectory_timesteps``. :func:`verify_engine_used_sigmas` asserts elementwise
     equality (fatal on drift) so rollout and trainer-side replay use numerically
@@ -116,7 +114,7 @@ def derive_timestep_alignment(
         f"SGLang trajectory length {traj_len} != expected_sigmas length {expected_len}. "
         f"Modern SGLang prepends initial latents at "
         f"sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py so "
-        f"trajectory carries T+1 latents; expected_sigmas (from req.sigmas) is T+1 "
+        f"trajectory carries T+1 latents; expected_sigmas (from sampling_params.sigmas) is T+1 "
         f"too. Upgrade SGLang or fix the sampler to emit a T+1 trajectory.",
     )
     expected_cpu = expected_sigmas.detach().to(torch.float32).cpu()

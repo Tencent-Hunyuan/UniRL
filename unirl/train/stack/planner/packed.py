@@ -46,7 +46,7 @@ import torch
 from unirl.algorithms import StageAlgorithm
 from unirl.train.stack.planner.count import _count_plan
 from unirl.train.stack.planner.types import Plan, UpdatePlan, _positive_int, _update_ranges
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +115,9 @@ def balance_into_k(samples: List[Sample], *, cost: Cost, k: int) -> List[List[Sa
 # --------------------------------------------------------------------------- #
 # Track extraction + the distributed parity boundary
 # --------------------------------------------------------------------------- #
-def _prompt_lengths(resp_track: RolloutTrack, total: int) -> Optional[List[int]]:
+def _prompt_lengths(part: Part, total: int) -> Optional[List[int]]:
     """Per-sample prompt token counts from ``conditions['prompt'].attention_mask`` (None if absent)."""
-    conditions = getattr(resp_track, "conditions", None)
+    conditions = getattr(part, "conditions", None)
     if isinstance(conditions, dict):
         prompt = conditions.get("prompt")
     else:
@@ -128,15 +128,15 @@ def _prompt_lengths(resp_track: RolloutTrack, total: int) -> Optional[List[int]]
     return None
 
 
-def _extract_samples(resp_track: RolloutTrack) -> Optional[List[Sample]]:
+def _extract_samples(part: Part) -> Optional[List[Sample]]:
     """Clamped :class:`Sample` list from a track, or ``None`` when it exposes no per-sample lengths."""
-    total = int(resp_track.batch_size)
-    segment = resp_track.segment
+    total = int(part.batch_size)
+    segment = part.segment
     raw = getattr(segment, "lengths", None) if segment is not None else None
     if not (isinstance(raw, torch.Tensor) and raw.numel() == total):
         return None
     resp_lens = [int(x) for x in raw.tolist()]
-    prompt_lens = _prompt_lengths(resp_track, total)
+    prompt_lens = _prompt_lengths(part, total)
     return [
         _sample(i, prompt=(prompt_lens[i] if prompt_lens is not None else 0), resp=resp_lens[i]) for i in range(total)
     ]
@@ -220,18 +220,16 @@ class TokenBudgetPlanner:
             raise ValueError(f"{type(self).__name__}.cost_model must be dense|sum, got {cost_model!r}")
         self.cost_model = str(cost_model)
 
-    def arrange(
-        self, resp_track: RolloutTrack, *, num_updates: int, micro_batch_size: int
-    ) -> Tuple[RolloutTrack, Plan]:
-        samples = _extract_samples(resp_track)
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> Tuple[Part, Plan]:
+        samples = _extract_samples(part)
         if samples is None:
             logger.warning(
                 "token-budget packing requested (budget=%s) but the segment exposes no "
                 "per-sample lengths; falling back to count-based micro-batching.",
                 self.token_budget,
             )
-            return resp_track, _count_plan(
-                total=int(resp_track.batch_size),
+            return part, _count_plan(
+                total=int(part.batch_size),
                 num_updates=num_updates,
                 micro_batch_size=micro_batch_size,
             )
@@ -240,7 +238,7 @@ class TokenBudgetPlanner:
         )
         # One up-front gather reorders the whole track (segment / conditions / advantages
         # stay sample-aligned) so the packed micros are contiguous.
-        return resp_track.select(perm), plan
+        return part.select(perm), plan
 
     def validate(self, algorithm: StageAlgorithm) -> None:
         """Require a grouping-invariant loss-weighting contract.

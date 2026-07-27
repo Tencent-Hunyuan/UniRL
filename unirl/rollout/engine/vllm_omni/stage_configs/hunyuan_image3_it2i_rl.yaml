@@ -1,7 +1,7 @@
 # RL-aware copy of upstream hunyuan_image3_it2i.yaml.
 # Diff vs upstream:
 #   1. Stage 0 final_output: true (was false). Surfaces the AR text + per-token
-#      logp our ar_capture.py reads to build tracks["ar"].segment. The KV transfer
+#      logp our ar_capture.py reads to fill the AR generation Part's segment. The KV transfer
 #      to Stage 1 is independent of this flag, so the AR→DiT bridge is
 #      unaffected.
 #   2. Stage 1 engine_args.custom_pipeline_args injected to install our

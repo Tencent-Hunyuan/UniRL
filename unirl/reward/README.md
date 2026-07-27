@@ -2,7 +2,7 @@
 
 > **Where it fits:** the *reward* step of the loop —
 > rollout → **reward** → advantage → train → sync. In: the rollout engine's
-> `RolloutResp`. Out: per-sample rewards (which the trainer turns into advantages).
+> response `Sample`. Out: per-sample rewards (which the trainer turns into advantages).
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
@@ -14,13 +14,13 @@
 ## What it is
 
 `unirl.reward` scores what a rollout produced — an image, a video, or text — and
-writes a per-sample reward back onto the rollout track. A `RewardService` wraps
+writes a per-sample reward back onto the Sample's frontier Part. A `RewardService` wraps
 exactly **one** `RewardBackend`: either a local in-process scorer (PickScore, HPS,
 CLIP, OCR, GenEval2, math, multiple-choice, video, …) or `RemoteRewardBackend`, a
 thin HTTP client for the standalone server in `unirl-reward-service/`.
 
 Turning rewards into advantages is the trainer's job
-(`RolloutTrack.compute_advantages`); generating the media is the rollout engine's.
+(`Part.compute_advantages`); generating the media is the rollout engine's.
 
 ## Why it exists
 
@@ -28,7 +28,7 @@ RL is only as good as its reward signal, and two things about that signal are
 easy to get wrong — so this module owns both:
 
 - **One interface over many scorers.** Local or remote, image/video/text, the
-  trainer always calls the same `score_and_attach(req, track)` and never touches a
+  trainer always calls the same `score_and_attach(sample)` and never touches a
   backend. Swapping PickScore for a remote multi-reward server is a recipe change,
   not a code change.
 - **A bad reward must stop the step, not poison it.** A single NaN, null, or
@@ -38,20 +38,21 @@ easy to get wrong — so this module owns both:
 
 ## How it works
 
-Everything goes through one method, `RewardService.score_and_attach(req, track)`
-(`service.py`). It runs per DP shard, so it never mutates the input track — it
-returns a fresh one. Per call it:
+Everything goes through one method, `RewardService.score_and_attach(sample)`
+(`service.py`). It runs per DP shard (sharding the Sample by prompt-tree), so it
+never mutates the input Sample — it returns a fresh one. Per call it:
 
-1. **Refuses precomputed rewards** — raises if the track already has `rewards`
-   (actor-side scoring is the only writer).
-2. **Pairs input with output** — the prompt from `req.primitives` with the media
-   in `track.decoded`. (For PE's N×M expansion it replicates each prompt to match.)
+1. **Refuses precomputed rewards** — raises if the frontier Part already has
+   `rewards` (actor-side scoring is the only writer).
+2. **Pairs input with output** — the conditioning (`Sample.conditioning`) with the
+   media in the frontier Part's `primitive`, already row-aligned (no expansion).
 3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
    back rewards, per-component rewards, and per-sample success flags.
 4. **Fails fast** — raises and names the sample if any failed.
-5. **Zeroes runaway AR traces** — an AR generation that hit `max_new_tokens` (never
-   terminated) gets reward 0, so training doesn't learn to ramble to the cap.
-6. **Attaches** `rewards` + `component_rewards` and returns the track.
+5. **Zeroes runaway AR traces** — when the scored Part is itself an AR generation,
+   one that hit `max_new_tokens` (never terminated) gets reward 0, so training
+   doesn't learn to ramble to the cap.
+6. **Attaches** `rewards` + `component_rewards` and returns the Sample.
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers
 (`local/`) subclass `LocalRewardBackend` and implement `_compute_model_rewards`;

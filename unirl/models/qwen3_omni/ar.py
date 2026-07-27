@@ -35,9 +35,26 @@ def _fuse_mm_embeds(
     """Prepare audio, video, and DeepStack inputs inside the root FSDP forward."""
     inputs_embeds = transformer.get_input_embeddings()(full_ids)
     if input_features is not None:
-        audio_features = transformer.get_audio_features(
-            input_features, feature_attention_mask=feature_attention_mask
-        )
+        try:
+            audio_outputs = transformer.get_audio_features(
+                input_features,
+                feature_attention_mask=feature_attention_mask,
+                return_dict=True,
+            )
+        except TypeError as exc:
+            # Older Transformers releases reject ``return_dict`` here.
+            if "unexpected keyword argument 'return_dict'" not in str(exc):
+                raise
+            audio_outputs = transformer.get_audio_features(
+                input_features,
+                feature_attention_mask=feature_attention_mask,
+            )
+        if hasattr(audio_outputs, "last_hidden_state"):
+            audio_features = audio_outputs.last_hidden_state
+        elif isinstance(audio_outputs, tuple):
+            audio_features = audio_outputs[0]
+        else:
+            audio_features = audio_outputs
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         _, _, audio_mask = transformer.get_placeholder_mask(full_ids, inputs_embeds=inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
@@ -431,7 +448,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         # Merge per-sample CONCAT media for the thinker.
         pvv = _merge_video(conditions.pixel_values_videos)
         vgt = _merge_video(conditions.video_grid_thw)
-        vspg = _merge_video(conditions.video_second_per_grid)
         ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
 
         forward_kwargs: dict = {
@@ -450,23 +466,37 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             # Compute TMRoPE here, but defer parameter reads to the FSDP forward.
             pvv = pvv.to(device=device, dtype=self.model.dtype)
             vgt = vgt.to(device=device)
-            vspg = vspg.to(device=device) if vspg is not None else None
             use_audio = ivf is not None
-            audio_seqlens = None
             if use_audio:
                 ivf = ivf.to(device=device, dtype=self.model.dtype)
                 fam = fam.to(device=device)
-                audio_seqlens = fam.sum(-1)
+            # ``use_audio_in_video`` is a batch-wide Transformers flag. Build
+            # positions per sample so a video without an audio track does not
+            # consume the following sample's video grid as text.
+            sample_video_grids = conditions.video_grid_thw or [None] * batch_size
+            sample_seconds = conditions.video_second_per_grid or [None] * batch_size
+            sample_features = conditions.input_features or [None] * batch_size
+            sample_feature_masks = conditions.feature_attention_mask or [None] * batch_size
+            position_parts: List[torch.Tensor] = []
+            for b in range(batch_size):
+                sample_grid = sample_video_grids[b]
+                sample_second = sample_seconds[b]
+                sample_feature = sample_features[b]
+                sample_feature_mask = sample_feature_masks[b]
+                sample_has_audio = sample_feature is not None and sample_feature_mask is not None
+                sample_audio_seqlens = sample_feature_mask.to(device=device).sum(-1) if sample_has_audio else None
+                sample_position_ids, _ = transformer.get_rope_index(
+                    full_ids[b : b + 1],
+                    image_grid_thw=None,
+                    video_grid_thw=sample_grid.to(device=device) if sample_grid is not None else None,
+                    attention_mask=full_mask[b : b + 1],
+                    use_audio_in_video=sample_has_audio,
+                    audio_seqlens=sample_audio_seqlens,
+                    second_per_grids=(sample_second.to(device=device) if sample_second is not None else None),
+                )
+                position_parts.append(sample_position_ids)
             # Preserve the [3, B, seq] temporal/height/width position layout.
-            position_ids, _ = transformer.get_rope_index(
-                full_ids,
-                image_grid_thw=None,
-                video_grid_thw=vgt,
-                attention_mask=full_mask,
-                use_audio_in_video=use_audio,
-                audio_seqlens=audio_seqlens,
-                second_per_grids=vspg,
-            )  # [3, B, seq]
+            position_ids = torch.cat(position_parts, dim=1)
             # Integer positions prevent FSDP mixed precision from rounding indices.
             position_ids = position_ids.long()
             forward_kwargs["pixel_values_videos"] = pvv

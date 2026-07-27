@@ -133,6 +133,8 @@ def patch_qwen3_omni_audio_video_mrope(thinker_cls: type[Any]) -> None:
     ) -> tuple[torch.Tensor, int]:
         positions, delta = original(self, input_tokens, mm_features, **kwargs)
         config = self.config
+        vision_start = int(config.vision_start_token_id)
+        vision_end = int(config.vision_end_token_id)
         audio_start = int(config.audio_start_token_id)
         audio_end = int(config.audio_end_token_id)
         audio_token = int(config.audio_token_id)
@@ -141,32 +143,41 @@ def patch_qwen3_omni_audio_video_mrope(thinker_cls: type[Any]) -> None:
 
         blocks: list[tuple[int, int]] = []
         for start in (tokens == audio_start).nonzero().flatten().tolist():
-            video_start = int(start) + 1
-            if video_start >= tokens.numel() or int(tokens[video_start]) != video_token:
+            start = int(start)
+            if start == 0 or int(tokens[start - 1]) != vision_start:
                 continue
-            audio_end_idx = video_start
+            audio_end_idx = start + 1
             while audio_end_idx < tokens.numel() and int(tokens[audio_end_idx]) in (
                 video_token,
                 audio_token,
             ):
                 audio_end_idx += 1
-            if audio_end_idx + 1 >= tokens.numel() or int(tokens[audio_end_idx]) != audio_end:
+            if (
+                audio_end_idx + 1 >= tokens.numel()
+                or int(tokens[audio_end_idx]) != audio_end
+                or int(tokens[audio_end_idx + 1]) != vision_end
+            ):
                 continue
-            blocks.append((video_start, audio_end_idx))
+            # vLLM 0.20 duplicates the vision-start position for audio-start.
+            # Leave newer runtimes that already fixed the layout untouched.
+            if not torch.equal(positions[:, start], positions[:, start - 1]):
+                continue
+            blocks.append((start, audio_end_idx))
         if not blocks:
             return positions, delta
 
         corrected = positions.clone()
         cursor = 0
         cumulative_shift = 0
-        for video_start, audio_end_idx in blocks:
-            corrected[:, cursor:video_start] = positions[:, cursor:video_start] + cumulative_shift
-            corrected[:, video_start:audio_end_idx] = (
-                positions[:, video_start + 1 : audio_end_idx + 1] + cumulative_shift
+        for audio_start_idx, audio_end_idx in blocks:
+            corrected[:, cursor:audio_start_idx] = positions[:, cursor:audio_start_idx] + cumulative_shift
+            # HF assigns audio-start, every interleaved feature, and audio-end
+            # one position after vLLM while preserving each token's 3D axes.
+            corrected[:, audio_start_idx : audio_end_idx + 1] = (
+                positions[:, audio_start_idx : audio_end_idx + 1] + cumulative_shift + 1
             )
-            eos_position = positions[:, audio_end_idx + 1] + cumulative_shift
-            corrected[:, audio_end_idx] = eos_position
-            corrected[:, audio_end_idx + 1] = eos_position + 1
+            # The final vision-end delimiter is one further position along.
+            corrected[:, audio_end_idx + 1] = positions[:, audio_end_idx + 1] + cumulative_shift + 2
             cursor = audio_end_idx + 2
             cumulative_shift += 2
         corrected[:, cursor:] = positions[:, cursor:] + cumulative_shift

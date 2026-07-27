@@ -1,4 +1,4 @@
-"""QwenImageEditPlusPipeline — RolloutReq → RolloutResp for Edit-Plus.
+"""QwenImageEditPlusPipeline — ``Sample → Sample`` for Edit-Plus.
 
 Text+image → image editing flow::
 
@@ -21,7 +21,7 @@ text-only stage. The VAE-decode stage is reused from
 step/stage are Edit-Plus-specific.
 
 σ schedule contract: identical to :class:`QwenImagePipeline` — the hosting
-engine pins ``req.sigmas`` before calling ``generate(req)``. The schedule's
+engine pins the frontier sampling params' ``sigmas`` before calling ``generate(sample)``. The schedule's
 ``image_seq_len`` is derived from the **noise** latent shape only
 (boundary condition #3): the source-image concat happens inside
 ``predict_noise`` after the schedule is fixed.
@@ -36,8 +36,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import QwenImageEditPlusBundle
@@ -54,23 +53,24 @@ from .vae import QwenImageEditPlusVAEEncodeStage
 class QwenImageEditPlusPipeline(Pipeline):
     """Qwen-Image-Edit-Plus generate pipeline.
 
-    Reads from ``RolloutReq``:
+    Reads from the conditioning ancestors:
 
     - ``primitives["text"]: Texts`` — required edit instructions.
     - ``primitives["image"]: Images`` — **required** source images (Edit-Plus
       is edit-only; raises ``TypeError`` if absent — fail-fast, constraint #27).
-      Still required for VAE latent-concat even when
-      ``use_condition_image_prompt=False`` (text encoder then sees edit-template
-      text only).
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
+      The source remains required for VAE latent concatenation even when
+      ``use_condition_image_prompt=False``; that switch only controls whether
+      the text encoder also sees the source image.
+    - CFG negatives are accepted by ``build_conditions`` for direct callers,
+      but are not transported as Sample conditioning Parts.
+    - The frontier ``sampling_params.sigmas`` schedule is required.
 
-    Writes to ``RolloutResp``:
+    Fills the frontier Part:
 
     - ``conditions["text"]``; plus ``conditions["negative_text"]`` when
       negatives supplied and ``conditions["image_latent"]`` always.
-    - ``tracks["image"].segment: LatentSegment``.
-    - ``tracks["image"].decoded: Images``.
+    - ``segment: LatentSegment``.
+    - ``primitives["image"]: Images``.
     """
 
     def __init__(
@@ -186,91 +186,102 @@ class QwenImageEditPlusPipeline(Pipeline):
             processor_path=config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path,
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run Edit-Plus text+image→image end-to-end. Requires ``req.sigmas``
-        to be pinned by the hosting engine adapter."""
-        if req.sigmas is None:
-            raise ValueError(
-                "QwenImageEditPlusPipeline.generate: req.sigmas is None. The hosting "
-                "engine (Trainside / SGLang / VLLMOmni) must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before "
-                "invoking pipeline.generate; see the σ ownership note in "
-                "unirl.models.types.pipeline."
-            )
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"QwenImageEditPlusPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-        images = req.primitives.get("image")
-        if not isinstance(images, Images):
-            raise TypeError(
-                f"QwenImageEditPlusPipeline.generate: req.primitives['image'] must be Images "
-                f"(Edit-Plus is edit-only), got "
-                f"{type(images).__name__ if images is not None else 'None'}"
-            )
-        if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
-            raise ValueError(
-                f"QwenImageEditPlusPipeline.generate: req.primitives['image'] batch "
-                f"{None if images.pixels is None else int(images.pixels.shape[0])} != "
-                f"text batch {len(texts.texts)}"
-            )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        images: Optional[Images] = None,
+        guidance_scale: float = 1.0,
+    ) -> QwenImageEditPlusConditions:
+        """Build the text side of Edit-Plus conditions.
+
+        The source-image latent depends on the generation geometry and is attached
+        by generate. Qwen's canonical CFG default is one space.
+        """
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
-                f"QwenImageEditPlusPipeline.generate: negative_text length "
+                f"QwenImageEditPlusPipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
             )
-
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-
         if self.text_embed is None:
             raise RuntimeError(
-                "QwenImageEditPlusPipeline.generate: no text_embed stage "
-                "(load_text_encoder=False). The trainer-side pipeline cannot "
-                "encode prompts in this configuration — separate-engine "
-                "recipes encode in the rollout engine; trainside rollout "
-                "requires load_text_encoder=True."
+                "QwenImageEditPlusPipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         # CFG empty negative: single-space " " (mirrors base Qwen-Image —
         # the chat-template prefix strip makes "" unsafe).
-        if negatives is None and float(params.guidance_scale) > 1.0:
+        if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[" "] * len(texts.texts))
-        # Multimodal: both CFG branches share the same source images
-        # (upstream encode_prompt(image=...)). False → Edit text-only
-        # (images=None), still edit template / drop 64.
+        # Both CFG branches share the source image when multimodal prompt
+        # conditioning is enabled. Disabling it preserves the Edit-Plus
+        # template/drop-64 path while passing no image to the text encoder.
         embed_images = images if self.use_condition_image_prompt else None
         text_cond = self.text_embed.embed(texts, embed_images)
         negative_text_cond = self.text_embed.embed(negatives, embed_images) if negatives is not None else None
+        return QwenImageEditPlusConditions(text=text_cond, negative_text=negative_text_cond)
 
-        image_latent_cond = self.vae_encode.encode(images, height=int(params.height), width=int(params.width))
+    def generate(self, sample: Sample) -> Sample:
+        """Run Edit-Plus text+image → image and fill the diffusion frontier."""
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                "QwenImageEditPlusPipeline.generate: frontier gen Part must carry "
+                f"DiffusionSamplingParams, got {type(params).__name__ if params is not None else 'None'}"
+            )
+        if params.sigmas is None:
+            raise ValueError(
+                "QwenImageEditPlusPipeline.generate: frontier sampling_params.sigmas is None; "
+                "the hosting engine must pin the schedule before pipeline.generate."
+            )
 
-        edit_conds = QwenImageEditPlusConditions(
-            text=text_cond,
-            negative_text=negative_text_cond,
-            image_latent=image_latent_cond,
+        conditioning = sample.conditioning()
+        text_inputs = [value for value in conditioning if isinstance(value, Texts)]
+        image_inputs = [value for value in conditioning if isinstance(value, Images)]
+        if len(text_inputs) != 1:
+            raise TypeError(
+                "QwenImageEditPlusPipeline.generate: expected exactly one Texts conditioning "
+                f"primitive, got {len(text_inputs)}"
+            )
+        if len(image_inputs) != 1:
+            raise TypeError(
+                "QwenImageEditPlusPipeline.generate: expected exactly one Images conditioning "
+                f"primitive (Edit-Plus is edit-only), got {len(image_inputs)}"
+            )
+        texts, images = text_inputs[0], image_inputs[0]
+        if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+            raise ValueError(
+                f"QwenImageEditPlusPipeline.generate: image batch "
+                f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                f"!= text batch {len(texts.texts)}"
+            )
+
+        edit_conds = self.build_conditions(
+            texts,
+            images=images,
+            guidance_scale=float(params.guidance_scale),
         )
+        image_latent = self.vae_encode.encode(
+            images,
+            height=int(params.height),
+            width=int(params.width),
+        )
+        edit_conds.image_latent = image_latent
 
-        schedule = req.sigmas.to(self.bundle.device)
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
-
+        schedule = params.sigmas.to(self.bundle.device)
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
         latent_seg = self.diffusion.diffuse(
-            edit_conds, schedule=schedule, params=params, initial_latents=initial_latents
+            edit_conds,
+            schedule=schedule,
+            params=params,
+            initial_latents=initial_latents,
         )
         decoded = self.vae_decode.decode(latent_seg)
-
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=edit_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=decoded,
-                ),
-            }
+        return sample.with_filled_frontier(
+            segment=latent_seg,
+            primitives={"image": decoded},
+            conditions=edit_conds.to_dict(),
         )
 
 

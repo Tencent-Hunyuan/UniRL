@@ -17,7 +17,7 @@ that was free to begin with:
   climbs as the model actually applies the requested edit.
 
 The source condition frame is available because ``RewardService`` copies the
-rollout request's ``primitives`` (including the ``video`` condition) into the
+Sample's conditioning primitives (including the ``video`` condition) into the
 reward request and ``repeat_interleave``s them to per-sample alignment.
 """
 
