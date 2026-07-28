@@ -9,9 +9,9 @@ is weights+params only.
 
 Qwen3 is a pure causal LM (no diffusion / VAE / scheduler), so there is
 no ``shift`` / ``vae_dtype`` / ``text_encoder_*`` / ``dynamic_shift_*``
-field — the hosting engine's :func:`ensure_req_sigmas` is a no-op for
+field — the hosting engine's :func:`ensure_sample_sigmas` is a no-op for
 AR-only pipelines because :class:`Qwen3Pipeline.generate` never reads
-``req.sigmas``.
+diffusion ``sampling_params.sigmas``.
 """
 
 from __future__ import annotations

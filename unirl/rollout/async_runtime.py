@@ -3,7 +3,8 @@
 The runtime is deliberately policy- and trainer-agnostic.  It owns the
 non-blocking Ray dispatch seam, in-flight generation bookkeeping, and the
 versioned buffer of complete rollout groups.  Callers retain responsibility for
-building requests, scoring responses, and training on the selected groups.
+building request Samples, scoring completed Samples, and training on the
+selected groups.
 
 Everything here is single-threaded and lock-free.  A generation is always
 completed before its groups enter :class:`VersionedGroupBuffer`; partial
@@ -21,8 +22,7 @@ import ray
 from unirl.distributed.group.dispatch import DISPATCH_MODE_REGISTRY, Dispatch
 from unirl.distributed.tensor import WorkerLocalTransport
 from unirl.distributed.tensor.pytree import infer_batch_size
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 class BufferedRolloutGroup:
     """One complete rollout group plus the policy version that produced it."""
 
-    resp: RolloutResp
+    sample: Sample
     weight_version: int
     gen_id: int
 
@@ -78,7 +78,6 @@ class InflightGeneration:
 
     refs: List[Any]
     worker_local: bool
-    req: RolloutReq
     gen_id: int
     weight_version: int
 
@@ -88,7 +87,7 @@ class GenerationDispatcher(Protocol):
 
     def launch(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         gen_id: int,
         weight_version: int,
@@ -98,7 +97,7 @@ class GenerationDispatcher(Protocol):
 
     def wait(self, job: InflightGeneration) -> None: ...
 
-    def collect(self, job: InflightGeneration) -> RolloutResp: ...
+    def collect(self, job: InflightGeneration) -> Sample: ...
 
 
 class RayGenerationDispatcher:
@@ -116,17 +115,19 @@ class RayGenerationDispatcher:
 
     def launch(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         gen_id: int,
         weight_version: int,
     ) -> InflightGeneration:
         rollout = self._rollout
         dispatch_fn = DISPATCH_MODE_REGISTRY[Dispatch.DP_SCATTER]["dispatch_fn"]
-        batch_size = infer_batch_size((req,), {})
+        batch_size = infer_batch_size((sample,), {})
         if batch_size is not None and batch_size % rollout.dp_size != 0:
-            raise ValueError(f"req batch_size={batch_size} not divisible by rollout dp_size={rollout.dp_size}")
-        shards = dispatch_fn(rollout, (req,), {}, batch_size)
+            raise ValueError(
+                f"request Sample batch_size={batch_size} not divisible by rollout dp_size={rollout.dp_size}"
+            )
+        shards = dispatch_fn(rollout, (sample,), {}, batch_size)
         worker_local = issubclass(
             rollout.pool.transport_cls,
             WorkerLocalTransport,
@@ -146,7 +147,6 @@ class RayGenerationDispatcher:
         return InflightGeneration(
             refs=refs,
             worker_local=worker_local,
-            req=req,
             gen_id=gen_id,
             weight_version=weight_version,
         )
@@ -162,7 +162,7 @@ class RayGenerationDispatcher:
     def wait(self, job: InflightGeneration) -> None:
         ray.get(job.refs)
 
-    def collect(self, job: InflightGeneration) -> RolloutResp:
+    def collect(self, job: InflightGeneration) -> Sample:
         rollout = self._rollout
         collect_fn = DISPATCH_MODE_REGISTRY[Dispatch.DP_SCATTER]["collect_fn"]
         results = ray.get(job.refs)
@@ -177,10 +177,10 @@ class RayGenerationDispatcher:
         return collect_fn(rollout, results)
 
 
-BuildRequest = Callable[[int], RolloutReq]
+BuildSample = Callable[[int], Sample]
 CompleteGeneration = Callable[
-    [InflightGeneration, RolloutResp],
-    List[RolloutResp],
+    [InflightGeneration, Sample],
+    List[Sample],
 ]
 
 
@@ -212,14 +212,14 @@ class AsyncRolloutScheduler:
     def _launch_one(
         self,
         *,
-        build_req: BuildRequest,
+        build_sample: BuildSample,
         weight_version: int,
     ) -> None:
         gen_id = self._launch_id
-        req = build_req(gen_id)
+        sample = build_sample(gen_id)
         self._inflight.append(
             self._dispatcher.launch(
-                req,
+                sample,
                 gen_id=gen_id,
                 weight_version=weight_version,
             )
@@ -234,12 +234,12 @@ class AsyncRolloutScheduler:
         # Complete-or-nothing: collect + score first, then a single buffer
         # mutation. If either step fails the job stays in-flight for retry
         # without double-inserting groups from a partial put.
-        resp = self._dispatcher.collect(job)
-        groups = on_complete(job, resp)
+        completed = self._dispatcher.collect(job)
+        groups = on_complete(job, completed)
         self._buffer.put_all(
             [
                 BufferedRolloutGroup(
-                    resp=group,
+                    sample=group,
                     weight_version=job.weight_version,
                     gen_id=job.gen_id,
                 )
@@ -305,7 +305,7 @@ class AsyncRolloutScheduler:
         max_staleness: int,
         num_rollouts: int,
         current_version: int,
-        build_req: BuildRequest,
+        build_sample: BuildSample,
         on_complete: CompleteGeneration,
     ) -> List[BufferedRolloutGroup]:
         """Return the freshest full training step, blocking only when needed.
@@ -327,7 +327,7 @@ class AsyncRolloutScheduler:
             ceiling = min(num_rollouts, staleness_window)
             while self._launch_id < ceiling and len(self._inflight) < max_inflight:
                 self._launch_one(
-                    build_req=build_req,
+                    build_sample=build_sample,
                     weight_version=current_version,
                 )
 

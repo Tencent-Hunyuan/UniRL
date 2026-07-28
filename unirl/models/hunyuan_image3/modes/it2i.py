@@ -23,8 +23,7 @@ from typing import TYPE_CHECKING
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
@@ -33,36 +32,31 @@ if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
-    texts = req.primitives.get("text")
+    frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+    params = frontier.sampling_params
+    if params.sigmas is None:
+        raise ValueError(
+            "HunyuanImage3 it2i: gen part sampling_params.sigmas is None. The hosting engine must "
+            "pin σ before pipeline.generate."
+        )
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
     require(
         isinstance(texts, Texts),
-        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
+        f"HunyuanImage3Pipeline.generate (it2i): prompt from sample.conditioning()[0] "
         f"must be Texts, "
         f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
-    images = req.primitives.get("image")
+    images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
     require(
         isinstance(images, Images),
-        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
-        f"must be Images, "
-        f"got {type(images).__name__ if images is not None else 'None'}",
-    )
-    require(
-        req.primitives.get("negative_text") is None,
-        "HunyuanImage3Pipeline.generate (it2i): negative_text is not supported — "
-        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
-        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
+        "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
-    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-    if req.sigmas is None:
-        raise ValueError(
-            "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "
-            "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
-        )
-    schedule = req.sigmas.to(pipeline.bundle.device)
+    schedule = params.sigmas.to(pipeline.bundle.device)
     # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
     # and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
@@ -89,7 +83,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         }
 
     # 4. Build the unified-MM tensors with cond-image markers spliced in.
-    bot_task = str(req.stage_config.get("bot_task", "image"))
+    bot_task = str((sample.parts[0].control or {}).get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
@@ -120,14 +114,5 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
     edited = pipeline.vae_decode.decode(latent_seg)
 
-    return RolloutResp(
-        tracks={
-            "image": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=diff_conds.to_dict(),
-                segment=latent_seg,
-                decoded=edited,
-            ),
-        }
-    )
+    filled = frontier.fill(segment=latent_seg, primitives={"image": edited}, conditions=diff_conds.to_dict())
+    return sample.with_parts([*sample.parts[:-1], filled])

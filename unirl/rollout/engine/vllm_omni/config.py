@@ -78,6 +78,11 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     # Passthrough for advanced ``Omni`` kwargs not surfaced as typed fields.
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
+    # Model chat-template kwargs. AgenticRolloutEngine injects environment tool
+    # schemas here before constructing the inner engine; adapters that do not
+    # use a chat template ignore the field.
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
         # Validate against the live adapter registry (importing it registers them).

@@ -10,14 +10,13 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_req
-from unirl.types.rollout_req import RolloutReq
+from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 
 
-def core_diff_kwargs(req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
+def core_diff_kwargs(diff_params: Any) -> Dict[str, Any]:
     """The diffusion sampling kwargs common to every DiT stage.
 
-    Every value reads off the request's typed ``DiffusionSamplingParams``
+    Every value reads off the gen Part's typed ``DiffusionSamplingParams``
     — the engine keeps no sampling defaults. ``eta`` rides as a typed
     first-class field; ``guidance_scale_provided`` marks the explicit CFG
     choice; trajectory latents are always requested (dense — replay needs
@@ -35,7 +34,7 @@ def core_diff_kwargs(req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
         return_trajectory_decoded=False,
         num_outputs_per_prompt=1,
     )
-    sigmas = sigmas_list_from_req(req, num_inference_steps)
+    sigmas = sigmas_list_from_diffusion(diff_params, num_inference_steps)
     if sigmas is not None:
         diff_kwargs["sigmas"] = sigmas
     return diff_kwargs

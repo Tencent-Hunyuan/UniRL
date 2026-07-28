@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
 from unirl.config.require import require
 
 if TYPE_CHECKING:
+    import torch
+
     from unirl.utils.scheduler_utils import TimestepScheduler
 
 
@@ -33,7 +35,7 @@ def _is_param_dict(sampling: Any) -> bool:
     """True iff ``sampling`` is a modality-keyed mapping (``"diffusion"`` / ``"ar"``)
     rather than a single sampling-params object.
 
-    ``RolloutReq.sampling_params`` is a ``Dict[str, BaseSamplingParams]``. A bare
+    the gen Part's ``sampling_params`` is a ``Dict[str, BaseSamplingParams]``. A bare
     ``DiffusionSamplingParams`` (or its raw OmegaConf node from a flat
     ``cfg.sampling``) is NOT a param dict — :func:`total_samples_per_prompt` then
     treats it as a single modality.
@@ -111,6 +113,18 @@ class DiffusionSamplingParams(BaseSamplingParams):
     seed: Optional[int] = 42
     init_same_noise: bool = False
     noise_group_ids: Optional[List[str]] = None
+    # x_T noise recipe: the per-sample latent shape each engine regenerates a
+    # byte-identical initial noise into (pairs with init_same_noise + seed).
+    init_noise_latent_shape: Optional[List[int]] = None
+    # Driver-x_T opt-out (debug escape hatch). When True the trainer is NOT
+    # authoring x_T: the engine adapter skips the init_noise_group_ids recipe and
+    # each engine falls back to its own RNG. Per-request so the unified DiT path
+    # honors it just like DiffusionTrainer's DISABLE_DRIVER_XT env.
+    disable_driver_xt: bool = False
+    # Resolved σ schedule for this rollout, pinned by the rollout-engine adapter
+    # before generation (single source of truth). The engine echoes it back on
+    # ``LatentSegment.sigmas`` and ``sigma_verify`` asserts the two match.
+    sigmas: Optional[torch.Tensor] = None
 
     # --- SDE ---
     eta: float = 1.0

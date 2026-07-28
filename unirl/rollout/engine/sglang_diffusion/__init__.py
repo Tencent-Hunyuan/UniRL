@@ -1,7 +1,7 @@
 """SGLang diffusion rollout engine (v2 — role-decomposed rewrite of ``sglang/``).
 
 A thin core over one runtime seam (``backends``), with per-model ``adapters``
-holding the ``RolloutReq``↔``RolloutResp`` conversion, a small ``utils`` helper bag,
+holding the ``Sample``↔wire conversion, a small ``utils`` helper bag,
 and a ``WeightSync`` component owning the sync ops + LoRA lifecycle (the offload
 flag lives on the engine itself). In local mode the engine reserves its own
 ``SGLangDiffusionPorts`` at boot and ``config.server_intent`` spells them into

@@ -17,7 +17,8 @@ from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 @register_adapter("flux")
@@ -49,7 +50,7 @@ class Flux2KleinAdapter(ImageAdapter):
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -61,10 +62,11 @@ class Flux2KleinAdapter(ImageAdapter):
         Klein keeps the packed channels at patch resolution (a token→spatial
         reshape). 5-D arrivals (image-form) skip the unpack.
         """
+        diffusion = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 5:
             B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
-                traj, req, family="flux2_klein", downsample=_KLEIN_DOWNSAMPLE, require_divisible=True
+                traj, diffusion, family="flux2_klein", downsample=_KLEIN_DOWNSAMPLE, require_divisible=True
             )
             from unirl.models.flux2_klein.flux2_klein_utils import unpack_latents
 
@@ -73,7 +75,7 @@ class Flux2KleinAdapter(ImageAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=diffusion.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,

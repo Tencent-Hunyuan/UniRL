@@ -134,10 +134,10 @@ class PhaseTimer:
 
         timer = PhaseTimer()
         with timer.phase("generate"):
-            resp = self.rollout.generate(req)
+            sample = self.rollout.generate(sample)
         ...
         logger.log_rollout_step(
-            rollout_id, result, resp,
+            rollout_id, result, sample,
             step_time_s=timer.total(), phase_times=timer.phases,
         )
 
@@ -735,7 +735,7 @@ class UniRLWandBLogger:
         self,
         rollout_id: int,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
-        resp: Any,
+        sample: Any,
         *,
         step_time_s: Optional[float] = None,
         phase_times: Optional[Dict[str, float]] = None,
@@ -745,14 +745,15 @@ class UniRLWandBLogger:
         """Log one rollout's metrics to wandb. No-op when disabled.
 
         The single per-step entry point shared by every trainer. It consumes
-        only framework-universal objects: a :class:`RolloutResp` (``resp``)
+        only framework-universal objects: a :class:`Sample` (``sample``)
         and a :class:`TrainStepResult` (single-track) or a ``{track:
         TrainStepResult}`` dict (multi-track). All wandb/metric/step logic
         lives here so trainers stay logging-free.
 
         - ``rollout/*``: reward/advantage (and AR response-length) distribution
-          stats from ``resp.tracks`` via ``compute_rollout_resp_metrics``, plus
-          any ``extra_metrics`` (e.g. ``sync_weights``) merged in.
+          stats from the sample's gen Parts via
+          ``compute_rollout_sample_metrics``, plus any ``extra_metrics``
+          (e.g. ``sync_weights``) merged in.
         - ``train/*``: optimizer scalars + algorithm metrics, per-update aware
           (see :meth:`_log_train`).
         - ``perf/step_time_s``: optional total wall-clock for the step.
@@ -776,10 +777,10 @@ class UniRLWandBLogger:
         if not self.enabled or not self._initialized:
             return
         # Lazy import keeps wandb_logger importable without the training stack.
-        from unirl.utils.wandb_metrics import compute_rollout_resp_metrics
+        from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
         step = rollout_id + 1
-        rollout_metrics = compute_rollout_resp_metrics(resp=resp, trunc_len=trunc_len)
+        rollout_metrics = compute_rollout_sample_metrics(sample=sample, trunc_len=trunc_len)
         if extra_metrics:
             rollout_metrics.update(extra_metrics)
         self.log_rollout(step, rollout_metrics)

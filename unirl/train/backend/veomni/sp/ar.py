@@ -2,11 +2,12 @@
 
 Installed by the VeOmni backend after ``veomni_parallelize``. Two pieces:
 
-1. **Attention** — set ``config._attn_implementation`` to VeOmni's registered
-   ``veomni_flash_attention_2_with_sp`` so the decoder's attention runs the
-   Ulysses all-to-all (gather sequence / scatter heads → full-seq attention →
-   scatter sequence / gather heads). The wrapper self-disables when
-   ``ulysses_size == 1``, so this is safe to set unconditionally.
+1. **Attention** — set ``config._attn_implementation`` to the newest locally
+   available VeOmni FlashAttention implementation (FA4 → FA3 → FA2), so the
+   decoder's attention runs the Ulysses all-to-all (gather sequence / scatter
+   heads → full-seq attention → scatter sequence / gather heads). The wrapper
+   self-disables when ``ulysses_size == 1``, so this is safe to set
+   unconditionally.
 
 2. **Boundary** — wrap the *decoder* ``forward`` (``model.model``) to slice the
    sequence across SP ranks at entry and ``gather_outputs`` the hidden states at
@@ -48,6 +49,11 @@ from torch import nn
 logger = logging.getLogger(__name__)
 
 SP_ATTN_IMPL = "veomni_flash_attention_2_with_sp"
+_SP_ATTN_IMPL_CANDIDATES = (
+    ("is_flash_attn_4_available", "veomni_flash_attention_4_with_sp"),
+    ("is_flash_attn_3_available", "veomni_flash_attention_3_with_sp"),
+    ("is_flash_attn_2_available", SP_ATTN_IMPL),
+)
 
 
 def is_ar_causal_lm(model: nn.Module) -> bool:
@@ -60,26 +66,38 @@ def apply_ar_sequence_parallelism(model: nn.Module, sp_size: int) -> None:
     from unirl.train.backend.veomni import _compat
 
     _compat.ensure_attention_patch_installed()
-    _install_b1_dense_attn_patch()
+    sp_attn_impl = _select_sp_attn_impl()
+    _install_b1_dense_attn_patch(sp_attn_impl)
 
     # Set the SP attn impl on the model config and every sub-config that carries
     # one (transformers resolves the attention fn per-forward via this field, so
     # setting it on the already-built model re-dispatches).
-    _set_attn_impl(model.config)
+    _set_attn_impl(model.config, sp_attn_impl)
     for m in model.modules():
         cfg = getattr(m, "config", None)
         if cfg is not None:
-            _set_attn_impl(cfg)
+            _set_attn_impl(cfg, sp_attn_impl)
 
     _wrap_decoder_forward(model.model)
     logger.info(
         "AR SP installed: attn_implementation=%s + decoder slice/gather wrapper (sp_size=%d)",
-        SP_ATTN_IMPL,
+        sp_attn_impl,
         sp_size,
     )
 
 
-def _install_b1_dense_attn_patch() -> None:
+def _select_sp_attn_impl() -> str:
+    """Choose the newest FlashAttention backend installed in this environment."""
+    import transformers.utils as transformers_utils
+
+    for availability_probe, implementation in _SP_ATTN_IMPL_CANDIDATES:
+        probe = getattr(transformers_utils, availability_probe, None)
+        if callable(probe) and probe():
+            return implementation
+    return SP_ATTN_IMPL
+
+
+def _install_b1_dense_attn_patch(sp_attn_impl: str) -> None:
     """B=1 dense path — KERNEL HALF (pairs with :func:`_sp_b1_dense_forward`, the
     boundary half; see the module docstring's two-point-fix note).
 
@@ -98,7 +116,7 @@ def _install_b1_dense_attn_patch() -> None:
     """
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    orig = ALL_ATTENTION_FUNCTIONS[SP_ATTN_IMPL]
+    orig = ALL_ATTENTION_FUNCTIONS[sp_attn_impl]
     if getattr(orig, "_unirl_b1_dense", False):
         return
 
@@ -123,7 +141,7 @@ def _install_b1_dense_attn_patch() -> None:
         return orig(*args, **kwargs)
 
     _b1_dense._unirl_b1_dense = True
-    ALL_ATTENTION_FUNCTIONS.register(SP_ATTN_IMPL, _b1_dense)
+    ALL_ATTENTION_FUNCTIONS.register(sp_attn_impl, _b1_dense)
 
 
 def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
@@ -180,16 +198,16 @@ def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
     return out
 
 
-def _set_attn_impl(cfg: Any) -> None:
+def _set_attn_impl(cfg: Any, sp_attn_impl: str) -> None:
     if hasattr(cfg, "_attn_implementation"):
-        cfg._attn_implementation = SP_ATTN_IMPL
+        cfg._attn_implementation = sp_attn_impl
     # Some HF configs nest a text sub-config (VLMs); set there too if present.
     get_text = getattr(cfg, "get_text_config", None)
     if callable(get_text):
         try:
             tcfg = get_text()
             if tcfg is not None and tcfg is not cfg and hasattr(tcfg, "_attn_implementation"):
-                tcfg._attn_implementation = SP_ATTN_IMPL
+                tcfg._attn_implementation = sp_attn_impl
         except Exception:  # noqa: BLE001 — best-effort; absence is fine
             pass
 

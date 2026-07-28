@@ -1,15 +1,15 @@
 """The backend seam contract — the ``Backend`` protocol + the wire types.
 
 Every ``sglang`` collaborator reaches the SGLang SRT runtime through this
-protocol; the real implementation lives beside it (``http.py`` — SRT server
-subprocess + HTTP). This module holds no runtime code at all, so it is trivially
-CPU-importable.
+protocol; the real implementations live beside it (``http.py`` — SRT server
+subprocess + sync HTTP; ``native.py`` — in-process Engine). This module holds
+no runtime code at all, so it is trivially CPU-importable.
 
 **No RL types cross this seam.** ``generate`` takes ready-to-POST ``/generate``
 payload dicts (one per prompt) and returns ``list[RawResult]`` (a structural view
 of one parsed ``/generate`` candidate); the adapters do the
-``RolloutReq``↔``RolloutResp`` translation. The impl absorbs its transport
-asymmetries (async fan-out, retries, SGLang's dict-vs-list response shape for
+``Sample``↔wire translation. The impl absorbs its transport
+asymmetries (thread fan-out, retries, SGLang's dict-vs-list response shape for
 ``n``) behind these signatures.
 
 Deliberate divergences from the ``sglang_diffusion`` seam:
@@ -64,8 +64,14 @@ class RawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
-    # generation
+    # generation — synchronous and safe for CONCURRENT callers: the agentic
+    # drain calls it from one thread per trajectory, and the impl must keep the
+    # in-flight requests batching together on the runtime (never serialize them).
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
+    # best-effort controls
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None: ...
+    def pause(self) -> None: ...
+    def resume(self) -> None: ...
     # memory / lifecycle / health
     def flush_cache(self) -> None: ...
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None: ...

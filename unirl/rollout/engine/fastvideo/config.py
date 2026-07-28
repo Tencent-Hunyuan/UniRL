@@ -46,7 +46,7 @@ class FastVideoEngineConfig(BaseEngineConfig):
     # --- Sampling (live interpolation back to top-level cfg.sampling) ---
     sampling: Any = dc_field(default_factory=lambda: SI("${sampling}"))
 
-    # --- Model family: selects the req<->resp conversion (only wan2.1 for now) ---
+    # --- Model family: selects the Sample frontier conversion (only wan2.1 for now) ---
     model_family: str = "wan2.1"
 
     # --- Native log-prob (PR #1222 ForwardBatch.RLData path). When False the
@@ -54,7 +54,8 @@ class FastVideoEngineConfig(BaseEngineConfig):
     #     via replay (algorithm.old_logp_source=replay). ---
     native_logprob: bool = True
 
-    # --- Engine-internal noise fallback (only when caller didn't pre-ship x_T) ---
+    # --- Engine-internal noise fallback. FastVideo currently uses one seed for
+    #     x_T and SDE noise, so True shares the whole random stream, not only x_T. ---
     init_same_noise: bool = False
 
     # --- Parallelism & GPU (colocate first cut: 1 GPU per actor) ---

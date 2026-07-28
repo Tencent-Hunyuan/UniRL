@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from unirl.algorithms import StageAlgorithm
 from unirl.train.stack.planner.types import Plan, _build_micro_batch_slices, _update_ranges
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 
 
 def _count_plan(*, total: int, num_updates: int, micro_batch_size: int) -> Plan:
@@ -42,11 +42,9 @@ class CountPlanner:
     algorithm precondition.
     """
 
-    def arrange(
-        self, resp_track: RolloutTrack, *, num_updates: int, micro_batch_size: int
-    ) -> tuple[RolloutTrack, Plan]:
-        return resp_track, _count_plan(
-            total=int(resp_track.batch_size),
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> tuple[Part, Plan]:
+        return part, _count_plan(
+            total=int(part.batch_size),
             num_updates=num_updates,
             micro_batch_size=micro_batch_size,
         )

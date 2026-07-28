@@ -1,5 +1,6 @@
 import inspect
 import logging
+import math
 import time
 from contextlib import contextmanager
 from typing import Dict, Iterator, Optional, Tuple
@@ -11,9 +12,8 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
-from unirl.types.prompts import RolloutInputs
-from unirl.types.rollout_req import RolloutReq
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -24,7 +24,7 @@ class ARTrainer(BaseTrainer):
     """Autoregressive (VLM / LLM) RL trainer: rollout + train colocated.
 
     Sibling of :class:`~unirl.trainer.diffusion.DiffusionTrainer` for the
-    AR path. Structurally identical except ``_build_req`` carries **no SDE step
+    AR path. Structurally identical except ``_build_request_sample`` carries **no SDE step
     scheduling** — that is diffusion-only (``DiffusionSamplingParams`` owns
     ``scheduler`` / ``sde_indices`` / ``resolve_sde_indices``), and
     ``ARSamplingParams`` has none of it. Keeping the AR trainer separate means
@@ -254,28 +254,35 @@ class ARTrainer(BaseTrainer):
                     cleanup_error.add_note(f"anchored cleanup operation: {operation}")
                     raise cleanup_error
 
-    def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
-        """Turn a data source batch into a typed :class:`RolloutReq`.
+    def _build_request_sample(
+        self,
+        inputs: Sample,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
+        """Turn a data source batch into a request :class:`Sample`.
 
-        Expands ``inputs`` by ``total_samples_per_prompt(sampling_params)`` so
-        each prompt produces an N-sample GRPO group (sibling samples consecutive).
-        AR sampling params ride to the engine untouched — there is no SDE step
-        schedule to resolve (that is the diffusion trainer's job).
+        The data source's input-only Part tree is preserved while every id is
+        rollout-keyed (``r{rollout_id}:…``), then ``Part.fork`` fans out the AR
+        gen shell to the ``N``-sample GRPO group (siblings stay consecutive).
+        VLM image/video inputs are already chained by the data source.
+        AR params ride on the gen Part — no SDE schedule to resolve (that is the
+        diffusion trainer's job). ``sampling`` overrides the dict (``evaluate``
+        passes its own); ``None`` uses ``self.sampling_params``.
         """
-        inputs = inputs.expand(total_samples_per_prompt(self.sampling_params))
-        req = RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=self.sampling_params,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
+        sp = sampling if sampling is not None else self.sampling_params
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text", "image", "video"},
+            caller="ARTrainer._build_request_sample",
         )
-        return req
+        return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
 
     def train_step(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
@@ -284,8 +291,8 @@ class ARTrainer(BaseTrainer):
         """One ``rollout → reward → advantage → optimizer step`` pass.
 
         Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the single track (0.0 if none), for the log line.
-        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
+        per-sample reward of the frontier gen Part (0.0 if none), for the log
+        line. ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
         anchored = self._rollout_anchor_device is not None
@@ -294,49 +301,45 @@ class ARTrainer(BaseTrainer):
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
-            resp = self.rollout.generate(req)
+            sample = self.rollout.generate(sample)
             self.rollout.sleep()
         else:
             # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
             # unified models; replace it with first-class TP/DP/PP support.
             with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
-                resp = self.rollout.generate(req)
+                sample = self.rollout.generate(sample)
                 # DP_SCATTER consumers require materialized tensors.
                 from unirl.trainer.unified_model import deep_hydrate
 
-                resp = deep_hydrate(resp)
+                sample = deep_hydrate(sample)
 
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
+        # Score the frontier gen Part (Sample -> Sample; the reward service is
+        # migrated alongside on its own branch — see the LIN-480 plan).
+        sample = self.reward.score_and_attach(sample)
 
+        part = sample.parts[-1]
         mean_reward = 0.0
-        for track in resp.tracks.values():
-            if track.rewards is None:
-                continue
+        if part.rewards is not None:
             # Hydrate in place so the wandb reward/advantage stats reuse this
             # fetch instead of re-pulling the TensorRef from the worker.
-            track.rewards = hydrate(track.rewards)
-            mean_reward = float(track.rewards.to(torch.float32).mean().item())
-            break  # single-track for now; revisit if multi-track lands
+            part.rewards = hydrate(part.rewards)
+            if isinstance(part.component_rewards, dict):
+                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
+            mean_reward = float(part.rewards.to(torch.float32).mean().item())
+            part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+            sample = sample.with_parts([*sample.parts[:-1], part])
 
-        for name, track in list(resp.tracks.items()):
-            if track.rewards is not None:
-                resp.tracks[name] = track.compute_advantages(
-                    normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope
-                )
-
-        self._dump_rollout_samples(req, resp, rollout_id)
-        self._drop_decoded(req, resp, rollout_id=rollout_id)
-        (track,) = resp.tracks.values()
+        self._dump_rollout_samples(sample, rollout_id)
+        self._drop_decoded(sample, rollout_id=rollout_id)
+        train_part = sample.parts[-1]
         # verl balance_batch parity: reorder so each DP shard gets a near-equal
         # token load before DP_SCATTER (no-op when already balanced).
         if self.balance_shards:
-            track = track.balance_shards(int(self.num_devices))
+            train_part = train_part.balance_shards(int(self.num_devices))
         if anchored:
             self._ensure_anchored_backend_loaded()
         try:
-            result = self.stack.train_track(track, training_progress=float(training_progress))
+            result = self.stack.train_track(train_part, training_progress=float(training_progress))
         finally:
             # Match UnifiedModelTrainer's steady state: FSDP on CPU and the
             # rollout asleep between steps.  This also reclaims every rank's
@@ -346,7 +349,7 @@ class ARTrainer(BaseTrainer):
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
-            resp,
+            sample,
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
@@ -393,41 +396,42 @@ class ARTrainer(BaseTrainer):
         sync_anchored_weights = anchored and self.weight_sync is not None
         try:
             for eval_inputs in eval_batches:
+                real_prompt_n = eval_inputs.batch_size
                 batch_n += 1
-                prompt_n += len(eval_inputs.sample_ids)
-                inputs = eval_inputs.expand(self.eval_samples_per_prompt)
-                req = RolloutReq(
-                    sample_ids=list(inputs.sample_ids),
-                    group_ids=list(inputs.group_ids),
-                    primitives=dict(inputs.primitives),
-                    request_conditions={},
-                    sampling_params=eval_sp,
-                    metadata=list(inputs.metadata) if inputs.metadata else [],
-                )
+                prompt_n += real_prompt_n
+                dispatch_inputs = self._pad_eval_inputs(eval_inputs)
+                sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
                 if anchored:
                     # Keep the manual FSDP state offloaded throughout eval and
-                    # release the TP engine between batches.  Only the first
+                    # release the TP engine between batches. Only the first
                     # batch needs an adapter extract/push.
                     with self._anchored_rollout_session(
                         sync_weights=sync_anchored_weights,
                         restore_backend=False,
                     ):
                         sync_anchored_weights = False
-                        resp = self.rollout.generate(req)
+                        generated = self.rollout.generate(sample)
                         # DP_SCATTER reward scoring requires materialized tensors.
                         from unirl.trainer.unified_model import deep_hydrate
 
-                        resp = deep_hydrate(resp)
+                        generated = deep_hydrate(generated)
                 else:
-                    resp = self.rollout.generate(req)
-                for track in resp.tracks.values():
-                    if track.segment is not None:
-                        track = self.reward.score_and_attach(req=req, track=track)
-                    if track.rewards is not None:
-                        rewards = hydrate(track.rewards).to(torch.float32)
-                        reward_sum += float(rewards.sum().item())
-                        reward_n += int(rewards.numel())
-                        break  # single-track for now; revisit if multi-track lands
+                    generated = self.rollout.generate(sample)
+                scored = self.reward.score_and_attach(generated)
+                rewards = scored.parts[-1].rewards
+                if rewards is not None:
+                    rewards = hydrate(rewards).to(torch.float32)
+                    fanout = total_samples_per_prompt(eval_sp)
+                    expected_total = dispatch_inputs.batch_size * fanout
+                    if int(rewards.numel()) != expected_total:
+                        raise RuntimeError(
+                            f"ARTrainer.evaluate: reward count {int(rewards.numel())} != "
+                            f"dispatch prompts {dispatch_inputs.batch_size} * fanout {fanout} "
+                            f"({expected_total})."
+                        )
+                    rewards = rewards[: real_prompt_n * fanout]
+                    reward_sum += float(rewards.sum().item())
+                    reward_n += int(rewards.numel())
         finally:
             if not anchored:
                 self.rollout.sleep()
@@ -447,7 +451,46 @@ class ARTrainer(BaseTrainer):
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
 
-    def _dump_rollout_samples(self, req, resp, rollout_id: int) -> None:
+    def _pad_eval_inputs(self, inputs: Sample) -> Sample:
+        """Append replicated prompt rows until rollout and reward DP can shard.
+
+        Evaluation still reports only the original rows; the replicas exist solely
+        to satisfy ``DP_SCATTER``. Their ids are rewritten because Sample lineage
+        requires distinct root ids within one request.
+        """
+        n = inputs.batch_size
+        if n == 0:
+            return inputs
+        rollout_dp = max(1, int(getattr(self.rollout, "dp_size", 1)))
+        reward_dp = max(1, int(getattr(self.reward, "dp_size", 1)))
+        multiple = math.lcm(rollout_dp, reward_dp)
+        pad_n = (-n) % multiple
+        if pad_n == 0:
+            return inputs
+
+        source = inputs.slice(n - 1, n)
+        source_root_id = source.parts[0].sample_ids[0]
+        used_root_ids = set(inputs.parts[0].sample_ids)
+        padded: list[Sample] = []
+        for i in range(pad_n):
+            candidate = f"{source_root_id}:eval-pad:{i}"
+            while candidate in used_root_ids:
+                candidate += ":pad"
+            used_root_ids.add(candidate)
+
+            def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
+                root, separator, suffix = sample_id.partition("/")
+                if root != source_root_id:
+                    raise ValueError(
+                        "ARTrainer._pad_eval_inputs: selected pad tree contains "
+                        f"unexpected root {root!r}; expected {source_root_id!r}."
+                    )
+                return new_root + (f"/{suffix}" if separator else "")
+
+            padded.append(source.map_sample_ids(replace_root))
+        return Sample.concat([inputs, *padded])
+
+    def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
         """Debug dump of the first N (prompt, output, reward) triples per rollout.
 
         Off unless ``ROLLOUT_DUMP_DIR`` is set (driver-side env). Writes one
@@ -462,11 +505,16 @@ class ARTrainer(BaseTrainer):
         if not out_dir:
             return
         try:
+            from unirl.types.primitives import Texts
+
             n = int(os.environ.get("ROLLOUT_DUMP_N", "4"))
-            prompts = getattr(req.primitives.get("text"), "texts", None) or []
-            (track,) = resp.tracks.values()
-            outputs = getattr(track.decoded, "texts", None) or []
-            rewards = track.rewards.to(torch.float32).tolist() if track.rewards is not None else []
+            # Prompts row-aligned to the frontier samples (the lineage walk
+            # expands the P prompts to the P*N gen samples).
+            cond = sample.conditioning()
+            prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
+            part = sample.parts[-1]
+            outputs = getattr(part.primitives.get("text"), "texts", None) or []
+            rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
             with open(path, "w", encoding="utf-8") as f:
@@ -510,7 +558,10 @@ class ARTrainer(BaseTrainer):
         ``load_dir``: restore from a checkpoint directory and RESUME from its
         saved step — ``num_rollouts`` is the TOTAL budget.
 
-        Deferred: ``num_updates_per_batch`` multi-epoch replay, eval cadence.
+        Evaluation follows ``self.eval_interval``. Multiple optimizer updates
+        per rollout are configured on the train stack with
+        ``num_updates_per_batch``; the stack partitions its shard into disjoint
+        updates while keeping the pre-update policy anchor fixed.
         """
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
@@ -530,7 +581,7 @@ class ARTrainer(BaseTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
+                sample = self._build_request_sample(inputs, rollout_id)
                 # Sync before generate; skip step 0 (nothing trained yet). On
                 # resume, force the first sync — the engine booted with fresh
                 # weights and needs the restored adapter before generate.
@@ -538,7 +589,7 @@ class ARTrainer(BaseTrainer):
                     resumed and rollout_id == start_rollout
                 )
                 result, mean_reward = self.train_step(
-                    req,
+                    sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,

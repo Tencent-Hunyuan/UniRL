@@ -1,4 +1,4 @@
-"""Adapter registry — importing this package registers all 9 modalities.
+"""Adapter registry — importing this package registers all 10 modalities.
 
 Modality adapters are grouped by model family and composed from input/output
 sub-adapters (the binder constructs both in ``__init__`` and delegates the
@@ -52,11 +52,12 @@ from unirl.rollout.engine.vllm_omni.adapters.qwen3_omni import (
     Qwen3OmniThinkerInputAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.qwen_image import (
+    QwenImageGroupedInputAdapter,
     QwenImageInputAdapter,
     QwenImageOutputAdapter,
     QwenImageT2iAdapter,
 )
-from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3OutputAdapter, Sd3T2iAdapter
+from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3InputAdapter, Sd3OutputAdapter, Sd3T2iAdapter
 
 __all__ = [
     "DitInputAdapter",
@@ -80,11 +81,13 @@ __all__ = [
     "Hv15T2vAdapter",
     "Hv15VideoOutputAdapter",
     "ModelAdapter",
+    "QwenImageGroupedInputAdapter",
     "Qwen3OmniThinkerAdapter",
     "Qwen3OmniThinkerInputAdapter",
     "QwenImageInputAdapter",
     "QwenImageOutputAdapter",
     "QwenImageT2iAdapter",
+    "Sd3InputAdapter",
     "Sd3OutputAdapter",
     "Sd3T2iAdapter",
     "get_adapter",
