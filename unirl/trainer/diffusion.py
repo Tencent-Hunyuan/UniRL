@@ -51,6 +51,8 @@ class DiffusionTrainer(BaseTrainer):
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
         adv_use_global_std: bool = False,
+        adv_decoupled: bool = False,
+        adv_component_weights: Optional[Dict[str, float]] = None,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
@@ -74,6 +76,12 @@ class DiffusionTrainer(BaseTrainer):
         # ``use_global_std=True`` scale) instead of each prompt's own std. Off by
         # default → unchanged per-group GRPO normalization for every other recipe.
         self._adv_use_global_std = bool(adv_use_global_std)
+        # GDPO: when True, normalize each component_rewards dimension per group
+        # (via Part.compute_gdpo_advantages) instead of the pre-summed scalar.
+        # adv_component_weights selects + weights the dims (None ⇒ all at 1.0).
+        # Off by default → unchanged scalar GRPO advantage.
+        self._adv_decoupled = bool(adv_decoupled)
+        self._adv_component_weights = dict(adv_component_weights) if adv_component_weights else None
         # Periodic eval on the eval set (run.eval_data_path), logged under eval/*.
         # eval_interval=0 disables it (zero-impact for runs that don't set it).
         # Diffusion eval generates at the deterministic best-quality setting
@@ -511,7 +519,16 @@ class DiffusionTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
+            if self._adv_decoupled:
+                if not (isinstance(part.component_rewards, dict) and part.component_rewards):
+                    raise ValueError(
+                        "adv_decoupled=True but the scored part has no component_rewards; "
+                        "GDPO needs a multi-dimension reward (e.g. VideoAlign vq/mq/ta or a "
+                        "composite scorer). Set adv_decoupled=false for a scalar reward."
+                    )
+                part = part.compute_gdpo_advantages(weights=self._adv_component_weights)
+            else:
+                part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
             sample = sample.with_parts([*sample.parts[:-1], part])
 
         self._drop_decoded(sample, rollout_id=rollout_id)

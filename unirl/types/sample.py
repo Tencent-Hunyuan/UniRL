@@ -418,6 +418,66 @@ class Part(Batch):
             adv = reshaped - mean
         return _part_with_field(self, "advantages", adv.flatten())
 
+    def compute_gdpo_advantages(
+        self,
+        weights: Optional[Dict[str, float]] = None,
+        *,
+        eps: float = 1e-8,
+        group_layer: Optional[int] = None,
+        whiten: bool = True,
+    ) -> "Part":
+        """GDPO — per-reward-dimension decoupled group normalization.
+
+        Normalizes each dimension in :attr:`component_rewards` within its group
+        (the GRPO step, per dimension), weighted-sums the results, then
+        batch-whitens — so a large-magnitude reward can't drown out a weaker one,
+        unlike scalar :meth:`compute_advantages` on the pre-summed reward.
+        Mirrors verl ``compute_gdpo_outcome_advantage``.
+
+        ``weights`` maps a component key to its weight and doubles as a selector:
+        only listed keys participate (each must exist in ``component_rewards``);
+        ``None`` uses all with weight 1.0. Pass explicit keys to exclude a derived
+        component (e.g. VideoAlign ``overall`` = vq+mq+ta) from double-counting.
+        """
+        if not self.component_rewards:
+            raise ValueError(
+                "Part.compute_gdpo_advantages: part has no component_rewards; "
+                "GDPO requires a multi-dimension reward (e.g. VideoAlign vq/mq/ta or a "
+                "composite scorer). Use compute_advantages for a scalar reward."
+            )
+        components = self.component_rewards
+        if weights is not None:
+            missing = [k for k in weights if k not in components]
+            if missing:
+                raise ValueError(
+                    f"compute_gdpo_advantages: weight keys {missing} not in "
+                    f"component_rewards (have {sorted(components.keys())})."
+                )
+            selected = {k: float(w) for k, w in weights.items()}
+        else:
+            selected = {k: 1.0 for k in components}
+
+        n = len(self.sample_ids)
+        adv_sum: Optional[torch.Tensor] = None
+        for key, w in selected.items():
+            comp = hydrate(components[key]).to(torch.float32)
+            if comp.numel() != n:
+                raise ValueError(
+                    f"compute_gdpo_advantages: component {key!r} has {comp.numel()} "
+                    f"values but the part has {n} samples."
+                )
+            # Per-group normalize this component (reuse the scalar GRPO path).
+            comp_part = _part_with_field(self, "rewards", comp)
+            a_k = comp_part.compute_advantages(
+                normalize=True, scope="group", eps=eps, group_layer=group_layer
+            ).advantages
+            term = w * a_k
+            adv_sum = term if adv_sum is None else adv_sum + term
+
+        if whiten:
+            adv_sum = (adv_sum - adv_sum.mean()) / (adv_sum.std() + eps)
+        return _part_with_field(self, "advantages", adv_sum)
+
 
 def _part_with_field(part: Part, field_name: str, value: Any) -> Part:
     """Copy of ``part`` with one field replaced."""
