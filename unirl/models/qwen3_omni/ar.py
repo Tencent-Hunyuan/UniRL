@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -58,18 +59,17 @@ def _fuse_mm_embeds(
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         _, _, audio_mask = transformer.get_placeholder_mask(full_ids, inputs_embeds=inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
-    try:
-        video_outputs = transformer.get_video_features(
-            pixel_values_videos,
-            video_grid_thw,
-            return_dict=True,
-        )
-    except TypeError as exc:
-        # Transformers releases differ here: older Qwen3-Omni returns
-        # ``(video_embeds, deepstack_features)`` and rejects return_dict.
-        if "unexpected keyword argument 'return_dict'" not in str(exc):
-            raise
-        video_outputs = transformer.get_video_features(pixel_values_videos, video_grid_thw)
+    # Older Transformers releases reject ``return_dict`` entirely.
+    video_feature_kwargs = (
+        {"return_dict": True}
+        if "return_dict" in inspect.signature(transformer.get_video_features).parameters
+        else {}
+    )
+    video_outputs = transformer.get_video_features(
+        pixel_values_videos,
+        video_grid_thw,
+        **video_feature_kwargs,
+    )
     if hasattr(video_outputs, "pooler_output"):
         video_embeds = video_outputs.pooler_output
         video_embeds_multiscale = video_outputs.deepstack_features
