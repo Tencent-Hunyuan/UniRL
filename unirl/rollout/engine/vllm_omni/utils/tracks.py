@@ -375,6 +375,7 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
     return TextSegment.pack(
         tokens=tokens_list,
         log_probs=log_probs_list,
+        rollout_log_probs=log_probs_list,
     )
 
 

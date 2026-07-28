@@ -17,6 +17,8 @@ class Qwen3OmniARConditions(Batch):
     pixel_values_videos: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     video_grid_thw: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     video_second_per_grid: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
+    input_features: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
+    feature_attention_mask: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Qwen3OmniARConditions":
@@ -31,6 +33,8 @@ class Qwen3OmniARConditions(Batch):
             pixel_values_videos=d.get("pixel_values_videos"),
             video_grid_thw=d.get("video_grid_thw"),
             video_second_per_grid=d.get("video_second_per_grid"),
+            input_features=d.get("input_features"),
+            feature_attention_mask=d.get("feature_attention_mask"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -44,6 +48,10 @@ class Qwen3OmniARConditions(Batch):
             out["video_grid_thw"] = self.video_grid_thw
         if self.video_second_per_grid is not None:
             out["video_second_per_grid"] = self.video_second_per_grid
+        if self.input_features is not None:
+            out["input_features"] = self.input_features
+        if self.feature_attention_mask is not None:
+            out["feature_attention_mask"] = self.feature_attention_mask
         return out
 
 
