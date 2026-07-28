@@ -80,6 +80,16 @@ class LTX2PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[list] = None
 
+    # Keep the frozen NON-trainable components (VAE, Gemma3 text encoder,
+    # connectors) on CPU instead of the train device. For sglang-rollout configs
+    # the trainside only replays the DiT for the policy gradient — encoding,
+    # decoding and generation all happen in the sglang server — so these
+    # components are dead weight on the train GPU and, being non-FSDP, stay
+    # resident during sglang generation, starving its DiT-resume of headroom in
+    # colocate. CPU-parking them frees that headroom. MUST stay False for the
+    # trainside-rollout recipe (which needs them on-device).
+    aux_components_on_cpu: bool = False
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")
 

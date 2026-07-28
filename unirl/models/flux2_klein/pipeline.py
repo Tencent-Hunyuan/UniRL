@@ -1,4 +1,4 @@
-"""Flux2KleinPipeline — RolloutReq → RolloutResp end-to-end for FLUX.2-klein-9B.
+"""Flux2KleinPipeline — ``Sample → Sample`` end-to-end for FLUX.2-klein-9B.
 
 Implements the typed four-tier flow::
 
@@ -19,9 +19,9 @@ config.
 σ schedule contract
 -------------------
 The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
-``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
+/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
+``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
+pipeline reads ``params.sigmas`` and uses it
 verbatim.
 
 FLUX.2-klein-specific override: μ depends on both ``image_seq_len`` AND
@@ -41,9 +41,9 @@ from typing import Any, Optional, Tuple
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from .bundle import Flux2KleinBundle
 from .conditions import Flux2KleinConditions
@@ -59,26 +59,20 @@ from .vae import Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
 
 
 class Flux2KleinPipeline(Pipeline):
-    """FLUX.2-klein-9B generate pipeline.
+    """FLUX.2-klein-9B generate pipeline (t2i / image-edit): ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
+    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
+    hosting engine). Reads the prompt — and, for image-edit, the chained source
+    image — via ``sample.conditioning()`` and fills the frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-      The canonical Klein recipe runs at ``guidance_scale=1.0`` with
-      no negative branch.
-    - ``sampling_params: Dict[str, BaseSamplingParams]`` — the ``"diffusion"``
-      entry is mapped onto :class:`Flux2KleinDiffusionParams`.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
-
-    Writes to ``RolloutResp.tracks["image"]: RolloutTrack``:
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]: TextEmbedCondition`` when negative
-      prompts were supplied.
     - ``segment: LatentSegment`` (patchified spatial shape
       ``[B, K, 128, H_pat, W_pat]``).
-    - ``decoded: Images``.
+    - ``primitives["image"]: Images`` — the decoded images.
+
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
+    deferred; the canonical Klein recipe runs at ``guidance_scale=1.0`` with no
+    negative branch, so CFG synthesizes an empty negative only when guidance > 1.
     """
 
     def __init__(
@@ -232,90 +226,89 @@ class Flux2KleinPipeline(Pipeline):
         is robust to ``""``: no chat-template prefix is stripped, so
         the resulting embedding is well-defined).
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"Flux2KleinPipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run FLUX.2-klein-9B t2i end-to-end. Requires ``req.sigmas``
-        to be pinned by the hosting engine adapter."""
-        if req.sigmas is None:
+    def generate(self, sample: Sample) -> Sample:
+        """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine before the call; see the σ ownership note in
+        ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        sampling = frontier.sampling_params
+        if sampling is None:
+            raise TypeError("Flux2KleinPipeline.generate: frontier gen Part must carry DiffusionSamplingParams")
+        if getattr(sampling, "sigmas", None) is None:
             raise ValueError(
-                "Flux2KleinPipeline.generate: req.sigmas is None. The hosting "
-                "engine (Trainside / SGLang / VLLMOmni) must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before "
-                "invoking pipeline.generate; see the σ ownership note in "
-                "unirl.models.types.pipeline."
-            )
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"Flux2KleinPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"Flux2KleinPipeline.generate: negative_text length "
-                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+                "Flux2KleinPipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
             )
 
-        sampling = req.sampling_params.get("diffusion")
+        # conditioning() surfaces [text, image?] in turn order — the image-edit
+        # source rides as a chained input Part (Part.input_child) on the request.
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"Flux2KleinPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+        source_image = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+
         allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
         params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
         params = Flux2KleinDiffusionParams(**params_dict)
-        # init_same_noise shares the initial latent within each prompt group. The
-        # group key is the per-sample group id, which rides on the (already-sliced)
-        # req — surface it to the noise sampler when the driver didn't pre-ship
+        # init_same_noise shares the initial latent within each prompt group; surface
+        # the gen part's group ids to the noise sampler when the driver didn't pre-ship
         # noise_group_ids on sampling_params (a shared_field that isn't batch-sliced).
         # Mirrors SD3Pipeline.generate; without it generate_latents asserts on the
         # missing noise_group_ids when init_same_noise=True.
         if bool(params.init_same_noise) and not params.noise_group_ids:
-            params = _dc.replace(params, noise_group_ids=list(req.group_ids))
+            params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        klein_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
-
-        # Image-edit conditioning: when the request carries a source image
-        # (primitives["image"], role="condition" in the data), VAE-encode it
-        # into packed condition tokens + RoPE ids and attach to the conditions.
-        # Flux2KleinDiffusionStep concatenates these onto the noise sequence so
-        # the transformer actually sees the source. Without this the edit is
-        # text-only (the bug this fixes: edited images ignored the source).
-        images = req.primitives.get("image")
-        if isinstance(images, Images):
-            if int(images.pixels.shape[0]) != len(texts.texts):
+        klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        # Image-edit encoding depends on the output grid, so attach it after the
+        # public text-only condition builder.
+        if source_image is not None:
+            if source_image.pixels is None or int(source_image.pixels.shape[0]) != len(texts.texts):
                 raise ValueError(
-                    f"Flux2KleinPipeline.generate: image count {int(images.pixels.shape[0])} "
+                    f"Flux2KleinPipeline.generate: image count "
+                    f"{None if source_image.pixels is None else int(source_image.pixels.shape[0])} "
                     f"!= text count {len(texts.texts)}"
                 )
-            image_tokens, image_ids = self.vae_encode.encode(images, height=int(params.height), width=int(params.width))
+            image_tokens, image_ids = self.vae_encode.encode(
+                source_image,
+                height=int(params.height),
+                width=int(params.width),
+            )
             klein_conds.image_latent = image_tokens
             klein_conds.image_latent_ids = image_ids
+        schedule = sampling.sigmas.to(self.bundle.device)
 
-        schedule = req.sigmas.to(self.bundle.device)
-
-        initial_cond = (req.request_conditions or {}).get("initial_latents")
-        initial_latents = getattr(initial_cond, "latents", None) if initial_cond is not None else None
+        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
+        # pre-shipped initial_latents tensor (on the gen part's segment) still wins.
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
             klein_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
-        images = self.vae_decode.decode(latent_seg)
+        decoded = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=klein_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=images,
-                ),
-            }
-        )
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
+        filled = frontier.fill(segment=latent_seg, primitives={"image": decoded}, conditions=klein_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["Flux2KleinPipeline", "Flux2KleinSchedulePolicy", "build_flux2_klein_schedule_policy"]

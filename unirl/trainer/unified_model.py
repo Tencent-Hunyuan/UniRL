@@ -16,11 +16,12 @@ vLLM-Omni engine Remotes that share ONE backbone / ONE LoRA:
 - ``dit_rollout`` (modality ``hi3_dit_recaption``, GPUs 4-7): each recaption → ``M``
   images of distinct noise (group-by-recaption → FlowGRPO).
 
-The trainer assembles the lineage itself (``make_root_track(N)`` /
-``fork_track(M)``, exactly like ``PEPipeline.generate``) because the two engines
+The trainer assembles the lineage itself (pre-forks ``[input, ar_shell,
+image_shell]`` then re-roots a flat 1:1 sub-request per engine and fills the
+shells, exactly like ``ComposedRolloutEngine.generate``) because the two engines
 are independent Remotes, not a composed pipeline. Reward routing then matches
-:class:`~unirl.trainer.pe.PETrainer`: score the image track, credit-assign
-the mean image reward up to the AR track, per-track GRPO advantages, then ONE
+:class:`~unirl.trainer.pe.PETrainer`: score the image Part, credit-assign
+the mean image reward up to the AR Part, per-Part GRPO advantages, then ONE
 :class:`UnifiedModelTrainStack` step (ar.loss + image.loss → one optimizer step on the
 single shared LoRA).
 
@@ -36,13 +37,12 @@ makes anchoring correct — see ``train_step`` and ``_wire_engine``.
 
 One ``train_step``::
 
-    wake ar+dit; [sync → both]; ar_resp = ar_rollout.generate(ar_req)
-    img_shell = ar_track.fork_track(M); dit_resp = dit_rollout.generate(dit_req)
+    wake ar+dit; [sync → both]; sample = run_rollout(sample)  # → [input, ar, image]
     sleep ar+dit
-    reward.score_and_attach(image track)         # only the image track is scorable
-    resp.propagate_rewards("mean")               # image reward → ar track
-    track.compute_advantages() per track         # ar groups by prompt, image by ar-sample
-    unified_model_stack.train_track(ar_track, image_track) # 2 backward → 1 optimizer step
+    reward.score_and_attach(sample)              # only the frontier image Part is scorable
+    sample.propagate_rewards("mean")             # image reward → ar Part
+    part.compute_advantages() per Part           # ar groups by prompt, image by recaption
+    unified_model_stack.train_track(sample)      # tree-shard lineage → 2 backward → 1 step
 
 Pairs with ``examples/unified_model/hi3_vllmomni.yaml`` and ``unirl/train_unified_model.py``.
 Deferred (same as the reference trainers): multi-epoch replay, checkpoint /
@@ -67,22 +67,14 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import TensorRef, hydrate
 from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.primitives import Texts
-from unirl.types.prompts import RolloutInputs
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack, _track_with_field
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sample import Part, Sample
+from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
-
-# Track names produced by the vLLM-Omni HI3 rollout (see
-# ``rollout/engine/vllm_omni/response.py``): "ar" is the root (TextSegment,
-# groups by prompt), "image" is its 1:1 child (LatentSegment).
-AR_TRACK = "ar"
-IMAGE_TRACK = "image"
 
 
 def deep_hydrate(obj: Any) -> Any:
@@ -102,7 +94,7 @@ def deep_hydrate(obj: Any) -> Any:
     NB: this walks TUPLES too (rebuilding them), unlike ``_collect_leaves``
     which skips them. HunyuanImage3's fused condition stores ``rope_cache`` as a
     ``tuple`` of two TensorRef; the DP scatter's driver-side
-    ``RolloutTrack.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
+    ``Part.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
     → ``t.ndim``), so the rope MUST be real tensors here. (dp=1 never concats on
     the driver, so it never tripped on this.)
     """
@@ -231,7 +223,8 @@ class UnifiedModelTrainer(BaseTrainer):
             # makes train_step copy the AR's prompt-level advantage onto the 1:1
             # image track (M=1) instead of the degenerate per-rewrite grouping.
             self._single_engine = rollout_cfg is not None
-            self._shared_advantage = self._single_engine
+            diffusion_params = self.sampling_params.get("diffusion")
+            self._shared_advantage = int(diffusion_params.samples_per_prompt) == 1
             self._rollout_is_trainside = False
             if self._single_engine:
                 self.dp = 1
@@ -357,216 +350,206 @@ class UnifiedModelTrainer(BaseTrainer):
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
 
-    def _build_req(
-        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
-    ) -> RolloutReq:
-        """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
+    def _build_request_sample(
+        self,
+        inputs: Sample,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
+        """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``.
 
-        Like :meth:`PETrainer._build_req`, NO pre-expansion: ``train_step`` fans
-        out ``P → P*N → P*N*M`` itself (make_root_track / fork_track), and the
-        reward expands ``req.primitives`` by ``N*M`` to align prompts to images.
-        Pre-expanding here would double-count. The composed sampling params are
-        kept whole (the reward reads ``ar.samples_per_prompt * diffusion.``
-        ``samples_per_prompt`` to validate the expansion factor); the SDE step
-        schedule is resolved off the diffusion sub-block per rollout and stamped
-        back onto a per-request copy.
-
-        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
-        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
+        Namespaces the data source's single text input Part, then pre-forks
+        the unified lineage shells ``[input, ar_shell(P*N), image_shell(P*N*M)]``
+        (located by sampling-params type); ``run_rollout`` drives the two engines
+        and fills these shells. ``rollout_id`` keys the
+        diffusion SDE-step schedule (``scheduler`` nulled so only the concrete
+        ``sde_indices`` ride) and salts the root ids. The AR sub-block has no SDE
+        machinery and is left untouched. ``sampling`` optionally supplies the
+        evaluation sampling parameters.
         """
-        base = base_sampling if base_sampling is not None else self.sampling_params
+        base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
+        ar_params = base.get("ar")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
-        diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**base, "diffusion": diffusion}
-        return RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=sampling_params,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
+        # Driver-x_T opt-out: env DISABLE_DRIVER_XT (parity with DiffusionTrainer) OR a
+        # recipe-set params flag. The hi3 DiT adapter skips init_noise_group_ids when
+        # set, so every engine falls back to its own RNG (the debug escape hatch).
+        disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(getattr(diff_params, "disable_driver_xt", False))
+        diffusion = dataclasses.replace(
+            diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
+        )
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text"},
+            caller="UnifiedModelTrainer._build_request_sample",
+            require_single_input_part=True,
+        )
+        return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
+            diffusion.samples_per_prompt, sampling_params=diffusion
         )
 
-    def run_rollout(self, req: RolloutReq) -> RolloutResp:
-        """DP rollout: scatter the P prompts across the ``dp`` engine replicas
-        (one (AR, DiT) pair per node), run each sub-batch on its replica, then
-        ``RolloutTrack.concat`` the per-replica tracks. ``dp<=1`` or ``P<=1``
-        falls back to the single-replica path (the original single-node rollout),
-        so this is a transparent wrapper when not multinode.
+    def run_rollout(self, sample: Sample) -> Sample:
+        """DP rollout: scatter the ``P`` prompt-trees of the request ``Sample``
+        across the ``dp`` engine replicas (one (AR, DiT) pair per node), run each
+        on its replica, then ``Sample.concat`` the per-replica filled Samples.
+        ``dp<=1`` or ``P<=1`` falls back to the single-replica path.
 
         v1 runs the replicas SEQUENTIALLY — this validates placement + the
         scatter/concat correctness; issuing the per-replica ``generate()`` as Ray
         futures for true concurrent throughput is the follow-up (handoff §8).
-        """
-        # Single-engine (M=1 / UniGRPO): the shared pipeline returns the 2-track
-        # {"ar","image"} resp directly (DP_SCATTER-sharded like the train stack —
-        # no anchored-engine single-handle hydration needed).
-        if self._single_engine:
-            return self.rollout.generate(req)
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError("UnifiedModelTrainer.run_rollout: req.primitives['text'] must be a Texts primitive.")
-        prompts = list(texts.texts)
-        n = len(prompts)
-        if self.dp <= 1 or n <= 1:
-            return self._run_rollout_one(self.ar_rollouts[0], self.dit_rollouts[0], req)
 
-        # Contiguous near-equal prompt bounds across the dp replicas.
+        CAVEAT — the fused condition's rope_cache is a ``shared_field``, so
+        ``Sample.concat`` (→ ``Part.concat``) keeps replica-0's tensor verbatim:
+        the merged condition carries a rope_cache whose batch dim is replica-0's
+        sample count, NOT the global P*N*M. Harmless TODAY because HI3 replay
+        rebuilds rope from gen_image_mask + the real latent shape and never reads
+        the part's rope_cache — it only rides along in the KV-propagation kwargs.
+        If a future change makes replay consume ``fused.rope_cache``, dp>1 would
+        SILENTLY feed replica-0 rope to every sample (wrong gradient, no crash);
+        make rope_cache a tuple-aware CONCAT field before relying on it.
+        """
+        valid_layout = (
+            len(sample.parts) == 3
+            and sample.parts[0].is_root
+            and isinstance(sample.parts[1].sampling_params, ARSamplingParams)
+            and isinstance(sample.parts[2].sampling_params, DiffusionSamplingParams)
+        )
+        if not valid_layout:
+            raise ValueError(
+                "UnifiedModelTrainer.run_rollout requires exactly "
+                f"[input, ar_shell, image_shell]; got {len(sample.parts)} Parts with sampling types "
+                f"{[type(part.sampling_params).__name__ for part in sample.parts]}."
+            )
+        if self._single_engine:
+            return self.rollout.generate(sample)
+
+        n = sample.parts[0].batch_size
+        if self.dp <= 1 or n <= 1:
+            return self._run_rollout_one(self.ar_rollouts[0], self.dit_rollouts[0], sample)
+
+        # Split into P per-prompt trees, regroup into dp contiguous shards.
+        groups = sample.split()
         bounds = [(n * r) // self.dp for r in range(self.dp + 1)]
-        shards: list[RolloutResp] = []
+        shards: list[Sample] = []
         for r in range(self.dp):
             lo, hi = bounds[r], bounds[r + 1]
             if lo >= hi:
                 continue
-            # Only "text" is consumed downstream by _run_rollout_one; slice it
-            # to this replica's prompt range and rebuild a standalone sub-req.
-            sub_req = RolloutReq(
-                sample_ids=list(req.sample_ids[lo:hi]),
-                group_ids=list(req.group_ids[lo:hi]),
-                primitives={"text": Texts(texts=prompts[lo:hi])},
-                request_conditions=dict(req.request_conditions),
-                sampling_params=req.sampling_params,
-                metadata=list(req.metadata[lo:hi]) if req.metadata else [],
-            )
-            shards.append(self._run_rollout_one(self.ar_rollouts[r], self.dit_rollouts[r], sub_req))
-        # Merge per-replica tracks via the default Batch.concat per-field
-        # merge; segment rows are 1:1 with track samples, so the AR/image
-        # segments stay globally consistent across replicas.
-        #
-        # CAVEAT — the fused condition's rope_cache is a ``shared_field``
-        # (FusedMultimodalCondition), so this concat keeps replica-0's tensor
-        # verbatim: the merged condition carries a rope_cache whose batch dim is
-        # replica-0's sample count, NOT the global P*N*M. Harmless TODAY because
-        # HI3 replay rebuilds rope from gen_image_mask + the real latent shape
-        # (diffusion.py ``predict_noise`` [ROPE-FIX]; ar.py likewise) and never
-        # reads the track's rope_cache — it only rides along in the KV-propagation
-        # kwargs. If a future change makes replay consume ``fused.rope_cache``,
-        # dp>1 would SILENTLY feed replica-0 rope to every sample (wrong gradient,
-        # no crash, reward unaffected); make rope_cache a tuple-aware CONCAT field
-        # before relying on it.
-        return RolloutResp(
-            tracks={name: RolloutTrack.concat([s.tracks[name] for s in shards]) for name in (AR_TRACK, IMAGE_TRACK)}
-        )
+            sub = Sample.concat(groups[lo:hi])
+            shards.append(self._run_rollout_one(self.ar_rollouts[r], self.dit_rollouts[r], sub))
+        return Sample.concat(shards)
 
-    def _run_rollout_one(self, ar_engine: Any, dit_engine: Any, req: RolloutReq) -> RolloutResp:
-        """One (AR, DiT) engine pair: PE-style fan-out → 2-track ``RolloutResp`` {"ar","image"}.
+    def _run_rollout_one(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
+        """One (AR, DiT) engine pair: fill the unified ``[input, ar, image]`` lineage.
 
-        Drives the given ``ar_engine`` / ``dit_engine`` pair (one replica). The
-        DP wrapper :meth:`run_rollout` calls this once per replica with that
-        node's engines; ``dp=1`` calls it once with replica 0.
+        Drives the given ``ar_engine`` / ``dit_engine`` pair for this replica's
+        prompt-trees::
 
-        ::
+            P prompts ──AR engine──▶ P*N recaptions  (root "ar", groups by prompt)
+                      ──DiT engine─▶ P*N*M images     ("image", groups by recaption)
 
-            P prompts ─make_root_track(N)─▶ P*N recaptions  (AR engine, root "ar")
-                      ─fork_track(M)──────▶ P*N*M images     (DiT engine, "image")
-
-        Mirrors :meth:`PEPipeline.generate`, but the two 1:1 child generators are
-        independent vLLM-Omni engine Remotes sharing one backbone/LoRA — so this
-        assembles the lineage explicitly and grafts each engine's
-        segment/decoded/conditions onto the lineage shell. The DiT engine reads
-        the ORIGINAL prompt (``primitives['text']``) plus the recaption
-        (``primitives['cot_text']``); each image's unique ``sample_id`` drives
-        ``engine.seed_from_sample_id`` so the M images of a recaption differ.
+        Each engine runs FLAT (re-rooted, 1:1) — the vLLM-Omni adapters require the
+        input primitive 1:1 with the gen samples — so the AR engine sees ``P*N``
+        pre-expanded prompts and the DiT engine sees ``P*N*M`` (the original prompt
+        plus the recaption chained as a ``cot_text`` input Part via
+        :meth:`Part.input_child`). Their per-sample outputs are mapped back, by row
+        order, onto the unified lineage shells (:meth:`Part.fill`) — both sides are
+        group-by-parent in the same order, so the rows line up. Each image's
+        ``r{rollout_id}:d{k}`` root makes its x_T per-rollout-VARYING (the engine
+        derives the noise key from the gen Part ids).
         """
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError("UnifiedModelTrainer.run_rollout: req.primitives['text'] must be a Texts primitive.")
-        prompts = list(texts.texts)
+        input_part = sample.parts[0]
+        ar_shell = sample.gen_part(ARSamplingParams)
+        image_shell = sample.gen_part(DiffusionSamplingParams)
+        prompts = input_part.primitives.get("text")
+        if not isinstance(prompts, Texts):
+            raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
+        n_rec = int(ar_shell.sampling_params.samples_per_prompt)
+        n_img = int(image_shell.sampling_params.samples_per_prompt)
+        rid = int(self._dump_rollout_id)
 
-        ar_params = req.sampling_params.get("ar")
-        diff_params = req.sampling_params.get("diffusion")
-        n_recaptions = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-        n_images = int(diff_params.samples_per_prompt)
-
-        # ── Level 1: P → P*N recaptions. Root "ar" track groups by prompt.
-        ar_shell = req.make_root_track(track_name=AR_TRACK, branch=n_recaptions)
-        ar_texts = Texts(texts=[t for t in prompts for _ in range(n_recaptions)])
-        # Ship the WHOLE composed params: the hi3_ar_recaption adapter reads its AR
-        # slice for sampling AND the diffusion slice's height/width for the
-        # recaption prompt (the engine keeps no sampling defaults).
-        ar_req = RolloutReq(
-            sample_ids=list(ar_shell.sample_ids),
-            group_ids=list(ar_shell.parent_ids),
+        # ── Level 1: AR. P*N pre-expanded prompts, re-rooted flat (1:1). The
+        # hi3_ar_recaption adapter reads its AR slice for sampling AND the diffusion
+        # slice's height/width, so ship the AR shell's params whole.
+        ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
+        n_ar = len(ar_texts.texts)
+        ar_input = Part.input(
+            [f"r{rid}:a{k}" for k in range(n_ar)],
             primitives={"text": ar_texts},
-            request_conditions={},
-            sampling_params=req.sampling_params,
+            control=dict(input_part.control),
         )
-        ar_resp = ar_engine.generate(ar_req)
-        ar_inner = ar_resp.tracks.get(AR_TRACK)
-        recaptions = ar_inner.decoded if ar_inner is not None else None
-        if not isinstance(recaptions, Texts):
-            raise RuntimeError("UnifiedModelTrainer.run_rollout: AR engine returned no decoded Texts on tracks['ar'].")
-        if len(recaptions.texts) != len(ar_shell.sample_ids):
+        # The hi3_ar_recaption adapter (carries_target_size) reads the diffusion gen
+        # Part's height/width for the recaption prompt, so the AR request carries a
+        # params-only diffusion shell ahead of the AR frontier. Only the AR stage
+        # runs (stages=("ar",)), so that shell is never generated/filled — it just
+        # supplies the canvas size; the "ar" output still fills the AR frontier
+        # (gen Parts are located by sampling_params type, not position).
+        ar_request = (
+            Sample.request(ar_input)
+            .fork(1, sampling_params=image_shell.sampling_params)
+            .fork(1, sampling_params=ar_shell.sampling_params)
+        )
+        ar_out = ar_engine.generate(ar_request)
+        ar_gen = ar_out.parts[-1]
+        recaptions = ar_gen.primitives.get("text")
+        if not isinstance(recaptions, Texts) or len(recaptions.texts) != n_ar:
+            got = len(recaptions.texts) if isinstance(recaptions, Texts) else type(recaptions).__name__
             raise RuntimeError(
-                f"UnifiedModelTrainer.run_rollout: AR engine returned {len(recaptions.texts)} recaption(s) "
-                f"but the AR track expects {len(ar_shell.sample_ids)} (= P*N). The AR engine must be 1:1."
+                f"UnifiedModelTrainer.run_rollout: AR engine must return {n_ar} decoded Texts (= P*N); got {got}."
             )
-        ar_track = _track_with_field(ar_shell, "segment", ar_inner.segment)
-        ar_track = _track_with_field(ar_track, "decoded", recaptions)
-        ar_track = _track_with_field(ar_track, "conditions", dict(ar_inner.conditions))
+        # Fill the unified ar shell (carries the N-grouping lineage) by row order.
+        ar_part = ar_shell.fill(
+            segment=ar_gen.segment,
+            primitives={"text": recaptions},
+            conditions=dict(ar_gen.conditions),
+        )
 
-        # ── Level 2: P*N → P*N*M images. Fork "image" from "ar". For AR sample i
-        # (0..P*N-1) the original prompt is prompts[i // N] and the recaption is
-        # recaptions[i]; replicate each M× for the 1:1 DiT engine.
-        img_shell = ar_track.fork_track(parent_name=AR_TRACK, child_name=IMAGE_TRACK, branch=n_images)
-        n_ar = len(ar_shell.sample_ids)
-        dit_prompts = Texts(texts=[prompts[i // n_recaptions] for i in range(n_ar) for _ in range(n_images)])
-        dit_cot = Texts(texts=[recaptions.texts[i] for i in range(n_ar) for _ in range(n_images)])
-        # Driver-authoritative x_T RECIPE (per-IMAGE, ROLLOUT-keyed gids). HI3's
-        # DiT latent shape is AR-dynamic, so we ship only the recipe (no shape);
-        # the worker's prepare_latents hook fills the shape post-AR and regenerates
-        # the byte-identical x_T (NoiseRecipe). Keying on (rollout_id, image
-        # sample_id) makes x_T per-rollout-VARYING — overriding the engine's
-        # seed_from_sample_id, which is keyed on the rollout-STABLE sample_id alone
-        # and so reused the SAME x_T every rollout (frozen-noise overfit, the bug
-        # this fixes). ``_dump_rollout_id`` is set to the current rollout_id by the
-        # train loop just before train_step. Opt out via DISABLE_DRIVER_XT.
-        dit_noise_gids = (
-            []
-            if os.environ.get("DISABLE_DRIVER_XT")
-            else [f"r{int(self._dump_rollout_id)}:{sid}" for sid in img_shell.sample_ids]
+        # ── Level 2: DiT. P*N*M pre-expanded (original prompt + recaption cot_text),
+        # re-rooted flat (1:1). The recaption rides as a chained cot_text input Part.
+        dit_prompts = Texts(texts=[prompts.texts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
+        dit_cot = Texts(texts=[recaptions.texts[i] for i in range(n_ar) for _ in range(n_img)])
+        # Re-root from the globally-unique image-shell lineage (flatten the path into a
+        # legal root id) rather than replica-local ``d{k}``: the DiT engine derives the
+        # x_T noise key from these ids, and ``d{k}`` restarts at 0 per dp>1 replica so
+        # images on different replicas would collide on identical noise. The shell ids
+        # are row-aligned with ``dit_prompts`` and the map-back is positional, so only
+        # the noise key changes — restoring the pre-migration lineage-based key.
+        dit_input = Part.input(
+            [sid.replace("/", "_") for sid in image_shell.sample_ids], primitives={"text": dit_prompts}
         )
-        dit_req = RolloutReq(
-            sample_ids=list(img_shell.sample_ids),
-            group_ids=list(img_shell.parent_ids),
-            primitives={"text": dit_prompts, "cot_text": dit_cot},
-            request_conditions={},
-            sampling_params={"diffusion": diff_params},
-            init_noise_group_ids=dit_noise_gids,
+        cot_input = dit_input.input_child(primitives={"text": dit_cot})
+        dit_out = dit_engine.generate(
+            Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params)
         )
-        dit_resp = dit_engine.generate(dit_req)
-        img_inner = dit_resp.tracks.get(IMAGE_TRACK)
-        if img_inner is None:
+        img_gen = dit_out.parts[-1]
+        if len(img_gen.sample_ids) != len(image_shell.sample_ids):
             raise RuntimeError(
-                f"UnifiedModelTrainer.run_rollout: DiT engine returned no 'image' track (got {sorted(dit_resp.tracks.keys())})."
+                f"UnifiedModelTrainer.run_rollout: DiT engine returned {len(img_gen.sample_ids)} image(s) "
+                f"but the image shell expects {len(image_shell.sample_ids)} (= P*N*M). The DiT engine must be 1:1."
             )
-        if len(img_inner.sample_ids) != len(img_shell.sample_ids):
-            raise RuntimeError(
-                f"UnifiedModelTrainer.run_rollout: DiT engine returned {len(img_inner.sample_ids)} image(s) "
-                f"but the image track expects {len(img_shell.sample_ids)} (= P*N*M). The DiT engine must be 1:1."
-            )
-        img_track = _track_with_field(img_shell, "segment", img_inner.segment)
-        img_track = _track_with_field(img_track, "decoded", img_inner.decoded)
-        img_track = _track_with_field(img_track, "conditions", dict(img_inner.conditions))
-        img_track = _track_with_field(img_track, "media_preview", img_inner.media_preview)
+        image_part = image_shell.fill(
+            segment=img_gen.segment,
+            primitives=dict(img_gen.primitives),
+            primitive_metadata=dict(img_gen.primitive_metadata),
+            conditions=dict(img_gen.conditions),
+            media_preview=img_gen.media_preview,
+        )
 
-        # Each anchored engine returns its track as ONE transport handle (a single
-        # ref spanning all P*N / P*N*M samples). The train side is num_devices-way DP and
-        # slices each track into per-rank shards — but a single ref can't be
-        # intra-handle-sliced ("does not align to ref boundaries"). Materialize
-        # the tracks to real tensors on the driver here; the reward / advantage /
+        # Each anchored engine returns its part as ONE transport handle (a single
+        # ref spanning all samples); the train side is num_devices-way DP and can't
+        # intra-handle-slice a single ref ("does not align to ref boundaries").
+        # Materialize to real tensors on the driver here; the reward / advantage /
         # train DP dispatch then re-shards real tensors. (DiffusionTrainer dodges
-        # this because its per-worker DP engine already emits one ref per rank,
-        # aligned to the train DP boundaries — our single-actor TP engines don't.)
-        deep_hydrate(ar_track)
-        deep_hydrate(img_track)
-
-        return RolloutResp(tracks={AR_TRACK: ar_track, IMAGE_TRACK: img_track})
+        # this because its per-worker DP engine already emits one ref per rank.)
+        deep_hydrate(ar_part)
+        deep_hydrate(image_part)
+        return Sample(parts=[input_part, ar_part, image_part])
 
     def train_step(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
@@ -580,9 +563,10 @@ class UnifiedModelTrainer(BaseTrainer):
         """
         t0 = time.perf_counter()
         if self._single_engine:
-            # Trainside / single-engine (M=1): the rollout shares the live FSDP
-            # modules — no engine wake/sleep, no base offload, no weight sync.
-            resp = self.run_rollout(req)
+            # Single-engine UniGRPO runs the Sample-native composed rollout
+            # directly. The trainside variant shares the live FSDP module, so it
+            # must not participate in the two-engine offload/sync choreography.
+            sample = self.run_rollout(sample)
         else:
             # Colocate memory dance (150GB base can't coexist with an awake engine
             # on the same card). Steady state on entry: base offloaded, engines
@@ -596,105 +580,90 @@ class UnifiedModelTrainer(BaseTrainer):
                     self.backend.offload()
             for _eng in self.ar_rollouts + self.dit_rollouts:
                 _eng.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.push()
-            resp = self.run_rollout(req)
-            for _eng in self.ar_rollouts + self.dit_rollouts:
-                _eng.sleep()
-            if self._enable_fsdp_offload:
-                self.backend.onload()
+            try:
+                if sync_weights and self.weight_sync is not None:
+                    self.weight_sync.push()
+                sample = self.run_rollout(sample)
+            finally:
+                for _eng in self.ar_rollouts + self.dit_rollouts:
+                    _eng.sleep()
+                if self._enable_fsdp_offload:
+                    self.backend.onload()
 
-        # 1. Score the IMAGE track only — the AR track's TextSegment is not
-        #    directly scorable; its reward is credit-assigned below.
-        #    Build a reward req aligned 1:1 with the image track (each image's
-        #    ORIGINAL prompt). score_and_attach is DP_SCATTER: it splits the track
-        #    across ranks but broadcasts the req, so a P-prompt req leaves each
-        #    rank with req(P) > track(P*N*M/dp) → "not an integer multiple". A
-        #    1:1 req shards together with the track (req==track per rank).
-        img_track = resp.tracks[IMAGE_TRACK]
-        ar_params = req.sampling_params.get("ar")
-        diff_params = req.sampling_params.get("diffusion")
-        n_rec = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-        n_img = int(diff_params.samples_per_prompt)
-        orig_texts = req.primitives.get("text")
-        reward_texts = Texts(texts=[orig_texts.texts[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))])
-        # Per-sample metadata, expanded 1:1 with the image track by the SAME
-        # prompt-index map as reward_texts. GenEval-style rewards read each
-        # image's compositional spec (tag/include/exclude) from metadata[i];
-        # without this expansion the geneval scorer raises (no per-item spec).
-        # Empty when the data source carries no metadata (e.g. pickscore prompts).
-        reward_metadata = (
-            [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))] if req.metadata else []
-        )
-        reward_req = RolloutReq(
-            sample_ids=list(img_track.sample_ids),
-            group_ids=list(img_track.parent_ids) if img_track.parent_ids else list(img_track.sample_ids),
-            primitives={"text": reward_texts},
-            request_conditions={},
-            sampling_params=req.sampling_params,
-            metadata=reward_metadata,
-        )
-        scored = self.reward.score_and_attach(req=reward_req, track=img_track)
-        if scored.rewards is not None:
-            scored.rewards = hydrate(scored.rewards)
-        resp.tracks[IMAGE_TRACK] = scored
+        # Locate the two gen Parts by sampling-params type (the image Part is the
+        # frontier of the unified [input, ar, image] lineage).
+        ar_idx = sample.gen_part_index(ARSamplingParams)
+        img_idx = sample.gen_part_index(DiffusionSamplingParams)
 
-        # 2. Credit-assign image reward up the lineage → fills the "ar" track.
-        resp = resp.propagate_rewards(op="mean")
+        # 1. Score the frontier (image) Part only — the AR TextSegment is not
+        #    directly scorable; its reward is credit-assigned below. The reward
+        #    derives each image's prompt context from the lineage (conditioning),
+        #    so no manual req expansion is needed.
+        sample = self.reward.score_and_attach(sample)
+        # propagate_rewards reshapes child rewards directly (no hydration), so
+        # realize the worker-returned TensorRef first.
+        img_part = sample.parts[img_idx]
+        if img_part.rewards is not None:
+            img_part.rewards = hydrate(img_part.rewards)
+        if isinstance(img_part.component_rewards, dict):
+            img_part.component_rewards = {name: hydrate(value) for name, value in img_part.component_rewards.items()}
+
+        # 2. Credit-assign image reward up the lineage → fills the "ar" Part.
+        sample = sample.propagate_rewards(op="mean")
 
         # 3. Mean image reward for the log line.
         mean_reward = 0.0
-        di_rewards = resp.tracks[IMAGE_TRACK].rewards
+        di_rewards = sample.parts[img_idx].rewards
         if di_rewards is not None:
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
         # 3b. Intrusive debug dump (best-effort) — observe what AR generated and
-        #     what DiT rendered before advantages/training mutate the tracks.
+        #     what DiT rendered before advantages/training mutate the Parts.
         if self.dump_dir:
-            self._dump_rollout(self._dump_rollout_id, req, resp)
+            self._dump_rollout(self._dump_rollout_id, sample)
 
-        # 4. GRPO advantages. AR always groups by prompt. In single-engine
-        #    (M=1 / UniGRPO) mode the image is 1:1 with its AR chain, so it SHARES
-        #    the AR's prompt-level advantage (Â_i) — the framework's per-rewrite
-        #    image grouping would be a degenerate size-1 group (advantage 0) at M=1.
-        resp.tracks[AR_TRACK] = resp.tracks[AR_TRACK].compute_advantages(normalize=True)
+        # 4. AR always groups by prompt. In single-engine M=1 mode the image
+        #    Part is 1:1 with the AR Part, so share the prompt-level advantage;
+        #    computing an image advantage by rewrite would produce size-1 groups.
+        new_parts = list(sample.parts)
+        new_parts[ar_idx] = new_parts[ar_idx].compute_advantages(normalize=True)
         if self._shared_advantage:
-            resp.tracks[IMAGE_TRACK] = _track_with_field(
-                resp.tracks[IMAGE_TRACK], "advantages", resp.tracks[AR_TRACK].advantages
-            )
+            if new_parts[img_idx].batch_size != new_parts[ar_idx].batch_size:
+                raise ValueError(
+                    "UnifiedModelTrainer: shared M=1 advantage requires equal AR/image batch sizes; "
+                    f"got {new_parts[ar_idx].batch_size} and {new_parts[img_idx].batch_size}."
+                )
+            new_parts[img_idx] = dataclasses.replace(new_parts[img_idx], advantages=new_parts[ar_idx].advantages)
         else:
-            resp.tracks[IMAGE_TRACK] = resp.tracks[IMAGE_TRACK].compute_advantages(normalize=True)
+            new_parts[img_idx] = new_parts[img_idx].compute_advantages(normalize=True)
+        sample = sample.with_parts(new_parts)
 
-        # after the debug dump (which reads decoded), before training.
-        # ``reward_texts`` is 1:1 with the image track (built at scoring), so it
-        # captions the image previews correctly.
-        self._drop_decoded(
-            req,
-            resp,
-            rollout_id=rollout_id,
-            media_prompts={IMAGE_TRACK: list(reward_texts.texts)},
-        )
-        # 5. Two backward (shared backbone) → one optimizer step.
+        # Captions for the image previews fall back to the frontier-aligned prompt
+        # texts (``Sample.conditioning``), so no per-track caption override is needed.
+        self._drop_decoded(sample, rollout_id=rollout_id)
+        # 5. Two backward (shared backbone) → one optimizer step. Pass the whole
+        #    [input, ar, image] lineage so the stack DP-scatters it as a unit
+        #    (Sample.chunk tree-shards both stages at the SAME prompt boundaries);
+        #    passing the two Parts separately replicates the P*N*M image Part at dp>1.
         results: Dict[str, TrainStepResult] = self.stack.train_track(
-            resp.tracks[AR_TRACK],
-            resp.tracks[IMAGE_TRACK],
+            sample,
             training_progress=float(training_progress),
         )
         self.wandb_logger.log_rollout_step(
             rollout_id,
             results,
-            resp,
+            sample,
             step_time_s=time.perf_counter() - t0,
             extra_metrics={"sync_weights": float(bool(sync_weights))},
         )
 
         # 6. Back to steady state (base on CPU) so the next rollout's engines
         #    have room to wake.
-        if self._enable_fsdp_offload:
+        if self._enable_fsdp_offload and not self._single_engine:
             self.backend.offload()
         return results, mean_reward
 
-    def _dump_rollout(self, rollout_id: int, req: RolloutReq, resp: Any) -> None:
+    def _dump_rollout(self, rollout_id: int, sample: Any) -> None:
         """Best-effort intrusive dump of one rollout to ``self.dump_dir``.
 
         Writes ``rollout_<id>/`` with:
@@ -710,21 +679,23 @@ class UnifiedModelTrainer(BaseTrainer):
             out_dir = os.path.join(self.dump_dir, f"rollout_{rollout_id}")
             os.makedirs(out_dir, exist_ok=True)
 
-            prompts_obj = req.primitives.get("text")
-            prompts = list(prompts_obj.texts) if prompts_obj is not None else []
+            prompts_obj = sample.parts[0].primitives.get("text")
+            prompts = list(prompts_obj.texts) if isinstance(prompts_obj, Texts) else []
 
-            ar_track = resp.tracks.get(AR_TRACK)
-            ar_decoded = getattr(ar_track, "decoded", None) if ar_track is not None else None
-            ar_texts = list(ar_decoded.texts) if ar_decoded is not None else []
+            ar_part = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
+            ar_decoded = ar_part.primitives.get("text") if ar_part is not None else None
+            ar_texts = list(ar_decoded.texts) if isinstance(ar_decoded, Texts) else []
 
-            image_track = resp.tracks.get(IMAGE_TRACK)
-            img_decoded = getattr(image_track, "decoded", None) if image_track is not None else None
-            sample_ids = list(image_track.sample_ids) if image_track is not None else []
-            parent_ids = list(image_track.parent_ids) if (image_track is not None and image_track.parent_ids) else []
+            image_part = next(
+                (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
+            )
+            img_decoded = image_part.primitives.get("image") if image_part is not None else None
+            sample_ids = list(image_part.sample_ids) if image_part is not None else []
+            parent_ids = list(image_part.group_ids) if image_part is not None else []
 
             rewards = None
-            if image_track is not None and image_track.rewards is not None:
-                rewards = hydrate(image_track.rewards).to(torch.float32).tolist()
+            if image_part is not None and image_part.rewards is not None:
+                rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
 
             # Save images (best-effort): hydrate pixels and write per-sample PNGs.
             n_imgs = 0
@@ -815,9 +786,11 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.backend.offload()
             for eng in self.ar_rollouts + self.dit_rollouts:
                 eng.wake_up()
-            self.weight_sync.push()
-            for eng in self.ar_rollouts + self.dit_rollouts:
-                eng.sleep()
+            try:
+                self.weight_sync.push()
+            finally:
+                for eng in self.ar_rollouts + self.dit_rollouts:
+                    eng.sleep()
         # Default pass: training reward + shared-set suites score the SAME images.
         scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
         metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
@@ -851,49 +824,29 @@ class UnifiedModelTrainer(BaseTrainer):
         is floored off.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
+        n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
         usable = n_prompts - n_prompts % chunk or n_prompts
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
-            req = self._build_req(sub, step, base_sampling=eval_sp)
+            request = self._build_request_sample(sub, step, sampling=eval_sp)
             if self._single_engine:
-                resp = self.run_rollout(req)
+                generated = self.run_rollout(request)
             else:
                 for eng in self.ar_rollouts + self.dit_rollouts:
                     eng.wake_up()
-                resp = self.run_rollout(req)
-                for eng in self.ar_rollouts + self.dit_rollouts:
-                    eng.sleep()
-            # Score the image track only; build a reward req aligned 1:1 with the
-            # image track (each image's ORIGINAL prompt) so req and track shard
-            # together across DP ranks (mirrors train_step).
-            img_track = resp.tracks[IMAGE_TRACK]
-            ar_params = req.sampling_params.get("ar")
-            diff_params = req.sampling_params.get("diffusion")
-            n_rec = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-            n_img = int(diff_params.samples_per_prompt)
-            orig_texts = req.primitives.get("text")
-            reward_texts = Texts(
-                texts=[orig_texts.texts[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))]
-            )
-            reward_metadata = (
-                [req.metadata[i // (n_rec * n_img)] for i in range(len(img_track.sample_ids))] if req.metadata else []
-            )
-            reward_req = RolloutReq(
-                sample_ids=list(img_track.sample_ids),
-                group_ids=list(img_track.parent_ids) if img_track.parent_ids else list(img_track.sample_ids),
-                primitives={"text": reward_texts},
-                request_conditions={},
-                sampling_params=req.sampling_params,
-                metadata=reward_metadata,
-            )
+                try:
+                    generated = self.run_rollout(request)
+                finally:
+                    for eng in self.ar_rollouts + self.dit_rollouts:
+                        eng.sleep()
             for name, reward in scorers:
-                scored = reward.score_and_attach(req=reward_req, track=img_track)
-                if scored.rewards is not None:
-                    r = hydrate(scored.rewards).to(torch.float32)
+                scored = reward.score_and_attach(generated)
+                rewards = scored.parts[-1].rewards
+                if rewards is not None:
+                    r = hydrate(rewards).to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
@@ -933,7 +886,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 self._dump_rollout_id = rollout_id  # picked up by train_step's dump
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
+                sample = self._build_request_sample(inputs, rollout_id)
                 # Sync before generate; skip step 0 (nothing trained yet). On
                 # resume, force the first sync — the engine booted with fresh
                 # weights and needs the restored adapter before generate. The
@@ -946,7 +899,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 )
                 sync_weights = force_sync or (rollout_id > 0 and rollout_id % interval == 0)
                 results, mean_reward = self.train_step(
-                    req,
+                    sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
@@ -964,6 +917,12 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+        except Exception:
+            # Surface the real failure (e.g. a worker CUDA OOM re-raised by ray.get)
+            # at the point we catch it -- before _finish_wandb runs -- so it lands in
+            # the log immediately instead of being masked by a hanging teardown.
+            logger.exception("Training loop aborted at rollout %s", locals().get("rollout_id", "?"))
+            raise
         finally:
             self._finish_wandb()
 

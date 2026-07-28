@@ -2,7 +2,7 @@
 
 A thin core over the backend seam: it names no concrete model (the adapter,
 picked from the registry by ``config.model_family``, owns the
-``RolloutReq``↔``RolloutResp`` conversion) and no concrete transport (the seam
+``Sample`` → ``Sample`` conversion) and no concrete transport (the seam
 owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
 picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
 constructed over the seam; the offload lifecycle (the two staged flags) lives
@@ -28,19 +28,18 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangRolloutEngine(BaseRolloutEngine):
+class SGLangRolloutEngine(BaseSingleTurnRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"
@@ -193,7 +192,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._backend = NativeBackend.boot(
                 intent,
                 concurrency=concurrency,
-                cuda_visible_devices=self._tp_visible_devices,
             )
         else:
             # The address peers reach this server at (the bind host is usually
@@ -223,38 +221,60 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
+        # The backend owns its runtime concurrency. The engine only owns policy
+        # provenance and delegates generation through the seam.
+        self._weight_version = 0
+
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — sync whole-Sample path, safe for concurrent callers
     # ------------------------------------------------------------------ #
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run text generation against the engine and return a typed response.
-
-        Only tp_rank==0 hosts a SGLang server; other TP ranks in the group are
-        no-op shells. The ``DP_SCATTER`` collect (``_collect_dp_merge``) keeps
-        only results from ranks where ``tp_rank==0 and
-        is_pipeline_last_stage and sp_rank==0``, so a shell's return value is
-        dropped by the collect (the ``return None`` below is defensive — the
-        collect filters on ``RankInfo``, not on ``None``).
-        """
-        if not self._is_tp_zero:
-            return None
+    def _prepare_generation(self, sample: Sample) -> Any:
         require(
-            int(req.batch_size) > 0,
-            "SGLangRolloutEngine.generate requires non-empty req (batch_size > 0)",
+            int(sample.parts[-1].batch_size) > 0,
+            "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        sampling = resolve_sampling(self.cfg, req)
-        prepared = self.adapter.build_inputs(req, sampling=sampling)
-        # Activate the synced LoRA adapter for these requests — the visible
-        # line connecting WeightSync's state to the wire (the adapter and the
-        # seam stay unaware of weight sync).
+        sampling = resolve_sampling(self.cfg, sample)
+        prepared = self.adapter.build_inputs(sample, sampling=sampling)
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
             for payload in prepared.wire:
                 payload["lora_path"] = active_adapter
+        return prepared
+
+    def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
+        return self._stamp_weight_version(self.adapter.build_response(sample, prepared, raw))
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole Sample synchronously through the backend seam.
+
+        Only tp_rank==0 hosts a SGLang server; other TP ranks in the group are
+        no-op shells. The DP_SCATTER collect keeps only tp_rank==0 pipeline-tail
+        results, so returning None here is defensive and gets filtered out.
+        """
+        if not self._is_tp_zero:
+            return None
+        prepared = self._prepare_generation(sample)
         raw = self._backend.generate(prepared.wire)
-        return self.adapter.build_response(req, prepared, raw)
+        return self._finish_generation(sample, prepared, raw)
+
+    # ── control plane — sync; reached via the raw Worker.call RPC ──────────
+    def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
+        """Abort in-flight generation (best-effort). Partials surface via the
+        pending ``generate`` returns, so this returns ``[]``."""
+        del ids
+        if self._is_tp_zero:
+            self._backend.abort(abort_all=True)
+        return []
+
+    def pause(self) -> None:
+        if self._is_tp_zero:
+            self._backend.pause()
+
+    def resume(self) -> None:
+        if self._is_tp_zero:
+            self._backend.resume()
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flags live here; decorators re-applied
@@ -377,6 +397,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -427,6 +448,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,

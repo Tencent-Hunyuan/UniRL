@@ -164,12 +164,23 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
         pending = [
-            (role, worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}))
+            (
+                role,
+                worker.call.remote(role, "tp_per_stage", (), {}),
+                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
+            )
             for role, workers in self._targets
             for worker in workers
         ]
-        for role, ref in pending:
-            self._assert_loaded(exp_a, exp_b, ray.get(ref), label=f"engine {role!r}")
+        for role, topology_ref, loaded_ref in pending:
+            topology, loaded = ray.get([topology_ref, loaded_ref])
+            self._assert_loaded(
+                exp_a,
+                exp_b,
+                loaded,
+                topology=topology,
+                label=f"engine {role!r}",
+            )
         logger.info(
             "[LoRA-SYNC] rank 0: verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
             len(self._targets),

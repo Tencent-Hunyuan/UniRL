@@ -1,7 +1,7 @@
 """``sglang_diffusion`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete model (the adapter, picked
-from the registry by ``config.model_family``, owns the ``RolloutReq``↔``RolloutResp``
+from the registry by ``config.model_family``, owns the ``Sample`` → ``Sample``
 conversion) and no concrete backend (the seam owns the runtime). Weight sync is a
 :class:`WeightSync` component constructed over the seam; the offload lifecycle (a
 single flag) lives directly on the engine. The frozen ``base.py`` surface is
@@ -18,13 +18,14 @@ engine is usable. ``generate`` / ``sleep`` / ``wake_up`` re-apply ``@distributed
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -33,10 +34,10 @@ from unirl.rollout.engine.sglang_diffusion.config import (
 )
 from unirl.rollout.engine.sglang_diffusion.weight_sync import WeightSync
 from unirl.sde.noise import generate_latents
-from unirl.sde.runtime import ensure_req_sigmas
+from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Part, Sample
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
 _CPU_BACKUP_TAGS = ("vae", "text_encoder")
 
 
-class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
+class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
     """Rollout engine backed by ``sglang.multimodal_gen.DiffGenerator`` (v2 layout)."""
 
     _component_name = "sglang_diffusion"
@@ -119,51 +120,94 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         # σ schedule policy comes from the adapter (absorbs the generic-vs-factory branch).
         self.schedule_policy = self.adapter.schedule_policy()
 
+        # The DiffGenerator backend is synchronous and its scheduler client is not
+        # request-concurrent-safe; the lock serializes concurrent generate callers.
+        self._weight_version = 0
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
+
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — sync entrypoint, serialized internally
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole DP shard synchronously."""
+        return self._generate_locked(sample)
+
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
+            return self._stamp_weight_version(self._generate_core(sample))
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous generation for one whole ``Sample``."""
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
-            int(req.batch_size) > 0,
-            "SGLangDiffusionRolloutEngine.generate requires a non-empty req (batch_size > 0)",
+            int(gen.batch_size) > 0,
+            "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        # σ SSOT: pin once on the full batch (a shared field, so req.slice keeps it).
-        ensure_req_sigmas(req, self.schedule_policy)
+        # σ SSOT: pin once onto the gen part's (shared) sampling_params, so every
+        # forward-batch chunk sees the same schedule.
+        self._ensure_sample_sigmas(sample)
 
         fbs = self.cfg.forward_batch_size
-        bs = int(req.batch_size)
+        bs = int(gen.batch_size)
         if fbs is None or bs <= fbs:
-            return self._generate_batch(req)
+            return self._generate_batch(sample)
 
-        outputs: List[RolloutResp] = []
+        # Slice the gen frontier into chunks; ``replace_frontier`` keeps the input
+        # part(s) whole (mirrors trainside; preserves any chained inputs).
+        gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
-            outputs.append(self._generate_batch(req.slice(start, end)))
+            chunk = self._generate_batch(sample.replace_frontier(gen.slice(start, end)))
+            gen_chunks.append(chunk.frontier_gen_part(DiffusionSamplingParams))
             torch.cuda.empty_cache()
-        return RolloutResp.concat(outputs)
+        return sample.replace_frontier(Part.concat(gen_chunks))
 
-    def _generate_batch(self, req: RolloutReq) -> RolloutResp:
-        initial_noise = self._resolve_initial_noise(req)
-        kwargs = self.adapter.build_inputs(req, initial_noise=initial_noise)
+    def _ensure_sample_sigmas(self, sample: Sample) -> None:
+        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
+
+        σ is the single source of truth, computed from the model-owned schedule
+        policy and shared across the part's samples (one params object).
+        """
+        ensure_sample_sigmas(sample, self.schedule_policy)
+
+    def _generate_batch(self, sample: Sample) -> Sample:
+        initial_noise = self._resolve_initial_noise(sample)
+        kwargs = self.adapter.build_inputs(sample, initial_noise=initial_noise)
         raw = self._backend.generate(kwargs)
-        return self.adapter.build_response(req, raw)
+        return self.adapter.build_response(sample, raw)
 
-    def _resolve_initial_noise(self, req: RolloutReq) -> Optional[torch.Tensor]:
-        """NoiseRecipe (driver-authoritative x_T) → init_same_noise → None. Model-agnostic."""
-        xt = NoiseRecipe.from_rollout_req(req).resolve()
+    def _resolve_initial_noise(self, sample: Sample) -> Optional[torch.Tensor]:
+        """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic.
+
+        ``disable_driver_xt`` returns ``None`` before every recipe/fallback path.
+        Otherwise, the x_T noise key is derived from the lineage path (OD-2): the parent
+        (group) id under ``init_same_noise`` so siblings share x_T, else the
+        per-sample id. ``initial_latents`` (img2img) rides on the gen part's
+        ``LatentSegment`` shell; the regen shape on ``init_noise_latent_shape``.
+        """
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
+        diffusion = gen.sampling_params
+        if diffusion is not None and bool(getattr(diffusion, "disable_driver_xt", False)):
+            return None
+        recipe = NoiseRecipe.from_sample(sample)
+        xt = recipe.resolve()
         if xt is not None:
             return xt
         if not bool(self.cfg.init_same_noise):
             return None
 
-        diffusion = req.sampling_params.get("diffusion")
         require(
             diffusion is not None and diffusion.seed is not None,
-            "init_same_noise=True requires req.sampling_params diffusion seed",
+            "init_same_noise=True requires a diffusion seed",
         )
-        batch_size = int(req.batch_size)
+        batch_size = int(gen.batch_size)
         latent_shape = self._backend.prepare_latent_shape(
             height=int(diffusion.height),
             width=int(diffusion.width),
@@ -178,7 +222,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             dtype=dtype,
             init_same_noise=True,
             samples_per_prompt=int(diffusion.samples_per_prompt),
-            noise_group_ids=[str(gid) for gid in req.group_ids],
+            noise_group_ids=[str(g) for g in gen.group_ids],
             base_seed=int(diffusion.seed),
         )
 
@@ -220,7 +264,14 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         return self._backend.ping()
 
     def shutdown(self) -> None:
-        self._backend.shutdown()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            with self._generate_lock:
+                self._shutdown_requested = True
+            with self._generate_lock:
+                self._backend.shutdown()
+            self._shutdown_complete = True
 
     # ------------------------------------------------------------------ #
     # Weight sync — frozen base.py surface; thin forwards to the component.
@@ -244,6 +295,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -286,6 +338,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,

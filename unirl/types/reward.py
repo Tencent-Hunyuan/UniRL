@@ -22,15 +22,16 @@ class RewardType(Enum):
 class RewardRequest:
     """Request for reward computation.
 
-    Two typed primitive dicts mirror the ``RolloutReq`` contract:
+    Two typed primitive dicts describe one scoring unit:
 
     ``primitives``
-        Input context — what was fed to the model.  Copied from
-        ``RolloutReq.primitives``.  Typical keys: ``"text"`` (prompt
-        ``Texts``), ``"image"`` (conditioning ``Images``).
+        Input context — what was fed to the model. From the scored
+        ``Sample``'s conditioning (its ancestor input Parts). Typical keys:
+        ``"text"`` (prompt ``Texts``), ``"image"`` (conditioning ``Images``).
 
     ``generated``
-        Model output being scored — from ``RolloutTrack.decoded``.
+        Model output being scored — the frontier ``Part``'s complete
+        ``primitives`` map.
         Typical keys: ``"image"`` (generated ``Images``), ``"video"``
         (generated ``Videos``), ``"text"`` (generated ``Texts``).
 
@@ -48,7 +49,7 @@ class RewardRequest:
     reward_types: List[RewardType] = field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
     return_components: bool = False
     # Source sample rate (Hz) of any waveforms in ``generated["audio"]``. Set by
-    # the reward service when a track carries a parallel audio stream (LTX-2.3
+    # the reward service when a Part carries a parallel audio stream (LTX-2.3
     # T2AV). ``None`` for non-audio requests. Audio reward scorers (CLAP /
     # ImageBind) read it to resample to their model's expected rate.
     audio_sample_rate: Optional[int] = None
@@ -87,7 +88,7 @@ class RewardRequest:
     def audio(self) -> Optional[List[torch.Tensor]]:
         """Generated audio waveforms, one ``[C, L]`` (or ``[L]``) tensor per sample.
 
-        Populated when a track carries a parallel audio stream (LTX-2.3 T2AV);
+        Populated when a Part carries a parallel audio stream (LTX-2.3 T2AV);
         the reward service places the decoded ``Audios`` under
         ``generated["audio"]``. ``None`` for non-audio requests.
         """

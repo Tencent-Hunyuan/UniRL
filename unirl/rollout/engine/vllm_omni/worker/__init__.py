@@ -9,8 +9,8 @@ instantiation time. They are the receive side of the three transports:
   the checksum read-backs. Installs the patch bundle in ``__new__``.
 - ``NcclBroadcastReceiveMixin`` — NCCL ``init_weights_update_group`` /
   ``update_weights_from_distributed`` / ``destroy_weights_update_group``.
-- ``HI3ARWeightSyncExtension`` / ``DiTWeightSyncExtension`` — the per-stage
-  compositions the YAMLs reference.
+- ``HI3ARWeightSyncExtension`` / ``Qwen3OmniARWeightSyncExtension`` /
+  ``DiTWeightSyncExtension`` — the per-stage compositions the YAMLs reference.
 
 Host contract (the vllm-omni worker ``self`` these mixins extend): ``device``,
 ``local_rank``, ``load_weights(weights)``, ``add_lora(req)`` /
@@ -30,6 +30,7 @@ _LAZY_TARGETS = {
     "BucketedIPCReceiveMixin": ("ipc_receive_mixin", "BucketedIPCReceiveMixin"),
     "NcclBroadcastReceiveMixin": ("nccl_receive_mixin", "NcclBroadcastReceiveMixin"),
     "HI3ARWeightSyncExtension": ("ar_extension", "HI3ARWeightSyncExtension"),
+    "Qwen3OmniARWeightSyncExtension": ("qwen3_omni_ar_extension", "Qwen3OmniARWeightSyncExtension"),
     "DiTWeightSyncExtension": ("dit_extension", "DiTWeightSyncExtension"),
 }
 

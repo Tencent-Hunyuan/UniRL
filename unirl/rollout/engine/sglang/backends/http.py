@@ -1,13 +1,14 @@
-"""The HTTP ``Backend`` impl — SGLang SRT server subprocess + HTTP client.
+"""The HTTP ``Backend`` impl — SGLang SRT server subprocess + sync HTTP client.
 
 The ONLY module that imports the SGLang runtime or does I/O — including the
 spawn. :meth:`HTTPBackend.boot` filters the config-spelled intent against the
 real ``ServerArgs`` fields (the only place that knows them), quarantines the env
 the SRT subprocess needs at the spawn boundary, launches the server, and polls
-``/health_generate``. Generation fans the per-prompt payloads out concurrently
-(persistent event loop + semaphore + retry — ``slime``-style HTTP plumbing); weight/memory
-verbs are synchronous POSTs with
-the long weight-op timeout tier.
+``/health_generate``. Everything is plain blocking ``urllib`` — no event loop:
+generation concurrency comes from the CALLERS' threads (the agentic drain runs
+one thread per trajectory; the batch path fans out on its own pool), bounded by
+one ``threading.Semaphore``, and the SRT server batches the in-flight POSTs
+together. Weight/memory verbs keep the long weight-op timeout tier.
 
 Control-plane payloads (weight sync, memory, LoRA) are constructed from the
 installed runtime's own ``io_struct`` request dataclasses rather than hand-built
@@ -24,33 +25,28 @@ function.
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import json
 import logging
 import multiprocessing
 import os
 import signal
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from unirl.rollout.engine.sglang.backends.base import (
-    _normalize_cuda_visible_devices,
-    _preloaded_cuda_driver_libraries,
-    _preserve_cuda_driver_preloads,
-    _run_sglang_scheduler_with_cuda_driver_preload,
-    _scheduler_spawn_environment,
-)
-
-try:
-    import httpx
-except ImportError:  # pragma: no cover - exercised only when httpx is missing
-    httpx = None  # type: ignore[assignment]
+from unirl.rollout.engine.sglang.backends.base import _normalize_cuda_visible_devices
 
 logger = logging.getLogger(__name__)
+
+#: Sentinel for :meth:`HTTPBackend._post`'s ``timeout``: apply the per-path
+#: tier (600s weight ops / 120s rest). Pass ``None`` explicitly to block
+#: indefinitely (the ``/generate`` decode path).
+_TIERED_TIMEOUT: Any = object()
 
 
 # ---------------------------------------------------------------------------
@@ -133,18 +129,14 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     }
 
 
-def _launch_server_with_cuda_driver_preloads(
-    server_args: Any,
-    driver_libraries: Sequence[str],
-) -> Any:
-    """HTTP server target that preserves driver shims for scheduler spawns."""
+def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
+    """HTTP server target with child-local launch environment overrides."""
+    if env_overrides:
+        os.environ.update(env_overrides)
+
     from sglang.srt.entrypoints.http_server import launch_server
 
-    with _preserve_cuda_driver_preloads(driver_libraries):
-        return launch_server(
-            server_args,
-            run_scheduler_process_func=_run_sglang_scheduler_with_cuda_driver_preload,
-        )
+    return launch_server(server_args)
 
 
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
@@ -240,11 +232,10 @@ class HTTPBackend:
         self._base_url = base_url
         self._concurrency = int(concurrency)
         self._rt = runtime
-        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._client: Any = None
-        if httpx is not None:
-            self._async_loop = asyncio.new_event_loop()
-            self._client = self._run_async(self._make_client())
+        # One shared semaphore bounding concurrent in-flight /generate POSTs
+        # across ALL caller threads (agentic trajectory threads + the batch
+        # path's own fan-out pool share this single bound).
+        self._sem = threading.Semaphore(int(concurrency))
         self._logged_first_response = False
 
     # ------------------------------------------------------------------ #
@@ -315,7 +306,6 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-
         server_args = rt["ServerArgs"](**server_kwargs)
 
         tp_size = int(server_kwargs.get("tp_size", 1))
@@ -323,21 +313,16 @@ class HTTPBackend:
             cuda_visible_devices,
             tp_size=tp_size,
         )
+        env_overrides: Dict[str, str] = {}
         if visible_devices is not None:
             # The restricted list is re-indexed to logical ordinals 0..TP-1.
             server_args.base_gpu_id = 0
-        cuda_driver_preloads = _preloaded_cuda_driver_libraries()
-        if cuda_driver_preloads:
-            process = multiprocessing.Process(
-                target=_launch_server_with_cuda_driver_preloads,
-                args=(server_args, cuda_driver_preloads),
-            )
-        else:
-            process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
-        # The server child captures the clean library path and CUDA tokens at
-        # start; the Ray Worker's environment is restored immediately after.
-        with _scheduler_spawn_environment(visible_devices):
-            process.start()
+            env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        process = multiprocessing.Process(
+            target=_launch_server_with_env,
+            args=(server_args, env_overrides),
+        )
+        process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
         wait_server_healthy(
@@ -358,29 +343,29 @@ class HTTPBackend:
         return cls(process, base_url, concurrency=concurrency, runtime=rt)
 
     # ------------------------------------------------------------------ #
-    # Generation — async fan-out owned here (event loop, semaphore, retry)
+    # Generation — blocking POSTs; concurrency = caller threads + semaphore
     # ------------------------------------------------------------------ #
 
-    async def _make_client(self) -> Any:
-        return httpx.AsyncClient(
-            timeout=httpx.Timeout(None),
-            trust_env=False,
-        )
-
-    def _run_async(self, awaitable: Any) -> Any:
-        if self._async_loop is None or self._async_loop.is_closed():
-            close = getattr(awaitable, "close", None)
-            if close is not None:
-                close()
-            raise RuntimeError("sglang HTTPBackend async event loop is not available.")
-        return self._async_loop.run_until_complete(awaitable)
-
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
-        """POST the per-prompt payloads concurrently; flatten prompt-major."""
-        if self._client is None:
-            raise RuntimeError("httpx is required for sglang generate. Install httpx: pip install httpx")
+        """POST the per-prompt payloads concurrently; flatten prompt-major.
+
+        Safe for concurrent callers: each POST blocks its own thread while the
+        SRT server batches the in-flight requests. A length-1 wire (the agentic
+        per-turn path) posts on the calling thread — no pool, no per-batch INFO
+        log; longer wires fan out on a throwaway pool (``executor.map`` keeps
+        prompt order).
+        """
+        if not requests:
+            return []
+        if len(requests) == 1:
+            return self.generate_one(requests[0])
         t0 = time.perf_counter()
-        results = self._run_async(self._generate_async(requests))
+        with ThreadPoolExecutor(
+            max_workers=min(self._concurrency, len(requests)),
+            thread_name_prefix="sglang-http-gen",
+        ) as pool:
+            nested = list(pool.map(self.generate_one, requests))
+        results = [item for sublist in nested for item in sublist]
         elapsed = time.perf_counter() - t0
         logger.info(
             "sglang HTTPBackend.generate: %d requests -> %d results in %.2fs",
@@ -390,78 +375,82 @@ class HTTPBackend:
         )
         return results
 
-    async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
-        sem = asyncio.Semaphore(self._concurrency)
+    def generate_one(self, payload: Dict[str, Any]) -> List[_HTTPRawResult]:
+        """POST ONE ``/generate`` payload, bounded by the shared semaphore."""
+        with self._sem:
+            response = self._post_generate(payload)
+        parsed = parse_generate_response(response)
+        if not self._logged_first_response and parsed:
+            self._logged_first_response = True
+            first = parsed[0]
+            logger.info(
+                "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                len(first.token_ids),
+                len(first.logprobs),
+                first.text[:200],
+            )
+        return parsed
 
-        async def _generate_one(payload: Dict[str, Any]) -> List[_HTTPRawResult]:
-            async with sem:
-                response = await self._apost("/generate", payload)
-            parsed = parse_generate_response(response)
-            if not self._logged_first_response and parsed:
-                self._logged_first_response = True
-                first = parsed[0]
-                logger.info(
-                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
-                    len(first.token_ids),
-                    len(first.logprobs),
-                    first.text[:200],
-                )
-            return parsed
+    def _post_generate(self, payload: Dict[str, Any], max_retries: int = 60) -> Any:
+        """POST /generate with retry. Mirrors slime/utils/http_utils.py:165-198.
 
-        nested = await asyncio.gather(*(_generate_one(p) for p in requests))
-        return [item for sublist in nested for item in sublist]
-
-    async def _apost(
-        self,
-        path: str,
-        payload: Dict[str, Any],
-        max_retries: int = 60,
-    ) -> Any:
-        """Async POST with retry. Mirrors slime/utils/http_utils.py:165-198."""
-        url = f"{self._base_url}{path}"
+        ``timeout=None``: a long decode must never be killed client-side (the
+        old async client ran with no timeout — same semantics: bounded retry
+        against a dead server, indefinite block on a wedged-but-alive one).
+        """
+        url = f"{self._base_url}/generate"
         for attempt in range(max_retries):
-            response = None
             try:
-                response = await self._client.post(url, json=payload)
-                response.raise_for_status()
-                content = await response.aread()
-                return json.loads(content) if content else {}
+                return self._post("/generate", payload, timeout=None)
             except Exception as exc:
                 if attempt >= max_retries - 1:
-                    error_detail = ""
-                    if response is not None:
-                        try:
-                            error_detail = response.text[:500]
-                        except Exception:
-                            pass
-                    raise RuntimeError(
-                        f"SGLang SRT POST {url} failed after {max_retries} retries: {exc} | response={error_detail}"
-                    ) from exc
-                logger.debug(
-                    "SGLang SRT POST %s attempt %d/%d failed: %s",
-                    url,
-                    attempt + 1,
-                    max_retries,
-                    exc,
-                )
-                await asyncio.sleep(1)
-            finally:
-                if response is not None:
-                    await response.aclose()
+                    raise RuntimeError(f"SGLang SRT POST {url} failed after {max_retries} retries: {exc}") from exc
+                logger.debug("SGLang SRT POST %s attempt %d/%d failed: %s", url, attempt + 1, max_retries, exc)
+                time.sleep(1)
         return {}  # unreachable
 
     # ------------------------------------------------------------------ #
-    # Sync HTTP for non-generation endpoints (weight sync, memory)
+    # Abort / pause — best-effort sync POSTs (bounded 10s, swallow + warn).
     # ------------------------------------------------------------------ #
 
-    def _post(self, path: str, payload: Dict[str, Any]) -> Any:
-        """Synchronous POST JSON to the SRT server."""
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        payload: Dict[str, Any] = {"rid": rid} if rid is not None else {"abort_all": bool(abort_all)}
+        self._post_best_effort("/abort_request", payload)
+
+    def pause(self) -> None:
+        self._post_best_effort("/pause_generation", {})
+
+    def resume(self) -> None:
+        self._post_best_effort("/continue_generation", {})
+
+    def _post_best_effort(self, path: str, payload: Dict[str, Any]) -> None:
+        """One bounded attempt; the server may lack the endpoint (best-effort).
+
+        The 10s bound matters: these fire while /generate POSTs are in flight,
+        and the old path bounded them with the control runner's 10s wait.
+        """
+        try:
+            self._post(path, payload, timeout=10)
+        except Exception as exc:
+            logger.warning("sglang HTTPBackend: %s failed (best-effort): %s", path, exc)
+
+    # ------------------------------------------------------------------ #
+    # Sync HTTP core (all endpoints)
+    # ------------------------------------------------------------------ #
+
+    def _post(self, path: str, payload: Dict[str, Any], *, timeout: Any = _TIERED_TIMEOUT) -> Any:
+        """Synchronous POST JSON to the SRT server.
+
+        Default timeout is tiered by path; pass an explicit value (or ``None``
+        for no timeout) to override.
+        """
         url = f"{self._base_url}{path}"
-        # Weight-update + LoRA hot-reload endpoints can stall server-side
-        # (NCCL init / broadcast, or SGLang's LoRA-pool unload+reload which
-        # takes ~2 min from the 2nd sync on — LIN-287). Give them the long
-        # timeout so a legitimately-slow-but-succeeding op isn't killed at 120s.
-        timeout = 600 if ("weights" in path or "update" in path or "lora" in path) else 120
+        if timeout is _TIERED_TIMEOUT:
+            # Weight-update + LoRA hot-reload endpoints can stall server-side
+            # (NCCL init / broadcast, or SGLang's LoRA-pool unload+reload which
+            # takes ~2 min from the 2nd sync on — LIN-287). Give them the long
+            # timeout so a legitimately-slow-but-succeeding op isn't killed at 120s.
+            timeout = 600 if ("weights" in path or "update" in path or "lora" in path) else 120
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url=url,
@@ -550,20 +539,7 @@ class HTTPBackend:
             return False
 
     def shutdown(self) -> None:
-        """Kill the SRT server and close the HTTP client."""
-        if self._client is not None:
-            try:
-                self._run_async(self._client.aclose())
-            except Exception:
-                pass
-            self._client = None
-        if self._async_loop is not None:
-            try:
-                if not self._async_loop.is_closed():
-                    self._async_loop.close()
-            except Exception:
-                pass
-            self._async_loop = None
+        """Kill the SRT server (idempotent via the None-swap)."""
         if self._server_process is not None:
             logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
             kill_process_tree(self._server_process.pid)

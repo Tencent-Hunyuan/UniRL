@@ -1,0 +1,193 @@
+# @package _global_
+# M2 — Deep-research agentic RL: the REAL deep-research run. Same AgenticTrainer
+# + AgenticRolloutEngine as M1 (unchanged), swapping ONLY the tools (search + visit)
+# and the reward backend (LLM-as-judge). This is the proof that the design isolates
+# "what tools / what reward" from "how to train".
+#
+# Prerequisites (operational — set on the pod):
+#   - QWEN3_INSTRUCT_PATH : local Qwen3-Instruct checkpoint dir
+#   - DATA_PATH           : ASearcher jsonl (python -m unirl.utils.prepare_asearcher --out-dir data/asearcher)
+#   - SERPER_KEY_ID       : Serper web-search API key (search tool)
+#   - JINA_API_KEYS       : Jina reader key (visit tool)
+#   - JUDGE_URL/JUDGE_MODEL: an OpenAI-compatible judge endpoint (e.g. a separate
+#                            SGLang/vLLM server hosting Qwen2.5-72B-Instruct)
+#   - SUMMARY_URL/SUMMARY_MODEL (optional): summarizer for the visit tool (the judge
+#                            endpoint works); without it, visit returns raw page text.
+#
+# Run (single node, >=2 GPUs; scale num_devices / batch_size / n up for real training):
+#   QWEN3_INSTRUCT_PATH=... DATA_PATH=data/asearcher/train.jsonl \
+#   SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
+#   python -m unirl.train_agentic --config-name=deep_research/deep_research_search_judge num_devices=2
+
+num_devices: 2
+batch_size: 4 # P prompts_per_rollout; P*n = 8 must be divisible by num_devices
+num_rollouts: 200
+weight_sync_interval: 1
+eval_interval: 0
+
+worker_max_concurrency: 8
+stop: ["</tool_call>"]
+
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-deep-research
+  run_name: deepresearch_search_judge_qwen3
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [deep-research, agentic, search, visit, llm-judge, qwen3, m2]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+    model_precision: fp32
+    use_gradient_checkpointing: true
+    attn_implementation: flex_attention
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2000
+
+rollout:
+  _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig
+    max_turns: 8 # research trajectories need more turns than the calculator smoke
+    per_worker_concurrency: 8
+    inner:
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
+      pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+      tp_size: 1
+      max_new_tokens: 2048 # per TURN (reasoning + a tool call / the final answer)
+      temperature: 1.0
+      top_p: 1.0
+      concurrency: 8
+      # The deep-research framing — verbatim from AReaL's tongyi_deepresearch
+      # SYSTEM_PROMPT, adapted for UniRL: the <tools> JSON block is dropped because
+      # the tool SCHEMAS are auto-injected into the chat template from the env.
+      # Set on the inner engine, so it is frozen into the stored rollout
+      # conditions the trainer replays -> one edit covers generation AND training.
+      system_instruction: |-
+        You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
+
+        You may call one or more functions to assist with the user query. For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+        <tool_call>
+        {"name": <function-name>, "arguments": <args-json-object>}
+        </tool_call>
+      chat_template_kwargs:
+        enable_thinking: false
+        # `tools` is auto-injected from the env's tool_schemas() at engine build.
+      engine_kwargs:
+        mem_fraction_static: 0.3
+        skip_server_warmup: true
+        attention_backend: triton
+        disable_cuda_graph: false
+        cuda_graph_max_bs: 16
+        enable_lora: false
+    env:
+      _target_: unirl.rollout.loop.tool_environment.ToolEnvironment
+      max_turns: 8 # keep == config.max_turns
+      tools:
+        - _target_: unirl.rollout.loop.tools.search.SearchTool
+          top_k: 10
+        - _target_: unirl.rollout.loop.tools.visit.VisitTool
+          endpoint: ${oc.env:SUMMARY_URL,""}
+          model: ${oc.env:SUMMARY_MODEL,""}
+    episode_sampling:
+      _target_: unirl.types.sampling.ARSamplingParams
+      samples_per_prompt: 2
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 0
+      max_new_tokens: 2048
+
+reward:
+  # LLM-as-judge over text: the judge decides whether the trajectory's <answer> is
+  # equivalent to the reference answer (metadata["answer"]) -> 1.0 / 0.0. Hosted
+  # out-of-band; the scorer only POSTs to $JUDGE_URL.
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.llm_judge.LLMJudgeRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.llm_judge.LLMJudgeSpec
+      endpoint: ${oc.env:JUDGE_URL,""}
+      model: ${oc.env:JUDGE_MODEL,""}
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: null
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-mean
+  horizon: 2048
+  sampling_temperature: 1.0 # MUST equal episode_sampling.temperature
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1 # strict on-policy MVP
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # ASearcher jsonl: {"prompt": ..., "metadata": {"answer": ...}}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}} # unused (eval_interval=0); defaults to train
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 4 # == batch_size (P)
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 2
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 2048

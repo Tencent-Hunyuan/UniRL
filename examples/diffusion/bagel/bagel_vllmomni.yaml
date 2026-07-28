@@ -16,7 +16,7 @@
 #     and injects the driver-authored x_T into bagel.prepare_vae_latent.
 #   - num_inference_steps is sent as steps+1 (BAGEL loops num_timesteps-1) and
 #     BAGEL builds its own sigma schedule (shift 3.0 == trainside) — the response
-#     sigma-echo verify asserts it matches the engine-pinned req.sigmas.
+#     sigma-echo verification asserts it matches the diffusion Part's pinned sigmas.
 #   - BAGEL conditioning (opaque KV caches) can't cross the IPC boundary, so the
 #     adapter ships the PROMPTS and BagelDiffusionStage rebuilds the KV contexts
 #     trainer-side at replay (the und/text path is frozen → identical contexts).

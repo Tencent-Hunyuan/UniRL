@@ -3,7 +3,7 @@
 Sibling of :mod:`unirl.rollout.engine.sglang_diffusion.adapters.qwen_image`
 (the T2I modality) with two image-edit deltas:
 
-- **Request side.** Edit-Plus **requires** ``req.primitives['image']: Images``
+- **Request side.** Edit-Plus **requires** an aligned image conditioning Part
   (fail-fast if absent — Edit-Plus is edit-only). The adapter extracts PILs
   via :meth:`Images.to_pils` and injects each into the sampling kwargs under
   ``condition_image`` — a SamplingParams field injected by
@@ -46,7 +46,9 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.image import ImageLatentCondition
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 # Qwen-Image VAE downsample factor (pixel → latent).
 _VAE_SCALE_FACTOR = 8
@@ -68,7 +70,7 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
     #: mask, so the mask must be padded (not dropped) to match embeds length.
     pad_mask_to_embeds = True
 
-    def build_prompts(self, req: RolloutReq) -> Dict[str, Any]:
+    def build_prompts(self, sample: Sample) -> Dict[str, Any]:
         """Inject source-image PIL via ``condition_image`` sampling kwarg.
 
         Edit-Plus **requires** a source image per prompt (fail-fast if absent).
@@ -81,16 +83,24 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         inherited from :meth:`ImageAdapter.build_prompts`; we only add the
         ``condition_image`` key alongside ``prompt``.
         """
-        prompts = list(req.primitives["text"].texts)
-        unique_prompts, k = self._deexpand_prompts(prompts, req)
-        images_prim = req.primitives.get("image")
-        if images_prim is None:
+        turns, image_batches = sample.vision_conditioning()
+        text_turns = [turn.content for turn in turns if isinstance(turn.content, Texts)]
+        if len(text_turns) != 1 or len(image_batches) != 1:
             raise ValueError(
-                f"modality={self.model_family!r} requires req.primitives['image'] (Edit-Plus is edit-only); got None."
+                f"modality={self.model_family!r} requires exactly one text turn and one "
+                f"image turn; got {len(text_turns)} text and {len(image_batches)} image turns."
             )
+        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
+        prompts = list(text_turns[0].texts)
+        unique_prompts, k = self._deexpand_prompts(prompts, gen_part.group_ids)
+        images_prim = image_batches[0]
         pil_images = images_prim.to_pils()
         if len(pil_images) != len(prompts):
             raise ValueError(f"build_prompts: image batch {len(pil_images)} != prompt count {len(prompts)}")
+        if len(prompts) != len(gen_part.sample_ids):
+            raise ValueError(
+                f"build_prompts: prompt count {len(prompts)} != diffusion sample count {len(gen_part.sample_ids)}"
+            )
         # Collapse PILs in parallel with prompts: one source image per group.
         # Mirror ``deexpand_prompts_from_groups``'s group logic (first image per
         # group, in first-seen group order) rather than assuming a contiguous
@@ -99,7 +109,7 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         # means no collapse happened (heterogeneous K or no grouping), so the
         # PILs stay 1:1 with the prompts.
         if k > 1:
-            unique_pils = self._first_per_group(pil_images, list(req.group_ids))
+            unique_pils = self._first_per_group(pil_images, list(gen_part.group_ids))
             if len(unique_pils) != len(unique_prompts):
                 raise ValueError(
                     f"build_prompts: collapsed image count {len(unique_pils)} != unique prompt "
@@ -195,7 +205,7 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                 out.append(item)
         return out
 
-    def _deexpand_prompts(self, prompts: List[str], req: RolloutReq):
+    def _deexpand_prompts(self, prompts: List[str], group_ids: List[str]):
         """Collapse K-expanded prompts back to unique + repeat count.
 
         Thin wrapper around :func:`utils.deexpand_prompts_from_groups` so the
@@ -205,7 +215,7 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         """
         from unirl.rollout.engine.sglang_diffusion import utils
 
-        return utils.deexpand_prompts_from_groups(prompts, list(req.group_ids))
+        return utils.deexpand_prompts_from_groups(prompts, list(group_ids))
 
 
 __all__ = ["QwenImageEditPlusAdapter"]

@@ -93,7 +93,7 @@ rollout:
   _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
   config:
     _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
-    backend: native
+    backend: http
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     tp_size: 8
     ep_size: 8

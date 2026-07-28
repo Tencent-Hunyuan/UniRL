@@ -17,7 +17,18 @@
 
 num_devices: 8
 batch_size: 8
-num_rollouts: 10000
+# Validated V10 curve configuration.
+adv_use_global_std: false
+num_rollouts: 200
+eval_interval: 20
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_cfg_text_scale: 1.0
+eval_eta: 0.7
+save_interval: 20
+save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_t2v_trainside}
+save_mode: adapter
 
 logging:
   report_to_wandb: true
@@ -27,7 +38,7 @@ logging:
   tags: [ltx2, t2v, grpo, trainside, dancegrpo]
   log_media: true
   media_max_items: 4
-  media_log_interval: 1
+  media_log_interval: 10
 
 bundle:
   _target_: unirl.models.ltx2.bundle.LTX2Bundle.from_config
@@ -36,14 +47,17 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Lightricks/LTX-2}
     model_precision: bf16
     autocast_precision: bf16
-    trajectory_precision: fp16
+    # Keep the denoising state in fp32. SGLang's LTX scheduler updates and
+    # carries fp32 state while casting only the DiT input to bf16; matching that
+    # boundary is required for cross-engine rollout-distribution parity.
+    trajectory_precision: fp32
     logprob_precision: fp32
     shift: 1.0
     max_sequence_length: 512
     enable_audio: false
     default_height: 512
     default_width: 768
-    default_num_frames: 33
+    default_num_frames: 9
     default_frame_rate: 24.0
 
 pipeline:
@@ -80,7 +94,7 @@ backend:
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
-    alpha: 64
+    alpha: 256
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
@@ -102,7 +116,7 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion]
-  forward_batch_size: 2
+  forward_batch_size: 1
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -111,7 +125,7 @@ reward:
     base_device: cuda
     config:
       _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
-      batch_size: 4
+      batch_size: 8
       device: auto
       processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
       model_id: yuvalkirstain/PickScore_v1
@@ -121,7 +135,7 @@ algorithm:
   stage_attr: diffusion
   clip_range: 5.0e-3
   clip_schedule: constant
-  old_logp_source: replay
+  old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.ltx2.conditions.LTX2Conditions
@@ -137,8 +151,8 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/vid_prompt/train.txt
-      eval_data_path: datasets/vid_prompt/test.txt
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}
@@ -149,13 +163,13 @@ sampling:
   guidance_scale: 1.0
   height: 512
   width: 768
-  num_frames: 33
+  num_frames: 9
   eta: 0.7
-  samples_per_prompt: 4
+  samples_per_prompt: 16
   seed: 42
   init_same_noise: false
   autocast_precision: bf16
-  trajectory_precision: fp16
+  trajectory_precision: fp32
   logprob_precision: fp32
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler

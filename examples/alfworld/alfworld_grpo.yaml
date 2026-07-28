@@ -1,0 +1,178 @@
+# @package _global_
+# ALFWorld — multi-turn agentic RL baseline. The mature benchmark that shows the
+# agentic stack LEARNS on a genuine long-horizon tool/agent workload: the model issues
+# a text command each turn, AlfworldEnv steps the simulator and returns the next
+# observation, and the trajectory reward is the environment's terminal task-success
+# (attached to the trajectory by AgenticRolloutEngine, read by AgenticEnvTrainer — NO
+# reward backend is scored). Same trainer/engine as deep-research; only the env + the
+# reward SOURCE differ.
+#
+# Prerequisites (on the pod):
+#   - QWEN3_INSTRUCT_PATH : local Qwen3 checkpoint dir
+#   - ALFWORLD_DATA       : ALFWorld data dir (after `alfworld-download`)
+#   - DATA_PATH           : game-index jsonl (python -m unirl.utils.prepare_alfworld --out-dir data/alfworld)
+#   - ALFWORLD_CONFIG (optional): ALFWorld base_config.yaml (else the package default)
+#
+# Run (single node, whole 8-GPU node):
+#   QWEN3_INSTRUCT_PATH=... ALFWORLD_DATA=... DATA_PATH=data/alfworld/train.jsonl \
+#   python -m unirl.train_agentic_env --config-name=alfworld/alfworld_grpo num_devices=8
+
+num_devices: 8
+batch_size: 8 # P prompts_per_rollout; P*n must be divisible by num_devices
+num_rollouts: 50
+weight_sync_interval: 1
+eval_interval: 0 # agentic eval not implemented (env-driven); keep 0
+
+worker_max_concurrency: 8
+stop: null # ALFWorld actions are free text; rely on per-turn max_new_tokens
+
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-alfworld
+  run_name: alfworld_grpo_qwen3
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [alfworld, agentic, multi-turn, env-reward, grpo, qwen3]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+    model_precision: fp32
+    use_gradient_checkpointing: true
+    attn_implementation: flex_attention
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+
+rollout:
+  # Multi-turn agentic engine driving a STATEFUL per-episode ALFWorld env. Each
+  # trajectory is one episode; the env emits the terminal task-success as the reward.
+  _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig
+    max_turns: 15 # ALFWorld is long-horizon; cap per-episode turns (cost lever)
+    per_worker_concurrency: 8
+    inner:
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
+      pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
+      tp_size: 1
+      max_new_tokens: 256 # per TURN (a short Thought + one Action line)
+      temperature: 1.0
+      top_p: 1.0
+      concurrency: 8
+      chat_template_kwargs:
+        enable_thinking: false
+        # No tools: AlfworldEnv has no tool_schemas; the ReAct instruction + the
+        # observation come from the env's reset/step text.
+      engine_kwargs:
+        mem_fraction_static: 0.3
+        skip_server_warmup: true
+        attention_backend: triton
+        disable_cuda_graph: false
+        cuda_graph_max_bs: 16
+        enable_lora: false
+    env:
+      _target_: unirl.rollout.loop.alfworld_env.AlfworldEnv
+      split: train
+      max_steps: 15 # keep == config.max_turns
+      step_penalty: 0.0 # binary terminal success; add a small penalty for efficiency later
+      max_obs_chars: 1500
+      config_file: ${oc.env:ALFWORLD_CONFIG,""}
+    episode_sampling:
+      _target_: unirl.types.sampling.ARSamplingParams
+      samples_per_prompt: 8 # n — GRPO group (siblings share the same game)
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 0
+      max_new_tokens: 256
+
+reward:
+  # BUILT BUT UNUSED — the reward is env-sourced (AgenticEnvTrainer reads the
+  # trajectory's env return). Present only so the shared ARTrainer construction path
+  # (remote_hydra(reward_cfg)) has something to build.
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: null
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-mean
+  horizon: 256
+  sampling_temperature: 1.0 # MUST equal episode_sampling.temperature
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1 # strict on-policy MVP
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # game-index rows: {"prompt": "", "metadata": {"game_index": i}}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}} # unused (eval_interval=0)
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 8 # == batch_size (P)
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8 # MUST match episode_sampling
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 256

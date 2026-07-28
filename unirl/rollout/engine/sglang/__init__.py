@@ -1,7 +1,7 @@
 """SGLang LLM/VLM rollout engine — role-decomposed.
 
 A thin core over one runtime seam (``backends`` — the only sglang import, boot
-included), with ``adapters`` holding the ``RolloutReq``↔``RolloutResp``
+included), with ``adapters`` holding the ``Sample``↔wire
 conversion (``text`` base + ``vlm`` override, keyed by ``model_family`` /
 derived from ``image_token``), a small ``utils`` helper bag, and a
 ``WeightSync`` component owning the sync ops + LoRA lifecycle (the offload
