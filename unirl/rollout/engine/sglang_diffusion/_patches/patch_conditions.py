@@ -93,6 +93,14 @@ logger = logging.getLogger(__name__)
 # ``image_latent`` from packed ``[S_img, C*4]`` to spatial ``[C, H_img, W_img]``
 # (S_img alone is ambiguous — multiple H×W grids give the same token count).
 # Wrapped as ``[value]`` to fit the list-based merge/slice path.
+#
+# ``condition_image_latent_ids`` (9th field, FLUX.2-Klein ti2i only) carries the
+# 4-axis RoPE ids ``[B, N, 4]`` upstream's ``prepare_condition_image_latent_ids``
+# sets alongside ``image_latent``. FLUX.2 replay needs both the condition tokens
+# and their ids, and the grid factorization can't be recovered from N alone (see
+# the Flux2KleinAdapter.build_condition note), so the ids are captured rather than
+# recomputed. Single ``[B, N, 4]`` tensor, wrapped as ``[tensor]`` like
+# ``image_latent``; ``None`` for every non-Klein-ti2i adapter.
 _COND_FIELDS = (
     "prompt_embeds",
     "pooled_prompt_embeds",
@@ -102,6 +110,7 @@ _COND_FIELDS = (
     "negative_attention_mask",
     "image_latent",
     "image_latent_sizes",
+    "condition_image_latent_ids",
 )
 
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
@@ -324,6 +333,20 @@ def _copy_conditions(src, output_batch) -> None:
     vae_image_sizes = getattr(src, "vae_image_sizes", None)
     if vae_image_sizes is not None:
         output_batch.image_latent_sizes = [vae_image_sizes]
+    # FLUX.2-Klein ti2i condition_image_latent_ids: a single [B, N, 4] RoPE-id
+    # tensor set by upstream's prepare_condition_image_latent_ids alongside
+    # image_latent. Same presence-is-the-gate + [tensor]-wrap contract as
+    # image_latent; None for every non-Klein-ti2i adapter.
+    condition_image_latent_ids = getattr(src, "condition_image_latent_ids", None)
+    if condition_image_latent_ids is not None:
+        import torch
+
+        if torch.is_tensor(condition_image_latent_ids):
+            output_batch.condition_image_latent_ids = [condition_image_latent_ids.detach().cpu()]
+        elif isinstance(condition_image_latent_ids, (list, tuple)):
+            output_batch.condition_image_latent_ids = [
+                t.detach().cpu() if torch.is_tensor(t) else t for t in condition_image_latent_ids
+            ]
 
 
 def _copy_mapped_conditions(src, output_batch, mapping) -> None:
