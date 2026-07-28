@@ -53,6 +53,7 @@ SCORER_MODULES: dict[str, str] = {
     "imagereward": "reward_service.scorers.imagereward",
     "hpsv2": "reward_service.scorers.hpsv2_scorer",
     "hpsv3": "reward_service.scorers.hpsv3_scorer",
+    "videohpsv3": "reward_service.scorers.video_hpsv3",
     "unified_reward": "reward_service.scorers.unified_reward",
     "geneval2": "reward_service.scorers.geneval2",
     "geneval": "reward_service.scorers.geneval",

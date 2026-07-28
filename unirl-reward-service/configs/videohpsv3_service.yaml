@@ -1,0 +1,41 @@
+# VideoHPSv3-only service configuration (WAN2.1 T2V / Flash-GRPO).
+#
+# Start:
+#   ray start --head --port=6379 --num-gpus=1
+#   python -m reward_service --config configs/videohpsv3_service.yaml
+# The training node connects via REWARD_SERVICE_URL=http://<this_node_ip>:8080.
+#
+# Consumer recipe: examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  # Covers a whole rollout step, not one request: score_and_attach is
+  # DP_SCATTER-dispatched and _await_ref clocks from dispatch, so queue wait
+  # counts too. On timeout the Ray task keeps running and its GPU time is lost.
+  score_timeout_s: 1800.0
+
+rewards:
+  - name: videohpsv3
+    scorer: videohpsv3
+    # Same deps as the image hpsv3 scorer, so Ray reuses one cached venv.
+    runtime_env: envs/hpsv3.txt
+    # One replica per GPU. This service runs its own Ray cluster, so these are
+    # the same physical GPUs the trainer holds — HPSv3's ~17 GB of bf16 weights
+    # fit alongside the ~48 GB training footprint on a 97 GB H20.
+    num_replicas: 8
+    num_gpus: 1
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      # HF repo id, downloaded once into the hub cache. A local directory
+      # holding HPSv3.safetensors also works, for nodes without egress.
+      weights_path: MizzenAI/HPSv3
+      config_path: null
+      max_batch_size: 4       # frames per forward; 8 OOMs a 95GB H20
+      # 1 = upstream semantics: all 81 frames scored, best 24 averaged. Raising
+      # it is a reward-hacking hole, not an optimization — at stride 8 only 3
+      # frames survive top_ratio and 78 go unconstrained. Measured cost of
+      # stride 1 is ~5% of step time, so there is no reason to.
+      frame_stride: 1
+      top_ratio: 0.3          # keep the best 30% of frames
