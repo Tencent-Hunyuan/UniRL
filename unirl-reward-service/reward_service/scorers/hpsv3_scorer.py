@@ -17,8 +17,9 @@ hpsv3 must be installed from the upstream ``upgrade_transformers_version``
 branch — see install.sh for the pinned commit. The PyPI 1.0.0 wheel is
 incompatible with transformers ≥4.50.
 
-Local checkpoint layout (official HF release):
+Checkpoint layout (official HF release):
   <weights_dir>/HPSv3.safetensors   (+ optional YAML under <weights_dir>/config/)
+A Hugging Face repo id works too — see ``_resolve_checkpoint_path``.
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ class HPSv3Scorer(BaseScorer):
         """Load the HPSv3 reward model.
 
         Args:
-            weights_path: Directory containing ``HPSv3.safetensors`` (or the
-                file itself). ``None`` falls back to the hpsv3 package's
-                default HF download path.
+            weights_path: Directory containing ``HPSv3.safetensors``, the file
+                itself, or a Hugging Face repo id to download it from.
+                ``None`` falls back to the hpsv3 package's default HF download.
             config_path: Optional override for the HPSv3 config YAML.
                 ``None`` uses the one bundled with the hpsv3 package.
             device: Target device (``"cuda"`` / ``"cpu"``).
@@ -69,17 +70,53 @@ class HPSv3Scorer(BaseScorer):
 
         kwargs: dict = {"device": device}
         if weights_path:
-            p = Path(weights_path)
-            if p.is_dir():
-                ckpt = p / "HPSv3.safetensors"
-                if not ckpt.exists():
-                    raise FileNotFoundError(f"HPSv3.safetensors not found under {p}")
-                kwargs["checkpoint_path"] = str(ckpt)
-            else:
-                kwargs["checkpoint_path"] = str(p)
+            kwargs["checkpoint_path"] = self._resolve_checkpoint_path(weights_path)
         if config_path:
             kwargs["config_path"] = config_path
         self._inferencer = HPSv3RewardInferencer(**kwargs)
+
+    @staticmethod
+    def _resolve_checkpoint_path(weights_path: str) -> str:
+        """Resolve *weights_path* to a checkpoint file the inferencer can load.
+
+        Args:
+            weights_path: A directory holding ``HPSv3.safetensors``, the
+                checkpoint file itself, or a Hugging Face repo id.
+
+        Returns:
+            Absolute path to the checkpoint file. A repo id is downloaded on
+            first use and served from the hub cache afterwards.
+
+        Raises:
+            FileNotFoundError: If a directory is given but holds no
+                ``HPSv3.safetensors``, or if the value is neither a local path
+                nor a downloadable repo id.
+        """
+        p = Path(weights_path)
+        if p.is_dir():
+            ckpt = p / "HPSv3.safetensors"
+            if not ckpt.exists():
+                raise FileNotFoundError(f"HPSv3.safetensors not found under {p}")
+            return str(ckpt)
+        if p.exists():
+            return str(p)
+
+        # Not on disk, so read it as a repo id — the same interpretation
+        # hpsv3/inference.py gives its own MizzenAI/HPSv3 default.
+        import huggingface_hub
+
+        try:
+            return huggingface_hub.hf_hub_download(
+                weights_path, "HPSv3.safetensors", repo_type="model"
+            )
+        except Exception as exc:
+            # huggingface_hub raises a whole family here (bad repo id, missing
+            # file, no network). Any of them means the same thing to a
+            # deployment, and the raw message rarely says which.
+            raise FileNotFoundError(
+                f"{weights_path!r} is neither a local HPSv3 checkpoint path nor "
+                f"an HF repo id serving HPSv3.safetensors"
+            ) from exc
 
     @torch.inference_mode()
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
