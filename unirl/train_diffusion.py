@@ -55,6 +55,8 @@ def main(cfg: DictConfig) -> None:
         reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
+        adv_decoupled=cfg.get("adv_decoupled", False),
+        adv_component_weights=cfg.get("adv_component_weights"),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
