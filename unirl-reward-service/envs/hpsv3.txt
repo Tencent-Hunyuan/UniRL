@@ -5,6 +5,8 @@
 # See hpsv3_scorer.py lines 16-18 for details.
 #
 transformers>=4.55.2,<4.58
+# hpsv3/inference.py imports hpsv3.train, which imports trl at module level.
+trl>=0.19,<0.22
 git+https://github.com/MizzenAI/HPSv3.git@ad33a29d5896fe46ae74f9865444d6adbadbc750
 peft
 timm
@@ -14,3 +16,6 @@ fire
 matplotlib
 opencv-python-headless
 qwen-vl-utils
+# Imported at module level by hpsv3.model.qwen2vl_trainer, even for inference.
+tensorboard
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.17/flash_attn-2.8.3%2Bcu130torch2.12-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
