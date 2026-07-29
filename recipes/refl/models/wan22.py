@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from unirl.models.types.diffusion import DiffuseWithGradResult
+from unirl.models.wan21.clip_vision_encode import WAN21CLIPVisionEncodeStage
 from unirl.models.wan21.conditions import WAN21Conditions
+from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan22.bundle import WAN22Bundle
 from unirl.models.wan22.diffusion import WAN22DiffusionStage, WAN22DiffusionStep
 from unirl.models.wan22.pipeline import WAN22Pipeline
 from unirl.train.lora import adapters_disabled
+from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import DiffusionSamplingParams
 
 # Matches the mainline module-level constant in unirl/models/wan22/diffusion.py.
@@ -146,7 +150,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         """Differentiable WAN 2.2 sampling for REFL-style BPTT training.
 
         Returns :class:`DiffuseWithGradResult` with the live-grad
-        ``z_final`` + scalar ``kl_loss``.
+        ``z_final`` + per-sample ``kl_loss`` ``[B]``.
         """
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -215,7 +219,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
             )
 
         dual = self.model.transformer
-        kl_total = torch.zeros((), device=device, dtype=torch.float32)
+        kl_total = torch.zeros(batch_size, device=device, dtype=torch.float32)
         kl_steps = 0
 
         for i in range(T):
@@ -283,7 +287,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                         use_high_noise=use_high_noise,
                     )
                 sigma_f32 = sigma.to(dtype=torch.float32)
-                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).mean()
+                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).flatten(1).mean(dim=1)
                 kl_total = kl_total + kl_step
                 kl_steps += 1
 
@@ -328,6 +332,54 @@ class Wan22ReflPipeline(WAN22Pipeline):
             trajectory_precision=old.trajectory_dtype,
             logprob_precision=old.logprob_dtype,
         )
+
+    def build_refl_conditions(
+        self,
+        texts: Texts,
+        *,
+        images: Optional[Images] = None,
+        params: DiffusionSamplingParams,
+    ) -> WAN21Conditions:
+        """Full REFL conditioning: text + CFG negative + optional I2V image.
+
+        Mirrors the condition assembly of :meth:`WAN22Pipeline.generate` —
+        the negative branch is encoded against the **effective** guidance
+        ``max(guidance_scale, guidance_scale_2)`` (WAN22 routes CFG by sigma
+        across the low/high-noise DiTs), and image slots are attached with
+        the diffusion geometry from ``params``. An explicit negative prompt
+        rides ``params.sampler_kwargs['negative_prompt']``.
+        """
+        primary_g = float(params.guidance_scale)
+        low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
+        effective_guidance = max(primary_g, low_g)
+        negative_prompt = (params.sampler_kwargs or {}).get("negative_prompt")
+        negatives = (
+            Texts(texts=[str(negative_prompt)] * len(texts.texts))
+            if negative_prompt and effective_guidance > 1.0
+            else None
+        )
+        conds = self.build_conditions(texts, negatives=negatives, guidance_scale=effective_guidance)
+
+        if images is not None:
+            if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"Wan22ReflPipeline.build_refl_conditions: image count "
+                    f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_latent = WAN21ImageLatentEncodeStage(
+                self.bundle,
+                num_frames=int(params.num_frames),
+                height=int(params.height),
+                width=int(params.width),
+            ).encode(images)
+            image_embed = (
+                WAN21CLIPVisionEncodeStage(self.bundle).encode(images)
+                if getattr(self.bundle, "uses_clip_vision", False)
+                else None
+            )
+            conds = dataclasses.replace(conds, image_latent=image_latent, image_embed=image_embed)
+        return conds
 
 
 __all__ = ["Wan22ReflDiffusionStep", "Wan22ReflDiffusionStage", "Wan22ReflPipeline"]

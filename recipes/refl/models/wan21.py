@@ -19,6 +19,7 @@ CFG prediction lives in recipe-local :class:`Wan21ReflDiffusionStep`.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -26,10 +27,13 @@ import torch
 
 from unirl.models.types.diffusion import DiffuseWithGradResult
 from unirl.models.wan21.bundle import WAN21Bundle
+from unirl.models.wan21.clip_vision_encode import WAN21CLIPVisionEncodeStage
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.diffusion import WAN21DiffusionStage, WAN21DiffusionStep
+from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.pipeline import WAN21Pipeline
 from unirl.train.lora import adapters_disabled
+from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import DiffusionSamplingParams
 
 # Matches the mainline module-level constant in unirl/models/wan21/diffusion.py.
@@ -161,7 +165,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         """Differentiable WAN 2.1 T2V sampling for REFL-style BPTT training.
 
         Returns :class:`DiffuseWithGradResult` with the live-grad
-        ``z_final`` + scalar ``kl_loss``.
+        ``z_final`` + per-sample ``kl_loss`` ``[B]``.
 
         BPTT knobs (read from ``params.sampler_kwargs``):
 
@@ -172,9 +176,10 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         - ``final_timestep`` (int, default ``num_inference_steps - 1``):
           early stop. The loop breaks once ``i >= final_timestep``.
         - ``kl_weight`` (float, default 0.0): when non-zero, per-step KL
-          ``mean((pred - ref_pred)**2 / (2 * sigma**2))`` is accumulated
-          and returned in ``kl_loss``. The trainer multiplies it by its own
-          ``kl_weight`` at the loss site.
+          ``(pred - ref_pred)**2 / (2 * sigma**2)`` is reduced per sample
+          and accumulated into the ``[B]`` ``kl_loss``. Per-sample (not a
+          scalar) so DP_SCATTER merge/re-shard round-trips each shard's own
+          KL. The actor multiplies it by its ``kl_weight`` at the loss site.
 
         ``initial_latents`` follows the same contract as :meth:`diffuse`:
         when provided, used verbatim and the internal RNG path is
@@ -235,7 +240,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
         transformer = self.model.transformer
-        kl_total = torch.zeros((), device=device, dtype=torch.float32)
+        kl_total = torch.zeros(batch_size, device=device, dtype=torch.float32)
         kl_steps = 0
 
         guidance_scale = float(params.guidance_scale)
@@ -303,7 +308,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
                         branch="cond",
                     )
                 sigma_f32 = sigma.to(dtype=torch.float32)
-                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).mean()
+                kl_step = ((kl_pred.float() - ref_pred.float()) ** 2 / (2.0 * sigma_f32**2)).flatten(1).mean(dim=1)
                 kl_total = kl_total + kl_step
                 kl_steps += 1
 
@@ -353,6 +358,49 @@ class Wan21ReflPipeline(WAN21Pipeline):
             trajectory_precision=old.trajectory_dtype,
             logprob_precision=old.logprob_dtype,
         )
+
+    def build_refl_conditions(
+        self,
+        texts: Texts,
+        *,
+        images: Optional[Images] = None,
+        params: DiffusionSamplingParams,
+    ) -> WAN21Conditions:
+        """Full REFL conditioning: text + CFG negative + optional I2V image.
+
+        Mirrors the condition assembly of :meth:`WAN21Pipeline.generate`
+        (text via the public ``build_conditions``, image slots attached with
+        the diffusion geometry from ``params``), plus the REFL convention
+        that an explicit negative prompt rides
+        ``params.sampler_kwargs['negative_prompt']``.
+        """
+        guidance = float(params.guidance_scale)
+        negative_prompt = (params.sampler_kwargs or {}).get("negative_prompt")
+        negatives = (
+            Texts(texts=[str(negative_prompt)] * len(texts.texts)) if negative_prompt and guidance > 1.0 else None
+        )
+        conds = self.build_conditions(texts, negatives=negatives, guidance_scale=guidance)
+
+        if images is not None:
+            if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+                raise ValueError(
+                    f"Wan21ReflPipeline.build_refl_conditions: image count "
+                    f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                    f"!= text count {len(texts.texts)}"
+                )
+            image_latent = WAN21ImageLatentEncodeStage(
+                self.bundle,
+                num_frames=int(params.num_frames),
+                height=int(params.height),
+                width=int(params.width),
+            ).encode(images)
+            image_embed = (
+                WAN21CLIPVisionEncodeStage(self.bundle).encode(images)
+                if getattr(self.bundle, "uses_clip_vision", False)
+                else None
+            )
+            conds = dataclasses.replace(conds, image_latent=image_latent, image_embed=image_embed)
+        return conds
 
 
 __all__ = ["Wan21ReflDiffusionStep", "Wan21ReflDiffusionStage", "Wan21ReflPipeline"]

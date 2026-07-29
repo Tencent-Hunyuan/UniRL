@@ -10,7 +10,7 @@ attached to the frontier Part, under DP-sharded distributed dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 

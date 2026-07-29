@@ -170,7 +170,12 @@ class DiffusionStage(Protocol[C]):
 
 @dataclass
 class DiffuseWithGradResult:
-    """Output of :meth:`DiffusionStage.diffuse_with_grad`."""
+    """Output of :meth:`DiffusionStage.diffuse_with_grad`.
+
+    ``kl_loss`` is per-sample ``[B]`` (zeros when the KL branch is off) so
+    DP-scattered consumers round-trip each shard's own KL, never a
+    cross-shard aggregate.
+    """
 
     z_final: torch.Tensor
     kl_loss: torch.Tensor
