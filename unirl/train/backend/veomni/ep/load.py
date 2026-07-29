@@ -21,6 +21,8 @@ from typing import Callable, Dict
 import torch
 from torch import nn
 
+from unirl.train.backend.veomni.ep.placement import assign_local_block
+
 
 def load_ep_experts(
     model: nn.Module,
@@ -34,7 +36,7 @@ def load_ep_experts(
     model package owns the naming). Returns the number of expert params loaded.
     """
     import torch.distributed as dist
-    from torch.distributed.tensor import DTensor, distribute_tensor
+    from torch.distributed.tensor import DTensor
     from veomni.distributed.parallel_state import get_parallel_state
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
@@ -71,9 +73,8 @@ def load_ep_experts(
                 dist.broadcast(block, src=0)
             if ep_rank == j:
                 my_block = block
-        sharded = distribute_tensor(my_block, param.device_mesh, param.placements)
-        param.to_local().copy_(sharded.to_local())
-        del full, my_block, sharded
+        assign_local_block(param, my_block)
+        del full, my_block
         n += 1
     return n
 

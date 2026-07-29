@@ -185,18 +185,31 @@ CompleteGeneration = Callable[
 
 
 class AsyncRolloutScheduler:
-    """Single-threaded scheduler for complete, versioned rollout groups."""
+    """Single-threaded scheduler for complete, versioned rollout groups.
+
+    ``reap_before_launch`` picks the phase order inside :meth:`next_step`.
+    Launch-first (the default, used by the AR path) keeps the in-flight window as
+    full as possible. Reap-first instead guarantees that the reap-time work
+    (``collect`` plus the caller's ``on_complete``) runs while the rollout workers
+    hold no other queued generation — required when that work pulls a large payload
+    off those workers, because the transfer would otherwise queue behind a freshly
+    launched generation. It also keeps ``max_inflight=1`` overlapping: the post-reap
+    launch is still made before the step returns, so it runs during the caller's
+    train step.
+    """
 
     def __init__(
         self,
         dispatcher: GenerationDispatcher,
         *,
         groups_per_step: int,
+        reap_before_launch: bool = False,
     ) -> None:
         if groups_per_step < 1:
             raise ValueError(f"groups_per_step must be >= 1, got {groups_per_step}")
         self._dispatcher = dispatcher
         self._groups_per_step = groups_per_step
+        self._reap_before_launch = bool(reap_before_launch)
         self._buffer = VersionedGroupBuffer()
         self._inflight: List[InflightGeneration] = []
         self._launch_id = 0
@@ -225,6 +238,22 @@ class AsyncRolloutScheduler:
             )
         )
         self._launch_id += 1
+
+    def _top_up(
+        self,
+        *,
+        ceiling: int,
+        max_inflight: int,
+        build_sample: BuildSample,
+        current_version: int,
+    ) -> None:
+        """Launch generations until the launch ceiling or the in-flight cap binds."""
+
+        while self._launch_id < ceiling and len(self._inflight) < max_inflight:
+            self._launch_one(
+                build_sample=build_sample,
+                weight_version=current_version,
+            )
 
     def _complete(
         self,
@@ -312,7 +341,9 @@ class AsyncRolloutScheduler:
 
         A step is ``groups_per_step`` complete rollout groups. The launch ceiling
         is the load-bearing on-policy invariant: at ``max_staleness=0`` no
-        generation is launched into a future weight-sync window.
+        generation is launched into a future weight-sync window. Whether each
+        iteration launches or reaps first is fixed by ``reap_before_launch`` (see
+        the class docstring).
 
         ``sync_interval`` and ``max_inflight`` must already be ``>= 1``; callers
         (e.g. ``AsyncARTrainer``) clamp config before invoking this method.
@@ -325,13 +356,16 @@ class AsyncRolloutScheduler:
         while True:
             staleness_window = ((rollout_id // sync_interval) + 1 + max_staleness) * sync_interval
             ceiling = min(num_rollouts, staleness_window)
-            while self._launch_id < ceiling and len(self._inflight) < max_inflight:
-                self._launch_one(
-                    build_sample=build_sample,
-                    weight_version=current_version,
-                )
-
-            self.reap_ready(on_complete)
+            if self._reap_before_launch:
+                self.reap_ready(on_complete)
+            self._top_up(
+                ceiling=ceiling,
+                max_inflight=max_inflight,
+                build_sample=build_sample,
+                current_version=current_version,
+            )
+            if not self._reap_before_launch:
+                self.reap_ready(on_complete)
             picked = self._buffer.drain_freshest(
                 self._groups_per_step,
                 current_version=current_version,
