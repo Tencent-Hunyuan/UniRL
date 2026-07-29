@@ -103,6 +103,14 @@ class _RawResultView:
         return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
 
     @property
+    def aux_trajectory_latents(self) -> Any:
+        """LTX-2's co-denoised AUDIO trajectory ([B, T+1, ...]), attached onto
+        ``dit_trajectory.audio_latents`` by ``patch_ltx2_rollout_sde`` and carried
+        through the per-output concat/slice. ``None`` for models without it."""
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
+
+    @property
     def trajectory_log_probs(self) -> Any:
         rtd = getattr(self._result, "rollout_trajectory_data", None)
         return getattr(rtd, "rollout_log_probs", None)

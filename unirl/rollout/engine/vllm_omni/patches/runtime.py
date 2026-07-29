@@ -205,13 +205,18 @@ def patch_qwen3_omni_thinker_lora() -> None:
 
     from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
         Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerMultiModalProcessor,
     )
 
     from unirl.rollout.engine.vllm_omni.patches.compat_qwen3_omni import (
+        patch_qwen3_omni_audio_truncation,
+        patch_qwen3_omni_audio_video_mrope,
         patch_qwen3_omni_thinker_class,
     )
 
     patch_qwen3_omni_thinker_class(Qwen3OmniMoeThinkerForConditionalGeneration)
+    patch_qwen3_omni_audio_video_mrope(Qwen3OmniMoeThinkerForConditionalGeneration)
+    patch_qwen3_omni_audio_truncation(Qwen3OmniMoeThinkerMultiModalProcessor)
 
 
 def patch_dit_lora_loader() -> None:

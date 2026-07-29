@@ -7,7 +7,7 @@ holds no runtime code at all, so it is trivially CPU-importable.
 
 **No RL types cross this seam.** ``generate`` takes a plain ``dict`` of SGLang
 sampling kwargs and returns ``list[RawResult]`` (a structural view of SGLang's
-``GenerationResult``); the engine core + adapters do the ``RolloutReq``↔``RolloutResp``
+``GenerationResult``); the engine core + adapters do the ``Sample``↔wire
 translation. Implementations absorb their transport asymmetries (in-process tensors
 vs. HTTP-serialized payloads) behind these signatures.
 """
@@ -63,9 +63,11 @@ class RawResult(Protocol):
     trajectory_log_probs: Optional["torch.Tensor"]
     samples: MediaPayload
     prompt_embeds: EncoderOutputs
+    audio_prompt_embeds: EncoderOutputs
     pooled_prompt_embeds: EncoderOutputs
     encoder_attention_mask: EncoderOutputs
     negative_prompt_embeds: EncoderOutputs
+    negative_audio_prompt_embeds: EncoderOutputs
     neg_pooled_prompt_embeds: EncoderOutputs
     #: Mask paired with ``negative_prompt_embeds`` — variable-length encoders
     #: (Qwen-VL) require it for mask-consuming replay conditioning.

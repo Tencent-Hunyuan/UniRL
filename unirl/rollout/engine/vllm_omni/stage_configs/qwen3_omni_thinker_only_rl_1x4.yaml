@@ -14,16 +14,25 @@ stage_args:
       tensor_parallel_size: 4
       distributed_executor_backend: "mp"
 
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.35
       max_num_seqs: 64
       max_num_batched_tokens: 32768
       enable_chunked_prefill: true
+
+      # Audio fusion is enabled per request; setting use_audio_in_video globally
+      # breaks vLLM's video-only dummy profiling during startup.
+      limit_mm_per_prompt:
+        audio: 1
+        video: 1
+        image: 0
+
+      mm_processor_cache_gb: 0
 
       dtype: bfloat16
       load_format: safetensors
       trust_remote_code: true
       enable_prefix_caching: false
-      enforce_eager: true
+      enforce_eager: false
 
       enable_lora: true
       max_lora_rank: 64

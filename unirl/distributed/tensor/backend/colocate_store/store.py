@@ -56,7 +56,7 @@ class TensorStore:
         self._lock = threading.Lock()
         self._counter = 0
 
-        # Global ProcessGroup for cross-worker NCCL (initialized lazily)
+        # Global ProcessGroup for cross-worker NCCL.
         self._global_pg = None
 
     def put(self, tensor: Tensor) -> ColocateTensorHandle:
@@ -153,6 +153,13 @@ class TensorStore:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
+        # ProcessGroupNCCL otherwise creates a new two-rank communicator on the
+        # first unbatched send/recv.  PE reaches that first transfer only after
+        # the colocated models fill the GPUs, leaving too little memory for
+        # NCCL communicator setup.  Eager initialization reserves the global
+        # communicator while the workers are still empty; send/recv then reuse
+        # it instead of allocating at the training-step memory peak.
+        self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
         """Send stored tensors (or row ranges of them) to dst_rank via NCCL.

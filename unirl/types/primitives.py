@@ -48,7 +48,7 @@ framework's default machinery already handles.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import PIL.Image
 import torch
@@ -327,6 +327,32 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
+# The batched single-modality primitive union — a Part's raw content (text /
+# image / video / audio). Mirrors ``sample.Primitive`` without importing the
+# Sample module and creating a cycle.
+PrimitiveValue = Union[Texts, Images, Videos, Audios]
+
+
+def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
+    """Map a batched primitive to its modality slot key.
+
+    ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
+    ``Audios -> "audio"`` — the keying convention shared by
+    ``RewardRequest.primitives`` / ``generated`` and the slots
+    :meth:`Sample.conditioning` surfaces. Inverse of a backend's
+    ``preferred_input_kind``.
+    """
+    if isinstance(prim, Texts):
+        return "text"
+    if isinstance(prim, Images):
+        return "image"
+    if isinstance(prim, Videos):
+        return "video"
+    if isinstance(prim, Audios):
+        return "audio"
+    raise TypeError(f"primitive_modality_key: unknown primitive type {type(prim).__name__!r}")
+
+
 __all__ = [
     "Audio",
     "Audios",
@@ -337,6 +363,8 @@ __all__ = [
     "TextAndImage",
     "TextAndVideo",
     "Texts",
+    "PrimitiveValue",
     "Video",
     "Videos",
+    "primitive_modality_key",
 ]

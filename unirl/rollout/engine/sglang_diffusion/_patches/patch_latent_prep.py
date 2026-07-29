@@ -176,6 +176,10 @@ def _patch_grouped_initial_noise_slice() -> None:
                 shape = getattr(lat, "shape", None)
                 if lat is not None and shape is not None and len(shape) >= 1 and shape[0] == n:
                     req.latents = lat[i : i + 1]
+                audio_lat = getattr(req, "audio_latents", None)
+                audio_shape = getattr(audio_lat, "shape", None)
+                if audio_lat is not None and audio_shape is not None and len(audio_shape) >= 1 and audio_shape[0] == n:
+                    req.audio_latents = audio_lat[i : i + 1]
                 # denoise_seeds [K] -> [this output's seed] (the per-step generator
                 # list is built from it; len must equal the per-output batch=1).
                 # This per-Req slice is what makes each sample's SDE noise

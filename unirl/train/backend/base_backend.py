@@ -721,8 +721,8 @@ class BaseFSDP2Backend(Remote):
           silently dropped", NOT "everything persisted": ``_save_dcp`` writes
           every non-meta entry but ``drop_meta_entries`` drops the frozen aux.
           Frozen-but-owned state (full-EMA mirror params, a frozen shadow LoRA
-          under full mode) is intentionally not guarded here — see
-          ``docs/dcp_checkpoint_impl.md``.
+          under full mode) is intentionally not guarded here — see the
+          checkpointing section in ``unirl/trainer/README.md``.
         - ``full`` + ``"torch"``: every param — the rank-0 gather encodes the
           whole model (frozen aux included) and cannot represent meta.
         """

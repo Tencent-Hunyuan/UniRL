@@ -1,4 +1,4 @@
-"""ZImagePipeline — RolloutReq → RolloutResp end-to-end for Z-Image.
+"""ZImagePipeline — ``Sample → Sample`` end-to-end for Z-Image.
 
 Implements the four-tier flow::
 
@@ -17,9 +17,9 @@ stages with the precision policy from the config.
 
 σ schedule contract
 -------------------
-The hosting engine (``TrainsideRolloutEngine``) pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
-``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
+The hosting engine (``TrainsideRolloutEngine``) pins the σ schedule onto the gen
+Part's ``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``;
+this pipeline reads ``params.sigmas`` and uses it
 verbatim. Both Z-Image variants' ``scheduler/scheduler_config.json`` declare
 ``use_dynamic_shifting: false`` (the diffusers ``ZImagePipeline`` computes a
 Flux-style ``mu`` but ``FlowMatchEulerDiscreteScheduler`` discards it on the
@@ -43,8 +43,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import ZImageBundle
@@ -56,21 +55,18 @@ from .vae import ZImageVAEDecodeStage
 
 
 class ZImagePipeline(Pipeline):
-    """Z-Image generate pipeline.
+    """Z-Image generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
+    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
+    hosting engine). Reads the prompt via ``sample.conditioning()`` and fills the
+    frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``stage_params["diffusion"]: dict`` — diffusion sampling kwargs.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
+    - ``segment: LatentSegment`` — the denoising trajectory.
+    - ``primitives["image"]: Images`` — the decoded images.
 
-    Writes to ``RolloutResp`` (single ``"image"`` track):
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]`` when negatives were supplied.
-    - ``segment: LatentSegment``.
-    - ``decoded: Images``.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
+    deferred; CFG uses a synthesized empty negative.
     """
 
     def __init__(
@@ -190,62 +186,63 @@ class ZImagePipeline(Pipeline):
         chat template tokenizes ``""`` cleanly, so no ``" "`` workaround is
         needed (unlike Qwen-Image).
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"ZImagePipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 0.0:
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return ZImageConditions(text=text_cond, negative_text=negative_text_cond)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run Z-Image t2i end-to-end. Requires ``req.sigmas`` to be pinned
-        by the hosting engine adapter."""
-        if req.sigmas is None:
-            raise ValueError(
-                "ZImagePipeline.generate: req.sigmas is None. The hosting "
-                "engine must call unirl.sde.runtime.ensure_req_sigmas(req, "
-                "policy) before invoking pipeline.generate; see the σ "
-                "ownership note in unirl.models.types.pipeline."
+    def generate(self, sample: Sample) -> Sample:
+        """Run Z-Image t2i end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine before the call; see the σ ownership note in
+        ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"ZImagePipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
             )
-        texts = req.primitives.get("text")
+        if params.sigmas is None:
+            raise ValueError(
+                "ZImagePipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"ZImagePipeline.generate: req.primitives['text'] must be Texts, "
+                f"ZImagePipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"ZImagePipeline.generate: negative_text length "
-                f"{len(negatives.texts)} != text length {len(texts.texts)}"
-            )
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
         if bool(params.init_same_noise) and not params.noise_group_ids:
-            params = dataclasses.replace(params, noise_group_ids=list(req.group_ids))
+            params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        z_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
-
-        schedule = req.sigmas.to(self.bundle.device)
+        z_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
         # pre-shipped initial_latents tensor still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(z_conds, schedule=schedule, params=params, initial_latents=initial_latents)
         images = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=z_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=images,
-                ),
-            }
-        )
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
+        filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=z_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["ZImagePipeline"]

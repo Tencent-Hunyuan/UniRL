@@ -16,6 +16,7 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sglang_diffusion.utils.tracks import (
     build_latent_segment,
+    collect_aux_trajectory_latents,
     collect_trajectory_latents,
     derive_timestep_alignment,
     fuse_text_conditions,
@@ -32,6 +33,7 @@ __all__ = [
     "tensorize",
     "build_latent_segment",
     "collect_trajectory_latents",
+    "collect_aux_trajectory_latents",
     "derive_timestep_alignment",
     "fuse_text_conditions",
     "stack_decoded_images",

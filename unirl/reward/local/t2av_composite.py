@@ -1,9 +1,9 @@
 """T2AV composite reward — weighted blend of video + audio scorers.
 
-For LTX-2.3 text-to-audio-video, a single track carries both the decoded video
+For LTX-2.3 text-to-audio-video, one generated Part carries both the decoded video
 (``request.generated["video"]``) and the jointly-generated audio
-(``request.generated["audio"]``, injected by the reward service from
-``track.decoded_audio``). This composite runs several inner scorers over the
+(``request.generated["audio"]``, copied by the reward service from the Part's
+``primitives["audio"]`` entry). This composite runs several inner scorers over the
 SAME request and returns their weighted sum, exposing each as a component.
 
 Mirrors ``VideoRewardScorer``'s composite pattern: inner scorers are resolved
@@ -27,8 +27,8 @@ from .registry import resolve_builtin_reward_scorer_class, resolve_builtin_rewar
 class T2AVCompositeScorer(RewardBackend):
     """Weighted blend of inner reward scorers for T2AV (video + audio).
 
-    ``input_kind = "video"``: the track routes through the video path; audio is
-    the parallel side-channel the reward service injects. Each inner scorer
+    ``input_kind = "video"``: the generated Part routes through the video path;
+    audio is the jointly generated modality. Each inner scorer
     reads whichever modality it needs off the shared request.
     """
 

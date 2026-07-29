@@ -25,7 +25,7 @@
 #     linspace(1, 0, num_timesteps) and loops num_timesteps-1 steps. BAGEL builds
 #     its sigma schedule internally (it ignores sampling_params.sigmas), with a
 #     hardwired timestep_shift=3.0 == the trainside shift, so the worker schedule
-#     equals the engine-pinned req.sigmas; the response sigma-echo verify asserts it.
+#     equals the diffusion Part's pinned sigmas; response sigma-echo verification asserts it.
 #   - trust_remote_code: BAGEL ships custom configs (llm_config.json / vit_config.json).
 #
 # NB: no ``pipeline:`` key — the legacy stage_configs loader reads only
