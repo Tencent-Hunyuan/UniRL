@@ -282,6 +282,10 @@ class TensorWorker:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
+        # Reserve the communicator before role models consume the device.  In
+        # lazy mode, the first unbatched send/recv creates a two-rank NCCL
+        # communicator at peak memory and can fail even for a tiny transfer.
+        self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
         """Send stored tensors (or row ranges of them) to dst_rank via NCCL.

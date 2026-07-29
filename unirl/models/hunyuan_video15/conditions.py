@@ -22,7 +22,7 @@ token-level hidden states only.
 Pairs ``from_dict`` / ``to_dict`` mirroring SD3 / Qwen-Image for
 round-tripping between the typed form (used inside the pipeline at
 stage call sites) and the generic ``Conditions = Dict[str, Condition]``
-shape on ``RolloutResp``. Keys emitted: ``text_mllm`` /
+shape on a ``Part``. Keys emitted: ``text_mllm`` /
 ``text_glyph`` / (optional) ``negative_text_mllm`` /
 ``negative_text_glyph`` / (optional) ``vision``.
 """
@@ -104,7 +104,7 @@ class HunyuanVideo15Conditions(Batch):
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.tracks["video"].conditions``.
+        packing into ``Part.conditions``.
 
         Emits the optional negative_* / vision keys only when populated
         so the dict shape stays minimal for CFG-off / T2V rollouts.

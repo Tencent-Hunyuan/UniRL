@@ -8,7 +8,7 @@ Contract:
 
 Re-exports are lazy via ``__getattr__`` so that importing a leaf module
 (e.g. ``unirl.distributed.tensor.transport``) does NOT eagerly
-pull in ``weight_sync`` → ``rollout/engine`` → ``types/rollout_req``,
+pull in ``weight_sync`` → ``rollout/engine`` → ``types/sample``,
 which would close the loop back on a mid-init ``types/conditions/base``.
 """
 

@@ -7,11 +7,11 @@ Contract
 --------
 
 The engine adapter (main side):
-    1. Pins ``RolloutReq.sigmas`` via
-       :func:`unirl.sde.runtime.ensure_req_sigmas` (which applies
+    1. Pins the gen Part's ``DiffusionSamplingParams.sigmas`` via
+       :func:`unirl.sde.runtime.ensure_sample_sigmas` (which applies
        the engine's :class:`FlowMatchSchedulePolicy` to the per-request
        ``(T, H, W)`` triple).
-    2. Forwards ``req.sigmas`` to the worker (SGLang's
+    2. Forwards the diffusion Part's pinned sigmas to the worker (SGLang's
        ``DiffusionSamplingParams.sigmas`` / vllm-omni's
        ``OmniDiffusionSamplingParams.sigmas``).
     3. Worker calls ``scheduler.set_timesteps(sigmas=...)`` so the loop
@@ -80,9 +80,9 @@ def verify_engine_used_sigmas(
             May be ``None`` for legacy results that don't surface it;
             we then raise rather than silently pass (silent agreement
             on σ is unsafe).
-        expected: ``RolloutReq.sigmas`` (engine pinned). ``None`` skips
+        expected: the gen Part's engine-pinned ``sigmas``. ``None`` skips
             the check — legacy callers that bypass
-            :func:`unirl.sde.runtime.ensure_req_sigmas` keep their
+            :func:`unirl.sde.runtime.ensure_sample_sigmas` keep their
             pre-existing behavior.
         engine_name: Used in error messages to point at the right wire
             (``"sglang"`` / ``"vllm-omni"`` etc.).
@@ -96,7 +96,7 @@ def verify_engine_used_sigmas(
     if actual is None:
         raise RuntimeError(
             f"{engine_name}: worker did not echo trajectory_timesteps. "
-            f"Cannot verify the σ schedule the engine pinned on req.sigmas "
+            f"Cannot verify the σ schedule pinned on the diffusion Part "
             f"was actually used. Either upgrade the worker to emit "
             f"trajectory_timesteps or pin a build that does — silent "
             f"agreement on σ is not safe (GRPO log-prob ratio drifts away "
@@ -110,8 +110,8 @@ def verify_engine_used_sigmas(
         raise RuntimeError(
             f"{engine_name}: trajectory_timesteps shape mismatch — got "
             f"{tuple(actual_t.shape)}, sent {tuple(expected_f32.shape)}. "
-            f"Worker did not use the σ schedule pinned on req.sigmas. "
-            f"Verify the engine→worker wiring threads req.sigmas into "
+            f"Worker did not use the σ schedule pinned on the diffusion Part. "
+            f"Verify the engine→worker wiring threads sampling_params.sigmas into "
             f"scheduler.set_timesteps(sigmas=...) without modification."
         )
 

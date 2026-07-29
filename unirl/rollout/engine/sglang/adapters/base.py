@@ -1,7 +1,7 @@
-"""Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + boilerplate) over the per-shape base adapter
-(:mod:`text` — both registered families emit the packed-text ``"ar"`` track) that
+(:mod:`text` — both registered families fill a packed-text generation Part) that
 holds the conversion logic as overridable methods. The VLM adapter overrides only
 the steps that differ and self-registers by ``model_family`` key. Selected once
 at engine construction via :func:`get_adapter`.
@@ -27,8 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from unirl.config.require import require
 from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import ResolvedSampling
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 # --------------------------------------------------------------------------- #
 # Registry
@@ -167,12 +166,12 @@ class ModelAdapter(ABC):
 
     # ---- the two conversion seams the engine drives ----
     @abstractmethod
-    def build_inputs(self, req: RolloutReq, *, sampling: ResolvedSampling) -> PreparedInputs:
-        """Translate a ``RolloutReq`` into per-prompt SRT ``/generate`` payloads."""
+    def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
+        """Translate a request ``Sample`` into per-prompt SRT ``/generate`` payloads."""
 
     @abstractmethod
-    def build_response(self, req: RolloutReq, prepared: PreparedInputs, raw: List[RawResult]) -> RolloutResp:
-        """Translate the seam's results back into a typed ``RolloutResp``."""
+    def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
+        """Fill the frontier gen ``Part`` from the seam's results; return the ``Sample``."""
 
 
 __all__ = [

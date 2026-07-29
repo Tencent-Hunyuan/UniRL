@@ -27,6 +27,10 @@ Patch registry (all in ``runtime.py`` unless noted) with DELETE-WHEN notes:
 - ``patch_per_request_ar_seed`` — fresh per-request AR seed so a GRPO
   group's N requests don't collapse to identical tokens.
   DELETE-WHEN: vllm-omni stops sharing one SamplingParams across requests.
+- ``patch_qwen3_omni_thinker_lora`` — backport of vllm-omni #3915: expose
+  the Thinker LoRA interface, select ``thinker_config`` during model init,
+  and accept the current M-RoPE call signature.
+  DELETE-WHEN: pin vllm-omni >=0.22, which includes the upstream change.
 - ``patch_sigmas_passthrough`` — forwards ``sampling_params.sigmas`` into
   HI3's DiT ``scheduler.set_timesteps``.
   DELETE-WHEN: upstream pipeline forwards ``sigmas`` itself.

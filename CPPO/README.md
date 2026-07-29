@@ -105,17 +105,17 @@ matching `GRPO` / `DRPO`.
 | Token-level threshold `δ` | `cppo_delta` (0.20 for 30B-A3B; paper Table 3) |
 | Position-weight floor `w_min` | `cppo_w_min` (0.8) |
 | Prefix-budget floor `δ_b^min` | `cppo_delta_b` (0.02) |
-| Sample-level advantage `Â` | `track.advantages` |
+| Sample-level advantage `Â` | `part.advantages` |
 | Token-level advantage | `GRPO._expand_advantages_to_tokens(advantages, segment.lengths, ...)` |
 | Padding/eos mask | `segment.loss_mask` |
 
 ## From rollout to update
 
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
-2. `SGLangRolloutEngine` samples completions and returns an `"ar"` track with packed
+2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
 3. `MathVerifyRewardScorer` scores each completion correct/incorrect.
-4. `RolloutTrack.compute_advantages(normalize=False, scope="group")` mean-centers rewards
+4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
 5. `TrainStack.train_track` calls `CPPO.compute_loss_and_backward`, which replays the sampled

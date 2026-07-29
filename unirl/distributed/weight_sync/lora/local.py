@@ -78,9 +78,16 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
+        topology = self._rollout.tp_per_stage()
         loaded = self._rollout.loaded_lora_checksums(adapter_id=int(DIFFRL_LORA_INT_ID))
         rank = self.rank_info.rank if self.rank_info is not None else 0
-        self._assert_loaded(exp_a, exp_b, loaded, label=f"train-rank {rank} rollout")
+        self._assert_loaded(
+            exp_a,
+            exp_b,
+            loaded,
+            topology=topology,
+            label=f"train-rank {rank} rollout",
+        )
         logger.info(
             "[LoRA-SYNC] rank %s: verify OK (%d lora_A / %d lora_B layers match)",
             rank,

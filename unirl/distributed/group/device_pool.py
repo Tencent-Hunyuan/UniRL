@@ -52,6 +52,7 @@ class DevicePool:
         workers_per_device: int = 1,
         transport_kind: str = "colocate_store",
         tq_handoff: Optional[dict] = None,
+        worker_max_concurrency: int = 1,
     ) -> None:
         if num_devices % devices_per_node != 0:
             raise ValueError(f"num_devices ({num_devices}) must be divisible by devices_per_node ({devices_per_node})")
@@ -67,6 +68,13 @@ class DevicePool:
         # Driver's TransferQueue actor handoff; required when transport_kind is
         # transfer_queue (fanned to each Worker before it builds its transport).
         self.tq_handoff = tq_handoff
+
+        # Ray actor ``max_concurrency`` for every Worker. Default 1 keeps the
+        # existing single-threaded-actor semantics byte-for-byte. The async
+        # rollout path opts in (>1) so a control RPC (``abort``/``pause``) can be
+        # serviced WHILE an in-flight ``generate`` blocks the actor — the engine
+        # still serializes the real work on its own event loop.
+        self.worker_max_concurrency = max(1, int(worker_max_concurrency))
 
         # slot0 workers indexed by device_id (backward-compatible)
         self.workers: List[ray.actor.ActorHandle] = []
@@ -185,6 +193,10 @@ class DevicePool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
+        # >1 makes the Worker a threaded Ray actor so control RPCs interleave with
+        # an in-flight blocking call. Default 1 = unchanged single-threaded actor.
+        if self.worker_max_concurrency > 1:
+            options["max_concurrency"] = self.worker_max_concurrency
         if env_vars:
             options["runtime_env"] = {"env_vars": env_vars}
 

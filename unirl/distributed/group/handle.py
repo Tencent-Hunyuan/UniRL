@@ -358,6 +358,12 @@ class Handle:
         """
 
         def handle_fn(*args, **kwargs):
+            # Optional per-call bound on the result gather. Reserved kwarg, popped
+            # before dispatch so it never reaches the worker method; None (the
+            # default) leaves ray.get unbounded. The exception-teardown flush passes
+            # it so a worker wedged in an NCCL collective can't hang the driver's
+            # ray.get forever (raises ray.exceptions.GetTimeoutError on expiry).
+            ray_get_timeout = kwargs.pop("_ray_get_timeout", None)
             ctx = current_grad_context()
 
             # ── enable_grad: validate backward support, record input TensorMetas ──
@@ -389,7 +395,7 @@ class Handle:
             shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
             # grad_mode/call_id passed as dedicated args, not mixed into kwargs
             refs = execute_fn(method_name, shards, grad_mode=ctx is not None, call_id=call_id)
-            results = ray.get(refs)
+            results = ray.get(refs, timeout=ray_get_timeout)
 
             # Rebind before collect: results[i] comes from workers[i],
             # so worker attribution is unambiguous at this point. For worker-local

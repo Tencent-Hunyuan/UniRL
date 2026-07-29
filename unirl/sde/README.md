@@ -42,8 +42,8 @@ them wrong and GRPO/FlowDPPO optimize noise.
   once per actor from the checkpoint JSON (no weights). Static schedules apply the
   SD3 time-shift locally (to dodge diffusers' double-shift bug #13243); dynamic
   schedules derive μ from `(H, W)` — `compute_mu` is the single per-model override
-  point (FLUX.2-klein subclasses it). `ensure_req_sigmas(req, policy)` pins the
-  result onto `req.sigmas` at the top of every *diffusion* engine's `generate`, so
+  point (FLUX.2-klein subclasses it). `ensure_sample_sigmas(sample, policy)` pins the
+  result onto the diffusion Part's `sampling_params.sigmas` in every diffusion engine, so
   every backend samples on the exact schedule the trainer will replay (AR-only
   paths skip it).
 - **The `x_T` recipe** (`noise.py`). The driver doesn't ship the noise tensor — it

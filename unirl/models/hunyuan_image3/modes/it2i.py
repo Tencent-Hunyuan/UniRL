@@ -25,9 +25,9 @@ import torch
 
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
@@ -38,27 +38,21 @@ if TYPE_CHECKING:
 
 
 def _prepare_seeded_sampling(
-    req: RolloutReq,
+    sample: Sample,
+    frontier: Part,
+    params: DiffusionSamplingParams,
 ) -> Tuple[DiffusionSamplingParams, Optional[List[torch.Generator]], Optional[List[str]]]:
-    """Prepare request-local RNG streams without touching process-global RNG.
-
-    UniRL's shared trainside contract makes only the initial ``x_T``
-    driver-authoritative. HI3 additionally needs deterministic source-image VAE
-    posterior samples and per-step SDE noise to satisfy strict same-seed
-    end-to-end image reproducibility.
-    """
-    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-    recipe_ids = [str(noise_id) for noise_id in (req.init_noise_group_ids or [])]
+    """Prepare request-local RNG streams without touching global RNG state."""
+    recipe_ids = [str(key) for key in NoiseRecipe.from_sample(sample).noise_group_ids]
     if params.seed is None or not recipe_ids:
         return params, None, None
-
-    sample_ids = [str(sample_id) for sample_id in (req.sample_ids or [])]
-    if len(sample_ids) != len(recipe_ids):
+    if len(recipe_ids) != frontier.batch_size:
         raise ValueError(
-            "HunyuanImage3 it2i seeded sampling requires sample_ids aligned with "
-            f"init_noise_group_ids; got {len(sample_ids)} and {len(recipe_ids)}."
+            "HunyuanImage3 it2i seeded sampling requires noise keys aligned with "
+            f"the frontier batch; got {len(recipe_ids)} for {frontier.batch_size}."
         )
 
+    sample_ids = [str(sample_id) for sample_id in frontier.sample_ids]
     seeded_params = replace(params, noise_group_ids=recipe_ids)
     condition_vae_generators = make_cpu_generators(
         int(params.seed),
@@ -73,7 +67,7 @@ def _encode_cond_images_per_sample(
     batch_cond_images,
     generators: Optional[List[torch.Generator]],
 ):
-    """Encode each outer sample with its matching VAE RNG stream."""
+    """Encode every source image with the matching per-sample VAE RNG."""
     if generators is None:
         return transformer._encode_cond_image(batch_cond_images, cfg_factor=1, generator=None)
     if len(generators) != len(batch_cond_images):
@@ -105,42 +99,39 @@ def _encode_cond_images_per_sample(
     return cond_vae_images, cond_timestep, vit_items or None
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
-    texts = req.primitives.get("text")
+    frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+    params = frontier.sampling_params
+    params, condition_vae_generators, sde_sample_keys = _prepare_seeded_sampling(sample, frontier, params)
+    if params.sigmas is None:
+        raise ValueError(
+            "HunyuanImage3 it2i: gen part sampling_params.sigmas is None. The hosting engine must "
+            "pin σ before pipeline.generate."
+        )
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
     require(
         isinstance(texts, Texts),
-        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['text'] "
+        f"HunyuanImage3Pipeline.generate (it2i): prompt from sample.conditioning()[0] "
         f"must be Texts, "
         f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
-    images = req.primitives.get("image")
+    images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
     require(
         isinstance(images, Images),
-        f"HunyuanImage3Pipeline.generate (it2i): req.primitives['image'] "
-        f"must be Images, "
-        f"got {type(images).__name__ if images is not None else 'None'}",
-    )
-    require(
-        req.primitives.get("negative_text") is None,
-        "HunyuanImage3Pipeline.generate (it2i): negative_text is not supported — "
-        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
-        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
+        "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
-    params, condition_vae_generators, sde_sample_keys = _prepare_seeded_sampling(req)
     require(
         int(params.samples_per_prompt) <= 2,
-        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet — "
-        "the per-sample cond_vit lists (spatial_shapes / attn_mask) trip the dp>1 track merge above 2 "
-        "(see the pin in examples/unified_model/hi3_it2i.yaml; per-sample tensors are the tracked follow-up).",
+        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet; "
+        "per-sample cond_vit lists are not transport-safe above 2.",
     )
-    if req.sigmas is None:
-        raise ValueError(
-            "HunyuanImage3 it2i: req.sigmas is None. Engine adapter must call "
-            "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
-        )
-    schedule = req.sigmas.to(pipeline.bundle.device)
+    schedule = params.sigmas.to(pipeline.bundle.device)
+    # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
+    # and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
 
     # 1. ViT cond features. Returns joint_image_info (forwarded to chat
@@ -160,9 +151,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
     vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
 
-    # 3. Build the unified-MM tensors with cond-image markers spliced in. With
-    #    cfg=True the fused is the cfg-doubled [cond; uncond] N=2B batch.
-    bot_task = str(req.stage_config.get("bot_task", "image"))
+    # 4. Build the unified-MM tensors with cond-image markers spliced in.
+    bot_task = str((sample.parts[0].control or {}).get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
@@ -179,8 +169,16 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     #    B-sample track transport, and the stage re-stacks [cond; uncond] for a GUIDED
     #    replay (ratio=1 at cfg>1). cfg=False -> single branch, fused_uncond=None.
     fused_full = mm["fused"]
+    expected_fused_rows = frontier.batch_size * (2 if cfg else 1)
+    actual_fused_rows = int(fused_full.input_ids.shape[0])
+    if actual_fused_rows != expected_fused_rows:
+        raise ValueError(
+            "HunyuanImage3 it2i tokenizer batch mismatch: "
+            f"expected {expected_fused_rows} fused rows for B={frontier.batch_size}, "
+            f"got {actual_fused_rows}."
+        )
     if cfg:
-        n = int(fused_full.input_ids.shape[0]) // 2
+        n = frontier.batch_size
         fused_cond = fused_full.slice(0, n)
         fused_uncond = fused_full.slice(n, 2 * n)
     else:
@@ -214,14 +212,5 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     )
     edited = pipeline.vae_decode.decode(latent_seg)
 
-    return RolloutResp(
-        tracks={
-            "image": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=diff_conds.to_dict(),
-                segment=latent_seg,
-                decoded=edited,
-            ),
-        }
-    )
+    filled = frontier.fill(segment=latent_seg, primitives={"image": edited}, conditions=diff_conds.to_dict())
+    return sample.with_parts([*sample.parts[:-1], filled])

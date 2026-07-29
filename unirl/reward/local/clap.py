@@ -27,9 +27,9 @@ class CLAPRewardScorer(LocalRewardBackend):
     """Audio-text alignment reward using LAION CLAP.
 
     ``input_kind = "video"``: the primary decoded media is the video (so the
-    track routes through the video path), and the audio arrives as a parallel
+    generated Part routes through the video path), and the audio arrives as a parallel
     side-channel (``request.generated["audio"]`` + ``request.audio_sample_rate``)
-    that the reward service injects when the track has ``decoded_audio``.
+    modality from the same Part's ``primitives["audio"]`` entry.
     """
 
     canonical_model_name = "clap"
@@ -94,7 +94,7 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ValueError(
                 "CLAPRewardScorer requires audio in the reward request "
                 "(request.generated['audio']); got none. Ensure the pipeline "
-                "decodes audio into track.decoded_audio for LTX-2.3 T2AV."
+                "decodes audio into Part.primitives['audio'] for LTX-2.3 T2AV."
             )
         if request.audio_sample_rate is None:
             raise ValueError("CLAPRewardScorer requires request.audio_sample_rate (source Hz); got None.")

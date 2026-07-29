@@ -1,0 +1,173 @@
+# @package _global_
+# Qwen3-Omni Thinker · GSPO + LoRA · video MCQA · vLLM-Omni rollout.
+# TP=4 is required because TP must divide the audio tower's 20 attention heads.
+#
+# Launch from the repository root:
+#   QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
+#   DATA_PATH=/path/to/video_r1_260k/train.jsonl \
+#   EVAL_DATA_PATH=/path/to/video_r1_260k/val.jsonl \
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh \
+#     ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+
+num_devices: 8
+devices_per_node: 8
+batch_size: 8
+
+num_rollouts: 500
+weight_sync_interval: 1
+
+adv_normalization_scope: group
+
+eval_interval: 20
+eval_num_prompts: 8
+eval_samples_per_prompt: 1
+eval_temperature: 1.0
+
+# The anchor must differ from rank 0 to avoid a synchronous self-call.
+rollout_anchor_device: 1
+# Offload training state while the colocated rollout engine is awake.
+enable_fsdp_offload: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-omni
+  run_name: qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [gspo, qwen3-omni, thinker, video, vllm-omni, lora, video-r1-260k, 1x8]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
+    model_precision: bf16
+    attn_implementation: sdpa
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    use_lora: true
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+    use_gradient_checkpointing: true
+    max_prompt_length: 12288
+    video_fps: 1.0
+    video_max_frames: 64
+    video_max_pixels: 262144
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
+  max_prompt_length: 12288
+  video_fps: 1.0
+  video_max_frames: 64
+  video_max_pixels: 262144
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # Manual offload and FSDP CPUOffloadPolicy must not be enabled together.
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 500
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    # PEFT injects adapters by name even under frozen encoder modules.
+    exclude_modules: ".*visual.*|.*audio_tower.*"
+
+# vLLM-Omni thinker rollout, TP=4.
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
+    modality: qwen3_omni_thinker
+    stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
+    enable_sleep_mode: true
+    omni_extra:
+      stage_init_timeout: 1200
+      init_timeout: 1800
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
+  # vLLM-Omni's thinker mapper requires this prefix.
+  param_prefix: "thinker."
+  adapter_name: default
+  verify: true
+  copy: true
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Apply a smooth penalty near the generation limit.
+  truncated_reward: soft
+  overlong_buffer_len: 512
+  overlong_penalty_factor: 1.0
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+      # Correct tagged answers score 1.0; other correct formats score 0.5.
+      graded_format_reward: true
+
+algorithm:
+  _target_: unirl.algorithms.gspo.GSPO
+  stage_attr: ar
+  clip_range: 3.0e-4
+  clip_range_high: 4.0e-4
+  clip_schedule: constant
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/video_r1_260k/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/video_r1_260k/val.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 8
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

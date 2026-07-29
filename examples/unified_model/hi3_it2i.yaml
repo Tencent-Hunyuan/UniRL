@@ -45,13 +45,13 @@
 #                export PRETRAINED_MODEL=... EDIT_DATA_PATH=... EDIT_EVAL_DATA_PATH=...
 #                PYTHONPATH=$PWD python -m unirl.train_diffusion --config-name unified_model/hi3_it2i
 #
-# Smoke (8 GPUs): override batch_size=4 num_rollouts=2 logging.report_to_wandb=false.
+# Smoke (8 GPUs): keep batch_size=8; override num_rollouts=2 logging.report_to_wandb=false.
 # Compose check (CPU): python -m unirl.train_diffusion --config-name unified_model/hi3_it2i --cfg job --resolve
 
 num_devices: 8
-batch_size: 8                  # prompts/rollout. TRAINSIDE DP_SCATTER splits (batch_size x
-                               # samples_per_prompt) across dp_size, so that product MUST be
-                               # divisible by num_devices. 8x2=16 -> 2 images/GPU.
+batch_size: 8                  # prompts/rollout. The first TRAINSIDE DP_SCATTER splits prompts
+                               # before group expansion, so batch_size itself MUST be divisible by
+                               # num_devices. 8x2=16 -> 2 images/GPU.
 adv_use_global_std: false      # per-group GRPO normalization
 num_rollouts: 10000            # intentionally large; stop manually
 
@@ -67,7 +67,7 @@ workers_per_device: 1
 
 # Pin the it2i edit task: every sample MUST carry a source image (dataset media
 # role: condition). HunyuanImage3Pipeline.generate routes task=it2i -> modes/it2i.
-stage_config:
+task_config:
   task: it2i
   bot_task: image              # direct edit, no CoT (template flag for embed_for_gen_image)
 

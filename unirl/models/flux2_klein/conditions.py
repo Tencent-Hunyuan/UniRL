@@ -12,12 +12,12 @@ the Klein transformer ignores ``pooled_projections`` entirely).
 The CFG negative branch is split into a sibling ``negative_text``
 field (rather than nested under ``text.negative``) so the schema is
 honest about which slots travel on the wire — a reader of
-``RolloutResp.tracks["image"].conditions`` sees ``"text"`` and ``"negative_text"`` as
+``Part.conditions`` sees ``"text"`` and ``"negative_text"`` as
 two equal-status entries.
 
 Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
 form (used inside the pipeline at stage call sites) and the generic
-``Conditions = Dict[str, Condition]`` shape on ``RolloutResp``.
+generic ``Dict[str, Condition]`` shape on a ``Part``.
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ class Flux2KleinConditions(Batch):
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.tracks["image"].conditions``.
+        packing into ``Part.conditions``.
 
         Emits ``"negative_text"`` only when ``negative_text is not None``
         and the image-edit slots only when an image condition is present,
