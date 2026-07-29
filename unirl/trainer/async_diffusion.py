@@ -4,36 +4,39 @@ Diffusion sibling of :class:`~unirl.trainer.async_ar.AsyncARTrainer`. It subclas
 :class:`~unirl.trainer.diffusion.DiffusionTrainer` with ``layout="separate"`` to
 REUSE its two-slab build (train slab + dedicated rollout engine slab), the
 cross-slab weight-sync wiring (``RemoteLoraWeightSync`` for the BAGEL recipe;
-``NCCLWeightSync`` is also supported by ``_connect_separate``), and the diffusion
-plumbing (``_build_req`` / ``_drop_decoded`` / ``evaluate`` / checkpoint /
-FlowGRPO ``stack.train_track``). On top of that it overlays the SAME
-single-threaded async rollout buffer loop as ``AsyncARTrainer``:
+``NCCLWeightSync`` is also supported by ``_connect_separate``) and the diffusion
+plumbing (``_build_request_sample`` / ``_drop_decoded`` / ``evaluate`` /
+checkpoint / FlowGRPO ``stack.train_track``).
 
-* Generation is launched as **non-blocking Ray futures** on the rollout slab
-  (``_generate_async``) and reaped on the driver thread (``_reap_ready``); no
-  producer thread, no locks.
-* Reward is scored synchronously at reap time (``_score_into_buffer``) before
-  groups enter the buffer. Generation overlaps training; reward scoring itself
-  does not.
-* Training consumes the freshest ``batch_size`` groups per step
-  (``_advantage_and_train``: advantage + FlowGRPO optimizer step); it never calls
-  the reward.
+The async loop itself is the shared
+:class:`~unirl.rollout.async_runtime.AsyncRolloutScheduler` that ``AsyncARTrainer``
+drives — one single-threaded driver loop over non-blocking Ray dispatch, no
+producer thread and no locks. This trainer supplies only the diffusion hooks:
+
+* ``_build_async_sample`` — one data batch → one request ``Sample``.
+* ``_score_completed`` — reward at reap time, then split into tree-complete
+  groups. Generation overlaps training; reward scoring itself does not.
+* ``_advantage_and_train`` — advantage + FlowGRPO optimizer step over the
+  freshest ``batch_size`` groups; it never calls the reward.
 
 Two numeric knobs (identical semantics to AsyncARTrainer):
-  * ``max_inflight`` — must be ``1`` so reap-time transfer never competes with
+  * ``max_inflight`` — must be ``1`` so a reap-time transfer never competes with
     a queued generation on the rollout workers.
-  * ``buffer_max_staleness`` — regular rollout-weight syncs a buffered group
-    may cross. ``0`` (default) never crosses a sync; ``>0`` enables a bounded
+  * ``buffer_max_staleness`` — regular rollout-weight syncs a buffered group may
+    cross. ``0`` (default) never crosses a sync; ``>0`` enables a bounded
     policy-lag buffer.
 
-Draining all in-flight generations before each weight sync is MANDATORY (a
-weight + KV update corrupts an in-flight generation); that is the single-threaded
-``_drain_all`` quiesce.
+The scheduler runs in ``reap_before_launch`` mode, which is what makes the overlap
+fast here: reaping a generation pulls its trajectory segment off the rollout slab
+(the reward's cross-slab localize, an NCCL send issued on the rollout workers), so
+a generation launched ahead of that send blocks it — measured ~150s/rollout on
+BAGEL instead of ~8s. Reaping first hands the send idle workers, and the launch
+that follows still happens before the step returns, so the next generation
+overlaps this step's training.
 
-NOTE: the async buffer/generate-seam machinery below is intentionally a faithful
-copy of ``AsyncARTrainer`` (it is engine- and modality-agnostic); a future refactor
-could lift it into a shared mixin. Kept self-contained here to leave the validated
-AR path untouched.
+Draining all in-flight generations before each weight sync is MANDATORY (a
+weight + KV update corrupts an in-flight generation); that is the
+single-threaded ``_drain_all`` quiesce.
 """
 
 from __future__ import annotations
@@ -41,61 +44,22 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
-import ray
 import torch
 
-from unirl.distributed.group.dispatch import DISPATCH_MODE_REGISTRY, Dispatch
-from unirl.distributed.tensor import WorkerLocalTransport, hydrate
-from unirl.distributed.tensor.pytree import infer_batch_size
+from unirl.distributed.tensor import hydrate
+from unirl.rollout.async_runtime import (
+    AsyncRolloutScheduler,
+    BufferedRolloutGroup,
+    InflightGeneration,
+    RayGenerationDispatcher,
+)
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.diffusion import DiffusionTrainer
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
-
-
-class _RolloutBuffer:
-    """Group-keyed rollout buffer (single-threaded; no lock needed).
-
-    Each entry is one prompt's GRPO group — a ``RolloutTrack`` of
-    ``samples_per_prompt`` already-scored samples — stamped with the
-    ``weight_version`` it was generated under and a monotonic ``gen_id`` for
-    freshness ordering. Groups are always complete (the whole ``generate``
-    finished before they are ``put``), so there is no partial-group bookkeeping.
-    """
-
-    def __init__(self) -> None:
-        self._items: List[Tuple[RolloutTrack, int, int]] = []  # (group, weight_version, gen_id)
-
-    def put(self, track: RolloutTrack, *, weight_version: int, gen_id: int) -> None:
-        self._items.append((track, int(weight_version), int(gen_id)))
-
-    def size(self) -> int:
-        return len(self._items)
-
-    def drain_freshest(
-        self,
-        n: int,
-        *,
-        current_version: Optional[int] = None,
-        max_staleness: Optional[int] = None,
-    ) -> Optional[List[Tuple[RolloutTrack, int, int]]]:
-        """Pop the ``n`` freshest complete groups, carrying leftovers forward.
-
-        Returns ``None`` if fewer than ``n`` groups remain after eviction. When
-        ``max_staleness`` is set, groups older than ``current_version -
-        max_staleness`` weight versions are evicted first (bounded off-policy).
-        """
-        if max_staleness is not None and current_version is not None:
-            self._items = [it for it in self._items if current_version - it[1] <= max_staleness]
-        if len(self._items) < n:
-            return None
-        self._items.sort(key=lambda it: it[2], reverse=True)  # freshest gen_id first
-        picked, self._items = self._items[:n], self._items[n:]
-        return picked
 
 
 class AsyncDiffusionTrainer(DiffusionTrainer):
@@ -130,131 +94,41 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         self._max_inflight = max_inflight
         self._buffer_max_staleness = buffer_max_staleness
         self._weight_version = 0  # driver-tracked policy version (# of weight syncs issued)
-        # The rollout resp's single track key (e.g. "diffusion"), captured from the
-        # first reaped generation so the reassembled resp keeps the same key.
-        self._track_key: str = "diffusion"
 
     # ------------------------------------------------------------------
-    # Non-blocking generate seam (split of the rollout Handle dispatch at ray.get;
-    # mirrors AsyncARTrainer._generate_async — engine-agnostic).
+    # Generic async-runtime hooks
     # ------------------------------------------------------------------
 
-    def _generate_async(self, req: RolloutReq):
-        """Launch ``generate`` non-blocking; return (refs, worker_local)."""
-        r = self.rollout
-        dispatch_fn = DISPATCH_MODE_REGISTRY[Dispatch.DP_SCATTER]["dispatch_fn"]
-        bs = infer_batch_size((req,), {})
-        if bs is not None and bs % r.dp_size != 0:
-            raise ValueError(f"req batch_size={bs} not divisible by rollout dp_size={r.dp_size}")
-        shards = dispatch_fn(r, (req,), {}, bs)
-        worker_local = issubclass(r.pool.transport_cls, WorkerLocalTransport)
-        shards = r.pool.transport_cls.localize(shards, r.pool, r.device_ids, r.worker_ids)
-        refs = r._execute_all("generate", shards, grad_mode=False, call_id=None)
-        return refs, worker_local
+    def _build_async_sample(self, gen_id: int) -> Sample:
+        """Consume one data batch and build the request Sample for ``gen_id``."""
+        return self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
 
-    def _collect_resp(self, refs, worker_local) -> RolloutResp:
-        """Join a completed generate → full RolloutResp (blocks in ray.get)."""
-        r = self.rollout
-        collect_fn = DISPATCH_MODE_REGISTRY[Dispatch.DP_SCATTER]["collect_fn"]
-        results = ray.get(refs)
-        results = [r._rebind_tree(x, r.workers[i], worker_local=worker_local) for i, x in enumerate(results)]
-        return collect_fn(r, results)
+    def _score_completed(
+        self,
+        job: InflightGeneration,
+        completed: Sample,
+    ) -> List[Sample]:
+        """Score a completed Sample and split it into tree-complete groups.
 
-    @staticmethod
-    def _is_ready(refs) -> bool:
-        """True iff every worker's generate ref is resolved (non-blocking reap)."""
-        ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
-        return len(ready) == len(refs)
-
-    # ------------------------------------------------------------------
-    # In-flight bookkeeping
-    # ------------------------------------------------------------------
-
-    def _launch(self, gen_id: int) -> None:
-        """Build a request and launch one non-blocking generation."""
-        req = self._build_req(self.data_source.get_samples(self.batch_size), gen_id)
-        refs, worker_local = self._generate_async(req)
-        self._inflight.append(
-            {
-                "refs": refs,
-                "worker_local": worker_local,
-                "req": req,
-                "gen_id": gen_id,
-                "weight_version": self._weight_version,
-            }
-        )
-
-    def _score_into_buffer(self, rec: Dict[str, Any], resp: RolloutResp) -> None:
-        """Score a completed generation and split its groups into the buffer.
-
-        Scoring (``reward.score_and_attach``) is synchronous at reap time,
-        before the next launch and training-batch consumption. It must precede
-        ``_drop_decoded`` because the reward reads ``decoded``.
+        Scoring is synchronous at reap time — before the next launch and before
+        training consumes the batch — and must precede ``_drop_decoded`` (the
+        reward reads the decoded primitive). Keyed by ``gen_id`` so media panels
+        behave like the synchronous path. The filled ``Sample`` is self-contained
+        (it carries its input Parts), so no request handle is kept on the
+        in-flight record.
         """
-        req = rec["req"]
-        for name, track in list(resp.tracks.items()):
-            if track.segment is not None:
-                resp.tracks[name] = self.reward.score_and_attach(req=req, track=track)
-        self._track_key = next(iter(resp.tracks))
-        self._drop_decoded(req, resp, rollout_id=rec["gen_id"])
-        (track,) = resp.tracks.values()
-        for group in track.split():
-            self._buffer.put(group, weight_version=rec["weight_version"], gen_id=rec["gen_id"])
-
-    def _reap_ready(self) -> None:
-        """Move every completed in-flight generation into the buffer (scored)."""
-        still: List[Dict[str, Any]] = []
-        for rec in self._inflight:
-            if self._is_ready(rec["refs"]):
-                self._score_into_buffer(rec, self._collect_resp(rec["refs"], rec["worker_local"]))
-            else:
-                still.append(rec)
-        self._inflight = still
+        scored = self.reward.score_and_attach(completed)
+        self._drop_decoded(scored, rollout_id=job.gen_id)
+        return scored.split()
 
     def _drain_all(self) -> None:
-        """Finish + buffer EVERY in-flight generation (single-threaded quiesce).
+        """Finish + buffer EVERY in-flight generation (the single-threaded quiesce).
 
         Mandatory before a weight sync (a weight + KV update corrupts an in-flight
-        generate), before eval/checkpoint (shared engine), and in ``finally``.
+        generate), before eval/checkpoint (shared engine), and in ``finally`` (no
+        leaked ObjectRefs).
         """
-        for rec in self._inflight:
-            self._score_into_buffer(rec, self._collect_resp(rec["refs"], rec["worker_local"]))
-        self._inflight = []
-
-    def _next_batch(self, rollout_id: int, interval: int, M: int, stale: int, num_rollouts: int):
-        """Top up launches, reap completed generations, and return the freshest
-        ``batch_size`` groups (blocking on the oldest in-flight generation if the
-        buffer is short).
-
-        The launch clamp guarantees that ``stale=0`` never launches into a
-        future sync window, so no generation crosses a regular rollout-weight
-        sync boundary.
-        """
-        while True:
-            # Reap (and cross-slab-transfer the completed generation's segment)
-            # BEFORE launching the next one. The transfer runs on the rollout
-            # worker as an NCCL send; if a fresh generation were already queued on
-            # that worker (launch-first), the send would block behind it (~150s).
-            # Reaping first gives the transfer an idle-worker window; the launch
-            # below then starts the NEXT generation, which overlaps the caller's
-            # train step. Contention-free as long as at most one generation is in
-            # flight at the transfer instant (max_inflight=1).
-            self._reap_ready()
-            staleness_window = ((rollout_id // interval) + 1 + stale) * interval
-            ceiling = min(num_rollouts, staleness_window)
-            while self._launch_id < ceiling and len(self._inflight) < M:
-                self._launch(self._launch_id)
-                self._launch_id += 1
-
-            picked = self._buffer.drain_freshest(
-                self.batch_size, current_version=self._weight_version, max_staleness=stale
-            )
-            if picked is not None:
-                return picked
-            if self._inflight:
-                ray.get(self._inflight[0]["refs"])  # block on oldest; next _reap_ready harvests it
-            else:
-                raise RuntimeError("async-diffusion: buffer underflow with no in-flight generations")
+        self._async_scheduler.drain_all(self._score_completed)
 
     # ------------------------------------------------------------------
     # Train tail (mirrors DiffusionTrainer.train_step's post-generate half:
@@ -263,27 +137,28 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
 
     def _advantage_and_train(
         self,
-        track: RolloutTrack,
-        resp: RolloutResp,
+        sample: Sample,
         *,
         training_progress: float,
         rollout_id: int,
         t0: Optional[float] = None,
     ) -> Tuple[TrainStepResult, float]:
-        """Advantage + optimizer step for a SCORED track (rewards already attached)."""
+        """Advantage + optimizer step for a SCORED ``Sample`` (rewards already attached)."""
         if t0 is None:
             t0 = time.perf_counter()
+        part = sample.parts[-1]
         mean_reward = 0.0
-        if track.rewards is not None:
-            track.rewards = hydrate(track.rewards)
-            if isinstance(track.component_rewards, dict):
-                track.component_rewards = {name: hydrate(value) for name, value in track.component_rewards.items()}
-            mean_reward = float(track.rewards.to(torch.float32).mean().item())
-        track = track.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
-        (name,) = resp.tracks.keys()  # single-track diffusion
-        resp.tracks[name] = track
-        result = self.stack.train_track(track, training_progress=float(training_progress))
-        self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
+        if part.rewards is not None:
+            # Hydrate in place so the wandb reward/advantage stats reuse this fetch
+            # instead of re-pulling the TensorRef from the worker.
+            part.rewards = hydrate(part.rewards)
+            if isinstance(part.component_rewards, dict):
+                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
+            mean_reward = float(part.rewards.to(torch.float32).mean().item())
+        part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
+        sample = sample.replace_frontier(part)
+        result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
+        self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
         # train_step is bypassed, so BaseTrainer's per-step reset hook never fires;
         # reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
@@ -324,9 +199,15 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             },
         )
 
-        self._buffer = _RolloutBuffer()
-        self._inflight: List[Dict[str, Any]] = []
-        self._launch_id = start_rollout
+        # reap_before_launch: reaping pulls the trajectory segment off the rollout
+        # slab, so it must not queue behind a freshly launched generation, and the
+        # post-reap launch is what overlaps this step (see the module docstring).
+        self._async_scheduler = AsyncRolloutScheduler(
+            RayGenerationDispatcher(self.rollout),
+            groups_per_step=self.batch_size,
+            reap_before_launch=True,
+        )
+        self._async_scheduler.reset(start_rollout)
 
         if resumed and self.weight_sync is not None:
             self.weight_sync.sync()  # push restored weights into the fresh engine
@@ -338,12 +219,13 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
-                picked = self._next_batch(rollout_id, interval, M, stale, num_rollouts)
-                track = RolloutTrack.concat([p[0] for p in picked])
-                resp = RolloutResp(tracks={self._track_key: track})
+                picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
+                # Reassemble the drained per-prompt group Samples into one batched
+                # Sample [input(P), gen(P*N)] — the inverse of Sample.split.
+                sample = Sample.concat([item.sample for item in picked])
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
-                    track, resp, training_progress=training_progress, rollout_id=rollout_id, t0=t0
+                    sample, training_progress=training_progress, rollout_id=rollout_id, t0=t0
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
@@ -371,3 +253,31 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                 logger.exception("Failed to drain in-flight generations during async diffusion teardown")
             finally:
                 self._finish_wandb()
+
+    def _next_step(
+        self,
+        rollout_id: int,
+        interval: int,
+        M: int,
+        stale: int,
+        num_rollouts: int,
+    ) -> List[BufferedRolloutGroup]:
+        """Reap completed generations, top up launches, and return the freshest
+        ``batch_size`` groups for ``rollout_id`` (blocking on the oldest in-flight
+        generation if the buffer is short).
+
+        The launch clamp is the load-bearing on-policy guarantee: a generation
+        launched now is consumed later, so bound how far ahead we launch to
+        ``stale`` weight-syncs. ``stale=0`` ⇒ never launch into a future
+        sync-window ⇒ no generation crosses a regular rollout-weight sync.
+        """
+        return self._async_scheduler.next_step(
+            rollout_id=rollout_id,
+            sync_interval=interval,
+            max_inflight=M,
+            max_staleness=stale,
+            num_rollouts=num_rollouts,
+            current_version=self._weight_version,
+            build_sample=self._build_async_sample,
+            on_complete=self._score_completed,
+        )
