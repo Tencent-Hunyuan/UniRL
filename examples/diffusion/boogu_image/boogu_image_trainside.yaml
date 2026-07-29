@@ -1,0 +1,215 @@
+# @package _global_
+# Boogu-Image-0.1-Base + trainside (FSDP) colocate, v2 trainer, FlowGRPO.
+#
+# Trainside = rollout runs in-process on the FSDP-wrapped training pipeline
+# (no separate rollout actor, no weight sync). Strongest colocate form.
+#
+# This recipe targets Boogu/Boogu-Image-0.1-Base: a 10.29B vendored
+# single/double-stream DiT (Lumina-2 lineage) + frozen Qwen3-VL-8B mllm
+# instruction encoder + FLUX.1 16-channel AutoencoderKL. The released Base
+# scheduler is a STATIC v1 time shift (seq_len=4096) whose sigma-space form is
+# the standard static shift with s = e^{1.15} = 3.158192909689768 — pinned via
+# BooguImagePipeline.build_schedule_policy (Boogu's scheduler_config.json uses
+# custom field names the generic JSON loader would silently ignore).
+#
+# CFG is intentionally OFF here (guidance_scale=1.0 — Boogu's off value; the
+# combine is pred + (g-1)*(pred - pred_neg)). Same rationale as z_image: CFG
+# sharpens the per-prompt distribution (less in-group diversity -> weaker GRPO
+# advantage) AND doubles the per-step forward cost. To re-enable: set
+# sampling.guidance_scale to 2.0-4.0 (reference inference uses 4.0); the
+# pipeline then auto-adds ""-negatives, which the embed stage routes to the
+# DROP system prompt (dataset logic).
+#
+# Resolution note: Boogu's native band is 1K/1.5K/2K; 512^2 is off-band but
+# the sigma schedule is resolution-invariant (config-pinned static shift), and
+# 512^2 keeps the smoke cheap. If early rollout/generated_media look too
+# degenerate for PickScore to rank, fall back to 1024^2:
+#   sampling.height=1024 sampling.width=1024 rollout.forward_batch_size=1 \
+#   stack.micro_batch_size=1 batch_size=16 sampling.samples_per_prompt=8
+#
+# Scale is set by the launcher (num_devices = cluster GPU count). For a quick
+# wiring smoke, shrink via CLI overrides, e.g.:
+#   batch_size=8 sampling.samples_per_prompt=4 num_rollouts=2
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout (divisible by 8)
+adv_use_global_std: true      # advantage: divide by ONE batch-wide std, not per-group
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-boogu-image}
+  run_name: ${oc.env:WANDB_RUN_NAME,boogu_image_trainside}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: null
+
+bundle:
+  _target_: unirl.models.boogu_image.bundle.BooguImageBundle.from_config
+  config:
+    _target_: unirl.models.boogu_image.config.BooguImagePipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BOOGU_IMAGE_PATH,Boogu/Boogu-Image-0.1-Base}
+    model_precision: bf16
+    # Reference __call__ default; the Qwen3-VL processor pads to the batch
+    # longest under this cap (pickscore prompts are far shorter — this is a
+    # cap, not a padded length).
+    max_sequence_length: 1280
+    # e^{lin(4096)} = e^{1.15}: the released static-v1 shift. Read by
+    # build_schedule_policy (static posture pinned from config).
+    shift: 3.158192909689768
+
+# Pipeline relies on the optional-stages constructor (mirrors z_image): the
+# trainer auto-injects `bundle=self.bundle`; text_embed/diffusion/vae_decode
+# are built from the bundle here using the precision policy below.
+pipeline:
+  _target_: unirl.models.boogu_image.pipeline.BooguImagePipeline
+  shift: 3.158192909689768
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 1280
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # FSDP matches by EXACT concrete class name (train/backend/fsdp/wrap.py):
+  # the bare BooguImageTransformerBlock base is never instantiated — the DiT
+  # builds 4 pass-subclasses plus BooguImageDoubleStreamTransformerBlock,
+  # which is a separate class (NOT a subclass) and must be listed or the 8
+  # double-stream layers stay unsharded/un-checkpointed. RefImgRefiner blocks
+  # exist and hold weights even in T2I.
+  block_class_names:
+    - BooguImageNoiseRefinerTransformerBlock
+    - BooguImageRefImgRefinerTransformerBlock
+    - BooguImageContextRefinerTransformerBlock
+    - BooguImageSingleStreamTransformerBlock
+    - BooguImageDoubleStreamTransformerBlock
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # 10.29B DiT + frozen Qwen3-VL-8B under full-graph replay: keep AC on.
+    activation_checkpointing: true
+    use_torch_compile: false
+    # fp32 LoRA master + Adam states (bagel's reward-collapse fix): a bf16
+    # master rounds away ~1e-4-scale GRPO updates on a bf16-loaded base.
+    master_dtype: fp32
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Boogu attention projections. peft suffix-matching is dot-boundary, so
+    # the double-stream joint-attention projections — which live INSIDE the
+    # attn processor module (img_instruct_attn's own to_q/to_k/to_v are
+    # deleted at ctor) — must be listed explicitly; `to_q` does NOT match
+    # `img_to_q`. Covers: 32 single-stream + 6 refiner blocks + img_self_attn
+    # (standard diffusers Attention: to_q/to_k/to_v/to_out.0) and the 8
+    # double-stream joint attentions (processor img/instruct projections).
+    # No bare FFN linear_N targets: those suffixes also match norm_out and
+    # the timestep embedder.
+    target_modules:
+      - to_k
+      - to_out.0
+      - to_q
+      - to_v
+      - img_to_q
+      - img_to_k
+      - img_to_v
+      - instruct_to_q
+      - instruct_to_k
+      - instruct_to_v
+      - img_out
+      - instruct_out
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # 10.29B DiT + 8.8B frozen encoder: chunk generate() so the rollout/decode
+  # peak stays bounded. Start at 4 (z_image 6B uses 8; qwen 20B uses 1);
+  # bump to 8 after an HBM check, halve if CFG is enabled (2x forwards).
+  forward_batch_size: 4
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  # Recompute pi_old at the exact train micro-geometry so the on-policy ratio
+  # is exactly 1. REQUIRED here (not just prudence): forward_batch_size (4)
+  # != micro_batch_size (2) and bf16 forwards are batch-shape sensitive.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.boogu_image.conditions.BooguImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  # Per-GPU mini-batch is batch_size*spp/num_devices/num_updates_per_batch =
+  # 48*16/8/2 = 48 -> mbs 2 = 24 accum steps. Resident frozen weights
+  # dominate HBM at 10.29B+8.8B; try mbs 4 if headroom allows.
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2      # PPO mini-batches per rollout (pi_old frozen once)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 12       # RL-reduced from the native 25-50 (matches
+                                # z_image/qwen recipes)
+  guidance_scale: 1.0           # CFG OFF in Boogu's convention (1.0 == off;
+                                # reference inference uses 4.0). Set 2.0-4.0
+                                # to re-enable (auto-""-negatives + DROP
+                                # system prompt; ~2x rollout+replay cost).
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    # SDE-step window: confine SDE noise to the early high-sigma steps.
+    timestep_fraction: [0, 0.5]

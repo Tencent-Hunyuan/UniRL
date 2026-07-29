@@ -96,7 +96,9 @@ _SP_INJECT_FIELDS = {
     "sigmas": (None, "list[float] | None"),
     "timesteps": (None, "list[float] | None"),
     "initial_noise": (None, "torch.Tensor | None"),
+    "initial_audio_noise": (None, "torch.Tensor | None"),
     "denoise_seeds": (None, "list[str] | None"),
+    "max_sequence_length": (None, "int | None"),
     "return_prompt_embeds": (False, "bool"),
     "return_negative_prompt_embeds": (False, "bool"),
     # Edit-Plus source-image PIL. ``Req.condition_image`` is a real dataclass
@@ -612,10 +614,18 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         if initial_noise is not None:
             req.latents = initial_noise
 
+        initial_audio_noise = getattr(sampling_params, "initial_audio_noise", None)
+        if initial_audio_noise is not None:
+            req.audio_latents = initial_audio_noise
+
         # Per-sample SDE noise grouping (Req field injected by this patch).
         denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
+
+        max_sequence_length = getattr(sampling_params, "max_sequence_length", None)
+        if max_sequence_length is not None:
+            req.max_sequence_length = int(max_sequence_length)
 
         # Edit-Plus source-image PIL. Req.condition_image is a real dataclass
         # field (schedule_batch.py:59), so this assignment lands on the Req
