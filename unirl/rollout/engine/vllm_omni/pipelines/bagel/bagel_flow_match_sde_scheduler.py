@@ -136,7 +136,7 @@ class BagelFlowSDEScheduler:
         by zero). It MUST equal the trainside ``BagelDiffusionStage``'s choice —
         ``schedule[1]`` (the second σ point) — or the first SDE step's std_dev_t /
         log-prob diverges and the GRPO ratio drifts off 1 (a hardcoded 0.99 gave
-        ratio ≈ 0.8). The adapter passes ``req.sigmas[1]``; ``None`` keeps the
+        ratio ≈ 0.8). The adapter passes ``sampling_params.sigmas[1]``; ``None`` keeps the
         prior instance value (smoke tests without an engine-pinned schedule).
 
         The σ schedule itself is NOT passed: BAGEL's ``generate_image`` builds it
@@ -144,7 +144,7 @@ class BagelFlowSDEScheduler:
         reconstructs the echo from the σ the loop visits (see
         :meth:`drain_trajectory`). The adapter is responsible for sending
         ``num_inference_steps = trainside_steps + 1`` and the matching shift so
-        BAGEL's internal schedule equals the engine-pinned ``req.sigmas``.
+        BAGEL's internal schedule equals the diffusion Part's pinned sigmas.
         """
         if eta < 0.0:
             raise ValueError(f"BagelFlowSDEScheduler.set_for_request: eta must be >= 0; got {eta!r}.")
@@ -335,19 +335,20 @@ class BagelFlowSDEScheduler:
     def drain_trajectory(
         self,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return ``(latents [1,T+1,seq,C], sigmas [T+1], timesteps [1,T+1], log_probs [1,K])`` or ``None``.
+        """Return ``(latents [N,T+1,seq,C], sigmas [T+1], timesteps [1,T+1], log_probs [N,K])`` or ``None``.
 
         Latents/timesteps are dense (length ``T+1``): position-0 is the input
         x_T captured on the first ``step`` plus ``T`` post-step states. Log-probs
         are length ``K = len(last_sde_step_indices)`` (``K == 0`` for the
-        no-SDE / forward-process path → ``[1, 0]``). Batch dim is 1 (BAGEL runs
-        navit bs=1 per request); ``build_image_segment`` concatenates per-request.
+        no-SDE / forward-process path → ``[N, 0]``). ``N`` is 1 for the plain
+        request path or ``num_outputs_per_prompt`` for packed T2I; the latter is
+        split back out of BAGEL's packed token axis before returning.
 
         ``sigmas`` is reconstructed from the σ the loop actually visited
         (position-0 ``sigma`` = full[0]; each step's ``sigma_next`` = full[1..T]),
         so it is a GENUINE echo of the worker's schedule — the response layer's
         ``verify_engine_used_sigmas`` then asserts it matches the engine-pinned
-        ``req.sigmas`` (BAGEL builds σ internally, so a divergent
+        the diffusion Part's pinned sigmas (BAGEL builds σ internally, so a divergent
         num_inference_steps / shift surfaces here rather than de-syncing replay).
         """
         if not self._traj_latents:

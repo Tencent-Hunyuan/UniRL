@@ -20,6 +20,10 @@
 # Image-edit path (vs base qwen_image_nft.yaml):
 #   - bundle/pipeline → QwenImageEditPlus* (in_channels=64, source-image
 #     latent token-concat inside predict_noise).
+#   - use_condition_image_prompt=true also feeds the source image through the
+#     Qwen2.5-VL text encoder (upstream encode_prompt(image=...)). Set it
+#     false for Edit text-only: same edit chat template / drop-64, no vision
+#     tokens (upstream image=None) — not base Qwen-Image's drop-34 stage.
 #   - data_source → datasets/image_edit (JSONL with prompt + media[image,role=condition]).
 #     MultimodalRLDataSource emits primitives["image"]: Images, which the
 #     Edit-Plus pipeline requires at generate(req) (fail-fast if absent).
@@ -29,7 +33,7 @@
 #   - conditions_cls → QwenImageEditPlusConditions (carries image_latent).
 #     DiffusionNFT resolves typed conditions via conditions_cls.from_dict(
 #     dict(conditions)) on each train step; the dict is what
-#     RolloutResp.tracks["image"].conditions emits (text / negative_text /
+#     the generated image Part's conditions map emits (text / negative_text /
 #     image_latent).
 
 num_devices: 8
@@ -53,6 +57,7 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
     model_precision: bf16
     max_sequence_length: 512
+    use_condition_image_prompt: true
     shift: 3.0
 
 pipeline:
@@ -62,6 +67,7 @@ pipeline:
   trajectory_precision: bf16
   logprob_precision: fp32
   max_sequence_length: 512
+  use_condition_image_prompt: ${bundle.config.use_condition_image_prompt}
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

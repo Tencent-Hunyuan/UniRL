@@ -70,7 +70,7 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
   ctor never warns.
 - **Advantages are not computed here** — `train` raises if
-  `resp_track.advantages is None`; the trainer must call `compute_advantages` on the
+  `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
 - **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the

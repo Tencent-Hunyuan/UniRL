@@ -379,8 +379,8 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
 
         Segment latents stay in patchified spatial form
         ``[B, K, 128, H_pat, W_pat]``. The driver may pre-ship
-        ``initial_latents`` (in the same patchified spatial form) via
-        ``req.request_conditions['initial_latents']``; when absent we
+        ``initial_latents`` (in the same patchified spatial form), resolved from
+        the request ``Sample``'s diffusion generation Part; when absent we
         sample fresh Gaussian noise.
         """
         from unirl.sde.noise import generate_latents

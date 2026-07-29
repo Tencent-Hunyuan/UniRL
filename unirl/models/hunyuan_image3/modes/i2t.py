@@ -23,8 +23,7 @@ import torch
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
@@ -34,26 +33,27 @@ if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """i2t — AR-stage rollout with image comprehension."""
-    texts = req.primitives.get("text")
+    frontier = sample.frontier_gen_part(ARSamplingParams)
+    ar = frontier.sampling_params
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
     if not isinstance(texts, Texts):
         raise TypeError(
             f"HunyuanImage3Pipeline.generate (i2t): "
-            f"req.primitives['text'] must be Texts, "
+            f"prompt from sample.conditioning()[0] must be Texts, "
             f"got {type(texts).__name__ if texts is not None else 'None'}"
         )
-    images = req.primitives.get("image")
+    images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
     if not isinstance(images, Images):
         raise TypeError(
-            f"HunyuanImage3Pipeline.generate (i2t): "
-            f"req.primitives['image'] must be Images, "
-            f"got {type(images).__name__ if images is not None else 'None'}"
+            "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
         )
 
-    # Build HunyuanImage3ARParams from typed sampling params + model-specific stage_config.
-    ar = req.sampling_params.get("ar")
-    model_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    # Build HunyuanImage3ARParams from typed sampling params + model-specific control.
+    model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
         temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),
@@ -159,14 +159,5 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
 
     decoded_texts = pipeline._detokenize_text_segment(text_seg)
 
-    return RolloutResp(
-        tracks={
-            "ar": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=ar_conds.to_dict(),
-                segment=text_seg,
-                decoded=decoded_texts,
-            ),
-        }
-    )
+    filled = frontier.fill(segment=text_seg, primitives={"text": decoded_texts}, conditions=ar_conds.to_dict())
+    return sample.with_parts([*sample.parts[:-1], filled])

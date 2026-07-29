@@ -74,6 +74,11 @@ class LTX2Bundle(Bundle):
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
+        # Frozen non-trainable components (VAE / Gemma3 / connectors) optionally stay
+        # on CPU — for sglang-rollout configs the trainside never invokes them, and
+        # parking them off-GPU frees the headroom the sglang DiT-resume needs in
+        # colocate. The trainable transformer always loads to ``device``.
+        aux_device = torch.device("cpu") if getattr(config, "aux_components_on_cpu", False) else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
@@ -86,7 +91,11 @@ class LTX2Bundle(Bundle):
         transformer = transformer.to(device, dtype=dtype)
 
         # Video VAE (frozen)
-        vae = AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+        vae = (
+            AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+            .to(aux_device)
+            .eval()
+        )
         vae.requires_grad_(False)
 
         # Text encoder — Gemma3 (frozen). LTX-2 uses Gemma-3-12B whose config is
@@ -96,7 +105,7 @@ class LTX2Bundle(Bundle):
         # which uses Gemma3ForConditionalGeneration.
         text_encoder = (
             Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
+            .to(aux_device)
             .eval()
         )
         text_encoder.requires_grad_(False)
@@ -111,7 +120,7 @@ class LTX2Bundle(Bundle):
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
         connectors = (
-            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(device).eval()
+            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(aux_device).eval()
         )
         connectors.requires_grad_(False)
 

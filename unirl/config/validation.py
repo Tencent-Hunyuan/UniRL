@@ -290,8 +290,8 @@ def validate_multi_track_mini_batch_geometry(cfg: DictConfig) -> None:
     """Multi-track mini-batching requires per-actor sample counts divisible by num_updates.
 
     In a multi-track PE joint setup (ar + diffusion), the train actor splits the
-    rollout response into ``num_updates_per_batch`` mini-batches along the root
-    track (ar).  The root track's per-actor batch size is
+    generated Sample into ``num_updates_per_batch`` mini-batches along the AR
+    Part. The AR Part's per-actor batch size is
     ``P * N / actor_count`` and must divide evenly by ``num_updates_per_batch``;
     otherwise the lineage-aware split cannot produce equal-sized chunks.
 

@@ -346,8 +346,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
     ) -> LatentSegment:
         """Run full WAN 2.1 T2V sampling. Returns a ``LatentSegment``.
 
-        ``initial_latents`` (optional) — driver-shipped x_T per
-        ``req.request_conditions['initial_latents']``. When provided,
+        ``initial_latents`` (optional) — x_T resolved from the request
+        ``Sample``'s diffusion generation Part. When provided,
         used verbatim and the internal ``generate_latents`` RNG path is
         bypassed. See :class:`SD3DiffusionStage.diffuse` for the contract.
         """

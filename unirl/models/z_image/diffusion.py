@@ -290,8 +290,8 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
     ) -> LatentSegment:
         """Run full Z-Image sampling. Returns a ``LatentSegment``.
 
-        ``initial_latents`` (optional) — driver-shipped x_T per
-        ``req.request_conditions['initial_latents']``; see
+        ``initial_latents`` (optional) — x_T resolved from the request
+        ``Sample``'s diffusion generation Part; see
         :class:`SD3DiffusionStage.diffuse` for the contract.
         """
         from unirl.sde.noise import generate_latents

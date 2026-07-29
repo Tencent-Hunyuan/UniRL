@@ -1,7 +1,7 @@
-"""Worker-side supervised track builders for the SFT domain.
+"""Worker-side supervised Part builders for the SFT domain.
 
 In the RL loop the rollout engine is the data producer: it turns a request
-into a ``RolloutTrack`` (conditions + segment) that ``TrainStack.train_track``
+into a training ``Part`` (conditions + segment) that ``TrainStack.train_track``
 consumes. SFT swaps that producer for a dataset-backed one and keeps the whole
 consumer side (stack / algorithm / backend) unchanged — these classes are the
 swap, mirroring :class:`~unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine`'s
@@ -10,9 +10,9 @@ shape (a ``Remote`` sibling holding the trainer-injected ``pipeline``, one
 
 Per-model logic stays in the model packages: prompts go through the bundle's
 own chat-template / text-embed stages, targets through the bundle's VAE encode
-stage — a supervised track is indistinguishable from a rollout-built one to
+stage — a supervised Part is indistinguishable from a rollout-built one to
 ``ARStage.replay`` / ``predict_noise_at_step``. A new modality plugs in as
-(bundle stages) + (a track builder here) + (a loss in ``unirl/algorithms``)
+(bundle stages) + (a Part builder here) + (a loss in ``unirl/algorithms``)
 only when its record→(conditions, segment) mapping or loss math is genuinely
 new — never as a per-model SFT file.
 
@@ -30,10 +30,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment
 from unirl.types.segments.text import TextSegment
 
@@ -74,14 +75,14 @@ def _pad_flags(records: Sequence[Record]) -> List[bool]:
 
 
 class SupervisedTrackBuilder(Remote):
-    """Worker-side interface for converting normalized records into tracks."""
+    """Worker-side interface for converting normalized records into Parts."""
 
-    def build(self, records: List[Record]) -> RolloutTrack:
+    def build(self, records: List[Record]) -> Part:
         raise NotImplementedError
 
 
 class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → AR ``RolloutTrack`` (LLM + VLM), via the bundle's stages.
+    """Dataset records → AR ``Part`` (LLM + VLM), via the bundle's stages.
 
     Prompt side: the pipeline's chat-template stage (``add_generation_prompt``
     baked in, byte-identical to what rollout engines render — the SFT model is
@@ -94,7 +95,8 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             any pipeline exposing a chat stage + tokenizer-carrying bundle).
         chat_stage_attr: chat/template stage attribute on the pipeline.
         max_response_length: hard token cap per response (uncapped targets OOM'd
-            other frameworks); truncated responses keep their EOS and log once.
+            other frameworks); legacy responses are truncated with EOS kept,
+            while agent targets must be filtered before training.
         append_eos: append ``tokenizer.eos_token_id`` to every response —
             disable only for models whose template ends turns with a non-EOS
             token that the dataset already includes.
@@ -129,40 +131,47 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self._warned_truncation = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def build(self, records: List[Record]) -> RolloutTrack:
-        """Tokenize + embed one shard of supervised records into a root track."""
+    def build(self, records: List[Record]) -> Part:
+        """Tokenize + embed one shard of supervised records into a training Part."""
         if not records:
             raise ValueError("ARSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
             conditions = self._embed_prompts(records)
             tokens, loss_masks = self._tokenize_responses(records)
         segment = TextSegment.pack(tokens=tokens, loss_mask=loss_masks)
-        track = RolloutTrack(
+        part = Part(
             sample_ids=_sample_ids(records),
-            parent_ids=None,
-            parent_track=None,
             conditions=conditions.to_dict(),
             segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
         )
-        if track.batch_size != len(records):
+        if part.batch_size != len(records):
             raise RuntimeError(
-                f"ARSupervisedTrackBuilder.build: built {track.batch_size} rows from {len(records)} "
+                f"ARSupervisedTrackBuilder.build: built {part.batch_size} rows from {len(records)} "
                 "records — token accounting is broken."
             )
-        return track
+        return part
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
     def _embed_prompts(self, records: Sequence[Record]) -> Any:
-        for r in records:
-            if "messages" in r:
-                raise NotImplementedError(
-                    "ARSupervisedTrackBuilder: multi-turn 'messages' records are not supported yet — "
-                    "use single-turn {'prompt', 'response'} rows (multi-turn interleaved masking "
-                    "is a follow-up with its own template-consistency tests)."
+        agent_flags = ["messages" in r for r in records]
+        if any(agent_flags):
+            if not all(agent_flags):
+                raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
+            if any(r.get("media_refs") for r in records):
+                raise ValueError("ARSupervisedTrackBuilder: agent messages currently support text-only records.")
+            embed_messages = getattr(self._chat_stage, "embed_messages", None)
+            if not callable(embed_messages):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support OpenAI-style messages."
                 )
+            histories = [r["messages"][:-1] for r in records]
+            tools = [r.get("tools") for r in records]
+            return embed_messages(histories, tools=tools)
+
         texts = Texts(texts=[str(r["prompt"]) for r in records])
         if not self._embed_takes_images:
             return self._chat_stage.embed(texts)
@@ -191,23 +200,35 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         masks: List[torch.Tensor] = []
         truncated = 0
         for r, is_pad in zip(records, _pad_flags(records)):
-            response = r.get("response")
-            if not isinstance(response, str) or not response:
-                raise ValueError(
-                    f"ARSupervisedTrackBuilder: record {r.get('sample_id')!r} has no non-empty 'response' — "
-                    "AR SFT manifests must carry the target text."
-                )
-            ids = self._tokenizer(response, add_special_tokens=False)["input_ids"]
+            if "messages" in r:
+                ids = self._tokenize_agent_target(r)
+            else:
+                response = r.get("response")
+                if not isinstance(response, str) or not response:
+                    raise ValueError(
+                        f"ARSupervisedTrackBuilder: record {r.get('sample_id')!r} has no non-empty 'response' — "
+                        "AR SFT manifests must carry the target text."
+                    )
+                ids = self._tokenizer(response, add_special_tokens=False)["input_ids"]
             if not ids:
                 raise ValueError(
-                    f"ARSupervisedTrackBuilder: response of record {r.get('sample_id')!r} tokenized to zero "
+                    f"ARSupervisedTrackBuilder: target of record {r.get('sample_id')!r} tokenized to zero "
                     "tokens — a sample with no supervision would poison the loss denominator."
                 )
-            budget = self.max_response_length - (1 if self.append_eos else 0)
+            needs_eos = self.append_eos and (not ids or ids[-1] != eos_id)
+            budget = self.max_response_length - (1 if needs_eos else 0)
             if len(ids) > budget:
-                ids = ids[:budget]
+                if "messages" in r:
+                    raise ValueError(
+                        f"ARSupervisedTrackBuilder: agent target of record {r.get('sample_id')!r} exceeds "
+                        f"max_response_length={self.max_response_length}; filter overlong agent targets "
+                        "during manifest preparation instead of truncating a structured assistant turn."
+                    )
+                ids = list(ids[:budget])
                 truncated += 1
-            if self.append_eos:
+                if self.append_eos and not needs_eos and eos_id is not None:
+                    ids[-1] = eos_id
+            if needs_eos:
                 ids = list(ids) + [eos_id]
             tokens.append(torch.tensor(ids, dtype=torch.long, device=device))
             # _eval_pad rows ride the forward but carry zero loss weight — the
@@ -217,17 +238,26 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         if truncated and not self._warned_truncation:
             self._warned_truncation = True
             logger.warning(
-                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d (EOS kept). "
-                "This warning is emitted once.",
+                "ARSupervisedTrackBuilder: %d/%d responses truncated to max_response_length=%d "
+                "(append_eos=%s). This warning is emitted once.",
                 truncated,
                 len(records),
                 self.max_response_length,
+                self.append_eos,
             )
         return tokens, masks
 
+    def _tokenize_agent_target(self, record: Record) -> List[int]:
+        """Render one final assistant turn and return only its supervised suffix."""
+        return tokenize_agent_target(
+            record,
+            tokenizer=self._tokenizer,
+            enable_thinking=bool(getattr(self._chat_stage, "enable_thinking", False)),
+        )
+
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → diffusion ``RolloutTrack`` with an x0-only segment.
+    """Dataset records → diffusion ``Part`` with an x0-only segment.
 
     Prompt side: the pipeline's own ``build_conditions`` (the exact conditions
     ``diffuse``/``replay`` consume — CFG defaults included). Target side: the
@@ -286,8 +316,8 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             self._conditions_kwargs["image_shape"] = (self.height, self.width)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def build(self, records: List[Record]) -> RolloutTrack:
-        """Encode one shard of (prompt, target image) records into a root track."""
+    def build(self, records: List[Record]) -> Part:
+        """Encode one shard of (prompt, target image) records into a training Part."""
         if not records:
             raise ValueError("DiffusionSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
@@ -305,12 +335,11 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             latents=latents.unsqueeze(1),  # [B, 1, ...] — clean x0 at the last (only) position
             loss_mask=pad.to(latents.device),
         )
-        return RolloutTrack(
+        return Part(
             sample_ids=_sample_ids(records),
-            parent_ids=None,
-            parent_track=None,
             conditions=conditions.to_dict(),
             segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
         )
 
     # ------------------------------------------------------------------

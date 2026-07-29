@@ -1,4 +1,4 @@
-"""Assemble ``RolloutResp`` track pieces (segment / decoded / conditions) from raw results.
+"""Assemble ``Sample`` Part pieces (segment / decoded / conditions) from raw results.
 
 Pure: operates on already-fetched wire data (SGLang ``GenerationResult`` objects)
 and ``unirl.types`` — no SGLang import, no engine state. The model-specific
@@ -12,7 +12,7 @@ branches (those move to adapter overrides).
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -25,7 +25,6 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.primitives import Images, Video, Videos
-from unirl.types.rollout_req import RolloutReq
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 
@@ -46,9 +45,24 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
     return torch.cat(latents, dim=0)
 
 
+def collect_aux_trajectory_latents(results: Sequence[RawResult]) -> Optional[torch.Tensor]:
+    """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim.
+
+    Returns ``None`` when no result carries one (non-LTX-2 families); requires all
+    results to agree (present or absent) so a partial set never silently mis-aligns
+    the per-sample audio the trainside replay cross-attends to.
+    """
+    auxes = [getattr(r, "aux_trajectory_latents", None) for r in results]
+    present = [a is not None for a in auxes]
+    if not any(present):
+        return None
+    require(all(present), "SGLang results inconsistent: some carry aux_trajectory_latents, some do not")
+    return torch.cat([a.detach().cpu() for a in auxes], dim=0)
+
+
 def validate_packed_trajectory(
     traj: torch.Tensor,
-    req: RolloutReq,
+    diffusion: Any,
     *,
     family: str,
     downsample: int,
@@ -69,12 +83,11 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    diffusion = req.sampling_params.get("diffusion")
     height = int(diffusion.height) if diffusion.height is not None else None
     width = int(diffusion.width) if diffusion.width is not None else None
     require(
         height is not None and width is not None,
-        f"{family}: need height/width from req.sampling_params to unpack the packed "
+        f"{family}: need height/width from the diffusion sampling params to unpack the packed "
         f"[B, T, S, C] trajectory; both must be set.",
     )
     if require_divisible:
@@ -103,7 +116,7 @@ def derive_timestep_alignment(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate the T+1 trajectory shape and verify SGLang used the σ we sent.
 
-    ``expected_sigmas`` is the schedule the engine pinned on ``RolloutReq.sigmas``
+    ``expected_sigmas`` is the schedule the engine pinned on the gen Part's ``sigmas``
     and forwarded to SGLang; SGLang echoes it back per result via
     ``trajectory_timesteps``. :func:`verify_engine_used_sigmas` asserts elementwise
     equality (fatal on drift) so rollout and trainer-side replay use numerically
@@ -116,7 +129,7 @@ def derive_timestep_alignment(
         f"SGLang trajectory length {traj_len} != expected_sigmas length {expected_len}. "
         f"Modern SGLang prepends initial latents at "
         f"sglang/multimodal_gen/runtime/pipelines_core/stages/denoising.py so "
-        f"trajectory carries T+1 latents; expected_sigmas (from req.sigmas) is T+1 "
+        f"trajectory carries T+1 latents; expected_sigmas (from sampling_params.sigmas) is T+1 "
         f"too. Upgrade SGLang or fix the sampler to emit a T+1 trajectory.",
     )
     expected_cpu = expected_sigmas.detach().to(torch.float32).cpu()
@@ -139,6 +152,7 @@ def build_latent_segment(
     sde_indices: Optional[List[int]],
     emit_native_logprob: bool,
     segment_factory: Callable[..., LatentSegment] = make_image_segment,
+    aux_trajectory: Optional[torch.Tensor] = None,
 ) -> LatentSegment:
     """Pack an (already-unpacked) trajectory tensor into one batched ``LatentSegment``.
 
@@ -146,6 +160,10 @@ def build_latent_segment(
     passes ``make_video_segment``. The caller owns the model-specific unpack of
     ``trajectories_tensor`` (e.g. Klein); this function is shape-agnostic past
     the T+1 invariant.
+
+    ``aux_trajectory`` (LTX-2 audio, ``[B, T+1, ...]``) — when present it is stored
+    as ``segment.aux_latents`` and column-trimmed in lockstep with the video latents
+    so ``aux_latents_at(step)`` and ``latents_at(step)`` index the same sparse steps.
     """
     sigmas, step_indices = derive_timestep_alignment(
         trajectories_tensor=trajectories_tensor,
@@ -159,6 +177,22 @@ def build_latent_segment(
     # SDE-gated steps; we always preserve the terminal position T so the clean
     # image latent (``seg.latents[:, -1]``) stays available for VAE decode.
     traj_len = int(trajectories_tensor.shape[1])
+    if aux_trajectory is not None:
+        require(
+            aux_trajectory.ndim >= 2,
+            "Auxiliary trajectory must be at least 2-D [B, T+1, ...]; "
+            f"got rank {aux_trajectory.ndim}, shape {tuple(aux_trajectory.shape)}.",
+        )
+        require(
+            int(aux_trajectory.shape[0]) == int(trajectories_tensor.shape[0]),
+            "Auxiliary/video trajectory batch mismatch: "
+            f"{int(aux_trajectory.shape[0])} != {int(trajectories_tensor.shape[0])}.",
+        )
+        require(
+            int(aux_trajectory.shape[1]) == traj_len,
+            "Auxiliary/video trajectory length mismatch: "
+            f"{int(aux_trajectory.shape[1])} != {traj_len}. Both must carry T+1 states.",
+        )
     indices_t: torch.Tensor = step_indices
     if sde_indices is not None and len(sde_indices) < num_steps:
         needed = set(compute_trajectory_positions(set(sde_indices), num_steps))
@@ -167,6 +201,10 @@ def build_latent_segment(
         if keep_cols and len(keep_cols) < traj_len:
             trajectories_tensor = trajectories_tensor[:, keep_cols]
             indices_t = torch.tensor(keep_cols, dtype=torch.long)
+            # Trim the audio trajectory to the SAME kept columns so it stays indexed
+            # by the same sparse positions as the video latents.
+            if aux_trajectory is not None:
+                aux_trajectory = aux_trajectory[:, keep_cols]
 
     # sde_indices: always populated (trainer needs to know which steps to replay).
     # sde_logp: best-effort native emission; whether it is used or recomputed is
@@ -186,6 +224,7 @@ def build_latent_segment(
         indices=indices_t,
         sde_logp=sde_logp,
         sde_indices=sde_indices_t,
+        aux_latents=aux_trajectory,
     )
 
 

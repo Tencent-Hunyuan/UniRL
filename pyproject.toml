@@ -24,6 +24,11 @@ dependencies = [
   "omegaconf>=2.3",
   # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
   "transformers>=5.6,<5.7",
+  "huggingface-hub>=0.34",
+  # Vendored Boogu-Image DiT (unirl/models/boogu_image/vendor/) imports einops
+  # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
+  # engine-agnostic.
+  "einops>=0.7",
   "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
   "safetensors>=0.4",
   "Pillow>=10",
@@ -64,6 +69,7 @@ vllm = [
   "torch==2.11.0+cu129 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
   "wandb>=0.16,<0.20",
@@ -165,8 +171,8 @@ include = [
 line-length = 120
 target-version = "py312"
 # unirl-reward-service/ is a vendored standalone sub-project with its own pyproject and
-# lint/test tooling; it is not governed by this repo's lint (mirrors its
-# exclusion from this repo's pytest). Its vendored upstream model code carries
+# lint/test tooling; it is not governed by this repo's lint. Its vendored
+# upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
 extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]

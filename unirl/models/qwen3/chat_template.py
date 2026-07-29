@@ -1,10 +1,11 @@
-"""Qwen3ChatTemplateStage — ``Texts → Qwen3ARConditions``.
+"""Qwen3ChatTemplateStage — conversations or batched text → AR conditions.
 
-Implements ``EmbedStage[Texts, Qwen3ARConditions]`` from
-:mod:`unirl.models.types.embedding`. Applies the bundle
-tokenizer's chat template (with ``add_generation_prompt=True``) so the
-AR stage starts from the canonical assistant-turn prefix the model was
-trained against.
+Implements ``EmbedStage[List[Turn] | Texts, Qwen3ARConditions]`` from
+:mod:`unirl.models.types.embedding`. Renders the role-tagged trajectory
+(:meth:`Sample.text_conditioning`) into one chat conversation per frontier sample
+and applies the bundle tokenizer's chat template (with
+``add_generation_prompt=True``) so the AR stage starts from the canonical
+assistant-turn prefix the model was trained against.
 
 An optional ``system_instruction`` string is prepended as a ``system``
 message — callers that need byte-for-byte parity with an SFT template
@@ -14,19 +15,23 @@ stage does not interpret it.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
+from unirl.models.types.conversations import build_text_messages
 from unirl.models.types.embedding import EmbedStage
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Texts
+from unirl.types.sample import Turn
 
 from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
+Qwen3ChatInput = Union[List[Turn], Texts]
 
-class Qwen3ChatTemplateStage(EmbedStage[Texts, Qwen3ARConditions]):
+
+class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
     """Apply the Qwen3 chat template, right-pad in batch, return AR conditions."""
 
     def __init__(
@@ -45,33 +50,64 @@ class Qwen3ChatTemplateStage(EmbedStage[Texts, Qwen3ARConditions]):
         # prompts diverge and the importance ratio breaks.
         self.enable_thinking = bool(enable_thinking)
 
-    def embed(self, p: Texts) -> Qwen3ARConditions:
-        """Tokenize ``p.texts`` via the chat template and pack into AR conditions."""
+    def embed(self, value: Qwen3ChatInput) -> Qwen3ARConditions:
+        """Render one chat conversation per row and pack it into AR conditions.
+
+        A ``List[Turn]`` comes from :meth:`Sample.text_conditioning` and retains
+        full role-aware history. ``Texts`` is the supervised single-turn seam and
+        is normalized to one ``user`` turn before the same rendering/tokenization
+        path, keeping SFT and rollout prompts byte-identical.
+        """
+        turns = [Turn(role="user", content=value)] if isinstance(value, Texts) else value
+        if not turns:
+            raise ValueError("Qwen3ChatTemplateStage.embed: expected at least one conversation turn.")
+        return self.embed_messages(build_text_messages(turns, self.system_instruction))
+
+    def embed_messages(
+        self,
+        conversations: Sequence[Sequence[Dict[str, Any]]],
+        *,
+        tools: Optional[Sequence[Optional[Sequence[Dict[str, Any]]]]] = None,
+    ) -> Qwen3ARConditions:
+        """Render OpenAI-style histories and pack them as generation conditions.
+
+        Agent SFT passes each conversation without its final target assistant
+        turn. Long histories are cropped from the left after templating so the
+        latest user/tool interaction and assistant generation prefix survive.
+        """
+        if not conversations:
+            raise ValueError("Qwen3ChatTemplateStage.embed_messages: empty conversation batch.")
+        if tools is None:
+            tools = [None] * len(conversations)
+        if len(tools) != len(conversations):
+            raise ValueError(
+                "Qwen3ChatTemplateStage.embed_messages: tools and conversations batch sizes differ "
+                f"({len(tools)} != {len(conversations)})."
+            )
+
         tokenizer = self.bundle.tokenizer
         device = self.bundle.device
-
         per_sample_ids: List[torch.Tensor] = []
-        for text in p.texts:
-            messages: List[dict] = []
-            if self.system_instruction is not None:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({"role": "user", "content": text})
+        for messages, sample_tools in zip(conversations, tools):
             ids = tokenizer.apply_chat_template(
                 messages,
+                tools=sample_tools,
                 add_generation_prompt=True,
                 enable_thinking=self.enable_thinking,
                 tokenize=True,
                 return_tensors="pt",
                 return_dict=False,
-                truncation=True,
-                max_length=self.max_prompt_length,
+                truncation=False,
             )
             # transformers v5 flipped apply_chat_template's `return_dict` default
             # from False to True: it now returns a BatchEncoding, and integer-
             # indexing a fast-tokenizer BatchEncoding yields a tokenizers.Encoding
             # (no `.to`), not a tensor. Pin return_dict=False so we keep the bare
             # input_ids [1, L] tensor identically across v4/v5; squeeze leading dim.
-            per_sample_ids.append(ids[0].to(device=device, dtype=torch.long))
+            ids = ids[0]
+            if ids.shape[0] > self.max_prompt_length:
+                ids = ids[-self.max_prompt_length :]
+            per_sample_ids.append(ids.to(device=device, dtype=torch.long))
 
         # Right-pad to the in-batch max so the AR loop can use a single tensor.
         max_len = max(int(t.shape[0]) for t in per_sample_ids)

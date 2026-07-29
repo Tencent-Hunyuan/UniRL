@@ -26,7 +26,7 @@ fields.
 
 Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
 form (used inside the pipeline at stage call sites) and the generic
-``Conditions = Dict[str, Condition]`` shape on ``RolloutResp``.
+generic ``Dict[str, Condition]`` shape on a ``Part``.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 """``vllm_omni`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete modality (the adapter,
-picked from the registry by ``config.modality``, owns the
-``RolloutReq``↔``RolloutResp`` conversion and the per-modality topology knobs)
+picked from the registry by ``config.modality``, owns the ``Sample`` →
+``Sample`` conversion and the per-modality topology knobs)
 and no concrete backend (the seam owns the runtime — boot, ports, env quirks,
 the per-stage ``collective_rpc`` fan-out). Weight sync is a :class:`WeightSync`
 component constructed over the seam; the offload lifecycle (a single flag)
@@ -23,23 +23,26 @@ worker partitions.
 
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
-from unirl.sde.runtime import ensure_req_sigmas
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.sde.runtime import ensure_sample_sigmas
+from unirl.types.sample import Sample
+
+logger = logging.getLogger(__name__)
 
 
-class VLLMOmniRolloutEngine(BaseRolloutEngine):
+class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
@@ -55,6 +58,13 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
         self.cfg = config
+        # Initialize lifecycle state before any fallible construction so worker
+        # teardown can safely sweep a role whose adapter or backend boot failed.
+        self._weight_version = 0
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
         # Carried for subclass / extension use; the synchronous Omni
         # entrypoint does not consume them directly.
         self.device = device
@@ -62,6 +72,12 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        logger.info(
+            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            config,
+            model_config is not None,
+            model_config,
+        )
 
         # Adapter (the only read of the modality knob) — owns the conversion,
         # topology knobs, and the σ schedule. ``tokenize_fn`` is late-bound to
@@ -104,11 +120,22 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
 
     # ------------------------------------------------------------------ #
-    # Generation
+    # Generation — sync entrypoint, serialized internally
     # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole DP shard synchronously."""
+        return self._generate_locked(sample)
+
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
+            return self._stamp_weight_version(self._generate_core(sample))
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
         # Defense-in-depth the v1 wake-failure path documented but never
         # implemented: a failed LoRA re-push keeps the engine offloaded so
         # this guard catches callers that swallowed the wake_up exception.
@@ -116,21 +143,29 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             not self._is_offloaded,
             "VLLMOmniRolloutEngine.generate: engine is offloaded (wake_up first).",
         )
-        self.adapter.validate_request(req)
-        # Main-repo SSOT for σ: pin once via the shared helper; the adapter
-        # forwards it on the wire and ``build_image_segment`` asserts the
-        # worker echoed it back. AR-only modalities have no diffusion params,
-        # so the adapter opts out (ensure_req_sigmas would raise on them).
+        self.adapter.validate_request(sample)
+        # Main-repo SSOT for σ: pin once onto the diffusion gen Part; the adapter
+        # forwards it on the wire and ``build_image_segment`` asserts the worker
+        # echoed it back. AR-only modalities have no diffusion gen Part, so the
+        # adapter opts out (needs_sigmas=False).
         if self.adapter.needs_sigmas:
             require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
-            ensure_req_sigmas(req, self.schedule_policy)
-        calls = self.adapter.build_inputs(req)
+            self._ensure_sample_sigmas(sample)
+        calls = self.adapter.build_inputs(sample)
         per_request = self._backend.generate(
             calls,
             attach_lora=self._weight_sync.lora_loaded,
             ar_lora_passthrough=self.adapter.ar_lora_passthrough,
         )
-        return self.adapter.build_response(req, per_request)
+        return self.adapter.build_response(sample, per_request)
+
+    def _ensure_sample_sigmas(self, sample: Sample) -> None:
+        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``.
+
+        σ is computed from the model-owned schedule policy and shared across the
+        Part's samples. Idempotent — a pre-pinned σ is left as-is.
+        """
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
     # ------------------------------------------------------------------ #
     # Lifecycle — the offload flag lives here; decorators re-applied
@@ -179,8 +214,36 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def health_check(self) -> bool:
         return self._backend.ping()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        self._backend.shutdown()
+        # Reachable on a partially constructed role: Worker.teardown sweeps
+        # every role it holds, including one whose __init__ raised before the
+        # backend was attached.
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            backend = getattr(self, "_backend", None)
+            if backend is not None:
+                backend.shutdown()
+            return
+
+        with shutdown_lock:
+            if getattr(self, "_shutdown_complete", False):
+                return
+
+            generate_lock = getattr(self, "_generate_lock", None)
+            if generate_lock is None:
+                self._shutdown_requested = True
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    backend.shutdown()
+            else:
+                with generate_lock:
+                    self._shutdown_requested = True
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    with generate_lock:
+                        backend.shutdown()
+            self._shutdown_complete = True
 
     # ------------------------------------------------------------------ #
     # Stage topology
@@ -215,6 +278,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def init_weights_update_group(
         self,
@@ -257,6 +321,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def destroy_weights_update_group(
         self,
@@ -283,6 +348,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._weight_version += 1  # weights changed → bump the version stamped onto gens
 
     def set_lora_from_tensors(
         self,

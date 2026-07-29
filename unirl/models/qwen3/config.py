@@ -9,9 +9,9 @@ is weights+params only.
 
 Qwen3 is a pure causal LM (no diffusion / VAE / scheduler), so there is
 no ``shift`` / ``vae_dtype`` / ``text_encoder_*`` / ``dynamic_shift_*``
-field — the hosting engine's :func:`ensure_req_sigmas` is a no-op for
+field — the hosting engine's :func:`ensure_sample_sigmas` is a no-op for
 AR-only pipelines because :class:`Qwen3Pipeline.generate` never reads
-``req.sigmas``.
+diffusion ``sampling_params.sigmas``.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ class Qwen3PipelineConfig:
     # Chat-template thinking switch; MUST agree with the rollout engine's
     # chat_template_kwargs.enable_thinking or train/rollout prompts diverge.
     enable_thinking: bool = False
+    max_prompt_length: int = 4096
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3PipelineConfig.model_precision")

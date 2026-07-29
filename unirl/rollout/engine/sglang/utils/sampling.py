@@ -1,11 +1,9 @@
-"""Sampling resolution — the single consolidation of the three param sources.
+"""Resolve Sample-native AR sampling parameters for SGLang.
 
-The predecessor resolved sampling inline across ``generate`` and the async
-helper, re-deriving the precedence per field. This is the one place it happens
-now: typed ``ARSamplingParams`` (``req.sampling_params['ar']``) > the
-``req.stage_config['ar']`` bag > engine-config defaults, including the
-``top_k`` translation and the ``samples_pre_expanded`` n-logic. Pure —
-table-testable with config/req stand-ins.
+Typed ``ARSamplingParams`` on the generated frontier take precedence over
+engine defaults. Request-level controls such as stop sequences and the system
+instruction come from the root ``Part``. The helper also translates UniRL's
+canonical ``top_k=0`` into SGLang's ``-1`` sentinel.
 """
 
 from __future__ import annotations
@@ -13,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
 
 
 @dataclass(frozen=True)
@@ -30,15 +28,19 @@ class ResolvedSampling:
     block: Dict[str, Any] = field(default_factory=dict)
 
 
-def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
-    """Resolve the SRT sampling block for one request.
+def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
+    """Resolve the SRT sampling block for one request ``Sample``.
 
-    Reproduces the predecessor's exact precedence:
+    Sources: the frontier gen ``Part``'s ``ARSamplingParams`` (temperature /
+    top_p / top_k / max_new_tokens) > the input ``Part``'s ``control['ar']`` bag
+    (stop / system_instruction / return_logprob) > engine-config defaults.
 
-    - ``n``: 1 when ``config.samples_pre_expanded`` (the caller already
-      expanded P prompts → P*N entries, one per GRPO sibling — re-applying
-      ``samples_per_prompt`` would generate N completions per expanded entry);
-      else ``ar.samples_per_prompt``, else ``stage_ar['n']``, else 1.
+    - ``n`` (the per-prompt fan-out the backend must generate) is the **last-fork
+      branch** ``len(gen) // len(parts[-2])`` (children per frontier parent), so the
+      backend fills the pre-forked gen shell exactly — this subsumes the old
+      ``samples_pre_expanded`` two-mode logic (the fork *is* the expansion in the
+      Sample model). For a multi-turn Sample the frontier parent is a later turn,
+      not the root ``parts[0]``; the two coincide for a single-stage request.
     - ``temperature`` / ``top_p`` / ``max_new_tokens``: typed AR params, else
       the config defaults.
     - ``top_k``: typed AR params, else the config default. The value must still
@@ -47,15 +49,18 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
       ``-1`` (disabled); positive values pass through.
     - ``return_logprob`` (default True), ``system_instruction``, and the
       ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
-      come from ``stage_config['ar']``.
+      come from the root Part's ``control['ar']`` mapping.
     """
-    ar = req.sampling_params.get("ar")
-    stage_ar: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    input_part, gen_part = sample.parts[0], sample.parts[-1]
+    ar = gen_part.sampling_params
+    control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
-    if config.samples_pre_expanded:
-        n = 1
-    else:
-        n = int(ar.samples_per_prompt if ar is not None else stage_ar.get("n", 1))
+    # Fan-out is the LAST-fork branch (children per *frontier parent*), not the
+    # root-relative count: in a multi-turn Sample the frontier's parent is a later
+    # turn (parts[-2]), not parts[0]. They coincide for a single-stage request.
+    parent_part = sample.parts[-2] if len(sample.parts) >= 2 else input_part
+    n_parent = len(parent_part.sample_ids)
+    n = (len(gen_part.sample_ids) // n_parent) if n_parent else 1
 
     raw_top_k = ar.top_k if ar is not None else config.top_k
     block: Dict[str, Any] = {
@@ -66,13 +71,13 @@ def resolve_sampling(config: Any, req: RolloutReq) -> ResolvedSampling:
         "n": n,
     }
     for key in ("stop", "stop_token_ids", "skip_special_tokens"):
-        if key in stage_ar:
-            block[key] = stage_ar[key]
+        if key in control_ar:
+            block[key] = control_ar[key]
 
     return ResolvedSampling(
         n=n,
-        return_logprob=bool(stage_ar.get("return_logprob", True)),
-        system_instruction=stage_ar.get("system_instruction") or config.system_instruction,
+        return_logprob=bool(control_ar.get("return_logprob", True)),
+        system_instruction=control_ar.get("system_instruction") or config.system_instruction,
         block=block,
     )
 

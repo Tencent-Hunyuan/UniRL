@@ -10,7 +10,7 @@ plain prompt dicts + :class:`StageSampling` intent (kind + kwargs; the impl
 constructs the real ``vllm.SamplingParams`` / ``OmniDiffusionSamplingParams``
 objects) — and returns per-request-grouped lists of :class:`OmniRawResult`
 (a structural view of vllm-omni's ``OmniRequestOutput``). The engine core +
-adapters do the ``RolloutReq``↔``RolloutResp`` translation.
+adapters do the ``Sample``↔wire translation.
 
 The seam absorbs the transport asymmetries: ``Omni.generate``'s flat output
 list is grouped back to per-request order by the ``"{i}_{uuid}"`` request-id

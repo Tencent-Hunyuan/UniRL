@@ -8,8 +8,8 @@ instead of a rollout engine — no reward service, no advantages, no weight
 sync, no sampling params. Each step::
 
     records = data_source.get_samples(batch_size)       # driver-side rows
-    track   = track_builder.build(records)              # worker-side encode → RolloutTrack
-    result  = stack.train_track(track, ...)             # the SAME stack RL uses
+    part    = track_builder.build(records)              # worker-side encode → Part
+    result  = stack.train_track(part, ...)               # the SAME stack RL uses
 
 The algorithm (``unirl.algorithms.SFT`` / ``FlowMatchSFT``) declares
 ``requires_advantages=False``; everything else about the stack — micro
@@ -71,6 +71,14 @@ class SFTTrainer(BaseTrainer):
         self.eval_interval = eval_interval
         self.eval_batch_size = max(1, eval_batch_size)
         self.eval_num_samples = -1 if eval_num_samples < 0 else eval_num_samples
+        num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        if num_updates_per_batch != 1:
+            raise ValueError(
+                "SFTTrainer requires stack.num_updates_per_batch=1: its num_steps, logging, "
+                "checkpoint cadence, and resume cursor each count one optimizer update per "
+                "dataset batch. Multi-update SFT is supported by TrainStack but not yet by "
+                "this trainer's outer-step accounting."
+            )
 
         # Driver-side data iterator (not a Remote) — records stay light dicts;
         # tokenization / media loading run worker-side in the track builder.
@@ -95,13 +103,13 @@ class SFTTrainer(BaseTrainer):
 
     def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
         """records → worker-side track build → stack train. No rollout legs."""
-        track = self.track_builder.build(records)
-        if track.batch_size != len(records):
+        part = self.track_builder.build(records)
+        if part.batch_size != len(records):
             # AReaL's single-controller once broadcast SFT batches instead of
             # scattering them — 8× duplicated tokens with a correct-LOOKING loss.
             # Token conservation is cheap to assert; assert it.
-            raise RuntimeError(f"SFTTrainer: track builder built {track.batch_size} rows from {len(records)} records.")
-        return self.stack.train_track(track, training_progress=training_progress)
+            raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
+        return self.stack.train_track(part, training_progress=training_progress)
 
     # ------------------------------------------------------------------
     # Validation loss (full set, exact)
@@ -141,10 +149,11 @@ class SFTTrainer(BaseTrainer):
         track builders zero their loss weight, so coverage stays exact.
         """
         records = list(records)
+        pad_source = records[-1] if records else None
         while len(records) % self.dp_size:
-            pad = dict(records[-1])
+            pad = dict(pad_source)
             pad["_eval_pad"] = True
-            pad["sample_id"] = f"{pad.get('sample_id', 'sft')}/pad{len(records)}"
+            pad["sample_id"] = f"{pad.get('sample_id', 'sft')}:eval-pad:{len(records)}"
             records.append(pad)
         return records
 
@@ -162,8 +171,17 @@ class SFTTrainer(BaseTrainer):
             return
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step_1}", _DATA_STATE_FILENAME)
-        with open(path, "w") as fh:
-            json.dump(self.data_source.state_dict(), fh)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        try:
+            with open(tmp, "w") as fh:
+                json.dump(self.data_source.state_dict(), fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
     def _load_data_state(self, load_dir: Optional[str], start_step: int) -> None:
         if not load_dir:

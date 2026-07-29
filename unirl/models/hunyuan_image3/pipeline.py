@@ -1,13 +1,13 @@
-"""HunyuanImage3Pipeline — RolloutReq → RolloutResp dispatcher.
+"""HunyuanImage3Pipeline — ``Sample → Sample`` dispatcher.
 
 Per-task generate logic lives in ``modes/<task>.py`` (one file each for
 ``t2t``, ``i2t``, ``t2i``, ``it2i``, ``t2ti``). This module is a thin
 dispatcher:
 it instantiates / composes the shared stages (``Bundle``,
 ``TextEmbedStage``, ``DiffusionStage``, ``ARStage``, ``VAEEncodeStage``,
-``VAEDecodeStage``, ``VitEncodeStage``) and routes ``generate(req)`` to
+``VAEDecodeStage``, ``VitEncodeStage``) and routes ``generate(sample)`` to
 the matching ``modes.<task>.generate`` based on
-``req.stage_params["task"]``.
+``sample.parts[0].control["task"]``.
 
 Hydra registers ``model/hunyuan_image3`` against
 ``HunyuanImage3Pipeline.from_config`` via ``config.py``; that path
@@ -15,9 +15,9 @@ remains unchanged across the per-mode split.
 
 Detokenization (``_detokenize_text_segment``) stays on this class
 because multiple modes need it. σ schedule construction is no longer
-the pipeline's concern — the engine adapter pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` before invoking
-``generate``; modes read ``req.sigmas`` directly.
+the pipeline's concern — the engine adapter pins the gen Part's
+``DiffusionSamplingParams.sigmas`` before invoking ``generate``; modes
+read ``params.sigmas`` directly.
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ from typing import List, Optional
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import CPSSDEStrategy, StepStrategy
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 from .ar import HunyuanImage3ARStage
 from .bundle import HunyuanImage3Bundle
@@ -43,38 +42,38 @@ from .vit_encode import HunyuanImage3VitEncodeStage
 
 
 class HunyuanImage3Pipeline(Pipeline):
-    """HunyuanImage 3.0 generate pipeline.
+    """HunyuanImage 3.0 generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` and fills the gen Part(s), dispatching on
+    ``parts[0].control["task"]`` to the per-task functions in ``modes/``.
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]`` — rejected for t2i / it2i: the HI3
-      tokenizer never consumes negative-prompt text; CFG derives from
-      ``guidance_scale > 1.0``.
-    - ``primitives["image"]: Images`` — required for i2t / it2i.
-    - ``stage_params["task"]: str`` — one of ``{"t2t", "i2t", "t2i",
+    Reads via ``sample.conditioning()`` / the gen Part's ``sampling_params``:
+
+    - the prompt ``Texts`` (``conditioning()[0]``) — required prompts.
+    - a chained ``Images`` input — required for i2t / it2i.
+    - ``parts[0].control["task"]: str`` — one of ``{"t2t", "i2t", "t2i",
       "it2i", "t2ti"}``. Defaults to ``"t2i"`` if absent.
-    - ``stage_params["bot_task"]: str`` — chat-template flag forwarded to
+    - ``parts[0].control["bot_task"]: str`` — chat-template flag forwarded to
       ``HunyuanImage3TextEmbedStage.embed_for_gen_image`` (t2i / it2i),
       or the CoT-chain preset for t2ti (default ``"think_recaption"``).
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`HunyuanImage3DiffusionParams` (t2i / it2i).
-    - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t / t2ti).
+    - the gen Part's ``DiffusionSamplingParams`` (t2i / it2i) /
+      ``ARSamplingParams`` (t2t / i2t) — t2ti carries both, as two gen Parts.
 
-    t2ti (text → CoT text + image) requires a sampling dict with both
-    ``"ar"`` and ``"diffusion"`` entries and returns TWO
-    tracks: ``"ar"`` (root, the CoT TextSegment) and ``"image"``
-    (``parent_track="ar"``, the LatentSegment). Fan-out
-    (``samples_per_prompt``) is NOT honored by t2ti — replication
-    belongs to the engine adapter, as with the other HI3 modes.
+    Negative prompts are rejected for t2i / it2i: the HI3 tokenizer never
+    consumes negative-prompt text; CFG derives from ``guidance_scale > 1.0``.
 
-    Writes to ``RolloutResp``:
+    t2ti (text → CoT text + image) carries both an ``ar`` and a ``diffusion``
+    gen Part and fills both: the ``ar`` gen Part (the CoT TextSegment) and the
+    ``diffusion`` gen Part (the LatentSegment). Fan-out (``samples_per_prompt``)
+    is NOT honored by t2ti — replication belongs to the engine adapter, as with
+    the other HI3 modes.
+
+    Each mode fills its gen Part(s):
 
     - ``conditions``: per-task — see each ``modes/<task>.py``.
-    - ``tracks["ar"].segment: TextSegment`` for AR-mode tasks.
-    - ``tracks["image"].segment: LatentSegment`` for diffusion-mode tasks.
-    - ``tracks["ar"].decoded: Texts`` (AR-mode) /
-      ``tracks["image"].decoded: Images`` (diffusion-mode).
+    - the AR gen Part's ``segment: TextSegment`` + ``primitive: Texts`` (AR modes).
+    - the diffusion gen Part's ``segment: LatentSegment`` + ``primitive: Images``
+      (diffusion modes).
     """
 
     def __init__(
@@ -192,26 +191,26 @@ class HunyuanImage3Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
         """Dispatch to the per-task generate function in ``modes/``.
 
-        ``stage_params["task"]`` selects the topology. Lazy-imports the
+        ``parts[0].control["task"]`` selects the topology. Lazy-imports the
         modes package to avoid the circular ``modes -> pipeline`` ref
         (mode files type-annotate ``pipeline: "HunyuanImage3Pipeline"``).
         """
         from .modes import i2t, it2i, t2i, t2t, t2ti
 
-        task = req.stage_config.get("task", "t2i")
+        task = (sample.parts[0].control or {}).get("task", "t2i")
         if task == "t2t":
-            return t2t.generate(self, req)
+            return t2t.generate(self, sample)
         if task == "i2t":
-            return i2t.generate(self, req)
+            return i2t.generate(self, sample)
         if task == "t2i":
-            return t2i.generate(self, req)
+            return t2i.generate(self, sample)
         if task == "it2i":
-            return it2i.generate(self, req)
+            return it2i.generate(self, sample)
         if task == "t2ti":
-            return t2ti.generate(self, req)
+            return t2ti.generate(self, sample)
         raise ValueError(
             f"HunyuanImage3Pipeline.generate: unknown task={task!r}; "
             f"expected one of 't2t', 'i2t', 't2i', 'it2i', 't2ti'."

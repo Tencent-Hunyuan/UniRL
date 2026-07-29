@@ -449,8 +449,8 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         unpacks at the transformer boundary so the VAE decode stage can
         read ``segment.latents[:, -1]`` without per-shape handling.
 
-        ``initial_latents`` (optional) — driver-shipped x_T per
-        ``req.request_conditions['initial_latents']``; see
+        ``initial_latents`` (optional) — x_T resolved from the request
+        ``Sample``'s diffusion generation Part; see
         :class:`SD3DiffusionStage.diffuse` for the contract.
         """
         from unirl.sde.noise import generate_latents

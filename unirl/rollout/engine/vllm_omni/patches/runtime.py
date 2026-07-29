@@ -20,6 +20,11 @@ from a worker-extension's ``__new__``).
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import signal
+import threading
+import time
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 
 from msgspec import field
@@ -54,18 +59,97 @@ class OmniTensorLoRARequest(OmniLoRARequest):
 # Mirrors the LIN-210 sglang pattern (``samplers/sglang/patches/_spawn_wrap.py``).
 
 
+#: Pid of the process at the ROOT of the spawn chain (the Ray actor hosting
+#: ``Omni``). Exported into the environment so it survives every subsequent
+#: spawn level: the AR stage's ``StageEngineCoreProc`` and the vLLM
+#: ``Worker_TP*`` processes it spawns all watch the same anchor.
+_FATE_ANCHOR_ENV = "UNIRL_FATE_ANCHOR_PID"
+_FATE_POLL_SECONDS = 5.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not ours to signal
+    except OSError:
+        return True  # unknown failure — never take this as "dead"
+    return True
+
+
+def install_fate_sharing(anchor_pid: int) -> None:
+    """Bind this process's lifetime to the root of its spawn chain.
+
+    Without this the engine subprocess tree outlives the run. Measured on the
+    Qwen3-Omni anchored TP=4 topology: ``kill -TERM`` on the driver takes down
+    the driver, the Ray actors and ``StageEngineCoreProc``, but the four
+    ``Worker_TP*`` processes reparent to init and sit there holding ~7.3 GiB of
+    device memory each until reaped by hand.
+
+    Two independent mechanisms, because neither alone is sufficient:
+
+    - ``PR_SET_PDEATHSIG`` fires on termination of the *thread* that created
+      this process, not the parent process. vllm-omni already arms it (with
+      SIGTERM) for ``StageEngineCoreProc``, whose creating thread lives in
+      ``AsyncOmniEngine._stage_init_executor`` — that is why the engine core
+      does die. It buys the TP workers nothing when their creator wedges.
+    - A poll on the root anchor. vLLM's own ``death_pipe`` EOF monitor is the
+      intended backstop for the TP workers, but it only unblocks the worker's
+      message queues; a worker sitting in a CUDA or NCCL call never observes
+      it. Polling a pid and calling ``os._exit`` does not depend on the worker
+      being schedulable in Python at the moment its parent dies.
+    """
+    try:
+        import ctypes
+
+        # PR_SET_PDEATHSIG == 1. SIGKILL rather than vllm-omni's SIGTERM: by
+        # the time we get here the parent is already gone, so there is nobody
+        # left to hand a graceful shutdown to.
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
+    except Exception:  # noqa: BLE001 - best effort; the watchdog below is the real guarantee
+        pass
+
+    root = os.environ.get(_FATE_ANCHOR_ENV)
+    root_pid = int(root) if root else int(anchor_pid)
+    # Children spawned from here inherit the environment, so the whole tree
+    # converges on one anchor instead of a fragile parent-of-parent chain.
+    os.environ[_FATE_ANCHOR_ENV] = str(root_pid)
+
+    original_ppid = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(_FATE_POLL_SECONDS)
+            if not _pid_alive(root_pid):
+                os._exit(1)
+            # Reparenting is the earlier signal when the immediate parent dies
+            # but the anchor is still up (e.g. the engine core crashed alone).
+            if original_ppid != 1 and os.getppid() != original_ppid:
+                os._exit(1)
+
+    threading.Thread(target=_watch, daemon=True, name="unirl-fate-watchdog").start()
+
+
 class _DiffrlPatchedTarget:
     """Pickleable top-level wrapper that installs patches in the child first.
 
     Must be a module-level class so spawn's pickler can serialise the wrapped
     target across the process boundary. Nested functions / closures cannot be
     pickled and would break spawn.
+
+    ``_anchor_pid`` is captured in the PARENT (``__init__`` runs there, at
+    ``Process(...)`` construction) and read back in the child, which is what
+    makes it a usable fate-sharing anchor.
     """
 
     def __init__(self, target):
         self._target = target
+        self._anchor_pid = os.getpid()
 
     def __call__(self, *args, **kwargs):
+        install_fate_sharing(getattr(self, "_anchor_pid", os.getppid()))
         VLLMOmniHijack.hijack()
         return self._target(*args, **kwargs)
 
@@ -111,6 +195,28 @@ def wrap_mp_process_for_children() -> None:
 
     _MpBaseProcess.__init__ = __init__
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
+
+
+def patch_qwen3_omni_thinker_lora() -> None:
+    """Backport Qwen3-Omni Thinker LoRA support to vLLM-Omni 0.20."""
+    module_name = "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
+    if importlib.util.find_spec(module_name) is None:
+        return
+
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerMultiModalProcessor,
+    )
+
+    from unirl.rollout.engine.vllm_omni.patches.compat_qwen3_omni import (
+        patch_qwen3_omni_audio_truncation,
+        patch_qwen3_omni_audio_video_mrope,
+        patch_qwen3_omni_thinker_class,
+    )
+
+    patch_qwen3_omni_thinker_class(Qwen3OmniMoeThinkerForConditionalGeneration)
+    patch_qwen3_omni_audio_video_mrope(Qwen3OmniMoeThinkerForConditionalGeneration)
+    patch_qwen3_omni_audio_truncation(Qwen3OmniMoeThinkerMultiModalProcessor)
 
 
 def patch_dit_lora_loader() -> None:
@@ -662,6 +768,7 @@ class VLLMOmniHijack:
         # never take effect in the worker subprocesses.
         wrap_mp_process_for_children()
 
+        patch_qwen3_omni_thinker_lora()
         patch_dit_lora_loader()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
