@@ -94,6 +94,14 @@ def _concat_rollout_trajectory_data(output_batches: list):
             latents=_cat0([r.dit_trajectory.latents for r in rtds if r.dit_trajectory is not None]),
             timesteps=first.dit_trajectory.timesteps,
         )
+        # LTX-2 carries a parallel AUDIO trajectory (``audio_latents``) the video
+        # forward cross-attends to; it is attached onto each per-output
+        # ``dit_trajectory`` by ``patch_ltx2_rollout_sde``. Concat it dim-0 like the
+        # video latents so the grouped (nopp>1) merge preserves per-output audio.
+        # ``RolloutDitTrajectory.__init__`` has no such field, so set it post-hoc.
+        _auds = [getattr(r.dit_trajectory, "audio_latents", None) for r in rtds if r.dit_trajectory is not None]
+        if _auds and all(a is not None for a in _auds):
+            new_dit.audio_latents = _cat0(_auds)
 
     new_debug = None
     if first.rollout_debug_tensors is not None:
@@ -141,6 +149,11 @@ def _slice_rollout_trajectory_keepdim(rtd, idx: int):
             latents=_slice_row_keepdim(rtd.dit_trajectory.latents, idx),
             timesteps=rtd.dit_trajectory.timesteps,
         )
+        # Carry the LTX-2 audio trajectory through the per-output slice (keep-dim),
+        # mirroring the video latents (see ``_concat_rollout_trajectory_data``).
+        _aud = getattr(rtd.dit_trajectory, "audio_latents", None)
+        if _aud is not None:
+            new_dit.audio_latents = _slice_row_keepdim(_aud, idx)
 
     new_debug = None
     if rtd.rollout_debug_tensors is not None:

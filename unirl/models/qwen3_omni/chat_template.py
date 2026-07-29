@@ -13,6 +13,7 @@ from unirl.types.sample import Turn
 
 from .bundle import Qwen3OmniBundle
 from .conditions import Qwen3OmniARConditions
+from .media import extract_audio_from_video_pyav
 from .video import limit_video_frames, sample_video_frames_pyav
 
 Qwen3OmniChatInput = Union[List[Turn], Texts]
@@ -29,6 +30,7 @@ class Qwen3OmniChatTemplateStage:
         video_fps: float = 1.0,
         video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
+        use_audio_in_video: bool = False,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.bundle = bundle
@@ -39,6 +41,7 @@ class Qwen3OmniChatTemplateStage:
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
+        self.use_audio_in_video = bool(use_audio_in_video)
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
 
     def embed(
@@ -101,11 +104,13 @@ class Qwen3OmniChatTemplateStage:
     def _prepare_messages(
         self,
         messages: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], bool]:
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any], bool, Optional[Any], Optional[Any]]:
         """Decode/sample the single supported video block without mutating input."""
         prepared: List[Dict[str, Any]] = []
         processor_kwargs: Dict[str, Any] = {}
         video_count = 0
+        video_frames: Optional[Any] = None
+        audio_wave: Optional[Any] = None
         for message in messages:
             content = message.get("content")
             if not isinstance(content, list):
@@ -127,19 +132,29 @@ class Qwen3OmniChatTemplateStage:
                             target_fps=self.video_fps,
                             max_frames=self.video_max_frames,
                         )
+                        if self.use_audio_in_video:
+                            sample_rate = int(
+                                getattr(
+                                    getattr(self.bundle.processor, "feature_extractor", None),
+                                    "sampling_rate",
+                                    16000,
+                                )
+                            )
+                            audio_wave = extract_audio_from_video_pyav(raw_video, sample_rate)
                     else:
                         frames, effective_fps = limit_video_frames(
                             raw_video,
                             fps=self.video_fps,
                             max_frames=self.video_max_frames,
                         )
+                    video_frames = frames
                     block["video"] = frames
                     processor_kwargs = self._multimodal_processor_kwargs(video_fps=effective_fps)
                 blocks.append(block)
             copied = dict(message)
             copied["content"] = blocks
             prepared.append(copied)
-        return prepared, processor_kwargs, video_count > 0
+        return prepared, processor_kwargs, video_count > 0, video_frames, audio_wave
 
     def embed_messages(
         self,
@@ -157,18 +172,32 @@ class Qwen3OmniChatTemplateStage:
         per_sample_inputs: List[Dict[str, Any]] = []
         has_video_by_row: List[bool] = []
         for messages in conversations:
-            prepared, mm_kwargs, has_video = self._prepare_messages(messages)
+            prepared, mm_kwargs, has_video, video_frames, audio_wave = self._prepare_messages(messages)
             template_kwargs = dict(self.chat_template_kwargs)
-            template_kwargs.update(mm_kwargs)
-            # These define the replay-condition wire shape and cannot be
-            # overridden by recipe-level chat kwargs.
-            template_kwargs.update(
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            inputs = processor.apply_chat_template(prepared, **template_kwargs)
+            if audio_wave is not None:
+                template_kwargs.update(add_generation_prompt=True, tokenize=False)
+                prompt_text = processor.apply_chat_template(prepared, **template_kwargs)
+                processor_kwargs = dict(mm_kwargs)
+                processor_kwargs.update(
+                    text=[prompt_text],
+                    videos=[video_frames],
+                    audio=[audio_wave],
+                    use_audio_in_video=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                inputs = processor(**processor_kwargs)
+            else:
+                template_kwargs.update(mm_kwargs)
+                # These define the replay-condition wire shape and cannot be
+                # overridden by recipe-level chat kwargs.
+                template_kwargs.update(
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                inputs = processor.apply_chat_template(prepared, **template_kwargs)
             prompt_len = int(inputs["input_ids"].shape[-1])
             if prompt_len > self.max_prompt_length:
                 if has_video:
@@ -210,6 +239,8 @@ class Qwen3OmniChatTemplateStage:
         pixel_values_videos: List[Optional[torch.Tensor]] = []
         video_grid_thw: List[Optional[torch.Tensor]] = []
         video_second_per_grid: List[Optional[torch.Tensor]] = []
+        input_features: List[Optional[torch.Tensor]] = []
+        feature_attention_mask: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:
             pvv = inp.get("pixel_values_videos")
             vgt = inp.get("video_grid_thw")
@@ -221,13 +252,20 @@ class Qwen3OmniChatTemplateStage:
                 video_second_per_grid.append(vspg_t.to(device=device))
             else:
                 video_second_per_grid.append(None)
+            ivf = inp.get("input_features")
+            fam = inp.get("feature_attention_mask")
+            input_features.append(ivf.to(device=device, dtype=dtype) if ivf is not None else None)
+            feature_attention_mask.append(fam.to(device=device) if fam is not None else None)
 
+        has_audio = any(a is not None for a in input_features)
         has_video = any(has_video_by_row)
         return Qwen3OmniARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
             pixel_values_videos=pixel_values_videos if has_video else None,
             video_grid_thw=video_grid_thw if has_video else None,
             video_second_per_grid=video_second_per_grid if has_video else None,
+            input_features=input_features if has_audio else None,
+            feature_attention_mask=feature_attention_mask if has_audio else None,
         )
 
 

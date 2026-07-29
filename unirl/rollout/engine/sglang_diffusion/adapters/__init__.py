@@ -24,6 +24,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image_edit_plus import 
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.video import (
     HunyuanVideoAdapter,
+    Ltx2T2VAdapter,
     MochiAdapter,
     VideoAdapter,
     Wan21T2VAdapter,
@@ -45,6 +46,7 @@ __all__ = [
     "QwenImageEditPlusAdapter",
     "Wan22T2VAdapter",
     "Wan21T2VAdapter",
+    "Ltx2T2VAdapter",
     "MochiAdapter",
     "HunyuanVideoAdapter",
     "ZImageAdapter",

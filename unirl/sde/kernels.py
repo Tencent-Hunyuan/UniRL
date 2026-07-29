@@ -9,7 +9,8 @@ from typing import ClassVar, List, Optional, Tuple, Union
 
 import torch
 
-NoiseGenerator = Optional[Union[torch.Generator, List[torch.Generator]]]
+GeneratorLike = Optional[Union[torch.Generator, List[torch.Generator]]]
+NoiseGenerator = GeneratorLike
 
 # ---------------------------------------------------------------------------
 # Base class hierarchy
@@ -28,7 +29,7 @@ class StepStrategy(ABC):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -51,7 +52,7 @@ class StepStrategy(ABC):
         *,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -150,7 +151,7 @@ class SDEStrategy(StepStrategy, ABC):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -263,7 +264,7 @@ class FlowSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -333,7 +334,7 @@ class CPSSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -392,7 +393,7 @@ class DanceSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -580,7 +581,7 @@ class DPM2Strategy(StepStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:

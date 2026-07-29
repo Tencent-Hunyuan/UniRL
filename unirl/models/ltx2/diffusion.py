@@ -18,6 +18,7 @@ LTX2-specific deviations from other models:
 
 from __future__ import annotations
 
+import inspect
 from contextlib import nullcontext
 from typing import ClassVar, List, Optional, Set, Tuple
 
@@ -26,6 +27,7 @@ import torch
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -35,6 +37,27 @@ from .conditions import LTX2Conditions
 from .config import LTX2_SPATIAL_COMPRESSION, LTX2_TEMPORAL_COMPRESSION
 
 _LTX2_TIMESTEP_SCALE: float = 1000.0
+
+# diffusers 0.37.x LTX2VideoTransformer3DModel.forward rejects sigma/audio_sigma/
+# isolate_modalities (LTX-2.3-only kwargs) -> TypeError. Drop any kwarg the bound
+# forward() doesn't declare (pass through if it declares **kwargs). Cached per class.
+_FORWARD_PARAMS_CACHE: dict = {}
+
+
+def _filter_forward_kwargs(transformer, kwargs):
+    cls = type(transformer)
+    params = _FORWARD_PARAMS_CACHE.get(cls)
+    if params is None:
+        sig = inspect.signature(cls.forward)
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            params = True
+        else:
+            params = set(sig.parameters)
+        _FORWARD_PARAMS_CACHE[cls] = params
+    if params is True:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
 
 # LTX-2 is a UNIFIED audiovisual transformer: ``forward`` always runs both the
 # video and audio branches AND, by design, injects an audio→video cross-attn
@@ -158,15 +181,13 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
         audio_encoder_attention_mask = audio_text_cond.attn_mask
 
         def _run(v_in, a_in, ts_in, enc_hs, enc_mask, a_enc_hs, a_enc_mask):
-            out = transformer(
+            _fwd = dict(
                 hidden_states=v_in,
                 audio_hidden_states=a_in,
                 encoder_hidden_states=enc_hs,
                 audio_encoder_hidden_states=a_enc_hs,
                 timestep=ts_in,
                 audio_timestep=ts_in,
-                # ``sigma``/``audio_sigma`` are consumed only by LTX-2.3 prompt
-                # modulation; harmless for 2.0 and required by 2.3 — pass them.
                 sigma=ts_in,
                 audio_sigma=ts_in,
                 encoder_attention_mask=enc_mask,
@@ -179,6 +200,7 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
                 isolate_modalities=False,
                 return_dict=False,
             )
+            out = transformer(**_filter_forward_kwargs(transformer, _fwd))
             # forward returns (video_out, audio_out).
             return out[0], out[1]
 
@@ -186,13 +208,21 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
             # CFG: batch [uncond, cond] for both modalities.
             neg = conditions.negative_text
             neg_audio = conditions.negative_audio_text if conditions.negative_audio_text is not None else neg
+
+            def _cat_masks(negative_mask, positive_mask):
+                if negative_mask is None or positive_mask is None:
+                    if negative_mask is not None or positive_mask is not None:
+                        raise ValueError("LTX-2 CFG attention masks must be both present or both absent")
+                    return None
+                return torch.cat([negative_mask, positive_mask], dim=0)
+
             v_cfg = torch.cat([sample, sample], dim=0)
             a_cfg = torch.cat([audio_sample, audio_sample], dim=0)
             ts_cfg = torch.cat([timestep, timestep], dim=0)
             enc_hs = torch.cat([neg.embeds, encoder_hidden_states], dim=0)
-            enc_mask = torch.cat([neg.attn_mask, encoder_attention_mask], dim=0)
+            enc_mask = _cat_masks(neg.attn_mask, encoder_attention_mask)
             a_enc_hs = torch.cat([neg_audio.embeds, audio_encoder_hidden_states], dim=0)
-            a_enc_mask = torch.cat([neg_audio.attn_mask, audio_encoder_attention_mask], dim=0)
+            a_enc_mask = _cat_masks(neg_audio.attn_mask, audio_encoder_attention_mask)
 
             v_pred, a_pred = _run(v_cfg, a_cfg, ts_cfg, enc_hs, enc_mask, a_enc_hs, a_enc_mask)
             v_u, v_c = v_pred.chunk(2, dim=0)
@@ -272,6 +302,8 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         initial_latents: torch.Tensor,
         initial_audio_latents: Optional[torch.Tensor] = None,
         sde_indices: Optional[List[int]] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
     ) -> LatentSegment:
         """Run the full denoising loop, collecting trajectory for RL.
 
@@ -284,6 +316,9 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 128) resolved by the pipeline from the same NoiseRecipe as video.
                 ``None`` falls back to a bare randn (non-pipeline/test callers).
             sde_indices: Which steps to use SDE (stochastic) for RL.
+            denoise_seed_keys: Stable per-sample keys used to derive the same
+                per-step SDE noise as SGLang.
+            denoise_base_seed: Base seed paired with ``denoise_seed_keys``.
 
         Returns:
             LatentSegment with trajectory and log-probs at SDE steps.
@@ -294,6 +329,11 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
 
         device = initial_latents.device
+        if denoise_seed_keys is not None and len(denoise_seed_keys) != int(initial_latents.shape[0]):
+            raise ValueError(
+                "LTX2DiffusionStage.generate: denoise_seed_keys length "
+                f"{len(denoise_seed_keys)} != batch size {int(initial_latents.shape[0])}"
+            )
         num_steps = len(sigmas) - 1
         sigmas = sigmas.to(device)
         self.strategy.init_schedule(sigmas)
@@ -340,6 +380,15 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 sigma = sigmas[step_idx].to(device)
                 sigma_next = sigmas[step_idx + 1].to(device)
                 step_eta = eta if step_idx in sde_set else 0.0
+                step_generators = (
+                    make_denoise_step_generators(
+                        base_seed=int(denoise_base_seed),
+                        step_index=step_idx,
+                        sample_ids=[str(key) for key in denoise_seed_keys],
+                    )
+                    if step_eta > 0.0 and denoise_seed_keys is not None
+                    else None
+                )
 
                 video_pred, audio_pred = self.step_kernel.predict_noise(
                     self.bundle,
@@ -362,6 +411,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     sigma=sigma,
                     sigma_next=sigma_next,
                     eta=step_eta,
+                    generator=step_generators,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
