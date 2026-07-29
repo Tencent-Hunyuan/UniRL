@@ -182,6 +182,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_tensors import (
             patch_lora_tensors,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_ltx2_rollout_sde import (
+            patch_ltx2_rollout_sde,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_pipeline import (
             patch_pipeline,
         )
@@ -243,6 +246,7 @@ class SglangDiffusionHijack:
             patch_set_timesteps,
             patch_vae_decode_safe,
             patch_wan_scheduler,
+            patch_ltx2_rollout_sde,
             patch_safe_unpickler,
         ):
             _safe_apply(patch)

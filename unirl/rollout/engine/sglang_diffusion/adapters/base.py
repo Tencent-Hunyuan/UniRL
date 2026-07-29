@@ -1,4 +1,4 @@
-"""Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + boilerplate with sensible defaults) over a per-output-
 shape base adapter (:mod:`image`) that holds the conversion logic as overridable
@@ -18,8 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 # --------------------------------------------------------------------------- #
 # Registry
@@ -148,12 +147,12 @@ class ModelAdapter(ABC):
 
     # ---- the two conversion seams the engine drives ----
     @abstractmethod
-    def build_inputs(self, req: RolloutReq, *, initial_noise: Any) -> Dict[str, Any]:
-        """Translate a ``RolloutReq`` into SGLang ``generate`` sampling kwargs."""
+    def build_inputs(self, sample: Sample, *, initial_noise: Any) -> Dict[str, Any]:
+        """Translate a request ``Sample`` into SGLang ``generate`` sampling kwargs."""
 
     @abstractmethod
-    def build_response(self, req: RolloutReq, raw: List[RawResult]) -> RolloutResp:
-        """Translate SGLang's results back into a typed ``RolloutResp``."""
+    def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
+        """Fill the frontier gen ``Part`` from SGLang's results; return the ``Sample``."""
 
 
 __all__ = [

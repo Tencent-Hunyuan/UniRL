@@ -24,7 +24,13 @@
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
 #   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
-#   train_unified_model                  examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
+#   train_unified_model        examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
+#   train_agentic              examples/deep_research/ (barrier, answer-graded reward)
+#   train_agentic_partial      examples/deep_research/ (colocated partial rollout)
+#   train_agentic_async        examples/deep_research/ (disaggregated asynchronous rollout)
+#   train_agentic_env          examples/alfworld/ (barrier, environment-sourced reward)
+#   train_agentic_env_partial  examples/alfworld/ (colocated partial rollout)
+#   train_agentic_env_async    examples/alfworld/ (disaggregated asynchronous rollout)
 #
 # The first positional arg is the examples/ config name, domain-qualified
 # (passed to Hydra as --config-name); any extra args are forwarded verbatim as Hydra overrides. The
@@ -72,6 +78,31 @@ if [ -n "${CONDA_ENV:-}" ]; then
 elif [ -n "${VENV_DIR:-}" ] && [ -f "${VENV_DIR}/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "${VENV_DIR}/bin/activate"
+fi
+
+# NVIDIA's pip CUDA toolkit stores the versioned runtime in ``lib/`` without
+# the unversioned ``libcudart.so`` name expected by TVM-FFI's ``-lcudart``
+# link step. Build a disposable linker shim on every node before Ray starts.
+# The reward-curve launcher supplies these paths for its pinned SGLang env;
+# other launchers are unaffected.
+if [ -n "${CUDA_RUNTIME_LIB_DIR:-}" ] && [ -n "${CUDA_RUNTIME_LINK_DIR:-}" ]; then
+    cuda_runtime_lib=""
+    for candidate in \
+        "${CUDA_RUNTIME_LIB_DIR}/libcudart.so" \
+        "${CUDA_RUNTIME_LIB_DIR}"/libcudart.so.*; do
+        if [ -e "${candidate}" ]; then
+            cuda_runtime_lib="${candidate}"
+            break
+        fi
+    done
+    if [ -z "${cuda_runtime_lib}" ]; then
+        echo "CUDA runtime not found in CUDA_RUNTIME_LIB_DIR=${CUDA_RUNTIME_LIB_DIR}." >&2
+        exit 2
+    fi
+    mkdir -p "${CUDA_RUNTIME_LINK_DIR}"
+    ln -sfn "${cuda_runtime_lib}" "${CUDA_RUNTIME_LINK_DIR}/libcudart.so"
+    export LIBRARY_PATH="${CUDA_RUNTIME_LINK_DIR}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    export LD_LIBRARY_PATH="${CUDA_RUNTIME_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 # --- ssh fan-out worker join (LAUNCH=ssh) -----------------------------------
@@ -185,7 +216,12 @@ if [ "${LAUNCH}" = "ssh" ]; then
     ssh_nccl_env=""
     while IFS='=' read -r _k _v; do
         [ -n "${_k}" ] && ssh_nccl_env+="${_k}='${_v}' "
-    done < <(env | grep -E '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF' || true)
+    done < <(
+        env |
+            grep -E \
+                '^NCCL_|^PYTORCH_CUDA_ALLOC_CONF|^LD_LIBRARY_PATH=|^LIBRARY_PATH=|^CUDA_COMPAT_DIR=|^CUDA_RUNTIME_|^CUDA_HOME=|^CUDA_PATH=|^CUDACXX=|^NVCC=' ||
+            true
+    )
     IFS=',' read -ra _NODE_ENTRIES <<< "${NODE_IP_LIST}"
     worker_n=0
     for entry in "${_NODE_ENTRIES[@]}"; do

@@ -125,10 +125,10 @@ The practical consequence:
 ## From rollout to update
 
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
-2. `SGLangRolloutEngine` samples completions and returns an `"ar"` track with packed
+2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
 3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
-4. `RolloutTrack.compute_advantages(normalize=False, scope="group")` mean-centers rewards
+4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
 5. `TrainStack.train_track` calls `DRPO.compute_loss_and_backward`, which replays the

@@ -1,7 +1,7 @@
 # Distributed Runtime
 
 > **Where it fits:** the fabric under the whole loop — it places the rollout and
-> train workers on GPUs, fans every `RolloutReq` / `train_track` / `sync` call out
+> train workers on GPUs, fans every `Sample` generation / `train_track` / `sync` call out
 > to them, and moves rollout data between them without routing the heavy tensors
 > through the driver. Full map: [`../README.md`](../README.md).
 
@@ -32,8 +32,8 @@ placement groups, NCCL groups, who-owns-which-tensor) in every trainer would be
 unmaintainable. This layer hides it behind two ideas:
 
 - **Call a method, it runs everywhere it should.** The trainer writes
-  `self.rollout.generate(req)`; because `generate` is tagged
-  `@distributed(DP_SCATTER)`, the framework shards `req` across the rollout workers,
+  `self.rollout.generate(sample)`; because `generate` is tagged
+  `@distributed(DP_SCATTER)`, the framework shards the prompt trees across the rollout workers,
   runs it, and merges the result. The trainer reads like single-process code.
 - **The driver never holds the heavy bytes.** A rollout can be hundreds of GB of
   latents. Gathering it to the driver to hand to the trainer would OOM. So a produced
@@ -64,7 +64,7 @@ unmaintainable. This layer hides it behind two ideas:
 - **The data plane — how rollout data reaches train** (`tensor/`). The subtle part,
   and the one most worth understanding:
   1. `generate` runs `DP_SCATTER` on the rollout workers. As each worker returns,
-     every tensor in the `RolloutResp` is **dehydrated** into that worker's store and
+     every tensor in the returned `Sample` is **dehydrated** into that worker's store and
      replaced by a `TensorMeta` (a ref + shape).
   2. The driver's merge concatenates **handles**, so the heavy bytes never leave the
      workers; the driver hydrates only the small `rewards`/`advantages` vectors it
@@ -95,7 +95,7 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
 ## Gotchas
 
 - **The driver holds proxies, not tensors.** Driver-side arithmetic on a
-  `RolloutResp` / track field must `_hydrate_tensor_meta` first (the trainer does this
+  `Sample` / `Part` field must `_hydrate_tensor_meta` first (the trainer does this
   for `rewards`); don't assume a field on the driver is a real tensor.
 - **`DP_SCATTER` splits by the *first* batch-axis size it finds** (`infer_batch_size`),
   and `pytree_chunk` **replicates** — never errors on — anything whose leading dim

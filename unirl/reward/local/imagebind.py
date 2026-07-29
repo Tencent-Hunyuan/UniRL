@@ -170,7 +170,10 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
     @staticmethod
     def _temporal_subsample_clips(video: torch.Tensor, num_clips: int, frames_per_clip: int) -> List[torch.Tensor]:
-        T = video.shape[0]
+        # RewardRequest.videos exposes each sample as [C, T, H, W]. Keep that
+        # layout throughout ImageBind preprocessing; treating dim 0 as time
+        # would sample RGB channels instead of frames.
+        T = video.shape[1]
         clips = []
         for i in range(num_clips):
             center = int((i + 0.5) * T / num_clips)
@@ -179,7 +182,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
                 min(T - 1, center + frames_per_clip // 2 - 1),
                 frames_per_clip,
             ).long()
-            clips.append(video[indices].permute(1, 0, 2, 3))
+            clips.append(video[:, indices])
         return clips
 
     @staticmethod

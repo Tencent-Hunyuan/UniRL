@@ -30,9 +30,22 @@ from unirl.distributed.tensor.ref import hydrate
 from unirl.trainer.base import BaseTrainer
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.types.primitives import Texts
+from unirl.types.sample import Sample
 from unirl.utils.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
+
+
+def _text_inputs(inputs: Sample) -> Texts:
+    """Read the text root from a data-source input ``Sample``."""
+    if not isinstance(inputs, Sample):
+        raise TypeError(f"ReFL data source must return Sample, got {type(inputs).__name__}.")
+    if not inputs.parts:
+        raise ValueError("ReFL data-source Sample has no input Parts.")
+    prompts = inputs.parts[0].primitives.get("text")
+    if not isinstance(prompts, Texts):
+        raise TypeError(f"ReFL data-source root requires Texts, got {type(prompts).__name__}.")
+    return prompts
 
 
 class RewardBackpropTrainer(BaseTrainer):
@@ -174,9 +187,7 @@ class RewardBackpropTrainer(BaseTrainer):
         tail (``num_prompts`` not a multiple of ``batch_size``) is floored off.
         """
         eval_inputs = data_source.get_eval_samples(num_prompts)
-        prompts = eval_inputs.primitives["text"]
-        if not isinstance(prompts, Texts):
-            prompts = Texts(texts=list(prompts))
+        prompts = _text_inputs(eval_inputs)
         texts = list(prompts.texts)
         chunk = max(1, self.batch_size)
         usable = len(texts) - len(texts) % chunk or len(texts)
@@ -207,9 +218,7 @@ class RewardBackpropTrainer(BaseTrainer):
                 self.evaluate(start)  # baseline eval before any training
             for rollout_id in range(start, num_rollouts):
                 inputs = self.data_source.get_samples(self.batch_size)
-                prompts = inputs.primitives["text"]
-                if not isinstance(prompts, Texts):
-                    prompts = Texts(texts=list(prompts))
+                prompts = _text_inputs(inputs)
                 mean_reward, grad_norm, dt = self.train_step(prompts, rollout_id=rollout_id)
                 logger.info(
                     "rollout %d/%d  reward=%.4f grad_norm=%.4f  %.1fs",

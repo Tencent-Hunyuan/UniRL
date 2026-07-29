@@ -1,4 +1,4 @@
-"""Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + knobs + the two conversion verbs). Concrete
 modality adapters live in family files (``hi3`` / ``sd3`` / ``hv15``) and are
@@ -28,8 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from unirl.config.require import require
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 # --------------------------------------------------------------------------- #
 # Registry
@@ -88,8 +87,9 @@ class ModelAdapter(ABC):
     stage_yaml_source: str = "local"
     #: ``Omni(mode=...)`` kwarg; ``None`` omits it (v1 engine.py:377-378).
     omni_mode: Optional[str] = None
-    #: Request carries diffusion params → pin σ via ``ensure_req_sigmas``
-    #: (v1 ``_DIT_BEARING_MODALITIES``; AR-only requests would raise on it).
+    #: Request carries a diffusion gen Part → pin σ onto its
+    #: ``DiffusionSamplingParams.sigmas`` (v1 ``_DIT_BEARING_MODALITIES``;
+    #: AR-only requests have no diffusion gen Part to pin).
     needs_sigmas: bool = True
     #: Driver-side tokenizer for ``build_prompt_tokens`` (v1 engine.py:322 —
     #: everything except sd35_t2i / t2v, including dit_recaption, which loads
@@ -182,21 +182,21 @@ class ModelAdapter(ABC):
             )
 
     # ---- per-request validation (ports v1 ``_validate_request``) ----
-    def validate_request(self, req: RolloutReq) -> None:
+    def validate_request(self, sample: Sample) -> None:
         """Modality-specific request gate; default accepts everything."""
 
     # ---- the two conversion seams the engine drives ----
     @abstractmethod
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        """Translate a ``RolloutReq`` into the seam's generate calls.
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        """Translate a request ``Sample`` into the seam's generate calls.
 
         Normally one call carrying the whole batch; ``dit_recaption`` returns
         N seeded single-prompt calls.
         """
 
     @abstractmethod
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        """Translate the seam's per-request-grouped results into a ``RolloutResp``."""
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        """Fill the request ``Sample``'s gen Parts from the seam's per-request-grouped results."""
 
 
 __all__ = [

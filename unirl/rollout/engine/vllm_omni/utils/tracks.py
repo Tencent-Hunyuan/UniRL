@@ -1,4 +1,4 @@
-"""Response-side segment / decoded / track-assembly mechanics.
+"""Response-side segment and decoded-output mechanics.
 
 Pure helpers the adapters' ``build_response`` steps call — they operate on
 already-fetched wire data (the seam's :class:`OmniRawResult` protocol;
@@ -9,16 +9,12 @@ trainer-facing types. No runtime import, no engine state.
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
-from unirl.types.conditions import Condition
 from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
-from unirl.types.segments import Segment
 from unirl.types.segments.latent import make_image_segment
 
 
@@ -180,7 +176,7 @@ def build_image_segment(
     - ``sigmas`` from ``trajectory_timesteps`` — the field name reads
       "timesteps" but the ``RL*Pipeline.forward`` overwrites its contents with
       the true [0, 1] σ schedule (``[T+1]``); do not "fix" the misnomer.
-      Verified against ``expected_sigmas`` (the engine-pinned ``req.sigmas``)
+      Verified against ``expected_sigmas`` (the engine-pinned diffusion params)
       via :func:`verify_engine_used_sigmas` so a broken wire surfaces here.
     - ``sde_logp`` from ``trajectory_log_probs`` ``[B, K]`` (K = SDE-gated
       step count; can be < T for sparse SDE, 0 for NFT/forward-process).
@@ -201,7 +197,7 @@ def build_image_segment(
     traj_log_probs: Optional[torch.Tensor] = torch.cat(per_log_probs, dim=0) if per_log_probs else None
     head = diff_outputs[0]
     seg_sigmas = getattr(head, "trajectory_timesteps", None)
-    # Engine→worker→response σ contract: the engine pinned ``req.sigmas``
+    # Engine→worker→response σ contract: the engine pinned ``sampling_params.sigmas``
     # before dispatch, the worker consumed it via ``set_timesteps(sigmas=...)``
     # and echoed the same values back. Assert equality so a broken wire
     # surfaces immediately rather than silently de-syncing replay.
@@ -379,57 +375,11 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
     return TextSegment.pack(
         tokens=tokens_list,
         log_probs=log_probs_list,
+        rollout_log_probs=log_probs_list,
     )
 
 
-# --------------------------------------------------------------------------- #
-# Track assembly — the shared tail of every shape's ``build_response``
-# --------------------------------------------------------------------------- #
-
-
-def assemble_tracks(
-    req: RolloutReq,
-    *,
-    segments_for_track: Dict[str, Segment],
-    decoded_for_track: Dict[str, Optional[Any]],
-    conditions: Dict[str, Condition],
-) -> RolloutResp:
-    """Pack per-track segments/decoded/conditions into a ``RolloutResp``.
-
-    Tracks are one per ``segments_for_track`` key, each carrying its own
-    decoded value (or ``None``). ``conditions`` were resp-wide in the legacy
-    shape; keep that behavior by replicating onto every track (the legacy
-    single-image-track replay is the only consumer today).
-
-    HI3 think_recaption lineage: when both an "image" and an "ar" segment are
-    present the image is generated from the AR output 1-to-1, so
-    ``image.parent_track = "ar"`` with parent_ids aligned to ``ar.sample_ids``;
-    every other track is a root (``parent_ids = req.group_ids``).
-    """
-    sample_ids = list(req.sample_ids)
-    parent_ids = list(req.group_ids)
-    has_ar = "ar" in segments_for_track
-    tracks: Dict[str, RolloutTrack] = {}
-    for track_name, segment in segments_for_track.items():
-        if track_name == "image" and has_ar:
-            parent: Optional[str] = "ar"
-            track_parent_ids = list(sample_ids)
-        else:
-            parent = None
-            track_parent_ids = list(parent_ids)
-        tracks[track_name] = RolloutTrack(
-            sample_ids=list(sample_ids),
-            parent_ids=track_parent_ids,
-            parent_track=parent,
-            conditions=dict(conditions),
-            segment=segment,
-            decoded=decoded_for_track.get(track_name),
-        )
-    return RolloutResp(tracks=tracks)
-
-
 __all__ = [
-    "assemble_tracks",
     "build_ar_segment",
     "build_image_segment",
     "collect_dit_outputs",

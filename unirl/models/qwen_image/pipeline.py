@@ -1,4 +1,4 @@
-"""QwenImagePipeline — RolloutReq → RolloutResp end-to-end for Qwen-Image.
+"""QwenImagePipeline — ``Sample → Sample`` end-to-end for Qwen-Image.
 
 Implements the four-tier flow::
 
@@ -18,11 +18,10 @@ constructs the four stages with the precision policy from the config.
 σ schedule contract
 -------------------
 The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
-``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
-verbatim. The engine builds the policy with
-:meth:`FlowMatchSchedulePolicy.from_pretrained(pretrained_path,
+/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
+``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
+pipeline reads ``params.sigmas`` and uses it verbatim. The engine builds the
+policy with :meth:`FlowMatchSchedulePolicy.from_pretrained(pretrained_path,
 shift=pipeline.shift)`; Qwen-Image's
 ``scheduler/scheduler_config.json`` carries the dynamic-shift block, so
 the policy enables dynamic μ derivation automatically. The pipeline
@@ -37,8 +36,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import QwenImageBundle
@@ -53,23 +51,19 @@ from .vae import QwenImageVAEDecodeStage
 
 
 class QwenImagePipeline(Pipeline):
-    """Qwen-Image generate pipeline.
+    """Qwen-Image generate pipeline: ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked
+    diffusion gen shell carrying ``DiffusionSamplingParams`` (with ``sigmas``
+    pinned by the hosting engine). Reads the prompt via ``sample.conditioning()``
+    and fills the frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`QwenImageDiffusionParams`.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
+    - ``segment: LatentSegment`` — the denoising trajectory.
+    - ``primitives["image"]: Images`` — the decoded images.
 
-    Writes to ``RolloutResp``:
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]: TextEmbedCondition`` when negative
-      prompts were supplied.
-    - ``tracks["image"].segment: LatentSegment``.
-    - ``tracks["image"].decoded: Images``.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay.
+    Sample generation uses the model's default CFG negative; direct callers can
+    pass explicit negatives through :meth:`build_conditions`.
     """
 
     def __init__(
@@ -234,71 +228,68 @@ class QwenImagePipeline(Pipeline):
         is safe there. The empty-negative value is a per-model
         property, not a framework knob — hence hardcoded per pipeline.
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"QwenImagePipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "QwenImagePipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
+            )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[" "] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return QwenImageConditions(text=text_cond, negative_text=negative_text_cond)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run Qwen-Image t2i end-to-end. Requires ``req.sigmas`` to be
-        pinned by the hosting engine adapter."""
-        if req.sigmas is None:
-            raise ValueError(
-                "QwenImagePipeline.generate: req.sigmas is None. The hosting "
-                "engine (Trainside / SGLang / VLLMOmni) must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before "
-                "invoking pipeline.generate; see the σ ownership note in "
-                "unirl.models.types.pipeline."
+    def generate(self, sample: Sample) -> Sample:
+        """Run Qwen-Image t2i end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine (e.g. ``TrainsideRolloutEngine._ensure_sample_sigmas``)
+        before the call; see the σ ownership note in ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"QwenImagePipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
             )
-        texts = req.primitives.get("text")
+        if params.sigmas is None:
+            raise ValueError(
+                "QwenImagePipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"QwenImagePipeline.generate: req.primitives['text'] must be Texts, "
+                f"QwenImagePipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"QwenImagePipeline.generate: negative_text length "
-                f"{len(negatives.texts)} != text length {len(texts.texts)}"
-            )
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-
-        if self.text_embed is None:
-            raise RuntimeError(
-                "QwenImagePipeline.generate: no text_embed stage "
-                "(load_text_encoder=False). The trainer-side pipeline cannot "
-                "encode prompts in this configuration — separate-engine "
-                "recipes encode in the rollout engine; trainside rollout "
-                "requires load_text_encoder=True."
-            )
-        qwen_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
-
-        schedule = req.sigmas.to(self.bundle.device)
+        qwen_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        schedule = params.sigmas.to(self.bundle.device)
 
         # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
         # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
             qwen_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
         images = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=qwen_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=images,
-                ),
-            }
-        )
+        # Fill the frontier shell, carrying the encoded conditions for trainer-side
+        # replay: Part.conditions is the train stack's source (FlowGRPO re-types them
+        # via conditions_cls.from_dict in prepare_segment / compute_loss_and_backward).
+        filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=qwen_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["QwenImagePipeline"]

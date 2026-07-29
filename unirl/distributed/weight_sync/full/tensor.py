@@ -76,11 +76,15 @@ class TensorWeightSync(FullWeightSync):
         use_sglang = "sglang" in rollout_mod and "vllm" not in rollout_mod
         if use_sglang:
             try:
-                from sglang.srt.utils import MultiprocessingSerializer
+                from sglang.srt.utils.common import MultiprocessingSerializer
                 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
                 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-            except ImportError:
-                use_sglang = False
+            except ImportError as exc:
+                raise ImportError(
+                    "TensorWeightSync requires SGLang's native serializer, reductions, "
+                    "and tensor bucket classes for an SGLang rollout; falling back to "
+                    "sgl_compat would produce a SafeUnpickler-incompatible payload."
+                ) from exc
         if not use_sglang:
             from unirl.distributed.weight_sync.transfer.sgl_compat import (
                 FlattenedTensorBucket,

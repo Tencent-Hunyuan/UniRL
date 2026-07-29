@@ -1,21 +1,23 @@
 """``fastvideo`` engine core — in-process FastVideo ``VideoGenerator`` rollout.
 
 Mirrors the ``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` shells:
-``generate`` is ``@distributed(DP_SCATTER)``, pins σ via ``ensure_req_sigmas``,
-optionally chunks by ``forward_batch_size``, and packs one ``RolloutResp`` track
-with a ``LatentSegment`` (trajectory + native per-step log-probs).
+``generate`` is ``@distributed(DP_SCATTER)``, pins σ on the frontier generation
+``Part``, optionally chunks that frontier by ``forward_batch_size``, and fills it
+with a ``LatentSegment`` (trajectory + native per-step log-probs) and decoded
+``Videos``.
 
 The FastVideo-driving logic (VideoGenerator boot, PR #1222 ``ForwardBatch.RLData``
 native-logprob path, transformer hot-swap, sleep/wake) is ported from the proven
-DiffusionRL FastVideo engine; only the typed boundary (RolloutReq/RolloutResp/
-LatentSegment, σ SSOT) is new.
+DiffusionRL FastVideo engine; only the typed boundary (``Sample``/``Part``/
+``LatentSegment``, σ SSOT) is new.
 
 Validated scope:
   * Replay and native modes use the same resolved SDE window; native mode also
     returns FastVideo's transition log-probs for ``old_logp_source=rollout``.
   * x_T SSOT: FastVideo currently regenerates its own initial noise from
-    ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T; wiring the
-    shared x_T into FastVideo byte-for-byte is a follow-up.
+    ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T. Because that
+    seed also drives SDE noise, ``init_same_noise=True`` shares the whole random
+    stream, not only x_T; separate x_T/SDE streams are a follow-up.
   * Local-mode colocate, single model_family (wan2.1) only for now.
 """
 
@@ -25,6 +27,7 @@ import importlib
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -32,14 +35,15 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
 from unirl.sde.noise import _derive_group_seed
-from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_req_sigmas
+from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.conditions import TextEmbedCondition
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, Video, Videos
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Part, Sample
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import make_video_segment
 
 logger = logging.getLogger(__name__)
@@ -61,7 +65,7 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List
     return selected, selected
 
 
-class FastVideoRolloutEngine(BaseRolloutEngine):
+class FastVideoRolloutEngine(BaseSingleTurnRolloutEngine):
     """Rollout engine backed by FastVideo ``VideoGenerator`` (RL fork, PR #1222)."""
 
     _component_name = "fastvideo"
@@ -106,7 +110,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._build_generator()
 
         # σ SSOT: same schedule policy the trainer/replay uses, so the engine can
-        # pin req.sigmas and FastVideo consumes that exact schedule.
+        # pin the frontier's diffusion.sigmas and FastVideo consumes it exactly.
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
             model_config.pretrained_model_ckpt_path,
             shift=float(model_config.shift),
@@ -119,6 +123,16 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             config.native_logprob,
             ports.master_port,
         )
+
+        # ``VideoGenerator`` is synchronous and not request-concurrent-safe.
+        # Match the other dedicated single-turn engines: serialize generation,
+        # make shutdown idempotent, and stamp every filled frontier with the
+        # successfully loaded policy-weight version.
+        self._weight_version = 0
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
 
     # ------------------------------------------------------------------ #
     # FastVideo import + VideoGenerator boot (ported from DiffusionRL)
@@ -192,13 +206,30 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
     # Generation
     # ------------------------------------------------------------------ #
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole DP shard synchronously."""
+        return self._generate_locked(sample)
+
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("FastVideoRolloutEngine.generate called after shutdown")
+            return self._stamp_weight_version(self._generate_core(sample))
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Generate and fill the frontier diffusion Part."""
         require(
-            int(req.batch_size) > 0,
-            "FastVideoRolloutEngine.generate requires a non-empty req (batch_size > 0)",
+            not self._is_offloaded and self._generator is not None,
+            "FastVideoRolloutEngine.generate: engine is offloaded (wake_up first).",
         )
-        # σ SSOT: pin once on the full batch (shared field, survives req.slice).
-        ensure_req_sigmas(req, self.schedule_policy)
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
+        require(
+            int(gen.batch_size) > 0,
+            "FastVideoRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
+        )
+        # σ SSOT: pin once on the frontier's shared sampling_params. Frontier
+        # slices preserve that shared object, so every chunk sees one schedule.
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
         # ``forward_batch_size`` here is a CHUNKING cadence, NOT a GPU batch size:
         # ``_drive_fastvideo`` runs FastVideo one video at a time (per-sample seeds
@@ -207,41 +238,47 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # (trajectory/decoded tensors, already on CPU) accumulate before a concat +
         # ``empty_cache``. Leave it None to run the whole shard in one go.
         fbs = self.cfg.forward_batch_size
-        bs = int(req.batch_size)
+        bs = int(gen.batch_size)
         if fbs is None or bs <= fbs:
-            return self._generate_batch(req)
+            return self._generate_batch(sample)
 
-        outputs: List[RolloutResp] = []
+        # Slice only the frontier. The ancestor input Part(s) stay whole so
+        # ``Sample.text_conditioning`` can project them onto each chunk's ids.
+        gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
-            outputs.append(self._generate_batch(req.slice(start, end)))
+            chunk = self._generate_batch(sample.replace_frontier(gen.slice(start, end)))
+            gen_chunks.append(chunk.frontier_gen_part(DiffusionSamplingParams))
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        return RolloutResp.concat(outputs)
+        return sample.replace_frontier(Part.concat(gen_chunks))
 
-    def _generate_batch(self, req: RolloutReq) -> RolloutResp:
-        text_primitive = req.primitives.get("text")
+    def _generate_batch(self, sample: Sample) -> Sample:
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
+        turns = sample.text_conditioning()
         require(
-            text_primitive is not None and isinstance(text_primitive, Texts),
-            f"fastvideo engine requires req.primitives['text']: Texts; "
-            f"got {type(text_primitive).__name__ if text_primitive is not None else 'None'}",
+            len(turns) == 1 and isinstance(turns[0].content, Texts),
+            "fastvideo engine requires exactly one frontier-aligned text conditioning turn; "
+            f"got {[type(turn.content).__name__ for turn in turns]}",
         )
+        text_primitive = turns[0].content
         prompts = list(text_primitive.texts)
         require(
-            len(prompts) == int(req.batch_size),
-            f"fastvideo engine expects req.primitives['text'] of len batch_size; "
-            f"got {len(prompts)} vs {int(req.batch_size)}",
+            len(prompts) == int(gen.batch_size),
+            "fastvideo engine expects frontier-aligned text of len gen.batch_size; "
+            f"got {len(prompts)} vs {int(gen.batch_size)}",
         )
-        params = req.sampling_params.get("diffusion")
+        params = gen.sampling_params
         require(
-            params is not None,
-            "fastvideo engine requires req.sampling_params['diffusion']",
+            isinstance(params, DiffusionSamplingParams),
+            "fastvideo engine requires DiffusionSamplingParams on the frontier gen Part",
         )
-        seeds = self._per_sample_seeds(req, params)
-        raw = self._drive_fastvideo(prompts, params, req.sigmas, seeds)
-        return self._build_resp(req, params, raw)
+        require(params.sigmas is not None, "fastvideo engine requires engine-pinned diffusion.sigmas")
+        seeds = self._per_sample_seeds(sample, params)
+        raw = self._drive_fastvideo(prompts, params, params.sigmas, seeds)
+        return self._build_response(sample, params, raw)
 
-    def _per_sample_seeds(self, req: RolloutReq, params: Any) -> List[int]:
+    def _per_sample_seeds(self, sample: Sample, params: DiffusionSamplingParams) -> List[int]:
         """Per-sample seeds so sibling samples of one prompt diverge.
 
         Without this every sample of a prompt shared ``params.seed`` → identical
@@ -249,18 +286,20 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         the seed the same way the driver keys x_T (``_derive_group_seed``):
         per-sample ids when ``init_same_noise`` is false (siblings differ),
         per-group ids when true (siblings share). Prefer the driver's
-        ``init_noise_group_ids`` (carries rollout id + same/diff policy); fall
-        back to sample/group ids, then to the flat seed.
-        NOTE: this only decorrelates siblings; full driver-authoritative x_T SSOT
-        (byte-identical to other engines via ``regen_initial_noise``) is a
-        separate follow-up.
+        normalized ``NoiseRecipe`` keys (carry rollout id + same/diff policy);
+        fall back to frontier sample/group ids, then to the flat seed.
+        NOTE: FastVideo uses this one seed for x_T and per-step SDE noise. Thus
+        ``init_same_noise=True`` shares the entire stream across siblings rather
+        than only x_T. Full driver-authoritative x_T plus a sample-specific SDE
+        stream is a separate follow-up.
         """
-        bs = int(req.batch_size)
-        base_seed = int(params.seed)
-        keys = getattr(req, "init_noise_group_ids", None)
+        gen = sample.frontier_gen_part(DiffusionSamplingParams)
+        bs = int(gen.batch_size)
+        base_seed = int(params.seed) if params.seed is not None else 0
+        keys = NoiseRecipe.from_sample(sample).noise_group_ids
         if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
             same = bool(getattr(params, "init_same_noise", False))
-            keys = list(req.group_ids) if same else list(req.sample_ids)
+            keys = list(gen.group_ids) if same else list(gen.sample_ids)
         if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
             return [base_seed] * bs
         return [_derive_group_seed(base_seed, str(k)) for k in keys]
@@ -288,7 +327,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.num_frames = int(params.num_frames)
         sp.num_inference_steps = int(params.num_inference_steps)
         sp.guidance_scale = float(params.guidance_scale)
-        sp.seed = int(params.seed)  # per-sample override applied in the loop below
+        sp.seed = int(params.seed) if params.seed is not None else 0  # per-sample override applied below
         sp.num_videos_per_prompt = 1
         sp.save_video = False
         sp.return_frames = False
@@ -297,15 +336,15 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # throughout denoising and then copies it to CPU again.
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
-        # σ SSOT — AVOID the double-shift bug. ``req.sigmas`` is ALREADY the
+        # σ SSOT — AVOID the double-shift bug. ``diffusion.sigmas`` is ALREADY the
         # shift-applied flow-match schedule (σ = shift·t/(1+(shift-1)·t)), but
         # FastVideo's FlowMatchEulerDiscreteScheduler.set_timesteps re-applies
         # the SAME shift to whatever sigmas we hand it (no guard). Feeding
-        # req.sigmas directly makes FastVideo denoise on a *doubly*-shifted grid
+        # diffusion.sigmas directly makes FastVideo denoise on a *doubly*-shifted grid
         # while the trainer replays on the single-shift grid — the trajectory's
         # true noise level then mismatches the σ used to score its log-prob,
         # corrupting the GRPO gradient. So hand FastVideo the shift PRE-IMAGE g,
-        # for which FastVideo's own shift reproduces req.sigmas exactly:
+        # for which FastVideo's own shift reproduces diffusion.sigmas exactly:
         #     g = s / (shift - s·(shift-1))   ⇒   shift·g/(1+(shift-1)·g) == s
         # (valid because FastVideo's WAN flow_shift == model_config.shift). Drop
         # the terminal 0 — FastVideo appends its own endpoint.
@@ -370,7 +409,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             all_traj.append(traj.detach().cpu())
             # Decoded pixels: the FastVideo pipeline's DecodingStage writes the
             # final video to batch.output as [B, C, T, H, W] in [0, 1] (float32,
-            # CPU). The reward path needs this as track.decoded (Videos).
+            # CPU). The reward path consumes it from the frontier's "video" primitive.
             dec = getattr(out, "output", None)
             require(torch.is_tensor(dec), "FastVideo returned no decoded output (batch.output)")
             if dec.dim() == 4:
@@ -427,20 +466,19 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "neg_masks": all_neg_masks,
         }
 
-    def _build_resp(self, req: RolloutReq, params: Any, raw: Dict[str, Any]) -> RolloutResp:
-        segment = self._build_segment(req, params, raw)
+    def _build_response(
+        self,
+        sample: Sample,
+        params: DiffusionSamplingParams,
+        raw: Dict[str, Any],
+    ) -> Sample:
+        segment = self._build_segment(params, raw)
         decoded = self._build_decoded(raw)
         conditions = self._build_conditions(raw)
-        return RolloutResp(
-            tracks={
-                "video": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conditions,
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
+        return sample.with_filled_frontier(
+            segment=segment,
+            primitives={"video": decoded},
+            conditions=conditions,
         )
 
     def _build_conditions(self, raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -489,7 +527,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         videos = [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(frames.shape[0]))]
         return Videos.from_list(videos)
 
-    def _build_segment(self, req: RolloutReq, params: Any, raw: Dict[str, Any]):
+    def _build_segment(self, params: DiffusionSamplingParams, raw: Dict[str, Any]):
         traj = raw["trajectory"]  # [B, T+1, C, T_lat, H, W]
         device = traj.device
         T = int(traj.shape[1]) - 1
@@ -515,7 +553,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         return make_video_segment(
             latents=traj,
-            sigmas=req.sigmas,
+            sigmas=params.sigmas,
             indices=indices,
             sde_logp=sde_logp,
             sde_indices=sde_indices,
@@ -526,18 +564,26 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------ #
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        if self._is_offloaded:
-            return
-        if self._generator is not None:
-            try:
-                self._generator.shutdown()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("fastvideo sleep/shutdown warning: %s", exc)
-            self._generator = None
-        self._is_offloaded = True
+        with self._generate_lock:
+            if self._shutdown_requested or self._is_offloaded:
+                return
+            if self._generator is not None:
+                try:
+                    self._generator.shutdown()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("fastvideo sleep/shutdown warning: %s", exc)
+                self._generator = None
+            self._is_offloaded = True
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("FastVideoRolloutEngine.wake_up called after shutdown")
+            self._wake_up_locked()
+
+    def _wake_up_locked(self) -> None:
+        """Rebuild and restore the generator while ``_generate_lock`` is held."""
         if not self._is_offloaded:
             return
         from fastvideo import VideoGenerator
@@ -598,9 +644,20 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self.wake_up()
 
     def shutdown(self) -> None:
-        if self._generator is not None:
-            self._generator.shutdown()
-            self._generator = None
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            # First wait for an active generation and close admission. A caller
+            # already queued on ``_generate_lock`` will then fail the shutdown
+            # guard rather than entering FastVideo during teardown.
+            with self._generate_lock:
+                self._shutdown_requested = True
+            with self._generate_lock:
+                if self._generator is not None:
+                    self._generator.shutdown()
+                    self._generator = None
+                self._is_offloaded = True
+            self._shutdown_complete = True
 
     # ------------------------------------------------------------------ #
     # Weight sync — checkpoint_path (full-param hot-swap). Reached per worker
@@ -608,12 +665,18 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
     # ------------------------------------------------------------------ #
     def update_weights_from_path(self, checkpoint_path: str, *, track_prefix: str = "") -> None:
         del track_prefix
-        require(bool(checkpoint_path), "update_weights_from_path requires a non-empty path")
-        require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
-        self._generator.update_transformer_weights_from_path(checkpoint_path)
-        # Remember it so ``wake_up`` can re-apply after a rebuild (see wake_up).
-        self._last_weights_path = checkpoint_path
-        logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("FastVideoRolloutEngine.update_weights_from_path called after shutdown")
+            require(bool(checkpoint_path), "update_weights_from_path requires a non-empty path")
+            require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
+            self._generator.update_transformer_weights_from_path(checkpoint_path)
+            # Only a successful load changes either provenance field. Remember the
+            # path so ``wake_up`` can re-apply after a rebuild, then bump the version
+            # stamped onto subsequently generated Parts.
+            self._last_weights_path = checkpoint_path
+            self._weight_version += 1
+            logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 
 __all__ = ["FastVideoRolloutEngine"]

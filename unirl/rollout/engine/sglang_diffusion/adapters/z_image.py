@@ -37,7 +37,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _to_image_form_trajectory(traj: torch.Tensor) -> torch.Tensor:
@@ -79,7 +80,7 @@ class ZImageAdapter(ImageAdapter):
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -95,7 +96,7 @@ class ZImageAdapter(ImageAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
