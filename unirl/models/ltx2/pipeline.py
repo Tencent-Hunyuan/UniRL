@@ -316,6 +316,8 @@ class LTX2Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
+            denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
+            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
         )
 
         # 6. Unpack + denormalize → 5D latents → VAE decode → video frames.

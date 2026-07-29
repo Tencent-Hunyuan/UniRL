@@ -539,10 +539,11 @@ class DiffusionTrainer(BaseTrainer):
         All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
         returns ``eval/reward``.
 
-        ``sync_weights=False`` evaluates the policy already resident in the
-        rollout engine without changing its weight version. ``sleep_after=False``
-        leaves a dedicated rollout engine resident after evaluation. The defaults
-        preserve the synchronous trainer's existing behavior.
+        ``sync_weights=False`` evaluates the policy already resident in the rollout
+        engine without changing its weight version, and ``sleep_after=False`` leaves
+        a dedicated engine resident afterwards — what the async trainer needs so
+        evaluation does not perturb its pipeline. The defaults preserve the
+        synchronous trainer's existing behavior.
         """
         # Override only the "diffusion" entry of the modality-keyed sampling dict
         # (mirrors the AR trainer's evaluate()). ``cfg_text_scale`` only exists

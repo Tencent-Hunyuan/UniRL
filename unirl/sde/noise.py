@@ -75,6 +75,39 @@ def _derive_group_seed(base_seed: int, group_id: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=False) % (MAX_TORCH_SEED + 1)
 
 
+def derive_denoise_step_seed(base_seed: int, step_index: int, sample_id: str) -> int:
+    """Derive the cross-engine per-sample, per-step SDE-noise seed."""
+    payload = (f"{int(base_seed)}::step::{int(step_index)}::sample::{str(sample_id)}").encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    # Match the SGLang rollout contract exactly.
+    return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
+
+
+def make_denoise_step_generators(
+    *,
+    base_seed: int,
+    step_index: int,
+    sample_ids: List[str],
+) -> List[torch.Generator]:
+    """Build deterministic CPU generators for one SDE transition.
+
+    CPU generation keeps the random values independent of GPU architecture and
+    byte-identical between trainside and SGLang for the same seed tuple.
+    """
+    generators: List[torch.Generator] = []
+    for sample_id in sample_ids:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            derive_denoise_step_seed(
+                base_seed=int(base_seed),
+                step_index=int(step_index),
+                sample_id=str(sample_id),
+            )
+        )
+        generators.append(generator)
+    return generators
+
+
 def generate_shared_noise(
     batch_size: int,
     latent_shape: Tuple[int, ...],

@@ -63,9 +63,11 @@ class RawResult(Protocol):
     trajectory_log_probs: Optional["torch.Tensor"]
     samples: MediaPayload
     prompt_embeds: EncoderOutputs
+    audio_prompt_embeds: EncoderOutputs
     pooled_prompt_embeds: EncoderOutputs
     encoder_attention_mask: EncoderOutputs
     negative_prompt_embeds: EncoderOutputs
+    negative_audio_prompt_embeds: EncoderOutputs
     neg_pooled_prompt_embeds: EncoderOutputs
     #: Mask paired with ``negative_prompt_embeds`` — variable-length encoders
     #: (Qwen-VL) require it for mask-consuming replay conditioning.

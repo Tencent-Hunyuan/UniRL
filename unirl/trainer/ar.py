@@ -2,7 +2,7 @@ import inspect
 import logging
 import math
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Dict, Iterator, Optional, Tuple
 
 import torch
@@ -15,9 +15,15 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.utils.graceful_shutdown import run_with_timeout
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+#: Generous enough for a healthy engine — a TP group tearing down NCCL and its
+#: CUDA contexts takes tens of seconds — while still bounded well under the
+#: driver's own hard deadline so the pool teardown that follows gets to run.
+_ROLLOUT_SHUTDOWN_TIMEOUT_S = 60.0
 
 
 class ARTrainer(BaseTrainer):
@@ -389,49 +395,68 @@ class ARTrainer(BaseTrainer):
         # TODO: The anchored branch is temporarily migrated from unified models;
         # replace it with first-class TP/DP/PP support.
 
+        logger.info(
+            "EVAL rollout %d starting: max_prompts=%s batch_size=%d samples_per_prompt=%d temperature=%s anchored=%s",
+            rollout_id + 1,
+            "all" if self.eval_num_prompts < 0 else self.eval_num_prompts,
+            self.eval_batch_size,
+            self.eval_samples_per_prompt,
+            self.eval_temperature,
+            anchored,
+        )
         if not anchored:
             self.rollout.wake_up()
             if self.weight_sync is not None:
                 self.weight_sync.sync()
-        sync_anchored_weights = anchored and self.weight_sync is not None
+        # Anchored eval keeps FSDP offloaded and vLLM awake for the entire eval
+        # set. Training still uses one _anchored_rollout_session per rollout in
+        # train_step(), so its sleep/wake and onload/offload lifecycle is unchanged.
+        eval_session = (
+            self._anchored_rollout_session(
+                sync_weights=self.weight_sync is not None,
+                restore_backend=False,
+            )
+            if anchored
+            else nullcontext()
+        )
         try:
-            for eval_inputs in eval_batches:
-                real_prompt_n = eval_inputs.batch_size
-                batch_n += 1
-                prompt_n += real_prompt_n
-                dispatch_inputs = self._pad_eval_inputs(eval_inputs)
-                sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
-                if anchored:
-                    # Keep the manual FSDP state offloaded throughout eval and
-                    # release the TP engine between batches. Only the first
-                    # batch needs an adapter extract/push.
-                    with self._anchored_rollout_session(
-                        sync_weights=sync_anchored_weights,
-                        restore_backend=False,
-                    ):
-                        sync_anchored_weights = False
+            with eval_session:
+                for eval_inputs in eval_batches:
+                    batch_n += 1
+                    real_prompt_n = eval_inputs.batch_size
+                    prompt_n += real_prompt_n
+                    dispatch_inputs = self._pad_eval_inputs(eval_inputs)
+                    sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
+                    if anchored:
                         generated = self.rollout.generate(sample)
                         # DP_SCATTER reward scoring requires materialized tensors.
                         from unirl.trainer.unified_model import deep_hydrate
 
                         generated = deep_hydrate(generated)
-                else:
-                    generated = self.rollout.generate(sample)
-                scored = self.reward.score_and_attach(generated)
-                rewards = scored.parts[-1].rewards
-                if rewards is not None:
-                    rewards = hydrate(rewards).to(torch.float32)
-                    fanout = total_samples_per_prompt(eval_sp)
-                    expected_total = dispatch_inputs.batch_size * fanout
-                    if int(rewards.numel()) != expected_total:
-                        raise RuntimeError(
-                            f"ARTrainer.evaluate: reward count {int(rewards.numel())} != "
-                            f"dispatch prompts {dispatch_inputs.batch_size} * fanout {fanout} "
-                            f"({expected_total})."
-                        )
-                    rewards = rewards[: real_prompt_n * fanout]
-                    reward_sum += float(rewards.sum().item())
-                    reward_n += int(rewards.numel())
+                    else:
+                        generated = self.rollout.generate(sample)
+                    scored = self.reward.score_and_attach(generated)
+                    rewards = scored.parts[-1].rewards
+                    if rewards is not None:
+                        rewards = hydrate(rewards).to(torch.float32)
+                        fanout = total_samples_per_prompt(eval_sp)
+                        expected_total = dispatch_inputs.batch_size * fanout
+                        if int(rewards.numel()) != expected_total:
+                            raise RuntimeError(
+                                f"ARTrainer.evaluate: reward count {int(rewards.numel())} != "
+                                f"dispatch prompts {dispatch_inputs.batch_size} * fanout {fanout} "
+                                f"({expected_total})."
+                            )
+                        rewards = rewards[: real_prompt_n * fanout]
+                        reward_sum += float(rewards.sum().item())
+                        reward_n += int(rewards.numel())
+                    logger.info(
+                        "EVAL rollout %d progress: batch=%d prompts=%d samples=%d",
+                        rollout_id + 1,
+                        batch_n,
+                        prompt_n,
+                        reward_n,
+                    )
         finally:
             if not anchored:
                 self.rollout.sleep()
@@ -606,15 +631,31 @@ class ARTrainer(BaseTrainer):
             finally:
                 self._shutdown_runtime()
 
+    def shutdown(self) -> None:
+        """Release every runtime resource this trainer owns. Idempotent.
+
+        Public entry point for callers outside the training loop — notably the
+        driver's signal handler, which can fire before ``train()`` is reached
+        or while its own ``finally`` is already running.
+        """
+        self._shutdown_runtime()
+
     def _shutdown_runtime(self) -> None:
         """Best-effort ordered teardown for rollout children and Ray actors."""
+        # train()'s finally and the entrypoint's teardown both land here; the
+        # second pass must not re-enter shutdown on already-dead Ray actors.
+        if getattr(self, "_runtime_shutdown_done", False):
+            return
+        self._runtime_shutdown_done = True
+
         rollout = getattr(self, "rollout", None)
         shutdown = getattr(rollout, "shutdown", None)
         if callable(shutdown):
-            try:
-                shutdown()
-            except Exception:
-                logger.exception("Failed to shut down AR rollout engine")
+            # Bounded: this is a blocking call into a single-threaded Ray actor,
+            # so it queues behind whatever that actor is still doing. An engine
+            # wedged mid-generate would otherwise keep us out of pool.shutdown()
+            # indefinitely — and that is the step that frees the GPUs.
+            run_with_timeout(shutdown, timeout=_ROLLOUT_SHUTDOWN_TIMEOUT_S, what="AR rollout engine shutdown")
 
         pool = getattr(self, "pool", None)
         if pool is not None:

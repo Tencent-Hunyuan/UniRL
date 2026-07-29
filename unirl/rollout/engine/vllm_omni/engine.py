@@ -23,6 +23,7 @@ worker partitions.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,8 @@ from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmni
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
 from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.sample import Sample
+
+logger = logging.getLogger(__name__)
 
 
 class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
@@ -55,6 +58,13 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
         self.cfg = config
+        # Initialize lifecycle state before any fallible construction so worker
+        # teardown can safely sweep a role whose adapter or backend boot failed.
+        self._weight_version = 0
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
         # Carried for subclass / extension use; the synchronous Omni
         # entrypoint does not consume them directly.
         self.device = device
@@ -62,6 +72,12 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        logger.info(
+            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            config,
+            model_config is not None,
+            model_config,
+        )
 
         # Adapter (the only read of the modality knob) — owns the conversion,
         # topology knobs, and the σ schedule. ``tokenize_fn`` is late-bound to
@@ -98,14 +114,6 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
-
-        # The Omni orchestrator is synchronous and not request-concurrent-safe;
-        # the lock serializes concurrent generate callers.
-        self._weight_version = 0
-        self._generate_lock = threading.Lock()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_requested = False
-        self._shutdown_complete = False
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
@@ -208,13 +216,33 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        with self._shutdown_lock:
-            if self._shutdown_complete:
+        # Reachable on a partially constructed role: Worker.teardown sweeps
+        # every role it holds, including one whose __init__ raised before the
+        # backend was attached.
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            backend = getattr(self, "_backend", None)
+            if backend is not None:
+                backend.shutdown()
+            return
+
+        with shutdown_lock:
+            if getattr(self, "_shutdown_complete", False):
                 return
-            with self._generate_lock:
+
+            generate_lock = getattr(self, "_generate_lock", None)
+            if generate_lock is None:
                 self._shutdown_requested = True
-            with self._generate_lock:
-                self._backend.shutdown()
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    backend.shutdown()
+            else:
+                with generate_lock:
+                    self._shutdown_requested = True
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    with generate_lock:
+                        backend.shutdown()
             self._shutdown_complete = True
 
     # ------------------------------------------------------------------ #
