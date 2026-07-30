@@ -16,6 +16,7 @@ PlacementGroup bundles reserve CPU quota for all slots upfront.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import ray
@@ -27,6 +28,11 @@ from unirl.distributed.group.worker import Worker
 from unirl.distributed.utils import get_node_ip_and_port
 
 logger = logging.getLogger(__name__)
+
+#: Shared budget for asking every worker to close its roles. Sized for an
+#: engine shutdown that is merely slow, not for one that is wedged — a wedged
+#: actor is what ray.kill is for.
+_ROLE_TEARDOWN_TIMEOUT_S = 45.0
 
 
 class DevicePool:
@@ -428,7 +434,8 @@ class DevicePool:
         )
 
     def shutdown(self) -> None:
-        """Kill all Worker actors and remove PlacementGroups."""
+        """Release roles, then kill all Worker actors and remove PlacementGroups."""
+        self._release_roles()
         for tw in self._tw_by_device.values():
             ray.kill(tw, no_restart=True)
         for w in self._worker_by_id.values():
@@ -449,3 +456,27 @@ class DevicePool:
         for pg in self._pgs:
             ray.util.remove_placement_group(pg)
         self._pgs = []
+
+    def _release_roles(self) -> None:
+        """Give every worker a chance to close its roles before we kill it.
+
+        ``ray.kill`` is a SIGKILL — no ``finally``, no destructors. A role
+        holding an inference engine needs to be asked first, or its subprocess
+        tree is orphaned still holding device memory.
+
+        One deadline is shared across all workers rather than applied per
+        worker: they are torn down for the same reason at the same time, and a
+        per-worker timeout would multiply by the pool size in exactly the case
+        that matters (everything wedged at once).
+        """
+        if not self._worker_by_id:
+            return
+        pending = {wid: w.teardown.remote() for wid, w in self._worker_by_id.items()}
+        deadline = time.monotonic() + _ROLE_TEARDOWN_TIMEOUT_S
+        for wid, ref in pending.items():
+            try:
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                # Expected when an actor is stuck in a long call: Ray actors are
+                # single-threaded, so teardown queues behind it. ray.kill next.
+                logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)

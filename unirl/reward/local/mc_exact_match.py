@@ -14,7 +14,7 @@ from .base import LocalRewardBackend
 _ANSWER_TAG = re.compile(r"<answer>\s*([A-D])\s*</answer>", re.IGNORECASE)
 
 _ANSWER_PATTERN = re.compile(
-    r"(?:(?:answer|option)\s*(?:is|:)\s*)\(?([A-D])\)?",
+    r"(?:(?:answer|option)\s*(?:is|:)\s*)[\(\[]?\s*([A-D])\s*[\)\]]?",
     re.IGNORECASE,
 )
 
@@ -37,16 +37,21 @@ def _normalize_answer(answer: str) -> str:
     return a  # fallback
 
 
-def _extract_answer_letter(text: str) -> str:
+def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
     text = text.strip()
+    tag_matches = _ANSWER_TAG.findall(text)
+    if tag_matches:
+        return tag_matches[-1].upper()
+    phrase_matches = _ANSWER_PATTERN.findall(text)
+    if require_phrase:
+        return phrase_matches[-1].upper() if phrase_matches else ""
     # Handle numeric answers: "1"→"A", "2"→"B", "3"→"C", "4"→"D"
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1"))
     if len(text) == 1 and text.upper() in "ABCD":
         return text.upper()
-    match = _ANSWER_PATTERN.search(text)
-    if match:
-        return match.group(1).upper()
+    if phrase_matches:
+        return phrase_matches[-1].upper()
     matches = _STANDALONE_LETTER.findall(text)
     if matches:
         return matches[-1].upper()
@@ -62,9 +67,9 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
     if tag_matches:
         return tag_matches[-1].upper(), 1.0
 
-    m = _ANSWER_PATTERN.search(text)
-    if m:
-        return m.group(1).upper(), 0.5
+    phrase_matches = _ANSWER_PATTERN.findall(text)
+    if phrase_matches:
+        return phrase_matches[-1].upper(), 0.5
 
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1")), 0.5
@@ -94,6 +99,7 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
         super().__init__()
         self.graded_format_reward = bool(getattr(config, "graded_format_reward", False))
         self.require_answer_tag = bool(getattr(config, "require_answer_tag", False))
+        self.require_answer_phrase = bool(getattr(config, "require_answer_phrase", False))
 
     def _load_model(self) -> None:
         self.model = "mc_exact_match"
@@ -116,7 +122,7 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
                 predicted, fmt_weight = _extract_answer_letter_graded(text)
                 rewards.append(fmt_weight if predicted == gt else 0.0)
             else:
-                predicted = _extract_answer_letter(text)
+                predicted = _extract_answer_letter(text, require_phrase=self.require_answer_phrase)
                 rewards.append(1.0 if predicted == gt else 0.0)
 
         return rewards
@@ -128,7 +134,12 @@ class MCExactMatchSpec(BaseRewardComponentSpec):
 
     graded_format_reward: bool = False
     require_answer_tag: bool = False
+    require_answer_phrase: bool = False
 
     def __post_init__(self) -> None:
-        if self.graded_format_reward and self.require_answer_tag:
-            raise ValueError("MCExactMatchSpec graded_format_reward and require_answer_tag are mutually exclusive")
+        enabled = sum((self.graded_format_reward, self.require_answer_tag, self.require_answer_phrase))
+        if enabled > 1:
+            raise ValueError(
+                "MCExactMatchSpec graded_format_reward, require_answer_tag, "
+                "and require_answer_phrase are mutually exclusive"
+            )

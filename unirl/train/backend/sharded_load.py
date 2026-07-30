@@ -21,12 +21,15 @@ import glob
 import logging
 import os
 import re
+from fnmatch import fnmatchcase
 from typing import Dict
 
 import torch
 from torch import nn
 
 from unirl.train.backend.sharded_state import _build_state_dict_options, _current_rank
+from unirl.train.backend.veomni.ep.models.qwen3_moe import build_local_fused_block
+from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +130,252 @@ def load_sharded(
     common path for single-module trainables whose weights live in a dedicated
     directory (diffusion ``<ckpt>/transformer``, AR ``<ckpt>`` root).
     """
+    # Expert-parallel models shard stacked expert weights on a 2D composed mesh
+    # (``ep_fsdp x ep``); torch's rank-0-broadcast loader mis-slices that layout.
+    # Each rank reads ONLY its own expert block from the (local) safetensors via
+    # mmap'd ``get_slice`` and uses DTensor-native ``distribute_tensor`` to fill
+    # its exact local shard. Non-EP models keep the rank-0-broadcast path verbatim.
+    if hasattr(module, "_extra_parallel_param_groups"):
+        if _module_has_meta_param(module):
+            module.to_empty(device=device)
+        _load_state_dict_ep_sliced(module, weights_dir, device=device, strict=strict)
+        return
+
     state_dict = _read_safetensors_dir(weights_dir) if _current_rank() == 0 else {}
     _load_state_dict_sharded(module, state_dict, device=device, strict=strict)
+
+
+def _ep_shard_dims_from_plan(module: nn.Module) -> Dict[str, int]:
+    """Resolve each EP parameter's pre-sliced axis from VeOmni's parallel plan.
+
+    VeOmni records the plan after wildcard resolution in ``_fqn2spec_info``.
+    The ``get_parallel_plan`` fallback keeps this usable with older releases
+    that expose only the original pattern map.
+    """
+    named_ep = dict(ep_named_parameters(module))
+    if not named_ep:
+        return {}
+
+    resolved: Dict[str, int] = {}
+    spec_by_fqn = getattr(module, "_fqn2spec_info", None) or {}
+    for name, param in named_ep.items():
+        spec = spec_by_fqn.get(name)
+        if spec is None or getattr(spec, "para_name", None) != "ep":
+            continue
+        dim = getattr(getattr(spec, "placement", None), "dim", None)
+        if dim is not None:
+            resolved[name] = _validate_ep_shard_dim(name, int(dim), param)
+
+    missing = [name for name in named_ep if name not in resolved]
+    if missing:
+        get_plan = getattr(module, "get_parallel_plan", None)
+        if callable(get_plan):
+            plan = get_plan()
+            ep_plan = getattr(plan, "extra_parallel_plan", {}).get("ep", {})
+            for name in missing:
+                matches = [
+                    int(placement.dim)
+                    for pattern, placement in ep_plan.items()
+                    if hasattr(placement, "dim") and fnmatchcase(name, pattern)
+                ]
+                if len(set(matches)) > 1:
+                    raise RuntimeError(f"EP load: conflicting shard dims for {name!r}: {matches}.")
+                if matches:
+                    resolved[name] = _validate_ep_shard_dim(name, matches[0], named_ep[name])
+
+    unresolved = [name for name in named_ep if name not in resolved]
+    if unresolved:
+        raise RuntimeError(
+            "EP load: parallel plan does not declare a Shard placement for "
+            f"{len(unresolved)} EP parameter(s): {unresolved[:8]}."
+        )
+    return resolved
+
+
+def _read_ep_checkpoint_block(
+    tensor_slice,
+    *,
+    name: str,
+    ckpt_shape: tuple,
+    global_shape: tuple,
+    ep_size: int,
+    ep_rank: int,
+    ep_dim: int | None,
+) -> torch.Tensor:
+    """Read one parameter, slicing only the axis declared by the EP plan."""
+    if ep_dim is not None and ep_size > 1:
+        expected = list(global_shape)
+        expected[ep_dim] *= ep_size
+        expected_shape = tuple(expected)
+        if ckpt_shape == global_shape:
+            raise RuntimeError(
+                f"EP load: {name!r} contains only one pre-sliced EP block "
+                f"{ckpt_shape}; expected full checkpoint shape {expected_shape}."
+            )
+        if ckpt_shape != expected_shape:
+            raise RuntimeError(
+                f"EP load: EP param {name!r} shape mismatch: checkpoint "
+                f"{ckpt_shape} vs plan-declared full shape {expected_shape} "
+                f"(Shard({ep_dim}), local global shape {global_shape})."
+            )
+        width = global_shape[ep_dim]
+        index = [slice(None)] * len(global_shape)
+        index[ep_dim] = slice(ep_rank * width, (ep_rank + 1) * width)
+        block = tensor_slice[tuple(index)]
+        if tuple(block.shape) != global_shape:
+            raise RuntimeError(f"EP load: sliced {name!r} to {tuple(block.shape)} != {global_shape}.")
+        return block
+
+    if ckpt_shape != global_shape:
+        raise RuntimeError(
+            f"EP load: shape mismatch for non-EP param {name!r}: checkpoint {ckpt_shape} vs global {global_shape}."
+        )
+    return tensor_slice[:]
+
+
+def _validate_ep_shard_dim(name: str, dim: int, param: nn.Parameter) -> int:
+    if dim < 0:
+        dim += param.ndim
+    if dim < 0 or dim >= param.ndim:
+        raise RuntimeError(
+            f"EP load: parallel plan declares invalid Shard({dim}) for {name!r} shape {tuple(param.shape)}."
+        )
+    return dim
+
+
+def _load_state_dict_ep_sliced(
+    module: nn.Module,
+    weights_dir: str,
+    *,
+    device: torch.device,
+    strict: bool = False,
+) -> None:
+    """Memory-optimal EP weight load: each rank reads ONLY its expert block.
+
+    The EP plan pre-slices each expert param along its declared ``Shard(dim)``
+    (dim 0 / the expert axis for Qwen3-MoE), so the DTensor's GLOBAL shape is
+    already ``[E/ep, …]``: the ``ep`` split is baked in per rank, NOT a DTensor
+    placement. The checkpoint stores the full ``[E, …]``. Instead of
+    materializing the full tensor on every rank (8x host
+    RAM) or broadcasting it from rank 0 (rank-0 full-RAM bottleneck), we
+    ``safetensors.get_slice`` the file (mmap, lazy) and index **only this ep
+    rank's contiguous ``[E/ep, …]`` byte range** — no rank ever holds the full
+    ``[E, …]`` and there is no cross-rank broadcast. ``distribute_tensor`` then
+    shards that block across the remaining ``ep_fsdp`` FSDP dim. Non-expert params
+    (global == checkpoint shape) are read whole (they are small: embed / norm /
+    lm_head) and distributed over their own mesh.
+
+    Strictly dominates the full-read and rank-0-broadcast variants on peak host
+    RAM (``E/ep`` vs full) and avoids broadcast traffic; the per-rank reads run in
+    parallel off the shared file (shared mmap page cache on one node).
+
+    Checkpoint formats: both VeOmni **stacked** (``experts.gate_up_proj`` /
+    ``down_proj``) and HF **original per-expert** (``experts.{e}.gate_proj`` /
+    ``up_proj`` / ``down_proj``) are accepted — the latter is reconstructed per
+    rank via :func:`build_local_fused_block` (VeOmni's converter mapping),
+    so real Qwen3-MoE HF checkpoints load directly with no offline merge.
+    """
+    import glob
+
+    from safetensors import safe_open
+
+    from unirl.train.backend.veomni import _compat
+
+    _compat.ensure_installed()
+    from veomni.distributed.parallel_state import get_parallel_state
+
+    ps = get_parallel_state()
+    ep_size = int(ps.ep_size) if getattr(ps, "ep_enabled", False) else 1
+    ep_rank = int(ps.ep_rank) if ep_size > 1 else 0
+
+    shards = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"EP load: no *.safetensors under {weights_dir!r}")
+    # Open each shard once (mmap; header read only) and map key -> handle.
+    handles = {s: safe_open(s, framework="pt", device="cpu") for s in shards}
+    key_to_handle = {}
+    for s, h in handles.items():
+        for k in h.keys():
+            key_to_handle[k] = h
+    ckpt_keys = set(key_to_handle)
+
+    def get_checkpoint_tensor(key: str) -> torch.Tensor:
+        return key_to_handle[key].get_tensor(key)
+
+    ep_shard_dims = _ep_shard_dims_from_plan(module)
+    named = dict(module.named_parameters())
+    named.update(dict(module.named_buffers()))
+
+    missing, loaded, local_elems = [], 0, 0
+    for name, dst in named.items():
+        # LoRA inserts a ``base_layer`` hop; the base checkpoint omits it.
+        ckpt_key = name
+        if ckpt_key not in ckpt_keys:
+            stem, _, leaf = name.rpartition(".")
+            cand = f"{stem.removesuffix('.base_layer')}.{leaf}" if stem.endswith(".base_layer") else name
+            ckpt_key = cand if cand in ckpt_keys else name
+        if ckpt_key not in ckpt_keys:
+            # HF original (per-expert split) checkpoint: the fused expert param
+            # (``...experts.gate_up_proj`` / ``...experts.down_proj``) is absent;
+            # rebuild THIS ep rank's block from the per-expert ``experts.{e}.*``
+            # keys (VeOmni's CheckpointTensorConverter mapping, applied per rank).
+            block = build_local_fused_block(
+                fused_param_name=name,
+                expected_shape=tuple(dst.shape),
+                ep_rank=ep_rank,
+                available_keys=ckpt_keys,
+                get_tensor=get_checkpoint_tensor,
+            )
+            if block is not None:
+                block = block.to(device=device, dtype=dst.dtype)
+                local_elems += block.numel()
+                assign_local_block(dst, block)
+                loaded += 1
+                del block
+                continue
+            if name in ep_shard_dims:
+                raise RuntimeError(
+                    f"EP load: checkpoint contains neither fused tensor {name!r} "
+                    "nor the complete HF per-expert keys needed to rebuild it."
+                )
+            missing.append(name)
+            continue
+
+        sl = key_to_handle[ckpt_key].get_slice(ckpt_key)
+        ckpt_shape = tuple(sl.get_shape())
+        global_shape = tuple(dst.shape)
+
+        block = _read_ep_checkpoint_block(
+            sl,
+            name=name,
+            ckpt_shape=ckpt_shape,
+            global_shape=global_shape,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            ep_dim=ep_shard_dims.get(name),
+        )
+
+        block = block.to(device=device, dtype=dst.dtype)
+        local_elems += block.numel()
+        assign_local_block(dst, block)
+        loaded += 1
+        del block
+
+    if strict and missing:
+        raise RuntimeError(f"EP load: missing {len(missing)} tensor(s) in checkpoint: {missing[:8]}")
+    if missing and _current_rank() == 0:
+        logger.info(
+            "EP load: %d tensor(s) absent from checkpoint (e.g. non-persistent buffers): %s%s",
+            len(missing),
+            missing[:6],
+            " ..." if len(missing) > 6 else "",
+        )
+    if _current_rank() == 0:
+        logger.info(
+            "EP load: loaded %d tensor(s) via get_slice+distribute_tensor (rank0 read %.0fM elems)",
+            loaded,
+            local_elems / 1e6,
+        )
 
 
 def _load_state_dict_sharded(
