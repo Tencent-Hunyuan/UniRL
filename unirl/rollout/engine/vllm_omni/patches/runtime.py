@@ -203,9 +203,7 @@ def wrap_mp_process_for_children() -> None:
         if isinstance(target, _DiffrlPatchedTarget):
             # PDEATHSIG tracks the Process.start() thread; helper threads may
             # exit while their child remains owned by the live process.
-            target._arm_pdeathsig = (
-                threading.current_thread() is threading.main_thread()
-            )
+            target._arm_pdeathsig = threading.current_thread() is threading.main_thread()
         return orig_start(self)
 
     _MpBaseProcess.__init__ = __init__
