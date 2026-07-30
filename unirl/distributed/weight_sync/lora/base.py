@@ -82,6 +82,13 @@ class LoraWeightSyncBase(Remote):
     ) -> None:
         super().__init__()
         self._backend = backend
+        from unirl.utils.peft_merge import lora_targets_ep_experts
+
+        if lora_targets_ep_experts(backend.model):
+            raise ValueError(
+                f"{type(self).__name__}: LoRA targeting EP-sharded fused experts "
+                "is unsupported; target attention/shared non-EP modules instead."
+            )
         self._param_prefix = str(param_prefix or "")
         # None defers to the backend's single source of truth (the EMA shadow
         # "old" for DiffusionNFT, else "default"); an explicit value overrides.

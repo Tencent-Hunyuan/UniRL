@@ -47,9 +47,18 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     return _to_cpu_state_dict(full)
 
 
-def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
-    """Load a full state dict, broadcasting from rank 0 across ranks.
+def load_model_state_dict(
+    model: nn.Module,
+    state_dict: StateDict,
+    *,
+    strict: bool = True,
+    broadcast_from_rank0: bool = True,
+) -> None:
+    """Load a full state dict and reshard it into ``model``.
 
+    With ``broadcast_from_rank0=True`` (default), only rank 0 needs the full
+    state. Set it to ``False`` when every rank carries a deliberately different
+    full state, such as its own pre-sliced expert block under VeOmni EP.
     ``strict=False`` loads a partial dict (adapter-only checkpoints, or the
     backend's post-parallelize weight load where injected adapter params are
     legitimately absent): keys absent from ``state_dict`` keep the model's
@@ -59,7 +68,7 @@ def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bo
 
     options = _build_state_dict_options(
         full_state_dict=True,
-        broadcast_from_rank0=True,
+        broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
         strict=strict,
     )
@@ -122,18 +131,25 @@ def gather_lora_state_dict(model: nn.Module) -> StateDict:
     return gathered
 
 
-def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
-    """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
+def load_optimizer_state_dict(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state_dict: StateDict,
+    *,
+    broadcast_from_rank0: bool = True,
+) -> None:
+    """Load a full optimizer state dict and reshard it into ``optimizer``.
 
     Pass the rank-0 dict from :func:`gather_optimizer_state_dict`; other ranks
-    pass ``{}`` (their input is ignored — tensors broadcast from rank 0 and
-    re-shard into each rank's local state).
+    pass ``{}`` when ``broadcast_from_rank0=True``. Set it to ``False`` when
+    every rank supplies an intentionally different full state (VeOmni EP
+    pre-slices expert moments before this call).
     """
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(
         full_state_dict=True,
-        broadcast_from_rank0=True,
+        broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
     try:

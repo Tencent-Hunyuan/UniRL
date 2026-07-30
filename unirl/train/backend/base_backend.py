@@ -11,8 +11,8 @@ their engine-specific behavior:
 * the constructor *lifecycle* (wrap strategy, distributed bring-up, sequence
   parallelism, eager-vs-meta weight load) stays in each leaf, written as a linear
   named sequence that calls the shared construction helpers here; and
-* five small *hooks* — grad clip, optimizer-state gather/load, model on/offload —
-  that the methods below dispatch through.
+* small *hooks* — grad clip, checkpoint model/optimizer state, model
+  on/offload — that the methods below dispatch through.
 
 This module imports torch (and ema / lora / optim / deferred) at module level and
 MUST NOT be imported from ``veomni/__init__`` — only from inside the two
@@ -458,10 +458,7 @@ class BaseFSDP2Backend(Remote):
         FSDP, plain ``state_dict()`` for VeOmni) via :meth:`_gather_optimizer_state`.
         """
         self._reject_meta(operation="save", checkpoint_format="torch", mode=mode)
-        if mode == "adapter":
-            policy_state = gather_lora_state_dict(self.model)
-        else:
-            policy_state = gather_state_dict(self.model)
+        policy_state = self._gather_model_state(mode)
         optimizer_state = self._gather_optimizer_state()
         state: Dict[str, object] = {
             "policy_state_dict": policy_state,
@@ -471,6 +468,7 @@ class BaseFSDP2Backend(Remote):
             "save_mode": mode,
             "lora_config": self._lora_meta,
         }
+        state.update(self._torch_checkpoint_metadata())
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
 
@@ -643,7 +641,7 @@ class BaseFSDP2Backend(Remote):
         mode = checkpoint.get("save_mode", "full")
         strict = mode == "full"
         self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
-        load_model_state_dict(self.model, checkpoint["policy_state_dict"], strict=strict)
+        self._load_model_state(checkpoint["policy_state_dict"], strict=strict)
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -881,6 +879,20 @@ class BaseFSDP2Backend(Remote):
     def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:
         """Clip gradients and return the (pre-clip) global grad norm."""
         raise NotImplementedError
+
+    def _gather_model_state(self, mode: str) -> StateDict:
+        """Rank-0 model state for the single-file checkpoint."""
+        if mode == "adapter":
+            return gather_lora_state_dict(self.model)
+        return gather_state_dict(self.model)
+
+    def _load_model_state(self, model_state: StateDict, *, strict: bool) -> None:
+        """Restore model state from a single-file checkpoint."""
+        load_model_state_dict(self.model, model_state, strict=strict)
+
+    def _torch_checkpoint_metadata(self) -> Dict[str, object]:
+        """Backend-specific metadata added to a single-file checkpoint."""
+        return {}
 
     def _gather_optimizer_state(self) -> StateDict:
         """Rank-0 optimizer state for the checkpoint (collective for DCP backends)."""
