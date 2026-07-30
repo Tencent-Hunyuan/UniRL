@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from recipes.refl.models.types import DiffuseWithGradResult
+from recipes.refl.model_adaptor.types import DiffuseWithGradResult
 from unirl.models.wan21.clip_vision_encode import WAN21CLIPVisionEncodeStage
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage

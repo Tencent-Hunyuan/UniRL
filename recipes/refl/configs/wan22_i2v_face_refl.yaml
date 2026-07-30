@@ -18,7 +18,7 @@ max_grad_norm: 1.0
 
 actor:
   _target_: recipes.refl.roles.ReflActorRole
-  pipeline_target: recipes.refl.models.wan22.Wan22ReflPipeline
+  pipeline_target: recipes.refl.model_adaptor.wan22.Wan22ReflPipeline
   block_class_names: ["WanTransformerBlock"]
   # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.
   reward_weight: 0.1

@@ -19,7 +19,7 @@ actor:
   _target_: recipes.refl.roles.ReflActorRole
   # Family selector — swap pipeline_target + model_config for another family,
   # no code changes (mirrors ReFLPolicy's pipeline_target contract).
-  pipeline_target: recipes.refl.models.wan21.Wan21ReflPipeline
+  pipeline_target: recipes.refl.model_adaptor.wan21.Wan21ReflPipeline
   block_class_names: ["WanTransformerBlock"]
   # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.
   reward_weight: 0.25
