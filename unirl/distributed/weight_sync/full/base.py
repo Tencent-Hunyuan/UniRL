@@ -115,6 +115,36 @@ class FullWeightSync(Remote):
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
         self._lora_merged = bool(lora_merged)
+        ep_enabled = bool(
+            getattr(self._backend.model, "_extra_parallel_param_groups", None)
+            and self._backend.model._extra_parallel_param_groups.get("ep")
+        )
+        if ep_enabled:
+            from unirl.train.backend.veomni.ep.models.qwen3_moe import is_fused_expert_param
+            from unirl.train.backend.veomni.ep.placement import ep_named_parameters
+
+            unsupported = [
+                name for name, _ in ep_named_parameters(self._backend.model) if not is_fused_expert_param(name)
+            ]
+            if unsupported:
+                raise ValueError(
+                    "FullWeightSync: EP full-weight sync currently supports the "
+                    "Qwen3-MoE fused expert layout only; use a LoRA sync handler "
+                    f"for this model. Unsupported EP params: {unsupported[:4]}."
+                )
+        if ep_enabled and hasattr(self._backend.model, "peft_config"):
+            from unirl.utils.peft_merge import lora_targets_ep_experts
+
+            if lora_targets_ep_experts(self._backend.model):
+                raise ValueError(
+                    "FullWeightSync: LoRA targeting EP-sharded fused experts is unsupported; "
+                    "target attention/shared non-EP modules instead."
+                )
+            if not self._lora_merged:
+                raise ValueError(
+                    "FullWeightSync: EP + LoRA requires lora_merged=True. "
+                    "Use LocalLoraWeightSync/RemoteLoraWeightSync for adapter-only sync."
+                )
         # Which PEFT adapter's weights to push. ``None`` defers to the backend's
         # single source of truth (``rollout_adapter_name``): the EMA shadow
         # ("old") for DiffusionNFT, else "default". See class docstring; a
@@ -184,6 +214,13 @@ class FullWeightSync(Remote):
         from unirl.utils.peft_merge import merged_state_dict, raw_state_dict
 
         remap = self._name_remap
+        # Expert-parallel models always need the EP-aware walk: even when LoRA
+        # is merged, the frozen fused experts still carry only this rank's
+        # [E/ep] block and must be gathered + converted to HF per-expert names.
+        if getattr(self._backend.model, "_extra_parallel_param_groups", None) is not None:
+            yield from self._iter_full_tensors_ep()
+            return
+
         if self._lora_merged:
             for name, tensor in merged_state_dict(
                 self._backend.model, adapter_name=self._adapter_name, dtype=self._wire_dtype
@@ -201,6 +238,78 @@ class FullWeightSync(Remote):
             out = _apply_name_remap(name, remap)
             if out is not None:
                 yield out, tensor
+
+    def _iter_full_tensors_ep(self) -> Iterator[Tuple[str, "object"]]:
+        """EP-aware weight walk: emit HF per-expert tensors from the EP-sharded model.
+
+        For each fused expert param (``...experts.gate_up_proj`` / ``down_proj``):
+        materialize this rank's ``[E/ep, …]`` block (``_to_full_tensor`` replicates
+        over ``ep_fsdp``), **all-gather across the ``ep`` group** to reconstruct the
+        full ``[E, …]`` stack, then split it back into HF per-expert tensors
+        (``experts.{e}.gate_proj`` = ``gate_up[e][:I]``, ``up_proj`` = ``[I:2I]``,
+        ``down_proj`` = ``down[e]``) — the reverse of the load converter, the layout
+        SGLang's Qwen3-MoE ``expert_params_mapping`` consumes. Non-expert params
+        use the normal raw/LoRA-merged walk, including PEFT name normalization.
+
+        Runs on every train rank in lockstep (the all-gather is collective). Each
+        rank ends up with the full per-expert set and pushes it to its co-located
+        engine, exactly like the dense BROADCAST sync.
+        """
+        from unirl.train.backend.veomni import _compat
+        from unirl.train.backend.veomni.ep.models.qwen3_moe import (
+            fused_expert_kind,
+            iter_hf_expert_tensors,
+        )
+        from unirl.train.backend.veomni.ep.placement import gather_stacked_expert_block
+        from unirl.utils.peft_merge import merged_state_dict, raw_state_dict
+
+        _compat.ensure_installed()
+        from veomni.distributed.parallel_state import get_parallel_state
+
+        ps = get_parallel_state()
+        ep_size = int(ps.ep_size) if getattr(ps, "ep_enabled", False) else 1
+        ep_group = ps.ep_group if ep_size > 1 else None
+        remap = self._name_remap
+
+        if self._lora_merged:
+            state_walk = merged_state_dict(
+                self._backend.model,
+                adapter_name=self._adapter_name,
+                dtype=self._wire_dtype,
+            )
+        else:
+            state_walk = raw_state_dict(
+                self._backend.model,
+                adapter_name=self._adapter_name,
+                dtype=self._wire_dtype,
+            )
+
+        # Both source walks normalize PEFT names (strip ``base_model.model.`` and
+        # ``.base_layer.``). The merged walk also folds attention/shared-module
+        # LoRA deltas while leaving frozen fused experts as their local [E/ep]
+        # base blocks, which are gathered below.
+        for name, full in state_walk:
+            expert_kind = fused_expert_kind(name)
+            if expert_kind is not None and ep_size > 1:
+                stacked = gather_stacked_expert_block(
+                    full,
+                    ep_size=ep_size,
+                    ep_group=ep_group,
+                )
+                del full
+            elif expert_kind is not None:
+                stacked = full  # ep_size==1: already the full [E,…]
+            else:
+                out = _apply_name_remap(name, remap)
+                if out is not None:
+                    yield out, full
+                continue
+
+            for hf_name, tensor in iter_hf_expert_tensors(name, stacked):
+                out = _apply_name_remap(hf_name, remap)
+                if out is not None:
+                    yield out, tensor
+            del stacked
 
     def _iter_buckets(self) -> Iterator[Tuple[List[Tuple[str, "object"]], bool]]:
         """Yield ``(bucket, is_last)`` where ``bucket`` is a list of

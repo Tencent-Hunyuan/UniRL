@@ -3,11 +3,8 @@ name: PR Status Labels
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review, converted_to_draft, synchronize]
-  pull_request_review:
-    types: [submitted, dismissed]
 
 permissions:
-  pull-requests: write
   issues: write
 
 concurrency:
@@ -30,28 +27,15 @@ jobs:
             jq -e --arg name "$1" '.pull_request.labels | any(.name == $name)' "$event" >/dev/null
           }
 
-          if [ "$GITHUB_EVENT_NAME" = "pull_request_review" ]; then
-            [ "$draft" = "true" ] && exit 0
-            if [ "$(jq -r '.action' "$event")" = "dismissed" ]; then
-              target="need review"
-            else
-              case "$(jq -r '.review.state' "$event")" in
-                approved) target="approved" ;;
-                changes_requested) target="changes requested" ;;
-                *) exit 0 ;;
-              esac
-            fi
+          [ "$(jq -r '.pull_request.state' "$event")" = "open" ] || exit 0
+          if [ "$draft" = "true" ]; then
+            target="wip"
+          elif [ "$(jq -r '.action' "$event")" = "synchronize" ]; then
+            # New commits only move the status back to review after changes were requested.
+            has_label "changes requested" || exit 0
+            target="need review"
           else
-            [ "$(jq -r '.pull_request.state' "$event")" = "open" ] || exit 0
-            if [ "$draft" = "true" ]; then
-              target="wip"
-            elif [ "$(jq -r '.action' "$event")" = "synchronize" ]; then
-              # New commits only move the status back to review after changes were requested.
-              has_label "changes requested" || exit 0
-              target="need review"
-            else
-              target="need review"
-            fi
+            target="need review"
           fi
 
           for label in "wip" "need review" "changes requested" "approved"; do
