@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from unirl.models.types.diffusion import DiffuseWithGradResult
+from recipes.refl.models.types import DiffuseWithGradResult
 from unirl.models.wan21.clip_vision_encode import WAN21CLIPVisionEncodeStage
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
@@ -199,6 +199,12 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         mid_timestep = int(sk.get("mid_timestep", 0))
         final_timestep = int(sk.get("final_timestep", T - 1))
         kl_weight = float(sk.get("kl_weight", 0.0))
+        if not (0 <= mid_timestep <= final_timestep < T):
+            raise ValueError(
+                f"Wan22ReflDiffusionStage.diffuse_with_grad: require 0 <= mid_timestep <= "
+                f"final_timestep < num_inference_steps, got mid={mid_timestep} "
+                f"final={final_timestep} T={T}."
+            )
 
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)

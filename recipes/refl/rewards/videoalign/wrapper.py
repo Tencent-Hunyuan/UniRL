@@ -25,16 +25,15 @@ single line that makes REFL gradients work end-to-end.
 
 from __future__ import annotations
 
-# NOTE: ``inspect`` was previously used to filter ``batch`` against the
-# reward backbone's ``forward`` signature in order to drop the
-# ``mm_token_type_ids`` kwarg that transformers>=4.58/5.x injects via
-# ``Qwen2VLProcessor``. We have aligned the runtime back to transformers
-# 4.54 (matching the mmrl baseline), where that kwarg is not produced, so
-# the filter is no longer necessary — and under PEFT it can spuriously
-# strip ``pixel_values_videos`` / ``video_grid_thw`` when ``base.forward``
-# turns out to be ``LoraModel.forward(*args, **kwargs)``. The import is
-# kept commented for future re-enablement once we move past 4.58.
-# import inspect
+# NOTE: this wrapper runs on the UniRL core stack (transformers>=5.6 — the
+# reward shares one Python process with the actor, so there is no separate
+# environment to pin). Newer ``Qwen2VLProcessor`` versions inject
+# ``mm_token_type_ids``, which the 4.45-era reward backbone does not accept;
+# ``compute_scores`` drops it by explicit black-list. Signature-based
+# filtering (``inspect``) is deliberately NOT used: under PEFT it can resolve
+# to ``LoraModel.forward(*args, **kwargs)`` and silently strip
+# ``pixel_values_videos`` / ``video_grid_thw``.
+import importlib.util
 import json
 import logging
 import os
@@ -141,7 +140,9 @@ class VideoRewardWrapper:
             load_from_pretrained=checkpoint_dir,
             load_from_pretrained_step=-1,
             gradient_checkpointing=False,
-            disable_flash_attn2=False,
+            # flash-attn 2 is not part of the UniRL core stack; fall back to
+            # SDPA automatically when the wheel is absent.
+            disable_flash_attn2=importlib.util.find_spec("flash_attn") is None,
             bf16=(dtype == torch.bfloat16),
             fp16=(dtype == torch.float16),
             output_dir="",
@@ -313,50 +314,16 @@ class VideoRewardWrapper:
         for start in range(0, len(video_tensors), self.micro_batch_size):
             end = start + self.micro_batch_size
             batch = self.prepare_batch_from_frames(video_tensors[start:end], prompts[start:end])
-            # Aligned with mmrl's wrapper: pass the processor batch
-            # straight through to the model. transformers 4.54 (current
-            # pinned version) does not inject ``mm_token_type_ids``, so
-            # no filtering is required.
+            # transformers>=4.58/5.x ``Qwen2VLProcessor`` injects
+            # ``mm_token_type_ids`` (text/image/video ids for the rewritten
+            # ``get_rope_index``); ``Qwen2VLRewardModelBT.forward`` was
+            # authored against 4.45 and does not accept it. Drop it by
+            # explicit black-list — NEVER ``inspect.signature`` filtering,
+            # which under PEFT can resolve to ``LoraModel.forward(*args,
+            # **kwargs)`` and silently strip ``pixel_values_videos`` /
+            # ``video_grid_thw``, leaving the reward blind to the video.
+            batch.pop("mm_token_type_ids", None)
             logits = self.model(**batch, return_dict=True)["logits"]  # (B, 3)
-
-            # ----------------------------------------------------------
-            # transformers>=4.58/5.x compatibility shim (DISABLED).
-            #
-            # Newer ``Qwen2VLProcessor`` versions inject ``mm_token_type_ids``
-            # (text=0 / image=1 / video=2) into the batch dict for the
-            # rewritten ``get_rope_index``. ``Qwen2VLRewardModelBT`` was
-            # authored against transformers 4.45 and its ``forward`` does
-            # NOT list this kwarg, so ``self.model(**batch)`` would blow
-            # up with ``TypeError: ... got an unexpected keyword argument
-            # 'mm_token_type_ids'`` once upgraded.
-            #
-            # The previous implementation used ``inspect.signature`` on
-            # the unwrapped base forward to filter the batch, but PEFT
-            # wraps the model as ``PeftModel -> LoraModel -> Qwen2VLRewardModelBT``
-            # and depending on the PEFT version ``get_base_model()`` may
-            # return ``LoraModel`` whose forward signature is
-            # ``(*args, **kwargs)`` — the resulting filter would silently
-            # drop ``pixel_values_videos`` / ``video_grid_thw``, leaving
-            # the reward model "blind" to the video.
-            #
-            # When we re-upgrade past 4.58, the safer replacement is an
-            # explicit black-list (NOT signature inspection):
-            #
-            #     _DROP = {"mm_token_type_ids"}
-            #     filtered_batch = {k: v for k, v in batch.items() if k not in _DROP}
-            #     logits = self.model(**filtered_batch, return_dict=True)["logits"]
-            #
-            # Original code preserved below for reference:
-            #
-            # base = (
-            #     self.model.get_base_model()
-            #     if hasattr(self.model, "get_base_model")
-            #     else self.model
-            # )
-            # allowed = set(inspect.signature(base.forward).parameters)
-            # filtered_batch = {k: v for k, v in batch.items() if k in allowed}
-            # logits = self.model(**filtered_batch, return_dict=True)["logits"]
-            # ----------------------------------------------------------
             vq, mq, ta = logits[:, 0], logits[:, 1], logits[:, 2]
             if use_norm:
                 vq, mq, ta = self._norm(vq, mq, ta)

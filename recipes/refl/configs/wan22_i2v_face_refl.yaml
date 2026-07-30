@@ -120,12 +120,11 @@ sampling:
   init_same_noise: false
   sampler_kwargs:
     # Truncated BPTT window: grad on from mid_timestep..final_timestep — the
-    # last 4 of 8 steps, i.e. the low-noise DiT's sigma range.
+    # last 4 of 8 steps, i.e. the low-noise DiT's sigma range. The per-step
+    # KL against the LoRA-disabled reference is switched/weighted by the
+    # single actor.kl_weight knob.
     mid_timestep: 4
     final_timestep: 7
-    # Per-step KL against the LoRA-disabled reference (weighted again by
-    # actor.kl_weight at the loss site).
-    kl_weight: 1.0
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

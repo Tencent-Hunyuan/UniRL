@@ -134,9 +134,8 @@ sampling:
     # the final step traverses the reward backward pass (DRaFT-1 / ReFL).
     mid_timestep: 24
     final_timestep: 24
-    # KL branch off — actor.kl_weight is also 0. Single-pass forward per
-    # step, no LoRA-disabled reference recompute.
-    kl_weight: 0.0
+    # KL on/off + weight live on actor.kl_weight (single knob; 0 here →
+    # single-pass forward per step, no LoRA-disabled reference recompute).
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

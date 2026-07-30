@@ -169,11 +169,26 @@ class ReflActorRole(Remote):
         self.backend.model.train()
         self.backend.zero_grad()
 
+        # Single KL knob: the actor owns kl_weight (loss-side), the sampling
+        # config owns only sampling-shape knobs (mid/final window). A stale
+        # sampler_kwargs.kl_weight is an error, not a silent override.
+        sampler_kwargs = dict(params.sampler_kwargs or {})
+        if "kl_weight" in sampler_kwargs:
+            raise ValueError(
+                "ReflActorRole: sampling.sampler_kwargs.kl_weight is no longer read; "
+                "configure actor.kl_weight instead (single source of truth)."
+            )
+        sampler_kwargs["kl_weight"] = self.kl_weight
+
         # Decorrelate init noise across DP shards and rollouts (same scheme as
         # ReFLPolicy): the config seed is the base, not the per-step value.
         dp_rank = int(self.rank_info.dp_rank) if self.rank_info is not None else 0
         base_seed = int(params.seed) if params.seed is not None else 42
-        params = dataclasses.replace(params, seed=base_seed + 1000 * int(rollout_id) + dp_rank)
+        params = dataclasses.replace(
+            params,
+            seed=base_seed + 1000 * int(rollout_id) + dp_rank,
+            sampler_kwargs=sampler_kwargs,
+        )
 
         conditions = self.pipeline.build_refl_conditions(texts, images=images, params=params)
         schedule = get_sigma_schedule(

@@ -1,11 +1,9 @@
-accelerate==0.34.0
-decord==0.6.0
-einops
-flash-attn==2.5.8
-huggingface_hub
-opencv-python-headless
-peft==0.10.0
-safetensors
-setuptools<70
-transformers==4.45.2
-trl==0.8.6
+# VideoAlign reward extras — ADDITIVE ONLY on top of the UniRL core stack.
+#
+# The reward runs in the SAME Python process as the actor (colocated Remote
+# siblings), so a requirements file cannot "isolate" versions — any pin that
+# overlaps the core stack would downgrade the core environment itself. Core
+# already provides transformers / peft / safetensors / huggingface-hub /
+# einops (see pyproject.toml); never re-pin those here. flash-attn is
+# optional: the model factory falls back to SDPA when the wheel is absent.
+torchvision  # frame preprocessing transforms; matches the engine extra's torch build

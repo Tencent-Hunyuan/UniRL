@@ -14,7 +14,6 @@ so the kernel itself is stateless.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple, TypeVar, runtime_checkable
 
 import torch
@@ -152,33 +151,5 @@ class DiffusionStage(Protocol[C]):
         """
         ...
 
-    # ------------------------------------------------------------------
-    # BPTT path (REFL): generate-and-train in a single forward.
-    # ------------------------------------------------------------------
 
-    def diffuse_with_grad(
-        self,
-        conditions: C,
-        *,
-        schedule: torch.Tensor,
-        params: object,
-        initial_latents: Optional[torch.Tensor] = None,
-    ) -> "DiffuseWithGradResult":
-        """Differentiable sampling: ``C → (z_final, kl_loss)``."""
-        ...
-
-
-@dataclass
-class DiffuseWithGradResult:
-    """Output of :meth:`DiffusionStage.diffuse_with_grad`.
-
-    ``kl_loss`` is per-sample ``[B]`` (zeros when the KL branch is off) so
-    DP-scattered consumers round-trip each shard's own KL, never a
-    cross-shard aggregate.
-    """
-
-    z_final: torch.Tensor
-    kl_loss: torch.Tensor
-
-
-__all__ = ["DiffusionStage", "DiffusionStep", "DiffuseWithGradResult", "ReplayResult"]
+__all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult"]

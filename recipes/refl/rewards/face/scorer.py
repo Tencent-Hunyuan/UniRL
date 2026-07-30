@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -16,6 +17,9 @@ from unirl.types.reward import RewardRequest
 from .face_tools import Face, FaceAnalysis
 
 logger = logging.getLogger(__name__)
+
+# Reference-embedding LRU bound (see FaceRewardScorer._ref_cache).
+_REF_CACHE_MAX = 64
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +110,9 @@ class FaceRewardScorer(LocalRewardBackend):
         self._ref_max_frames = int(self.model_kwargs.get("ref_max_frames", 81))
         self._ref_max_pixels = int(self.model_kwargs.get("ref_max_pixels", 480 * 480))
         self._differentiable = bool(self.model_kwargs.get("differentiable", True))
-        self._ref_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Bounded LRU: reference embeddings are small, but a many-identity
+        # dataset must not grow GPU residency without bound.
+        self._ref_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         raise NotImplementedError("FaceRewardScorer is REFL-only; use compute_rewards_differentiable().")
@@ -182,6 +188,7 @@ class FaceRewardScorer(LocalRewardBackend):
     def _get_ref_embeddings(self, ref_video_path: str) -> tuple[torch.Tensor, torch.Tensor]:
         cached = self._ref_cache.get(ref_video_path)
         if cached is not None:
+            self._ref_cache.move_to_end(ref_video_path)
             return cached
         with torch.no_grad():
             video = _load_ref_video_frames(
@@ -193,6 +200,8 @@ class FaceRewardScorer(LocalRewardBackend):
         # Detach (defence-in-depth) before caching.
         cached = (ref_emb.detach(), ref_mask.detach())
         self._ref_cache[ref_video_path] = cached
+        while len(self._ref_cache) > _REF_CACHE_MAX:
+            self._ref_cache.popitem(last=False)
         return cached
 
     # ------------------------------------------------------------------
