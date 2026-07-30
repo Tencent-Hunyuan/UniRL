@@ -113,18 +113,10 @@ def load_model_from_checkpoint(
 
     # Upstream checkpoints use the old Qwen2VL layout (LM at
     # base_model.model.model.*, vision at base_model.model.visual.*);
-    # transformers>=5 nests them under model.language_model / model.visual.
-    # Detected from the TARGET model's keys; applied to every loaded dict —
-    # LoRA keys embed module paths too.
-    target_keys = model.state_dict().keys()
-    needs_remap = any(
-        k.startswith("base_model.model.model.language_model.") or k.startswith("base_model.model.model.visual.")
-        for k in target_keys
-    )
-
+    # transformers 5.6 nests them under model.language_model / model.visual.
+    # Applied to every loaded dict — LoRA keys embed module paths too — and
+    # idempotent for already-new-layout keys.
     def _remap_qwen_layout(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if not needs_remap:
-            return state_dict
         new_state_dict: Dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("base_model.model.model.language_model.") or key.startswith(

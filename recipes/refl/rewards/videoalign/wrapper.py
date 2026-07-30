@@ -17,21 +17,19 @@ graphs when the input videos have ``grad_fn`` set.
 Gradient flow
 -------------
 The Qwen2-VL vision encoder is fully differentiable w.r.t. its pixel input
-when the *fast* image processor (``Qwen2VLImageProcessorFast``) is used —
-the slow PIL-based variant routes through ``numpy`` and silently cuts the
-graph. We force-swap to the fast processor on construction; this is the
-single line that makes REFL gradients work end-to-end.
+through the *fast* (tensor-native) image processor, which transformers 5.6
+loads by default — the slow PIL-based variant routes through ``numpy`` and
+silently cuts the graph.
 """
 
 from __future__ import annotations
 
 # Runs on the shared core stack — reward and actor share one process, so
-# there is no separate env to pin. transformers>=4.58 processors inject
+# there is no separate env to pin. The 5.6 processor injects
 # ``mm_token_type_ids``, which the reward backbone does not accept;
 # ``compute_scores`` pops it explicitly. Never filter by forward-signature:
 # under PEFT that resolves to ``LoraModel.forward(*args, **kwargs)`` and
 # silently drops the video tensors.
-import importlib.util
 import json
 import logging
 import os
@@ -41,7 +39,6 @@ from typing import Dict, List, Optional
 import torch
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
-from transformers import AutoImageProcessor
 
 from .model import (
     ModelConfig,
@@ -87,8 +84,7 @@ class VideoRewardWrapper:
        :func:`create_model_and_processor`.
     3. Load weights from ``checkpoint-K`` via
        :func:`load_model_from_checkpoint`.
-    4. Replace the slow image processor with the autograd-friendly fast one.
-    5. Move to the requested device + dtype, ``eval()`` + freeze
+    4. Move to the requested device + dtype, ``eval()`` + freeze
        parameters (RL gradients flow *through* the activations, not into
        the reward weights).
     """
@@ -138,30 +134,23 @@ class VideoRewardWrapper:
             load_from_pretrained=checkpoint_dir,
             load_from_pretrained_step=-1,
             gradient_checkpointing=False,
-            # flash-attn 2 is not part of the UniRL core stack; fall back to
-            # SDPA automatically when the wheel is absent.
-            disable_flash_attn2=importlib.util.find_spec("flash_attn") is None,
+            # sdpa — deterministic on the locked stack; flash-attn 2 is not
+            # part of it.
+            disable_flash_attn2=True,
             bf16=(dtype == torch.bfloat16),
             fp16=(dtype == torch.float16),
             output_dir="",
         )
 
+        # transformers 5.6 loads the fast (tensor-native) image processor by
+        # default; gradient flow requires it — the slow variant round-trips
+        # through PIL and severs autograd.
         model, processor, _ = create_model_and_processor(
             model_config=model_config,
             peft_lora_config=peft_lora_config,
             training_args=training_args,
         )
         model, _ = load_model_from_checkpoint(model, checkpoint_dir, -1)
-
-        # CRITICAL: force the *fast* image processor. The slow variant
-        # converts inputs to numpy/PIL and (a) rejects float pixels outside
-        # [0, 1] via ``_rescale_for_pil_conversion``, and (b) silently
-        # severs autograd even when you push the values past the range
-        # check. The fast variant operates on torch tensors end-to-end via
-        # torchvision.transforms.v2.functional.resize, so gradients flow
-        # from pixels through the processor into the vision encoder.
-        fast_ip = AutoImageProcessor.from_pretrained(model_config.model_name_or_path, use_fast=True)
-        processor.image_processor = fast_ip
 
         model.to(self.device)
         model.eval()

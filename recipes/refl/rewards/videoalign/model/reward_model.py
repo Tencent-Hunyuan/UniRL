@@ -25,15 +25,9 @@ from transformers import Qwen2VLForConditionalGeneration
 
 
 def _cfg_get(config: Any, name: str) -> Any:
-    """Read a config attribute that may live on the top-level config or
-    on the nested ``text_config`` sub-config.
-
-    transformers>=4.52 refactored ``Qwen2VLConfig`` so that fields like
-    ``hidden_size`` / ``image_token_id`` / ``video_token_id`` / ``pad_token_id``
-    moved under ``config.text_config``. Older transformers exposed them at
-    the top level. This helper transparently supports both layouts and
-    raises a friendly error when the field is genuinely absent.
-    """
+    """Read a ``Qwen2VLConfig`` field from wherever 5.6 keeps it: media
+    token ids live on the top-level config, LM fields like ``hidden_size``
+    under the nested ``text_config``."""
     if hasattr(config, name):
         val = getattr(config, name)
         if val is not None:
@@ -88,44 +82,21 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         if self.special_token_ids is not None:
             self.reward_token = "special"
 
-    # ------------------------------------------------------------------
-    # Backwards-compat shim: vision tower location
-    # ------------------------------------------------------------------
-    # transformers <= 4.51 exposed the Qwen2-VL vision tower as
-    # ``self.visual`` directly on ``Qwen2VLForConditionalGeneration``.
-    # transformers >= 4.52 refactored it under ``self.model.visual``
-    # (the LM backbone now owns the vision encoder). The forward code
-    # below was written against the old layout; rather than fork it,
-    # we expose a thin property that resolves to whichever location
-    # the currently-installed transformers uses.
-    #
-    # Implementation notes:
-    # - Read from ``self._modules`` (the underlying ``OrderedDict``)
-    #   instead of ``getattr``/``hasattr`` to avoid recursing back into
-    #   ``nn.Module.__getattr__`` which would re-trigger this property
-    #   and yield a misleading "no attribute 'visual'" error.
-    # - We deliberately do *not* define a setter: ``super().__init__``
-    #   registers any ``self.visual = module`` assignment via
-    #   ``nn.Module.__setattr__`` (which writes into ``_modules``), and
-    #   the property here just reads that slot back out — so old-style
-    #   checkpoints still load and the ``state_dict`` layout is
-    #   completely unchanged.
+    # The forward code below addresses ``self.visual``; transformers 5.6
+    # owns the vision tower at ``self.model.visual``. Read via ``_modules``
+    # to avoid recursing into ``nn.Module.__getattr__``, which would
+    # re-trigger this property with a misleading "no attribute" error.
     @property
     def visual(self):  # type: ignore[override]
-        own = self._modules.get("visual", None)
-        if own is not None:
-            return own  # transformers <= 4.51 layout
         inner = self._modules.get("model", None)
-        if inner is not None:
-            inner_visual = getattr(inner, "visual", None)
-            if inner_visual is not None:
-                return inner_visual  # transformers >= 4.52 layout
-        raise AttributeError(
-            "Qwen2VLRewardModelBT: vision tower not found on either "
-            "self.visual (transformers<=4.51) or self.model.visual "
-            "(transformers>=4.52). The installed transformers version "
-            "may be incompatible with this checkpoint."
-        )
+        visual = getattr(inner, "visual", None) if inner is not None else None
+        if visual is None:
+            raise AttributeError(
+                "Qwen2VLRewardModelBT: vision tower not found at "
+                "self.model.visual — this code targets the locked "
+                "transformers 5.6 stack; align the environment."
+            )
+        return visual
 
     # ------------------------------------------------------------------
     # Forward
@@ -160,23 +131,20 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         # an LM head — only the regression head over the final hidden
         # states.
         #
-        # transformers 5.6 returns BaseModelOutputWithPooling: pooler_output
-        # = merged features (fills the placeholders); last_hidden_state =
-        # PRE-merger states (4x tokens, vision dim) — never usable here.
-        # transformers 4.56 (fleet image; TODO drop once the image moves to
-        # the locked 5.6 stack) returns the merged features as a raw Tensor.
+        # transformers 5.6: the vision tower returns BaseModelOutputWithPooling
+        # whose pooler_output holds the merged features that fill the media
+        # placeholders (what get_video_features reads). last_hidden_state is
+        # the PRE-merger states (4x tokens, vision dim) — never usable here.
         def _as_tensor(visual_out):
-            if isinstance(visual_out, torch.Tensor):
-                return visual_out
             t = getattr(visual_out, "pooler_output", None)
-            if t is not None:
-                return t
-            raise TypeError(
-                "Qwen2-VL vision tower returned an unsupported type: "
-                f"{type(visual_out).__name__} (no pooler_output). This code "
-                "targets the locked transformers stack — align the environment "
-                "instead of widening this shim."
-            )
+            if t is None:
+                raise TypeError(
+                    "Qwen2-VL vision tower returned "
+                    f"{type(visual_out).__name__} with no pooler_output. This "
+                    "code targets the locked transformers 5.6 stack — align "
+                    "the environment instead of widening this path."
+                )
+            return t
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
