@@ -33,7 +33,7 @@ RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan22_i2v_face_re
 |---|---|
 | `trainer.py` | `REFLTrainer(BaseTrainer)` — driver: wiring + the 3-RPC train step |
 | `roles.py` | `ReflActorRole(Remote)` — family-agnostic actor (`pipeline_target` + `model_config`) |
-| `model_adaptor/` | Per-model adaptations of core pipelines to the BPTT contract (`types.py` defines it): `wan21.py`, `wan22.py` |
+| `models/` | Per-model BPTT adaptations subclassing the core pipelines (`types.py` defines the contract): `wan21.py`, `wan22.py` — mirrors `unirl/models/` (graduates into the matching model packages) |
 | `reward/` | Package-local differentiable rewards (VideoAlign, Face), each with an additive-only `requirements.txt` — mirrors `unirl/reward/` (graduates into it) |
 | `examples/` | Flat Hydra configs (repo-wide schema) — mirrors the top-level `examples/` (graduates into it) |
 

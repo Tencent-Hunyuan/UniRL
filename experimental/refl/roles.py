@@ -11,7 +11,7 @@ driver RPCs per step under the distributed ``enable_grad()`` context::
     actor.step(max_grad_norm=…)                                    # ctx exit routed grads → optimizer
 
 The pipeline named by ``pipeline_target`` must expose the recipe contract
-(see ``experimental.refl.model_adaptor``): ``build_refl_conditions(texts, images=…,
+(see ``experimental.refl.models``): ``build_refl_conditions(texts, images=…,
 params=…)`` plus a ``diffusion`` stage with ``diffuse_with_grad`` and a
 ``vae_decode`` stage with ``decode_with_grad``.
 """
@@ -117,12 +117,12 @@ class ReflActorRole(Remote):
             if not hasattr(stage, method):
                 raise TypeError(
                     f"ReflActorRole: pipeline {self._pipeline_target} .{stage_attr} lacks {method}(...); "
-                    f"use a experimental.refl.model_adaptor pipeline (or implement the REFL contract)."
+                    f"use a experimental.refl.models pipeline (or implement the REFL contract)."
                 )
         if not hasattr(self.pipeline, "build_refl_conditions"):
             raise TypeError(
                 f"ReflActorRole: pipeline {self._pipeline_target} lacks build_refl_conditions(...); "
-                f"use a experimental.refl.model_adaptor pipeline."
+                f"use a experimental.refl.models pipeline."
             )
 
         # FSDP-wrap pipeline.bundle.transformer in place + LoRA + optimizer.
