@@ -1,0 +1,105 @@
+name: PR Review Status Labels
+
+# workflow_run restores write access after the unprivileged fork-safe collector.
+# This workflow must never check out or execute pull-request-controlled content.
+on:
+  workflow_run:
+    workflows: [PR Review Event]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: pr-review-status-labels
+  cancel-in-progress: false
+
+jobs:
+  sync-labels:
+    name: Sync PR review status labels
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'pull_request_review' &&
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download review event
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-review-event
+          path: ${{ runner.temp }}/pr-review-event
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reconcile status labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_EVENT_PATH: ${{ runner.temp }}/pr-review-event/pr-number
+        run: |
+          set -euo pipefail
+
+          sync_pr() {
+            local number="$1"
+            local pr state draft decision target label encoded
+
+            if ! [[ "$number" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::Invalid PR number: $number"
+              return 1
+            fi
+
+            pr=$(gh pr view "$number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json state,isDraft,reviewDecision,labels)
+            state=$(jq -r '.state' <<<"$pr")
+            [ "$state" = "OPEN" ] || return 0
+
+            draft=$(jq -r '.isDraft' <<<"$pr")
+            decision=$(jq -r '.reviewDecision // ""' <<<"$pr")
+            if [ "$draft" = "true" ]; then
+              target="wip"
+            else
+              case "$decision" in
+                APPROVED) target="approved" ;;
+                CHANGES_REQUESTED) target="changes requested" ;;
+                *) target="need review" ;;
+              esac
+            fi
+
+            for label in "wip" "need review" "changes requested" "approved"; do
+              [ "$label" = "$target" ] && continue
+              if jq -e --arg name "$label" '.labels | any(.name == $name)' <<<"$pr" >/dev/null; then
+                encoded=$(jq -rn --arg label "$label" '$label | @uri')
+                gh api --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/issues/$number/labels/$encoded" \
+                  >/dev/null
+              fi
+            done
+
+            if ! jq -e --arg name "$target" '.labels | any(.name == $name)' <<<"$pr" >/dev/null; then
+              gh api "repos/$GITHUB_REPOSITORY/issues/$number/labels" \
+                -f "labels[]=$target" \
+                >/dev/null
+            fi
+
+            echo "PR #$number: $target"
+          }
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_run" ]; then
+            if [ ! -f "$REVIEW_EVENT_PATH" ]; then
+              echo "::error::Review event artifact is missing its PR number"
+              exit 1
+            fi
+            number=$(tr -d '[:space:]' < "$REVIEW_EVENT_PATH")
+            sync_pr "$number"
+          else
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" \
+              --jq '.[].number' |
+              while IFS= read -r number; do
+                sync_pr "$number"
+              done
+          fi

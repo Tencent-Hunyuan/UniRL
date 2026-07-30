@@ -11,6 +11,19 @@ _PEFT_PREFIX = "base_model.model."
 _PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "qwen3_5_moe"})
 
 
+def lora_targets_ep_experts(model: torch.nn.Module) -> bool:
+    """Whether PEFT injected LoRA tensors into fused EP expert modules.
+
+    Attention/shared-expert LoRA remains compatible with EP because those
+    tensors use the normal FSDP mesh. LoRA inside ``.experts.`` would itself
+    need an outer EP gather and per-expert conversion, which neither the LoRA
+    nor merged-full receiver formats can represent safely.
+    """
+    if not getattr(model, "_extra_parallel_param_groups", None):
+        return False
+    return any(".experts." in name and (".lora_A." in name or ".lora_B." in name) for name in model.state_dict())
+
+
 def _strip_peft_prefix(name: str) -> str:
     return name.removeprefix(_PEFT_PREFIX)
 

@@ -111,8 +111,12 @@ class FSDPConfig:
     # Must divide the world size and the model's attention head count. Only the
     # VeOmni backend honors it; FSDPBackend ignores it.
     sp_size: int = 1
-    # Expert-parallel degree (default 1 = disabled); when >1 the VeOmni backend shards fused
-    # experts over a separate mesh and requires the model to expose get_parallel_plan(). VeOmni only.
+    # Expert-parallel degree for MoE models (default 1 = disabled, a true no-op).
+    # When >1 the VeOmni backend registers an "ep" extra-parallel submesh in
+    # init_parallel_state (ep x ep_fsdp), shards fused experts, and requires the
+    # bundle to implement prepare_for_expert_parallel() so the trainable model
+    # exposes get_parallel_plan() (Shard(0) on stacked expert weights). Must
+    # divide world size and num_experts. VeOmni only; FSDPBackend ignores it.
     ep_size: int = 1
 
 

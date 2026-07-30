@@ -60,6 +60,7 @@ The current trainer surface is:
 | `ARTrainer` | one AR `Part` → one `TrainStack` | Text or multimodal AR rollout with group/global advantage normalization and optional token-balanced DP shards. |
 | `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
 | `AsyncARTrainer` | buffered AR `Sample` groups → one `TrainStack` | Separate train/rollout slabs with resident generation, bounded staleness, and quiescence before sync, eval, or checkpoint. |
+| `AsyncDiffusionTrainer` | buffered diffusion `Sample` groups → one `TrainStack` | The same separate-slab async loop for DiT. Requires `max_inflight=1` and reaps each generation before launching the next, so the cross-slab trajectory transfer never queues behind a fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
 | `RewardBackpropTrainer` | differentiable image reward → policy step | ReFL/DRaFT-K path; no rollout engine, `Sample`, GRPO advantage, replay ratio, or weight sync. |
@@ -236,7 +237,9 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - `DiffusionTrainer`, `PETrainer`, `UnifiedModelTrainer`, and
   `RewardBackpropTrainer` report image reward; optional `eval_rewards` suites can
   score the same generated samples or their own prompt sets. PE scores only the
-  diffusion/image frontier.
+  diffusion/image frontier. `AsyncDiffusionTrainer` quiesces first and then scores
+  the policy already resident in its rollout engine, without a weight sync and
+  without offloading that engine afterwards.
 - Agentic evaluation is not implemented. Barrier and partial variants raise if
   evaluation is enabled; async variants currently force it off.
 
