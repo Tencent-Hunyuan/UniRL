@@ -66,6 +66,7 @@ class REFLTrainer(BaseTrainer):
 
     def __init__(self, *, cfg: DictConfig) -> None:
         super().__init__(cfg=cfg, logging_cfg=cfg.get("logging"))
+        self.cfg = cfg  # train() reads run-length/checkpoint defaults from it
         self.batch_size = int(cfg.batch_size)
         self.max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
         self.data_source = instantiate(cfg.data_source)
