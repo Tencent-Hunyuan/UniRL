@@ -25,14 +25,12 @@ single line that makes REFL gradients work end-to-end.
 
 from __future__ import annotations
 
-# NOTE: this wrapper runs on the UniRL core stack (transformers>=5.6 — the
-# reward shares one Python process with the actor, so there is no separate
-# environment to pin). Newer ``Qwen2VLProcessor`` versions inject
-# ``mm_token_type_ids``, which the 4.45-era reward backbone does not accept;
-# ``compute_scores`` drops it by explicit black-list. Signature-based
-# filtering (``inspect``) is deliberately NOT used: under PEFT it can resolve
-# to ``LoraModel.forward(*args, **kwargs)`` and silently strip
-# ``pixel_values_videos`` / ``video_grid_thw``.
+# Runs on the shared core stack — reward and actor share one process, so
+# there is no separate env to pin. transformers>=4.58 processors inject
+# ``mm_token_type_ids``, which the reward backbone does not accept;
+# ``compute_scores`` pops it explicitly. Never filter by forward-signature:
+# under PEFT that resolves to ``LoraModel.forward(*args, **kwargs)`` and
+# silently drops the video tensors.
 import importlib.util
 import json
 import logging
@@ -314,14 +312,8 @@ class VideoRewardWrapper:
         for start in range(0, len(video_tensors), self.micro_batch_size):
             end = start + self.micro_batch_size
             batch = self.prepare_batch_from_frames(video_tensors[start:end], prompts[start:end])
-            # transformers>=4.58/5.x ``Qwen2VLProcessor`` injects
-            # ``mm_token_type_ids`` (text/image/video ids for the rewritten
-            # ``get_rope_index``); ``Qwen2VLRewardModelBT.forward`` was
-            # authored against 4.45 and does not accept it. Drop it by
-            # explicit black-list — NEVER ``inspect.signature`` filtering,
-            # which under PEFT can resolve to ``LoraModel.forward(*args,
-            # **kwargs)`` and silently strip ``pixel_values_videos`` /
-            # ``video_grid_thw``, leaving the reward blind to the video.
+            # 5.x processors inject mm_token_type_ids; the backbone doesn't
+            # accept it (see module NOTE — pop, never signature-filter).
             batch.pop("mm_token_type_ids", None)
             logits = self.model(**batch, return_dict=True)["logits"]  # (B, 3)
             vq, mq, ta = logits[:, 0], logits[:, 1], logits[:, 2]

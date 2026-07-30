@@ -111,34 +111,37 @@ def load_model_from_checkpoint(
     lora_ckpt = os.path.join(checkpoint_path, "adapter_model.safetensors")
     non_lora_ckpt = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
 
+    # Upstream checkpoints use the old Qwen2VL layout (LM at
+    # base_model.model.model.*, vision at base_model.model.visual.*);
+    # transformers>=5 nests them under model.language_model / model.visual.
+    # Detected from the TARGET model's keys; applied to every loaded dict —
+    # LoRA keys embed module paths too.
+    target_keys = model.state_dict().keys()
+    needs_remap = any(
+        k.startswith("base_model.model.model.language_model.") or k.startswith("base_model.model.model.visual.")
+        for k in target_keys
+    )
+
+    def _remap_qwen_layout(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not needs_remap:
+            return state_dict
+        new_state_dict: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("base_model.model.model.language_model.") or key.startswith(
+                "base_model.model.model.visual."
+            ):
+                new_state_dict[key] = value  # already the new layout
+            elif key.startswith("base_model.model.model"):
+                new_state_dict["base_model.model.model.language_model" + key[len("base_model.model.model") :]] = value
+            elif key.startswith("base_model.model.visual"):
+                new_state_dict["base_model.model.model.visual" + key[len("base_model.model.visual") :]] = value
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
     if os.path.exists(full_ckpt):
         model_state_dict = torch.load(full_ckpt, map_location="cpu", weights_only=True)
-        # The upstream checkpoints were written against the old Qwen2VL
-        # submodule layout (LM under ``base_model.model.model.*``, vision
-        # under ``base_model.model.visual.*``). transformers>=5 moved
-        # language layers under
-        # ``base_model.model.model.language_model.*`` and the visual tower
-        # under ``base_model.model.model.visual.*``. Detect by inspecting
-        # the target model's own state_dict keys and remap when needed.
-        target_keys = model.state_dict().keys()
-        needs_remap = any(
-            k.startswith("base_model.model.model.language_model.") or k.startswith("base_model.model.model.visual.")
-            for k in target_keys
-        )
-        if needs_remap:
-            new_state_dict: Dict[str, torch.Tensor] = {}
-            for key, value in model_state_dict.items():
-                if key.startswith("base_model.model.model"):
-                    new_key = "base_model.model.model.language_model" + key[len("base_model.model.model") :]
-                    new_state_dict[new_key] = value
-                elif key.startswith("base_model.model.visual"):
-                    new_key = "base_model.model.model.visual" + key[len("base_model.model.visual") :]
-                    new_state_dict[new_key] = value
-                else:
-                    new_state_dict[key] = value
-            model.load_state_dict(new_state_dict)
-        else:
-            model.load_state_dict(model_state_dict)
+        model.load_state_dict(_remap_qwen_layout(model_state_dict))
     else:
         # LoRA branch — merge LoRA adapter + non-LoRA tensors.
         if not os.path.exists(lora_ckpt) or not os.path.exists(non_lora_ckpt):
@@ -147,8 +150,8 @@ def load_model_from_checkpoint(
                 f"({lora_ckpt!r} + {non_lora_ckpt!r}) was found under {checkpoint_path!r}."
             )
 
-        lora_state_dict = safetensors.torch.load_file(lora_ckpt)
-        non_lora_state_dict = torch.load(non_lora_ckpt, map_location="cpu")
+        lora_state_dict = _remap_qwen_layout(safetensors.torch.load_file(lora_ckpt))
+        non_lora_state_dict = _remap_qwen_layout(torch.load(non_lora_ckpt, map_location="cpu"))
 
         lora_state_dict = _insert_adapter_name_into_state_dict(
             lora_state_dict,

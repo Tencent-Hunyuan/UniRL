@@ -98,14 +98,6 @@ def create_model_and_processor(
 
     # Build the reward model. Quantisation is intentionally not supported
     # here — the reward path expects full-precision (or bf16/fp16) weights.
-    #
-    # Aligned with mmrl's ``create_model_and_processor``: forward
-    # ``revision`` and ``use_cache`` directly into ``from_pretrained``.
-    # ``use_cache`` is a standard ``PretrainedConfig`` field, so HF's
-    # ``from_pretrained`` absorbs it into the config rather than passing
-    # it down to ``Qwen2VLRewardModelBT.__init__`` — no ``TypeError``.
-    # ``revision`` is a no-op for local-path checkpoints but matches the
-    # mmrl call site verbatim.
     model = Qwen2VLRewardModelBT.from_pretrained(
         model_config.model_name_or_path,
         output_dim=model_config.output_dim,
@@ -115,26 +107,10 @@ def create_model_and_processor(
         attn_implementation=("flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa"),
         cache_dir=cache_dir,
         revision=getattr(model_config, "model_revision", "main"),
-        use_cache=True if training_args.gradient_checkpointing else False,
     )
-
-    # ------------------------------------------------------------------
-    # transformers>=4.58/5.x compatibility shim (DISABLED).
-    #
-    # Older comment / behaviour preserved here for reference: under some
-    # future transformers versions, ``from_pretrained`` may stop treating
-    # ``use_cache`` as a known ``PretrainedConfig`` field and pass it
-    # through to ``Qwen2VLRewardModelBT.__init__``, which only accepts
-    # ``output_dim`` / ``reward_token`` / ``special_token_ids`` and would
-    # raise ``TypeError: unexpected keyword argument 'use_cache'``. If
-    # that happens, drop ``use_cache`` / ``revision`` from the
-    # ``from_pretrained`` call above and re-enable the post-hoc setter
-    # below:
-    #
-    # model.config.use_cache = bool(
-    #     True if training_args.gradient_checkpointing else False
-    # )
-    # ------------------------------------------------------------------
+    # transformers 5.x forwards unknown from_pretrained kwargs to the model
+    # ctor (4.x absorbed config fields like use_cache) — set it on the config.
+    model.config.use_cache = bool(training_args.gradient_checkpointing)
 
     if model_config.use_special_tokens:
         model.resize_token_embeddings(len(processor.tokenizer))

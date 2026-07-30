@@ -160,27 +160,22 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         # an LM head — only the regression head over the final hidden
         # states.
         #
-        # Backwards-compat shim for transformers >= 4.52: the Qwen2-VL
-        # vision tower's forward used to return a raw ``Tensor`` (the
-        # flattened visual hidden states) but now returns a
-        # ``BaseModelOutputWithPooling`` dataclass. We accept both shapes
-        # by extracting ``.last_hidden_state`` when present.
+        # transformers 5.6 returns BaseModelOutputWithPooling: pooler_output
+        # = merged features (fills the placeholders); last_hidden_state =
+        # PRE-merger states (4x tokens, vision dim) — never usable here.
+        # transformers 4.56 (fleet image; TODO drop once the image moves to
+        # the locked 5.6 stack) returns the merged features as a raw Tensor.
         def _as_tensor(visual_out):
             if isinstance(visual_out, torch.Tensor):
                 return visual_out
-            # transformers >= 4.52 returns a ModelOutput-like dataclass;
-            # the visual hidden states live on ``last_hidden_state``.
-            t = getattr(visual_out, "last_hidden_state", None)
+            t = getattr(visual_out, "pooler_output", None)
             if t is not None:
                 return t
-            # Last resort: some forks return a tuple where the first
-            # element is the hidden-states tensor.
-            if isinstance(visual_out, (tuple, list)) and len(visual_out) > 0:
-                return visual_out[0]
             raise TypeError(
                 "Qwen2-VL vision tower returned an unsupported type: "
-                f"{type(visual_out).__name__}. Expected Tensor or "
-                "BaseModelOutputWithPooling (transformers>=4.52)."
+                f"{type(visual_out).__name__} (no pooler_output). This code "
+                "targets the locked transformers stack — align the environment "
+                "instead of widening this shim."
             )
 
         if inputs_embeds is None:
