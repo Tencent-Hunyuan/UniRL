@@ -2,7 +2,7 @@
 
 Self-contained re-implementation — does NOT touch ``sys.path`` . The Qwen2-VL reward
 backbone, its prompt template and the checkpoint loader all live under
-:mod:`experimental.refl.rewards.videoalign.model`.
+:mod:`experimental.refl.reward.videoalign.model`.
 
 Public API
 ----------

@@ -20,7 +20,7 @@ RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan21_t2v_videoal
 
 # WAN 2.2 I2V + Face-identity reward (first frame via (image, condition)
 # MediaRef; face reference via per-sample metadata ref_video_path)
-pip install -r experimental/refl/rewards/face/requirements.txt
+pip install -r experimental/refl/reward/face/requirements.txt
 export PRETRAINED_MODEL=/path/to/Wan2.2-I2V-A14B-Diffusers \
        FACE_MODEL_PATH=/path/to/antelodev2 \
        DATA_PATH=/path/to/i2v_prompts.jsonl
@@ -34,8 +34,8 @@ RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan22_i2v_face_re
 | `trainer.py` | `REFLTrainer(BaseTrainer)` — driver: wiring + the 3-RPC train step |
 | `roles.py` | `ReflActorRole(Remote)` — family-agnostic actor (`pipeline_target` + `model_config`) |
 | `model_adaptor/` | Per-model adaptations of core pipelines to the BPTT contract (`types.py` defines it): `wan21.py`, `wan22.py` |
-| `rewards/` | Recipe-local differentiable rewards (VideoAlign, Face), each with an additive-only `requirements.txt` |
-| `configs/` | Flat Hydra configs (repo-wide schema) |
+| `reward/` | Package-local differentiable rewards (VideoAlign, Face), each with an additive-only `requirements.txt` — mirrors `unirl/reward/` (graduates into it) |
+| `examples/` | Flat Hydra configs (repo-wide schema) — mirrors the top-level `examples/` (graduates into it) |
 
 ## Environment
 

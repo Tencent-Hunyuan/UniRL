@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 from experimental.refl.trainer import REFLTrainer
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="wan22_i2v_face_refl")
+@hydra.main(version_base=None, config_path="examples", config_name="wan22_i2v_face_refl")
 def main(cfg: DictConfig) -> None:
     trainer = REFLTrainer(cfg=cfg)
     trainer.train()

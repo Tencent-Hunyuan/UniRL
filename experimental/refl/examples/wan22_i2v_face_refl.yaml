@@ -85,10 +85,10 @@ actor:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: experimental.refl.rewards.face.FaceRewardScorer
+    _target_: experimental.refl.reward.face.FaceRewardScorer
     base_device: cuda
     config:
-      _target_: experimental.refl.rewards.face.FaceRewardSpec
+      _target_: experimental.refl.reward.face.FaceRewardSpec
       model_path: ${oc.env:FACE_MODEL_PATH,/path/to/antelodev2_face_ckpt}
       device: cuda
       batch_size: 1

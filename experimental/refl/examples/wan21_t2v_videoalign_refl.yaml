@@ -87,10 +87,10 @@ actor:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: experimental.refl.rewards.videoalign.VideoAlignRewardScorer
+    _target_: experimental.refl.reward.videoalign.VideoAlignRewardScorer
     base_device: cuda
     config:
-      _target_: experimental.refl.rewards.videoalign.VideoAlignSpec
+      _target_: experimental.refl.reward.videoalign.VideoAlignSpec
       reward_model_path: ${oc.env:VIDEOALIGN_MODEL_PATH}
       device: cuda
       batch_size: 1

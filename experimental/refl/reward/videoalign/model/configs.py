@@ -36,7 +36,7 @@ class TrainingConfig:
 
     Only ``bf16`` / ``fp16`` / ``gradient_checkpointing`` /
     ``disable_flash_attn2`` are actually consumed by the inference path
-    (see :func:`experimental.refl.rewards.videoalign.model.factory.create_model_and_processor`).
+    (see :func:`experimental.refl.reward.videoalign.model.factory.create_model_and_processor`).
     The other fields are kept so ``TrainingConfig(**model_config_json["training_args"])``
     still works when someone wants to introspect the saved config.
     """
