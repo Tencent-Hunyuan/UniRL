@@ -42,7 +42,9 @@ actor:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
-    master_dtype: fp32
+    # master_dtype deliberately omitted → LoRA stays bf16 (uniform dtype).
+    # fp32 LoRA over a bf16 base trips torch FSDP2's uniform-original-dtype
+    # assert (same note as examples/diffusion/refl_sd3.yaml).
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
