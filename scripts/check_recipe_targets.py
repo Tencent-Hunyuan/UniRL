@@ -7,6 +7,12 @@ stale dotted path can merge silently. This check parses every recipe ``_target_:
 pointing into the ``unirl`` package and confirms the module file and the attribute
 exist — purely via ``ast``, importing nothing (no torch/vllm/sglang needed).
 
+Only ~0.2s of the runtime is parsing; the rest is filesystem latency, which dominates
+when the checkout lives on a network filesystem. So the tree is walked once to index
+every module (rather than probing candidate paths per target, which costs ~10k stat
+calls) and file contents are read through a thread pool. On CephFS that is the
+difference between ~5min and ~15s per run.
+
 Run by the ``check-recipe-targets`` pre-commit hook (so it rides the existing
 ``pre-commit run --all-files`` lint CI). Exits non-zero, listing each unresolved
 target, when any path is dead.
@@ -15,9 +21,11 @@ target, when any path is dead.
 from __future__ import annotations
 
 import ast
+import fnmatch
+import os
 import re
 import sys
-from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,16 +34,46 @@ ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS = ["examples", "CPPO", "DRPO", "FlowDPPO", "unirl"]
 # Vendored / sub-project trees kept byte-pristine (mirror .pre-commit-config exclude).
 SKIP_PARTS = {".git", "vendor"}
+# The only package ``_TARGET_RE`` accepts, so the only one worth indexing.
+PACKAGE = "unirl"
 
 _TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?(unirl\.[A-Za-z0-9_.]+)['"]?\s*$""")
 
+# Deep enough to hide network-filesystem round trips behind each other.
+_READ_THREADS = 32
 
-@lru_cache(maxsize=None)
-def _module_top_level_names(module_file: Path) -> frozenset[str] | None:
-    """Top-level names bound in ``module_file`` (class/func/assign/import), or None."""
+
+def _scan() -> tuple[dict[str, Path], list[Path]]:
+    """One walk over ``SCAN_DIRS``: dotted module path -> file, plus every recipe file."""
+    modules: dict[str, Path] = {}
+    packages: dict[str, Path] = {}
+    recipes: list[Path] = []
+    for d in SCAN_DIRS:
+        for dirpath, _dirnames, filenames in os.walk(ROOT / d):
+            parts = Path(dirpath).relative_to(ROOT).parts
+            skipped = bool(SKIP_PARTS & set(parts))
+            for name in filenames:
+                if parts[0] == PACKAGE and name.endswith(".py"):
+                    if name == "__init__.py":
+                        packages[".".join(parts)] = Path(dirpath, name)
+                    else:
+                        modules[".".join((*parts, name[:-3]))] = Path(dirpath, name)
+                elif not skipped and fnmatch.fnmatch(name, "*.y*ml"):
+                    recipes.append(Path(dirpath, name))
+    # A module file shadows a package of the same name, as in Python's own lookup.
+    return {**packages, **modules}, sorted(recipes)
+
+
+def _read_all(paths: list[Path]) -> list[str]:
+    with ThreadPoolExecutor(max_workers=_READ_THREADS) as pool:
+        return list(pool.map(lambda p: p.read_text(encoding="utf-8"), paths))
+
+
+def _top_level_names(source: str, path: Path) -> frozenset[str] | None:
+    """Top-level names bound in ``source`` (class/func/assign/import), or None."""
     try:
-        tree = ast.parse(module_file.read_text(encoding="utf-8"), filename=str(module_file))
-    except (OSError, SyntaxError):
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
         return None
     names: set[str] = set()
     for node in tree.body:
@@ -53,49 +91,49 @@ def _module_top_level_names(module_file: Path) -> frozenset[str] | None:
     return frozenset(names)
 
 
-def _resolve(dotted: str) -> bool:
-    """True if ``dotted`` (e.g. unirl.algorithms.grpo.GRPO) names a real module attr.
+def _split_module(dotted: str, modules: dict[str, Path]) -> tuple[Path, str] | None:
+    """Longest module prefix of ``dotted`` that exists, with the attribute after it.
 
     Walks the standard Python split: try module = all-but-last part, attr = last;
-    if that module file is missing, fold trailing parts back into the attribute chain
-    until a module file exists, then check the first attribute after it is top-level.
+    if that module does not exist, fold trailing parts back into the attribute chain
+    until one does. None when no prefix names a module at all.
     """
     parts = dotted.split(".")
     for split in range(len(parts) - 1, 0, -1):
-        mod_parts, attr_parts = parts[:split], parts[split:]
-        base = ROOT.joinpath(*mod_parts)
-        module_file = base.with_suffix(".py")
-        if not module_file.is_file():
-            module_file = base / "__init__.py"
-        if not module_file.is_file():
-            continue  # not a module here — fold one more part into the attr chain
-        names = _module_top_level_names(module_file)
-        return names is not None and attr_parts[0] in names
-    return False
+        module_file = modules.get(".".join(parts[:split]))
+        if module_file is not None:
+            return module_file, parts[split]
+    return None
 
 
 def main() -> int:
+    modules, recipes = _scan()
+
+    targets: list[tuple[Path, int, str]] = []
+    for path, text in zip(recipes, _read_all(recipes)):
+        for lineno, line in enumerate(text.splitlines(), 1):
+            m = _TARGET_RE.match(line)
+            if m:
+                targets.append((path, lineno, m.group(1)))
+
+    module_split = {dotted: _split_module(dotted, modules) for _, _, dotted in targets}
+    # Only the modules a recipe actually names are worth reading and parsing.
+    needed = sorted({hit[0] for hit in module_split.values() if hit is not None})
+    top_level = {path: _top_level_names(source, path) for path, source in zip(needed, _read_all(needed))}
+
     failures: list[str] = []
-    checked = 0
-    for d in SCAN_DIRS:
-        for path in sorted((ROOT / d).rglob("*.y*ml")):
-            if SKIP_PARTS & set(path.relative_to(ROOT).parts):
-                continue
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                m = _TARGET_RE.match(line)
-                if not m:
-                    continue
-                checked += 1
-                if not _resolve(m.group(1)):
-                    rel = path.relative_to(ROOT)
-                    failures.append(f"{rel}:{lineno}: unresolved _target_ '{m.group(1)}'")
+    for path, lineno, dotted in targets:
+        hit = module_split[dotted]
+        names = top_level[hit[0]] if hit is not None else None
+        if names is None or hit[1] not in names:
+            failures.append(f"{path.relative_to(ROOT)}:{lineno}: unresolved _target_ '{dotted}'")
 
     if failures:
         print("Unresolved recipe _target_ paths (rename leftover or typo):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print(f"check-recipe-targets: {checked} unirl _target_ paths resolve.")
+    print(f"check-recipe-targets: {len(targets)} unirl _target_ paths resolve.")
     return 0
 
 
