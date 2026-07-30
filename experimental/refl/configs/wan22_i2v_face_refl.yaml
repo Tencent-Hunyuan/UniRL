@@ -17,8 +17,8 @@ save_mode: adapter
 max_grad_norm: 1.0
 
 actor:
-  _target_: recipes.refl.roles.ReflActorRole
-  pipeline_target: recipes.refl.model_adaptor.wan22.Wan22ReflPipeline
+  _target_: experimental.refl.roles.ReflActorRole
+  pipeline_target: experimental.refl.model_adaptor.wan22.Wan22ReflPipeline
   block_class_names: ["WanTransformerBlock"]
   # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.
   reward_weight: 0.1
@@ -85,10 +85,10 @@ actor:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: recipes.refl.rewards.face.FaceRewardScorer
+    _target_: experimental.refl.rewards.face.FaceRewardScorer
     base_device: cuda
     config:
-      _target_: recipes.refl.rewards.face.FaceRewardSpec
+      _target_: experimental.refl.rewards.face.FaceRewardSpec
       model_path: ${oc.env:FACE_MODEL_PATH,/path/to/antelodev2_face_ckpt}
       device: cuda
       batch_size: 1

@@ -6,7 +6,7 @@ stages inherit that Protocol *explicitly*, so a protocol-level stub would
 become a real ``None``-returning method on every diffusion stage in the
 repo and make ``hasattr``-based capability checks meaningless. While REFL
 is the only BPTT consumer, the contract lives here; if a second consumer
-appears outside ``recipes/refl``, promote it to core as a separate opt-in
+appears outside ``experimental/refl``, promote it to core as a separate opt-in
 ``@runtime_checkable`` protocol (the ``DifferentiableReward`` /
 ``LatentShapeProvider`` idiom), not as a method on ``DiffusionStage``.
 

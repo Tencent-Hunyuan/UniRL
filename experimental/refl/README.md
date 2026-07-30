@@ -1,4 +1,4 @@
-# recipes/refl — WAN ReFL/BPTT (differentiable reward backprop)
+# experimental/refl — WAN ReFL/BPTT (differentiable reward backprop)
 
 The first self-contained UniRL recipe: direct reward backprop (ReFL / DRaFT)
 for WAN video models. Two colocated roles — a `ReflActorRole` (FSDP WAN +
@@ -16,15 +16,15 @@ One command per config; a Ray cluster must be up (`ray start --head`).
 export PRETRAINED_MODEL=/path/to/Wan2.1-T2V-1.3B-Diffusers \
        VIDEOALIGN_MODEL_PATH=/path/to/VideoReward \
        DATA_PATH=/path/to/prompts.txt
-RAY_ADDRESS=auto python -m recipes.refl.run --config-name=wan21_t2v_videoalign_refl num_devices=8
+RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan21_t2v_videoalign_refl num_devices=8
 
 # WAN 2.2 I2V + Face-identity reward (first frame via (image, condition)
 # MediaRef; face reference via per-sample metadata ref_video_path)
-pip install -r recipes/refl/rewards/face/requirements.txt
+pip install -r experimental/refl/rewards/face/requirements.txt
 export PRETRAINED_MODEL=/path/to/Wan2.2-I2V-A14B-Diffusers \
        FACE_MODEL_PATH=/path/to/antelodev2 \
        DATA_PATH=/path/to/i2v_prompts.jsonl
-RAY_ADDRESS=auto python -m recipes.refl.run --config-name=wan22_i2v_face_refl num_devices=8
+RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan22_i2v_face_refl num_devices=8
 ```
 
 ## Layout

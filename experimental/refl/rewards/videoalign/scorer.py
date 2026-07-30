@@ -21,7 +21,7 @@ Self-containment
 This scorer no longer requires the sibling ``mmrl`` repo on disk. The
 Qwen2-VL reward backbone, prompt template, checkpoint loader and
 inference wrapper all live under
-:mod:`recipes.refl.rewards.videoalign.model` / :mod:`...wrapper`. The
+:mod:`experimental.refl.rewards.videoalign.model` / :mod:`...wrapper`. The
 ``mmrl_repo_root`` Spec field has been removed; ``MMRL_REPO_ROOT`` env
 var is now irrelevant.
 """

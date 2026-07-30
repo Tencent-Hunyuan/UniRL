@@ -16,10 +16,10 @@ save_mode: adapter
 max_grad_norm: 1.0
 
 actor:
-  _target_: recipes.refl.roles.ReflActorRole
+  _target_: experimental.refl.roles.ReflActorRole
   # Family selector — swap pipeline_target + model_config for another family,
   # no code changes (mirrors ReFLPolicy's pipeline_target contract).
-  pipeline_target: recipes.refl.model_adaptor.wan21.Wan21ReflPipeline
+  pipeline_target: experimental.refl.model_adaptor.wan21.Wan21ReflPipeline
   block_class_names: ["WanTransformerBlock"]
   # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.
   reward_weight: 0.25
@@ -87,10 +87,10 @@ actor:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: recipes.refl.rewards.videoalign.VideoAlignRewardScorer
+    _target_: experimental.refl.rewards.videoalign.VideoAlignRewardScorer
     base_device: cuda
     config:
-      _target_: recipes.refl.rewards.videoalign.VideoAlignSpec
+      _target_: experimental.refl.rewards.videoalign.VideoAlignSpec
       reward_model_path: ${oc.env:VIDEOALIGN_MODEL_PATH}
       device: cuda
       batch_size: 1

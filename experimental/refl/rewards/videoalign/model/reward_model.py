@@ -12,7 +12,7 @@ transformers>=5.
 The forward signature is preserved so the same checkpoint state_dict loads
 cleanly (no key remapping needed beyond the standard transformers>=5
 ``base_model.model.model.language_model.*`` shim handled by
-:func:`recipes.refl.rewards.videoalign.model.checkpoint.load_model_from_checkpoint`).
+:func:`experimental.refl.rewards.videoalign.model.checkpoint.load_model_from_checkpoint`).
 """
 
 from __future__ import annotations

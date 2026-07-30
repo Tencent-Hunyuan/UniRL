@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
-from recipes.refl.roles import REFLGenerated, REFLLossMetrics  # noqa: E402
+from experimental.refl.roles import REFLGenerated, REFLLossMetrics  # noqa: E402
 from unirl.distributed.tensor.pytree import infer_batch_size, pytree_cat, pytree_chunk  # noqa: E402
 
 # (batch_size, dp) — B == dp (the only previously-verified shape), B > dp,
