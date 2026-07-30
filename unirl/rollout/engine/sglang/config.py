@@ -9,6 +9,8 @@ extra key.
 ``server_intent`` (the successor of the hand-maintained ServerArgs allowlist)
 spells this config + the reserved ports as the SGLang ServerArgs intent dict;
 the backend filters it against the real ServerArgs fields and spawns.
+Explicit first-class correctness flags are marked as required so the backend
+fails closed when the installed SGLang ``ServerArgs`` cannot accept them.
 """
 
 from __future__ import annotations
@@ -25,6 +27,16 @@ from unirl.rollout.engine.ports import ReservedPorts
 _SGLANG_GRPC_PORT_OFFSET = 30000
 _SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET
 _SGLANG_SAFE_SERVER_PORT_MIN = 1024
+_REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+_LOAD_BEARING_SERVER_ARGS = frozenset(
+    {
+        "ep_size",
+        "enable_expert_parallel",
+        "enable_memory_saver",
+        "enable_weights_cpu_backup",
+        "skip_server_warmup",
+    }
+)
 
 
 def _bind_tcp_port(port: int) -> socket.socket:
@@ -300,12 +312,14 @@ class SGLangEngineConfig(BaseEngineConfig):
         """Spell this config (+ the reserved ports) as ServerArgs intent.
 
         Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns (non-ServerArgs escape-hatch keys drop harmlessly there).
+        spawns. Non-ServerArgs escape-hatch keys still drop harmlessly there,
+        but explicitly requested first-class correctness flags are recorded so
+        the backend can fail closed if the installed runtime cannot accept them.
         Precedence (low → high): ``engine_kwargs`` escape-hatch < typed cfg
-        fields < adapter ``extra`` < the reserved ports. The trailing
-        ``setdefault``s supply the predecessor's defaults (bind-all host so the
-        server accepts cross-node connections; mem_fraction 0.88) without
-        shadowing an escape-hatch override.
+        fields < adapter ``extra`` < runtime overrides < the reserved ports. The
+        trailing ``setdefault``s supply the predecessor's defaults (bind-all
+        host so the server accepts cross-node connections; mem_fraction 0.88)
+        without shadowing an escape-hatch override.
         """
         intent: Dict[str, Any] = {}
 
@@ -340,6 +354,13 @@ class SGLangEngineConfig(BaseEngineConfig):
         # Layer 4: runtime overrides (per-rank rollout layout; higher than cfg).
         if runtime_overrides:
             intent.update(runtime_overrides)
+
+        # Record explicit load-bearing UniRL fields before adding default
+        # fallbacks. If a runtime lacks one of these ServerArgs, silently
+        # dropping it would change correctness or memory-lifecycle semantics.
+        required_server_args = sorted(set(intent) & _LOAD_BEARING_SERVER_ARGS)
+        if required_server_args:
+            intent[_REQUIRED_SERVER_ARGS_METADATA_KEY] = required_server_args
 
         # Layer 5: the reserved ports (highest) — real ServerArgs fields.
         intent["port"] = ports.server_port

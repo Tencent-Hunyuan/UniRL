@@ -33,6 +33,37 @@ from typing import (
     runtime_checkable,
 )
 
+_REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+
+
+def _filter_server_args_or_raise(
+    server_intent: Dict[str, Any],
+    *,
+    allowed: set[str],
+    backend_name: str,
+) -> Dict[str, Any]:
+    """Filter ``server_intent`` against real SGLang ``ServerArgs`` fields.
+
+    Escape-hatch keys may still drop, but first-class UniRL config fields
+    recorded under ``_REQUIRED_SERVER_ARGS_METADATA_KEY`` must survive the
+    installed runtime's ``ServerArgs`` filter. Those fields are correctness or
+    memory-lifecycle knobs, so silently dropping them would make the recipe say
+    one thing while SGLang runs another.
+    """
+    raw_required = server_intent.get(_REQUIRED_SERVER_ARGS_METADATA_KEY, ())
+    if isinstance(raw_required, str):
+        required = [raw_required]
+    else:
+        required = sorted({str(key) for key in raw_required})
+    missing_required = [key for key in required if key not in allowed]
+    if missing_required:
+        raise RuntimeError(
+            f"SGLang {backend_name} backend cannot apply required ServerArgs fields: {missing_required}. "
+            "Upgrade SGLang to a build that supports these fields, or remove the explicit UniRL "
+            "rollout config that depends on them."
+        )
+    return {k: v for k, v in server_intent.items() if k != _REQUIRED_SERVER_ARGS_METADATA_KEY and k in allowed}
+
 
 def _normalize_cuda_visible_devices(
     cuda_visible_devices: Optional[Sequence[str]],

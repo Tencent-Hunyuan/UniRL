@@ -97,6 +97,7 @@ rollout:
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     tp_size: 8
     ep_size: 8
+    enable_expert_parallel: true
     max_new_tokens: 4096
     temperature: 1.0
     top_p: 1.0
@@ -111,7 +112,8 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      # SGLang GPU-memory utilization / static-memory fraction.
+      # Leaves room for FSDP offload/onload and staged SGLang wake on this
+      # 8-GPU 30B MoE recipe; retune when changing the model or TP layout.
       mem_fraction_static: 0.15
       attention_backend: triton
       disable_cuda_graph: false

@@ -39,7 +39,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from unirl.rollout.engine.sglang.backends.base import _normalize_cuda_visible_devices
+from unirl.rollout.engine.sglang.backends.base import (
+    _filter_server_args_or_raise,
+    _normalize_cuda_visible_devices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,8 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
     """HTTP server target with child-local launch environment overrides."""
     if env_overrides:
+        # Must run before importing SGLang or touching torch.cuda in the
+        # spawned child: CUDA_VISIBLE_DEVICES can be cached after CUDA init.
         os.environ.update(env_overrides)
 
     from sglang.srt.entrypoints.http_server import launch_server
@@ -257,13 +262,18 @@ class HTTPBackend:
         ``server_intent`` is the config-spelled ServerArgs intent (reserved
         ports already overlaid as ``port`` / ``nccl_port`` — real ServerArgs
         fields, so no port env manipulation happens anywhere). We filter it to
-        the real ServerArgs fields here (the only place that knows them —
-        non-ServerArgs escape-hatch keys drop harmlessly), then spawn.
+        the real ServerArgs fields here (the only place that knows them).
+        Non-ServerArgs escape-hatch keys drop harmlessly; explicitly requested
+        UniRL correctness flags fail closed if the installed runtime lacks them.
         """
         rt = _import_sglang_runtime()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
+        server_kwargs = _filter_server_args_or_raise(
+            server_intent,
+            allowed=allowed,
+            backend_name="HTTP",
+        )
 
         # --- Env quarantine: everything the SRT subprocess needs, set at the
         # spawn boundary (the spec's documented last resort) — never in the
