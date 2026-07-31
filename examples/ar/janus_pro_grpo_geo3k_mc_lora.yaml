@@ -114,6 +114,10 @@ algorithm:
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.janus_pro.conditions.JanusProARConditions
+  # Cached bf16 decode and teacher-forced replay diverge enough to push
+  # nominally on-policy samples past clip_range=1e-2. Re-anchor pi_old
+  # train-side at the exact micro geometry training replays at.
+  old_logp_source: replay
   sampling_temperature: 0.7
 
 stack:
