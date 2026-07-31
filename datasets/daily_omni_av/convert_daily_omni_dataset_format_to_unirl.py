@@ -5,7 +5,7 @@ The output contains only a video media reference. Qwen3-Omni extracts the
 embedded audio track from that same file when ``use_audio_in_video=true``.
 
 Example:
-    python scripts/convert_video_r1_260k_to_unirl.py \
+    python datasets/daily_omni_av/convert_daily_omni_dataset_format_to_unirl.py \
       --train-input /path/to/daily_omni_av_train.jsonl \
       --val-input /path/to/daily_omni_av_val.jsonl \
       --out-dir datasets/daily_omni_av

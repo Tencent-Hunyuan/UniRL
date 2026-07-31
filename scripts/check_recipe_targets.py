@@ -31,13 +31,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # YAML trees that hold recipes / stage configs with ``_target_`` entries.
-SCAN_DIRS = ["examples", "CPPO", "DRPO", "FlowDPPO", "unirl"]
+SCAN_DIRS = ["examples", "experimental", "CPPO", "DRPO", "FlowDPPO", "unirl"]
 # Vendored / sub-project trees kept byte-pristine (mirror .pre-commit-config exclude).
 SKIP_PARTS = {".git", "vendor"}
 # The only package ``_TARGET_RE`` accepts, so the only one worth indexing.
 PACKAGE = "unirl"
 
-_TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?(unirl\.[A-Za-z0-9_.]+)['"]?\s*$""")
+_TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?((?:unirl|experimental)\.[A-Za-z0-9_.]+)['"]?\s*$""")
 
 # Deep enough to hide network-filesystem round trips behind each other.
 _READ_THREADS = 32

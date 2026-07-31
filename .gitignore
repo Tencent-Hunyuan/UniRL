@@ -104,3 +104,6 @@ benchmarks/image/dpg_bench/data/
 benchmarks/text/aime/data/aime2025.jsonl
 benchmarks/text/gpqa/data/
 benchmarks_results/
+
+# Private experimental packages stay local-only (the tier is also not packaged).
+experimental/private_*/

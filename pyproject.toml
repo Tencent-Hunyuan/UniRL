@@ -29,7 +29,10 @@ dependencies = [
   # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
   # engine-agnostic.
   "einops>=0.7",
-  "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
+  # 0.20 floor: older peft imports transformers cache symbols (HybridCache)
+  # removed in 5.x and fails at import against the transformers pin above.
+  # exclude_modules support (>=0.14) used by LoRA/NFT adapter injection.
+  "peft>=0.20",
   "safetensors>=0.4",
   "Pillow>=10",
   "requests>=2.31",

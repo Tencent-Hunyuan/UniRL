@@ -1,0 +1,6 @@
+imageio>=2.31
+imageio-ffmpeg>=0.4
+onnx>=1.14
+onnx2torch>=1.5
+scikit-image>=0.21
+scipy>=1.11
