@@ -10,9 +10,9 @@ Video paths are resolved under ``--data-root`` and stored as absolute
 
 Missing videos are skipped unless ``--keep-missing`` is set. Example::
 
-    python scripts/convert_video_r1_260k_to_unirl.py \
+    python datasets/video_r1_260k/convert_video_r1_260k_to_unirl.py \
         --data-root /path/to/Video-R1-data \
-        --out-dir /path/to/output/video_r1_260k \
+        --out-dir datasets/video_r1_260k \
         --sources CLEVRER,STAR,NeXT-QA,PerceptionTest \
         --max-total 20000 --val-count 200
 """

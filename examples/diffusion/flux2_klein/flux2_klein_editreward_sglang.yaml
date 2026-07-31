@@ -1,0 +1,223 @@
+# @package _global_
+# FLUX.2-klein GRPO — SGLANG rollout + RemoteRewardBackend (EditReward).
+#
+# SGLang sibling of the proven trainside flux2_klein_editreward.yaml: same
+# EditReward objective, dataset, algorithm, and sampling — only the rollout
+# engine differs (SGLangDiffusionRolloutEngine instead of trainside). Klein
+# serves BOTH t2i and text+image→image off one checkpoint; the Flux2KleinAdapter
+# branches on Sample.has_image_input(), so an edit dataset (prompt + condition
+# image) drives the ti2i path and a t2i dataset the t2i path — no task flag.
+#
+# DEVIATIONS from flux2_klein_editreward.yaml, all forced by the engine swap:
+#   1. rollout / sync / weight_sync_interval — the engine itself. Trainside
+#      trains the sampler in place; SGLang pushes the LoRA to the engine each
+#      interval (LocalLoraWeightSync).
+#   2. param_dtype fp32 → bf16 + master_dtype fp32. The synced LoRA wire dtype
+#      must be bf16 for the SGLang kernels; master_dtype restores the proven
+#      recipe's fp32 optimizer precision (load-bearing at the ~1e-3 gradient
+#      scale — a bf16 master rounds those updates away).
+#   3. init_same_noise true → false. NOT a preference: the engine's
+#      init_same_noise=true path sizes x_T via the SGLang fork's flux2
+#      prepare_latent_shape, which mis-sizes FLUX.2 latent channels. GRPO
+#      correctness does not require shared init noise (per-group advantages
+#      don't need it; it's variance reduction only).
+#   4. activation_checkpointing false → true (memory: each actor colocates its
+#      own SGLang engine, and ti2i concatenates source tokens onto the noise
+#      sequence during replay). Numerically neutral.
+#   5. bundle.config inlined → ${model_config} anchor + strategy anchor, and
+#      use_lora / lora_target_modules surfaced onto model_config (SGLang builds
+#      its LoRA ServerArgs from these).
+#
+# 2-node deployment (reward service off the training GPUs):
+#   Node 0 (reward): ray start --head --port=6379 --num-gpus=1
+#                    python -m reward_service --config configs/editreward_service.yaml
+#   Node 1 (train):  export REWARD_SERVICE_URL=http://<node0_ip>:8080
+#                    export DATA_PATH=... EVAL_DATA_PATH=...
+#                    bash examples/run_experiment_single_node.sh diffusion/flux2_klein/flux2_klein_editreward_sglang
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout (48 x 16 samples = 768 global)
+num_rollouts: 10000
+weight_sync_interval: 1       # LoRA sync cadence: every rollout push adapter into the engine
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-flux2klein-editreward}
+  run_name: ${oc.env:WANDB_RUN_NAME,flux2klein_editreward_it2i_sglang}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [flux2_klein, it2i, edit, editreward, lora, sglang]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
+
+# Shared nodes: model_config + strategy defined once, referenced by
+# bundle / pipeline / rollout (the sglang engine needs both at init).
+model_config:
+  _target_: unirl.models.flux2_klein.config.Flux2KleinPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:FLUX2_KLEIN_PATH,black-forest-labs/FLUX.2-klein-base-9B}
+  model_precision: bf16
+  max_sequence_length: 512
+  shift: 1.0
+  use_lora: true
+  lora_target_modules: &lora_targets
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - add_q_proj
+    - add_k_proj
+    - add_v_proj
+    - to_add_out
+    - ff.linear_in
+    - ff.linear_out
+    - ff_context.linear_in
+    - ff_context.linear_out
+    - to_qkv_mlp_proj
+
+strategy:
+  _target_: unirl.sde.kernels.DanceSDEStrategy
+
+bundle:
+  _target_: unirl.models.flux2_klein.bundle.Flux2KleinBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.flux2_klein.pipeline.Flux2KleinPipeline
+  shift: 1.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  qwen3_extraction_layers: [9, 18, 27]
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    # fp32 → bf16 forced by the synced LoRA wire dtype; master_dtype restores
+    # the proven recipe's fp32 optimizer precision.
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Memory, not math: 8 colocated SGLang engines + ti2i source tokens on the
+    # noise sequence during replay.
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules: *lora_targets
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  model_config: ${model_config}
+  strategy: ${strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    # Klein serves t2i and ti2i off one checkpoint; the adapter branches on
+    # Sample.has_image_input(). An edit dataset drives the ti2i path.
+    model_family: flux2_klein
+    # LOAD-BEARING for ti2i: replay consumes the SERVER's packed condition
+    # tokens + their RoPE ids, shipped back as image_latent/image_latent_ids.
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    forward_batch_size: 16
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    target_modules: *lora_targets
+    engine_kwargs:
+      model_type: flux2_klein
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false                # only vLLM-Omni implements the checksum read-back
+  param_prefix: "transformer."
+  adapter_name: default
+
+# Remote EditReward service. The 2-turn history (source + generated) is built by
+# RemoteRewardBackend automatically when the request Sample carries an image.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: mean
+      aggregation_method: weighted_sum
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.flux2_klein.conditions.Flux2KleinConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # REQUIRED. datasets/image_edit/*.jsonl ships PLACEHOLDER uris that do not
+      # resolve; point these at a real, pod-local edit dataset.
+      data_path: ${oc.env:DATA_PATH,???}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,???}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  # FORCED false: the engine's init_same_noise=true path mis-sizes FLUX.2 latent
+  # channels. GRPO does not require shared init noise (variance reduction only).
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

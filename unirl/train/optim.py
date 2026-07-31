@@ -131,8 +131,8 @@ def build_lr_scheduler(
 
     Supports the same backend-override path as :func:`build_optimizer`.
     Returns ``None`` if ``config.type`` is not one of the supported values
-    (``constant`` / ``linear`` / ``cosine``) and the backend did not provide
-    an override.
+    (``constant`` / ``linear`` / ``linear_warmup`` / ``cosine``) and the backend
+    did not provide an override.
     """
     del actor
     if backend is not None:
@@ -166,6 +166,27 @@ def build_lr_scheduler(
             return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if scheduler_type == "linear_warmup":
+        constant = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=1.0,
+            total_iters=1,
+        )
+        if warmup_steps <= 0:
+            return constant
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-8,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, constant],
+            milestones=[warmup_steps],
+        )
 
     if scheduler_type == "cosine":
 

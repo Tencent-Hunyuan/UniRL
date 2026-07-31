@@ -130,7 +130,7 @@ class RewardBackpropTrainer(BaseTrainer):
         t0 = time.perf_counter()
         with enable_grad():
             images = self.policy.sample_and_decode(prompts=prompts, rollout_id=rollout_id)
-            rewards = self.reward.score_differentiable(images=images, prompts=prompts)
+            rewards = self.reward.score_differentiable(images.pixels, list(prompts.texts))
             # Detached value for logging (does not disturb the worker-side graph).
             mean_reward = float(hydrate(rewards).float().mean().item())
             self.policy.loss_backward(rewards=rewards)
@@ -197,7 +197,7 @@ class RewardBackpropTrainer(BaseTrainer):
             sub = Texts(texts=texts[start : start + chunk])
             images = self.policy.eval_sample(prompts=sub, rollout_id=step, guidance_scale=self.eval_cfg_text_scale)
             for name, reward in scorers:
-                r = hydrate(reward.score_differentiable(images=images, prompts=sub)).float()
+                r = hydrate(reward.score_differentiable(images.pixels, list(sub.texts))).float()
                 sums[name] += float(r.sum().item())
                 counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}

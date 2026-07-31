@@ -310,12 +310,14 @@ class MultimodalRLDataSource:
             args: Hydra ``cfg`` (DictConfig) with:
                 - run.data_path: Path to data file (JSON, JSONL, or TXT)
                 - run.seed: Random seed
+                - run.shuffle: Whether to shuffle the training prompts (default: True)
                 - algorithm.prompts_per_rollout: Batch size
         """
         self.args = args
         self.data_path = args.run.data_path
         self.eval_data_path = args.run.eval_data_path
         self.seed = args.run.seed
+        self.shuffle = bool(getattr(args.run, "shuffle", True))
         self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
         self.drop_last = True
 
@@ -401,12 +403,13 @@ class MultimodalRLDataSource:
                 f"prompts_per_rollout={self.prompts_per_rollout})."
             )
 
+        should_shuffle = sampler is None and self.shuffle
         self._dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.prompts_per_rollout,
             sampler=sampler,
-            shuffle=(sampler is None),  # Only shuffle if not using custom sampler
-            generator=self._shuffle_generator if sampler is None else None,
+            shuffle=should_shuffle,  # Only shuffle if not using custom sampler
+            generator=self._shuffle_generator if should_shuffle else None,
             num_workers=0,  # Keep simple for Ray
             collate_fn=self._collate_text,
             drop_last=True,

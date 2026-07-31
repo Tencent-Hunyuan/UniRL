@@ -84,6 +84,10 @@ Fail closed when the work is not ready:
 - If the change is duplicate, too trivial, missing context, or lacks a credible verification path, stop and explain what is missing.
 - Do not invent process exceptions just to keep moving.
 
+Verification harnesses and guard scripts:
+- `lint/` holds only guard scripts wired into `.pre-commit-config.yaml`; a file there that no hook `entry:` references does not belong in the repo.
+- One-off verification harnesses written to prove a PR correct are run and their commands + results quoted in the PR's Test Plan, **not committed**. The tests/ tree was removed by policy (#99/#267); do not recreate it under any name (`tests/`, `scripts/`, `tools/`, ...).
+
 ## 6. Review and Domain Guides
 
 **Verify guidance against the current repo before applying it.**
