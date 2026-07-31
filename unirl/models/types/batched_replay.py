@@ -3,6 +3,33 @@
 Replay steps are stacked step-major on the batch dimension so one batched
 step call replaces the serial loop. Concrete stages tile their conditions
 and supply any model-specific step arguments.
+
+Requires ``old_logp_source='replay'``
+-------------------------------------
+A ``[S*B]`` forward is numerically equivalent to the ``[B]`` forward the
+rollout ran, but **not** bit-identical: the batch shape changes GEMM tiling and
+reduction order, so per-sample log-probs move at the rounding level. The PPO
+ratio is only exact when the π_old anchor and the train pass take the *same*
+batched path, i.e. under ``old_logp_source='replay'``. Pairing this with the
+default ``'rollout'`` anchor is rejected at algorithm construction
+(``_require_replay_anchor_for_batched_replay``).
+
+Measured max per-sample log-prob gap versus the serial path (H20, bf16, B=2,
+S=3), worst strategy per model — compare against the recipe's ``clip_range``:
+
+===========  ====================  ====================
+model        Flow                  Dance / CFG
+===========  ====================  ====================
+sd3          2e-7                  3e-8
+qwen_image   2e-7                  1e-6 (CFG)
+flux2_klein  1e-5                  9e-4 (Dance+CFG)
+z_image      1e-4                  6e-3 (Flow+CFG)
+===========  ====================  ====================
+
+sd3 / qwen_image sit far below any usable ``clip_range``. z_image and
+flux2_klein do not: their list-based / RoPE-rebuilding forwards restructure
+more when the batch grows, so at ``clip_range=1e-4`` the residual is visible as
+extra clipping even with a replay anchor.
 """
 
 from __future__ import annotations

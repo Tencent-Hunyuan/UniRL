@@ -74,6 +74,8 @@ class QwenImagePipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
+    # See QwenImageDiffusionStage.batch_replay_steps and BatchedStepReplayMixin;
+    # requires old_logp_source='replay'.
     batch_replay_steps: bool = False
 
     # Static-shift fallback for FlowMatchSchedulePolicy when the pretrained
