@@ -157,7 +157,6 @@ class ReflActorRole(Remote):
         texts: Texts,
         images: Optional[Images] = None,
         params: DiffusionSamplingParams,
-        rollout_id: int = 0,
     ) -> REFLGenerated:
         """Grad-enabled BPTT sampling + in-graph VAE decode.
 
@@ -180,15 +179,11 @@ class ReflActorRole(Remote):
             )
         sampler_kwargs["kl_weight"] = self.kl_weight
 
-        # Decorrelate init noise across DP shards and rollouts (same scheme as
-        # ReFLPolicy): the config seed is the base, not the per-step value.
-        dp_rank = int(self.rank_info.dp_rank) if self.rank_info is not None else 0
-        base_seed = int(params.seed) if params.seed is not None else 42
-        params = dataclasses.replace(
-            params,
-            seed=base_seed + 1000 * int(rollout_id) + dp_rank,
-            sampler_kwargs=sampler_kwargs,
-        )
+        # Fixed init noise across rollouts and ranks — the contributor's
+        # verified DRaFT regime (params.seed used verbatim by the stage).
+        # Varying noise per rollout is a training-semantics change; do not
+        # introduce it here without its own evidence.
+        params = dataclasses.replace(params, sampler_kwargs=sampler_kwargs)
 
         conditions = self.pipeline.build_refl_conditions(texts, images=images, params=params)
         schedule = get_sigma_schedule(

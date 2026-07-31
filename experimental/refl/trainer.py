@@ -103,7 +103,7 @@ class REFLTrainer(BaseTrainer):
             self.max_grad_norm,
         )
 
-    def train_step(self, inputs: Sample, *, rollout_id: int) -> Dict[str, float]:
+    def train_step(self, inputs: Sample) -> Dict[str, float]:
         """One enable_grad() generate → score → backward, then optimizer step."""
         t0 = time.perf_counter()
         texts = _text_inputs(inputs)
@@ -114,7 +114,6 @@ class REFLTrainer(BaseTrainer):
                 texts=texts,
                 images=images,
                 params=self.sampling_params,
-                rollout_id=rollout_id,
             )
             rewards = self.reward.score_differentiable(gen.decoded, list(texts.texts), records)
             loss_metrics = self.actor.forward_backward_loss(rewards=rewards, kl_loss=gen.kl_loss)
@@ -155,7 +154,7 @@ class REFLTrainer(BaseTrainer):
         try:
             for rollout_id in range(start, num_rollouts):
                 inputs = self.data_source.get_samples(self.batch_size)
-                metrics = self.train_step(inputs, rollout_id=rollout_id)
+                metrics = self.train_step(inputs)
                 logger.info(
                     "rollout %d/%d  reward=%.4f loss=%.4f kl=%.4f grad_norm=%.4f  %.1fs",
                     rollout_id + 1,
