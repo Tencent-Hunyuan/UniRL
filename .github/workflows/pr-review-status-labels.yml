@@ -10,7 +10,9 @@ on:
 
 permissions:
   actions: read
-  pull-requests: read
+  # Labeling a PR goes through the issues API endpoint, but GitHub scopes the
+  # token check to the target resource: PRs require pull-requests write.
+  pull-requests: write
   issues: write
 
 concurrency:
