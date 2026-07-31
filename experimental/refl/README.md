@@ -18,6 +18,10 @@ export PRETRAINED_MODEL=/path/to/Wan2.1-T2V-1.3B-Diffusers \
        DATA_PATH=/path/to/prompts.txt
 RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan21_t2v_videoalign_refl num_devices=8
 
+# SD3.5 T2I + PickScore reward (core scorer — no package-local reward)
+export PRETRAINED_MODEL=/path/to/stable-diffusion-3.5-medium   # or the HF default
+RAY_ADDRESS=auto python -m experimental.refl.run --config-name=sd3_pickscore_refl num_devices=8
+
 # WAN 2.2 I2V + Face-identity reward (first frame via (image, condition)
 # MediaRef; face reference via per-sample metadata ref_video_path)
 pip install -r experimental/refl/reward/face/requirements.txt
@@ -33,7 +37,7 @@ RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan22_i2v_face_re
 |---|---|
 | `trainer.py` | `REFLTrainer(BaseTrainer)` — driver: wiring + the 3-RPC train step |
 | `roles.py` | `ReflActorRole(Remote)` — family-agnostic actor (`pipeline_target` + `model_config`) |
-| `models/` | Per-model BPTT adaptations subclassing the core pipelines (`types.py` defines the contract): `wan21.py`, `wan22.py` — mirrors `unirl/models/` (graduates into the matching model packages) |
+| `models/` | Per-model BPTT adaptations subclassing the core pipelines (`types.py` defines the contract): `wan21.py`, `wan22.py`, `sd3.py` — mirrors `unirl/models/` (graduates into the matching model packages) |
 | `reward/` | Package-local differentiable rewards (VideoAlign, Face), each with an additive-only `requirements.txt` — mirrors `unirl/reward/` (graduates into it) |
 | `examples/` | Flat Hydra configs (repo-wide schema) — mirrors the top-level `examples/` (graduates into it) |
 
@@ -54,3 +58,4 @@ core stack.
 | `wan21_t2v_videoalign_refl` (2-rollout smoke, full 81f/480x832 geometry) | 8xH20, fleet image | `40b3f4c9` | PASS — grads flow reward → VAE → DiT LoRA |
 | VideoAlign load + differentiable fwd/bwd on transformers 5.6.2 + peft 0.20 | 8xH20 (isolated venv) | `9087a671` | PASS — `grad_abs_mean=3.5e-3` |
 | `wan22_i2v_face_refl` | 8xH20 | current head | pending (needs face assets + I2V dataset) |
+| `sd3_pickscore_refl` (200 rollouts, ported from the legacy core path; hyperparameters preserved) | 8xH20 (torch 2.11 + transformers 5.6.2 + peft 0.20, fp32 LoRA master) | `9edcab00` | PASS — reward first-10 0.743 → last-10 0.903, matching the legacy-path curve (#120: 0.757 → 0.899) |

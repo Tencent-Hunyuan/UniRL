@@ -16,7 +16,7 @@
 
 num_devices: 4
 devices_per_node: 4
-batch_size: 4          # DP=4 -> 1 prompt/rank; x samples_per_prompt=8 = 8 seqs/rank
+batch_size: 4
 
 num_rollouts: 500
 weight_sync_interval: 1
@@ -50,7 +50,9 @@ bundle:
     _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
     model_precision: bf16
-    attn_implementation: sdpa
+    # Qwen3-Omni audio cu_seqlens are only honored by the FA2 varlen path;
+    # SDPA silently turns the intended windowed attention into full attention.
+    attn_implementation: flash_attention_2
     freeze_vision_tower: true
     freeze_audio_tower: true
     use_lora: true
@@ -186,7 +188,7 @@ data_source:
       eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/daily_omni_av/val.jsonl}
       seed: 42
     algorithm:
-      prompts_per_rollout: 4   # must match batch_size
+      prompts_per_rollout: 4
 
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
