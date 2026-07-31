@@ -66,79 +66,27 @@ are optional — parse defensively.
 
 ## Cook
 
-Two steps. `convert_daily_omni_dataset_format_to_unirl.py` consumes a **verl/EasyR1-style
-JSONL**, not the raw `qa.json`, so you first flatten `qa.json` into that intermediate form
-and split it.
-
-### Step 1 — `qa.json` → verl-style JSONL
-
-The converter reads four things per row: the user text (`prompt[].content[].text`), the video
-path (`videos[0].video`, falling back to a `type: "video"` content part), the gold letter
-(`reward_model.ground_truth`), and `extra_info.{video_id,qa_type}`.
-
-```python
-import json, os, random
-
-ROOT = "/path/to/Daily-Omni"
-INSTRUCTION = (
-    "Watch the video and listen to its audio, then answer the multiple-choice question.\n"
-    "Reason step by step, then end your reply with the exact phrase: The answer is [X]"
-)
-
-rows = []
-for i, qa in enumerate(json.load(open(f"{ROOT}/qa.json", encoding="utf-8"))):
-    vid = qa["video_id"]
-    path = os.path.join(ROOT, "Videos", vid, f"{vid}_video.mp4")
-    text = "\n".join([qa["Question"], *qa["Choice"], INSTRUCTION])
-    rows.append({
-        "prompt": [{"role": "user", "content": [
-            {"type": "video", "video": path},
-            {"type": "text", "text": text},
-        ]}],
-        "videos": [{"video": path}],
-        "reward_model": {"ground_truth": qa["Answer"]},
-        "extra_info": {"video_id": vid, "qa_type": qa.get("Type")},
-    })
-
-# Split by video_id so the same clip never lands in both splits.
-by_video = {}
-for r in rows:
-    by_video.setdefault(r["extra_info"]["video_id"], []).append(r)
-vids = sorted(by_video)
-random.Random(42).shuffle(vids)
-val_vids = set(vids[: max(1, len(vids) // 10)])
-
-for name, keep in (("train", lambda v: v not in val_vids), ("val", lambda v: v in val_vids)):
-    with open(f"{ROOT}/daily_omni_av_{name}.jsonl", "w", encoding="utf-8") as f:
-        for v in vids:
-            if keep(v):
-                for r in by_video[v]:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-```
-
-Two details that matter:
-
-- **Split by `video_id`, not by row.** Several QA pairs share one clip; a naive row-level
-  split leaks the same video into train and val and inflates `eval/acc`.
-- **The `The answer is [X]` instruction is required.** Both recipes score with
-  `MCExactMatchSpec(require_answer_phrase: true)`, which only accepts a phrase matching
-  `(answer|option)\s*(is|:)\s*[\(\[]?([A-D])` or an `<answer>X</answer>` tag. A reply ending
-  in a bare `B` scores **0.0**. Daily-Omni's own `Question` field carries no format
-  instruction, and the converter copies the user text verbatim, so if you skip this the
-  entire run sits at reward 0.
-
-### Step 2 — verl-style JSONL → UniRL JSONL
-
 ```bash
 python datasets/daily_omni_av/convert_daily_omni_dataset_format_to_unirl.py \
-  --train-input /path/to/Daily-Omni/daily_omni_av_train.jsonl \
-  --val-input   /path/to/Daily-Omni/daily_omni_av_val.jsonl \
-  --out-dir     datasets/daily_omni_av
+  --qa-json /path/to/Daily-Omni/qa.json \
+  --out-dir datasets/daily_omni_av
 ```
 
-Rows whose MP4 is missing on disk are dropped; pass `--keep-missing` to emit them anyway
-(useful for a dry run before the tar finishes extracting). An unparseable ground truth
-aborts with the offending `path:line`.
+`--videos-root` defaults to `Videos/` next to `qa.json`; point it elsewhere if you unpacked
+the tar somewhere else. `--val-ratio` (default `0.1`) and `--seed` (default `42`) control the
+holdout. Rows whose MP4 is missing on disk are dropped with a count on stderr — pass
+`--keep-missing` to emit them anyway, which is useful for a dry run before the tar finishes
+extracting. An unparseable ground truth aborts with the offending `qa.json[index]`.
+
+Two things the script does that are easy to get wrong by hand:
+
+- **It splits by `video_id`, not by row.** Several QA pairs share one clip; a row-level split
+  leaks the same video into train and val and inflates `eval/acc`.
+- **It appends the `The answer is [X]` instruction to every prompt.** Both recipes score with
+  `MCExactMatchSpec(require_answer_phrase: true)`, which only accepts a phrase matching
+  `(answer|option)\s*(is|:)\s*[\(\[]?([A-D])` or an `<answer>X</answer>` tag. A reply ending
+  in a bare `B` scores **0.0**, and Daily-Omni's own `Question` field carries no format
+  instruction, so without this line the entire run would sit at reward 0.
 
 ## Format
 
@@ -146,7 +94,7 @@ Each output line:
 
 ```json
 {
-  "prompt": "Question text\nA. ...\nB. ...\nC. ...\nD. ...\nReason step by step, then end your reply with the exact phrase: The answer is [X]",
+  "prompt": "Question text\nA. ...\nB. ...\nC. ...\nD. ...\nWatch the video and listen to its audio, then answer the multiple-choice question.\nReason step by step, then end your reply with the exact phrase: The answer is [X]",
   "prompt_id": "daily_omni_av:train:000042:Ec_lQgZ9wlg",
   "media_refs": [{"modality": "video", "role": "prompt", "uri": "/abs/path/Ec_lQgZ9wlg_video.mp4"}],
   "metadata": {"answer": "B", "video_id": "Ec_lQgZ9wlg", "qa_type": "Event Sequence"}
@@ -166,9 +114,9 @@ Each output line:
   tensor for diffusion V2V. `(video, prompt)` passes the URI through to the Qwen3-Omni
   conversation builder, which is what an AR prompt video needs. A batch may not mix the two.
 - **At most one video ref per prompt**, or collate raises `ValueError`.
-- **Absolute URIs.** The converter calls `os.path.abspath(os.path.expanduser(...))`. Relative
-  URIs are resolved against the directory holding the JSONL, so absolute paths keep the file
-  relocatable.
+- **Absolute URIs.** The converter resolves every clip against `--videos-root` and writes the
+  absolute path. Relative URIs would instead be resolved against the directory holding the
+  JSONL, so absolute paths keep the output relocatable.
 - **`metadata.answer` is a single uppercase letter.** `MCExactMatchRewardScorer` reads
   `metadata["answer"]` and nothing else, and the converter unwraps `[B]` → `B` and validates
   membership in `{A,B,C,D}` up front. This matters because the scorer **fails silently**: a
