@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the local daily_omni_av dataset the ``qwen3_omni_audio_video_gspo_*`` recipes train on.
+"""Convert Daily-Omni audio/video MCQA data to UniRL JSONL.
 
 Reads the official Daily-Omni release — ``qa.json`` plus the ``Videos/`` tree unpacked from
 ``Videos.tar`` (https://huggingface.co/datasets/liarliar/Daily-Omni) — and writes the jsonl
