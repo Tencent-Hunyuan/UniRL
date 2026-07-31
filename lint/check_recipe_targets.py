@@ -38,9 +38,7 @@ SKIP_PARTS = {".git", "vendor"}
 # regex alternation is derived from this tuple so the two cannot drift apart.
 PACKAGES = ("unirl", "experimental")
 
-_TARGET_RE = re.compile(
-    r"""^\s*_target_:\s*['"]?((?:%s)\.[A-Za-z0-9_.]+)['"]?\s*$""" % "|".join(PACKAGES)
-)
+_TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?((?:%s)\.[A-Za-z0-9_.]+)['"]?\s*$""" % "|".join(PACKAGES))
 
 # Deep enough to hide network-filesystem round trips behind each other.
 _READ_THREADS = 32

@@ -35,7 +35,7 @@ graduates into core instead of being borrowed sideways.
 
 ## Rules (lint-enforced where possible)
 
-1. **Import direction** (`scripts/check_experimental_boundaries.py`):
+1. **Import direction** (`lint/check_experimental_boundaries.py`):
    core never imports `experimental`; packages never import each other.
 2. **Additive-only requirements** (same script): reward and actor share
    one Python process, so a `requirements.txt` cannot version-"isolate" —
@@ -47,7 +47,7 @@ graduates into core instead of being borrowed sideways.
    `pyproject.toml` only — no version-compat branches; a wrong
    environment fails loudly and the user aligns the environment.
 4. **`_target_` hygiene**: every dotpath in `experimental/**` configs
-   must resolve (`scripts/check_recipe_targets.py` scans this tier).
+   must resolve (`lint/check_recipe_targets.py` scans this tier).
 5. **Owner + verification**: each package README carries its owner and a
    verification table (config × hardware × head × status). Unverified
    drive-by configs are rejected in review.

@@ -49,7 +49,7 @@ repos:
       # those extensions gate the (always full-tree) scan; `--all-files` CI is unaffected.
       - id: check-recipe-targets
         name: recipe _target_ paths resolve
-        entry: python scripts/check_recipe_targets.py
+        entry: python lint/check_recipe_targets.py
         language: python
         pass_filenames: false
         files: \.(ya?ml|py)$
@@ -57,7 +57,7 @@ repos:
       # packages never import each other, requirements stay additive-only.
       - id: check-experimental-boundaries
         name: experimental-tier boundaries hold
-        entry: python scripts/check_experimental_boundaries.py
+        entry: python lint/check_experimental_boundaries.py
         language: python
         pass_filenames: false
         always_run: true
