@@ -75,6 +75,36 @@ def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Ten
     return position_ids
 
 
+def _language_body(transformer: torch.nn.Module) -> torch.nn.Module:
+    """The bare decoder under a ``LlamaForCausalLM``-style head.
+
+    Both AR stages read ``last_hidden_state`` and apply their own head
+    (``lm_head`` for text, ``gen_head`` for image tokens), so neither wants the
+    wrapper's fused full-sequence logits.
+    """
+    body = getattr(transformer, "model", None)
+    if body is None:
+        body = getattr(getattr(transformer, "module", None), "model", None)
+    if body is None:
+        body = getattr(getattr(transformer, "_fsdp_wrapped_module", None), "model", None)
+    if body is None:
+        raise AttributeError(
+            "Janus-Pro AR requires a LlamaForCausalLM-style transformer exposing `.model`; "
+            f"got {type(transformer).__name__}."
+        )
+    return body
+
+
+def _output_head(transformer: torch.nn.Module) -> torch.nn.Module:
+    head = transformer.get_output_embeddings()
+    if head is None:
+        raise AttributeError(
+            "Janus-Pro AR replay requires an output head; "
+            f"{type(transformer).__name__}.get_output_embeddings() returned None."
+        )
+    return head
+
+
 def _left_repack_prompt(
     prompt: TextTokenCondition,
     images_seq_mask: torch.Tensor,
@@ -235,22 +265,15 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                     dim=1,
                 )
 
-        segment = TextSegment.pack(
+        # Cached one-token decode and full-sequence teacher forcing use different
+        # bf16 attention geometries, so these decode-time log-probs can put the
+        # first on-policy PPO ratio outside a narrow clip range. Recipes that
+        # care set `algorithm.old_logp_source: replay`, which re-anchors them
+        # train-side at the exact micro geometry training replays at.
+        return TextSegment.pack(
             tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
             log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
         )
-        # Cached one-token decode and full-sequence teacher forcing use
-        # different bf16 attention geometries. Even at identical weights, that
-        # numerical gap can put the first on-policy PPO ratio outside a narrow
-        # clip range. Anchor old-policy log-probs with the exact replay geometry
-        # used by training while keeping the extra forward graph-free.
-        with torch.no_grad():
-            segment.log_probs = self.replay(
-                conditions,
-                segment=segment,
-                temperature=float(sampling_params.temperature),
-            ).detach()
-        return segment
 
     def replay(
         self,
@@ -284,27 +307,42 @@ class JanusProARStage(ARStage[JanusProARConditions]):
             response_mask[b, :n] = 1
 
         response_embeds = self.model.transformer.get_input_embeddings()(response_tokens)
-        full_embeds = torch.cat([inputs_embeds, response_embeds], dim=1)
-        full_mask = torch.cat([attention_mask, response_mask], dim=1)
+        # Feed the prompt plus tokens [0, ..., T-2]: hidden position
+        # ``prompt_len - 1 + k`` predicts response token ``k``, so the last
+        # response token is a label only and never an input.
+        full_embeds = torch.cat([inputs_embeds, response_embeds[:, :-1]], dim=1)
+        full_mask = torch.cat([attention_mask, response_mask[:, :-1]], dim=1)
         position_ids = _position_ids_from_attention_mask(full_mask)
 
+        body = _language_body(self.model.transformer)
+        lm_head = _output_head(self.model.transformer)
         with self._autocast_ctx(device):
-            out = self.model.transformer(
+            out = body(
                 inputs_embeds=full_embeds,
                 attention_mask=full_mask,
                 position_ids=position_ids,
                 use_cache=False,
-                return_dict=True,
             )
-            logits = out.logits
+            hidden = out.last_hidden_state
 
         prompt_len = int(inputs_embeds.shape[1])
+        if int(hidden.shape[1]) != prompt_len + t_max - 1:
+            raise RuntimeError(
+                "JanusProARStage.replay: unexpected teacher-forced length "
+                f"{hidden.shape[1]}, expected {prompt_len + t_max - 1}."
+            )
         temp = float(temperature) if float(temperature) > 0.0 else 1.0
         flat: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
             if n == 0:
                 continue
-            pred_logits = logits[b, prompt_len - 1 : prompt_len - 1 + n, :]
+            # Run lm_head only at this row's predict positions. Janus-Pro's
+            # vocab is 102400, so a fused full-sequence forward would keep a
+            # [prompt_len + T, 102400] logits tensor alive in the autograd
+            # graph — ~430 MB per 2k-token sequence in bf16 — to use T rows of
+            # it. Mirrors the hidden-then-head split in `image_ar.replay`.
+            with self._autocast_ctx(device):
+                pred_logits = lm_head(hidden[b, prompt_len - 1 : prompt_len - 1 + n, :])
             log_probs_full = F.log_softmax(pred_logits.float() / temp, dim=-1)
             flat.append(log_probs_full.gather(-1, response_tokens[b, :n].unsqueeze(-1)).squeeze(-1))
 

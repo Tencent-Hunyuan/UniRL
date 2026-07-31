@@ -13,7 +13,7 @@ from unirl.types.primitives import Images
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
-from .ar import JanusProARStep, _position_ids_from_attention_mask
+from .ar import JanusProARStep, _language_body, _position_ids_from_attention_mask
 from .bundle import JanusProBundle
 from .conditions import JanusProImageARConditions
 
@@ -121,14 +121,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         return next(self.model.transformer.parameters()).device
 
     def _language_body(self) -> torch.nn.Module:
-        body = getattr(self.model.transformer, "model", None)
-        if body is None:
-            body = getattr(getattr(self.model.transformer, "module", None), "model", None)
-        if body is None:
-            body = getattr(getattr(self.model.transformer, "_fsdp_wrapped_module", None), "model", None)
-        if body is None:
-            raise AttributeError("JanusProImageARStage requires a LlamaForCausalLM-style transformer.model.")
-        return body
+        return _language_body(self.model.transformer)
 
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
@@ -235,24 +228,17 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                     dim=1,
                 )
 
-        segment = TextSegment.pack(
+        # Cached one-token decode and full-sequence teacher forcing are
+        # mathematically equivalent, but bf16 attention kernels use different
+        # numerical geometries and CFG amplifies that gap enough to move the
+        # nominally on-policy PPO ratio far outside its clip range. The T2I
+        # recipe therefore sets `algorithm.old_logp_source: replay` so the
+        # anchor is frozen train-side at the exact micro geometry training
+        # replays at, rather than at whatever shape rollout happened to use.
+        return TextSegment.pack(
             tokens=[generated_tokens[i] for i in range(batch_size)],
             log_probs=[generated_logps[i] for i in range(batch_size)],
         )
-        # Cached one-token decode and full-sequence teacher forcing are
-        # mathematically equivalent, but bf16 attention kernels use different
-        # numerical geometries. CFG amplifies that gap enough to move the
-        # nominally on-policy PPO ratio far outside its clip range. Freeze the
-        # old-policy anchor with the exact replay geometry used by training.
-        # This extra forward is graph-free and replaces 576 cached forwards in
-        # the old replay implementation.
-        with torch.no_grad():
-            segment.log_probs = self.replay(
-                conditions,
-                segment=segment,
-                temperature=float(sampling_params.temperature),
-            ).detach()
-        return segment
 
     def replay(
         self,
