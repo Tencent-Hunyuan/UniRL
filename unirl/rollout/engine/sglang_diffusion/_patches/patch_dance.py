@@ -1,20 +1,21 @@
-"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective.
+"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` for UniRL SDE variants.
 
-Stock upstream sglang supports only ``sde``/``cps``/``ode``; UniRL's
-primary objective for FLUX.2-Klein is ``dance`` (DanceGRPO). ``dance`` is
-FlowGRPO's SDE transition with a **constant** ``std_dev_t = eta`` (vs ``sde``'s
-sigma-dependent ``sqrt(sigma/(1-sigma)) * eta``); ``prev_sample_mean`` and the
-log-prob reduction are otherwise identical to the ``sde`` branch.
+Stock upstream sglang supports only ``sde``/``cps``/``ode``. UniRL additionally
+needs:
 
-This exactly matches UniRL's train-side authority
-``unirl/sde/kernels.py:DanceSDEStrategy`` (``.step`` / ``.compute_log_prob``)
-that ``logprob_source='replay'`` recomputes against -- keeping the rollout
-transition and the train-side log-prob consistent (iter-0 importance ratios ~1).
-Parity with that authority is verified by hand for now (no automated parity test yet).
+* ``dance`` (DanceGRPO): FlowGRPO's SDE drift with a constant
+  ``std_dev_t = eta``; and
+* ``flash`` (Flash-GRPO): the same drift with
+  ``std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma``.
+
+Both branches match UniRL's train-side authorities in ``unirl/sde/kernels.py``
+(``DanceSDEStrategy`` / ``FlashSDEStrategy``), so rollout trajectories and
+train-side replay log-probs stay on the same manifold. Parity is verified by
+formula review for now (no automated SGLang parity test yet).
 
 This is the ONLY REPLACE patch (all infra patches are additive). It re-vendors
-upstream ``flow_sde_sampling`` with one extra ``elif``, so it must be re-synced by
-hand against the pinned upstream source on any sglang bump.
+upstream ``flow_sde_sampling`` with extra ``elif`` branches, so it must be
+re-synced by hand against the pinned upstream source on any sglang bump.
 """
 
 from __future__ import annotations
@@ -27,23 +28,26 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 def patch_dance() -> None:
-    """Add ``dance`` to the rollout sde-type whitelist and to ``flow_sde_sampling``."""
+    """Add UniRL SDE variants to the rollout whitelist and sampler."""
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
-    # (1) Allow "dance" through request-path validation + CLI choices. Both
+    # (1) Allow UniRL variants through request-path validation + CLI choices.
     # `RLRolloutArgs.validate` and `add_cli_args` read this module global at
     # call time, so reassigning the attribute is sufficient. Idempotent.
-    if "dance" not in rl_rollout._VALID_ROLLOUT_SDE_TYPES:
-        rl_rollout._VALID_ROLLOUT_SDE_TYPES = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES) + ("dance",)
+    valid = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES)
+    for name in ("dance", "flash"):
+        if name not in valid:
+            valid = valid + (name,)
+    rl_rollout._VALID_ROLLOUT_SDE_TYPES = valid
 
-    # (2) REPLACE flow_sde_sampling with the dance-aware version. Idempotent.
-    if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_dance", False):
+    # (2) REPLACE flow_sde_sampling with the UniRL-variant-aware version. Idempotent.
+    if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_sde_variants", False):
         return
-    srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_dance
+    srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_unirl_variants
 
 
-def _flow_sde_sampling_with_dance(
+def _flow_sde_sampling_with_unirl_variants(
     self,
     batch,
     model_output: "torch.FloatTensor",
@@ -52,10 +56,10 @@ def _flow_sde_sampling_with_dance(
     next_sigma: "torch.FloatTensor",
     generator: "torch.Generator",
 ) -> "torch.Tensor":
-    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``.
+    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + UniRL variants.
 
-    Only the ``elif effective_sde_type == "dance"`` branch is new; everything
-    else is byte-for-byte upstream so sde/cps/ode behaviour is unchanged.
+    Only the ``dance`` and ``flash`` branches are new; everything else is
+    byte-for-byte upstream so sde/cps/ode behaviour is unchanged.
     """
     rollout_session_data = self._get_rollout_session_data(batch)
     sde_type = batch.rollout_sde_type
@@ -145,6 +149,39 @@ def _flow_sde_sampling_with_dance(
         prev_sample = prev_sample_mean + weighted_variance_noise
         log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
+    elif effective_sde_type == "flash":
+        # Flash-GRPO: identical drift/log-prob form to DanceGRPO, but with
+        # upstream Flash coefficient std_dev_t = sigma_min +
+        # (sigma_max - sigma_min) * sigma. SGLang receives driver-pinned
+        # FlowMatch sigmas without the terminal endpoint; for WAN/FlowMatch the
+        # terminal sigma_min is 0, matching FlashSDEStrategy.init_schedule().
+        model_output = model_output.float()
+        sample = sample.float()
+        variance_noise = self._rollout_variance_noise(batch, model_output, generator)
+        full_variance_noise = rollout_session_data.noise_buffer
+        sigma_min_raw = getattr(rollout_session_data, "sigma_min", None)
+        if sigma_min_raw is None:
+            sigma_min = current_sigma.new_tensor(0.0)
+        elif torch.is_tensor(sigma_min_raw):
+            sigma_min = sigma_min_raw.to(device=current_sigma.device, dtype=current_sigma.dtype)
+        else:
+            sigma_min = current_sigma.new_tensor(float(sigma_min_raw))
+        sigma_max_raw = rollout_session_data.sigma_max
+        if torch.is_tensor(sigma_max_raw):
+            sigma_max = sigma_max_raw.to(device=current_sigma.device, dtype=current_sigma.dtype)
+        else:
+            sigma_max = current_sigma.new_tensor(float(sigma_max_raw))
+        std_dev_t = (sigma_min + (sigma_max - sigma_min) * current_sigma) * noise_level
+        noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+        prev_sample_mean = (
+            sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
+            + model_output * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma)) * dt
+        )
+
+        weighted_variance_noise = variance_noise * noise_std_dev
+        prev_sample = prev_sample_mean + weighted_variance_noise
+        log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
+
     elif effective_sde_type == "ode":
         prev_sample = sample + dt * model_output
         prev_sample_mean = prev_sample
@@ -190,4 +227,5 @@ def _flow_sde_sampling_with_dance(
     return prev_sample
 
 
-_flow_sde_sampling_with_dance._unirl_dance = True  # type: ignore[attr-defined]
+_flow_sde_sampling_with_unirl_variants._unirl_dance = True  # type: ignore[attr-defined]
+_flow_sde_sampling_with_unirl_variants._unirl_sde_variants = True  # type: ignore[attr-defined]

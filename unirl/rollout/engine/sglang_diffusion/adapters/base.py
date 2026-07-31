@@ -95,8 +95,10 @@ class ModelAdapter(ABC):
             return "cps"
         if canonical == "dance":
             return "dance"
+        if canonical == "flash":
+            return "flash"
         raise ValueError(
-            f"SGLang rollout supports sde_type in {{'flow', 'cps', 'dance'}} only "
+            f"SGLang rollout supports sde_type in {{'flow', 'cps', 'dance', 'flash'}} only "
             f"(each has a verified SGLang-side kernel matching UniRL's math); got "
             f"canonical={canonical!r}. Switch the SDE strategy or add a mapping "
             f"after verifying the SGLang kernel is mathematically equivalent."

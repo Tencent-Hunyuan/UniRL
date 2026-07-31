@@ -414,6 +414,46 @@ class DanceSDEStrategy(SDEStrategy):
         return prev_sample, prev_sample_mean, std_var
 
 
+class FlashSDEStrategy(DanceSDEStrategy):
+    """Flash-GRPO one-step SDE formulation.
+
+    Flash-GRPO keeps the Flow/Dance drift and Gaussian log-prob form but
+    changes the per-step diffusion coefficient to
+
+    ``std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma``
+
+    (upstream ``Shredded-Pork/Flash-GRPO`` commit
+    ``bd6051f68e1ab444e5ec7c6ffe0a1f7eaf559a0d``). ``sigma_max`` is the first
+    post-initial schedule sigma (``sigmas[1]``), matching the existing stage
+    contract; ``sigma_min`` is captured from ``init_schedule(sigmas)`` and is
+    normally zero for FlowMatch schedules. Multiplying by ``eta`` preserves
+    UniRL's convention that non-SDE steps run as deterministic Euler steps when
+    the stage passes ``eta=0``. Use ``eta=1.0`` to match the upstream Flash-GRPO
+    sampler.
+    """
+
+    canonical_name: ClassVar[str] = "flash"
+
+    def __init__(self, *, config: Optional["FlashSpec"] = None) -> None:
+        del config
+        self._sigma_min: Optional[float] = None
+
+    def init_schedule(self, sigmas: torch.Tensor) -> None:
+        self._sigma_min = float(sigmas[-1].item())
+
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: float = 0.99,
+    ) -> torch.Tensor:
+        del sigma_next
+        sigma_min = 0.0 if self._sigma_min is None else float(self._sigma_min)
+        return (sigma_min + (float(sigma_max) - sigma_min) * sigma) * float(eta)
+
+
 # ---------------------------------------------------------------------------
 # DPM2 deterministic ODE strategy (migrated from sd3_sampler.py)
 # ---------------------------------------------------------------------------
@@ -612,6 +652,11 @@ class DanceSpec:
 
 
 @dataclass
+class FlashSpec:
+    """Empty Spec: FlashSDEStrategy has no per-strategy config fields."""
+
+
+@dataclass
 class DPM2Spec:
     """Empty Spec: DPM2Strategy has no per-strategy config fields."""
 
@@ -622,9 +667,11 @@ __all__ = [
     "FlowSDEStrategy",
     "CPSSDEStrategy",
     "DanceSDEStrategy",
+    "FlashSDEStrategy",
     "DPM2Strategy",
     "FlowSpec",
     "CPSSpec",
     "DanceSpec",
+    "FlashSpec",
     "DPM2Spec",
 ]

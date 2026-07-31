@@ -11,6 +11,7 @@ from .cppo import CPPO, CPPOConfig
 from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
 from .dppo import DPPO, DPPOConfig
 from .drpo import DRPO, DRPOConfig
+from .flashgrpo import FlashGRPO, FlashGRPOConfig
 from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .flowgrpo import FlowGRPO, FlowGRPOConfig
 from .grpo import GRPO, GRPOConfig
@@ -34,6 +35,8 @@ __all__ = [
     "BagelFlowUniGRPO",
     "FlowGRPO",
     "FlowGRPOConfig",
+    "FlashGRPO",
+    "FlashGRPOConfig",
     "DiffusionNFT",
     "DiffusionNFTConfig",
     "FlowDPPO",

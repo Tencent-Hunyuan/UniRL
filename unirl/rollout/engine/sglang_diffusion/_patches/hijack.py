@@ -225,7 +225,7 @@ class SglangDiffusionHijack:
         #     in-memory LoRA; RL Scheduler handlers.
         # (B) post1 bridge: grouped-stage dispatch (v0.5.12.post1 predates the
         #     3142278c5 grouped-path fix; no-op on any sglang that has it).
-        # (C) The one REPLACE: the DanceGRPO objective upstream lacks.
+        # (C) The one REPLACE: UniRL SDE variants upstream lacks (Dance/Flash).
         for patch in (
             patch_srt,
             patch_platform_device,
