@@ -39,7 +39,9 @@ class JanusProBundle(Bundle):
     @classmethod
     def from_config(cls, config: JanusProPipelineConfig) -> "JanusProBundle":
         try:
-            from .vendor.models import VLChatProcessor
+            # Importing the vendored package is also what registers
+            # MultiModalityCausalLM with AutoModelForCausalLM below.
+            from .vendor.models import MultiModalityCausalLM, VLChatProcessor
         except ImportError as exc:
             raise ImportError(
                 "JanusProBundle requires the vendored DeepSeek Janus code under "
@@ -65,6 +67,17 @@ class JanusProBundle(Bundle):
             trust_remote_code=bool(config.trust_remote_code),
             torch_dtype=dtype,
         ).to(device=device, dtype=dtype)
+        # With trust_remote_code a checkpoint shipping its own modeling file can
+        # win over the vendored registration, which would silently drop the
+        # transformers-5.x compatibility patches recorded in VENDOR_COMMIT.txt —
+        # including the grad-safety clone in prepare_inputs_embeds that replay
+        # backprop depends on. Fail loudly instead of training the wrong class.
+        if not isinstance(model, MultiModalityCausalLM):
+            raise TypeError(
+                f"JanusProBundle: {path} resolved to {type(model).__module__}.{type(model).__name__}, "
+                "not the vendored MultiModalityCausalLM. Set trust_remote_code=false, or re-vendor "
+                "if the checkpoint genuinely needs newer modeling code."
+            )
         model.eval()
 
         if config.freeze_vision_tower and hasattr(model, "vision_model"):
