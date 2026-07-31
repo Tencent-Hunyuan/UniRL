@@ -10,8 +10,8 @@ exist — purely via ``ast``, importing nothing (no torch/vllm/sglang needed).
 Only ~0.2s of the runtime is parsing; the rest is filesystem latency, which dominates
 when the checkout lives on a network filesystem. So the tree is walked once to index
 every module (rather than probing candidate paths per target, which costs ~10k stat
-calls) and file contents are read through a thread pool. On CephFS that is the
-difference between ~5min and ~15s per run.
+calls) and file contents are read through a thread pool. On CephFS that takes the
+hook from ~5m30s to ~26s.
 
 Run by the ``check-recipe-targets`` pre-commit hook (so it rides the existing
 ``pre-commit run --all-files`` lint CI). Exits non-zero, listing each unresolved
@@ -51,16 +51,24 @@ def _scan() -> tuple[dict[str, Path], list[Path]]:
     for d in SCAN_DIRS:
         for dirpath, _dirnames, filenames in os.walk(ROOT / d):
             parts = Path(dirpath).relative_to(ROOT).parts
+            # Only an importable directory chain can be named by a dotted ``_target_``.
+            importable = parts[0] == PACKAGE and all(p.isidentifier() for p in parts)
             skipped = bool(SKIP_PARTS & set(parts))
             for name in filenames:
-                if parts[0] == PACKAGE and name.endswith(".py"):
-                    if name == "__init__.py":
-                        packages[".".join(parts)] = Path(dirpath, name)
-                    else:
-                        modules[".".join((*parts, name[:-3]))] = Path(dirpath, name)
+                path = Path(dirpath, name)
+                if importable and name.endswith(".py"):
+                    stem = name[:-3]
+                    if stem == "__init__":
+                        # Both ``pkg`` and the explicit ``pkg.__init__`` spelling reach it.
+                        packages[".".join(parts)] = path
+                        packages[".".join((*parts, stem))] = path
+                    elif stem.isidentifier():
+                        modules[".".join((*parts, stem))] = path
                 elif not skipped and fnmatch.fnmatch(name, "*.y*ml"):
-                    recipes.append(Path(dirpath, name))
-    # A module file shadows a package of the same name, as in Python's own lookup.
+                    recipes.append(path)
+    # A module file shadows a package of the same name, keeping the probe order this
+    # check has always used (``pkg/sub.py`` before ``pkg/sub/__init__.py``); note that
+    # Python's own import machinery resolves the other way round.
     return {**packages, **modules}, sorted(recipes)
 
 
@@ -72,7 +80,7 @@ def _read_all(paths: list[Path]) -> list[str]:
 def _top_level_names(source: str, path: Path) -> frozenset[str] | None:
     """Top-level names bound in ``source`` (class/func/assign/import), or None."""
     try:
-        tree = ast.parse(source, filename=str(path))
+        tree = ast.parse(source, filename=path)
     except SyntaxError:
         return None
     names: set[str] = set()
