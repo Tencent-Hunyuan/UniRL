@@ -4,8 +4,8 @@
 Renames (e.g. ``unirl.algorithms.ar_grpo.ARGRPO`` -> ``unirl.algorithms.grpo.GRPO``)
 break Hydra ``instantiate`` only at *runtime*, and this repo's CI is lint-only, so a
 stale dotted path can merge silently. This check parses every recipe ``_target_:``
-pointing into the ``unirl`` package and confirms the module file and the attribute
-exist — purely via ``ast``, importing nothing (no torch/vllm/sglang needed).
+pointing into one of the ``PACKAGES`` trees and confirms the module file and the
+attribute exist — purely via ``ast``, importing nothing (no torch/vllm/sglang needed).
 
 Only ~0.2s of the runtime is parsing; the rest is filesystem latency, which dominates
 when the checkout lives on a network filesystem. So the tree is walked once to index
@@ -34,10 +34,13 @@ ROOT = Path(__file__).resolve().parents[1]
 SCAN_DIRS = ["examples", "experimental", "CPPO", "DRPO", "FlowDPPO", "unirl"]
 # Vendored / sub-project trees kept byte-pristine (mirror .pre-commit-config exclude).
 SKIP_PARTS = {".git", "vendor"}
-# The only package ``_TARGET_RE`` accepts, so the only one worth indexing.
-PACKAGE = "unirl"
+# The only packages ``_TARGET_RE`` accepts, so the only ones worth indexing; the
+# regex alternation is derived from this tuple so the two cannot drift apart.
+PACKAGES = ("unirl", "experimental")
 
-_TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?((?:unirl|experimental)\.[A-Za-z0-9_.]+)['"]?\s*$""")
+_TARGET_RE = re.compile(
+    r"""^\s*_target_:\s*['"]?((?:%s)\.[A-Za-z0-9_.]+)['"]?\s*$""" % "|".join(PACKAGES)
+)
 
 # Deep enough to hide network-filesystem round trips behind each other.
 _READ_THREADS = 32
@@ -52,7 +55,7 @@ def _scan() -> tuple[dict[str, Path], list[Path]]:
         for dirpath, _dirnames, filenames in os.walk(ROOT / d):
             parts = Path(dirpath).relative_to(ROOT).parts
             # Only an importable directory chain can be named by a dotted ``_target_``.
-            importable = parts[0] == PACKAGE and all(p.isidentifier() for p in parts)
+            importable = parts[0] in PACKAGES and all(p.isidentifier() for p in parts)
             skipped = bool(SKIP_PARTS & set(parts))
             for name in filenames:
                 path = Path(dirpath, name)
@@ -141,7 +144,7 @@ def main() -> int:
         for f in failures:
             print(f"  {f}", file=sys.stderr)
         return 1
-    print(f"check-recipe-targets: {len(targets)} unirl _target_ paths resolve.")
+    print(f"check-recipe-targets: {len(targets)} recipe _target_ paths resolve.")
     return 0
 
 
