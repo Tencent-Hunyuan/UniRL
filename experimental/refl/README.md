@@ -53,5 +53,4 @@ core stack.
 | `wan21_t2v_videoalign_refl` (835 rollouts) | 8xH20 | pre-adjustment (`e3c6b940` lineage) | contributor long run — reward curve in PR #210 |
 | `wan21_t2v_videoalign_refl` (2-rollout smoke, full 81f/480x832 geometry) | 8xH20, fleet image | `40b3f4c9` | PASS — grads flow reward → VAE → DiT LoRA |
 | VideoAlign load + differentiable fwd/bwd on transformers 5.6.2 + peft 0.20 | 8xH20 (isolated venv) | `9087a671` | PASS — `grad_abs_mean=3.5e-3` |
-| `wan21_t2v_videoalign_refl` (150-rollout trend, 5.6 stack, substitute assets: pickscore prompts + VideoReward-2B) | 8xH20 | `9087a671` | mechanics PASS (9.5h, 228s/step, clean exit, no collapse, grads healthy); reward FLAT at this horizon — segment means 1.91/1.95/1.91/2.07/1.80/1.95, first25→last25 +2.4%. Learning-effect verdict deferred to longer horizons / original assets; lr-sensitivity diagnostic tracked in PR #210 |
 | `wan22_i2v_face_refl` | 8xH20 | current head | pending (needs face assets + I2V dataset) |
