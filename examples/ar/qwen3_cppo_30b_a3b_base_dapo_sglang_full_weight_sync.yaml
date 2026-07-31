@@ -97,7 +97,8 @@ rollout:
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     tp_size: 8
     ep_size: 8
-    enable_expert_parallel: true
+    # SGLang enables MoE expert parallelism through ep_size; the pinned
+    # ServerArgs has no separate enable_expert_parallel boolean.
     max_new_tokens: 4096
     temperature: 1.0
     top_p: 1.0

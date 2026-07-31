@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pytest
+import yaml
 
 from unirl.rollout.engine.sglang.backends.base import (
     _REQUIRED_SERVER_ARGS_METADATA_KEY,
@@ -47,3 +50,14 @@ def test_normalize_cuda_visible_devices_preserves_opaque_tokens() -> None:
 def test_normalize_cuda_visible_devices_rejects_ambiguous_layout(tokens: list[str]) -> None:
     with pytest.raises(ValueError):
         _normalize_cuda_visible_devices(tokens, tp_size=2)
+
+
+def test_full_weight_sync_recipe_enables_expert_parallelism_with_ep_size() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    recipe = yaml.safe_load(
+        (repo_root / "examples/ar/qwen3_cppo_30b_a3b_base_dapo_sglang_full_weight_sync.yaml").read_text()
+    )
+    rollout_config = recipe["rollout"]["config"]
+
+    assert rollout_config["ep_size"] == rollout_config["tp_size"] == 8
+    assert "enable_expert_parallel" not in rollout_config

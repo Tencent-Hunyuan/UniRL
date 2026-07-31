@@ -134,6 +134,12 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 
 def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
     """HTTP server target with child-local launch environment overrides."""
+    # The backend tears this subprocess tree down with killpg().  A
+    # multiprocessing child inherits the launcher's process group by default,
+    # so without a fresh session that cleanup also SIGTERMs the Ray worker,
+    # training driver, and any other process in the launcher's group.
+    os.setsid()
+
     if env_overrides:
         # Must run before importing SGLang or touching torch.cuda in the
         # spawned child: CUDA_VISIBLE_DEVICES can be cached after CUDA init.
