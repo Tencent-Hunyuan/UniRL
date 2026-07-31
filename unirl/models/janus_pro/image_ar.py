@@ -8,12 +8,16 @@ import torch
 import torch.nn.functional as F
 
 from unirl.models.types.ar import ARSamplingParams, ARStage
-from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Images
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
-from .ar import JanusProARStep, _language_body, _position_ids_from_attention_mask
+from .ar import (
+    JanusProARStep,
+    _language_body,
+    _left_repack_token_condition,
+    _position_ids_from_attention_mask,
+)
 from .bundle import JanusProBundle
 from .conditions import JanusProImageARConditions
 
@@ -31,40 +35,6 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     width: Optional[int] = None
     height: Optional[int] = None
     patch_size: int = 16
-
-
-def _left_repack_token_condition(
-    prompt: TextTokenCondition,
-    *,
-    pad_id: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if prompt.input_ids is None or prompt.attention_mask is None:
-        raise ValueError("JanusProImageARStage requires prompt.input_ids and prompt.attention_mask.")
-
-    input_ids = prompt.input_ids.to(device=device, dtype=torch.long)
-    attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
-    if input_ids.shape != attention_mask.shape:
-        raise ValueError(
-            "JanusProImageARStage: prompt.input_ids and prompt.attention_mask must have matching shapes, "
-            f"got {tuple(input_ids.shape)} and {tuple(attention_mask.shape)}."
-        )
-
-    lengths = attention_mask.sum(dim=1).long()
-    if int(lengths.min().item()) <= 0:
-        raise ValueError("JanusProImageARStage received an empty prompt row.")
-    max_len = int(lengths.max().item())
-    batch = int(input_ids.shape[0])
-
-    repacked_ids = torch.full((batch, max_len), int(pad_id), dtype=torch.long, device=device)
-    repacked_mask = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-    real_mask = attention_mask.bool()
-    for b in range(batch):
-        real_ids = input_ids[b][real_mask[b]]
-        n = int(real_ids.numel())
-        repacked_ids[b, max_len - n :] = real_ids
-        repacked_mask[b, max_len - n :] = 1
-    return repacked_ids, repacked_mask
 
 
 def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int, int]:
@@ -141,11 +111,13 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             conditions.prompt,
             pad_id=self.model.pad_token_id,
             device=device,
+            where="JanusProImageARStage",
         )
         cfg_ids, cfg_mask = _left_repack_token_condition(
             conditions.cfg_prompt,
             pad_id=self.model.pad_token_id,
             device=device,
+            where="JanusProImageARStage.cfg_prompt",
         )
         if prompt_ids.shape != cfg_ids.shape:
             raise ValueError(
@@ -178,10 +150,19 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             top_p=float(sampling_params.top_p),
             top_k=int(sampling_params.top_k),
         )
-        cfg_weight = float(getattr(sampling_params, "cfg_weight", conditions.cfg_weight))
-
-        self.model.transformer.eval()
-        self.model.model.eval()
+        # `conditions.cfg_weight` is the single source of truth: replay runs from
+        # GRPO with no sampling_params, so anchoring the rollout on a different
+        # value would silently bias every importance ratio. The pipeline copies
+        # sampling_params.cfg_weight into the conditions, so a mismatch here
+        # means the two were wired from different places.
+        cfg_weight = float(conditions.cfg_weight)
+        sampled_cfg = getattr(sampling_params, "cfg_weight", None)
+        if sampled_cfg is not None and float(sampled_cfg) != cfg_weight:
+            raise ValueError(
+                "JanusProImageARStage: sampling_params.cfg_weight="
+                f"{float(sampled_cfg)} disagrees with conditions.cfg_weight={cfg_weight}; "
+                "replay can only see the conditions value, so the PPO ratio would be biased."
+            )
 
         with torch.no_grad(), self._autocast_ctx(device):
             inputs_embeds, attention_mask = self._prepare_paired_prompt_embeds(conditions, device=device)

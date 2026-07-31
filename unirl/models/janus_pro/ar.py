@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep
+from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -105,6 +105,36 @@ def _output_head(transformer: torch.nn.Module) -> torch.nn.Module:
     return head
 
 
+def _left_repack_token_condition(
+    prompt: TextTokenCondition,
+    *,
+    pad_id: int,
+    device: torch.device,
+    where: str = "Janus-Pro AR",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Move a prompt onto ``device`` and left-align it via ``left_pad_prompt``.
+
+    ``TextTokenCondition.concat`` right-pads shards to the global max, so a
+    batch that arrives from a merged rollout carries a left-pad run (the Janus
+    processor's own batchify) followed by a right-pad run. Both AR stages need
+    every row's last real token in the final column.
+    """
+    if prompt.input_ids is None or prompt.attention_mask is None:
+        raise ValueError(f"{where} requires prompt.input_ids and prompt.attention_mask.")
+
+    input_ids = prompt.input_ids.to(device=device, dtype=torch.long)
+    attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
+    if input_ids.shape != attention_mask.shape:
+        raise ValueError(
+            f"{where}: prompt.input_ids and prompt.attention_mask must have matching shapes, "
+            f"got {tuple(input_ids.shape)} and {tuple(attention_mask.shape)}."
+        )
+    if int(attention_mask.sum(dim=1).min().item()) <= 0:
+        raise ValueError(f"{where} received an empty prompt row.")
+
+    return left_pad_prompt(input_ids, attention_mask, int(pad_id))
+
+
 def _left_repack_prompt(
     prompt: TextTokenCondition,
     images_seq_mask: torch.Tensor,
@@ -112,30 +142,22 @@ def _left_repack_prompt(
     pad_id: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if prompt.input_ids is None or prompt.attention_mask is None:
-        raise ValueError("Janus-Pro AR requires prompt.input_ids and prompt.attention_mask.")
+    """``_left_repack_token_condition`` plus the image-placeholder mask.
 
-    input_ids = prompt.input_ids.to(device=device, dtype=torch.long)
+    ``images_seq_mask`` indexes prompt positions, so it has to travel through
+    the same permutation as ``input_ids`` or ``prepare_inputs_embeds`` scatters
+    the image embeddings into the wrong slots.
+    """
+    repacked_ids, repacked_mask = _left_repack_token_condition(prompt, pad_id=pad_id, device=device)
+
     attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
     images_seq_mask = images_seq_mask.to(device=device, dtype=torch.bool)
-
-    lengths = attention_mask.sum(dim=1).long()
-    if int(lengths.min().item()) <= 0:
-        raise ValueError("Janus-Pro AR received an empty prompt row.")
-    max_len = int(lengths.max().item())
-    batch = int(input_ids.shape[0])
-
-    repacked_ids = torch.full((batch, max_len), int(pad_id), dtype=torch.long, device=device)
-    repacked_mask = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-    repacked_img_mask = torch.zeros((batch, max_len), dtype=torch.bool, device=device)
-
+    max_len = int(repacked_ids.shape[1])
+    repacked_img_mask = torch.zeros_like(repacked_ids, dtype=torch.bool)
     real_mask = attention_mask.bool()
-    for b in range(batch):
-        real_ids = input_ids[b][real_mask[b]]
-        real_img = images_seq_mask[b][real_mask[b]]
-        n = int(real_ids.numel())
-        repacked_ids[b, max_len - n :] = real_ids
-        repacked_mask[b, max_len - n :] = 1
+    for b in range(int(images_seq_mask.shape[0])):
+        real_img = images_seq_mask[b][real_mask[b]][:max_len]
+        n = int(real_img.numel())
         repacked_img_mask[b, max_len - n :] = real_img
 
     return repacked_ids, repacked_mask, repacked_img_mask
@@ -208,16 +230,17 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         stop_ids = self._resolve_stop_ids(params, sampling_params)
         max_new = int(sampling_params.max_new_tokens)
 
-        generated_tokens: List[List[int]] = []
-        per_token_logps: List[List[float]] = []
-
-        self.model.transformer.eval()
         with torch.no_grad(), self._autocast_ctx(device):
             inputs_embeds, attention_mask = self._prepare_prompt_embeds(conditions, device=device)
             batch_size = int(inputs_embeds.shape[0])
-            generated_tokens = [[] for _ in range(batch_size)]
-            per_token_logps = [[] for _ in range(batch_size)]
-            finished = [False] * batch_size
+            # Accumulate on device: reading each token back with .item() inside
+            # the loop costs 2*B host syncs per step on top of the one the
+            # all-ranks-done reduction already pays.
+            generated_tokens = torch.zeros((batch_size, max_new), dtype=torch.long, device=device)
+            generated_logps = torch.zeros((batch_size, max_new), dtype=torch.float32, device=device)
+            lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            stop_ids_t = torch.tensor(stop_ids, dtype=torch.long, device=device) if stop_ids else None
             past_key_values = None
             next_input_ids = None
             cur_attention_mask = attention_mask
@@ -244,16 +267,19 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                     )
                 past_key_values = out.past_key_values
                 token_id, log_prob = step.step(out.logits[:, -1, :])
-                for b in range(batch_size):
-                    if finished[b]:
-                        continue
-                    tid = int(token_id[b].item())
-                    generated_tokens[b].append(tid)
-                    per_token_logps[b].append(float(log_prob[b].item()))
-                    if tid in stop_ids:
-                        finished[b] = True
 
-                local_done = torch.tensor([1 if all(finished) else 0], device=device)
+                # A row that already emitted its stop token keeps decoding (FSDP
+                # needs every rank in every collective) but stops recording.
+                active = ~finished
+                generated_tokens[:, i] = torch.where(active, token_id, torch.zeros_like(token_id))
+                generated_logps[:, i] = torch.where(active, log_prob.float(), torch.zeros_like(log_prob.float()))
+                lengths += active.long()
+                if stop_ids_t is not None:
+                    finished |= active & (token_id.unsqueeze(-1) == stop_ids_t).any(dim=-1)
+
+                # All ranks must agree before breaking: FSDP all-gathers on every
+                # forward, so one rank leaving early would hang the others.
+                local_done = finished.all().to(dtype=torch.long).reshape(1)
                 if dist.is_initialized():
                     dist.all_reduce(local_done, op=dist.ReduceOp.MIN)
                 if int(local_done.item()) == 1:
@@ -265,14 +291,16 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                     dim=1,
                 )
 
+        # One host sync for the whole loop, instead of one per token per row.
+        lens = [int(n) for n in lengths.tolist()]
         # Cached one-token decode and full-sequence teacher forcing use different
         # bf16 attention geometries, so these decode-time log-probs can put the
         # first on-policy PPO ratio outside a narrow clip range. Recipes that
         # care set `algorithm.old_logp_source: replay`, which re-anchors them
         # train-side at the exact micro geometry training replays at.
         return TextSegment.pack(
-            tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-            log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
+            tokens=[generated_tokens[b, :n] for b, n in enumerate(lens)],
+            log_probs=[generated_logps[b, :n] for b, n in enumerate(lens)],
         )
 
     def replay(
