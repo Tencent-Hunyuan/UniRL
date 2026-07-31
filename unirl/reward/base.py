@@ -81,12 +81,16 @@ class DifferentiableReward(Protocol):
 
     def compute_rewards_differentiable(
         self,
-        images_tensor: "torch.Tensor",
+        media_tensor: "torch.Tensor",
         prompts: List[str],
-        records: Optional[List[dict]] = None,
+        records: Optional[List[dict[str, object]]] = None,
     ) -> "torch.Tensor":
-        """Score a grad-carrying image tensor ``[B, C, H, W]`` in ``[0, 1]`` →
-        ``[B]`` reward tensor with ``grad_fn`` intact (no ``no_grad``/``.item()``)."""
+        """Score grad-carrying image ``[B,C,H,W]`` or video ``[B,C,T,H,W]`` media.
+
+        Returns a ``[B]`` reward tensor with ``grad_fn`` intact. ``records`` may
+        carry per-sample metadata such as ``ref_video_path`` for recipe-local
+        video rewards.
+        """
         ...
 
 
