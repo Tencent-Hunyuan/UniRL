@@ -5,8 +5,7 @@ from typing import Any, Dict, Optional
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from .ar import JanusProARParams, JanusProARStage
 from .bundle import JanusProBundle
@@ -18,6 +17,23 @@ from .image_prompt import JanusProImagePromptStage
 
 
 class JanusProPipeline(Pipeline):
+    """Janus-Pro generate pipeline: ``Sample -> Sample``.
+
+    Two tasks share one bundle, picked by ``parts[0].control["task"]`` or
+    inferred from whether an ancestor Part carries an ``Images`` primitive:
+
+    - ``i2t`` — Text+Image -> Text through the understanding tower. Reads one
+      ``Texts`` and one ``Images`` turn off the trajectory and fills the
+      frontier Part with a ``TextSegment`` plus ``primitives["text"]``.
+    - ``t2i`` — Text -> Image as autoregressive image tokens (Janus-Pro's image
+      path is AR, not diffusion). Fills the frontier Part with the image-token
+      ``TextSegment`` plus the decoded ``primitives["image"]``.
+
+    Either way ``Part.conditions`` carries the encoded prompt, and trainer-side
+    replay teacher-forces over those stored ids, so this encode is the single
+    source of truth for the importance ratio.
+    """
+
     def __init__(
         self,
         *,
@@ -102,33 +118,52 @@ class JanusProPipeline(Pipeline):
         bundle = JanusProBundle.from_config(config)
         return cls.from_bundle(bundle, config=config)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        task = str(req.task_config.get("task") or "").strip().lower()
-        if not task:
-            task = "i2t" if isinstance(req.primitives.get("image"), Images) else "t2i"
+    @staticmethod
+    def _resolve_task(sample: Sample) -> str:
+        """Explicit ``parts[0].control["task"]`` wins, else infer from the inputs.
+
+        Janus-Pro's two paths are told apart by the presence of an input image:
+        understanding consumes one, AR image generation does not.
+        """
+        task = (sample.parts[0].control or {}).get("task")
+        if task is None:
+            return "i2t" if sample.has_image_input() else "t2i"
+        return str(task).strip().lower()
+
+    def generate(self, sample: Sample) -> Sample:
+        task = self._resolve_task(sample)
         if task in {"i2t", "it2t", "understanding", "text"}:
-            return self._generate_i2t(req)
+            return self._generate_i2t(sample)
         if task in {"t2i", "text2image", "image", "generation"}:
-            return self._generate_t2i(req)
+            return self._generate_t2i(sample)
         raise ValueError(f"JanusProPipeline.generate: unsupported task={task!r}")
 
-    def _generate_i2t(self, req: RolloutReq) -> RolloutResp:
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"JanusProPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
+    @staticmethod
+    def _single(turns, kind, task: str):
+        """The one primitive of ``kind`` on the trajectory.
 
-        images_prim = req.primitives.get("image")
-        if not isinstance(images_prim, Images):
-            raise TypeError(
-                "JanusProPipeline.generate implements Text+Image -> Text and requires "
-                f"req.primitives['image'] to be Images, got "
-                f"{type(images_prim).__name__ if images_prim is not None else 'None'}"
+        Janus-Pro's chat template renders exactly one user turn, so a multi-turn
+        trajectory has no faithful encoding here — fail rather than silently
+        dropping turns.
+        """
+        found = [t.content for t in turns if isinstance(t.content, kind)]
+        if len(found) != 1:
+            raise ValueError(
+                f"JanusProPipeline.{task}: expected exactly one {kind.__name__} turn, got {len(found)}. "
+                "The Janus-Pro chat template renders a single user turn and cannot encode a "
+                "multi-turn trajectory."
             )
+        return found[0]
 
-        chat_overrides: Dict[str, Any] = dict(req.task_config.get("chat") or {})
+    def _generate_i2t(self, sample: Sample) -> Sample:
+        frontier = sample.frontier_gen_part(ARSamplingParams)
+
+        # Fails loud on zero images or a non-text/image modality.
+        turns, _images = sample.vision_conditioning()
+        texts = self._single(turns, Texts, "i2t")
+        images_prim = self._single(turns, Images, "i2t")
+
+        chat_overrides: Dict[str, Any] = dict((sample.parts[0].control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = JanusProChatTemplateStage(
                 self.bundle,
@@ -143,17 +178,15 @@ class JanusProPipeline(Pipeline):
 
         conds: JanusProARConditions = chat_stage.embed(texts, images=images_prim.to_pils())
 
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = JanusProARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
-            )
-        else:
-            params = JanusProARParams()
-
+        # Normalize the gen shell's params through JanusProARParams (stop_token_id
+        # reset, types coerced), mirroring qwen_vl.
+        ar = frontier.sampling_params
+        params = JanusProARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+        )
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
@@ -164,48 +197,32 @@ class JanusProPipeline(Pipeline):
 
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
-
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
+        return sample.with_filled_frontier(
+            segment=segment,
+            primitives={"text": decoded},
+            conditions=conds.to_dict(),
         )
 
-    def _generate_t2i(self, req: RolloutReq) -> RolloutResp:
+    def _generate_t2i(self, sample: Sample) -> Sample:
         if self.image_prompt is None or self.image_ar is None:
             raise RuntimeError("JanusProPipeline Text -> Image requires image_prompt and image_ar stages.")
 
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"JanusProPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
+        # The image grid, CFG weight, and token count all ride on the gen shell,
+        # so the params type is part of the contract rather than a soft default.
+        frontier = sample.frontier_gen_part(JanusProImageARSamplingParams)
+        sampling_params: JanusProImageARSamplingParams = frontier.sampling_params
 
-        ar = req.sampling_params.get("ar")
-        sampling_params = ar if ar is not None else JanusProImageARSamplingParams()
-        cfg_weight = float(getattr(sampling_params, "cfg_weight", 5.0))
-
-        conds: JanusProImageARConditions = self.image_prompt.embed(texts, cfg_weight=cfg_weight)
+        texts = self._single(sample.turns(), Texts, "t2i")
+        conds: JanusProImageARConditions = self.image_prompt.embed(
+            texts,
+            cfg_weight=float(sampling_params.cfg_weight),
+        )
         segment = self.image_ar.autoregress(conds, sampling_params=sampling_params)
         decoded = self.image_ar.decode(segment, sampling_params=sampling_params)
-
-        return RolloutResp(
-            tracks={
-                "image": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
+        return sample.with_filled_frontier(
+            segment=segment,
+            primitives={"image": decoded},
+            conditions=conds.to_dict(),
         )
 
     def _detokenize(self, segment) -> Texts:
