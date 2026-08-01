@@ -79,7 +79,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def install_fate_sharing(anchor_pid: int) -> None:
+def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
     """Bind this process's lifetime to the root of its spawn chain.
 
     Without this the engine subprocess tree outlives the run. Measured on the
@@ -88,28 +88,28 @@ def install_fate_sharing(anchor_pid: int) -> None:
     ``Worker_TP*`` processes reparent to init and sit there holding ~7.3 GiB of
     device memory each until reaped by hand.
 
-    Two independent mechanisms, because neither alone is sufficient:
+    Two complementary mechanisms:
 
-    - ``PR_SET_PDEATHSIG`` fires on termination of the *thread* that created
-      this process, not the parent process. vllm-omni already arms it (with
-      SIGTERM) for ``StageEngineCoreProc``, whose creating thread lives in
-      ``AsyncOmniEngine._stage_init_executor`` — that is why the engine core
-      does die. It buys the TP workers nothing when their creator wedges.
+    - ``PR_SET_PDEATHSIG`` is armed only when the parent's main thread creates
+      the process. Linux binds it to the specific creator thread, so arming it
+      for children launched by short-lived stage-initialization threads would
+      kill healthy workers as soon as initialization finishes.
     - A poll on the root anchor. vLLM's own ``death_pipe`` EOF monitor is the
       intended backstop for the TP workers, but it only unblocks the worker's
       message queues; a worker sitting in a CUDA or NCCL call never observes
       it. Polling a pid and calling ``os._exit`` does not depend on the worker
       being schedulable in Python at the moment its parent dies.
     """
-    try:
-        import ctypes
+    if arm_pdeathsig:
+        try:
+            import ctypes
 
-        # PR_SET_PDEATHSIG == 1. SIGKILL rather than vllm-omni's SIGTERM: by
-        # the time we get here the parent is already gone, so there is nobody
-        # left to hand a graceful shutdown to.
-        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
-    except Exception:  # noqa: BLE001 - best effort; the watchdog below is the real guarantee
-        pass
+            # PR_SET_PDEATHSIG == 1. SIGKILL rather than vllm-omni's SIGTERM:
+            # by the time it fires the creator thread is already gone, so
+            # there is nobody left to hand a graceful shutdown to.
+            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
+        except Exception:  # noqa: BLE001 - best effort; the watchdog below is the real guarantee
+            pass
 
     root = os.environ.get(_FATE_ANCHOR_ENV)
     root_pid = int(root) if root else int(anchor_pid)
@@ -147,9 +147,13 @@ class _DiffrlPatchedTarget:
     def __init__(self, target):
         self._target = target
         self._anchor_pid = os.getpid()
+        self._arm_pdeathsig = False
 
     def __call__(self, *args, **kwargs):
-        install_fate_sharing(getattr(self, "_anchor_pid", os.getppid()))
+        install_fate_sharing(
+            getattr(self, "_anchor_pid", os.getppid()),
+            arm_pdeathsig=getattr(self, "_arm_pdeathsig", False),
+        )
         VLLMOmniHijack.hijack()
         return self._target(*args, **kwargs)
 
@@ -170,6 +174,7 @@ def wrap_mp_process_for_children() -> None:
         return
 
     orig_init = _MpBaseProcess.__init__
+    orig_start = _MpBaseProcess.start
 
     def __init__(
         self,
@@ -193,7 +198,16 @@ def wrap_mp_process_for_children() -> None:
             daemon=daemon,
         )
 
+    def start(self):
+        target = getattr(self, "_target", None)
+        if isinstance(target, _DiffrlPatchedTarget):
+            # PDEATHSIG tracks the Process.start() thread; helper threads may
+            # exit while their child remains owned by the live process.
+            target._arm_pdeathsig = threading.current_thread() is threading.main_thread()
+        return orig_start(self)
+
     _MpBaseProcess.__init__ = __init__
+    _MpBaseProcess.start = start
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
 
 

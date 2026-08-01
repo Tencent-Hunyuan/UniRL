@@ -9,6 +9,7 @@ lives in ``unirl.train.ema``.
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import contextmanager
 from functools import partial
 from typing import Iterator, Optional, Sequence, Union
@@ -43,12 +44,46 @@ def normalize_optional_module_selection(
     return None if modules is None else normalize_module_selection(modules)
 
 
+def resolve_target_modules_pattern(
+    *,
+    target_modules: ModuleSelection,
+    module_prefix: str = "",
+) -> tuple[PeftModuleSelection, str]:
+    """Resolve PEFT targets, optionally restricting suffixes to one subtree."""
+    normalized = normalize_module_selection(target_modules)
+    if not module_prefix:
+        logged = normalized if isinstance(normalized, str) else tuple(normalized)
+        return normalized, str(logged)
+
+    if isinstance(normalized, str):
+        raise ValueError(
+            "resolve_target_modules_pattern: module_prefix cannot be combined "
+            "with a regex or 'all-linear' target_modules string; provide an "
+            "explicit sequence of target-module suffixes."
+        )
+    if not normalized:
+        raise ValueError(
+            "resolve_target_modules_pattern: module_prefix is set but "
+            "target_modules is empty; provide at least one target-module suffix."
+        )
+    normalized_prefix = str(module_prefix).strip(".")
+    if not normalized_prefix:
+        raise ValueError(
+            "resolve_target_modules_pattern: module_prefix must contain a model subtree name, not only dots."
+        )
+    prefix_re = re.escape(normalized_prefix)
+    leaves_re = "|".join(re.escape(str(target)) for target in normalized)
+    pattern = rf"^{prefix_re}\.(?:.*\.)?(?:{leaves_re})$"
+    return pattern, pattern
+
+
 def inject_lora(
     model: nn.Module,
     *,
     rank: int,
     alpha: int,
     target_modules: ModuleSelection,
+    module_prefix: str = "",
     exclude_modules: Optional[ModuleSelection] = None,
     dropout: float = 0.0,
     bias: str = "none",
@@ -58,11 +93,16 @@ def inject_lora(
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    peft_target_modules, log_target = resolve_target_modules_pattern(
+        target_modules=target_modules,
+        module_prefix=module_prefix,
+    )
+
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
-        target_modules=normalize_module_selection(target_modules),
+        target_modules=peft_target_modules,
         exclude_modules=normalize_optional_module_selection(exclude_modules),
         bias=str(bias),
         task_type=str(task_type),
@@ -71,7 +111,6 @@ def inject_lora(
 
     if _current_rank() == 0:
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
-        logged_targets = target_modules if isinstance(target_modules, str) else tuple(target_modules)
         logged_exclusions = (
             exclude_modules if isinstance(exclude_modules, str) or exclude_modules is None else tuple(exclude_modules)
         )
@@ -80,7 +119,7 @@ def inject_lora(
             adapter_name,
             rank,
             alpha,
-            logged_targets,
+            log_target,
             logged_exclusions,
             n_trainable,
         )
@@ -136,4 +175,5 @@ __all__ = [
     "inject_lora",
     "normalize_module_selection",
     "normalize_optional_module_selection",
+    "resolve_target_modules_pattern",
 ]

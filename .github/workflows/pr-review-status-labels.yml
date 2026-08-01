@@ -10,11 +10,20 @@ on:
 
 permissions:
   actions: read
-  pull-requests: read
+  # Labeling a PR goes through the issues API endpoint, but GitHub scopes the
+  # token check to the target resource: PRs require pull-requests write.
+  pull-requests: write
   issues: write
 
+# Per-PR concurrency: a single shared group silently drops the earlier PR's sync
+# when reviews land on two PRs within seconds (GitHub keeps one pending run per
+# group), while no group at all lets same-PR runs race each other's label writes.
+# Same-repo PRs serialize by PR number. Fork PRs (workflow_run.pull_requests is
+# empty for them) serialize by head repo+branch — equivalent per PR in practice
+# (two open PRs off one head branch would share a group). Manual dispatch sweeps
+# share their own literal fallback group.
 concurrency:
-  group: pr-review-status-labels
+  group: pr-review-status-labels-${{ github.event.workflow_run.pull_requests[0].number || format('{0}-{1}', github.event.workflow_run.head_repository.full_name, github.event.workflow_run.head_branch) }}
   cancel-in-progress: false
 
 jobs:
@@ -73,9 +82,14 @@ jobs:
               [ "$label" = "$target" ] && continue
               if jq -e --arg name "$label" '.labels | any(.name == $name)' <<<"$pr" >/dev/null; then
                 encoded=$(jq -rn --arg label "$label" '$label | @uri')
-                gh api --method DELETE \
-                  "repos/$GITHUB_REPOSITORY/issues/$number/labels/$encoded" \
-                  >/dev/null
+                # A racing run may have removed the label already, so a 404 is benign —
+                # but ONLY a 404. Swallowing 403/5xx would turn permission regressions
+                # into green runs with wrong labels (the one failure ever observed in
+                # production was exactly a 403).
+                if ! out=$(gh api --method DELETE \
+                      "repos/$GITHUB_REPOSITORY/issues/$number/labels/$encoded" 2>&1 >/dev/null); then
+                  grep -q "HTTP 404" <<<"$out" || { echo "$out" >&2; return 1; }
+                fi
               fi
             done
 
