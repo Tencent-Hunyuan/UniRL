@@ -59,6 +59,21 @@ from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 logger = logging.getLogger(__name__)
 
 
+def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
+    """Compute the rollout Handle's DP width before constructing GPU roles."""
+    from unirl.distributed.group.handle import _parallel_shape_from_init_kwargs
+
+    role_cls = rollout_parsed["role_cls"]
+    init_kwargs = {key: value for key, value in rollout_parsed.items() if key != "role_cls"}
+    sp_size, tp_size, pp_size, _ = _parallel_shape_from_init_kwargs(
+        init_kwargs,
+        int(world_size),
+        role_cls,
+    )
+    non_dp_width = sp_size if sp_size > 1 else tp_size * pp_size
+    return int(world_size) // int(non_dp_width)
+
+
 class AsyncARTrainer(ARTrainer):
     """Disaggregated async AR trainer (two slabs, resident engine, NCCL sync)."""
 
@@ -110,6 +125,13 @@ class AsyncARTrainer(ARTrainer):
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         self.weight_sync = None
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+            raise ValueError(
+                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
+                "separate slab; the trainside direct-sampling engine needs the pipeline "
+                "as a local sibling and cannot live cross-slab."
+            )
 
         # ---- async state ----
         self._train_fraction = float(train_fraction)
@@ -140,10 +162,15 @@ class AsyncARTrainer(ARTrainer):
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
                 f"slab size {self._train_devices}; adjust batch_size / samples_per_prompt / train_fraction."
             )
-        if prompts % self._rollout_devices != 0:
+        rollout_dp_size = _rollout_dp_size_from_parsed_config(
+            rollout_parsed,
+            world_size=self._rollout_devices,
+        )
+        if prompts % rollout_dp_size != 0:
             raise ValueError(
-                f"batch_size = {prompts} prompts is not divisible by the rollout slab size "
-                f"{self._rollout_devices} (each prompt-tree DP-scatters whole); adjust batch_size / train_fraction."
+                f"batch_size = {prompts} prompts is not divisible by the rollout DP size "
+                f"{rollout_dp_size} ({self._rollout_devices} rollout GPUs; each prompt-tree "
+                "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
             )
 
         # ---- two disjoint top-level slabs (diffusion.py:115-129 template) ----
@@ -162,13 +189,6 @@ class AsyncARTrainer(ARTrainer):
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
         # Rollout slab = the rest (fraction is relative to the WHOLE pool).
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                raise ValueError(
-                    "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
-                    "separate slab; the trainside direct-sampling engine needs the pipeline "
-                    "as a local sibling and cannot live cross-slab."
-                )
             self.rollout = remote(**rollout_parsed)
 
         if self.weight_sync is not None:

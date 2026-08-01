@@ -130,6 +130,15 @@ def _prepare_qwen_moe_dtensor(
 
 def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
     """Whether this model uses a supported packed Qwen MoE checkpoint layout."""
+    # VeOmni train-side EP keeps only this rank's contiguous [E/ep, ...]
+    # expert block in the model.  FullWeightSync._iter_full_tensors_ep must see
+    # the packed parameter name so it can gather those blocks across the EP
+    # group and assign global expert ids before exporting HF per-expert keys.
+    # Unpacking here would make every EP rank independently emit
+    # experts.0..E/ep-1 and bypass that gather.
+    parallel_groups = getattr(model, "_extra_parallel_param_groups", None) or {}
+    if parallel_groups.get("ep"):
+        return False
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     return model_type in _PACKED_QWEN_MOE_MODEL_TYPES
 

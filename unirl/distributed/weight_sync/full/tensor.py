@@ -141,13 +141,14 @@ class TensorWeightSync(FullWeightSync):
                 payload_keepalive = None
                 if sglang_tp_fanout:
                     if dist_ready:
-                        local_payload = self._serialize_payload(
+                        local_payload, serialization_error = self._serialize_payload_or_error(
                             grouped,
                             FlattenedTensorBucket,
                             MultiprocessingSerializer,
                         )
                         payload_per_rank = self._gather_sglang_tp_payloads(
                             local_payload,
+                            local_error=serialization_error,
                             rank_info=ri,
                             tp_size=tp_size,
                         )
@@ -216,6 +217,27 @@ class TensorWeightSync(FullWeightSync):
         finally:
             del payload, flat
 
+    @classmethod
+    def _serialize_payload_or_error(
+        cls, grouped, flat_bucket_cls, serializer_cls
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Capture a rank-local serialization error so peers can fail together.
+
+        Every TP rank must reach the following ``all_gather_object``. Letting one
+        rank raise here would leave successful peers blocked in that collective.
+        """
+        try:
+            return (
+                cls._serialize_payload(
+                    grouped,
+                    flat_bucket_cls,
+                    serializer_cls,
+                ),
+                None,
+            )
+        except BaseException as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
     @staticmethod
     def _dist_ready() -> bool:
         try:
@@ -226,7 +248,13 @@ class TensorWeightSync(FullWeightSync):
             return False
 
     @staticmethod
-    def _gather_sglang_tp_payloads(local_payload: str, *, rank_info, tp_size: int) -> list[str]:
+    def _gather_sglang_tp_payloads(
+        local_payload: Optional[str],
+        *,
+        local_error: Optional[str],
+        rank_info,
+        tp_size: int,
+    ) -> list[str]:
         import torch.distributed as dist
 
         if rank_info is None:
@@ -237,9 +265,16 @@ class TensorWeightSync(FullWeightSync):
             "pp_rank": int(rank_info.pp_rank),
             "tp_rank": int(rank_info.tp_rank),
             "payload": local_payload,
+            "error": local_error,
         }
         gathered = [None] * dist.get_world_size()
         dist.all_gather_object(gathered, local)
+        errors = [item for item in gathered if item is not None and item.get("error")]
+        if errors:
+            first = errors[0]
+            raise RuntimeError(
+                f"TensorWeightSync: SGLang TP payload serialization failed on rank {first['rank']}: {first['error']}"
+            )
         group = [
             item
             for item in gathered
@@ -254,6 +289,11 @@ class TensorWeightSync(FullWeightSync):
                 "TensorWeightSync: incomplete SGLang TP payload gather for "
                 f"dp_rank={rank_info.dp_rank}, pp_rank={rank_info.pp_rank}: "
                 f"expected tp ranks 0..{int(tp_size) - 1}, got {tp_ranks}"
+            )
+        missing_payload_ranks = [int(item["rank"]) for item in group if item.get("payload") is None]
+        if missing_payload_ranks:
+            raise RuntimeError(
+                f"TensorWeightSync: SGLang TP payload gather returned empty payloads from ranks {missing_payload_ranks}"
             )
         return [str(item["payload"]) for item in group]
 

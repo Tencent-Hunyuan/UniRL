@@ -57,17 +57,70 @@ _TIERED_TIMEOUT: Any = object()
 # ---------------------------------------------------------------------------
 
 
-def kill_process_tree(pid: int) -> None:
-    """Send SIGTERM to ``pid`` and its descendants."""
+def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
+    """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``.
+
+    The parent may observe a boot failure before the spawned child has executed
+    :func:`os.setsid`.  In that race the child still belongs to the Ray
+    worker/trainer's process group, so signaling that inherited group would
+    terminate the launcher too.  A session leader owns a group whose id equals
+    its pid; only that group is safe to fan out to.
+    """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        pgid = os.getpgid(pid)
     except ProcessLookupError:
-        pass
+        # The session leader may already have exited while scheduler children
+        # remain in the group it created with setsid().  That group's id is
+        # still the leader pid, so target it directly.  If setsid() never ran,
+        # no such group exists and killpg() is a harmless ESRCH.
+        pgid = pid
     except PermissionError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        pgid = None
+
+    try:
+        if pgid == pid:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_process_tree(pid: int) -> None:
+    """Send SIGTERM to ``pid`` and descendants in its owned process group."""
+    _signal_process_tree(pid, signal.SIGTERM)
+
+
+def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: float = 10.0) -> None:
+    """Best-effort bounded teardown for a started SRT server process tree."""
+    pid = getattr(process, "pid", None)
+    if pid is None:
+        return
+
+    kill_process_tree(int(pid))
+    try:
+        process.join(timeout=float(timeout_s))
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+
+    try:
+        alive = process.is_alive()
+    except Exception:
+        logger.exception("Failed to inspect SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+    if not alive:
+        return
+
+    logger.warning("SGLang SRT server process pid=%s ignored SIGTERM; sending SIGKILL", pid)
+    _signal_process_tree(int(pid), signal.SIGKILL)
+    try:
+        process.join(timeout=1.0)
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGKILL", pid)
+        return
+    if process.is_alive():
+        logger.error("SGLang SRT server process pid=%s is still alive after SIGKILL", pid)
 
 
 def wait_server_healthy(
@@ -341,11 +394,18 @@ class HTTPBackend:
         process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
-        wait_server_healthy(
-            base_url,
-            timeout_s=float(health_timeout_s),
-            is_alive_fn=lambda: process.is_alive(),
-        )
+        try:
+            wait_server_healthy(
+                base_url,
+                timeout_s=float(health_timeout_s),
+                is_alive_fn=lambda: process.is_alive(),
+            )
+        except BaseException:
+            # Construction has not returned a backend object yet, so no caller
+            # can invoke shutdown().  Reap the child here or its independent
+            # session can retain scheduler descendants and GPU memory.
+            _terminate_server_process(process)
+            raise
         # Bind-mapping gate (GPU smoke): the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles
         # them shows up here.
@@ -556,11 +616,11 @@ class HTTPBackend:
 
     def shutdown(self) -> None:
         """Kill the SRT server (idempotent via the None-swap)."""
-        if self._server_process is not None:
-            logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
-            kill_process_tree(self._server_process.pid)
-            self._server_process.join(timeout=10)
-            self._server_process = None
+        process = self._server_process
+        self._server_process = None
+        if process is not None:
+            logger.info("Shutting down SGLang SRT server (pid=%s)", process.pid)
+            _terminate_server_process(process)
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — HTTP POSTs to the SRT post-training endpoints
