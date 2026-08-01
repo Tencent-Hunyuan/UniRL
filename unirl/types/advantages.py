@@ -76,33 +76,27 @@ def scatter_terminal_rewards(
     *,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """Place each sample's scalar reward on its last response token in packed layout.
-
-    Args:
-        rewards_per_sample: Per-trajectory rewards ``[B]``.
-        cu_seqlens: Packed cumulative offsets ``[B + 1]`` (``TextSegment.cu_seqlens``).
-
-    Returns:
-        Packed per-token rewards ``[total_tokens]`` (zero except terminal positions).
-    """
+    """Scatter each trajectory reward onto its final packed response token."""
     if rewards_per_sample.ndim != 1:
+        raise ValueError(f"scatter_terminal_rewards: expected 1D rewards, got shape {tuple(rewards_per_sample.shape)}")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() == 0:
+        raise ValueError("scatter_terminal_rewards: cu_seqlens must be a non-empty 1D tensor")
+    batch_size = int(cu_seqlens.numel()) - 1
+    if int(rewards_per_sample.numel()) != batch_size:
         raise ValueError(
-            f"scatter_terminal_rewards: rewards_per_sample must be 1D, got shape {tuple(rewards_per_sample.shape)}"
+            f"scatter_terminal_rewards: rewards batch ({int(rewards_per_sample.numel())}) "
+            f"!= packed batch ({batch_size})"
         )
-    batch_size = int(cu_seqlens.shape[0]) - 1
-    if int(rewards_per_sample.shape[0]) != batch_size:
-        raise ValueError(
-            f"scatter_terminal_rewards: rewards batch ({int(rewards_per_sample.shape[0])}) != batch_size ({batch_size})"
-        )
-    total = int(cu_seqlens[-1].item())
-    out = rewards_per_sample.new_zeros(total)
-    cu = [int(c) for c in cu_seqlens.tolist()]
-    for b in range(batch_size):
-        start, end = cu[b], cu[b + 1]
-        if end <= start:
-            continue
-        out[end - 1] = rewards_per_sample[b]
-    return out
+
+    cu = [int(offset) for offset in cu_seqlens.tolist()]
+    if cu[0] != 0 or any(end < start for start, end in zip(cu, cu[1:])):
+        raise ValueError(f"scatter_terminal_rewards: invalid cumulative offsets {cu}")
+
+    token_rewards = rewards_per_sample.new_zeros(cu[-1])
+    for reward, start, end in zip(rewards_per_sample, cu, cu[1:]):
+        if end > start:
+            token_rewards[end - 1] = reward
+    return token_rewards
 
 
 def _gae_1d(

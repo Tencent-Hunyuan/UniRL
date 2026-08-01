@@ -36,6 +36,24 @@ from .config import Qwen3PipelineConfig
 logger = logging.getLogger(__name__)
 
 
+def _stamp_value_head_reset(transformer: nn.Module) -> None:
+    """Zero checkpoint-absent value-head params after meta materialization."""
+    from unirl.train.deferred import _stamp
+
+    def _reset(model: nn.Module) -> None:
+        reset: list[str] = []
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name.startswith("value_head."):
+                    param.zero_()
+                    reset.append(name)
+        if not reset:
+            raise RuntimeError("Qwen3 meta-init: value_head parameters disappeared before post-load reset")
+        logger.info("Qwen3 meta-init: zero-initialized checkpoint-absent value head: %s", reset)
+
+    _stamp(transformer, _reset)
+
+
 class Qwen3Bundle(Bundle):
     """Qwen3 bundle: causal-LM transformer + matching tokenizer."""
 
@@ -118,7 +136,13 @@ class Qwen3Bundle(Bundle):
 
         if config.use_value_head:
             hidden_size = int(getattr(transformer.config, "hidden_size"))
-            transformer.value_head = ValueHead(hidden_size).to(device)
+            transformer_device = next(transformer.parameters()).device
+            transformer.value_head = ValueHead(hidden_size, device=transformer_device)
+            if config.meta_init_transformer:
+                # The base checkpoint has no value_head.* tensors. ``to_empty``
+                # materializes the meta head as uninitialized storage, so reset
+                # it only after the sharded checkpoint load has completed.
+                _stamp_value_head_reset(transformer)
 
         bundle = cls(
             transformer=transformer,

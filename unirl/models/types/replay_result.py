@@ -8,9 +8,8 @@ stored ``segment.sde_logp`` (or its slice when ``step_indices`` subsets).
 
 Diffusion stages populate ``log_probs`` and ``prev_sample_means`` (the
 mean of the SDE Gaussian — μ_θ — used as the second moment in the KL
-penalty). AR stages return a plain ``Tensor`` for GRPO-style replay, or a
-:class:`ReplayResult` when optional critic ``values`` (or future ``logits``)
-are requested.
+penalty). AR stages return a plain ``Tensor`` for policy-only replay, or
+a :class:`ReplayResult` when optional critic ``values`` are requested.
 """
 
 from __future__ import annotations
@@ -27,9 +26,8 @@ class ReplayResult:
     others are stage-specific and may be ``None``."""
 
     log_probs: torch.Tensor
-    """Aligned with ``segment.sde_logp`` / ``segment.log_probs`` (or a slice
-    when ``step_indices`` subsets). Shape ``[B, S']`` for diffusion replay;
-    packed ``[total_tokens]`` for AR varlen replay."""
+    """Aligned with ``segment.sde_logp`` (or its slice when ``step_indices``
+    subsets). Shape ``[B, S']`` for diffusion replay."""
 
     prev_sample_means: Optional[torch.Tensor] = None
     """The SDE transition's mean μ_θ at each replayed step. Shape
@@ -43,9 +41,8 @@ class ReplayResult:
     only per-token log-probs). Currently not populated."""
 
     values: Optional[torch.Tensor] = None
-    """Per-token critic predictions ``V_t`` from replay. Shape ``[B, T]`` or
-    packed ``[total_tokens]`` for AR. Used by PPO / GAE training paths.
-    ``None`` when the stage does not attach a value head."""
+    """Per-token critic predictions ``V_t``. Packed ``[total_tokens]`` for AR.
+    ``None`` when replay did not request a value head."""
 
 
 __all__ = ["ReplayResult"]

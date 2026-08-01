@@ -69,7 +69,7 @@ class Qwen3PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Attach a scalar value head on the transformer for PPO / GAE training.
+    # Attach a scalar critic to the causal LM for PPO / GAE training.
     use_value_head: bool = False
 
     system_instruction: Optional[str] = None

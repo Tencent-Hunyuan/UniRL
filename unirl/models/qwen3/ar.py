@@ -167,9 +167,7 @@ def _replay_aware_forward(
         log_probs = torch.cat(flat_parts, dim=0)
         if value_head is None:
             return log_probs
-        value_parts: List[torch.Tensor] = []
-        for s in range(0, int(h_pred.size(0)), flat_chunk):
-            value_parts.append(value_head(h_pred[s : s + flat_chunk]))
+        value_parts = [value_head(h_pred[s : s + flat_chunk]) for s in range(0, int(h_pred.size(0)), flat_chunk)]
         values = torch.cat(value_parts, dim=0) if value_parts else log_probs.new_zeros(0)
         return ReplayResult(log_probs=log_probs, values=values)
     T_max = int(response_tokens.size(1))
@@ -198,9 +196,7 @@ def _replay_aware_forward(
     log_probs = torch.cat(parts, dim=1)
     if value_head is None:
         return log_probs
-    value_parts = []
-    for s in range(0, T_max, chunk):
-        value_parts.append(value_head(resp_hidden[:, s : s + chunk, :]))
+    value_parts = [value_head(resp_hidden[:, s : s + chunk, :]) for s in range(0, T_max, chunk)]
     values = torch.cat(value_parts, dim=1) if value_parts else log_probs.new_zeros((bsz, 0))
     return ReplayResult(log_probs=log_probs, values=values)
 
@@ -218,34 +214,26 @@ def _finalize_replay_output(
     segment: TextSegment,
     return_values: bool,
     logprob_dtype: torch.dtype,
-    device: torch.device,
 ) -> Union[torch.Tensor, ReplayResult]:
-    """Cast log-probs and flatten packed values to match ``segment`` layout."""
-    if isinstance(out, ReplayResult):
-        log_probs = out.log_probs.to(dtype=logprob_dtype)
-        if not return_values:
-            return log_probs
-        values = out.values
-        if values is None:
+    """Cast log-probs and flatten padded critic values to segment order."""
+    if not isinstance(out, ReplayResult):
+        if return_values:
             raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
-        if log_probs.ndim == 1:
-            return ReplayResult(log_probs=log_probs, values=values.to(device=device))
-        if segment.cu_seqlens is None or segment.lengths is None:
-            raise ValueError("Qwen3ARStage.replay: segment requires cu_seqlens to flatten values")
-        lengths = [int(n) for n in segment.lengths.tolist()]
-        flat: List[torch.Tensor] = []
-        for b, n in enumerate(lengths):
-            if n <= 0:
-                continue
-            flat.append(values[b, :n])
-        packed_values = torch.cat(flat, dim=0) if flat else values.new_zeros(0, device=device)
-        return ReplayResult(log_probs=log_probs, values=packed_values.to(device=device))
-    if return_values:
-        raise ValueError(
-            "Qwen3ARStage.replay: return_values=True but critic returned no values "
-            "(set use_value_head=True in the pipeline config)"
-        )
-    return out.to(dtype=logprob_dtype)
+        return out.to(dtype=logprob_dtype)
+
+    log_probs = out.log_probs.to(dtype=logprob_dtype)
+    if not return_values:
+        return log_probs
+    if out.values is None:
+        raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
+    if log_probs.ndim == 1:
+        return ReplayResult(log_probs=log_probs, values=out.values.float())
+    if segment.lengths is None:
+        raise ValueError("Qwen3ARStage.replay: segment requires lengths to flatten critic values")
+
+    flat_values = [out.values[b, : int(length)] for b, length in enumerate(segment.lengths.tolist()) if int(length) > 0]
+    values = torch.cat(flat_values, dim=0) if flat_values else out.values.new_zeros(0)
+    return ReplayResult(log_probs=log_probs, values=values.float())
 
 
 # Attention backends with a sparse packed kernel (skip cross-sequence blocks):
@@ -495,20 +483,26 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
 
         Branch: prefer :meth:`packed_replay` (packed-varlen, zero padding, B > 1)
         and fall back to :meth:`padding_replay` (the dense ``[B, P_max + T_max]``
-        padded path) when packing does not apply. Returns packed varlen
-        ``[total_tokens]`` aligned with ``segment.log_probs`` unless
-        ``return_values=True``, in which case an :class:`ReplayResult` with
-        packed ``values`` is returned alongside log-probs.
+        padded path) when packing does not apply. Returns packed varlen log-probs,
+        or a :class:`ReplayResult` with aligned critic values when requested.
         """
         _require_value_head_for_replay(self.model.transformer, return_values)
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(
-                conditions, segment=segment, temperature=temperature, return_values=return_values
+                conditions,
+                segment=segment,
+                temperature=temperature,
+                return_values=return_values,
             )
             if packed is not None:
                 return packed
-        return self.padding_replay(conditions, segment=segment, temperature=temperature, return_values=return_values)
+        return self.padding_replay(
+            conditions,
+            segment=segment,
+            temperature=temperature,
+            return_values=return_values,
+        )
 
     def packed_replay(
         self,
@@ -601,7 +595,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             segment=segment,
             return_values=return_values,
             logprob_dtype=self.logprob_dtype,
-            device=device,
         )
 
     def padding_replay(
@@ -719,44 +712,34 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             temperature=temperature,
             return_values=return_values,
             autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
-        )  # [B, T_max] FP32 or ReplayResult
+        )  # [B, T_max] FP32 tensor or ReplayResult
 
-        if T_max == 0:
-            empty = torch.zeros(0, dtype=self.logprob_dtype, device=device)
-            if return_values:
-                return ReplayResult(log_probs=empty, values=empty)
-            return empty
-
-        if isinstance(out, ReplayResult):
-            per_token = out.log_probs
-            per_value = out.values
+        finalized = _finalize_replay_output(
+            out,
+            segment=segment,
+            return_values=return_values,
+            logprob_dtype=self.logprob_dtype,
+        )
+        if isinstance(finalized, ReplayResult):
+            per_token = finalized.log_probs
+            values = finalized.values
         else:
-            per_token = out
-            per_value = None
-        if return_values and per_value is None:
-            raise ValueError(
-                "Qwen3ARStage.replay: return_values=True but critic returned no values "
-                "(set use_value_head=True in the pipeline config)"
-            )
+            per_token = finalized
+            values = None
 
-        flat_logp: List[torch.Tensor] = []
-        flat_val: List[torch.Tensor] = []
-        for b in range(batch_size):
-            n = lengths[b]
-            if n == 0:
-                continue
-            flat_logp.append(per_token[b, :n])
-            if per_value is not None:
-                flat_val.append(per_value[b, :n])
-        if not flat_logp:
-            empty = torch.zeros(0, dtype=self.logprob_dtype, device=device)
-            if return_values:
-                return ReplayResult(log_probs=empty, values=empty)
-            return empty
-        log_probs = torch.cat(flat_logp, dim=0).to(dtype=self.logprob_dtype)
+        flat_log_probs: List[torch.Tensor] = []
+        for b, n in enumerate(lengths):
+            if n > 0:
+                flat_log_probs.append(per_token[b, :n])
+        log_probs = (
+            torch.cat(flat_log_probs, dim=0)
+            if flat_log_probs
+            else torch.zeros(0, dtype=self.logprob_dtype, device=device)
+        )
         if not return_values:
             return log_probs
-        values = torch.cat(flat_val, dim=0)
+        if values is None:
+            raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
         return ReplayResult(log_probs=log_probs, values=values)
 
     def _resolve_stop_ids(
