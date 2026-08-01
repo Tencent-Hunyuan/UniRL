@@ -174,9 +174,10 @@ class SGLangEngineConfig(BaseEngineConfig):
     samples_pre_expanded: bool = False
 
     # --- VLM multimodal ---
-    # Image token placeholder injected into the chat template at image
-    # positions.  Model-specific: e.g. "<|vision_start|><|image_pad|><|vision_end|>"
-    # for Qwen2.5-VL.  None (default) = text-only mode.
+    # Non-None selects the VLM adapter and loads AutoProcessor. Typed image
+    # content still goes through the checkpoint's official chat template and
+    # processor; this value is not injected as the complete image marker.
+    # None (default) selects text-only mode.
     image_token: Optional[str] = None
 
     # --- LLM sampling (forwarded to SGLang /generate sampling_params) ---
@@ -185,8 +186,8 @@ class SGLangEngineConfig(BaseEngineConfig):
     top_p: float = 0.9
     top_k: int = 0
     # Exact tokenizer tokens excluded from response sampling via SGLang's
-    # logit_bias. Multimodal models use this for image/video placeholders:
-    # those ids are prompt structure and cannot be replayed as text actions.
+    # logit_bias. This never changes prompt tokens. A train-side replay path
+    # must exclude the same ids before log-softmax to preserve log-prob parity.
     response_forbidden_tokens: Optional[List[str]] = None
 
     # --- Chat template ---

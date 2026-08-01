@@ -2,7 +2,7 @@
 # AR GRPO Qwen3.5-MoE VL on Geometry3K-MC — train_ar (ARTrainer),
 # SGLang rollout, full-weight TensorWeightSync, colocate.
 #
-# MoE + VL combined: Qwen3_5MoeDecoderLayer blocks + image_token="<|image_pad|>".
+# MoE + VL combined: Qwen3_5MoeDecoderLayer blocks + the VLM adapter.
 # Install the VeOmni extra: uv pip install -e ".[sglang,train,infer,veomni]"
 #
 # Meta-init sharded loading requires a LOCAL checkpoint directory. For smoke,

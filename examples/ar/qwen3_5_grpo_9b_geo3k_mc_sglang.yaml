@@ -91,8 +91,9 @@ rollout:
     pretrained_model_ckpt_path: ${oc.env:QWEN3_5_PATH,tiny-random/qwen3.5}
     tp_size: 1
     samples_pre_expanded: true
-    # Qwen3.5 image token format: single "<|image_pad|>" (NOT the Qwen2.5-VL
-    # three-segment "<|vision_start|><|image_pad|><|vision_end|>"). image_token_id=248056.
+    # Selects the VLM adapter. The official Qwen3.5 processor renders
+    # "<|vision_start|><|image_pad|><|vision_end|>" and expands the inner
+    # image_pad to match image_grid_thw; this value is not the full image marker.
     image_token: "<|image_pad|>"
     response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
     max_new_tokens: 8192
