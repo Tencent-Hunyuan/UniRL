@@ -84,8 +84,9 @@ class ARTrainer(BaseTrainer):
         # group std. False = mean-center only (reward - group_mean), NO std division —
         # removes the difficulty bias that over-amplifies low-std (hard) prompts.
         self.normalize_adv_by_std = normalize_adv_by_std
-        # "grpo" (default) or "gae" (PPO path — GAE runs in PPO.prepare_rollout_track on workers).
-        self.advantage_mode = str(advantage_mode)
+        self.advantage_mode = str(advantage_mode).strip().lower()
+        if self.advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         # verl trainer.balance_batch parity: driver-side reorder of the rollout
         # batch so each DP shard receives a similar total-token workload. FSDP
         # collectives sync all ranks every micro, so a step runs at the SLOWEST

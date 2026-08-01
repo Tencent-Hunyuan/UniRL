@@ -192,9 +192,6 @@ class TrainStack(Remote):
         if part.segment is None:
             return
         algorithm = self.algorithm
-        prepare_track = getattr(algorithm, "prepare_rollout_track", None)
-        if prepare_track is not None:
-            prepare_track(resp_track)
         if not algorithm.recomputes_anchor():
             algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
@@ -508,6 +505,7 @@ class TrainStack(Remote):
         profiler = self._train_step_profiler() if profile_scope() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             self.prepare_segment(part, plans=plans)
+            part = self.algorithm.prepare_part(part)
             self.fsdp_backend.model.train()
             result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
         if profiler is not None:

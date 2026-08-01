@@ -20,6 +20,7 @@ from unirl.distributed.group.remote import Remote
 
 if TYPE_CHECKING:
     from unirl.types.conditions import Condition
+    from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
 
 
@@ -191,27 +192,6 @@ def _grpo_clip_loss(
         "approx_kl": (0.5 * log_diff.pow(2)).mean().detach(),
     }
     return loss_per_elem, metrics
-
-
-def _ppo_clipped_value_loss(
-    *,
-    values: torch.Tensor,
-    old_values: torch.Tensor,
-    returns: torch.Tensor,
-    clip_range: float,
-) -> torch.Tensor:
-    """PPO clipped value loss. Element-wise; reduction is the caller's job.
-
-    Returns per-token ``0.5 * max((V - R)², (V_clipped - R)²)`` with
-    ``V_clipped = V_old + clip(V - V_old, -clip_range, clip_range)``.
-    """
-    values_f = values.float()
-    old_f = old_values.detach().float()
-    returns_f = returns.detach().float()
-    clipped = old_f + (values_f - old_f).clamp(-clip_range, clip_range)
-    sq1 = (values_f - returns_f).square()
-    sq2 = (clipped - returns_f).square()
-    return 0.5 * torch.maximum(sq1, sq2)
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +440,15 @@ class StageAlgorithm(Remote, ABC):
                 must NOT mutate fields that the rollout already populated.
         """
         return None
+
+    def prepare_part(self, part: "Part") -> "Part":
+        """Optional post-anchor hook over the complete arranged worker shard.
+
+        Runs after per-micro anchor fields have been reassembled and before any
+        optimizer update. PPO uses it to derive GAE from frozen critic values;
+        other algorithms keep the part unchanged.
+        """
+        return part
 
     @abstractmethod
     def compute_loss_and_backward(

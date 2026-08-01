@@ -96,6 +96,7 @@ class AsyncARTrainer(ARTrainer):
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
+        advantage_mode: str = "grpo",
         balance_shards: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
@@ -122,6 +123,9 @@ class AsyncARTrainer(ARTrainer):
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
+        self.advantage_mode = str(advantage_mode).strip().lower()
+        if self.advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         self.balance_shards = bool(balance_shards)
         self.eval_interval = int(eval_interval)
         _num = int(eval_num_prompts)

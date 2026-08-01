@@ -1,16 +1,13 @@
 # @package _global_
-# PPO + GAE Qwen3-4B-Base on DAPO-Math — ARTrainer + SGLang rollout.
+# PPO + GAE on Qwen3-4B-Base / DAPO-Math with colocated SGLang rollout.
 #
-# Sibling of qwen3_grpo_4b_base_dapo_sglang.yaml with a value critic and GAE
-# advantages instead of group-relative GRPO normalization. Requires
-# bundle.config.use_value_head=true and advantage_mode=gae.
-#
-# Data prep (one-time):
+# Prepare data:
 #   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
 #
-# Run (32 GPU example):
-#   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#   python -m unirl.train_ar --config-name=ar/qwen3_ppo_4b_base_dapo_sglang num_devices=32
+# Run:
+#   DATA_PATH=data/dapo_math/train.jsonl \
+#   EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen3_ppo_4b_base_dapo_sglang
 
 num_devices: 32
 batch_size: 64
@@ -18,10 +15,10 @@ num_rollouts: 800
 weight_sync_interval: 1
 eval_interval: 10
 
-# GAE path: advantages computed on workers in PPO.prepare_rollout_track.
+# PPO prepares per-token GAE on each train worker after the micro-batched
+# pre-update critic replay. The driver must not replace it with GRPO scores.
 advantage_mode: gae
-adv_normalization_scope: group
-normalize_adv_by_std: false
+balance_shards: true
 
 logging:
   report_to_wandb: true
@@ -67,22 +64,35 @@ backend:
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
-    weight_decay: 0.0
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
 
 rollout:
-  _target_: unirl.rollout.engine.sglang.SGLangRolloutEngine
-  model_path: ${bundle.config.pretrained_model_ckpt_path}
-  concurrency: 16
-  samples_pre_expanded: true
-  chat_template_kwargs:
-    enable_thinking: true
-  engine_kwargs:
-    mem_fraction_static: 0.3
-    skip_server_warmup: true
-    attention_backend: triton
-    disable_cuda_graph: false
-    cuda_graph_max_bs: 16
-    enable_lora: false
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    samples_pre_expanded: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      rl_on_policy_target: fsdp
+      mem_fraction_static: 0.3
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -111,13 +121,12 @@ algorithm:
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
 
 sync:
-  # Drop train-only value_head weights — SGLang has no critic params to receive them.
   _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
   lora_merged: false
   bucket_size_mb: 64
   flush_cache: true
-  name_remap:
-    value_head.*: null
+  # The rollout model has no critic; never send train-only value-head tensors.
+  name_remap: {"value_head.*": null}
 
 stack:
   _target_: unirl.train.stack.TrainStack
