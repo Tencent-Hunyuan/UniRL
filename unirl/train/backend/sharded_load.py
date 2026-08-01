@@ -589,6 +589,22 @@ def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> State
         for key in source_keys:
             state_dict.pop(key)
 
+    # Qwen3.5 checkpoints may carry a standalone MTP speculative-prediction
+    # head even when the ForConditionalGeneration training model intentionally
+    # omits it. Those auxiliary expert keys are not a partially packed main
+    # model. Drop the whole MTP namespace only when the target exposes no MTP
+    # tensors; if it does, the normal target/leftover checks remain strict.
+    has_target_mtp = any("mtp" in name.split(".") for name in model_tensors)
+    if not has_target_mtp:
+        mtp_keys = [key for key in state_dict if "mtp" in key.split(".")]
+        for key in mtp_keys:
+            state_dict.pop(key)
+        if mtp_keys:
+            logger.info(
+                "Qwen MoE load: ignored %d auxiliary MTP checkpoint tensor(s) absent from the target model.",
+                len(mtp_keys),
+            )
+
     leftovers = [key for key in state_dict if _QWEN_MOE_EXPERT_RE.match(key)]
     if leftovers:
         raise ValueError(

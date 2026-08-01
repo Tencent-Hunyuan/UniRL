@@ -18,7 +18,7 @@ from __future__ import annotations
 import random
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
 from unirl.rollout.engine.base import BaseEngineConfig
@@ -184,6 +184,10 @@ class SGLangEngineConfig(BaseEngineConfig):
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 0
+    # Exact tokenizer tokens excluded from response sampling via SGLang's
+    # logit_bias. Multimodal models use this for image/video placeholders:
+    # those ids are prompt structure and cannot be replayed as text actions.
+    response_forbidden_tokens: Optional[List[str]] = None
 
     # --- Chat template ---
     # System message prepended to every prompt (e.g. "/no_think" to suppress

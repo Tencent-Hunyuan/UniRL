@@ -37,7 +37,8 @@ bundle:
   config:
     _target_: unirl.models.qwen3_5.config.Qwen3_5PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_5_PATH,tiny-random/qwen3.5}
-    model_precision: bf16
+    # Keep fp32 master shards; forward/backward and sync remain bf16 below.
+    model_precision: fp32
     freeze_vision_tower: true
     use_gradient_checkpointing: true
     max_prompt_length: 2048
@@ -93,6 +94,7 @@ rollout:
     # Qwen3.5 image token format: single "<|image_pad|>" (NOT the Qwen2.5-VL
     # three-segment "<|vision_start|><|image_pad|><|vision_end|>"). image_token_id=248056.
     image_token: "<|image_pad|>"
+    response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
@@ -132,6 +134,7 @@ sync:
   _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
   lora_merged: false
   bucket_size_mb: 64
+  wire_dtype: bf16
   flush_cache: true
   # Qwen3.5 HF namespace: model.visual (frozen vision tower) + model.language_model.
   # Drop the vision tower and remap language_model.* → model.* for the SRT server.

@@ -93,6 +93,7 @@ rollout:
     top_p: 1.0
     concurrency: 128
     samples_pre_expanded: true
+    response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
@@ -129,6 +130,7 @@ sync:
   _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
   lora_merged: false
   bucket_size_mb: 64
+  wire_dtype: bf16
   flush_cache: true
   # Qwen3.5 HF namespace: model.visual (frozen vision tower) + model.language_model.
   # Drop the vision tower and remap language_model.* → model.* for the SRT server.

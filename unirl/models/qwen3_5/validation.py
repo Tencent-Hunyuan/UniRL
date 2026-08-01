@@ -137,5 +137,15 @@ def validate_qwen3_5_training_contract(
         f"{rollout_thinking!r}. Rollout/train prompt IDs would diverge and corrupt the GRPO ratio.",
     )
 
+    forbidden_tokens = set(_get(engine_cfg, "response_forbidden_tokens", None) or [])
+    required_placeholders = {"<|image_pad|>", "<|video_pad|>"}
+    require(
+        required_placeholders.issubset(forbidden_tokens),
+        "Qwen3.5 SGLang rollout must exclude multimodal placeholders from "
+        "response sampling: set rollout.config.response_forbidden_tokens to "
+        f"{sorted(required_placeholders)}. Replaying a placeholder as a text "
+        "action is undefined.",
+    )
+
 
 __all__ = ["is_qwen3_5_pipeline_config", "validate_qwen3_5_training_contract"]

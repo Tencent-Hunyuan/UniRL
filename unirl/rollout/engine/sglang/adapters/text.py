@@ -119,8 +119,21 @@ class TextLMAdapter(ModelAdapter):
 
     def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
+        block = dict(sampling.block)
+        forbidden_tokens = list(getattr(self.cfg, "response_forbidden_tokens", None) or [])
+        if forbidden_tokens:
+            vocab = self._tokenizer.get_vocab()
+            unknown = [token for token in forbidden_tokens if token not in vocab]
+            require(
+                not unknown,
+                f"{type(self).__name__}: response_forbidden_tokens are absent from the tokenizer vocabulary: {unknown}",
+            )
+            logit_bias = dict(block.get("logit_bias") or {})
+            for token in forbidden_tokens:
+                logit_bias[str(int(vocab[token]))] = -1.0e9
+            block["logit_bias"] = logit_bias
         return {
-            "sampling_params": dict(sampling.block),
+            "sampling_params": block,
             "return_logprob": sampling.return_logprob,
         }
 

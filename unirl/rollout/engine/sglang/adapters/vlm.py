@@ -104,7 +104,21 @@ class VLMAdapter(TextLMAdapter):
             "tokenize": False,
         }
         template_kwargs.update(self.cfg.chat_template_kwargs or {})
-        text = self._processor.apply_chat_template(messages, **template_kwargs)
+        # Multimodal processors inspect every message as a list of typed
+        # content blocks. Normalize a system/text string so that scan does not
+        # iterate over its characters (Qwen3.5 raises TypeError otherwise).
+        processor_messages = [
+            {
+                **message,
+                "content": (
+                    [{"type": "text", "text": message["content"]}]
+                    if isinstance(message.get("content"), str)
+                    else message.get("content")
+                ),
+            }
+            for message in messages
+        ]
+        text = self._processor.apply_chat_template(processor_messages, **template_kwargs)
         enc = self._processor(text=[text], images=images, return_tensors="pt")
         return MMEncoding(
             image=images[0],

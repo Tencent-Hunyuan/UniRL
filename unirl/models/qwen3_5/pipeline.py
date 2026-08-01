@@ -133,13 +133,9 @@ class Qwen3_5Pipeline(Pipeline):
 
     def generate(self, sample: Sample) -> Sample:
         """Run Qwen3.5 generation and fill the frontier generation Part."""
-        frontier = sample.parts[-1]
+        frontier = sample.frontier_gen_part(ARSamplingParams)
         ar = frontier.sampling_params
-        if not isinstance(ar, ARSamplingParams):
-            raise TypeError(
-                "Qwen3_5Pipeline.generate: frontier gen Part must carry "
-                f"ARSamplingParams, got {type(ar).__name__ if ar is not None else 'None'}"
-            )
+        assert isinstance(ar, ARSamplingParams)
 
         if sample.has_image_input():
             turns, _images = sample.vision_conditioning()
@@ -152,14 +148,16 @@ class Qwen3_5Pipeline(Pipeline):
             temperature=ar.temperature,
             top_p=ar.top_p,
             top_k=ar.top_k,
+            stop_token_ids=([int(ar.stop_token_id)] if ar.stop_token_id is not None else []),
         )
 
         sampling_params = ARSamplingParams(
+            samples_per_prompt=int(ar.samples_per_prompt),
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
             top_p=float(params.top_p),
             top_k=int(params.top_k),
-            stop_token_id=None,
+            stop_token_id=ar.stop_token_id,
         )
 
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)

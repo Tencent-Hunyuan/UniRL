@@ -72,11 +72,18 @@ class Qwen3_5ChatTemplateStage:
                 messages = []
                 if self.system_instruction:
                     messages.append({"role": "system", "content": self.system_instruction})
-                content = []
                 if image is not None:
-                    content.append({"type": "image", "image": image})
-                content.append({"type": "text", "text": text})
-                messages.append({"role": "user", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": image},
+                                {"type": "text", "text": text},
+                            ],
+                        }
+                    )
+                else:
+                    messages.append({"role": "user", "content": text})
                 conversations.append(messages)
         else:
             turns = value
@@ -108,16 +115,62 @@ class Qwen3_5ChatTemplateStage:
         device = self.bundle.device
         dtype = self.bundle.dtype
 
-        per_sample_inputs = []
-        for messages in conversations:
-            inputs = processor.apply_chat_template(
+        def apply_template(
+            messages: List[dict],
+            *,
+            add_generation_prompt: bool,
+        ) -> dict:
+            has_media = any(
+                isinstance(message.get("content"), list)
+                and any(isinstance(part, dict) and part.get("type") == "image" for part in message["content"])
+                for message in messages
+            )
+            if has_media:
+                # Qwen3.5's AutoProcessor scans every message as multimodal
+                # content. Normalize system/text strings to text blocks so the
+                # scan does not iterate over characters.
+                processor_messages = [
+                    {
+                        **message,
+                        "content": (
+                            [{"type": "text", "text": message["content"]}]
+                            if isinstance(message.get("content"), str)
+                            else message.get("content")
+                        ),
+                    }
+                    for message in messages
+                ]
+                return processor.apply_chat_template(
+                    processor_messages,
+                    add_generation_prompt=add_generation_prompt,
+                    enable_thinking=self.enable_thinking,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+
+            # The processor's multimodal pre-scan does not accept the standard
+            # string content emitted by build_text_messages. The tokenizer does,
+            # and is also the exact path used by the SGLang text adapter.
+            ids = processor.tokenizer.apply_chat_template(
                 messages,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 enable_thinking=self.enable_thinking,
                 tokenize=True,
-                return_dict=True,
+                return_dict=False,
                 return_tensors="pt",
+                truncation=False,
             )
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            return {
+                "input_ids": ids,
+                "attention_mask": torch.ones_like(ids),
+            }
+
+        per_sample_inputs = []
+        for messages in conversations:
+            inputs = apply_template(messages, add_generation_prompt=True)
             has_media = any(
                 isinstance(message.get("content"), list)
                 and any(isinstance(part, dict) and part.get("type") == "image" for part in message["content"])
@@ -139,14 +192,7 @@ class Qwen3_5ChatTemplateStage:
                 # → degenerate/empty generations. Truncate the body but keep the
                 # suffix: re-tokenize without the generation prompt to measure the
                 # suffix, then splice head + suffix at max_prompt_length.
-                base = processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=False,
-                    enable_thinking=self.enable_thinking,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
+                base = apply_template(messages, add_generation_prompt=False)
                 suffix_len = prompt_len - int(base["input_ids"].shape[-1])
                 if suffix_len < 0 or suffix_len >= self.max_prompt_length:
                     raise ValueError(

@@ -180,6 +180,9 @@ class Qwen3_5Bundle(Bundle):
                 # init_weights to a no-op so parallelize does not re-init after
                 # to_empty. capture_init_state requires buffers real on CPU, which
                 # VeOmni's meta build provides.
+                from unirl.train.backend.veomni import _compat
+
+                _compat.ensure_qwen3_5_moe_installed()
                 from veomni.arguments import OpsImplementationConfig
                 from veomni.models.auto import build_foundation_model
 

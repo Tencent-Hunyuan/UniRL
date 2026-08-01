@@ -71,13 +71,6 @@ sglang = [
   # [tilelang] extra is already satisfied transitively. Pin to the version
   # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
-  # causal-conv1d: the official PyPI/GitHub wheels use a calendar-versioning
-  # scheme for the torch 2.11+ cu13 stack (e.g. cu13torch25.11). The
-  # cu13torch2.10 wheel is ABI-compatible with torch 2.11.0+cu130 (both cxx11
-  # ABI TRUE, same CUDA 13 major). Install from GitHub releases:
-  #   uv pip install --find-links https://github.com/Dao-AILab/causal-conv1d/releases \
-  #     "causal-conv1d==1.6.2.post1+cu13torch2.10cxx11abiTRUE"
-  "causal-conv1d>=1.4.0 ; sys_platform == 'linux'",
 ]
 # CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
 vllm = [

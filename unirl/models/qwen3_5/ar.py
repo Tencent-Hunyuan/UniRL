@@ -3,10 +3,9 @@
 Combines:
 * Qwen3's chunked ``_replay_aware_forward`` (no full-logits materialization)
   adapted for Qwen3.5's ``transformer.model`` + ``transformer.lm_head`` layout
-  and multimodal conditioning (pixel_values / image_grid_thw / video_grid_thw).
+  and multimodal conditioning (pixel_values / image_grid_thw).
 * Qwen-VL's M-RoPE ``_vision_rope_positions`` and per-sample pixel_values
-  merge, extended with ``video_grid_thw`` (Qwen3.5 adds first-class video
-  tokens).
+  merge.
 * ``_SPARSE_PACKED_ATTN = ()`` — Qwen3.5's hybrid attention (3 GDN + 1 full
   per 4 layers) cannot use a per-layer sparse-block gate, so packed replay
   is disabled and every replay goes through ``padding_replay``.
@@ -41,6 +40,17 @@ logger = logging.getLogger(__name__)
 # is stage-level (cannot per-layer branch), so packed replay is fully disabled
 # — every replay goes through the dense padded path.
 _SPARSE_PACKED_ATTN: Tuple[str, ...] = ()
+
+
+def _reserved_generation_token_ids(transformer: Any) -> Tuple[int, ...]:
+    """Image/video placeholders are prompt structure, never response actions."""
+    config = transformer.config
+    ids = []
+    for name in ("image_token_id", "video_token_id"):
+        token_id = getattr(config, name, None)
+        if token_id is not None:
+            ids.append(int(token_id))
+    return tuple(dict.fromkeys(ids))
 
 
 def _replay_aware_forward(
@@ -81,9 +91,13 @@ def _replay_aware_forward(
 
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
+    forbidden_ids = _reserved_generation_token_ids(self)
 
     def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
         lf = self.lm_head(h).float() / T  # [B, chunk, vocab] FP32
+        if forbidden_ids:
+            forbidden = torch.tensor(forbidden_ids, device=lf.device, dtype=torch.long)
+            lf = lf.index_fill(-1, forbidden, float("-inf"))
         chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
         return chosen - torch.logsumexp(lf, dim=-1)
 
@@ -122,22 +136,29 @@ class Qwen3_5ARStep(ARStep):
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 0,
+        forbidden_token_ids: Tuple[int, ...] = (),
     ) -> None:
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.top_k = int(top_k)
+        self.forbidden_token_ids = tuple(int(token_id) for token_id in forbidden_token_ids)
 
     def step(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if logits.dim() != 2:
             raise ValueError(f"Qwen3_5ARStep.step: expected logits shape [B, vocab], got {tuple(logits.shape)}")
 
+        scaled = logits.float()
+        if self.forbidden_token_ids:
+            forbidden = torch.tensor(self.forbidden_token_ids, device=scaled.device, dtype=torch.long)
+            scaled = scaled.index_fill(-1, forbidden, float("-inf"))
+
         if self.temperature <= 0.0:
-            log_probs_full = F.log_softmax(logits.float(), dim=-1)
+            log_probs_full = F.log_softmax(scaled, dim=-1)
             token_id = log_probs_full.argmax(dim=-1)
             log_prob = log_probs_full.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
             return token_id, log_prob
 
-        scaled = logits.float() / self.temperature
+        scaled = scaled / self.temperature
         log_probs_full = F.log_softmax(scaled, dim=-1)
 
         if self.top_k > 0 and self.top_k < scaled.shape[-1]:
@@ -175,7 +196,6 @@ def _vision_rope_positions(
     input_ids: torch.Tensor,
     *,
     image_grid_thw: Optional[torch.Tensor],
-    video_grid_thw: Optional[torch.Tensor],
     attention_mask: torch.Tensor,
     mm_token_type_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -183,14 +203,13 @@ def _vision_rope_positions(
 
     HF Qwen3.5 makes ``mm_token_type_ids`` a required positional arg, while
     VeOmni's patched Qwen3.5 omits it. Dispatch by the inspected signature; for
-    the HF path, build it from config token ids when absent (text=0, image=1,
-    video=2).
+    the HF path, build it from config token ids when absent (text=0, image=1).
 
     ``mm_token_type_ids`` should be built from the **prompt** portion only —
     response tokens must be text (0). Building it from ``input_ids`` directly
     is unsafe when ``input_ids`` contains sampled response tokens that happen
-    to equal ``image_token_id`` / ``video_token_id``, which would create
-    phantom image/video groups and exhaust the ``grid_thw`` iterator inside
+    to equal a multimodal placeholder, which would create phantom vision
+    groups and exhaust the ``grid_thw`` iterator inside
     ``get_rope_index`` (cf. ms-swift's collator, which builds it per-sample on
     the prompt before batching).
     """
@@ -199,25 +218,20 @@ def _vision_rope_positions(
     if mm_token_type_ids is None:
         mm_token_type_ids = torch.zeros_like(input_ids)
         image_token_id = getattr(cfg, "image_token_id", None)
-        video_token_id = getattr(cfg, "video_token_id", None)
         if image_token_id is not None:
             mm_token_type_ids[input_ids == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[input_ids == video_token_id] = 2
     rope_parameters = inspect.signature(get_rope_index).parameters
     if "mm_token_type_ids" in rope_parameters:
         position_ids, _ = get_rope_index(
             input_ids,
             mm_token_type_ids,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
     else:
         position_ids, _ = get_rope_index(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
         )
     return position_ids
@@ -227,7 +241,7 @@ def _build_mm_token_type_ids(
     transformer: Any,
     input_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Build ``mm_token_type_ids`` from token ids (text=0 / image=1 / video=2).
+    """Build ``mm_token_type_ids`` from token ids (text=0 / image=1).
 
     Qwen3.5 requires this on every multimodal forward where ``position_ids`` is
     None (decode loop) so ``compute_3d_position_ids`` can run.
@@ -235,11 +249,8 @@ def _build_mm_token_type_ids(
     cfg = transformer.config
     mm = torch.zeros_like(input_ids)
     image_token_id = getattr(cfg, "image_token_id", None)
-    video_token_id = getattr(cfg, "video_token_id", None)
     if image_token_id is not None:
         mm[input_ids == image_token_id] = 1
-    if video_token_id is not None:
-        mm[input_ids == video_token_id] = 2
     return mm
 
 
@@ -310,61 +321,99 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         transformer.model.rope_deltas = None
 
         stop_ids = self._resolve_stop_ids(params, sampling_params)
+        forbidden_ids = _reserved_generation_token_ids(transformer)
         step = Qwen3_5ARStep(
             temperature=float(sampling_params.temperature),
             top_p=float(sampling_params.top_p),
             top_k=int(sampling_params.top_k),
+            forbidden_token_ids=forbidden_ids,
         )
         max_new = int(sampling_params.max_new_tokens)
 
         pv = _merge_per_sample(conditions.pixel_values)
         igt = _merge_per_sample(conditions.image_grid_thw)
-        vgt = _merge_per_sample(conditions.video_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
             igt = igt.to(device)
-        if vgt is not None:
-            vgt = vgt.to(device)
+
+        # VeOmni 0.1.11's patched Qwen3.5-MoE GDN explicitly rejects the
+        # one-token cached-update path. Its EP-capable model exposes
+        # get_parallel_plan(); recompute the growing prefix there so trainside
+        # generation remains correct. Stock HF dense/MoE keeps the fast cache.
+        use_cache = not callable(getattr(transformer, "get_parallel_plan", None))
 
         model_kwargs: Dict[str, Any] = {
             "attention_mask": attention_mask,
-            "use_cache": True,
+            "use_cache": use_cache,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
+        if use_cache and pv is not None:
+            # GenerationMixin normally prepares Qwen3.5's 4-D M-RoPE ids
+            # before entering its decode loop. This stage owns the loop, so do
+            # that setup explicitly and let _update_model_kwargs_for_generation
+            # extend position/mm ids one text token at a time.
+            model_kwargs["image_grid_thw"] = igt
+            model_kwargs["mm_token_type_ids"] = _build_mm_token_type_ids(transformer, input_ids)
+            model_kwargs["position_ids"] = transformer._prepare_position_ids_for_generation(
+                input_ids,
+                model_kwargs,
+            )
 
         cur_input_ids = input_ids
+        next_sequence_length = int(input_ids.shape[1])
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
         is_first_step = True
 
         for _ in range(max_new):
-            prep_kwargs: Dict[str, Any] = {
-                "past_key_values": model_kwargs.get("past_key_values"),
-                "attention_mask": model_kwargs.get("attention_mask"),
-                "cache_position": model_kwargs.get("cache_position"),
-                "use_cache": True,
-            }
-            if is_first_step:
-                if pv is not None:
-                    prep_kwargs["pixel_values"] = pv
-                if igt is not None:
-                    prep_kwargs["image_grid_thw"] = igt
-                # Video rollout is not yet wired (no pixel_values_videos condition
-                # field); video_grid_thw is carried for the M-RoPE path only.
-                prep_kwargs["is_first_iteration"] = True
-            else:
-                prep_kwargs["is_first_iteration"] = False
+            if use_cache:
+                prep_kwargs: Dict[str, Any] = {
+                    "past_key_values": model_kwargs.get("past_key_values"),
+                    "attention_mask": model_kwargs.get("attention_mask"),
+                    "position_ids": model_kwargs.get("position_ids"),
+                    "mm_token_type_ids": model_kwargs.get("mm_token_type_ids"),
+                    "next_sequence_length": next_sequence_length,
+                    "use_cache": True,
+                }
+                if is_first_step:
+                    if pv is not None:
+                        prep_kwargs["pixel_values"] = pv
+                    if igt is not None:
+                        prep_kwargs["image_grid_thw"] = igt
+                    prep_kwargs["is_first_iteration"] = True
+                else:
+                    prep_kwargs["is_first_iteration"] = False
 
-            model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
-            # Qwen3.5 requires mm_token_type_ids on multimodal forwards where
-            # position_ids is None (compute_3d_position_ids reads it). Build it
-            # from the token ids and inject into model_inputs for the first step
-            # (decode steps carry no image tokens, so 0 is correct).
-            if is_first_step and (pv is not None or vgt is not None):
-                model_inputs["mm_token_type_ids"] = _build_mm_token_type_ids(transformer, cur_input_ids)
+                model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
+            else:
+                # VeOmni GDN fallback: no KV cache, so every forward sees the
+                # full prefix and must receive the image inputs and dense
+                # sequence boundaries again.
+                model_inputs = {
+                    "input_ids": cur_input_ids,
+                    "attention_mask": model_kwargs["attention_mask"],
+                    "use_cache": False,
+                }
+                if pv is not None:
+                    model_inputs["pixel_values"] = pv
+                if igt is not None:
+                    model_inputs["image_grid_thw"] = igt
+                if pv is not None:
+                    model_inputs["mm_token_type_ids"] = _build_mm_token_type_ids(transformer, cur_input_ids)
+                    vision_pos = _vision_rope_positions(
+                        transformer,
+                        cur_input_ids,
+                        image_grid_thw=igt,
+                        attention_mask=model_kwargs["attention_mask"],
+                        mm_token_type_ids=model_inputs["mm_token_type_ids"],
+                    )
+                    text_pos = model_kwargs["attention_mask"].long().cumsum(-1) - 1
+                    text_pos.masked_fill_(model_kwargs["attention_mask"] == 0, 1)
+                    model_inputs["position_ids"] = torch.cat([text_pos[None], vision_pos], dim=0)
+                model_inputs.update(_dense_flash_attention_kwargs(cur_input_ids))
+
             with torch.no_grad():
                 out = transformer(**model_inputs, return_dict=True)
             logits = out.logits
@@ -395,8 +444,20 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                 break
 
             cur_input_ids = torch.cat([cur_input_ids, token_id.unsqueeze(-1)], dim=1)
-            model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
-            model_kwargs["use_cache"] = True
+            if use_cache:
+                model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
+                model_kwargs["use_cache"] = True
+                next_sequence_length = 1
+            else:
+                next_mask = torch.ones(
+                    (batch_size, 1),
+                    dtype=model_kwargs["attention_mask"].dtype,
+                    device=device,
+                )
+                model_kwargs["attention_mask"] = torch.cat(
+                    [model_kwargs["attention_mask"], next_mask],
+                    dim=1,
+                )
             is_first_step = False
 
         return _pack_text_segment(generated_tokens, per_token_logps, device=device)
@@ -438,13 +499,10 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
 
         pv = _merge_per_sample(conditions.pixel_values)
         igt = _merge_per_sample(conditions.image_grid_thw)
-        vgt = _merge_per_sample(conditions.video_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
             igt = igt.to(device)
-        if vgt is not None:
-            vgt = vgt.to(device)
 
         # Strip right-padding introduced by cross-worker concat.
         real_lens = prompt_mask.sum(dim=1).long()
@@ -488,23 +546,18 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
-        # Response tokens are sampled text — but a sampled id may happen to equal
-        # image_token_id / video_token_id. The model's get_placeholder_mask
-        # counts image tokens from input_ids directly (not mm_token_type_ids),
-        # so any stray image_token_id in the response would make the count exceed
-        # the actual image features → "Image features and image tokens do not
-        # match". Scrub the collisions to pad_id in ``response_tokens`` BEFORE
-        # building ``full_ids`` so the forward input and the log-prob gather
-        # index stay consistent (scrubbing only ``full_ids`` would condition
-        # every later hidden state on pad while gathering the original id).
-        cfg = self.model.transformer.config
-        _resp_image_token_id = getattr(cfg, "image_token_id", None)
-        _resp_video_token_id = getattr(cfg, "video_token_id", None)
-        if T_max > 0 and (_resp_image_token_id is not None or _resp_video_token_id is not None):
-            if _resp_image_token_id is not None:
-                response_tokens[response_tokens == _resp_image_token_id] = pad_id
-            if _resp_video_token_id is not None:
-                response_tokens[response_tokens == _resp_video_token_id] = pad_id
+        # Rollout excludes multimodal placeholder ids from the response
+        # distribution. Never rewrite a stored action during replay: doing so
+        # would gather a different token's log-prob and condition every later
+        # position on the wrong prefix.
+        for token_id in _reserved_generation_token_ids(self.model.transformer):
+            if bool(((response_tokens == token_id) & response_mask.bool()).any().item()):
+                raise ValueError(
+                    "Qwen3_5ARStage.padding_replay: response contains reserved "
+                    f"multimodal placeholder token id {token_id}; refusing to "
+                    "rewrite the sampled action. Regenerate with placeholder "
+                    "logit bias enabled."
+                )
 
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
@@ -514,26 +567,19 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             full_mask = prompt_mask
 
         # Build mm_token_type_ids from the PROMPT only. Response tokens are
-        # sampled text and must be type 0 — but a sampled token id may happen
-        # to equal image_token_id / video_token_id, which would create phantom
-        # vision groups inside get_rope_index and exhaust the grid_thw iterator
-        # (StopIteration). Mirrors ms-swift's collator, which builds
-        # mm_token_type_ids per-sample on the prompt before batching.
+        # sampled text and must be type 0. Mirrors ms-swift's collator, which
+        # builds mm_token_type_ids per-sample on the prompt before batching.
         cfg = self.model.transformer.config
         mm_token_type_ids = torch.zeros_like(full_ids)
         image_token_id = getattr(cfg, "image_token_id", None)
-        video_token_id = getattr(cfg, "video_token_id", None)
         if image_token_id is not None:
             mm_token_type_ids[:, :max_real_len][prompt_ids == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[:, :max_real_len][prompt_ids == video_token_id] = 2
 
         # 4-D M-RoPE position_ids: [text_arange; get_rope_index (t,h,w)].
         vision_pos = _vision_rope_positions(
             self.model.transformer,
             full_ids,
             image_grid_thw=igt,
-            video_grid_thw=vgt,
             attention_mask=full_mask,
             mm_token_type_ids=mm_token_type_ids,
         )  # [3, bs, seq]
@@ -555,8 +601,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             forward_kwargs["pixel_values"] = pv
         if igt is not None:
             forward_kwargs["image_grid_thw"] = igt
-        if vgt is not None:
-            forward_kwargs["video_grid_thw"] = vgt
 
         per_token = self.model.transformer(**forward_kwargs)  # [B, T_max] FP32
 
