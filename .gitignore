@@ -72,10 +72,15 @@ local/
 *.pkl
 *.log
 
-# Datasets: keep the committed pickscore prompts, ignore other (local-only) datasets
+# Datasets: keep committed prompt sets and converter code, ignore local-only data
 datasets/*
 !datasets/pickscore
 !datasets/geneval2
+!datasets/video_r1_260k
+!datasets/daily_omni_av
+# converter outputs stay local-only; only the converter code is tracked
+datasets/video_r1_260k/**/*.jsonl
+datasets/daily_omni_av/**/*.jsonl
 
 # Large model artifacts (defense-in-depth)
 models/**/*.bin
@@ -104,3 +109,7 @@ benchmarks/image/dpg_bench/data/
 benchmarks/text/aime/data/aime2025.jsonl
 benchmarks/text/gpqa/data/
 benchmarks_results/
+
+# Private experimental packages (dirs or stray files) stay local-only
+# (the tier is also not packaged).
+experimental/private_*

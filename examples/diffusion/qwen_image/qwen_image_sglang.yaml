@@ -21,7 +21,7 @@
 #     (single-space negative — empty "" degenerates after the 34-token chat-template
 #     strip and divides the norm-preserving CFG blend by ~0; see QwenImagePipeline.)
 #
-#   1x8:  bash scripts/run_experiment_single_node.sh diffusion_rl/qwen_image_sglang
+#   1x8:  bash examples/run_experiment_single_node.sh diffusion/qwen_image/qwen_image_sglang
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout (matches qwen_image_dancegrpo)

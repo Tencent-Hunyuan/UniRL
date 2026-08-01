@@ -309,9 +309,9 @@ class Worker:
         resolved_kwargs = map_tree(kwargs, resolve)
 
         if grad_mode:
-            # get_batch returns detached views/copies, so resolved tensors are
-            # fresh objects that don't alias store contents — mark them directly.
-            tensors = collect_leaves(resolved_args, Tensor) + collect_leaves(tuple(resolved_kwargs.values()), Tensor)
+            # Cross-RPC autograd can only propagate gradients back to controller-side
+            # TensorRef inputs recorded by Handle as input_metas.
+            tensors = [fetched[str(i)] for i in range(len(in_metas))]
             for t in tensors:
                 t.requires_grad_(True)
                 t.retain_grad()

@@ -33,7 +33,6 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import make_video_segment
@@ -224,14 +223,14 @@ class Ltx2T2VAdapter(VideoAdapter):
 
         return build_ltx2_schedule_policy(float(self.model_config.shift))
 
-    def build_sampling(self, req: RolloutReq, *, diffusion: Any) -> Dict[str, Any]:
-        kwargs = super().build_sampling(req, diffusion=diffusion)
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
         kwargs["max_sequence_length"] = int(self.model_config.max_sequence_length)
 
         from unirl.models.ltx2.diffusion import audio_latent_shape
         from unirl.types.noise_recipe import NoiseRecipe
 
-        audio_noise = NoiseRecipe.from_rollout_req(req).resolve(
+        audio_noise = NoiseRecipe.from_sample(sample).resolve(
             salt="audio",
             latent_shape=audio_latent_shape(diffusion),
         )
@@ -282,7 +281,7 @@ class Ltx2T2VAdapter(VideoAdapter):
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -312,7 +311,7 @@ class Ltx2T2VAdapter(VideoAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,

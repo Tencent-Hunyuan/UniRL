@@ -308,10 +308,21 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx(device):
-            cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
-            gen = inf.update_context_text(clean_prompt, gen)
-            cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+        # eval() is load-bearing (same contract as ``rl_ops.forward_flow``): navit
+        # dispatches ``forward_train`` vs ``forward_inference`` on ``self.training``
+        # and ``update_context_text`` uses the packed-query inference signature,
+        # while ``TrainStack.train_track`` leaves the model in train() before the
+        # gradient-bearing replay.
+        mot = self.model.transformer
+        was_training = mot.training
+        mot.eval()
+        try:
+            with torch.no_grad(), self._autocast_ctx(device):
+                cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
+                gen = inf.update_context_text(clean_prompt, gen)
+                cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+        finally:
+            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
     def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
