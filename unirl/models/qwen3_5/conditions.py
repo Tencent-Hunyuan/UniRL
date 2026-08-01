@@ -1,11 +1,4 @@
-"""Qwen3_5ARConditions — typed conditions container for the Qwen3.5 AR stage.
-
-Mirror of :class:`unirl.models.qwen_vl.QwenVLARConditions` plus a
-``video_grid_thw`` slot (Qwen3.5 adds first-class video tokens).
-``pixel_values`` / ``image_grid_thw`` / ``video_grid_thw`` are per-sample
-lists (FieldKind.CONCAT) so multi-worker concatenation preserves every
-sample's media tensors.
-"""
+"""Typed text/image conditions for the Qwen3.5 AR stage."""
 
 from __future__ import annotations
 
@@ -18,12 +11,11 @@ from unirl.types.conditions import TextTokenCondition
 
 @dataclass
 class Qwen3_5ARConditions(Batch):
-    """Conditions for Qwen3.5 autoregressive generation (text + image + video)."""
+    """Conditions for Qwen3.5 autoregressive generation (text + optional image)."""
 
     prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
     pixel_values: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     image_grid_thw: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
-    video_grid_thw: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Qwen3_5ARConditions":
@@ -38,18 +30,17 @@ class Qwen3_5ARConditions(Batch):
             prompt=prompt,
             pixel_values=d.get("pixel_values"),
             image_grid_thw=d.get("image_grid_thw"),
-            video_grid_thw=d.get("video_grid_thw"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
         if self.prompt is None:
             raise ValueError("Qwen3_5ARConditions.to_dict: prompt field is None")
-        return {
-            "prompt": self.prompt,
-            "pixel_values": self.pixel_values,
-            "image_grid_thw": self.image_grid_thw,
-            "video_grid_thw": self.video_grid_thw,
-        }
+        out: Dict[str, Any] = {"prompt": self.prompt}
+        if self.pixel_values is not None:
+            out["pixel_values"] = self.pixel_values
+        if self.image_grid_thw is not None:
+            out["image_grid_thw"] = self.image_grid_thw
+        return out
 
 
 __all__ = ["Qwen3_5ARConditions"]

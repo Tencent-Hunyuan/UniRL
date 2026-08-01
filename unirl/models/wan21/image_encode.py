@@ -109,20 +109,6 @@ class WAN21ImageLatentEncodeStage(EncodeStage[Images, ImageLatentCondition]):
 
         latent_condition = latent_condition.to(device=device, dtype=dtype)
 
-        # Per-channel normalization — strict inverse of ``wan21/vae.py:78-87``
-        # decode: ``latent_decoded = stored * std + mean``.
-        vae_config = vae.config
-        latents_mean = getattr(vae_config, "latents_mean", None)
-        latents_std = getattr(vae_config, "latents_std", None)
-        if latents_mean is not None and latents_std is not None:
-            z_dim = int(getattr(vae_config, "z_dim", latent_condition.shape[1]))
-            mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(1, z_dim, 1, 1, 1)
-            std = torch.tensor(latents_std, device=device, dtype=dtype).view(1, z_dim, 1, 1, 1)
-            latent_condition = (latent_condition - mean) / std
-        else:
-            scaling_factor = float(getattr(vae_config, "scaling_factor", 1.0))
-            latent_condition = latent_condition * scaling_factor
-
         # 4-channel first-frame mask (mirrors diffusers
         # ``pipeline_wan_i2v.py:468-479``): 1.0 at first pixel-time slot,
         # 0.0 elsewhere; then view-reshape + transpose so the temporal

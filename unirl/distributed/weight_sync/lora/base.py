@@ -82,6 +82,13 @@ class LoraWeightSyncBase(Remote):
     ) -> None:
         super().__init__()
         self._backend = backend
+        from unirl.utils.peft_merge import lora_targets_ep_experts
+
+        if lora_targets_ep_experts(backend.model):
+            raise ValueError(
+                f"{type(self).__name__}: LoRA targeting EP-sharded fused experts "
+                "is unsupported; target attention/shared non-EP modules instead."
+            )
         self._param_prefix = str(param_prefix or "")
         # None defers to the backend's single source of truth (the EMA shadow
         # "old" for DiffusionNFT, else "default"); an explicit value overrides.
@@ -120,7 +127,15 @@ class LoraWeightSyncBase(Remote):
         exp_b = sorted(h for k, h in expected.items() if ".lora_B." in k)
         return exp_a, exp_b
 
-    def _assert_loaded(self, exp_a: List[str], exp_b: List[str], loaded: Dict, *, label: str) -> None:
+    def _assert_loaded(
+        self,
+        exp_a: List[str],
+        exp_b: List[str],
+        loaded: Dict,
+        *,
+        topology: Dict,
+        label: str,
+    ) -> None:
         """Assert one engine's loaded LoRA matches the expected multisets.
 
         The engine keys by vLLM-internal layer name + field (``lora_a`` /
@@ -131,8 +146,46 @@ class LoraWeightSyncBase(Remote):
         ``param_prefix`` (which yields wrong / zero loaded layers). ``loaded`` is a
         ``{stage_id: [per_rank {layer: {field: hex}}]}`` map.
         """
-        for stage_id, per_rank in loaded.items():
+        if not exp_a or not exp_b:
+            raise RuntimeError(
+                f"[LoRA-SYNC] verify FAILED on {label}: expected checksum sets must be non-empty "
+                f"(lora_A={len(exp_a)}, lora_B={len(exp_b)})."
+            )
+        if not isinstance(topology, dict) or not topology:
+            raise RuntimeError(f"[LoRA-SYNC] verify FAILED on {label}: rollout topology is empty.")
+        try:
+            expected_topology = {int(stage_id): int(tp) for stage_id, tp in topology.items()}
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"[LoRA-SYNC] verify FAILED on {label}: invalid rollout topology {topology!r}.") from exc
+        if any(tp <= 0 for tp in expected_topology.values()):
+            raise RuntimeError(f"[LoRA-SYNC] verify FAILED on {label}: invalid rollout topology {topology!r}.")
+
+        if not isinstance(loaded, dict) or not loaded:
+            raise RuntimeError(f"[LoRA-SYNC] verify FAILED on {label}: engine returned no loaded LoRA checksums.")
+        try:
+            loaded_by_stage = {int(stage_id): per_rank for stage_id, per_rank in loaded.items()}
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"[LoRA-SYNC] verify FAILED on {label}: invalid loaded stage keys.") from exc
+        if set(loaded_by_stage) != set(expected_topology):
+            raise RuntimeError(
+                f"[LoRA-SYNC] verify FAILED on {label}: expected stages {sorted(expected_topology)}, "
+                f"engine returned {sorted(loaded_by_stage)}."
+            )
+
+        for stage_id, tp in sorted(expected_topology.items()):
+            per_rank = loaded_by_stage[stage_id]
+            if not isinstance(per_rank, (list, tuple)) or len(per_rank) != tp:
+                actual = len(per_rank) if isinstance(per_rank, (list, tuple)) else type(per_rank).__name__
+                raise RuntimeError(
+                    f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id}: "
+                    f"expected {tp} TP rank readbacks, got {actual}."
+                )
             for rank_idx, layer_map in enumerate(per_rank):
+                if not isinstance(layer_map, dict) or not layer_map:
+                    raise RuntimeError(
+                        f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id} rank {rank_idx}: "
+                        "engine returned no loaded LoRA layers."
+                    )
                 # Plain layers expose ``lora_a`` / ``lora_b`` directly. Packed
                 # layers expose one checksum per fused projection as
                 # ``lora_a.<index>`` / ``lora_b.<index>``. Flatten both shapes

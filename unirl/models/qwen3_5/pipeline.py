@@ -1,4 +1,4 @@
-"""Qwen3.5 VL AR pipeline: text (+ images) in, text out.
+"""Qwen3.5 AR pipeline: text (+ optional image) in, text out.
 
 Combines :class:`Qwen3_5ChatTemplateStage` (chat template + image preprocessing)
 with :class:`Qwen3_5ARStage` (per-token decode + chunked-logp replay). Mirrors
@@ -9,13 +9,12 @@ with :class:`Qwen3_5ARStage` (per-token decode + chunked-logp replay). Mirrors
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample, Turn
 
 from .ar import Qwen3_5ARParams, Qwen3_5ARStage
 from .bundle import Qwen3_5Bundle
@@ -25,7 +24,7 @@ from .config import Qwen3_5PipelineConfig
 
 
 class Qwen3_5Pipeline(Pipeline):
-    """AR-only VL pipeline for Qwen3.5 (dense + MoE)."""
+    """Qwen3.5 AR pipeline for dense/MoE text and single-image inputs."""
 
     def __init__(
         self,
@@ -113,43 +112,47 @@ class Qwen3_5Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run Qwen3.5 AR generation end-to-end."""
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"Qwen3_5Pipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-
-        pil_images = None
-        images_prim = req.primitives.get("image")
-        if images_prim is not None and isinstance(images_prim, Images):
-            pil_images = images_prim.to_pils()
-
-        chat_overrides: Dict[str, Any] = dict(req.task_config.get("chat") or {})
+    def _conditions_for(
+        self,
+        turns: List[Turn],
+        control: Optional[Dict[str, Any]] = None,
+    ) -> Qwen3_5ARConditions:
+        """Render one role-aware text/image trajectory into replay conditions."""
+        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3_5ChatTemplateStage(
                 self.bundle,
                 system_instruction=chat_overrides["system_instruction"],
                 max_prompt_length=self.chat_template.max_prompt_length,
                 enable_thinking=self.chat_template.enable_thinking,
+                pad_to_max_length=self.chat_template.pad_to_max_length,
             )
         else:
             chat_stage = self.chat_template
+        return chat_stage.embed(turns)
 
-        conds: Qwen3_5ARConditions = chat_stage.embed(texts, images=pil_images)
-
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = Qwen3_5ARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
+    def generate(self, sample: Sample) -> Sample:
+        """Run Qwen3.5 generation and fill the frontier generation Part."""
+        frontier = sample.parts[-1]
+        ar = frontier.sampling_params
+        if not isinstance(ar, ARSamplingParams):
+            raise TypeError(
+                "Qwen3_5Pipeline.generate: frontier gen Part must carry "
+                f"ARSamplingParams, got {type(ar).__name__ if ar is not None else 'None'}"
             )
+
+        if sample.has_image_input():
+            turns, _images = sample.vision_conditioning()
         else:
-            params = Qwen3_5ARParams()
+            turns = sample.text_conditioning()
+        conds = self._conditions_for(turns, sample.parts[0].control)
+
+        params = Qwen3_5ARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+        )
 
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
@@ -162,16 +165,10 @@ class Qwen3_5Pipeline(Pipeline):
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                )
-            }
+        return sample.with_filled_frontier(
+            segment=segment,
+            primitives={"text": decoded},
+            conditions=conds.to_dict(),
         )
 
     def _detokenize(self, segment) -> Texts:

@@ -3,9 +3,8 @@
 Mirror of :class:`unirl.models.qwen_vl.QwenVLPipelineConfig` (vision tower,
 min/max pixels, meta-init) plus the chat-template knobs from
 :class:`unirl.models.qwen3.Qwen3PipelineConfig` (``system_instruction``,
-``enable_thinking``). Qwen3.5 is a multimodal model that degrades to
-text-only when no images/videos are supplied, so a single config covers
-both recipes.
+``enable_thinking``). Qwen3.5 degrades to text-only when no image is
+supplied, so a single config covers both supported recipe shapes.
 """
 
 from __future__ import annotations

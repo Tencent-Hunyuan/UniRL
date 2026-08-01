@@ -340,8 +340,8 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         """Run full HunyuanVideo-1.0 T2V sampling. Returns a ``LatentSegment``
         with 6D trajectory storage and ``modality=VIDEO``.
 
-        ``initial_latents`` (optional) -- driver-shipped x_T per
-        ``req.request_conditions['initial_latents']``; see
+        ``initial_latents`` (optional) -- x_T resolved from the request
+        ``Sample``'s diffusion generation Part; see
         :class:`SD3DiffusionStage.diffuse` for the contract.
         """
         from unirl.sde.noise import generate_latents

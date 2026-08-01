@@ -1,25 +1,29 @@
-"""Qwen3_5ChatTemplateStage — ``Texts (+ images) -> Qwen3_5ARConditions``.
+"""Qwen3_5ChatTemplateStage — text/image conversations → AR conditions.
 
 Applies the bundle processor's chat template (with
 ``add_generation_prompt=True`` and ``enable_thinking``) so the AR stage
 starts from the canonical assistant-turn prefix. Mirrors
 :class:`unirl.models.qwen_vl.QwenVLChatTemplateStage`'s per-sample
-processor call (to extract ``pixel_values`` / ``image_grid_thw`` /
-``video_grid_thw``) plus Qwen3's ``enable_thinking`` switch.
+processor call (to extract ``pixel_values`` / ``image_grid_thw``) plus
+Qwen3's ``enable_thinking`` switch.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional, Union
 
-import PIL.Image
 import torch
 
+from unirl.config.require import require
+from unirl.models.types.conversations import build_text_messages, build_vision_messages
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images, Texts
+from unirl.types.sample import Turn
 
 from .bundle import Qwen3_5Bundle
 from .conditions import Qwen3_5ARConditions
+
+Qwen3_5ChatInput = Union[List[Turn], Texts]
 
 
 class Qwen3_5ChatTemplateStage:
@@ -46,26 +50,66 @@ class Qwen3_5ChatTemplateStage:
 
     def embed(
         self,
-        texts: Texts,
-        images: Optional[List[Optional[PIL.Image.Image]]] = None,
+        value: Qwen3_5ChatInput,
+        images: Optional[List[Optional[Any]]] = None,
     ) -> Qwen3_5ARConditions:
+        """Render Sample-native turns or supervised text/image rows.
+
+        The rollout path carries images inside ``Turn`` objects. ``Texts`` plus
+        a separate image list remains the supervised single-turn seam.
+        """
+        if isinstance(value, Texts):
+            batch_size = len(value)
+            if batch_size == 0:
+                raise ValueError("Qwen3_5ChatTemplateStage.embed: expected at least one text row.")
+            image_rows = [None] * batch_size if images is None else list(images)
+            if len(image_rows) != batch_size:
+                raise ValueError(
+                    f"Qwen3_5ChatTemplateStage.embed: images length {len(image_rows)} != text batch {batch_size}."
+                )
+            conversations = []
+            for text, image in zip(value.texts, image_rows):
+                messages = []
+                if self.system_instruction:
+                    messages.append({"role": "system", "content": self.system_instruction})
+                content = []
+                if image is not None:
+                    content.append({"type": "image", "image": image})
+                content.append({"type": "text", "text": text})
+                messages.append({"role": "user", "content": content})
+                conversations.append(messages)
+        else:
+            turns = value
+            if images is not None:
+                raise ValueError(
+                    "Qwen3_5ChatTemplateStage.embed: images must be carried by Turn "
+                    "content; the separate images argument is only valid with Texts input."
+                )
+            if not turns:
+                raise ValueError("Qwen3_5ChatTemplateStage.embed: expected at least one conversation turn.")
+            unsupported = [
+                type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, Images))
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"Qwen3_5ChatTemplateStage.embed: only text and image turns are supported; got {unsupported}."
+                )
+            require(
+                sum(isinstance(turn.content, Images) for turn in turns) <= 1,
+                "Qwen3_5ChatTemplateStage.embed: at most one image turn per request "
+                "is supported (multi-image trajectories are out of scope).",
+            )
+            if any(isinstance(turn.content, Images) for turn in turns):
+                conversations = build_vision_messages(turns, self.system_instruction)
+            else:
+                conversations = build_text_messages(turns, self.system_instruction)
+
         processor = self.bundle.processor
         device = self.bundle.device
         dtype = self.bundle.dtype
-        batch_size = len(texts.texts)
 
         per_sample_inputs = []
-        for i, text in enumerate(texts.texts):
-            content: list = []
-            if images is not None and i < len(images) and images[i] is not None:
-                content.append({"type": "image", "image": images[i]})
-            content.append({"type": "text", "text": text})
-
-            messages: list = []
-            if self.system_instruction is not None:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({"role": "user", "content": content})
-
+        for messages in conversations:
             inputs = processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -74,14 +118,18 @@ class Qwen3_5ChatTemplateStage:
                 return_dict=True,
                 return_tensors="pt",
             )
-            has_media = any(part.get("type") in {"image", "video"} for part in content if isinstance(part, dict))
+            has_media = any(
+                isinstance(message.get("content"), list)
+                and any(isinstance(part, dict) and part.get("type") == "image" for part in message["content"])
+                for message in messages
+            )
             prompt_len = int(inputs["input_ids"].shape[-1])
             if has_media and prompt_len > self.max_prompt_length:
                 raise ValueError(
                     "Qwen3_5ChatTemplateStage.embed: multimodal prompt length "
                     f"{prompt_len} exceeds max_prompt_length={self.max_prompt_length}. "
                     "Refusing to truncate after vision preprocessing because that can "
-                    "desynchronize image/video placeholder tokens from pixel_values or grids. "
+                    "desynchronize image placeholder tokens from pixel_values or grids. "
                     "Increase pipeline.max_prompt_length or shorten the prompt."
                 )
             if not has_media and prompt_len > self.max_prompt_length:
@@ -115,6 +163,7 @@ class Qwen3_5ChatTemplateStage:
                     dim=-1,
                 )
             per_sample_inputs.append(inputs)
+        batch_size = len(per_sample_inputs)
 
         if self.pad_to_max_length:
             max_len = self.max_prompt_length
@@ -144,23 +193,18 @@ class Qwen3_5ChatTemplateStage:
         # Per-sample lists for media tensors (FieldKind.CONCAT-safe).
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
-        video_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:
             pv = inp.get("pixel_values")
             igt = inp.get("image_grid_thw")
-            vgt = inp.get("video_grid_thw")
             pixel_values.append(pv.to(device=device, dtype=dtype) if pv is not None else None)
             image_grid_thw.append(igt.to(device=device) if igt is not None else None)
-            video_grid_thw.append(vgt.to(device=device) if vgt is not None else None)
 
         has_img = any(p is not None for p in pixel_values)
-        has_vid = any(v is not None for v in video_grid_thw)
 
         return Qwen3_5ARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
             pixel_values=pixel_values if has_img else None,
             image_grid_thw=image_grid_thw if has_img else None,
-            video_grid_thw=video_grid_thw if has_vid else None,
         )
 
 

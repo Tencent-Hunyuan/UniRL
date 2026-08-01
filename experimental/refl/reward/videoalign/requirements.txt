@@ -1,0 +1,12 @@
+# VideoAlign reward extras — ADDITIVE ONLY on top of the UniRL core stack.
+#
+# The reward shares one Python process with the actor (colocated Remote
+# siblings), so pins here cannot "isolate" versions — an overlapping pin
+# would downgrade the core environment itself. Core already provides
+# transformers / peft / safetensors / huggingface-hub / einops (see
+# pyproject.toml); never re-pin those here. Attention runs SDPA — flash-attn
+# is not part of the locked stack.
+#
+# torchvision (frame preprocessing) also comes from the core engine extra —
+# additive-only forbids re-declaring it, and a bare re-pin could resolve a
+# cu-mismatched wheel that downgrades torch itself. Nothing extra to install.

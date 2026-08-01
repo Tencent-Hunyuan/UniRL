@@ -42,6 +42,14 @@ from unirl.train.backend.sharded_state import (
     gather_optimizer_state_dict,
     load_optimizer_state_dict,
 )
+from unirl.train.backend.veomni.ep.checkpoint import (
+    EP_CHECKPOINT_VERSION,
+    gather_ep_model_state_dict,
+    gather_ep_optimizer_state_dict,
+    has_ep_params,
+    load_ep_model_state_dict,
+    load_ep_optimizer_state_dict,
+)
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
 from unirl.train.configs import (
@@ -51,6 +59,7 @@ from unirl.train.configs import (
     LoraConfig,
 )
 from unirl.train.deferred import apply_deferred_ops
+from unirl.utils.dtypes import parse_torch_dtype
 
 
 class VeOmniBackend(BaseFSDP2Backend):
@@ -94,6 +103,10 @@ class VeOmniBackend(BaseFSDP2Backend):
         self._rank = dist.get_rank() if dist.is_initialized() else int(rank)
         world = dist.get_world_size() if dist.is_initialized() else 1
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
+            fsdp_cfg.param_dtype,
+            field_name="training.fsdp.param_dtype",
+        )
 
         _compat.ensure_installed()
         from veomni.distributed.parallel_state import init_parallel_state
@@ -118,9 +131,7 @@ class VeOmniBackend(BaseFSDP2Backend):
         # ep_size=1 (the default for every VeOmni-backed model) omits the
         # extra_parallel_* kwargs entirely, so the call is byte-identical to the
         # pre-EP path and never depends on the installed veomni accepting them.
-        self._ep_size = int(getattr(fsdp_cfg, "ep_size", 1) or 1)
-        if world % self._ep_size != 0:
-            raise ValueError(f"VeOmniBackend: world_size {world} not divisible by ep_size {self._ep_size}")
+        self._ep_size = _validate_ep_size(getattr(fsdp_cfg, "ep_size", 1), world_size=world)
         extra_parallel_kwargs = (
             {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)} if self._ep_size > 1 else {}
         )
@@ -191,6 +202,15 @@ class VeOmniBackend(BaseFSDP2Backend):
         # Post-materialize resets (LoRA adapter init, mirror copies).
         apply_deferred_ops(model)
 
+        # Guaranteed RoPE inv_freq recovery: meta-init + to_empty zero the
+        # non-persistent inv_freq, and the capture/stamp/restore path is unreliable
+        # under FSDP2 (DTensor buffers / module renaming) — leaving inv_freq==0 ->
+        # RoPE identity -> position-blind model -> rollout/replay logprob mismatch
+        # (ratio ~0.11) -> GRPO fully clipped -> reward can't move. Idempotent.
+        from unirl.models.types.meta_init import recover_rope_inv_freq
+
+        recover_rope_inv_freq(model)
+
         self._finalize_construction(
             model,
             shadow,
@@ -206,22 +226,47 @@ class VeOmniBackend(BaseFSDP2Backend):
     # Engine hooks (VeOmni FSDP2)
     # ------------------------------------------------------------------
 
+    @property
+    def weight_sync_dtype(self) -> torch.dtype:
+        """FSDP compute dtype used on the rollout wire.
+
+        This remains independent of an optional fp32 master dtype so LoRA
+        extraction cannot send fp32 tensors to bf16/fp16-only receivers.
+        """
+        return self._weight_sync_dtype
+
     def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:
         # VeOmni's clip takes the model (dispatches on EP / cpu-offload attrs).
         return clip_grad_norm(self.model, max_grad_norm)
 
+    def _gather_model_state(self, mode: str) -> StateDict:
+        if mode == "full" and has_ep_params(self.model):
+            return gather_ep_model_state_dict(self.model)
+        return super()._gather_model_state(mode)
+
+    def _load_model_state(self, model_state: StateDict, *, strict: bool) -> None:
+        if has_ep_params(self.model):
+            load_ep_model_state_dict(self.model, model_state, strict=strict)
+            return
+        super()._load_model_state(model_state, strict=strict)
+
+    def _torch_checkpoint_metadata(self) -> StateDict:
+        if not has_ep_params(self.model):
+            return {}
+        return {
+            "ep_checkpoint_version": EP_CHECKPOINT_VERSION,
+            "ep_size": self._ep_size,
+        }
+
     def _gather_optimizer_state(self) -> StateDict:
-        # Full optimizer state gathered to rank 0 via DCP (full_state_dict=True);
-        # the base writes only rank 0's. A plain per-rank optimizer.state_dict()
-        # would persist just rank 0's DTensor shard and load it onto every rank,
-        # corrupting ranks>0 momentum on resume. The folded dp_shard x ulysses
-        # mesh is a plain 2D DeviceMesh DCP gathers across both dims (same path
-        # the dcp checkpoint format already uses on this mesh).
+        if has_ep_params(self.model):
+            return gather_ep_optimizer_state_dict(self.model, self.optimizer)
         return gather_optimizer_state_dict(self.model, self.optimizer)
 
     def _load_optimizer_state(self, optimizer_state: StateDict) -> None:
-        # Full state on rank 0, broadcast + resharded into each rank's local
-        # shard (set_optimizer_state_dict, broadcast_from_rank0=True).
+        if has_ep_params(self.model):
+            load_ep_optimizer_state_dict(self.model, self.optimizer, optimizer_state)
+            return
         load_optimizer_state_dict(self.model, self.optimizer, optimizer_state)
 
     def _onload_model(self) -> None:
@@ -229,6 +274,20 @@ class VeOmniBackend(BaseFSDP2Backend):
 
     def _offload_model(self) -> None:
         veomni_offload(self.model)
+
+    def _reject_meta(self, *, operation, checkpoint_format, mode) -> None:
+        super()._reject_meta(
+            operation=operation,
+            checkpoint_format=checkpoint_format,
+            mode=mode,
+        )
+        if self._ep_size > 1 and checkpoint_format == "dcp" and mode == "full":
+            raise RuntimeError(
+                f"VeOmniBackend.{operation}: full DCP checkpoints are unsupported "
+                "with ep_size>1 because the outer expert split is not encoded in "
+                "the DTensor placements. Use checkpoint_format='torch' (EP-aware) "
+                "or adapter mode for frozen-expert LoRA."
+            )
 
 
 # ----------------------------------------------------------------------
@@ -247,6 +306,21 @@ def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
         raise ValueError("VeOmniBackend: cpu_offload=true unsupported in v1 (use FSDPBackend).")
     if not fsdp_cfg.mixed_precision:
         raise ValueError("VeOmniBackend: mixed_precision=false unsupported in v1 (bf16-parity mode is fixed).")
+
+
+def _validate_ep_size(value: object, *, world_size: int) -> int:
+    """Return a valid expert-parallel degree without truncating non-integers."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be an integer >= 1, got {value!r}")
+    try:
+        ep_size = int(value)
+    except ValueError as exc:
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be an integer >= 1, got {value!r}") from exc
+    if ep_size < 1:
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be >= 1, got {ep_size}")
+    if world_size % ep_size != 0:
+        raise ValueError(f"VeOmniBackend: world_size {world_size} not divisible by ep_size {ep_size}")
+    return ep_size
 
 
 __all__ = ["VeOmniBackend"]

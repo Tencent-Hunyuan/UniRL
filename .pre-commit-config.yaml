@@ -8,9 +8,11 @@ default_stages: [pre-commit, pre-push, manual]
 #   - unirl/models/bagel/vendor/ : pristine official ByteDance-Seed/Bagel modeling
 #     (see VENDOR_COMMIT.txt); kept byte-identical to upstream, so the whitespace/format
 #     hooks must not rewrite it either.
+#   - unirl/models/boogu_image/vendor/ : pristine boogu-project/Boogu-Image model code
+#     (see VENDOR_COMMIT.txt); same re-vendor rationale as bagel/vendor/.
 #   - benchmarks/*/*/data/ : vendored upstream benchmark prompt sets (GenEval,
 #     PartiPrompts, VBench, ...); kept byte-identical so upstream checksums verify.
-exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/|benchmarks/[^/]+/[^/]+/data/)
+exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/|unirl/models/boogu_image/vendor/|benchmarks/[^/]+/[^/]+/data/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -43,9 +45,19 @@ repos:
     hooks:
       # Static guard that every recipe `_target_` still resolves to a real symbol,
       # so a rename can't leave a dead Hydra path to fail only at launch time.
+      # A dead path can only appear via a recipe edit or a Python rename/removal, so
+      # those extensions gate the (always full-tree) scan; `--all-files` CI is unaffected.
       - id: check-recipe-targets
         name: recipe _target_ paths resolve
-        entry: python scripts/check_recipe_targets.py
+        entry: python lint/check_recipe_targets.py
+        language: python
+        pass_filenames: false
+        files: \.(ya?ml|py)$
+      # Experimental-tier boundaries: core never imports experimental,
+      # packages never import each other, requirements stay additive-only.
+      - id: check-experimental-boundaries
+        name: experimental-tier boundaries hold
+        entry: python lint/check_experimental_boundaries.py
         language: python
         pass_filenames: false
         always_run: true

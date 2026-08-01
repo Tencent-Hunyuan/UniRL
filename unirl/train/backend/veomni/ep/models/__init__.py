@@ -1,8 +1,8 @@
 """Per-model EP wiring for the VeOmni backend.
 
-Each module here adapts one model family's MoE to VeOmni expert parallelism
-(fused-expert module + checkpoint converter + parallel plan + the meta-swap),
-and feeds the generic loader in :mod:`unirl.train.backend.veomni.ep` (which
-shards the fused expert weights model-agnostically). e.g. :mod:`.hi3` for
-HunyuanImage 3.0.
+Each module owns one model family's fused-expert naming and tensor layout:
+:mod:`.hi3` includes the HI3 module swap/parallel plan, while
+:mod:`.qwen3_moe` is the shared HF ↔ fused converter used by Qwen3 loading and
+rollout sync. Transport and DTensor placement remain model-agnostic in the
+parent package.
 """

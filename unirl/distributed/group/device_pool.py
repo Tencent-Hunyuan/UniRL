@@ -16,6 +16,7 @@ PlacementGroup bundles reserve CPU quota for all slots upfront.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import ray
@@ -27,6 +28,11 @@ from unirl.distributed.group.worker import Worker
 from unirl.distributed.utils import get_node_ip_and_port
 
 logger = logging.getLogger(__name__)
+
+#: Shared budget for asking every worker to close its roles. Sized for an
+#: engine shutdown that is merely slow, not for one that is wedged — a wedged
+#: actor is what ray.kill is for.
+_ROLE_TEARDOWN_TIMEOUT_S = 45.0
 
 
 class DevicePool:
@@ -52,6 +58,7 @@ class DevicePool:
         workers_per_device: int = 1,
         transport_kind: str = "colocate_store",
         tq_handoff: Optional[dict] = None,
+        worker_max_concurrency: int = 1,
     ) -> None:
         if num_devices % devices_per_node != 0:
             raise ValueError(f"num_devices ({num_devices}) must be divisible by devices_per_node ({devices_per_node})")
@@ -67,6 +74,13 @@ class DevicePool:
         # Driver's TransferQueue actor handoff; required when transport_kind is
         # transfer_queue (fanned to each Worker before it builds its transport).
         self.tq_handoff = tq_handoff
+
+        # Ray actor ``max_concurrency`` for every Worker. Default 1 keeps the
+        # existing single-threaded-actor semantics byte-for-byte. The async
+        # rollout path opts in (>1) so a control RPC (``abort``/``pause``) can be
+        # serviced WHILE an in-flight ``generate`` blocks the actor — the engine
+        # still serializes the real work on its own event loop.
+        self.worker_max_concurrency = max(1, int(worker_max_concurrency))
 
         # slot0 workers indexed by device_id (backward-compatible)
         self.workers: List[ray.actor.ActorHandle] = []
@@ -185,6 +199,10 @@ class DevicePool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
+        # >1 makes the Worker a threaded Ray actor so control RPCs interleave with
+        # an in-flight blocking call. Default 1 = unchanged single-threaded actor.
+        if self.worker_max_concurrency > 1:
+            options["max_concurrency"] = self.worker_max_concurrency
         if env_vars:
             options["runtime_env"] = {"env_vars": env_vars}
 
@@ -416,7 +434,8 @@ class DevicePool:
         )
 
     def shutdown(self) -> None:
-        """Kill all Worker actors and remove PlacementGroups."""
+        """Release roles, then kill all Worker actors and remove PlacementGroups."""
+        self._release_roles()
         for tw in self._tw_by_device.values():
             ray.kill(tw, no_restart=True)
         for w in self._worker_by_id.values():
@@ -437,3 +456,27 @@ class DevicePool:
         for pg in self._pgs:
             ray.util.remove_placement_group(pg)
         self._pgs = []
+
+    def _release_roles(self) -> None:
+        """Give every worker a chance to close its roles before we kill it.
+
+        ``ray.kill`` is a SIGKILL — no ``finally``, no destructors. A role
+        holding an inference engine needs to be asked first, or its subprocess
+        tree is orphaned still holding device memory.
+
+        One deadline is shared across all workers rather than applied per
+        worker: they are torn down for the same reason at the same time, and a
+        per-worker timeout would multiply by the pool size in exactly the case
+        that matters (everything wedged at once).
+        """
+        if not self._worker_by_id:
+            return
+        pending = {wid: w.teardown.remote() for wid, w in self._worker_by_id.items()}
+        deadline = time.monotonic() + _ROLE_TEARDOWN_TIMEOUT_S
+        for wid, ref in pending.items():
+            try:
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                # Expected when an actor is stuck in a long call: Ray actors are
+                # single-threaded, so teardown queues behind it. ray.kill next.
+                logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)

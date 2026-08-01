@@ -9,6 +9,8 @@ extra key.
 ``server_intent`` (the successor of the hand-maintained ServerArgs allowlist)
 spells this config + the reserved ports as the SGLang ServerArgs intent dict;
 the backend filters it against the real ServerArgs fields and spawns.
+Explicit first-class correctness flags are marked as required so the backend
+fails closed when the installed SGLang ``ServerArgs`` cannot accept them.
 """
 
 from __future__ import annotations
@@ -25,6 +27,16 @@ from unirl.rollout.engine.ports import ReservedPorts
 _SGLANG_GRPC_PORT_OFFSET = 30000
 _SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET
 _SGLANG_SAFE_SERVER_PORT_MIN = 1024
+_REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+_LOAD_BEARING_SERVER_ARGS = frozenset(
+    {
+        "ep_size",
+        "enable_expert_parallel",
+        "enable_memory_saver",
+        "enable_weights_cpu_backup",
+        "skip_server_warmup",
+    }
+)
 
 
 def _bind_tcp_port(port: int) -> socket.socket:
@@ -115,7 +127,17 @@ class SGLangEngineConfig(BaseEngineConfig):
     model_family: Optional[str] = None
 
     # --- Parallelism & GPU ---
+    # ``tp_size`` / ``pp_size`` / ``ep_size`` are read by Handle to build the
+    # rollout rank layout; ``tp_size>1`` is what makes a multi-GPU SGLang engine.
+    # ``dp_size`` is forwarded to SGLang ServerArgs but NOT read by UniRL's
+    # Handle (UniRL derives dp_size = world_size // (tp*pp) internally); it is
+    # kept as an escape hatch for SGLang's own data-parallel semantics. Leave
+    # None unless a SGLang server-level dp override is explicitly needed.
     tp_size: Optional[int] = None
+    pp_size: Optional[int] = None
+    ep_size: Optional[int] = None
+    dp_size: Optional[int] = None
+    enable_expert_parallel: Optional[bool] = None
 
     # --- SGLang network ---
     # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
@@ -133,6 +155,14 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     # --- Concurrency / async ---
     concurrency: int = 8
+
+    # --- Colocated memory lifecycle ---
+    # Optional so existing SGLang recipes retain upstream ServerArgs defaults.
+    # Colocated trainers opt in explicitly when they need sleep/wake to hand
+    # GPU ownership between rollout and FSDP.
+    enable_memory_saver: Optional[bool] = None
+    enable_weights_cpu_backup: Optional[bool] = None
+    skip_server_warmup: Optional[bool] = None
 
     # --- Sample expansion contract ---
     # VLMTrainer pre-expands the request by samples_per_prompt (P prompts → P*N
@@ -181,6 +211,57 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
         )
         require(
+            self.pp_size is None or self.pp_size >= 1,
+            f"SGLangEngineConfig.pp_size must be >= 1 when set; got {self.pp_size!r}",
+        )
+        # pp_size>1 is currently unsupported end-to-end: ``Handle`` would build
+        # one Remote per pp_rank while a single SGLang ``Engine`` also spawns
+        # its own tp*pp scheduler subprocesses internally, so the two layouts
+        # would double-book the GPUs (see backends' spawn-scoped CVD mapping).
+        # ``NCCLWeightSync.connect`` already
+        # raises NotImplementedError for pp_size>1; fail closed at config-time
+        # so users hit a clear error before rollout boot.
+        require(
+            self.pp_size is None or self.pp_size == 1,
+            "SGLangEngineConfig.pp_size>1 is not supported yet: UniRL Handle "
+            "would spawn one engine per pp_rank while SGLang Engine also spawns "
+            "its own PP scheduler subprocesses, double-booking the GPUs. Set "
+            "pp_size=1 (or leave it unset) for now; per-stage rank_offset "
+            "routing and single-engine PP fan-out are future work "
+            f"(got pp_size={self.pp_size!r}).",
+        )
+        require(
+            self.ep_size is None or self.ep_size >= 1,
+            f"SGLangEngineConfig.ep_size must be >= 1 when set; got {self.ep_size!r}",
+        )
+        # SGLang derives moe_tp_size = tp_size // ep_size with plain integer
+        # division, so a non-divisible ep_size silently builds a wrong MoE
+        # group layout instead of erroring. Fail closed at config-time.
+        effective_tp = self.tp_size if self.tp_size is not None else 1
+        require(
+            self.ep_size is None or (self.ep_size <= effective_tp and effective_tp % self.ep_size == 0),
+            "SGLangEngineConfig.ep_size must divide tp_size: SGLang derives "
+            "moe_tp_size = tp_size // ep_size, so ep_size must be a divisor of "
+            f"tp_size (got ep_size={self.ep_size!r}, tp_size={self.tp_size!r}).",
+        )
+        require(
+            self.dp_size is None or self.dp_size >= 1,
+            f"SGLangEngineConfig.dp_size must be >= 1 when set; got {self.dp_size!r}",
+        )
+        # dp_size>1 is unsupported for the same double-booking reason as
+        # pp_size>1: UniRL's Handle sizes its Remote layout from tp*pp only,
+        # while SGLang ServerArgs.dp_size>1 spawns dp_size*tp_size scheduler
+        # subprocesses — the extra replicas would silently claim GPUs the
+        # Handle believes are free. Fail closed at config-time.
+        require(
+            self.dp_size is None or self.dp_size == 1,
+            "SGLangEngineConfig.dp_size>1 is not supported yet: UniRL Handle "
+            "derives data parallelism from world_size // (tp*pp) and does not "
+            "account for SGLang server-level DP replicas, which would "
+            "double-book GPUs. Set dp_size=1 (or leave it unset) "
+            f"(got dp_size={self.dp_size!r}).",
+        )
+        require(
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
@@ -226,16 +307,19 @@ class SGLangEngineConfig(BaseEngineConfig):
         *,
         ports: SGLangPorts,
         extra: Optional[Dict[str, Any]] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Spell this config (+ the reserved ports) as ServerArgs intent.
 
         Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns (non-ServerArgs escape-hatch keys drop harmlessly there).
+        spawns. Non-ServerArgs escape-hatch keys still drop harmlessly there,
+        but explicitly requested first-class correctness flags are recorded so
+        the backend can fail closed if the installed runtime cannot accept them.
         Precedence (low → high): ``engine_kwargs`` escape-hatch < typed cfg
-        fields < adapter ``extra`` < the reserved ports. The trailing
-        ``setdefault``s supply the predecessor's defaults (bind-all host so the
-        server accepts cross-node connections; mem_fraction 0.88) without
-        shadowing an escape-hatch override.
+        fields < adapter ``extra`` < runtime overrides < the reserved ports. The
+        trailing ``setdefault``s supply the predecessor's defaults (bind-all
+        host so the server accepts cross-node connections; mem_fraction 0.88)
+        without shadowing an escape-hatch override.
         """
         intent: Dict[str, Any] = {}
 
@@ -246,6 +330,20 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
             intent["tp_size"] = int(self.tp_size)
+        if self.pp_size is not None:
+            intent["pp_size"] = int(self.pp_size)
+        if self.ep_size is not None:
+            intent["ep_size"] = int(self.ep_size)
+        if self.dp_size is not None:
+            intent["dp_size"] = int(self.dp_size)
+        if self.enable_expert_parallel is not None:
+            intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
+        if self.enable_memory_saver is not None:
+            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+        if self.enable_weights_cpu_backup is not None:
+            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+        if self.skip_server_warmup is not None:
+            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
         if self.host is not None:
             intent["host"] = str(self.host)
 
@@ -253,12 +351,25 @@ class SGLangEngineConfig(BaseEngineConfig):
         if extra:
             intent.update(extra)
 
-        # Layer 4: the reserved ports (highest) — real ServerArgs fields.
+        # Layer 4: runtime overrides (per-rank rollout layout; higher than cfg).
+        if runtime_overrides:
+            intent.update(runtime_overrides)
+
+        # Record explicit load-bearing UniRL fields before adding default
+        # fallbacks. If a runtime lacks one of these ServerArgs, silently
+        # dropping it would change correctness or memory-lifecycle semantics.
+        required_server_args = sorted(set(intent) & _LOAD_BEARING_SERVER_ARGS)
+        if required_server_args:
+            intent[_REQUIRED_SERVER_ARGS_METADATA_KEY] = required_server_args
+
+        # Layer 5: the reserved ports (highest) — real ServerArgs fields.
         intent["port"] = ports.server_port
         intent["nccl_port"] = ports.nccl_port
 
         intent.setdefault("host", "0.0.0.0")
         intent.setdefault("tp_size", 1)
+        intent.setdefault("pp_size", 1)
+        intent.setdefault("ep_size", 1)
         intent.setdefault("mem_fraction_static", 0.88)
 
         return intent

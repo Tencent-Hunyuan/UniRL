@@ -71,6 +71,14 @@ class IPCWeightSync(FullWeightSync):
         Runs on every train rank. Spawns the engine receiver in a thread (so it
         overlaps the sender pump), pumps each stage's socket, then joins.
         """
+        rank_info = getattr(self, "rank_info", None)
+        if int(getattr(rank_info, "tp_size", 1) or 1) > 1:
+            raise NotImplementedError(
+                "IPCWeightSync does not support tp_size>1: it opens only the "
+                "local_rank=0 receiver socket. Use CkptEngineIPCWeightSync for "
+                "SGLang TP or keep this vLLM-Omni path at tp_size=1."
+            )
+
         from unirl.distributed.weight_sync.transfer.bucketed_transfer import (
             BucketedWeightSender,
         )
@@ -80,11 +88,18 @@ class IPCWeightSync(FullWeightSync):
 
         # Discover stages from the engine (TP-per-stage map). SD3 → {0: 1}.
         try:
-            stage_ids = sorted(int(s) for s in self._rollout.tp_per_stage().keys())
+            tp_per_stage = {int(stage_id): int(tp_size) for stage_id, tp_size in self._rollout.tp_per_stage().items()}
         except (AttributeError, NotImplementedError):
-            stage_ids = [0]
-        if not stage_ids:
-            stage_ids = [0]
+            tp_per_stage = {0: 1}
+        if not tp_per_stage:
+            tp_per_stage = {0: 1}
+        unsupported_tp = {stage_id: tp_size for stage_id, tp_size in tp_per_stage.items() if tp_size > 1}
+        if unsupported_tp:
+            raise NotImplementedError(
+                "IPCWeightSync does not support tp_size>1 because it only sends "
+                f"to local_rank=0; stage TP layout={unsupported_tp}."
+            )
+        stage_ids = sorted(tp_per_stage)
 
         recv_error: dict = {}
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pprint import pformat
 from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
@@ -42,8 +43,14 @@ from unirl.rollout.engine.vllm_omni.backends.base import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.utils.graceful_shutdown import terminate_descendants
 
 logger = logging.getLogger(__name__)
+
+#: vllm-omni renames its engine processes via setproctitle, so both the stage
+#: engine core and the TP workers carry this prefix. Matching on it keeps the
+#: reaper away from anything else the host actor may have spawned.
+_ENGINE_PROC_PREFIX = "VLLM::"
 
 
 def _import_omni_runtime() -> Dict[str, Any]:
@@ -240,35 +247,76 @@ class VLLMOmniBackend:
             pass
 
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+        omni_kwargs = _assemble_omni_kwargs(intent)
+        logger.info(
+            "VLLM-Omni boot intent (before engine startup):\n%s",
+            pformat(
+                {
+                    **intent,
+                    "stage_yaml_path": yaml_path,
+                    "assembled_omni_kwargs": omni_kwargs,
+                },
+                sort_dicts=True,
+            ),
+        )
         serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
+        omni = None
         try:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-            omni = rt["Omni"](
-                model=str(intent["model_path"]),
-                stage_configs_path=yaml_path,
-                **_assemble_omni_kwargs(intent),
+            try:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                omni = rt["Omni"](
+                    model=str(intent["model_path"]),
+                    stage_configs_path=yaml_path,
+                    **omni_kwargs,
+                )
+            finally:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    lock_file.close()
+
+            # From here on ``omni`` owns a live subprocess tree holding device
+            # memory, but no backend instance exists yet to shut it down.
+            try:
+                from omegaconf import OmegaConf
+
+                resolved_stage_configs = OmegaConf.to_container(
+                    OmegaConf.create(omni.stage_configs),
+                    resolve=True,
+                )
+            except Exception:  # noqa: BLE001 - config logging must never block boot
+                resolved_stage_configs = omni.stage_configs
+            logger.info(
+                "VLLM-Omni resolved runtime stage configs (after all overrides):\n%s",
+                pformat(resolved_stage_configs, sort_dicts=True),
             )
-        finally:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
 
-        # Driver-side tokenizer for AR prompt-token construction (workers
-        # reload their own from the model path). Pure-DiT modalities skip it.
-        tokenizer = None
-        if intent.get("needs_driver_tokenizer"):
-            tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
+            # Driver-side tokenizer for AR prompt-token construction (workers
+            # reload their own from the model path). Pure-DiT modalities skip it.
+            tokenizer = None
+            if intent.get("needs_driver_tokenizer"):
+                tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
 
-        return cls(
-            omni,
-            rt,
-            tokenizer=tokenizer,
-            # The runtime's own merged per-stage configs — authoritative,
-            # no YAML re-read.
-            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
-        )
+            return cls(
+                omni,
+                rt,
+                tokenizer=tokenizer,
+                # The runtime's own merged per-stage configs — authoritative,
+                # no YAML re-read.
+                tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
+            )
+        except BaseException:
+            logger.exception("VLLM-Omni boot failed; tearing down any engine processes")
+            if omni is not None:
+                try:
+                    close = getattr(omni, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.exception("Failed to close the half-booted vLLM-Omni engine")
+            terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+            raise
 
     def _require_omni(self) -> Any:
         if self._omni is None:
@@ -416,6 +464,15 @@ class VLLMOmniBackend:
                     close()
             finally:
                 self._omni = None
+
+        # close() returning is not proof the tree is gone: the orchestrator
+        # acknowledges the shutdown message before the stage engine's TP
+        # workers have actually exited, and a worker parked in a collective
+        # never gets to process it at all. Whatever is left here is holding
+        # device memory that the next boot on this GPU will need.
+        reaped = terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+        if reaped:
+            logger.warning("Reaped %d engine process(es) that outlived the vLLM-Omni shutdown", reaped)
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — per-stage collective_rpc fan-out lives here

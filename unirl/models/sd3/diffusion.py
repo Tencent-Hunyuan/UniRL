@@ -301,8 +301,8 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
     ) -> LatentSegment:
         """Run full SD3 sampling. Returns a ``LatentSegment``.
 
-        ``initial_latents`` (optional) — the per-sample x_T tensor pre-shipped
-        by the driver via ``req.request_conditions['initial_latents']``. When
+        ``initial_latents`` (optional) — the per-sample x_T tensor resolved from
+        the request ``Sample``'s diffusion generation Part. When
         provided, used verbatim and the internal ``generate_latents`` RNG
         path is bypassed (driver owns reproducibility / group-sharing /
         cross-rollout variation). When ``None``, the legacy internal path

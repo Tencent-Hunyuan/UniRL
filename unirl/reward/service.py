@@ -1,129 +1,73 @@
-"""Reward service: score one ``RolloutTrack`` against ``(RolloutReq, decoded)``.
+"""Reward service: score a response :class:`~unirl.types.sample.Sample` in place.
 
-Holds exactly one :class:`~unirl.reward.base.RewardBackend` — a local
-in-process scorer or the remote RewardService HTTP client. Builds a
-:class:`RewardRequest` from the track, scores it, and attaches the rewards back
-to a copy of the track under DP-sharded distributed dispatch.
+Holds exactly one :class:`~unirl.reward.base.RewardBackend` — a local in-process
+scorer or the remote RewardService HTTP client. Builds a :class:`RewardRequest`
+from the Sample's frontier Part (the generated output) plus its conditioning (the
+input context), scores it, and returns a copy of the Sample with the rewards
+attached to the frontier Part, under DP-sharded distributed dispatch.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
-from unirl.types.rollout_req import PrimitiveValue, RolloutReq
-from unirl.types.rollout_resp import RolloutTrack, _track_with_field
-from unirl.types.sampling import total_samples_per_prompt
+from unirl.types.sample import Primitive, Sample, _part_with_field
+from unirl.types.sampling import ARSamplingParams
 
 from .base import DifferentiableReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
-_KIND_TO_KEY = {"image": "image", "video": "video", "text": "text"}
 
+def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
+    """Assemble a :class:`RewardRequest` from a response ``Sample``.
 
-def _normalize_prompt_metadata(
-    *,
-    prompt_metadata: Optional[List[Optional[Dict[str, Any]]]],
-    sample_count: int,
-    prompt_ids: Optional[List[str]] = None,
-    samples_per_prompt: Optional[int] = None,
-) -> Optional[List[Optional[Dict[str, Any]]]]:
-    """Normalize prompt metadata to sample-aligned layout."""
-    if not isinstance(prompt_metadata, list) or not prompt_metadata:
-        return None
+    The frontier (last) Part is the generated output being scored; the input
+    context is :meth:`Sample.conditioning` — each ancestor primitive keyed by its
+    modality slot with the NEAREST ancestor winning, so a PE/recaption image
+    scores against the rewrite and an it2i edit against the instruction (plain T2I
+    has a single ancestor, so the choice is moot). Prompt metadata is the root's,
+    aligned to the frontier (:meth:`Sample.root_metadata`). Everything is already
+    row-aligned to the frontier, so there is no request/track expansion to
+    reconcile.
+    """
+    frontier = sample.parts[-1]
+    primitives: Dict[str, Primitive] = {}
+    for prim in sample.conditioning():
+        primitives[primitive_modality_key(prim)] = prim  # nearest ancestor wins (last)
 
-    if sample_count <= 0:
-        return None
+    if preferred_input_kind not in frontier.primitives:
+        raise ValueError(
+            f"Reward backend consumes {preferred_input_kind!r} but the frontier Part generated "
+            f"{sorted(frontier.primitives)!r}; check the recipe's reward/model pairing."
+        )
 
-    if len(prompt_metadata) == sample_count:
-        return list(prompt_metadata)
-
-    if isinstance(prompt_ids, list) and len(prompt_ids) == sample_count:
-        ordered_prompt_ids: List[str] = []
-        seen: set[str] = set()
-        for raw_prompt_id in prompt_ids:
-            prompt_id = str(raw_prompt_id).strip()
-            if not prompt_id or prompt_id in seen:
-                continue
-            seen.add(prompt_id)
-            ordered_prompt_ids.append(prompt_id)
-        if len(prompt_metadata) == len(ordered_prompt_ids):
-            metadata_by_prompt_id = {
-                prompt_id: prompt_metadata[idx] for idx, prompt_id in enumerate(ordered_prompt_ids)
-            }
-            return [metadata_by_prompt_id.get(str(raw_prompt_id).strip()) for raw_prompt_id in prompt_ids]
-
-    raise ValueError(
-        "Prompt metadata must already be sample-aligned or expand via explicit prompt_ids. "
-        f"Got sample_count={sample_count}, metadata={len(prompt_metadata)}, "
-        f"prompt_ids={len(prompt_ids) if isinstance(prompt_ids, list) else None}, "
-        f"samples_per_prompt={samples_per_prompt}."
-    )
-
-
-def _build_request_for_track(
-    *,
-    reward_input_kind: str,
-    samples_per_prompt: int,
-    track: RolloutTrack,
-    req_primitives: Dict[str, PrimitiveValue],
-    prompt_ids: List[str],
-    sample_ids: List[str],
-    group_ids: List[str],
-    prompt_metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
-) -> RewardRequest:
-    """Assemble a ``RewardRequest`` from one track + its request-side primitives."""
-    decoded = track.decoded
-    if decoded is None:
-        raise ValueError("Reward request assembly requires non-None track.decoded.")
-
-    gen_key = _KIND_TO_KEY.get(reward_input_kind)
-    if gen_key is None:
-        raise ValueError(f"Unknown reward_input_kind={reward_input_kind!r}. Expected one of {sorted(_KIND_TO_KEY)}.")
-
-    normalized_metadata = _normalize_prompt_metadata(
-        prompt_metadata=prompt_metadata,
-        sample_count=len(sample_ids),
-        prompt_ids=prompt_ids,
-        samples_per_prompt=samples_per_prompt,
-    )
-
-    # Side-channel: a track may carry a parallel audio stream decoded alongside
-    # the primary media (LTX-2.3 T2AV puts video in ``decoded`` and audio in
-    # ``decoded_audio``). Inject it under ``generated["audio"]`` regardless of
-    # the primary ``reward_input_kind`` so a composite scorer can read both. The
-    # audio source sample rate rides on the track's ``audio_sample_rate``.
-    generated: Dict[str, Any] = {gen_key: decoded}
+    metadata = sample.root_metadata(-1)
+    generated = dict(frontier.primitives)
     audio_sample_rate: Optional[int] = None
-    if getattr(track, "decoded_audio", None) is not None:
-        generated["audio"] = track.decoded_audio
-        rate = getattr(track, "audio_sample_rate", None)
-        audio_sample_rate = int(rate) if rate is not None else None
-
+    audio_metadata = frontier.primitive_metadata.get("audio", {})
+    if "audio" in generated and audio_metadata.get("sample_rate") is not None:
+        audio_sample_rate = int(audio_metadata["sample_rate"])
     return RewardRequest(
-        primitives=dict(req_primitives),
+        primitives=primitives,
         generated=generated,
         audio_sample_rate=audio_sample_rate,
-        prompt_ids=list(prompt_ids),
-        sample_ids=list(sample_ids),
-        group_ids=list(group_ids),
-        metadata=(
-            normalized_metadata
-            if normalized_metadata is not None and any(m is not None for m in normalized_metadata)
-            else None
-        ),
+        prompt_ids=[str(sid) for sid in frontier.sample_ids],
+        sample_ids=list(frontier.sample_ids),
+        group_ids=list(frontier.group_ids),
+        metadata=(metadata if any(m is not None for m in metadata) else None),
     )
 
 
 class RewardService(Remote):
-    """Actor-side reward entry: one backend, scores one track in place."""
+    """Actor-side reward entry: one backend, scores a Sample's frontier Part in place."""
 
     def __init__(
         self,
@@ -167,16 +111,23 @@ class RewardService(Remote):
         return self.backend.compute_rewards(request)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def score_differentiable(self, *, images: Images, prompts: Texts) -> torch.Tensor:
-        """ReFL scoring: score grad-carrying ``images`` (pixels ``[B, C, H, W]`` in
-        ``[0, 1]``) against ``prompts`` and return a ``[B]`` reward tensor with
-        ``grad_fn`` intact.
+    def score_differentiable(
+        self,
+        media_tensor: torch.Tensor,
+        prompts: List[str],
+        records: Optional[List[dict]] = None,
+    ) -> torch.Tensor:
+        """ReFL scoring: score grad-carrying ``media_tensor`` (image ``[B, C, H, W]``
+        or video ``[B, C, T, H, W]``) against ``prompts`` and return a ``[B]`` reward
+        tensor with ``grad_fn`` intact.
 
-        Deliberately bypasses :meth:`score_and_attach` / ``RewardRequest.images``
-        (those go through ``tensor_frame_to_pil`` + ``torch.tensor(...)``, which
-        detach). Under ``enable_grad()`` the framework marks ``images.pixels`` as a
-        grad leaf and chains the returned reward's grad back to it. The backend must
-        satisfy the :class:`~unirl.reward.base.DifferentiableReward` Protocol.
+        Deliberately bypasses :meth:`score_and_attach` / ``RewardRequest`` media
+        conversion (those go through ``tensor_frame_to_pil`` + ``torch.tensor(...)``,
+        which detach). Under ``enable_grad()`` the framework marks ``media_tensor`` as
+        a grad leaf and chains the returned reward's grad back to it. ``records``
+        carries optional per-sample metadata (e.g. ``ref_video_path`` for recipe-local
+        video rewards). The backend must satisfy the
+        :class:`~unirl.reward.base.DifferentiableReward` Protocol.
         """
         if not isinstance(self.backend, DifferentiableReward):
             raise TypeError(
@@ -184,74 +135,32 @@ class RewardService(Remote):
                 f"{type(self.backend).__name__} is not a DifferentiableReward — ReFL "
                 f"needs a differentiable in-process reward (e.g. pickscore/clip/hpsv2)."
             )
-        return self.backend.compute_rewards_differentiable(images.pixels, list(prompts.texts))
+        return self.backend.compute_rewards_differentiable(media_tensor, list(prompts), records=records)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def score_and_attach(self, *, req: RolloutReq, track: RolloutTrack) -> RolloutTrack:
-        """Score one track's decoded media and return a copy with rewards attached.
+    def score_and_attach(self, sample: Sample) -> Sample:
+        """Score the frontier (last) Part's generated media and return the updated Sample.
 
-        Copies ``req.primitives`` (input context) into the reward request and
-        pairs with ``track.decoded`` (generated output). For PE-joint tracks
-        where the request has fewer samples than the track (N×M expansion),
-        each primitive — and the per-prompt metadata — is replicated by the
-        expansion factor.
+        The frontier is the generated output; its :meth:`Sample.conditioning` is the
+        input context and :meth:`Sample.root_metadata` the per-sample spec — both
+        already row-aligned to the frontier, so there is no request/track expansion
+        to reconcile. DP_SCATTER shards the whole Sample by prompt-tree
+        (:meth:`Sample.slice`), keeping each shard's conditioning and frontier
+        co-resident.
 
-        Returns a new :class:`RolloutTrack` with ``rewards`` and
-        ``component_rewards`` populated; the input track is left unchanged so
-        the result flows back through Handle dispatch (pytree_merge across DP
-        shards) without relying on worker-local mutation.
-
+        Returns a new :class:`~unirl.types.sample.Sample` with ``rewards`` and
+        ``component_rewards`` on the frontier Part; the other parts are untouched
+        (the trainer credit-assigns upward via :meth:`Sample.propagate_rewards`).
         Fail-fast on per-sample failure flags so partial/corrupt rewards cannot
         silently enter advantage computation.
         """
-        if track.rewards is not None:
-            raise RuntimeError("Actor-side reward compute does not accept precomputed rewards on the track.")
+        frontier = sample.parts[-1]
+        if frontier.rewards is not None:
+            raise RuntimeError("Actor-side reward compute does not accept precomputed rewards on the frontier Part.")
+        if not frontier.primitives:
+            raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
-        sample_ids = list(track.sample_ids)
-        req_primitives: Dict[str, PrimitiveValue] = dict(req.primitives)
-
-        # Determine the request-side batch size from any primitive.
-        req_batch = 0
-        for v in req_primitives.values():
-            if v is not None:
-                req_batch = len(v)
-                break
-
-        expanded_metadata: Optional[List[Optional[Dict[str, Any]]]] = None
-        if req_batch > 0 and req_batch != len(sample_ids):
-            # PE-joint expansion: req has P prompts, track has P*N*M samples.
-            if len(sample_ids) % req_batch != 0:
-                raise RuntimeError(
-                    f"RewardService.score_and_attach: req batch {req_batch} != track.sample_ids "
-                    f"count {len(sample_ids)} and not an integer multiple — sample alignment broken."
-                )
-            factor = len(sample_ids) // req_batch
-            expected_factor = total_samples_per_prompt(req.sampling_params)
-            if factor != expected_factor:
-                raise RuntimeError(
-                    f"RewardService.score_and_attach: implicit expansion factor {factor} "
-                    f"(track={len(sample_ids)} / req={req_batch}) does not match sampling_params "
-                    f"total_samples_per_prompt={expected_factor}. Sample alignment is ambiguous."
-                )
-            req_primitives = {k: v.repeat_interleave(factor) for k, v in req_primitives.items()}
-            # Keep metadata aligned with primitives (one entry per sample).
-            if req.metadata:
-                expanded_metadata = [m for m in req.metadata for _ in range(factor)]
-
-        final_metadata = (
-            expanded_metadata if expanded_metadata is not None else (list(req.metadata) if req.metadata else None)
-        )
-
-        request = _build_request_for_track(
-            reward_input_kind=self.preferred_input_kind,
-            samples_per_prompt=max(1, len(sample_ids)),
-            track=track,
-            req_primitives=req_primitives,
-            prompt_ids=[str(sid) for sid in sample_ids],
-            sample_ids=sample_ids,
-            group_ids=list(track.group_ids),
-            prompt_metadata=final_metadata,
-        )
+        request = _build_reward_request(sample, self.preferred_input_kind)
         reward_response = self.compute_rewards(request)
 
         failed = [(i, e) for i, (ok, e) in enumerate(zip(reward_response.successes, reward_response.errors)) if not ok]
@@ -271,13 +180,14 @@ class RewardService(Remote):
         #   "zero" — force reward 0 on truncated traces (anti-ramble).
         #   "keep" — leave the raw score (= verl dapo, overlong disabled). No-op here.
         #   "soft" — verl DAPO graded overlong penalty (never a hard zero).
-        # seg_lengths and rewards are shard-aligned (one entry per sample).
-        ar_params = req.sampling_params.get("ar")
-        if self.truncated_reward != "keep" and ar_params is not None and track.segment is not None:
-            seg_lengths = getattr(track.segment, "lengths", None)
+        # Only applies when the SCORED frontier is itself an AR generation, where
+        # its segment lengths are 1:1 with the rewards.
+        sp = frontier.sampling_params
+        if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:
+            seg_lengths = getattr(frontier.segment, "lengths", None)
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
                 seg_lengths = seg_lengths.to(rewards.device).float()
-                max_len = float(int(ar_params.max_new_tokens))
+                max_len = float(int(sp.max_new_tokens))
                 if self.truncated_reward == "zero":
                     truncated = seg_lengths >= max_len
                     rewards = torch.where(truncated, torch.zeros_like(rewards), rewards)
@@ -287,23 +197,14 @@ class RewardService(Remote):
                     exceed = seg_lengths - (max_len - buf)
                     penalty = torch.clamp(-exceed / buf * self.overlong_penalty_factor, max=0.0)
                     rewards = rewards + penalty
-            elif seg_lengths is not None:
-                # Mismatched counts are expected when the AR segment is not 1:1 with
-                # rewards (e.g. composed PE: N AR segments vs N*M rewards), so we skip
-                # rather than crash. But in a pure-AR run a mismatch means the shaping
-                # silently did nothing — log it so the skip is discoverable.
-                logger.debug(
-                    "RewardService: skipped AR truncation shaping (seg_lengths=%d != rewards=%d).",
-                    seg_lengths.numel(),
-                    rewards.numel(),
-                )
 
         component_rewards = {
             str(name): torch.tensor(list(values or []), dtype=torch.float32)
             for name, values in dict(reward_response.component_rewards or {}).items()
         }
-        track = _track_with_field(track, "rewards", rewards)
-        return _track_with_field(track, "component_rewards", component_rewards)
+        scored = _part_with_field(frontier, "rewards", rewards)
+        scored = _part_with_field(scored, "component_rewards", component_rewards)
+        return sample.with_parts([*sample.parts[:-1], scored])
 
     def is_available(self) -> bool:
         return self.backend.is_available()

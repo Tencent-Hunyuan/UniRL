@@ -2,11 +2,11 @@ name: PR Status Labels
 
 on:
   pull_request_target:
-    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize]
-  pull_request_review:
-    types: [submitted, dismissed]
+    types: [opened, reopened, ready_for_review, converted_to_draft, synchronize, closed]
 
 permissions:
+  # Labeling a PR goes through the issues API endpoint, but GitHub scopes the
+  # token check to the target resource: PRs require pull-requests write.
   pull-requests: write
   issues: write
 
@@ -30,28 +30,38 @@ jobs:
             jq -e --arg name "$1" '.pull_request.labels | any(.name == $name)' "$event" >/dev/null
           }
 
-          if [ "$GITHUB_EVENT_NAME" = "pull_request_review" ]; then
-            [ "$draft" = "true" ] && exit 0
-            if [ "$(jq -r '.action' "$event")" = "dismissed" ]; then
+          if [ "$(jq -r '.pull_request.state' "$event")" != "open" ]; then
+            # Merged/closed PRs shed their status label so board views stay clean.
+            # Delete all four unconditionally: the payload's label snapshot can miss a
+            # label that a review-sync run racing the close instant wrote afterwards,
+            # and no later event ever repairs a closed PR (the dispatch sweep is
+            # open-only). A 404 (label absent) is benign; anything else fails loudly.
+            for label in "wip" "need review" "changes requested" "approved"; do
+              encoded=$(jq -rn --arg l "$label" '$l | @uri')
+              if ! out=$(gh api --method DELETE \
+                    "repos/$GITHUB_REPOSITORY/issues/$number/labels/$encoded" 2>&1 >/dev/null); then
+                echo "$out" | grep -q "HTTP 404" || { echo "$out" >&2; exit 1; }
+              fi
+            done
+            exit 0
+          fi
+          if [ "$draft" = "true" ]; then
+            target="wip"
+          elif [ "$(jq -r '.action' "$event")" = "synchronize" ]; then
+            # New commits move the status back to review after changes were requested,
+            # and self-heal a PR that carries no status label at all (missed event or
+            # transient write failure) — otherwise keep whatever label is there.
+            # Scope is deliberately zero-label-only: a stale-but-present label
+            # self-corrects on the next review event or dispatch sweep.
+            if has_label "changes requested"; then
+              target="need review"
+            elif ! has_label "wip" && ! has_label "need review" && ! has_label "approved"; then
               target="need review"
             else
-              case "$(jq -r '.review.state' "$event")" in
-                approved) target="approved" ;;
-                changes_requested) target="changes requested" ;;
-                *) exit 0 ;;
-              esac
+              exit 0
             fi
           else
-            [ "$(jq -r '.pull_request.state' "$event")" = "open" ] || exit 0
-            if [ "$draft" = "true" ]; then
-              target="wip"
-            elif [ "$(jq -r '.action' "$event")" = "synchronize" ]; then
-              # New commits only move the status back to review after changes were requested.
-              has_label "changes requested" || exit 0
-              target="need review"
-            else
-              target="need review"
-            fi
+            target="need review"
           fi
 
           for label in "wip" "need review" "changes requested" "approved"; do
