@@ -438,9 +438,19 @@ class BucketedIPCReceiveMixin:
         untouched — the driver still receives exactly one reply, it just
         carries every rank's entry.
 
-        This is a collective: every rank must reach it. The callers' early
-        ``return {}`` paths are uniform across ranks (they test worker-class
-        state, not per-rank state), so they cannot desynchronise it.
+        This is a collective, so every rank must reach it — including a rank
+        that has nothing to report. The public entry points below are therefore
+        thin wrappers whose only statement is this call; everything that can
+        bail out early lives in a ``_local_*`` helper that returns ``{}``
+        instead of returning from the RPC. That matters most in exactly the
+        case this read-back exists to catch: when an adapter failed to register
+        on one rank, that rank still joins the gather and contributes ``{}``,
+        and ``_assert_loaded`` then names it —
+
+            [LoRA-SYNC] verify FAILED on ..., stage 1 rank 2:
+            engine returned no loaded LoRA layers.
+
+        — rather than the whole sync hanging on a collective one rank skipped.
         """
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             return wrap_tp_rank_results([local_result])
@@ -458,6 +468,16 @@ class BucketedIPCReceiveMixin:
         return wrap_tp_rank_results(per_rank)
 
     def _diffrl_loaded_param_checksums(
+        self,
+        names: Optional[list] = None,
+    ) -> dict:
+        """Per-TP-rank wrapper around :meth:`_diffrl_local_param_checksums`.
+
+        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
+        """
+        return self._diffrl_gather_tp_rank_results(self._diffrl_local_param_checksums(names))
+
+    def _diffrl_local_param_checksums(
         self,
         names: Optional[list] = None,
     ) -> dict:
@@ -497,9 +517,20 @@ class BucketedIPCReceiveMixin:
             if target is not None and name not in target:
                 continue
             out[name] = fingerprint_tensor(p)
-        return self._diffrl_gather_tp_rank_results(out)
+        return out
 
     def _diffrl_loaded_lora_checksums(
+        self,
+        adapter_id: int,
+        names: Optional[list] = None,
+    ) -> dict:
+        """Per-TP-rank wrapper around :meth:`_diffrl_local_lora_checksums`.
+
+        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
+        """
+        return self._diffrl_gather_tp_rank_results(self._diffrl_local_lora_checksums(adapter_id, names))
+
+    def _diffrl_local_lora_checksums(
         self,
         adapter_id: int,
         names: Optional[list] = None,
@@ -566,7 +597,7 @@ class BucketedIPCReceiveMixin:
                         if isinstance(sub, torch.Tensor):
                             per_field[f"{field}.{i}"] = fingerprint_tensor(sub)
             out[layer_name] = per_field
-        return self._diffrl_gather_tp_rank_results(out)
+        return out
 
 
 __all__ = ["BucketedIPCReceiveMixin"]
