@@ -245,7 +245,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     diff_conds = HunyuanImage3DiffusionConditions(
         fused=mm2["fused"],
-        tokenizer_output=mm2["tokenizer_output"],
+        # See modes/t2i.py: only the KV-cached path reads tokenizer_output, so
+        # with the cache off it is dropped rather than transported.
+        tokenizer_output=(mm2["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None),
     )
 
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=diff_sp)
