@@ -37,7 +37,7 @@ from unirl.rollout.engine.vllm_omni.patches.runtime import (
     OmniTensorLoRARequest,
     VLLMOmniHijack,
 )
-from unirl.rollout.engine.vllm_omni.tp_readback import wrap_tp_rank_results
+from unirl.rollout.engine.vllm_omni.tp_readback import TP_RANK_RESULTS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -452,20 +452,17 @@ class BucketedIPCReceiveMixin:
 
         — rather than the whole sync hanging on a collective one rank skipped.
         """
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return wrap_tp_rank_results([local_result])
+        per_rank: list = [local_result]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from vllm.distributed.parallel_state import get_tp_group
 
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp_group = get_tp_group()
-        world_size = int(tp_group.world_size)
-        if world_size <= 1:
-            return wrap_tp_rank_results([local_result])
-
-        per_rank: list = [None] * world_size
-        group = getattr(tp_group, "cpu_group", None) or tp_group.device_group
-        torch.distributed.all_gather_object(per_rank, local_result, group=group)
-        return wrap_tp_rank_results(per_rank)
+            tp_group = get_tp_group()
+            world_size = int(tp_group.world_size)
+            if world_size > 1:
+                per_rank = [None] * world_size
+                group = getattr(tp_group, "cpu_group", None) or tp_group.device_group
+                torch.distributed.all_gather_object(per_rank, local_result, group=group)
+        return {TP_RANK_RESULTS_KEY: per_rank}
 
     def _diffrl_loaded_param_checksums(
         self,
