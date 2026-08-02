@@ -43,6 +43,7 @@ from unirl.rollout.engine.vllm_omni.backends.base import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.tp_readback import unwrap_tp_rank_readbacks
 from unirl.utils.graceful_shutdown import terminate_descendants
 
 logger = logging.getLogger(__name__)
@@ -761,9 +762,10 @@ class VLLMOmniBackend:
                 args=(list(names),),
                 stage_ids=[int(sid)],
             )
-            # collective_rpc returns ``[stage_results]`` where stage_results
-            # is ``[rank0, rank1, ...]`` — strip the outer list.
-            out[int(sid)] = results[0] if isinstance(results, list) and results else results
+            # ``collective_rpc`` runs on every rank but only rank 0's reply is
+            # returned, so the per-rank list has to come from the worker-side
+            # gather rather than from this transport.
+            out[int(sid)] = unwrap_tp_rank_readbacks(results)
         return out
 
     def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict:
@@ -776,7 +778,7 @@ class VLLMOmniBackend:
                 args=(int(adapter_id), list(names) if names else None),
                 stage_ids=[int(sid)],
             )
-            out[int(sid)] = results[0] if isinstance(results, list) and results else results
+            out[int(sid)] = unwrap_tp_rank_readbacks(results)
         return out
 
 

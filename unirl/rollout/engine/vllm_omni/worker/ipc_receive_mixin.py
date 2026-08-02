@@ -37,6 +37,7 @@ from unirl.rollout.engine.vllm_omni.patches.runtime import (
     OmniTensorLoRARequest,
     VLLMOmniHijack,
 )
+from unirl.rollout.engine.vllm_omni.tp_readback import TP_RANK_RESULTS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -427,7 +428,53 @@ class BucketedIPCReceiveMixin:
     # the ``compute_*_checksums`` helpers in ``weight_sync.checksum``.
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _diffrl_gather_tp_rank_results(local_result: dict) -> dict:
+        """Gather this rank's checksum map into the reply rank 0 sends back.
+
+        ``collective_rpc`` runs the method on every rank but only rank 0's
+        return value survives, so a per-rank readback has to be gathered
+        worker-side. Doing it here keeps vLLM-Omni's control-plane protocol
+        untouched — the driver still receives exactly one reply, it just
+        carries every rank's entry.
+
+        This is a collective, so every rank must reach it — including a rank
+        that has nothing to report. The public entry points below are therefore
+        thin wrappers whose only statement is this call; everything that can
+        bail out early lives in a ``_local_*`` helper that returns ``{}``
+        instead of returning from the RPC. That matters most in exactly the
+        case this read-back exists to catch: when an adapter failed to register
+        on one rank, that rank still joins the gather and contributes ``{}``,
+        and ``_assert_loaded`` then names it —
+
+            [LoRA-SYNC] verify FAILED on ..., stage 1 rank 2:
+            engine returned no loaded LoRA layers.
+
+        — rather than the whole sync hanging on a collective one rank skipped.
+        """
+        per_rank: list = [local_result]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            world_size = int(tp_group.world_size)
+            if world_size > 1:
+                per_rank = [None] * world_size
+                group = getattr(tp_group, "cpu_group", None) or tp_group.device_group
+                torch.distributed.all_gather_object(per_rank, local_result, group=group)
+        return {TP_RANK_RESULTS_KEY: per_rank}
+
     def _diffrl_loaded_param_checksums(
+        self,
+        names: Optional[list] = None,
+    ) -> dict:
+        """Per-TP-rank wrapper around :meth:`_diffrl_local_param_checksums`.
+
+        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
+        """
+        return self._diffrl_gather_tp_rank_results(self._diffrl_local_param_checksums(names))
+
+    def _diffrl_local_param_checksums(
         self,
         names: Optional[list] = None,
     ) -> dict:
@@ -470,6 +517,17 @@ class BucketedIPCReceiveMixin:
         return out
 
     def _diffrl_loaded_lora_checksums(
+        self,
+        adapter_id: int,
+        names: Optional[list] = None,
+    ) -> dict:
+        """Per-TP-rank wrapper around :meth:`_diffrl_local_lora_checksums`.
+
+        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
+        """
+        return self._diffrl_gather_tp_rank_results(self._diffrl_local_lora_checksums(adapter_id, names))
+
+    def _diffrl_local_lora_checksums(
         self,
         adapter_id: int,
         names: Optional[list] = None,
