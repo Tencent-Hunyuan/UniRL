@@ -198,7 +198,7 @@ class SingleStreamDiffusionRunner(ABC, Generic[B, C]):
             init_same_noise=bool(params.init_same_noise),
             samples_per_prompt=int(params.samples_per_prompt),
             noise_group_ids=params.noise_group_ids,
-            base_seed=int(params.seed),
+            base_seed=None if params.seed is None else int(params.seed),
         )
 
     def _prepare_conditions(
