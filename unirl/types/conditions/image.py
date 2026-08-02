@@ -10,11 +10,11 @@ to first consumer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, List, Optional
 
 import torch
 
-from unirl.distributed.tensor.batch import FieldKind, field, shared_field
+from unirl.distributed.tensor.batch import FieldKind, field
 from unirl.types.conditions.base import Condition, Modality
 
 
@@ -35,16 +35,22 @@ class ImageEmbedCondition(Condition):
     plus AR-emitted image-vocab token re-embeddings on the diffusion side).
     Same shape as ``TextEmbedCondition.embeds`` but tagged ``Modality.IMAGE``.
 
-    ``spatial_shapes`` is a per-sample list of ``(H, W)`` patch grid sizes,
-    used by ViT encoders that do dynamic positional encoding (e.g. SigLIP2).
-    Optional — cross-attention models that don't need it leave it ``None``.
+    ``spatial_shapes`` holds the patch grid sizes used by ViT encoders that do
+    dynamic positional encoding (e.g. SigLIP2). It is per-sample, so like
+    ``embeds`` and ``attn_mask`` it is a CONCAT field: the list is concatenated
+    and re-indexed along the batch axis together with them, keeping the three
+    aligned across DP merge, minibatch select and group repeat. Its length must
+    match the batch — a list of some other length is not a supported
+    batch-shared value here, since ``concat`` then falls back to comparing the
+    replicas element by element, which for tensors raises. Optional —
+    cross-attention models that don't need it leave it ``None``.
     """
 
     modality: ClassVar[Modality] = Modality.IMAGE
 
     embeds: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     attn_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    spatial_shapes: Optional[List[Tuple[int, int]]] = shared_field(default=None)
+    spatial_shapes: Optional[List[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
 
 
 __all__ = ["ImageEmbedCondition", "ImageLatentCondition"]

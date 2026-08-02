@@ -124,11 +124,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
-    require(
-        int(params.samples_per_prompt) <= 2,
-        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet; "
-        "per-sample cond_vit lists are not transport-safe above 2.",
-    )
     schedule = params.sigmas.to(pipeline.bundle.device)
     # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
     # and the vit_kwargs duplication below — they must agree on the batch axis.
@@ -201,7 +196,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         cond_vae=cond_vae,
         cond_vit=cond_vit,
         cond_timestep=cond_timestep,
-        tokenizer_output=mm["tokenizer_output"],
+        # See modes/t2i.py: only the KV-cached path reads tokenizer_output, so
+        # with the cache off it is dropped rather than transported.
+        tokenizer_output=(mm["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None),
     )
 
     latent_seg = pipeline.diffusion.diffuse(
