@@ -191,6 +191,10 @@ algorithm:
 stack:
   _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
   micro_batch_size: 1
+  # Optional per-track override of micro_batch_size (null = use the shared value).
+  # See hi3_vllmomni.yaml for the AR-vs-image trade-off and the loss_agg_mode caveat.
+  ar_micro_batch_size: null
+  image_micro_batch_size: null
   max_grad_norm: 1.0
   num_updates_per_batch: 2
 

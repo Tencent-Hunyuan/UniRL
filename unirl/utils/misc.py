@@ -142,11 +142,27 @@ def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
     return dict(items)
 
 
-def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Average numeric metric keys across repeated metric dictionaries."""
+def aggregate_numeric_metrics(
+    metrics_list: List[Dict[str, Any]],
+    *,
+    weights: Optional[List[float]] = None,
+) -> Dict[str, float]:
+    """Average numeric metric keys across repeated metric dictionaries.
+
+    ``weights`` (same length as ``metrics_list``) gives a weighted mean instead of a
+    plain one — used when the entries cover unequal sample counts, e.g. gradient-
+    accumulation micro-batches whose final micro is ragged. Weights are renormalized
+    per key over the entries that actually carry it, so a key present in only some
+    dictionaries still averages correctly. Non-positive total weight for a key falls
+    back to the unweighted mean.
+    """
     aggregated: Dict[str, float] = {}
     if not metrics_list:
         return aggregated
+    if weights is not None and len(weights) != len(metrics_list):
+        raise ValueError(
+            f"aggregate_numeric_metrics: weights has length {len(weights)} but metrics_list has {len(metrics_list)}."
+        )
 
     all_keys = set()
     for metrics in metrics_list:
@@ -154,7 +170,8 @@ def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, f
 
     for key in all_keys:
         values: List[float] = []
-        for metrics in metrics_list:
+        value_weights: List[float] = []
+        for index, metrics in enumerate(metrics_list):
             if key not in metrics:
                 continue
             value = metrics[key]
@@ -164,7 +181,15 @@ def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, f
                 values.append(float(value))
             elif isinstance(value, (int, float)):
                 values.append(float(value))
-        if values:
+            else:
+                continue
+            value_weights.append(1.0 if weights is None else float(weights[index]))
+        if not values:
+            continue
+        total_weight = sum(value_weights)
+        if total_weight > 0.0:
+            aggregated[key] = sum(v * w for v, w in zip(values, value_weights)) / total_weight
+        else:
             aggregated[key] = sum(values) / len(values)
 
     return aggregated
