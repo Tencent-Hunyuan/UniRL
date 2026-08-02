@@ -356,6 +356,7 @@ class AsyncAgenticRolloutEngine:
         self._buffer: VersionedBuffer[List["Sample"]] = VersionedBuffer()
         self._gen_id = int(start_gen_id)
         self._weight_version = 0
+        self._drive_active = False
 
     @property
     def weight_version(self) -> int:
@@ -364,16 +365,20 @@ class AsyncAgenticRolloutEngine:
     def sync_weights(self, weight_sync: Any) -> int:
         """Push train weights via *weight_sync* and advance the version ledger.
 
-        The only sanctioned weight-push path. The facade cannot see the
-        coordinator's drive state, so the quiesce contract stays with the
-        caller: sync only while the drive is finalized/quiesced (decode-idle).
+        The only sanctioned weight-push path — pairing the push with the bump
+        is what keeps the ledger truthful. Raises while a drive is active (a
+        weight push must be decode-idle); a joined ``finalize_if_drained`` or
+        ``quiesce`` ends the drive.
         """
+        if self._drive_active:
+            raise RuntimeError("sync_weights with a drive active; finalize or quiesce() first")
         weight_sync.sync()
         self._weight_version += 1
         return self._weight_version
 
     def submit(self, tasks: List["Sample"]) -> None:
         """Fire a background drive over a flat task list (fresh siblings + carried partials)."""
+        self._drive_active = True  # before the call: a failed submit must still block sync
         self._rollout.submit(tasks)
 
     def poll(self) -> int:
@@ -386,6 +391,7 @@ class AsyncAgenticRolloutEngine:
         completed = self._rollout.finalize_if_drained()[0]
         if completed is None:
             return None
+        self._drive_active = False
         return self._ingest(completed)
 
     def drain_freshest(self, n: int, *, max_staleness: int) -> Optional[List[List["Sample"]]]:
@@ -401,6 +407,7 @@ class AsyncAgenticRolloutEngine:
         version they completed under."""
         carried = self._rollout.abort()[0]
         self.poll()
+        self._drive_active = False
         return carried
 
     def discard_roots(self, roots: Iterable[str]) -> int:

@@ -114,8 +114,13 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
     def evaluate(self, step: int, *, sync_weights: bool = False, sleep_after: bool = False) -> float:
         """Resident-policy eval — async defaults: no weight push (the ledger stays
         exact; deployment cadence belongs to ``weight_sync_interval`` alone) and
-        no post-eval sleep (the disaggregated engine stays resident)."""
-        return super().evaluate(step, sync_weights=sync_weights, sleep_after=sleep_after)
+        no post-eval sleep (the disaggregated engine stays resident). The scored
+        ledger version is logged as ``eval/weight_version``."""
+        result = super().evaluate(step, sync_weights=sync_weights, sleep_after=sleep_after)
+        engine = getattr(self, "_async_engine", None)
+        if engine is not None:  # absent only for a standalone eval outside train()
+            self.wandb_logger.log_eval(step, {"weight_version": engine.weight_version})
+        return result
 
     def _drain_all(self) -> None:
         """Finish + buffer EVERY in-flight generation (the single-threaded quiesce).

@@ -211,9 +211,14 @@ class AsyncARTrainer(ARTrainer):
         Eval is read-only — weight deployment is governed solely by
         ``weight_sync_interval`` (pushes go through ``engine.sync_weights``).
         The scored policy is the one already on the rollout slab, 1..interval
-        optimizer steps old (exactly 1 at ``weight_sync_interval=1``).
+        optimizer steps old (exactly 1 at ``weight_sync_interval=1``); its
+        ledger version is logged as ``eval/weight_version``.
         """
-        return super().evaluate(rollout_id, sync_weights=sync_weights)
+        acc = super().evaluate(rollout_id, sync_weights=sync_weights)
+        engine = getattr(self, "_async_engine", None)
+        if engine is not None:  # absent only for a standalone eval outside train()
+            self.wandb_logger.log_eval(rollout_id + 1, {"weight_version": engine.weight_version})
+        return acc
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Prepare the resident separate-slab engine without colocate handoffs.
