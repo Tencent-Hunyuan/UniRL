@@ -191,6 +191,12 @@ algorithm:
 stack:
   _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
   micro_batch_size: 1
+  # Optional per-track override of micro_batch_size (null = use the shared value).
+  # See hi3_vllmomni.yaml: the image track is fixed-shape latents (a larger micro is
+  # clean parallelism), the AR track is variable-length responses (a larger micro
+  # pads, and needs a seq-mean-* loss_agg_mode to stay loss-equivalent).
+  ar_micro_batch_size: null
+  image_micro_batch_size: null
   max_grad_norm: 1.0
 
 data_source:

@@ -27,6 +27,12 @@ disjoint mini-batches and runs one optimizer step per mini-batch, with each trac
 clip / ratio trust region actually engages (the UniGRPO / FlowGRPO PPO schedule).
 Mirrors :class:`~unirl.train.stack.TrainStack` but for the two-algorithm backbone.
 
+``ar_micro_batch_size`` / ``image_micro_batch_size`` (both defaulting to the shared
+``micro_batch_size``) let the two tracks use different gradient-accumulation
+geometry. The lineage levels differ in row count (AR is ``P*N``, image is
+``P*N*M``) and in row shape (variable-length AR responses vs fixed-shape latents),
+so the micro size that fits one is rarely the best for the other.
+
 This is the multi-stage train stack — several stage algorithms share one
 optimizer step, in contrast to the single-stage ``TrainStack``.
 """
@@ -36,7 +42,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -76,6 +82,8 @@ class UnifiedModelTrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        ar_micro_batch_size: Optional[int] = None,
+        image_micro_batch_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -86,6 +94,30 @@ class UnifiedModelTrainStack(Remote):
         self.ar_algorithm = ar_algorithm
         self.image_algorithm = image_algorithm
         self.micro_batch_size = int(micro_batch_size)
+        # Per-track micro-batch size. The two lineage levels have different shapes:
+        # AR rows are variable-length responses (a larger micro pads to the longest
+        # and raises the activation peak), while image rows are fixed-shape latents
+        # (a larger micro is clean parallelism). Both default to the shared
+        # ``micro_batch_size``, so omitting them keeps the previous behavior.
+        #
+        # Micro-batching is only loss-equivalent to one full-batch backward when the
+        # per-micro ``loss_scale`` (sample share) reconstructs the whole-batch mean.
+        # That holds for a per-row mean (FlowGRPO's flat latent mean; GRPO's
+        # ``seq-mean-*`` modes, which average per sequence then over sequences), but
+        # NOT for GRPO's default ``token-mean`` when responses differ in length —
+        # there the exact objective weights by token count, not by row count. Raise
+        # ``ar_micro_batch_size`` above 1 only with a ``seq-mean-*``
+        # ``loss_agg_mode``, or accept that shift.
+        self.micro_batch_sizes = {
+            "ar": _positive_int(
+                name="UnifiedModelTrainStack.ar_micro_batch_size",
+                value=self.micro_batch_size if ar_micro_batch_size is None else ar_micro_batch_size,
+            ),
+            "image": _positive_int(
+                name="UnifiedModelTrainStack.image_micro_batch_size",
+                value=self.micro_batch_size if image_micro_batch_size is None else image_micro_batch_size,
+            ),
+        }
         self.max_grad_norm = float(max_grad_norm)
         # PPO-style multi-update: split each rollout shard into this many disjoint
         # mini-batches and run ONE optimizer step per mini-batch, with the π_old
@@ -106,27 +138,45 @@ class UnifiedModelTrainStack(Remote):
                         f"num_updates_per_batch=1."
                     )
 
-    def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
+    def _optimizer_step_slices(
+        self,
+        total: int,
+        *,
+        micro_batch_size: Optional[int] = None,
+    ) -> List[List[Tuple[int, int]]]:
         """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices.
 
         One inner list per ``num_updates_per_batch`` mini-batch (one optimizer step),
-        each split into ``micro_batch_size`` micro-batches. Shared by
+        each split into the requested micro-batch size (or the shared
+        ``micro_batch_size`` fallback). Shared by
         :meth:`prepare_segment` (to freeze the anchor at the exact geometry) and the
         train loop. Mirrors :meth:`unirl.train.stack.TrainStack._optimizer_step_slices`.
         """
+        resolved_micro_batch_size = (
+            self.micro_batch_size
+            if micro_batch_size is None
+            else _positive_int(name="micro_batch_size", value=micro_batch_size)
+        )
         steps: List[List[Tuple[int, int]]] = []
         for mini_start, mini_end in _update_ranges(total_size=total, num_updates=self.num_updates_per_batch):
             steps.append(
                 [
                     (mini_start + ms, mini_start + me)
                     for ms, me in _build_micro_batch_slices(
-                        total_size=mini_end - mini_start, micro_batch_size=self.micro_batch_size
+                        total_size=mini_end - mini_start,
+                        micro_batch_size=resolved_micro_batch_size,
                     )
                 ]
             )
         return steps
 
-    def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
+    def prepare_segment(
+        self,
+        algorithm: StageAlgorithm,
+        part: Part,
+        *,
+        micro_batch_size: Optional[int] = None,
+    ) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop.
 
         No-op if ``segment`` is None or the algorithm has no ``prepare_segment``. If
@@ -134,7 +184,9 @@ class UnifiedModelTrainStack(Remote):
         — e.g. FlowGRPO under ``old_logp_source='replay'``), the declared
         ``anchor_fields`` are recomputed at the SAME (mini, micro) slices training will
         use, so the on-policy ratio is exactly 1 (mirrors
-        :meth:`TrainStack.prepare_segment`). Rollout-anchored algorithms (the BAGEL
+        :meth:`TrainStack.prepare_segment`). ``micro_batch_size`` must therefore be the
+        SAME per-track value the train loop will use for this Part; passing None falls
+        back to the shared ``micro_batch_size``. Rollout-anchored algorithms (the BAGEL
         UniGRPO recipe: AR GRPO + image ``old_logp_source='rollout'``) take the
         one-shot path — the anchor is the rollout emission, geometry-independent.
         """
@@ -147,7 +199,11 @@ class UnifiedModelTrainStack(Remote):
         if recomputes is None or not recomputes():
             prepare(conditions=part.conditions, segment=part.segment)
             return
-        micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
+        micro_slices = [
+            sl
+            for step in self._optimizer_step_slices(int(part.batch_size), micro_batch_size=micro_batch_size)
+            for sl in step
+        ]
         if len(micro_slices) == 1:
             prepare(conditions=part.conditions, segment=part.segment)
             return
@@ -195,6 +251,7 @@ class UnifiedModelTrainStack(Remote):
         bs = int(part.batch_size)
         update_total = sum(end - start for start, end in micro_slices)
         micros: List[AlgorithmStepResult] = []
+        micro_weights: List[float] = []
         total_loss = 0.0
         has_backward = False
 
@@ -210,10 +267,19 @@ class UnifiedModelTrainStack(Remote):
                 loss_scale=loss_scale,
             )
             micros.append(result)
+            micro_weights.append(loss_scale)
             total_loss += result.loss * loss_scale
             has_backward = has_backward or result.has_backward
 
-        aggregated: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
+        # Weight each micro's metrics by its sample share, matching the weighted
+        # objective used for backward. A ragged final micro (batch not divisible by
+        # the micro size) otherwise skews an unweighted mean toward its fewer rows.
+        # Equal-sized micros reduce to the previous plain average.
+        metric_items = [(result.metrics, weight) for result, weight in zip(micros, micro_weights) if result.metrics]
+        aggregated: Mapping[str, object] = aggregate_numeric_metrics(
+            [metrics for metrics, _ in metric_items],
+            weights=[weight for _, weight in metric_items],
+        )
         # grad_norm / lr are filled by ``_train_one_step`` after the shared optimizer step.
         partial = TrainStepResult(
             loss=total_loss,
@@ -337,13 +403,19 @@ class UnifiedModelTrainStack(Remote):
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             # Freeze each Part's π_old anchor once, before the multi-update loop.
-            self.prepare_segment(self.ar_algorithm, ar_part)
-            self.prepare_segment(self.image_algorithm, image_part)
+            # Each track's anchor geometry must match the micro size training uses.
+            self.prepare_segment(self.ar_algorithm, ar_part, micro_batch_size=self.micro_batch_sizes["ar"])
+            self.prepare_segment(self.image_algorithm, image_part, micro_batch_size=self.micro_batch_sizes["image"])
 
-            # N optimizer steps over disjoint mini-batches (each Part sliced by the same
-            # shared _optimizer_step_slices; M=1 keeps ar/image 1:1 and equally sized).
-            ar_steps = self._optimizer_step_slices(int(ar_part.batch_size))
-            image_steps = self._optimizer_step_slices(int(image_part.batch_size))
+            # N optimizer steps over disjoint mini-batches. Each Part is sliced at its
+            # own micro size (the two lineage levels differ in both row count and row
+            # shape), so ar/image micro counts need not match.
+            ar_steps = self._optimizer_step_slices(
+                int(ar_part.batch_size), micro_batch_size=self.micro_batch_sizes["ar"]
+            )
+            image_steps = self._optimizer_step_slices(
+                int(image_part.batch_size), micro_batch_size=self.micro_batch_sizes["image"]
+            )
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
                 per_update.append(

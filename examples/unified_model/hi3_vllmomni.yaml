@@ -184,6 +184,13 @@ algorithm:
 stack:
   _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
   micro_batch_size: 1
+  # Optional per-track override of micro_batch_size (null = use the shared value).
+  # The image track is fixed-shape latents, so a larger micro is clean parallelism;
+  # the AR track is variable-length responses, where a larger micro pads to the
+  # longest row. Raising ar_micro_batch_size also needs a seq-mean-* loss_agg_mode
+  # (GRPO's default token-mean weights by token count, not by row count).
+  ar_micro_batch_size: null
+  image_micro_batch_size: null
   max_grad_norm: 1.0
 
 data_source:
