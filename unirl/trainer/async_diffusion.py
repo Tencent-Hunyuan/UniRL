@@ -111,6 +111,12 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         self._drop_decoded(scored, rollout_id=gen_id)
         return scored.split()
 
+    def evaluate(self, step: int, *, sync_weights: bool = False, sleep_after: bool = False) -> float:
+        """Resident-policy eval — async defaults: no weight push (the ledger stays
+        exact; deployment cadence belongs to ``weight_sync_interval`` alone) and
+        no post-eval sleep (the disaggregated engine stays resident)."""
+        return super().evaluate(step, sync_weights=sync_weights, sleep_after=sleep_after)
+
     def _drain_all(self) -> None:
         """Finish + buffer EVERY in-flight generation (the single-threaded quiesce).
 
@@ -197,7 +203,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         )
 
         if resumed and self.weight_sync is not None:
-            self.weight_sync.sync()  # push restored weights into the fresh engine
+            self._async_engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine
         if self.eval_interval > 0:
             # Evaluate the policy already resident on the rollout slab. Eval must
             # neither advance the async weight version nor offload this engine.
@@ -227,8 +233,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                     )
                 if step % interval == 0 and self.weight_sync is not None:
                     self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
-                    self.weight_sync.sync()
-                    self._async_engine.bump_weight_version()
+                    self._async_engine.sync_weights(self.weight_sync)
         finally:
             # Cleanup failures must not mask the exception that stopped training.
             active_exception = sys.exc_info()[0] is not None

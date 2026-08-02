@@ -94,8 +94,12 @@ implements its weight-receive method and a matching `sync:` handler in
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
 - **Quiesce before weight sync / eval / checkpoint on the batch async path** —
   `AsyncBatchRolloutEngine.quiesce()` drains every in-flight generation; a
-  weight + KV update corrupts one mid-flight. The agentic quiesce is a
-  turn-boundary `abort` + final poll, folded into
+  weight + KV update corrupts one mid-flight. Weight pushes go through
+  `engine.sync_weights(weight_sync)` — one call that pushes and advances
+  `weight_version`, and (batch engine) raises if anything is still in flight.
+  Async eval never pushes weights (`evaluate(..., sync_weights=False)`): it
+  scores the engine-resident policy so the ledger stays exact. The agentic
+  quiesce is a turn-boundary `abort` + final poll, folded into
   `AsyncAgenticRolloutEngine.quiesce()`. Reap-vs-launch ordering is trainer
   statement order (diffusion polls before topping up; see its `_next_step`).
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and

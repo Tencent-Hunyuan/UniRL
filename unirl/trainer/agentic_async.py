@@ -21,8 +21,8 @@ through the driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticR
   ``buffer_max_staleness``), reward + GRPO advantage + one optimizer step (reusing
   :class:`AgenticTrainer`'s helpers), then **quiesce + sync**: ``abort`` the in-flight
   tail at a turn boundary, apply the configured ``tail_policy`` (carry only when the
-  environment can resume from the ``Sample``; otherwise drop), ``weight_sync.sync()``,
-  bump the version.
+  environment can resume from the ``Sample``; otherwise drop), then
+  ``engine.sync_weights`` (one call: push + version bump).
 
 ONE single-threaded loop (the ``AsyncARTrainer`` shape): with disjoint slabs the
 rollout slab keeps generating in the background (the engine's per-worker drain) while
@@ -404,7 +404,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
         self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
 
         if start_rollout < num_rollouts and start_rollout and self.weight_sync is not None:
-            self.weight_sync.sync()  # push restored weights into the fresh engine
+            self._engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine
         if start_rollout < num_rollouts:
             self._submit_drive(carried=[], rollout_id=start_rollout)  # prime the first drive
 
@@ -437,8 +437,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
                             save_mode=save_mode,
                         )
                     if need_sync:
-                        self.weight_sync.sync()
-                        self._engine.bump_weight_version()
+                        self._engine.sync_weights(self.weight_sync)
                     if step < num_rollouts:
                         self._submit_drive(carried=carried, rollout_id=step)  # resume safe tails + fresh
         finally:

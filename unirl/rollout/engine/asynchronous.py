@@ -12,7 +12,8 @@ loops live in the trainers):
 - :class:`InflightPool` — non-blocking pool of distributed ``generate`` calls.
 
 Engines, sharing one consumer surface (``poll`` / ``drain_freshest`` /
-``pop_evicted`` / ``quiesce`` + engine-owned ``weight_version``):
+``pop_evicted`` / ``quiesce`` + engine-owned ``weight_version``, advanced
+only by ``sync_weights`` — every weight push goes through the ledger):
 
 - :class:`AsyncBatchRolloutEngine` — batch granularity over a single-turn
   engine slab; one ``submit`` is one non-blocking distributed ``generate``.
@@ -239,7 +240,16 @@ class AsyncBatchRolloutEngine:
     def weight_version(self) -> int:
         return self._weight_version
 
-    def bump_weight_version(self) -> int:
+    def sync_weights(self, weight_sync: Any) -> int:
+        """Push train weights via *weight_sync* and advance the version ledger.
+
+        The only sanctioned weight-push path — pairing the push with the bump
+        is what keeps the ledger truthful. Raises if any generation is in
+        flight (a weight + KV update corrupts it); drain via ``quiesce`` first.
+        """
+        if len(self._pool):
+            raise RuntimeError(f"sync_weights with {len(self._pool)} generations in flight; quiesce() first")
+        weight_sync.sync()
         self._weight_version += 1
         return self._weight_version
 
@@ -351,7 +361,14 @@ class AsyncAgenticRolloutEngine:
     def weight_version(self) -> int:
         return self._weight_version
 
-    def bump_weight_version(self) -> int:
+    def sync_weights(self, weight_sync: Any) -> int:
+        """Push train weights via *weight_sync* and advance the version ledger.
+
+        The only sanctioned weight-push path. The facade cannot see the
+        coordinator's drive state, so the quiesce contract stays with the
+        caller: sync only while the drive is finalized/quiesced (decode-idle).
+        """
+        weight_sync.sync()
         self._weight_version += 1
         return self._weight_version
 
@@ -380,7 +397,7 @@ class AsyncAgenticRolloutEngine:
     def quiesce(self) -> List["Sample"]:
         """Turn-boundary stop: abort, then one final poll for trajectories that
         completed DURING the quiesce (before the next ``submit`` resets worker
-        buffers). Call before ``bump_weight_version`` so those groups carry the
+        buffers). Call before ``sync_weights`` so those groups carry the
         version they completed under."""
         carried = self._rollout.abort()[0]
         self.poll()

@@ -205,10 +205,31 @@ class AsyncARTrainer(ARTrainer):
         if self.weight_sync is not None:
             self._connect_separate(sync_cfg)
 
+    def evaluate(self, rollout_id: int, *, sync_weights: bool = False) -> float:
+        """Resident-policy eval: the async default flips to ``sync_weights=False``.
+
+        Eval is read-only — weight deployment is governed solely by
+        ``weight_sync_interval`` (pushes go through ``engine.sync_weights``).
+        The scored policy is the one already on the rollout slab, 1..interval
+        optimizer steps old (exactly 1 at ``weight_sync_interval=1``).
+        """
+        return super().evaluate(rollout_id, sync_weights=sync_weights)
+
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
-        """Sync a resident separate-slab engine without colocate handoffs."""
+        """Prepare the resident separate-slab engine without colocate handoffs.
+
+        An explicit weight push stays on the ledger and is only possible inside
+        ``train()``, where the async engine exists.
+        """
         if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
+            engine = getattr(self, "_async_engine", None)
+            if engine is None:
+                raise RuntimeError(
+                    "AsyncARTrainer: weight push outside train() — the async engine owns the "
+                    "version ledger and exists only inside train(); use evaluate(sync_weights=False) "
+                    "for a standalone resident-policy eval."
+                )
+            engine.sync_weights(self.weight_sync)
         return False
 
     def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
@@ -360,9 +381,9 @@ class AsyncARTrainer(ARTrainer):
         )
 
         if resumed and self.weight_sync is not None:
-            self.weight_sync.sync()  # push restored weights into the fresh engine
+            self._async_engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine
         if self.eval_interval > 0:
-            self.evaluate(rollout_id=-1)  # baseline; engine quiescent
+            self.evaluate(rollout_id=-1)  # baseline; resident-policy eval, engine quiescent
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
@@ -380,7 +401,7 @@ class AsyncARTrainer(ARTrainer):
                 step = rollout_id + 1
                 if self.eval_interval > 0 and step % self.eval_interval == 0:
                     self._drain_all()  # eval shares the engine
-                    self.evaluate(rollout_id=rollout_id)
+                    self.evaluate(rollout_id=rollout_id)  # resident-policy eval; ledger stays exact
                 if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
                     self._drain_all()  # consistent engine + deterministic resume
                     self.maybe_save_checkpoint(
@@ -388,8 +409,7 @@ class AsyncARTrainer(ARTrainer):
                     )
                 if step % interval == 0 and self.weight_sync is not None:
                     self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
-                    self.weight_sync.sync()
-                    self._async_engine.bump_weight_version()
+                    self._async_engine.sync_weights(self.weight_sync)
         finally:
             # Match BaseTrainer._finish_wandb: cleanup failures must not mask
             # the exception that caused teardown.

@@ -181,8 +181,7 @@ class AgenticPartialTrainer(AgenticTrainer):
         # Sync at the top, AWAKE + decode-idle (barrier parity): TensorWeightSync writes the live
         # SRT weight pool, which a full sleep() would release.
         if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-            self._engine.bump_weight_version()
+            self._engine.sync_weights(self.weight_sync)
         tasks = self._build_tasks(self._carried, rollout_id)  # fresh + carried
         self._carried = []  # consumed into this drive
         self._engine.submit(tasks)

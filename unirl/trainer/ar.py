@@ -493,8 +493,12 @@ class ARTrainer(BaseTrainer):
         )
         return result, mean_reward
 
-    def evaluate(self, rollout_id: int) -> float:
+    def evaluate(self, rollout_id: int, *, sync_weights: bool = True) -> float:
         """Periodic eval — ``avg@k`` accuracy on the eval prompt set.
+
+        ``sync_weights=False`` skips the pre-eval weight push and scores the
+        engine-resident policy (the async trainers' mode; keeps the driver-side
+        version ledger exact).
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips
         advantage/backward: iterate up to ``eval_num_prompts`` prompts from
@@ -538,13 +542,13 @@ class ARTrainer(BaseTrainer):
         )
         train_state_offloaded = False
         if not anchored:
-            train_state_offloaded = self._prepare_rollout(sync_weights=self.weight_sync is not None)
+            train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights and self.weight_sync is not None)
         # Anchored eval keeps FSDP offloaded and vLLM awake for the entire eval
         # set. Training still uses one _anchored_rollout_session per rollout in
         # train_step(), so its sleep/wake and onload/offload lifecycle is unchanged.
         eval_session = (
             self._anchored_rollout_session(
-                sync_weights=self.weight_sync is not None,
+                sync_weights=sync_weights and self.weight_sync is not None,
                 restore_backend=False,
             )
             if anchored
