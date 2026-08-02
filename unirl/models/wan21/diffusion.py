@@ -42,7 +42,7 @@ from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionStep, VideoDiffusionRunner
+from unirl.models.diffusion import SingleStreamDiffusionStep, SingleStreamLatentSpec, SingleStreamVideoDiffusionRunner
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -54,7 +54,7 @@ from .conditions import WAN21Conditions
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
 
-class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
+class WAN21DiffusionStep(SingleStreamDiffusionStep[WAN21Bundle, WAN21Conditions]):
     """Per-step WAN 2.1 denoising kernel — stateless.
 
     ``step`` / ``step_with_logp`` take the model + conditions + an SDE
@@ -252,7 +252,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(VideoDiffusionRunner[WAN21Bundle, WAN21Conditions]):
+class WAN21DiffusionStage(SingleStreamVideoDiffusionRunner[WAN21Bundle, WAN21Conditions]):
     """WAN 2.1 T2V rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies require a stable
@@ -334,11 +334,11 @@ class WAN21DiffusionStage(VideoDiffusionRunner[WAN21Bundle, WAN21Conditions]):
         self,
         conditions: WAN21Conditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("WAN21DiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=self._latent_shape(

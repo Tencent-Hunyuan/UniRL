@@ -11,7 +11,7 @@ Pipeline stages (each ``X → Y`` between tiers):
 
 Step kernels (per-step math, tensor I/O):
 
-- ``DiffusionStep`` — single denoising transition.
+- ``DiffusionStep`` — legacy alias for the single-stream denoising protocol.
 - ``ARStep`` — single-token transition (model forward + sample).
 
 All schedule / sampling parameters are passed at call time on the rollout-

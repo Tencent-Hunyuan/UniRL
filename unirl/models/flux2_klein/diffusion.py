@@ -54,7 +54,12 @@ from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep, temporary_eval
+from unirl.models.diffusion import (
+    SingleStreamDiffusionRunner,
+    SingleStreamDiffusionStep,
+    SingleStreamLatentSpec,
+    temporary_eval,
+)
 from unirl.sde.kernels import StepStrategy
 from unirl.types.segments.latent import LatentSegment
 
@@ -95,7 +100,7 @@ class Flux2KleinDiffusionParams:
     noise_group_ids: Optional[List[str]] = None
 
 
-class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditions]):
+class Flux2KleinDiffusionStep(SingleStreamDiffusionStep[Flux2KleinBundle, Flux2KleinConditions]):
     """Per-step FLUX.2-klein denoising kernel — stateless.
 
     Operates on patchified ``[B, 128, H_pat, W_pat]`` latents. Packs to
@@ -285,7 +290,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         )
 
 
-class Flux2KleinDiffusionStage(DiffusionRunner[Flux2KleinBundle, Flux2KleinConditions]):
+class Flux2KleinDiffusionStage(SingleStreamDiffusionRunner[Flux2KleinBundle, Flux2KleinConditions]):
     """FLUX.2-klein rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (DanceSDE by default for Klein), the
@@ -365,11 +370,11 @@ class Flux2KleinDiffusionStage(DiffusionRunner[Flux2KleinBundle, Flux2KleinCondi
         self,
         conditions: Flux2KleinConditions,
         params: Flux2KleinDiffusionParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("Flux2KleinDiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=self._patchified_shape(int(params.height), int(params.width)),
@@ -381,7 +386,7 @@ class Flux2KleinDiffusionStage(DiffusionRunner[Flux2KleinBundle, Flux2KleinCondi
         params: Flux2KleinDiffusionParams,
         *,
         schedule: torch.Tensor,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
     ) -> None:
         del conditions, params, schedule, spec
         self.model.transformer.eval()

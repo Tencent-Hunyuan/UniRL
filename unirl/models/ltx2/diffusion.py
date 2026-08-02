@@ -24,7 +24,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionStage, DiffusionStep, ReplayResult
+from unirl.models.diffusion import DiffusionStage, ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -109,11 +109,12 @@ def _combine_modality_logp(
     return (video_logp * n_video + audio_logp * n_audio) / total
 
 
-class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
-    """Per-step LTX2 denoising kernel — stateless.
+class LTX2DiffusionStep:
+    """Specialized joint audio-video prediction kernel.
 
-    Handles the video-only forward (SDE path for RL). Audio is handled
-    separately via ODE in the stage.
+    This is deliberately not a ``SingleStreamDiffusionStep``: one transformer
+    call returns coupled video and audio predictions, and the stage applies
+    modality-specific transitions.
     """
 
     def predict_noise(

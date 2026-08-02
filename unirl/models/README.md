@@ -49,12 +49,13 @@ A model package bridges three concerns through one shared bundle:
   (`generate(sample) -> sample`): it reads ancestor primitives through
   `sample.conditioning()`, reads sampling params from a pre-forked generation
   Part, builds typed `Conditions`, runs the stage, and fills that Part.
-- **Stages** (`diffusion.py` / `ar.py`) — the trainable units. Ordinary image and
-  video stages inherit `DiffusionRunner`, which provides `diffuse` (rollout),
-  `replay` (train), trajectory/precision handling, and
+- **Stages** (`diffusion.py` / `ar.py`) — the trainable units. Dense,
+  single-stream image and video stages inherit `SingleStreamDiffusionRunner`,
+  which provides `diffuse` (rollout), `replay` (train), trajectory/precision handling, and
   `predict_noise_at_step` (DiffusionNFT); packages supply latent geometry and
-  narrow model hooks. BAGEL and LTX2 remain explicit transition-kernel
-  exceptions. `ARStage` exposes `autoregress` and `replay`. Each stage exposes
+  narrow model hooks. BAGEL packed geometry and LTX2 joint audio-video remain
+  explicit transition-kernel exceptions. `ARStage` exposes `autoregress` and
+  `replay`. Each stage exposes
   `trainable_module()`, returning the `nn.Module` the FSDP backend wraps and
   engines eval-scope.
 - **Conditions** (`conditions.py`) — typed `Batch` subclasses with

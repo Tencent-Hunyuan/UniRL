@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep
+from unirl.models.diffusion import SingleStreamDiffusionRunner, SingleStreamDiffusionStep, SingleStreamLatentSpec
 from unirl.sde.kernels import NoiseGenerator, StepStrategy
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
@@ -53,7 +53,7 @@ from .seed import make_sde_step_generators
 logger = logging.getLogger(__name__)
 
 
-class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
+class HunyuanImage3DiffusionStep(SingleStreamDiffusionStep[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
     """Per-step HunyuanImage3 denoising kernel — stateless.
 
     ``step`` / ``step_with_logp`` take the model + conditions + an SDE
@@ -658,7 +658,7 @@ def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> Hun
     )
 
 
-class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
+class HunyuanImage3DiffusionStage(SingleStreamDiffusionRunner[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
     """HunyuanImage3 rollout-level diffusion stage.
 
     Owns the SDE ``strategy``, bundle, kernel, and precision policy. The
@@ -707,7 +707,7 @@ class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanIm
         self,
         conditions: HunyuanImage3DiffusionConditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         device, batch_size = _conditions_device_and_batch(conditions, guidance_scale=float(params.guidance_scale))
         # HI3 snaps any requested H×W to the nearest preset at base_size² area
         # (image_base_size=1024 → ~1MP) — the text-embed stage's
@@ -743,7 +743,7 @@ class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanIm
         else:
             latent_h = int(params.height) // int(self.vae_scale_factor)
             latent_w = int(params.width) // int(self.vae_scale_factor)
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=device,
             batch_size=batch_size,
             shape=(int(self.latent_channels), latent_h, latent_w),
@@ -751,7 +751,7 @@ class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanIm
 
     def _prepare_initial_latents(
         self,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
@@ -790,7 +790,7 @@ class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanIm
         params: DiffusionSamplingParams,
         *,
         schedule: torch.Tensor,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
     ) -> Optional[HunyuanImage3DiffusionState]:
         del conditions, params, schedule, spec
         return HunyuanImage3DiffusionState() if self.diffuse_kv_cache else None
@@ -799,7 +799,7 @@ class HunyuanImage3DiffusionStage(DiffusionRunner[HunyuanImage3Bundle, HunyuanIm
         self,
         params: DiffusionSamplingParams,
         *,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
         step_index: int,
         eta: float,
         sde_sample_keys: Optional[List[str]],

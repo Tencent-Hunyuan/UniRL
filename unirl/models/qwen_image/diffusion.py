@@ -57,7 +57,7 @@ from typing import Any, ClassVar, Mapping, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep
+from unirl.models.diffusion import SingleStreamDiffusionRunner, SingleStreamDiffusionStep, SingleStreamLatentSpec
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
@@ -110,10 +110,10 @@ def _unpack_latents(latents: torch.Tensor, *, latent_h: int, latent_w: int) -> t
     return latents.reshape(batch_size, channels, latent_h, latent_w)
 
 
-class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]):
+class QwenImageDiffusionStep(SingleStreamDiffusionStep[QwenImageBundle, QwenImageConditions]):
     """Per-step Qwen-Image denoising kernel — stateless.
 
-    Extends the :class:`DiffusionStep` protocol with Qwen-Image-specific
+    Extends the :class:`SingleStreamDiffusionStep` protocol with Qwen-Image-specific
     per-call kwargs (``latent_h`` / ``latent_w`` /
     ``distilled_guidance_scale``) on :meth:`predict_noise`,
     :meth:`step`, and :meth:`step_with_logp`. The protocol surface stays
@@ -360,7 +360,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         )
 
 
-class QwenImageDiffusionStage(DiffusionRunner[QwenImageBundle, QwenImageConditions]):
+class QwenImageDiffusionStage(SingleStreamDiffusionRunner[QwenImageBundle, QwenImageConditions]):
     """Qwen-Image rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -429,13 +429,13 @@ class QwenImageDiffusionStage(DiffusionRunner[QwenImageBundle, QwenImageConditio
         self,
         conditions: QwenImageConditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("QwenImageDiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
         latent_h = 2 * (int(params.height) // (int(self.vae_scale_factor) * 2))
         latent_w = 2 * (int(params.width) // (int(self.vae_scale_factor) * 2))
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=(int(self.latent_channels), latent_h, latent_w),

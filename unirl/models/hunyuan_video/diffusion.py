@@ -47,7 +47,7 @@ from typing import ClassVar, Dict, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionStep, VideoDiffusionRunner
+from unirl.models.diffusion import SingleStreamDiffusionStep, SingleStreamLatentSpec, SingleStreamVideoDiffusionRunner
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -55,10 +55,10 @@ from .bundle import HunyuanVideoBundle
 from .conditions import HunyuanVideoConditions
 
 
-class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoConditions]):
+class HunyuanVideoDiffusionStep(SingleStreamDiffusionStep[HunyuanVideoBundle, HunyuanVideoConditions]):
     """Per-step HunyuanVideo-1.0 denoising kernel -- stateless.
 
-    Extends the :class:`DiffusionStep` protocol with HunyuanVideo-1.0-
+    Extends the :class:`SingleStreamDiffusionStep` protocol with HunyuanVideo-1.0-
     specific per-call kwargs on :meth:`predict_noise`, :meth:`step`, and
     :meth:`step_with_logp`. The protocol surface stays structurally
     compatible because Python protocols are non-strict on extra kwargs.
@@ -233,7 +233,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         )
 
 
-class HunyuanVideoDiffusionStage(VideoDiffusionRunner[HunyuanVideoBundle, HunyuanVideoConditions]):
+class HunyuanVideoDiffusionStage(SingleStreamVideoDiffusionRunner[HunyuanVideoBundle, HunyuanVideoConditions]):
     """HunyuanVideo-1.0 rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -331,14 +331,14 @@ class HunyuanVideoDiffusionStage(VideoDiffusionRunner[HunyuanVideoBundle, Hunyua
         self,
         conditions: HunyuanVideoConditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text_llama is None or conditions.text_llama.embeds is None:
             raise ValueError("HunyuanVideoDiffusionStage: conditions.text_llama.embeds is None")
         embeds = conditions.text_llama.embeds
         latent_t, latent_h, latent_w = self._latent_shape(
             height=params.height, width=params.width, num_frames=params.num_frames
         )
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=(self.latent_channels, latent_t, latent_h, latent_w),

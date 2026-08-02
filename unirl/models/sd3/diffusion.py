@@ -25,7 +25,12 @@ from typing import Any, ClassVar, List, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep, ReplayResult
+from unirl.models.diffusion import (
+    ReplayResult,
+    SingleStreamDiffusionRunner,
+    SingleStreamDiffusionStep,
+    SingleStreamLatentSpec,
+)
 from unirl.sde.kernels import SDEStrategy, StepStrategy
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams
@@ -35,7 +40,7 @@ from .bundle import SD3Bundle
 from .conditions import SD3Conditions
 
 
-class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
+class SD3DiffusionStep(SingleStreamDiffusionStep[SD3Bundle, SD3Conditions]):
     """Per-step SD3 denoising kernel — stateless.
 
     ``step`` / ``step_with_logp`` take the model + conditions + an SDE
@@ -229,7 +234,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         )
 
 
-class SD3DiffusionStage(DiffusionRunner[SD3Bundle, SD3Conditions]):
+class SD3DiffusionStage(SingleStreamDiffusionRunner[SD3Bundle, SD3Conditions]):
     """SD3 rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -290,13 +295,13 @@ class SD3DiffusionStage(DiffusionRunner[SD3Bundle, SD3Conditions]):
         self,
         conditions: SD3Conditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("SD3DiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
         latent_h = int(params.height) // int(self.vae_scale_factor)
         latent_w = int(params.width) // int(self.vae_scale_factor)
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=(int(self.latent_channels), latent_h, latent_w),

@@ -34,7 +34,7 @@ from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionStep, VideoDiffusionRunner
+from unirl.models.diffusion import SingleStreamDiffusionStep, SingleStreamLatentSpec, SingleStreamVideoDiffusionRunner
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
@@ -44,7 +44,7 @@ from .bundle import WAN22Bundle
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
 
-class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
+class WAN22DiffusionStep(SingleStreamDiffusionStep[WAN22Bundle, WAN21Conditions]):
     """Per-step WAN 2.2 denoising kernel — stateless, dual-transformer routing.
 
     For each call, decides whether to route through the high- or
@@ -295,7 +295,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         )
 
 
-class WAN22DiffusionStage(VideoDiffusionRunner[WAN22Bundle, WAN21Conditions]):
+class WAN22DiffusionStage(SingleStreamVideoDiffusionRunner[WAN22Bundle, WAN21Conditions]):
     """WAN 2.2 T2V rollout-level diffusion stage with dual-transformer routing.
 
     Owns the SDE ``strategy`` (stateful strategies require a stable
@@ -359,11 +359,11 @@ class WAN22DiffusionStage(VideoDiffusionRunner[WAN22Bundle, WAN21Conditions]):
         self,
         conditions: WAN21Conditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("WAN22DiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=self._latent_shape(

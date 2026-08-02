@@ -1,19 +1,21 @@
-"""Shared contracts and control flow for diffusion model packages."""
+"""Diffusion-stage contracts and reusable execution patterns."""
 
-from unirl.models.diffusion.contracts import DiffusionLatentSpec, DiffusionStage, DiffusionStep
-from unirl.models.diffusion.runner import (
-    DiffusionRunner,
-    VideoDiffusionRunner,
+from unirl.models.diffusion.contracts import DiffusionStage
+from unirl.models.diffusion.single_stream import (
+    SingleStreamDiffusionRunner,
+    SingleStreamDiffusionStep,
+    SingleStreamLatentSpec,
+    SingleStreamVideoDiffusionRunner,
     temporary_eval,
 )
 from unirl.models.types.replay_result import ReplayResult
 
 __all__ = [
-    "DiffusionLatentSpec",
-    "DiffusionRunner",
     "DiffusionStage",
-    "DiffusionStep",
     "ReplayResult",
-    "VideoDiffusionRunner",
+    "SingleStreamDiffusionRunner",
+    "SingleStreamDiffusionStep",
+    "SingleStreamLatentSpec",
+    "SingleStreamVideoDiffusionRunner",
     "temporary_eval",
 ]

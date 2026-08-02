@@ -34,8 +34,8 @@ The current architecture is a typed pipeline:
 4. In `bundle.py`, implement `<Model>Bundle` as a plain class with `from_config(config)`. Load transformer, VAE, text encoders, vision encoders, tokenizers, processors, and schedulers as needed. Use `parse_torch_dtype(..., field_name=...)` for dtype fields, place the trainable module on the requested device and dtype, and freeze auxiliary modules with `requires_grad_(False)`.
 5. In `conditions.py`, implement `<Model>Conditions(Batch)` with typed condition slots and `from_dict(d)` / `to_dict()`. Validate required slots, reject wrong types with actionable errors, and omit `None` optional slots from the outgoing dict.
 6. Add embed/encode stages for inputs: `EmbedStage[Texts, TextEmbedCondition]`, `EncodeStage[Images, ImageLatentCondition]`, or model-specific variants. Keep tokenization, chat templates, text encoder fusion, image preprocessing, and upstream-compatible negative prompt defaults in these stages or in the pipeline that calls them.
-7. For diffusion models, add `<Model>DiffusionStep(DiffusionStep[<Model>Bundle, <Model>Conditions])`. By local convention, it should expose `predict_noise(...)` for per-step transformer invocation, CFG batching, timestep scaling, condition concat, masks, and private third-party kwargs. Delegate SDE math to the supplied `StepStrategy`.
-8. Add `<Model>DiffusionStage(DiffusionRunner[<Model>Bundle, <Model>Conditions])`. Implement `_latent_spec(...)` and only the narrow hooks needed for model-specific kwargs, state, initialization, mode, or trainable-root behavior. The shared runner owns schedule validation, sampling, sparse trajectory storage, replay, precision policy, and default `trainable_module()`. A stage should implement `DiffusionStage` directly only when its transition kernel is structurally different, such as BAGEL packed/Navit replay or LTX2 joint audio-video SDE. Declare `_no_split_modules` on the stage when diffusers modules need FSDP wrapping hints.
+7. For a dense single-stream diffusion model, add `<Model>DiffusionStep(SingleStreamDiffusionStep[<Model>Bundle, <Model>Conditions])`. By local convention, it should expose `predict_noise(...)` for per-step transformer invocation, CFG batching, timestep scaling, condition concat, masks, and private third-party kwargs. Delegate SDE math to the supplied `StepStrategy`.
+8. Add `<Model>DiffusionStage(SingleStreamDiffusionRunner[<Model>Bundle, <Model>Conditions])`. Implement `_latent_spec(...)` and only the narrow hooks needed for model-specific kwargs, state, initialization, mode, or trainable-root behavior. This implementation owns schedule validation, sampling, sparse trajectory storage, replay, precision policy, and default `trainable_module()`. A stage should implement the domain-level `DiffusionStage` contract directly when its transition kernel is structurally different, such as BAGEL packed/Navit replay or LTX2 joint audio-video SDE. Declare `_no_split_modules` on the stage when diffusers modules need FSDP wrapping hints.
 9. For AR models, add `<Model>ARStep` and `<Model>ARStage(ARStage[<Model>Conditions])` instead of diffusion step/stage classes. Follow `unirl/models/qwen3/ar.py` for packed `TextSegment` generation and replay.
 10. In `vae.py` or equivalent, implement `DecodeStage[LatentSegment, Images | Videos]` and any required `EncodeStage[Images | Videos, ImageLatentCondition]`. Apply the model's VAE scale, shift, dtype, layout, frame, and clamp conventions.
 11. In `pipeline.py`, implement `<Model>Pipeline(Pipeline)` with `from_config(...)` and `generate(sample)`. Read raw inputs through `sample.conditioning()`, read sampling params from the typed generation Part, require `params.sigmas` for diffusion, call stages in order, and fill that Part with `segment`, modality-keyed `primitives`, and `conditions`.
@@ -122,14 +122,14 @@ CFG belongs in the diffusion step, with the pipeline and embed stages preparing 
 
 - The pipeline validates prompt and negative prompt batch sizes.
 - If upstream behavior requires CFG negatives and none were supplied, the pipeline should create the upstream-compatible empty negative primitive before embedding, such as `""` for SD3 or the model-specific canonical empty string for Qwen-style pipelines.
-- `<Model>DiffusionStep.predict_noise(...)` should batch unconditional and conditional branches, run one transformer call, chunk outputs, and combine `uncond + guidance_scale * (cond - uncond)`.
+- A `<Model>DiffusionStep.predict_noise(...)` implementation for the single-stream pattern should batch unconditional and conditional branches, run one transformer call, chunk outputs, and combine `uncond + guidance_scale * (cond - uncond)`.
 - If `negative_text` is absent but `guidance_scale > 1.0`, either raise a clear error or use the package's established fallback, such as zero-init negative embeddings in SD3. Match the model's existing or upstream behavior explicitly.
 
 ## DiffusionStage Rules
 
-Ordinary `<Model>DiffusionStage` implementations inherit
-`unirl.models.diffusion.DiffusionRunner`; the runner owns the
-rollout/replay loops and `LatentSegment` assembly:
+Dense single-stream `<Model>DiffusionStage` implementations inherit
+`unirl.models.diffusion.SingleStreamDiffusionRunner`; this implementation owns
+the rollout/replay loops and `LatentSegment` assembly:
 
 - Use `schedule=params.sigmas` from the generation Part; diffusion pipelines should raise if it is `None`.
 - Do not build sigma schedules inside the pipeline or stage. Hosting engines pin schedules onto the Sample before calling `generate(sample)`.
@@ -139,8 +139,8 @@ rollout/replay loops and `LatentSegment` assembly:
   `_step_kwargs(...)`; use `_prepare_conditions(...)` for mode-consistent
   condition transforms, `_sampling_state(...)` for state shared across one
   rollout, and `_step_generator(...)` only for model-specific SDE RNG policy.
-- Inherit `VideoDiffusionRunner` for the standard 5D video-latent contract so replay validation and `modality=VIDEO` stay centralized.
-- Keep direct transformer calls inside `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
+- Inherit `SingleStreamVideoDiffusionRunner` for the dense 5D video-latent pattern so replay validation and `modality=VIDEO` stay centralized.
+- Keep direct transformer calls inside the single-stream `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
 - Override the shared `replay(...)`, `diffuse(...)`, or `predict_noise_at_step(...)`
   only when the transition itself cannot be represented by the runner hooks;
   document why the model is a transition-kernel exception.

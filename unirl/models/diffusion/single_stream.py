@@ -1,8 +1,8 @@
-"""Reusable diffusion model sampling and replay loop.
+"""Reusable single-stream diffusion sampling and replay.
 
 Model packages own transformer adaptation, conditioning, latent geometry, and
-small per-step kwargs.  This runner owns the invariant control flow shared by
-image and video diffusion:
+small per-step kwargs. This implementation owns the invariant control flow
+shared by image and video stages with one dense latent stream:
 
 * schedule validation and strategy initialization;
 * initial-latent validation / fallback generation;
@@ -11,29 +11,118 @@ image and video diffusion:
 * autocast and precision policy;
 * single-step noise prediction and the default trainable surface.
 
-The hook surface is deliberately narrow.  A model should override latent
+The hook surface is deliberately narrow. A model should override latent
 specification and only the kwargs/state/segment behavior its kernel actually
-needs.  Multi-stream policies whose transition itself is different (for
-example LTX2 joint audio+video SDE) remain specialized stages.
+needs. Packed geometry and multi-stream policies whose transition itself is
+different (for example BAGEL Navit and LTX2 joint audio+video SDE) remain
+specialized stages.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Callable, ClassVar, Generic, List, Mapping, Optional, TypeVar
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Generic,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeVar,
+    runtime_checkable,
+)
 
 import torch
 
-from unirl.models.diffusion.contracts import DiffusionLatentSpec
-from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
 
+if TYPE_CHECKING:
+    from unirl.models.types.replay_result import ReplayResult
+
 B = TypeVar("B")
 C = TypeVar("C")
+
+
+@dataclass(frozen=True)
+class SingleStreamLatentSpec:
+    """Device, batch, and dense per-sample shape for one latent stream."""
+
+    device: torch.device
+    batch_size: int
+    shape: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "device", torch.device(self.device))
+        if self.batch_size <= 0:
+            raise ValueError(f"SingleStreamLatentSpec.batch_size must be positive; got {self.batch_size}.")
+        if not self.shape or any(int(size) <= 0 for size in self.shape):
+            raise ValueError(f"SingleStreamLatentSpec.shape must contain positive dimensions; got {self.shape!r}.")
+
+
+@runtime_checkable
+class SingleStreamDiffusionStep(Protocol[B, C]):
+    """One transition for a dense latent stream on a scalar sigma schedule.
+
+    The kernel is stateless: it takes a model bundle, conditions, and an SDE
+    strategy per call, runs the model forward, and applies one transition.
+    ``prev_sample=None`` selects sampling; a stored ``prev_sample`` selects
+    log-prob replay.
+    """
+
+    def forward(
+        self,
+        *,
+        strategy: "StepStrategy",
+        noise_pred: torch.Tensor,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        prev_sample: Optional[torch.Tensor] = None,
+        sigma_max: float = 0.99,
+        eta: float = 1.0,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]: ...
+
+    def step(
+        self,
+        model: B,
+        conditions: C,
+        *,
+        strategy: "StepStrategy",
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        guidance_scale: float,
+        prev_sample: Optional[torch.Tensor] = None,
+        sigma_max: float = 0.99,
+        eta: float = 1.0,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]: ...
+
+    def step_with_logp(
+        self,
+        model: B,
+        conditions: C,
+        *,
+        strategy: "StepStrategy",
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        guidance_scale: float,
+        prev_sample: Optional[torch.Tensor] = None,
+        sigma_max: float = 0.99,
+        eta: float = 1.0,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]: ...
 
 
 @contextmanager
@@ -47,8 +136,8 @@ def temporary_eval(module: torch.nn.Module):
         module.train(was_training)
 
 
-class DiffusionRunner(ABC, Generic[B, C]):
-    """Model-agnostic denoising and stored-transition replay.
+class SingleStreamDiffusionRunner(ABC, Generic[B, C]):
+    """Denoising and stored-transition replay for one dense latent stream.
 
     Subclasses implement :meth:`_latent_spec`.  Optional hooks expose
     model-specific step kwargs, state, segment modality, replay validation, and
@@ -80,12 +169,12 @@ class DiffusionRunner(ABC, Generic[B, C]):
         return type(self).__name__
 
     @abstractmethod
-    def _latent_spec(self, conditions: C, params: DiffusionSamplingParams) -> DiffusionLatentSpec:
+    def _latent_spec(self, conditions: C, params: DiffusionSamplingParams) -> SingleStreamLatentSpec:
         """Resolve the request's device, batch size, and per-sample latent shape."""
 
     def _prepare_initial_latents(
         self,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor],
     ) -> torch.Tensor:
@@ -129,7 +218,7 @@ class DiffusionRunner(ABC, Generic[B, C]):
         params: DiffusionSamplingParams,
         *,
         schedule: torch.Tensor,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
     ) -> Any:
         """Create optional state shared by every step of one rollout."""
         del conditions, params, schedule, spec
@@ -141,7 +230,7 @@ class DiffusionRunner(ABC, Generic[B, C]):
         params: DiffusionSamplingParams,
         *,
         schedule: torch.Tensor,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
     ) -> None:
         """Optional model-mode/cache setup immediately before the sampling loop."""
         del conditions, params, schedule, spec
@@ -165,7 +254,7 @@ class DiffusionRunner(ABC, Generic[B, C]):
         self,
         params: DiffusionSamplingParams,
         *,
-        spec: DiffusionLatentSpec,
+        spec: SingleStreamLatentSpec,
         step_index: int,
         eta: float,
         sde_sample_keys: Optional[List[str]],
@@ -424,6 +513,9 @@ class DiffusionRunner(ABC, Generic[B, C]):
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
+
+        from unirl.models.types.replay_result import ReplayResult
+
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def _predict_noise_kwargs(
@@ -472,8 +564,8 @@ class DiffusionRunner(ABC, Generic[B, C]):
         return self.model.transformer
 
 
-class VideoDiffusionRunner(DiffusionRunner[B, C], ABC):
-    """Shared video contract: video modality, 5D state, and scalar sigma max."""
+class SingleStreamVideoDiffusionRunner(SingleStreamDiffusionRunner[B, C], ABC):
+    """Single-stream specialization for dense 5D video latents."""
 
     SEGMENT_FACTORY = make_video_segment
     SIGMA_MAX_AS_FLOAT = True
@@ -488,7 +580,9 @@ class VideoDiffusionRunner(DiffusionRunner[B, C], ABC):
 
 
 __all__ = [
-    "DiffusionRunner",
-    "VideoDiffusionRunner",
+    "SingleStreamDiffusionRunner",
+    "SingleStreamDiffusionStep",
+    "SingleStreamLatentSpec",
+    "SingleStreamVideoDiffusionRunner",
     "temporary_eval",
 ]

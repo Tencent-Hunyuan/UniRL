@@ -57,7 +57,7 @@ from typing import Any, ClassVar, List, Mapping, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep
+from unirl.models.diffusion import SingleStreamDiffusionRunner, SingleStreamDiffusionStep, SingleStreamLatentSpec
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -82,7 +82,7 @@ def build_freqs_cis(transformer_config, device: torch.device) -> List[torch.Tens
     return [t.to(device) for t in tables]
 
 
-class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditions]):
+class BooguImageDiffusionStep(SingleStreamDiffusionStep[BooguImageBundle, BooguImageConditions]):
     """Per-step Boogu-Image denoising kernel — stateless."""
 
     def predict_noise(
@@ -269,7 +269,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
         )
 
 
-class BooguImageDiffusionStage(DiffusionRunner[BooguImageBundle, BooguImageConditions]):
+class BooguImageDiffusionStage(SingleStreamDiffusionRunner[BooguImageBundle, BooguImageConditions]):
     """Boogu-Image rollout-level diffusion stage.
 
     Owns the SDE ``strategy``, the bundle, the stateless kernel, the
@@ -356,14 +356,14 @@ class BooguImageDiffusionStage(DiffusionRunner[BooguImageBundle, BooguImageCondi
         self,
         conditions: BooguImageConditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("BooguImageDiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
         vsf = int(self.vae_scale_factor)
         latent_h = 2 * (int(params.height) // (vsf * 2))
         latent_w = 2 * (int(params.width) // (vsf * 2))
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=(int(self.latent_channels), latent_h, latent_w),

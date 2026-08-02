@@ -7,7 +7,7 @@ container.
 
 Step-level kernel: ``ARStep`` — per-token transition kernel: ``sample`` is
 the logits→token math kernel; ``init_state`` / ``step`` own the per-token
-model forward (mirroring ``DiffusionStep.forward`` vs ``.step``).
+model forward (mirroring ``SingleStreamDiffusionStep.forward`` vs ``.step``).
 
 The legacy ``ARTrajectory`` type is deleted — ``TextSegment`` (in
 ``unirl/types/segments/text.py``) replaces it.
@@ -62,7 +62,7 @@ class ARStage(Protocol[C]):
 
 @runtime_checkable
 class ARStep(Protocol[B, C, S]):
-    """Per-token AR transition kernel — two levels, mirroring ``DiffusionStep``.
+    """Per-token AR transition kernel, mirroring the single-stream diffusion step.
 
     - ``sample(logits)`` — the math kernel: given ``[B, vocab]`` logits at
       the current position, sample the next token and return
@@ -72,8 +72,8 @@ class ARStep(Protocol[B, C, S]):
       running a forward; ``step`` runs one token's model forward, ``sample``,
       and the state advance, returning ``(token_id, log_prob, state)``.
 
-    Unlike ``DiffusionStep`` (whose per-model state is default-constructed
-    by the stage and lazily filled on step 0), AR gets an explicit
+    Unlike the single-stream diffusion step (whose per-model state is
+    default-constructed by the stage and lazily filled on step 0), AR gets an explicit
     ``init_state`` because the KV cache must be pre-sized with
     ``prompt_len + max_new_tokens`` — a loop-level quantity the per-step
     kernel otherwise never sees.

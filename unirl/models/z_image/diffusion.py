@@ -47,7 +47,7 @@ from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
-from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep
+from unirl.models.diffusion import SingleStreamDiffusionRunner, SingleStreamDiffusionStep, SingleStreamLatentSpec
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -73,7 +73,7 @@ def _caption_list(text, dtype: torch.dtype, device: torch.device) -> List[torch.
     return [embeds[i][bool_mask[i]] for i in range(bsz)]
 
 
-class ZImageDiffusionStep(DiffusionStep[ZImageBundle, ZImageConditions]):
+class ZImageDiffusionStep(SingleStreamDiffusionStep[ZImageBundle, ZImageConditions]):
     """Per-step Z-Image denoising kernel — stateless."""
 
     def predict_noise(
@@ -225,7 +225,7 @@ class ZImageDiffusionStep(DiffusionStep[ZImageBundle, ZImageConditions]):
         )
 
 
-class ZImageDiffusionStage(DiffusionRunner[ZImageBundle, ZImageConditions]):
+class ZImageDiffusionStage(SingleStreamDiffusionRunner[ZImageBundle, ZImageConditions]):
     """Z-Image rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -274,14 +274,14 @@ class ZImageDiffusionStage(DiffusionRunner[ZImageBundle, ZImageConditions]):
         self,
         conditions: ZImageConditions,
         params: DiffusionSamplingParams,
-    ) -> DiffusionLatentSpec:
+    ) -> SingleStreamLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("ZImageDiffusionStage: conditions.text.embeds is None")
         embeds = conditions.text.embeds
         vsf = int(self.vae_scale_factor)
         latent_h = 2 * (int(params.height) // (vsf * 2))
         latent_w = 2 * (int(params.width) // (vsf * 2))
-        return DiffusionLatentSpec(
+        return SingleStreamLatentSpec(
             device=embeds.device,
             batch_size=int(embeds.shape[0]),
             shape=(int(self.latent_channels), latent_h, latent_w),
