@@ -53,20 +53,22 @@ Math mirrors PR #104's ``qwen_image_sampler.py`` / ``forward_denoiser``.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from typing import ClassVar, List, Optional, Set, Tuple
+from typing import Any, ClassVar, Mapping, Optional, Tuple
 
 import torch
 
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
-from unirl.models.types.replay_result import ReplayResult
+from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep
 from unirl.sde.kernels import StepStrategy
-from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
-from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import QwenImageBundle
 from .conditions import QwenImageConditions
+
+# --------------------------------------------------------------------------
+# Pack / unpack helpers — module-level so unit tests can import them
+# without constructing the stage.
+# --------------------------------------------------------------------------
 
 
 def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -155,6 +157,8 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         dtype = prompt_embeds.dtype
         packed = _pack_latents(sample).to(dtype=dtype)
 
+        # Qwen-Image's transformer takes raw sigma as the timestep
+        # input (not sigma * 1000 like SD3).
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size).to(device, dtype=dtype)
         elif sigma.shape[0] != batch_size:
@@ -162,14 +166,30 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         else:
             timestep = sigma.to(device, dtype=dtype)
 
+        # The transformer needs the per-sample latent grid shape so it
+        # can rebuild positional embeddings; format is
+        # ``[[(frames, H/(vae_scale_factor*2), W/(vae_scale_factor*2))]] * B``.
+        # Here ``latent_h`` / ``latent_w`` ARE already in the post-VAE
+        # spatial grid, so the patchify divisor is just 2.
         img_shapes = [[(1, latent_h // 2, latent_w // 2)]] * batch_size
 
+        # Distilled-guidance scalar — embedded by the transformer when
+        # ``guidance_embeds=True`` is set on its config (set by some
+        # Qwen-Image variants only). Independent of CFG guidance_scale.
         guidance = None
         if getattr(model.transformer.config, "guidance_embeds", False):
             guidance_value = guidance_scale if distilled_guidance_scale is None else float(distilled_guidance_scale)
             guidance = torch.tensor([guidance_value], device=device, dtype=torch.float32).expand(batch_size)
 
-        # Trim embeds to max(txt_seq_lens) to keep RoPE widths aligned.
+        # Per-sample true text lengths — the RoPE builder slices its text
+        # frequency table by ``max(txt_seq_lens)`` (required positionally by
+        # the installed diffusers; passing only the attention mask raises
+        # ``max(None)`` TypeError — LIN-382 qwen probe-e). The embeds must be
+        # trimmed to this slice's true max first: replay microbatches carry
+        # the BATCH-wide pad width (e.g. 18) while their own max true length
+        # may be shorter (12) — diffusers applies RoPE over the full tensor
+        # width and the freq slice over max(txt_seq_lens), so a width
+        # mismatch hard-crashes in apply_rotary_emb_qwen (probe-f).
         true_lens = prompt_embeds_mask.sum(dim=1).to(torch.long)
         max_true = int(true_lens.max().item())
         if prompt_embeds.shape[1] > max_true:
@@ -211,12 +231,16 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
                     txt_seq_lens=negative_txt_seq_lens,
                     return_dict=False,
                 )[0]
+                # Combined-CFG with norm correction. Spec: keep the per-token
+                # L2 norm of the conditional prediction after CFG blending.
                 comb = negative_noise_pred_packed + guidance_scale * (noise_pred_packed - negative_noise_pred_packed)
                 cond_norm = torch.norm(noise_pred_packed, dim=-1, keepdim=True)
                 comb_norm = torch.norm(comb, dim=-1, keepdim=True)
                 noise_pred_packed = comb * (cond_norm / comb_norm)
 
         return _unpack_latents(noise_pred_packed, latent_h=latent_h, latent_w=latent_w)
+
+    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -268,6 +292,9 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition. End-to-end one diffusion step."""
         if latent_h <= 0 or latent_w <= 0:
+            # Recover from sample shape — diffuse/replay always pass both
+            # explicitly, but defaulting here keeps unit tests that hand-
+            # roll ``[B, C, H, W]`` simple.
             latent_h = int(sample.shape[-2])
             latent_w = int(sample.shape[-1])
         noise_pred = self.predict_noise(
@@ -333,7 +360,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         )
 
 
-class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
+class QwenImageDiffusionStage(DiffusionRunner[QwenImageBundle, QwenImageConditions]):
     """Qwen-Image rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -361,6 +388,11 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("QwenImageTransformerBlock",)
 
+    # Qwen-Image t2i uses an 8× VAE downsample and 16 latent channels
+    # in the post-VAE grid. The model bundle's ``transformer.config``
+    # carries the authoritative count via ``in_channels // 4`` (the
+    # packed-latent format multiplies by 4); we default to that and let
+    # callers override via the stage constructor.
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
 
     def __init__(
@@ -375,264 +407,64 @@ class QwenImageDiffusionStage(DiffusionStage[QwenImageConditions]):
         vae_scale_factor: int = 8,
         latent_channels: Optional[int] = None,
     ) -> None:
-        self.model = model
-        self.step = step
-        self.strategy = strategy
-        self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
-        self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
-        self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        super().__init__(
+            model=model,
+            step=step,
+            strategy=strategy,
+            autocast_precision=autocast_precision,
+            trajectory_precision=trajectory_precision,
+            logprob_precision=logprob_precision,
+        )
         self.vae_scale_factor = vae_scale_factor
         if latent_channels is None:
+            # Read from the transformer config: in_channels is the
+            # packed-input dim (C * 4), so the post-VAE channel count is
+            # in_channels // 4. Falls back to 16 if the attr is missing.
             tx_cfg = getattr(model.transformer, "config", None)
             in_channels = getattr(tx_cfg, "in_channels", 64) if tx_cfg is not None else 64
             latent_channels = int(in_channels) // 4
         self.latent_channels = int(latent_channels)
 
-    def diffuse(
+    def _latent_spec(
         self,
         conditions: QwenImageConditions,
-        *,
-        schedule: torch.Tensor,
         params: DiffusionSamplingParams,
-        initial_latents: Optional[torch.Tensor] = None,
-    ) -> LatentSegment:
-        """Run full Qwen-Image sampling. Returns a ``LatentSegment``.
-
-        The SDE loop and the segment store stay in spatial ``[B, C, H, W]``
-        shape; :meth:`QwenImageDiffusionStep.predict_noise` packs /
-        unpacks at the transformer boundary so the VAE decode stage can
-        read ``segment.latents[:, -1]`` without per-shape handling.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part; see
-        :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
-        from unirl.sde.noise import generate_latents
-
+    ) -> DiffusionLatentSpec:
         if conditions.text is None or conditions.text.embeds is None:
-            raise ValueError("QwenImageDiffusionStage.diffuse: conditions.text.embeds is None")
-        prompt_embeds = conditions.text.embeds
-        device = prompt_embeds.device
-        batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
-        if int(schedule.shape[0]) != T + 1:
-            raise ValueError(f"QwenImageDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
-        schedule = schedule.to(device)
-        self.strategy.init_schedule(schedule)
-
+            raise ValueError("QwenImageDiffusionStage: conditions.text.embeds is None")
+        embeds = conditions.text.embeds
         latent_h = 2 * (int(params.height) // (int(self.vae_scale_factor) * 2))
         latent_w = 2 * (int(params.width) // (int(self.vae_scale_factor) * 2))
-        expected_latent_shape = (int(self.latent_channels), latent_h, latent_w)
-        if initial_latents is not None:
-            if int(initial_latents.shape[0]) != batch_size:
-                raise ValueError(
-                    f"QwenImageDiffusionStage.diffuse: initial_latents.shape[0]="
-                    f"{int(initial_latents.shape[0])} != batch_size={batch_size}."
-                )
-            if tuple(initial_latents.shape[1:]) != expected_latent_shape:
-                raise ValueError(
-                    f"QwenImageDiffusionStage.diffuse: initial_latents.shape[1:]="
-                    f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for height={int(params.height)}, width={int(params.width)}."
-                )
-            latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
-        else:
-            latents = generate_latents(
-                batch_size=batch_size,
-                latent_shape=expected_latent_shape,
-                device=device,
-                dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
-                noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
-            )
-
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
-        sde_sorted: List[int] = sorted(sde_set)
-
-        needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
-        needed.add(T)
-
-        stored_pairs: List[Tuple[int, torch.Tensor]] = []
-        if 0 in needed:
-            stored_pairs.append((0, latents.detach().clone()))
-        sde_logp_list: List[torch.Tensor] = []
-
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-        sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
-
-        for i in range(T):
-            sigma = schedule[i].to(device)
-            sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
-
-            with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=latents,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=step_eta,
-                    sigma_max=sigma_max,
-                    step_index=i,
-                    latent_h=latent_h,
-                    latent_w=latent_w,
-                    distilled_guidance_scale=params.distilled_guidance_scale,
-                )
-            latents = new_latents.to(dtype=self.trajectory_dtype)
-
-            if (i + 1) in needed:
-                stored_pairs.append((i + 1, latents.detach().clone()))
-
-            if log_prob is not None:
-                sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
-
-        positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
-
-        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
-        sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
-
-        indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
-
-        return LatentSegment(
-            latents=latents_stacked,
-            sigmas=schedule,
-            indices=indices_tensor,
-            sde_logp=sde_logp,
-            sde_indices=sde_indices_tensor,
+        return DiffusionLatentSpec(
+            device=embeds.device,
+            batch_size=int(embeds.shape[0]),
+            shape=(int(self.latent_channels), latent_h, latent_w),
         )
 
-    def replay(
+    def _step_kwargs(
         self,
         conditions: QwenImageConditions,
-        *,
-        segment: LatentSegment,
         params: DiffusionSamplingParams,
-        step_indices: Optional[List[int]] = None,
-    ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
+        *,
+        sample: torch.Tensor,
+        step_index: int,
+        num_steps: int,
+        mode: str,
+        state: Any,
+    ) -> Mapping[str, Any]:
+        del conditions, step_index, num_steps, mode, state
+        return {
+            "latent_h": int(sample.shape[-2]),
+            "latent_w": int(sample.shape[-1]),
+            "distilled_guidance_scale": params.distilled_guidance_scale,
+        }
 
-        Recovers ``latent_h`` / ``latent_w`` from the stored segment's
-        latent shape (``[B, K, C, H, W]``) so the kernel can rebuild the
-        packed-latent geometry per step.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this
-        method only manages the autocast scope.
-        """
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("QwenImageDiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("QwenImageDiffusionStage.replay: segment.sigmas missing")
+    def _validate_replay_segment(self, segment: LatentSegment) -> None:
+        super()._validate_replay_segment(segment)
         if segment.latents.ndim != 5:
             raise ValueError(
                 f"QwenImageDiffusionStage.replay: expected latents [B, K, C, H, W], got {tuple(segment.latents.shape)}"
             )
-        latent_h = int(segment.latents.shape[-2])
-        latent_w = int(segment.latents.shape[-1])
-
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"QwenImageDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
-
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-        log_probs: List[torch.Tensor] = []
-        prev_sample_means: List[torch.Tensor] = []
-        with autocast_ctx:
-            for step_idx in target:
-                sigma = sigmas[step_idx].to(dtype=torch.float32)
-                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx)
-                prev_sample = segment.latents_at(step_idx + 1)
-                _, log_prob, prev_mean = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=sample,
-                    prev_sample=prev_sample,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=float(params.eta),
-                    sigma_max=sigma_max,
-                    step_index=step_idx,
-                    latent_h=latent_h,
-                    latent_w=latent_w,
-                    distilled_guidance_scale=params.distilled_guidance_scale,
-                )
-                if log_prob is None:
-                    raise RuntimeError(
-                        f"QwenImageDiffusionStage.replay: strategy returned None "
-                        f"log-prob at step_index={step_idx} (deterministic mode); "
-                        f"replay requires a stochastic SDE strategy."
-                    )
-                log_probs.append(log_prob)
-                if prev_mean is not None:
-                    prev_sample_means.append(prev_mean)
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    def predict_noise_at_step(
-        self,
-        conditions: QwenImageConditions,
-        *,
-        sample: torch.Tensor,
-        sigma: torch.Tensor,
-        params: DiffusionSamplingParams,
-    ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Latent ``H × W`` are taken directly from ``sample.shape[-2:]`` (no
-        VAE round-trip). ``distilled_guidance_scale`` is read from
-        ``params`` when set (Qwen-Image checkpoints with
-        ``guidance_embeds=True`` use it; otherwise it's ignored).
-        """
-        return self.step.predict_noise(
-            self.model,
-            sample,
-            sigma,
-            conditions,
-            guidance_scale=float(params.guidance_scale),
-            latent_h=int(sample.shape[-2]),
-            latent_w=int(sample.shape[-1]),
-            distilled_guidance_scale=getattr(params, "distilled_guidance_scale", None),
-        )
-
-    def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For Qwen-Image, that's the bundle's transformer
-        (``QwenImageTransformer2DModel``) — the FSDP wrap target. Aux
-        modules (VAE, text encoder) are siblings on the bundle, never
-        under the transformer.
-        """
-        return self.model.transformer
 
 
 __all__ = [

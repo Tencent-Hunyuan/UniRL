@@ -15,8 +15,8 @@ from typing import List, Optional, Sequence, Union
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.models.diffusion import DiffusionStage
 from unirl.models.types.ar import ARStage
-from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas

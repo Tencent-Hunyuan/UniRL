@@ -44,8 +44,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import torch
 
 from unirl.config.require import require
-from unirl.models.types.diffusion import DiffusionStage
-from unirl.models.types.replay_result import ReplayResult
+from unirl.models.diffusion import DiffusionStage, ReplayResult
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment

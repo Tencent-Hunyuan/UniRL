@@ -49,18 +49,14 @@ two implementations must stay in spec sync via review and tests.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import ClassVar, List, Optional, Set, Tuple
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
-from unirl.models.types.replay_result import ReplayResult
+from unirl.models.diffusion import DiffusionLatentSpec, DiffusionRunner, DiffusionStep, temporary_eval
 from unirl.sde.kernels import StepStrategy
-from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
-from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import Flux2KleinBundle
 from .conditions import Flux2KleinConditions
@@ -151,6 +147,12 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         txt_ids = prepare_text_ids(prompt_embeds).to(device=device)
         img_ids = prepare_latent_ids(sample).to(device=device)
 
+        # Image-edit conditioning: append the source-image condition tokens to
+        # the noise token sequence (and their RoPE ids to img_ids), mirroring
+        # diffusers' Flux2KleinPipeline reference path
+        # (latent_model_input = cat([latents, image_latents], dim=1)). The
+        # transformer attends jointly; we slice the prediction back to the
+        # noise tokens afterwards. Pure T2I leaves these None → no-op.
         cond_tokens = conditions.image_latent
         if cond_tokens is not None:
             cond_tokens = cond_tokens.to(device=device, dtype=dtype)
@@ -173,6 +175,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
+        # Drop the condition-token predictions; keep only the noise tokens.
         noise_pred_packed = noise_pred_packed[:, :noise_seq_len]
 
         if guidance_scale > 1.0:
@@ -197,6 +200,8 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         latent_h = int(sample.shape[-2])
         latent_w = int(sample.shape[-1])
         return unpack_latents(noise_pred_packed, latent_h, latent_w)
+
+    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -280,7 +285,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         )
 
 
-class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
+class Flux2KleinDiffusionStage(DiffusionRunner[Flux2KleinBundle, Flux2KleinConditions]):
     """FLUX.2-klein rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (DanceSDE by default for Klein), the
@@ -304,6 +309,10 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         "Flux2SingleTransformerBlock",
     )
 
+    # FLUX.2-klein VAE spatial downsample (8×) and patchify factor (2×)
+    # → effective patchified downsample 16×. The bundle's
+    # ``transformer.config.in_channels`` is the patchified channel count
+    # (128 = 32 × 4); we use it to derive ``latent_channels`` (32).
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
     DEFAULT_PATCHIFY_FACTOR: ClassVar[int] = 2
 
@@ -320,12 +329,14 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         patchify_factor: int = 2,
         latent_channels: Optional[int] = None,
     ) -> None:
-        self.model = model
-        self.step = step
-        self.strategy = strategy
-        self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
-        self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
-        self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        super().__init__(
+            model=model,
+            step=step,
+            strategy=strategy,
+            autocast_precision=autocast_precision,
+            trajectory_precision=trajectory_precision,
+            logprob_precision=logprob_precision,
+        )
         self.vae_scale_factor = int(vae_scale_factor)
         self.patchify_factor = int(patchify_factor)
         if latent_channels is None:
@@ -333,6 +344,10 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
             in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
             latent_channels = int(in_channels)
         self.latent_channels = int(latent_channels)
+
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
 
     def _patchified_shape(self, height: int, width: int) -> Tuple[int, int, int]:
         """Compute the patchified ``(C, H_pat, W_pat)`` for ``(height, width)`` pixels."""
@@ -346,244 +361,41 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         w_pat = width // downsample
         return (self.latent_channels, h_pat, w_pat)
 
-    def diffuse(
+    def _latent_spec(
         self,
         conditions: Flux2KleinConditions,
+        params: Flux2KleinDiffusionParams,
+    ) -> DiffusionLatentSpec:
+        if conditions.text is None or conditions.text.embeds is None:
+            raise ValueError("Flux2KleinDiffusionStage: conditions.text.embeds is None")
+        embeds = conditions.text.embeds
+        return DiffusionLatentSpec(
+            device=embeds.device,
+            batch_size=int(embeds.shape[0]),
+            shape=self._patchified_shape(int(params.height), int(params.width)),
+        )
+
+    def _before_diffuse(
+        self,
+        conditions: Flux2KleinConditions,
+        params: Flux2KleinDiffusionParams,
         *,
         schedule: torch.Tensor,
-        params: Flux2KleinDiffusionParams,
-        initial_latents: Optional[torch.Tensor] = None,
-    ) -> LatentSegment:
-        """Run full FLUX.2-klein sampling. Returns a ``LatentSegment``.
-
-        Segment latents stay in patchified spatial form
-        ``[B, K, 128, H_pat, W_pat]``. The driver may pre-ship
-        ``initial_latents`` (in the same patchified spatial form), resolved from
-        the request ``Sample``'s diffusion generation Part; when absent we
-        sample fresh Gaussian noise.
-        """
-        from unirl.sde.noise import generate_latents
-
-        if conditions.text is None or conditions.text.embeds is None:
-            raise ValueError("Flux2KleinDiffusionStage.diffuse: conditions.text.embeds is None")
-        prompt_embeds = conditions.text.embeds
-        device = prompt_embeds.device
-        batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
-        if int(schedule.shape[0]) != T + 1:
-            raise ValueError(f"Flux2KleinDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
-        schedule = schedule.to(device)
-        self.strategy.init_schedule(schedule)
-
-        expected_latent_shape = self._patchified_shape(int(params.height), int(params.width))
-        if initial_latents is not None:
-            if int(initial_latents.shape[0]) != batch_size:
-                raise ValueError(
-                    f"Flux2KleinDiffusionStage.diffuse: initial_latents.shape[0]="
-                    f"{int(initial_latents.shape[0])} != batch_size={batch_size}."
-                )
-            if tuple(initial_latents.shape[1:]) != expected_latent_shape:
-                raise ValueError(
-                    f"Flux2KleinDiffusionStage.diffuse: initial_latents.shape[1:]="
-                    f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for height={int(params.height)}, width={int(params.width)}."
-                )
-            latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
-        else:
-            latents = generate_latents(
-                batch_size=batch_size,
-                latent_shape=expected_latent_shape,
-                device=device,
-                dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
-                noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
-            )
-
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
-        sde_sorted: List[int] = sorted(sde_set)
-
-        needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
-        needed.add(T)
-
-        stored_pairs: List[Tuple[int, torch.Tensor]] = []
-        if 0 in needed:
-            stored_pairs.append((0, latents.detach().clone()))
-        sde_logp_list: List[torch.Tensor] = []
-
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-        sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
-
+        spec: DiffusionLatentSpec,
+    ) -> None:
+        del conditions, params, schedule, spec
         self.model.transformer.eval()
 
-        for i in range(T):
-            sigma = schedule[i].to(device)
-            sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
-
-            with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=latents,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=step_eta,
-                    sigma_max=sigma_max,
-                    step_index=i,
-                )
-            latents = new_latents.to(dtype=self.trajectory_dtype)
-
-            if (i + 1) in needed:
-                stored_pairs.append((i + 1, latents.detach().clone()))
-
-            if log_prob is not None:
-                sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
-
-        positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
-
-        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
-        sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
-
-        indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
-
-        return LatentSegment(
-            latents=latents_stacked,
-            sigmas=schedule,
-            indices=indices_tensor,
-            sde_logp=sde_logp,
-            sde_indices=sde_indices_tensor,
-        )
-
-    def replay(
-        self,
-        conditions: Flux2KleinConditions,
-        *,
-        segment: LatentSegment,
-        params: Flux2KleinDiffusionParams,
-        step_indices: Optional[List[int]] = None,
-    ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Mirrors :class:`SD3DiffusionStage.replay`. Klein-specific
-        difference: the transformer is held in ``.eval()`` mode for the
-        forward pass (matches legacy
-        ``Flux2Sampler.compute_log_prob_for_training`` Klein branch).
-        Caller manages the outer ``.train()`` / ``.eval()`` mode and
-        grad scope; this method only manages the autocast scope and
-        the per-step eval flip.
-        """
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("Flux2KleinDiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("Flux2KleinDiffusionStage.replay: segment.sigmas missing")
+    def _validate_replay_segment(self, segment: LatentSegment) -> None:
+        super()._validate_replay_segment(segment)
         if segment.latents.ndim != 5:
             raise ValueError(
                 f"Flux2KleinDiffusionStage.replay: expected latents [B, K, C, H_pat, W_pat], "
                 f"got {tuple(segment.latents.shape)}"
             )
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"Flux2KleinDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
-
-        autocast_ctx = (
-            torch.autocast("cuda", self.autocast_dtype)
-            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
-            else nullcontext()
-        )
-
-        prior_training = self.model.transformer.training
-        self.model.transformer.eval()
-        try:
-            log_probs: List[torch.Tensor] = []
-            prev_sample_means: List[torch.Tensor] = []
-            with autocast_ctx:
-                for step_idx in target:
-                    sigma = sigmas[step_idx].to(dtype=torch.float32)
-                    sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                    sample = segment.latents_at(step_idx)
-                    prev_sample = segment.latents_at(step_idx + 1)
-                    _, log_prob, prev_mean = self.step.step_with_logp(
-                        self.model,
-                        conditions,
-                        strategy=self.strategy,
-                        sample=sample,
-                        prev_sample=prev_sample,
-                        sigma=sigma,
-                        sigma_next=sigma_next,
-                        guidance_scale=float(params.guidance_scale),
-                        eta=float(params.eta),
-                        sigma_max=sigma_max,
-                        step_index=step_idx,
-                    )
-                    if log_prob is None:
-                        raise RuntimeError(
-                            f"Flux2KleinDiffusionStage.replay: strategy returned None "
-                            f"log-prob at step_index={step_idx} (deterministic mode); "
-                            f"replay requires a stochastic SDE strategy."
-                        )
-                    log_probs.append(log_prob)
-                    if prev_mean is not None:
-                        prev_sample_means.append(prev_mean)
-        finally:
-            if prior_training:
-                self.model.transformer.train()
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    def predict_noise_at_step(
-        self,
-        conditions: Flux2KleinConditions,
-        *,
-        sample: torch.Tensor,
-        sigma: torch.Tensor,
-        params: Flux2KleinDiffusionParams,
-    ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        ``sample`` is patchified ``[B, 128, H_pat, W_pat]``. Delegates
-        to :meth:`Flux2KleinDiffusionStep.predict_noise`.
-        """
-        return self.step.predict_noise(
-            self.model,
-            sample,
-            sigma,
-            conditions,
-            guidance_scale=float(params.guidance_scale),
-        )
-
-    def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For FLUX.2-klein, that's the bundle's transformer
-        (``Flux2Transformer2DModel``) — the FSDP wrap target. Aux
-        modules (VAE, Qwen3 text encoder) are siblings on the bundle,
-        never under the transformer.
-        """
-        return self.model.transformer
+    def _replay_context(self):
+        return temporary_eval(self.model.transformer)
 
 
 __all__ = [

@@ -7,7 +7,9 @@ description: Add or update UniRL model package support. Use when adding diffusio
 
 ## Start Here
 
-When adding a diffusion or autoregressive model, first inspect `unirl/models/README.md`, `unirl/models/types/`, and the closest package under `unirl/models/`:
+When adding a diffusion or autoregressive model, first inspect `unirl/models/README.md`,
+`unirl/models/diffusion/`, `unirl/models/types/`, and the closest package under
+`unirl/models/`:
 
 - `unirl/models/sd3/`: image diffusion with text embeddings, CFG, VAE decode, and driver-provided initial latents.
 - `unirl/models/wan21/`: text/image-to-video diffusion with image latent and CLIP-vision conditioning.
@@ -33,7 +35,7 @@ The current architecture is a typed pipeline:
 5. In `conditions.py`, implement `<Model>Conditions(Batch)` with typed condition slots and `from_dict(d)` / `to_dict()`. Validate required slots, reject wrong types with actionable errors, and omit `None` optional slots from the outgoing dict.
 6. Add embed/encode stages for inputs: `EmbedStage[Texts, TextEmbedCondition]`, `EncodeStage[Images, ImageLatentCondition]`, or model-specific variants. Keep tokenization, chat templates, text encoder fusion, image preprocessing, and upstream-compatible negative prompt defaults in these stages or in the pipeline that calls them.
 7. For diffusion models, add `<Model>DiffusionStep(DiffusionStep[<Model>Bundle, <Model>Conditions])`. By local convention, it should expose `predict_noise(...)` for per-step transformer invocation, CFG batching, timestep scaling, condition concat, masks, and private third-party kwargs. Delegate SDE math to the supplied `StepStrategy`.
-8. Add `<Model>DiffusionStage(DiffusionStage[<Model>Conditions])`. It owns latent initialization when supported by the package, the diffusion loop, trajectory storage, replay, precision policy, and `trainable_module()` when training-side injection needs the trainable root. Declare `_no_split_modules` on the stage when diffusers modules need FSDP wrapping hints.
+8. Add `<Model>DiffusionStage(DiffusionRunner[<Model>Bundle, <Model>Conditions])`. Implement `_latent_spec(...)` and only the narrow hooks needed for model-specific kwargs, state, initialization, mode, or trainable-root behavior. The shared runner owns schedule validation, sampling, sparse trajectory storage, replay, precision policy, and default `trainable_module()`. A stage should implement `DiffusionStage` directly only when its transition kernel is structurally different, such as BAGEL packed/Navit replay or LTX2 joint audio-video SDE. Declare `_no_split_modules` on the stage when diffusers modules need FSDP wrapping hints.
 9. For AR models, add `<Model>ARStep` and `<Model>ARStage(ARStage[<Model>Conditions])` instead of diffusion step/stage classes. Follow `unirl/models/qwen3/ar.py` for packed `TextSegment` generation and replay.
 10. In `vae.py` or equivalent, implement `DecodeStage[LatentSegment, Images | Videos]` and any required `EncodeStage[Images | Videos, ImageLatentCondition]`. Apply the model's VAE scale, shift, dtype, layout, frame, and clamp conventions.
 11. In `pipeline.py`, implement `<Model>Pipeline(Pipeline)` with `from_config(...)` and `generate(sample)`. Read raw inputs through `sample.conditioning()`, read sampling params from the typed generation Part, require `params.sigmas` for diffusion, call stages in order, and fill that Part with `segment`, modality-keyed `primitives`, and `conditions`.
@@ -50,7 +52,10 @@ Model packages are wired into recipes by `_target_` dotpath (no ConfigStore):
 - Add new shared condition types under `unirl/types/conditions/` only when existing slots cannot express the semantics; export them from `unirl/types/conditions/__init__.py`.
 - Add or update rollout-engine model-family enums only when the model is served through an engine that explicitly enumerates families, such as SGLang or vLLM-Omni configs.
 
-Keep package-specific logic under `unirl/models/<model_name>/`. Put only cross-model protocols or reusable condition abstractions under `unirl/models/types/` or `unirl/types/conditions/`.
+Keep package-specific logic under `unirl/models/<model_name>/`. Put
+diffusion-specific cross-family contracts and loop control under
+`unirl/models/diffusion/`; put other cross-model protocols or reusable condition
+abstractions under `unirl/models/types/` or `unirl/types/conditions/`.
 
 ## Meta-Init (avoid the per-rank full-model load)
 
@@ -122,17 +127,24 @@ CFG belongs in the diffusion step, with the pipeline and embed stages preparing 
 
 ## DiffusionStage Rules
 
-`<Model>DiffusionStage.diffuse(...)` owns the rollout loop and `LatentSegment` assembly:
+Ordinary `<Model>DiffusionStage` implementations inherit
+`unirl.models.diffusion.DiffusionRunner`; the runner owns the
+rollout/replay loops and `LatentSegment` assembly:
 
 - Use `schedule=params.sigmas` from the generation Part; diffusion pipelines should raise if it is `None`.
 - Do not build sigma schedules inside the pipeline or stage. Hosting engines pin schedules onto the Sample before calling `generate(sample)`.
-- Validate schedule length against the requested step count.
-- Initialize latents from request-provided `initial_latents` when the package supports deterministic driver-side noise; otherwise call the repository noise helper used by the closest template.
-- Store trajectories at `unirl.types.sampling.compute_trajectory_positions(...)` plus the final clean latent position, with stored latents in `trajectory_precision` and log-probs in `logprob_precision`.
+- Implement `_latent_spec(...)` to resolve device, batch size, and per-sample latent geometry.
+- Override `_prepare_initial_latents(...)` only for a genuinely different noise contract, such as HI3's late-resolved `NoiseRecipe`; otherwise use the runner's driver-latent validation and fallback generation.
+- Put per-step architecture constants and request-specific extensions in
+  `_step_kwargs(...)`; use `_prepare_conditions(...)` for mode-consistent
+  condition transforms, `_sampling_state(...)` for state shared across one
+  rollout, and `_step_generator(...)` only for model-specific SDE RNG policy.
+- Inherit `VideoDiffusionRunner` for the standard 5D video-latent contract so replay validation and `modality=VIDEO` stay centralized.
 - Keep direct transformer calls inside `<Model>DiffusionStep.predict_noise(...)`. The stage should call `self.step.step(...)` or `self.step.step_with_logp(...)`.
-- Implement `replay(...)` to recompute log-probs and previous-sample means from stored `LatentSegment` transitions for training.
-- Implement `predict_noise_at_step(conditions, *, sample, sigma, params)` for forward-process algorithms such as DiffusionNFT; it should delegate to the same `predict_noise(...)` path so CFG and guidance behavior match `diffuse(...)` and `replay(...)`.
-- Expose `trainable_module()` and `_no_split_modules` on the stage when training-side injection or wrapping needs the trainable root or FSDP hints.
+- Override the shared `replay(...)`, `diffuse(...)`, or `predict_noise_at_step(...)`
+  only when the transition itself cannot be represented by the runner hooks;
+  document why the model is a transition-kernel exception.
+- Override `trainable_module()` only when the trainable root is not `bundle.transformer`; keep `_no_split_modules` on the stage when FSDP needs package-specific hints.
 
 ## ARStage Rules
 
@@ -171,7 +183,7 @@ Adjust the command to real files before running. If the model is AR-only or pipe
 - Filled generation Parts use canonical primitive keys such as `"image"`, `"video"`, `"audio"`, or `"text"`, and include conditions and a segment when available.
 - `<Model>Conditions.from_dict` and `to_dict` are symmetric and fail loudly for wrong or missing required slots.
 - Per-sample tensors use `FieldKind.CONCAT`; shared metadata uses `FieldKind.SHARED`.
-- The diffusion stage owns loop bookkeeping, trajectory storage, replay, and precision casts; the diffusion step owns transformer calls and CFG math.
+- The shared diffusion runner owns loop bookkeeping, trajectory storage, replay, and precision casts; the concrete stage owns latent geometry and narrow model hooks; the diffusion step owns transformer calls and CFG math.
 - The sigma schedule is consumed from the generation Part's params; it is not rebuilt in the model package.
 - Bundle loading normalizes dtype/device, freezes auxiliary modules, and keeps trainable module naming compatible with `weight_sync_param_name_prefix`.
 - LoRA target modules are explicit for production models; `None` is only used deliberately.

@@ -24,8 +24,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
-from unirl.models.types.replay_result import ReplayResult
+from unirl.models.diffusion import DiffusionStage, DiffusionStep, ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions

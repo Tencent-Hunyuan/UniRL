@@ -324,7 +324,7 @@ class StageAlgorithm(Remote, ABC):
 
     Targets the four-tier pipeline contract (``models``). The algorithm
     holds a reference to a
-    :class:`unirl.models.types.diffusion.DiffusionStage` or
+    :class:`unirl.models.diffusion.DiffusionStage` or
     :class:`unirl.models.types.ar.ARStage` and dispatches all
     model forward / SDE / CFG work into ``stage.replay(...)``. It does not
     know its slot key in the dispatcher; slot routing lives on the train stack.

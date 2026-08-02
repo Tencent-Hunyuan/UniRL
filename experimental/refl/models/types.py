@@ -1,7 +1,7 @@
 """Recipe-local BPTT stage contract for the refl recipe.
 
 ``diffuse_with_grad`` is deliberately NOT part of the core
-:class:`~unirl.models.types.diffusion.DiffusionStage` protocol: concrete
+:class:`~unirl.models.diffusion.DiffusionStage` protocol: concrete
 stages inherit that Protocol *explicitly*, so a protocol-level stub would
 become a real ``None``-returning method on every diffusion stage in the
 repo and make ``hasattr``-based capability checks meaningless. While REFL
