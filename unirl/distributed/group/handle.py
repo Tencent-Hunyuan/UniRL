@@ -350,12 +350,8 @@ class PendingHandleCall:
         if self._consumed:
             return self._value
         handle = self._handle
-        results = ray.get(self._refs)
-        results = [
-            handle._rebind_tree(r, handle.workers[i], worker_local=self._worker_local) for i, r in enumerate(results)
-        ]
         _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = collect_fn(handle, results)
+        self._value = handle._collect_half(collect_fn, self._refs, worker_local=self._worker_local)
         self._consumed = True
         return self._value
 
@@ -605,8 +601,9 @@ class Handle:
         grad_mode and call_id are passed as dedicated parameters to Worker.call
         (not via kwargs) so dispatch internals remain unaware of grad state.
 
-        The non-blocking twin is :meth:`launch_nowait` +
-        :meth:`PendingHandleCall.result` below — keep the halves in parity.
+        Both this blocking form and :meth:`launch_nowait` +
+        :meth:`PendingHandleCall.result` are thin sequencing over the shared
+        :meth:`_launch_half` / :meth:`_collect_half`.
         """
 
         def handle_fn(*args, **kwargs):
@@ -627,36 +624,22 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            batch_size = infer_batch_size(args, kwargs)
-            # Only DP_SCATTER/DP_SCATTER_HEAD split the per-sample batch by dp_size, so only
-            # they require divisibility; BROADCAST/SCATTER must not be rejected (main #202).
-            if (
-                dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
-                and batch_size is not None
-                and batch_size % self.dp_size != 0
-            ):
-                raise ValueError(f"batch_size={batch_size} not divisible by dp_size={self.dp_size}")
-
-            shards = dispatch_fn(self, args, kwargs, batch_size)
-            # Locality + cross-worker transfer is the transport's policy: its
-            # localize makes every ref resolvable on its dst worker (GLOBAL =
-            # identity; worker-local = NCCL/IPC routing). It needs controller
-            # topology + per-shard dst identity, passed directly.
-            transport_cls = self.pool.transport_cls
-            worker_local = issubclass(transport_cls, WorkerLocalTransport)
-            shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
-            # grad_mode/call_id passed as dedicated args, not mixed into kwargs
-            refs = execute_fn(method_name, shards, grad_mode=ctx is not None, call_id=call_id)
-            results = ray.get(refs, timeout=ray_get_timeout)
-
-            # Rebind before collect: results[i] comes from workers[i],
-            # so worker attribution is unambiguous at this point. For worker-local
-            # this registers the decref GC finalizer; GLOBAL lifecycle is
-            # queue-managed, so skip rebind/GC there.
-            results = [self._rebind_tree(r, self.workers[i], worker_local=worker_local) for i, r in enumerate(results)]
-
-            # Collect: merge primary rank results
-            collected = collect_fn(self, results)
+            refs, worker_local = self._launch_half(
+                method_name,
+                dispatch_mode,
+                dispatch_fn,
+                execute_fn,
+                args,
+                kwargs,
+                grad_mode=ctx is not None,
+                call_id=call_id,
+            )
+            collected = self._collect_half(
+                collect_fn,
+                refs,
+                worker_local=worker_local,
+                ray_get_timeout=ray_get_timeout,
+            )
 
             if ctx is not None:
                 output_metas = collect_leaves(collected, TensorRef)
@@ -676,16 +659,78 @@ class Handle:
         handle_fn.__doc__ = f"SPMD handle: {method_name} (dispatch={dispatch_fn.__name__})"
         return handle_fn
 
+    # ── Shared call halves ──
+
+    def _launch_half(
+        self,
+        method_name: str,
+        dispatch_mode: Dispatch,
+        dispatch_fn: Callable,
+        execute_fn: Callable,
+        args: tuple,
+        kwargs: dict,
+        *,
+        grad_mode: bool,
+        call_id: Optional[str],
+    ) -> Tuple[List, bool]:
+        """dispatch → localize → execute; returns ``(refs, worker_local)``.
+
+        The launch half shared by the blocking ``handle_fn`` and the
+        non-blocking :meth:`launch_nowait`.
+        """
+        batch_size = infer_batch_size(args, kwargs)
+        # Only DP_SCATTER/DP_SCATTER_HEAD split the per-sample batch by dp_size, so only
+        # they require divisibility; BROADCAST/SCATTER must not be rejected (main #202).
+        if (
+            dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
+            and batch_size is not None
+            and batch_size % self.dp_size != 0
+        ):
+            raise ValueError(f"batch_size={batch_size} not divisible by dp_size={self.dp_size}")
+
+        shards = dispatch_fn(self, args, kwargs, batch_size)
+        # Locality + cross-worker transfer is the transport's policy: its
+        # localize makes every ref resolvable on its dst worker (GLOBAL =
+        # identity; worker-local = NCCL/IPC routing). It needs controller
+        # topology + per-shard dst identity, passed directly.
+        transport_cls = self.pool.transport_cls
+        worker_local = issubclass(transport_cls, WorkerLocalTransport)
+        shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
+        # grad_mode/call_id passed as dedicated args, not mixed into kwargs
+        refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
+        return refs, worker_local
+
+    def _collect_half(
+        self,
+        collect_fn: Callable,
+        refs: List,
+        *,
+        worker_local: bool,
+        ray_get_timeout: Optional[float] = None,
+    ):
+        """ray.get → rebind → collect: the collected method return value.
+
+        The collect half shared by the blocking ``handle_fn`` and
+        :meth:`PendingHandleCall.result`.
+        """
+        results = ray.get(refs, timeout=ray_get_timeout)
+        # Rebind before collect: results[i] comes from workers[i],
+        # so worker attribution is unambiguous at this point. For worker-local
+        # this registers the decref GC finalizer; GLOBAL lifecycle is
+        # queue-managed, so skip rebind/GC there.
+        results = [self._rebind_tree(r, self.workers[i], worker_local=worker_local) for i, r in enumerate(results)]
+        # Collect: merge primary rank results
+        return collect_fn(self, results)
+
     # ── Non-blocking launch ──
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
-        """Launch a @distributed method without blocking: the dispatch → localize →
-        execute half of ``handle_fn``, stopping before ``ray.get``.
+        """Launch a @distributed method without blocking: the launch half of
+        ``handle_fn``, stopping before ``ray.get``.
 
         Always ``grad_mode=False`` / ``call_id=None`` (a pending call is never
         valid under a GradContext, so the ``_grad_call_counter`` single-thread
-        assumption is untouched). Kept in line-parity with ``handle_fn`` above —
-        same divisibility gate, same localize. ``result()`` on the returned
+        assumption is untouched). ``result()`` on the returned
         :class:`PendingHandleCall` runs the collect half.
         """
         try:
@@ -695,19 +740,16 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        batch_size = infer_batch_size(args, kwargs)
-        if (
-            dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
-            and batch_size is not None
-            and batch_size % self.dp_size != 0
-        ):
-            raise ValueError(f"batch_size={batch_size} not divisible by dp_size={self.dp_size}")
-
-        shards = dispatch_fn(self, args, kwargs, batch_size)
-        transport_cls = self.pool.transport_cls
-        worker_local = issubclass(transport_cls, WorkerLocalTransport)
-        shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
-        refs = execute_fn(method_name, shards, grad_mode=False, call_id=None)
+        refs, worker_local = self._launch_half(
+            method_name,
+            dispatch_mode,
+            dispatch_fn,
+            execute_fn,
+            args,
+            kwargs,
+            grad_mode=False,
+            call_id=None,
+        )
         return PendingHandleCall(self, method_name, refs, worker_local)
 
     # ── Execute strategies ──
