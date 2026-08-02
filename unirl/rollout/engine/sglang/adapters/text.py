@@ -51,6 +51,16 @@ class TextLMAdapter(ModelAdapter):
 
     def validate(self) -> None:
         super().validate()
+        forbidden_tokens = list(getattr(self.cfg, "response_forbidden_tokens", None) or [])
+        self._response_forbidden_token_ids: Tuple[int, ...] = ()
+        if forbidden_tokens:
+            vocab = self._tokenizer.get_vocab()
+            unknown = [token for token in forbidden_tokens if token not in vocab]
+            require(
+                not unknown,
+                f"{type(self).__name__}: response_forbidden_tokens are absent from the tokenizer vocabulary: {unknown}",
+            )
+            self._response_forbidden_token_ids = tuple(dict.fromkeys(int(vocab[token]) for token in forbidden_tokens))
         if not self._has_chat_template():
             logger.info(
                 "%s: tokenizer has no chat template — raw-text completion rollouts",
@@ -119,10 +129,15 @@ class TextLMAdapter(ModelAdapter):
 
     def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
+        block = dict(sampling.block)
+        if self._response_forbidden_token_ids:
+            logit_bias = dict(block.get("logit_bias") or {})
+            for token_id in self._response_forbidden_token_ids:
+                logit_bias[str(token_id)] = -1.0e9
+            block["logit_bias"] = logit_bias
         return {
-            "sampling_params": dict(sampling.block),
+            "sampling_params": block,
             "return_logprob": sampling.return_logprob,
-            "logprob_start_len": 0,
         }
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:

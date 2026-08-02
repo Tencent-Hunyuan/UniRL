@@ -1,6 +1,6 @@
 """ReflActorRole — family-agnostic REFL/BPTT actor Remote for the refl recipe.
 
-Mirrors :class:`unirl.train.refl.policy.ReFLPolicy` (the SD3 image-ReFL actor):
+The family-agnostic REFL actor:
 a **config-chosen** ``Pipeline`` (``pipeline_target`` + ``model_config``, no
 per-family imports), FSDP-wrapped in place via ``FSDPBackend``, driven by three
 driver RPCs per step under the distributed ``enable_grad()`` context::
@@ -100,7 +100,7 @@ class ReflActorRole(Remote):
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
         # Default PG over the actor role's workers (env:// from Remote.setup's
-        # dist_env); FSDP2 fully_shard wraps over it. Same order as ReFLPolicy.
+        # dist_env); FSDP2 fully_shard wraps over it. Phase-0-validated order.
         if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 

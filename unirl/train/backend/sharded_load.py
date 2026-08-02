@@ -21,6 +21,7 @@ import glob
 import logging
 import os
 import re
+from collections.abc import Callable, Collection, Sequence
 from fnmatch import fnmatchcase
 from typing import Dict
 
@@ -34,6 +35,8 @@ from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named
 logger = logging.getLogger(__name__)
 
 StateDict = Dict[str, object]
+_PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen2_moe", "qwen3_moe", "qwen3_5_moe"})
+_QWEN_MOE_EXPERT_RE = re.compile(r"(^|.*\.)mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 def load_trainable_weights(
@@ -64,15 +67,17 @@ def load_trainable_weights(
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
         load_sharded(model, weights_path, device=device, strict=False)
-        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
-        # tables, …) captured on the bundle before meta-init's `to_empty` clobbered
-        # them and not carried by the checkpoint. Restoring here — in the shared
-        # post-load path — is robust to the live trainer's Ray-actor boundaries where
-        # a model-bound deferred closure can be dropped. Without this the train model
-        # keeps garbage RoPE -> garbage replay log-probs -> the DRPO rollout/replay
-        # ratio collapses (~0.05) and nothing learns.
+        # Recover init-computed non-persistent state (RoPE inv_freq, sincos tables,
+        # …) clobbered by meta-init `to_empty` and not carried by the checkpoint.
+        # The bundle carries the capture (capture_init_state); restoring here — in
+        # the shared post-load path — is robust to the live trainer's Ray-actor
+        # boundaries where the model-bound deferred closure can be dropped. Without
+        # this the train model keeps garbage RoPE -> garbage replay log-probs ->
+        # the DRPO rollout/replay ratio collapses (~0.05) and nothing learns.
         from unirl.models.types.meta_init import restore_init_state
 
+        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
+        # tables, …) captured on the bundle before meta-init's to_empty clobbered them.
         n_recovered = restore_init_state(model, getattr(bundle, "_meta_init_state", None))
         # Re-establish TIED weights (lm_head <-> embed_tokens). For tie_word_embeddings
         # models, meta-init's to_empty breaks the tie and the checkpoint carries NO
@@ -394,7 +399,8 @@ def _load_state_dict_sharded(
        no-op when the wrap already materialized the module (VeOmni's
        ``parallelize``) and the allocator that the FSDP-meta path needs when it
        did not.
-    2. rank 0: insert the ``base_layer`` hop for LoRA-injected modules.
+    2. rank 0: apply checkpoint-key compatibility rewrites (Qwen MoE
+       per-expert -> packed parameters, LoRA ``base_layer`` hops).
     3. ``set_model_state_dict(..., broadcast_from_rank0=True, strict=strict)``
        — DTensor-aware; handles FSDP2 shards + plain params in one collective.
     """
@@ -404,9 +410,11 @@ def _load_state_dict_sharded(
         module.to_empty(device=device)
 
     if _current_rank() == 0:
-        # Align raw-checkpoint keys to the constructed model's key layout *before*
-        # the LoRA base_layer hop, then guard against a silent no-load.
+        # Align raw-checkpoint keys to the constructed model's key layout before
+        # Qwen MoE packing and the LoRA base_layer hop, then guard against a
+        # silent no-load.
         state_dict = _remap_hf_checkpoint_keys(state_dict, module)
+        state_dict = _pack_qwen_moe_expert_keys(state_dict, module)
         state_dict = _remap_lora_base_keys(state_dict, module)
         _assert_state_dict_covers_model(state_dict, module)
 
@@ -447,6 +455,164 @@ def _read_safetensors_dir(weights_dir: str) -> StateDict:
     state_dict: StateDict = {}
     for shard in shards:
         state_dict.update(load_file(shard, device="cpu"))
+    return state_dict
+
+
+def _qwen_moe_source_base_candidates(target: str, model: nn.Module) -> list[str]:
+    """Return checkpoint prefix candidates for one packed model parameter."""
+    base = target.removesuffix(".gate_up_proj").removesuffix(".down_proj")
+    candidates = [base]
+    prefix = str(getattr(model, "base_model_prefix", "") or "")
+    if prefix:
+        dotted = f"{prefix}."
+        candidates.append(base.removeprefix(dotted) if base.startswith(dotted) else f"{prefix}.{base}")
+    return list(dict.fromkeys(candidates))
+
+
+def _qwen_moe_source_groups(
+    target: str,
+    checkpoint_keys: Collection[str],
+    model: nn.Module,
+    expert_ids: Sequence[int] | range,
+) -> tuple[tuple[str, ...], ...] | None:
+    """Resolve complete split-checkpoint key groups for one packed target."""
+    if target.endswith(".experts.gate_up_proj"):
+        leaves = ("gate_proj", "up_proj")
+    elif target.endswith(".experts.down_proj"):
+        leaves = ("down_proj",)
+    else:
+        return None
+
+    checkpoint_keys = set(checkpoint_keys)
+    expert_ids = tuple(expert_ids)
+    for source_base in _qwen_moe_source_base_candidates(target, model):
+        groups = tuple(tuple(f"{source_base}.{expert_id}.{leaf}.weight" for expert_id in expert_ids) for leaf in leaves)
+        expected = tuple(key for group in groups for key in group)
+        present = tuple(key for key in expected if key in checkpoint_keys)
+        if not present:
+            continue
+        if len(present) != len(expected):
+            missing = next(key for key in expected if key not in checkpoint_keys)
+            raise RuntimeError(
+                f"Qwen MoE load: incomplete per-expert checkpoint for {target!r}: "
+                f"{len(present)}/{len(expected)} keys present (e.g. missing {missing!r})."
+            )
+        return groups
+    return None
+
+
+def _build_qwen_moe_packed_tensor(
+    target: str,
+    target_shape: tuple[int, ...],
+    checkpoint_keys: Collection[str],
+    get_tensor: Callable[[str], torch.Tensor],
+    *,
+    model: nn.Module,
+    expert_ids: Sequence[int] | range,
+) -> tuple[torch.Tensor, tuple[str, ...]] | None:
+    """Build one packed Qwen expert tensor from split checkpoint tensors."""
+    groups = _qwen_moe_source_groups(target, checkpoint_keys, model, expert_ids)
+    if groups is None:
+        return None
+
+    blocks = [torch.stack([get_tensor(key) for key in group], dim=0) for group in groups]
+    packed = torch.cat(blocks, dim=1) if len(blocks) == 2 else blocks[0]
+    if tuple(packed.shape) != target_shape:
+        raise RuntimeError(
+            f"Qwen MoE load: rebuilt expert block for {target!r} has shape {tuple(packed.shape)} "
+            f"!= target shape {target_shape}."
+        )
+    return packed.contiguous(), tuple(key for group in groups for key in group)
+
+
+def _qwen_moe_num_experts(model: nn.Module) -> int:
+    """Resolve expert count from text-only or multimodal Qwen configs."""
+    config = getattr(model, "config", None)
+    for owner in (config, getattr(config, "text_config", None)):
+        value = getattr(owner, "num_experts", None)
+        if value is not None and int(value) > 0:
+            return int(value)
+    model_type = getattr(config, "model_type", None)
+    raise ValueError(f"Qwen MoE load: invalid num_experts for model_type={model_type!r}.")
+
+
+def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
+    """Convert a complete split Qwen-MoE checkpoint to packed model keys.
+
+    HF ``from_pretrained`` performs this rewrite through ``WeightConverter``;
+    meta-init bypasses that pipeline, so the generic sharded loader performs
+    the same conversion before ``set_model_state_dict``.
+    """
+    config = getattr(model, "config", None)
+    model_type = getattr(config, "model_type", None)
+    if model_type not in _PACKED_QWEN_MOE_MODEL_TYPES:
+        return state_dict
+    if not any(_QWEN_MOE_EXPERT_RE.match(key) for key in state_dict):
+        return state_dict
+
+    model_tensors = dict(model.named_parameters())
+    model_tensors.update(dict(model.named_buffers()))
+    targets = sorted(
+        name for name in model_tensors if name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
+    )
+    if not targets:
+        raise ValueError(
+            f"Qwen MoE load: checkpoint has split experts for model_type={model_type!r}, "
+            "but the target model exposes no packed expert parameters."
+        )
+
+    expert_ids = range(_qwen_moe_num_experts(model))
+    checkpoint_keys = set(state_dict)
+    plans: list[tuple[str, tuple[tuple[str, ...], ...]]] = []
+    for target in targets:
+        groups = _qwen_moe_source_groups(target, checkpoint_keys, model, expert_ids)
+        if target in state_dict:
+            if groups is not None:
+                raise ValueError(f"Qwen MoE load: both packed and split keys are present for {target!r}.")
+            continue
+        if groups is None:
+            raise ValueError(f"Qwen MoE load: missing packed or complete split expert weights for {target!r}.")
+        plans.append((target, groups))
+
+    for target, groups in plans:
+        result = _build_qwen_moe_packed_tensor(
+            target,
+            tuple(model_tensors[target].shape),
+            checkpoint_keys,
+            lambda key: state_dict[key],
+            model=model,
+            expert_ids=expert_ids,
+        )
+        assert result is not None  # groups were resolved above from the same immutable key set
+        packed, source_keys = result
+        state_dict[target] = packed
+        for key in source_keys:
+            state_dict.pop(key)
+
+    # Qwen3.5 checkpoints may carry a standalone MTP speculative-prediction
+    # head even when the ForConditionalGeneration training model intentionally
+    # omits it. Those auxiliary expert keys are not a partially packed main
+    # model. Drop the whole MTP namespace only when the target exposes no MTP
+    # tensors; if it does, the normal target/leftover checks remain strict.
+    has_target_mtp = any("mtp" in name.split(".") for name in model_tensors)
+    if not has_target_mtp:
+        mtp_keys = [key for key in state_dict if "mtp" in key.split(".")]
+        for key in mtp_keys:
+            state_dict.pop(key)
+        if mtp_keys:
+            logger.info(
+                "Qwen MoE load: ignored %d auxiliary MTP checkpoint tensor(s) absent from the target model.",
+                len(mtp_keys),
+            )
+
+    leftovers = [key for key in state_dict if _QWEN_MOE_EXPERT_RE.match(key)]
+    if leftovers:
+        raise ValueError(
+            "Qwen MoE load: split expert keys remain after packing and would be ignored with strict=False; "
+            f"examples: {leftovers[:8]}."
+        )
+
+    logger.info("Packed Qwen MoE checkpoint for model_type=%s: %d tensor(s)", model_type, len(plans))
     return state_dict
 
 

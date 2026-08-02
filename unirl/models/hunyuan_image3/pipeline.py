@@ -22,7 +22,7 @@ read ``params.sigmas`` directly.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import CPSSDEStrategy, StepStrategy
@@ -119,6 +119,29 @@ class HunyuanImage3Pipeline(Pipeline):
         )
 
     @classmethod
+    def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise
+        pre-computation — opens the trainer's x_T-recipe gate
+        (``DiffusionTrainer._resolve_noise_latent_shape``), so
+        the gen Part's ``init_noise_group_ids`` are authored and ``sampling.seed``
+        actually governs x_T.
+
+        HI3: 32-channel 3D-VAE, 16x spatial downsample (the
+        ``HunyuanImage3DiffusionStage`` defaults). Non-preset sizes are SNAPPED
+        inside ``diffuse()`` (image_processor), which regenerates x_T at the
+        snapped grid via ``NoiseRecipe.for_batch`` — so this value gates/labels
+        the recipe; it is NOT the materialization shape for HI3.
+        """
+        height = int(sampling_spec.height)
+        width = int(sampling_spec.width)
+        if height <= 0 or width <= 0 or height % 16 or width % 16:
+            raise NotImplementedError(
+                f"HunyuanImage3Pipeline.latent_shape: {height}x{width} is not a multiple of the "
+                "16x VAE factor; opting out of the driver x_T recipe (engine RNG fallback)."
+            )
+        return (32, height // 16, width // 16)
+
+    @classmethod
     def from_meta_config(
         cls,
         config: HunyuanImage3PipelineConfig,
@@ -175,6 +198,7 @@ class HunyuanImage3Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            diffuse_kv_cache=bool(config.diffuse_kv_cache),
         )
         vae_decode = HunyuanImage3VAEDecodeStage(bundle)
         vae_encode = HunyuanImage3VAEEncodeStage(bundle)

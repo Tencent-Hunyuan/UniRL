@@ -99,7 +99,26 @@ class VLMAdapter(TextLMAdapter):
             f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
             f"got {len(images)} (multi-image conversations are unsupported).",
         )
-        text = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        template_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        # Multimodal processors inspect every message as a list of typed
+        # content blocks. Normalize a system/text string so that scan does not
+        # iterate over its characters (Qwen3.5 raises TypeError otherwise).
+        processor_messages = [
+            {
+                **message,
+                "content": (
+                    [{"type": "text", "text": message["content"]}]
+                    if isinstance(message.get("content"), str)
+                    else message.get("content")
+                ),
+            }
+            for message in messages
+        ]
+        text = self._processor.apply_chat_template(processor_messages, **template_kwargs)
         enc = self._processor(text=[text], images=images, return_tensors="pt")
         return MMEncoding(
             image=images[0],

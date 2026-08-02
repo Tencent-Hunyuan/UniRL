@@ -18,24 +18,92 @@ those slots via the ``HunyuanStaticCache``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
 
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Sample
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
+from ..seed import make_cpu_generators
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
+
+
+def _prepare_seeded_sampling(
+    sample: Sample,
+    frontier: Part,
+    params: DiffusionSamplingParams,
+) -> Tuple[DiffusionSamplingParams, Optional[List[torch.Generator]], Optional[List[str]]]:
+    """Prepare request-local RNG streams without touching global RNG state."""
+    recipe_ids = [str(key) for key in NoiseRecipe.from_sample(sample).noise_group_ids]
+    if params.seed is None or not recipe_ids:
+        return params, None, None
+    if len(recipe_ids) != frontier.batch_size:
+        raise ValueError(
+            "HunyuanImage3 it2i seeded sampling requires noise keys aligned with "
+            f"the frontier batch; got {len(recipe_ids)} for {frontier.batch_size}."
+        )
+
+    sample_ids = [str(sample_id) for sample_id in frontier.sample_ids]
+    seeded_params = replace(params, noise_group_ids=recipe_ids)
+    condition_vae_generators = make_cpu_generators(
+        int(params.seed),
+        [f"cond-vae:{recipe_id}" for recipe_id in recipe_ids],
+    )
+    sde_sample_keys = [f"{recipe_id}:sample:{sample_id}" for recipe_id, sample_id in zip(recipe_ids, sample_ids)]
+    return seeded_params, condition_vae_generators, sde_sample_keys
+
+
+def _encode_cond_images_per_sample(
+    transformer,
+    batch_cond_images,
+    generators: Optional[List[torch.Generator]],
+):
+    """Encode every source image with the matching per-sample VAE RNG."""
+    if generators is None:
+        return transformer._encode_cond_image(batch_cond_images, cfg_factor=1, generator=None)
+    if len(generators) != len(batch_cond_images):
+        raise ValueError(
+            "HunyuanImage3 it2i condition-VAE generator count "
+            f"{len(generators)} != condition batch {len(batch_cond_images)}."
+        )
+
+    vae_items, timestep_items, vit_items = [], [], []
+    for cond_images, generator in zip(batch_cond_images, generators):
+        cond_vae, cond_timestep, cond_vit = transformer._encode_cond_image(
+            [cond_images],
+            cfg_factor=1,
+            generator=[generator],
+        )
+        vae_items.append(cond_vae)
+        timestep_items.append(cond_timestep)
+        if cond_vit is not None:
+            vit_items.extend(cond_vit)
+
+    if all(isinstance(item, torch.Tensor) for item in vae_items) and all(
+        item.shape[1:] == vae_items[0].shape[1:] for item in vae_items
+    ):
+        cond_vae_images = torch.cat(vae_items, dim=0)
+        cond_timestep = torch.cat(timestep_items, dim=0)
+    else:
+        cond_vae_images = vae_items
+        cond_timestep = timestep_items
+    return cond_vae_images, cond_timestep, vit_items or None
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
     frontier = sample.frontier_gen_part(DiffusionSamplingParams)
     params = frontier.sampling_params
+    params, condition_vae_generators, sde_sample_keys = _prepare_seeded_sampling(sample, frontier, params)
     if params.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: gen part sampling_params.sigmas is None. The hosting engine must "
@@ -56,31 +124,32 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
+    require(
+        int(params.samples_per_prompt) <= 2,
+        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet; "
+        "per-sample cond_vit lists are not transport-safe above 2.",
+    )
     schedule = params.sigmas.to(pipeline.bundle.device)
     # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
     # and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
-    cfg_factor = 2 if cfg else 1
 
     # 1. ViT cond features. Returns joint_image_info (forwarded to chat
     #    template), cond_vit_images, vit_kwargs.
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # 2. VAE encode + ViT-cond duplication for CFG, all via the upstream
-    #    ``_encode_cond_image`` so per-sample list shapes match what the
-    #    unified-MM forward iterates with at hunyuan.py:1903.
-    cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
-        vit["joint_image_info"], cfg_factor=cfg_factor
+    # 2. VAE encode + ViT cond, built at cfg_factor=1 (ONE copy per sample). The
+    #    cfg uncond branch keeps the SAME source image, so cfg doubling of these
+    #    payloads is a pure block duplication (_encode_cond_image / vit_kwargs do
+    #    ``.repeat`` / ``list*cfg``); the diffusion stage re-applies it when it
+    #    expands CFG. Keeping them B-batched (not doubled) means they survive the
+    #    B-sample track transport that a 2B batch would not.
+    cond_vae_images, cond_timestep, cond_vit_images = _encode_cond_images_per_sample(
+        pipeline.bundle.transformer,
+        vit["joint_image_info"],
+        condition_vae_generators,
     )
-
-    # 3. vit_kwargs duplicated for CFG -- mirror upstream pipeline
-    #    (hunyuan.py:2298-2299).
-    vit_kwargs = vit["vit_kwargs"]
-    if cfg_factor > 1:
-        vit_kwargs = {
-            "spatial_shapes": vit_kwargs["spatial_shapes"] * cfg_factor,
-            "attention_mask": vit_kwargs["attention_mask"] * cfg_factor,
-        }
+    vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
 
     # 4. Build the unified-MM tensors with cond-image markers spliced in.
     bot_task = str((sample.parts[0].control or {}).get("bot_task", "image"))
@@ -93,6 +162,29 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
+    # 4. Split the cfg-doubled fused into cond (-> fused) + uncond (-> fused_uncond),
+    #    both B-batched (one row per sample). The uncond branch genuinely differs from
+    #    cond (its prompt tokens are replaced by <cfg> tokens), so it must be carried
+    #    explicitly; storing it as its own B-aligned field lets it survive the
+    #    B-sample track transport, and the stage re-stacks [cond; uncond] for a GUIDED
+    #    replay (ratio=1 at cfg>1). cfg=False -> single branch, fused_uncond=None.
+    fused_full = mm["fused"]
+    expected_fused_rows = frontier.batch_size * (2 if cfg else 1)
+    actual_fused_rows = int(fused_full.input_ids.shape[0])
+    if actual_fused_rows != expected_fused_rows:
+        raise ValueError(
+            "HunyuanImage3 it2i tokenizer batch mismatch: "
+            f"expected {expected_fused_rows} fused rows for B={frontier.batch_size}, "
+            f"got {actual_fused_rows}."
+        )
+    if cfg:
+        n = frontier.batch_size
+        fused_cond = fused_full.slice(0, n)
+        fused_uncond = fused_full.slice(n, 2 * n)
+    else:
+        fused_cond = fused_full
+        fused_uncond = None
+
     # 5. Pack into the typed conditions container. The chat-template
     #    path drives the fused sequence via input_ids; cond-image data
     #    flows through the typed ImageLatentCondition / ImageEmbedCondition
@@ -104,14 +196,20 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         spatial_shapes=vit_kwargs["spatial_shapes"],
     )
     diff_conds = HunyuanImage3DiffusionConditions(
-        fused=mm["fused"],
+        fused=fused_cond,
+        fused_uncond=fused_uncond,
         cond_vae=cond_vae,
         cond_vit=cond_vit,
         cond_timestep=cond_timestep,
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
+    latent_seg = pipeline.diffusion.diffuse(
+        diff_conds,
+        schedule=schedule,
+        params=params,
+        sde_sample_keys=sde_sample_keys,
+    )
     edited = pipeline.vae_decode.decode(latent_seg)
 
     filled = frontier.fill(segment=latent_seg, primitives={"image": edited}, conditions=diff_conds.to_dict())

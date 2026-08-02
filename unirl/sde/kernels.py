@@ -10,6 +10,7 @@ from typing import ClassVar, List, Optional, Tuple, Union
 import torch
 
 GeneratorLike = Optional[Union[torch.Generator, List[torch.Generator]]]
+NoiseGenerator = GeneratorLike
 
 # ---------------------------------------------------------------------------
 # Base class hierarchy
@@ -59,6 +60,8 @@ class StepStrategy(ABC):
 
         ``prev_sample=None`` ⇒ sampling; otherwise log-prob replay. ``log_prob``
         is ``None`` for ODE strategies and for SDE strategies with ``eta<1e-7``.
+        ``generator=None`` preserves the historical engine-local RNG behaviour;
+        callers may opt in with one generator or a sample-aligned generator list.
         """
         input_dtype = sample.dtype
         noise_pred = noise_pred.float()

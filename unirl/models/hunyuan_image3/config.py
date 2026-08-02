@@ -54,6 +54,14 @@ class HunyuanImage3PipelineConfig:
     # CFG default. Upstream `it2i` config ships 2.5; t2i auto mode varies.
     guidance_scale: float = 2.5
 
+    # Trainside sampling KV-cache policy for ``diffuse()``. True (default) keeps
+    # the per-rollout KV-cached decode (fast sampling). False makes every step a
+    # full prefill, so the sampling forward bit-matches replay's — REQUIRED for
+    # the exact on-policy ratio (≈1) under ``algorithm.old_logp_source=rollout``
+    # (native). Harmless to leave True under ``old_logp_source=replay`` (ratio=1
+    # by construction). Replaces the former HI3_DIFFUSE_KV_CACHE env gate.
+    diffuse_kv_cache: bool = True
+
     # Trainer-side ``trainable_module()`` returns ``self.model.transformer.model``
     # (bare ``HunyuanImage3Model`` decoder). Its state_dict keys are
     # ``layers.X.*`` with no outer envelope. The rollout model

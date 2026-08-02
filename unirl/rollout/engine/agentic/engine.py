@@ -9,7 +9,10 @@ the in-flight requests batching together) and ``env.step`` (the env is re-entran
 
 **Partial rollout interface (LIN-531).** The engine is the *mechanism*; the trainer owns the *policy*
 (how many to over-sample, staleness, when to sync). The coordinator exposes a
-**submit / poll / finalize / abort** interface over a **background** drain the trainer reaps and interrupts:
+**submit / poll / finalize / abort** interface over a **background** drain the trainer reaps and
+interrupts — consumed driver-side through
+:class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine` (rank-0 unwrap + group assembly +
+versioned buffering):
 
 - ``submit(request)`` — enqueue a pool (fresh prompts and/or carried partials) and fire the drain
   **non-blocking**; the trainer reaps completions with ``poll`` and cuts the tail with ``abort``.
@@ -55,7 +58,7 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
-from unirl.rollout.engine.base import BaseRolloutEngine, BaseSingleTurnRolloutEngine
+from unirl.rollout.engine.synchronous import BaseRolloutEngine, SyncRolloutEngine
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import total_samples_per_prompt
 
@@ -98,7 +101,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         # ``inner.chat_template_kwargs.tools`` in the recipe still wins.
         self._maybe_inject_tool_schemas(config.inner, self._env)
         inner = config.inner.make_engine(strategy=strategy, **deps)
-        if not isinstance(inner, BaseSingleTurnRolloutEngine):
+        if not isinstance(inner, SyncRolloutEngine):
             shutdown = getattr(inner, "shutdown", None)
             if callable(shutdown):
                 try:
@@ -108,7 +111,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             raise ValueError(
                 f"AgenticRolloutEngine inner must implement the single-turn engine contract; got {type(inner).__name__}"
             )
-        self._inner: BaseSingleTurnRolloutEngine = inner
+        self._inner: SyncRolloutEngine = inner
 
         self._sp = config.episode_sampling  # per-turn sampling params; carries n via samples_per_prompt
         self._n = total_samples_per_prompt(self._sp)  # GRPO group size
@@ -240,9 +243,9 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         cleared, and the now-stable completed buffers are drained exactly once. An
         empty ref set is already finalized and returns ``[]`` without polling workers.
 
-        Use this instead of a separate ``drained()`` check followed by ``poll()`` when
-        the next action is ``submit()``: ``submit`` resets per-drive worker buffers, so
-        the readiness check and final reap must remain one coordinator operation.
+        The readiness check and final reap must remain ONE coordinator operation
+        when the next action is ``submit()``: ``submit`` resets per-drive worker
+        buffers, so a separate check-then-poll would race it.
         """
         if not self._drain_refs:
             return []
@@ -303,21 +306,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         ray.get(self._drain_refs)  # drives finish naturally (queue drained, no abort)
         self._drain_refs = []
         return self._fan("drain_completed")
-
-    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-    def drained(self) -> bool:
-        """Rank-0 compatibility probe: True once the in-flight drive is finished (queue empty + every
-        trajectory terminal) — i.e. every ``run_drain`` ref is resolved. The async
-        trainer polls this to know a drive is exhausted so it can safely re-``submit``
-        (firing a drain over a still-running one would double-pull the queue).
-
-        This does not join or reap the completed buffers. Call
-        :meth:`finalize_if_drained` for a lossless transition to the next drive.
-        """
-        if not self._drain_refs:
-            return True
-        ready, _ = ray.wait(self._drain_refs, num_returns=len(self._drain_refs), timeout=0)
-        return len(ready) == len(self._drain_refs)
 
     def next_task(self, worker_rank: int) -> Optional[Sample]:
         """Hand out the next trajectory task, or ``None`` when the queue is drained.

@@ -35,8 +35,8 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
+from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.conditions import TextEmbedCondition
@@ -65,7 +65,7 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List
     return selected, selected
 
 
-class FastVideoRolloutEngine(BaseSingleTurnRolloutEngine):
+class FastVideoRolloutEngine(SyncRolloutEngine):
     """Rollout engine backed by FastVideo ``VideoGenerator`` (RL fork, PR #1222)."""
 
     _component_name = "fastvideo"

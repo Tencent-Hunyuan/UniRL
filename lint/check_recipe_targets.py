@@ -131,16 +131,40 @@ def main() -> int:
     top_level = {path: _top_level_names(source, path) for path, source in zip(needed, _read_all(needed))}
 
     failures: list[str] = []
+    tier: list[str] = []
     for path, lineno, dotted in targets:
         hit = module_split[dotted]
         names = top_level[hit[0]] if hit is not None else None
         if names is None or hit[1] not in names:
             failures.append(f"{path.relative_to(ROOT)}:{lineno}: unresolved _target_ '{dotted}'")
+        if dotted.startswith("experimental."):
+            # Tier direction: only experimental's own recipes may wire experimental code,
+            # and only within their own package (mirrors check_experimental_boundaries).
+            rel = path.relative_to(ROOT)
+            if rel.parts[0] != "experimental":
+                tier.append(
+                    f"{rel}:{lineno}: core recipe targets '{dotted}' — the dependency arrow points the other way"
+                )
+            elif len(rel.parts) == 2:
+                tier.append(
+                    f"{rel}:{lineno}: recipe at the experimental/ root targets '{dotted}' — "
+                    "a recipe belongs inside one package (experimental/<name>/...)"
+                )
+            elif dotted.split(".")[1] != rel.parts[1]:
+                tier.append(
+                    f"{rel}:{lineno}: recipe under 'experimental/{rel.parts[1]}/' targets sibling '{dotted}' — "
+                    "shared code graduates into core"
+                )
 
     if failures:
         print("Unresolved recipe _target_ paths (rename leftover or typo):", file=sys.stderr)
         for f in failures:
             print(f"  {f}", file=sys.stderr)
+    if tier:
+        print("Experimental-tier direction violations:", file=sys.stderr)
+        for f in tier:
+            print(f"  {f}", file=sys.stderr)
+    if failures or tier:
         return 1
     print(f"check-recipe-targets: {len(targets)} recipe _target_ paths resolve.")
     return 0

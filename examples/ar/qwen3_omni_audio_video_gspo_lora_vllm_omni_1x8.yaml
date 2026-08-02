@@ -41,7 +41,9 @@ bundle:
     _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
     model_precision: bf16
-    attn_implementation: sdpa
+    # Qwen3-Omni audio cu_seqlens are only honored by the FA2 varlen path;
+    # SDPA silently turns the intended windowed attention into full attention.
+    attn_implementation: flash_attention_2
     freeze_vision_tower: true
     freeze_audio_tower: true
     use_lora: true

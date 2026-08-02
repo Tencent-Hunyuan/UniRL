@@ -64,7 +64,30 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
             latents_f32 = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
+            # The HunyuanImage3 3D-VAE .decode has a single-image MULTI-GPU path:
+            # when ``torch.distributed`` is initialized it decodes tile-parallel
+            # across ranks, all_gathers to rank 0, and returns the reassembled
+            # image on rank 0 ONLY (empty on every other rank). That is correct
+            # for decoding ONE big image across GPUs, but WRONG for per-rank RL
+            # rollout where each DP rank owns DIFFERENT samples and must decode its
+            # own independently (else only rank-0's images survive → the merged
+            # track's ``decoded`` has 1/dp_size the rows → the reward scatter slices
+            # out of bounds). Mask ``is_initialized`` for the decode so the VAE runs
+            # its ordinary single-GPU path on every rank (no cross-rank gather, no
+            # rank-0 discard). The decode is a self-contained frozen forward — no
+            # real collective is needed.
+            import torch.distributed as _dist
+
+            _orig_is_init = _dist.is_initialized
+            _dist.is_initialized = lambda: False
+            try:
+                out = self.bundle.vae.to(torch.float32).decode(latents_f32)
+            finally:
+                _dist.is_initialized = _orig_is_init
+            # AutoencoderKLConv3D.decode returns DecoderOutput(sample=...) on the
+            # normal path (autoencoder_kl_3d.py:825); the rank!=0 discard path and
+            # the _Dist variant return a bare tensor. Accept both.
+            decoded = out.sample if hasattr(out, "sample") else out
             # decoded: [B, 3, T_out, H_out, W_out]; T_out is 1 for still images.
             if decoded.dim() == 5:
                 decoded = decoded.squeeze(2)  # [B, 3, H_out, W_out]

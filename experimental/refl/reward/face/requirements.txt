@@ -1,3 +1,6 @@
+# Face reward extras — ADDITIVE ONLY on top of the UniRL core stack.
+# torch / torchvision (used by face_tools.py) come from the core engine extra
+# (pyproject.toml); additive-only forbids re-declaring them here.
 imageio>=2.31
 imageio-ffmpeg>=0.4
 onnx>=1.14

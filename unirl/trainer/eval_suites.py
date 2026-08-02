@@ -25,7 +25,7 @@ prompt set), sized by ``num_prompts`` (default: the trainer's
 Placement: :func:`build_eval_suites` must be called inside the SAME placement
 context that created the trainer's training reward — each suite reward becomes
 a sibling remote there, so where the trainer has a ``reward_fraction`` slab
-(DiffusionTrainer, ReFL) ALL eval rewards share that dedicated-GPU slab, and
+(DiffusionTrainer) ALL eval rewards share that dedicated-GPU slab, and
 elsewhere (PE, UnifiedModel) they colocate with the training reward.
 
 Data: an own-set suite instantiates its own driver-side data source — the
@@ -34,10 +34,9 @@ trainer's ``data_source_cfg`` with ``args.run.data_path`` /
 format the trainer's data source reads (txt / JSONL / JSON manifests with
 metadata) works per suite.
 
-Scoring uses the trainer's own reward interface: composed/rollout trainers call
-``suite.reward.score_and_attach``, ReFL calls ``score_differentiable`` — a
-suite's backend must support whichever its trainer uses (the same contract as
-the training reward).
+Scoring uses the trainer's own reward interface (every current consumer calls
+``suite.reward.score_and_attach``) — a suite's backend must support whichever
+its trainer uses (the same contract as the training reward).
 """
 
 from __future__ import annotations

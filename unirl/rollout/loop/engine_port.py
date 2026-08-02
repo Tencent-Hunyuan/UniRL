@@ -1,7 +1,7 @@
 """RolloutEnginePort — the generation seam the agent loop calls (LIN-492).
 
 See ``unirl/rollout/loop/README.md``. A structural ``Protocol`` for a single-turn
-engine; ``BaseSingleTurnRolloutEngine`` is its nominal runtime counterpart.
+engine; ``SyncRolloutEngine`` is its nominal runtime counterpart.
 """
 
 from __future__ import annotations

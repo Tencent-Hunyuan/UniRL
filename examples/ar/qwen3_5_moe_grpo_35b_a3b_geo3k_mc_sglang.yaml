@@ -1,0 +1,158 @@
+# @package _global_
+# AR GRPO Qwen3.5-MoE VL on Geometry3K-MC — train_ar (ARTrainer),
+# SGLang rollout, full-weight TensorWeightSync, colocate.
+#
+# MoE + VL combined: Qwen3_5MoeDecoderLayer blocks + the VLM adapter.
+# Install the VeOmni extra: uv pip install -e ".[sglang,train,infer,veomni]"
+#
+# Meta-init sharded loading requires a LOCAL checkpoint directory. For smoke,
+# download tiny-random/qwen3.5-moe locally and point QWEN3_5_MOE_PATH at it.
+#
+# Smoke (1 GPU, 1 rollout, tiny model):
+#   QWEN3_5_MOE_PATH=/path/to/local/qwen3.5-moe-tiny \
+#     python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang \
+#     num_devices=1 num_rollouts=1 backend.fsdp_cfg.ep_size=1 \
+#     rollout.config.tp_size=1 rollout.config.ep_size=1
+#
+# Real run (8 GPU):
+#   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
+#   QWEN3_5_MOE_PATH=/path/to/Qwen3.5-35B-A3B \
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang
+
+num_devices: 8
+batch_size: 32
+num_rollouts: 2000
+weight_sync_interval: 1
+enable_fsdp_offload: true
+
+adv_normalization_scope: global
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-grpo
+  run_name: grpo_qwen3_5_moe_vl_geo3k_mc_sglang
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [grpo, qwen3_5, moe, vl, geo3k-mc, sglang]
+
+bundle:
+  _target_: unirl.models.qwen3_5.bundle.Qwen3_5Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3_5.config.Qwen3_5PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH}
+    model_precision: bf16
+    meta_init_transformer: true
+    freeze_vision_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+    attn_implementation: null
+    trust_remote_code: false
+
+pipeline:
+  _target_: unirl.models.qwen3_5.pipeline.Qwen3_5Pipeline.from_bundle
+  max_prompt_length: 2048
+  enable_thinking: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.veomni.backend.VeOmniBackend
+  block_class_names: ["Qwen3_5MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+    sp_size: 1
+    ep_size: 8
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 5.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2000
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: http
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH}
+    tp_size: 8
+    ep_size: 8
+    samples_pre_expanded: true
+    image_token: "<|image_pad|>"
+    response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
+    max_new_tokens: 512
+    temperature: 0.7
+    top_p: 0.9
+    concurrency: 8
+    enable_memory_saver: true
+    enable_weights_cpu_backup: true
+    skip_server_warmup: false
+    chat_template_kwargs:
+      enable_thinking: false
+    engine_kwargs:
+      mem_fraction_static: 0.15
+      disable_cuda_graph: true
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 1.0e-2
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions
+  sampling_temperature: 0.7
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 512
+  wire_dtype: bf16
+  flush_cache: true
+  name_remap: {"model.visual.*": null, "model.language_model.*": "model.*"}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 32
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 1024
+  max_new_tokens: 512

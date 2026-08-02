@@ -54,6 +54,13 @@ graduates into core instead of being borrowed sideways.
 6. **Model/engine variation goes through `_target_` polymorphism** —
    an `if model_family == ...` branch in package code is a review reject.
 
+Rules 1, 2, and 4 are script-enforced (`lint/check_experimental_boundaries.py`;
+`lint/check_recipe_targets.py`, which also rejects recipes outside this tier
+targeting `experimental.*` and recipes targeting a sibling package). Rules 3,
+5, and 6 are enforced in review. The boundary hook scans the working tree, so
+uncommitted `private_*` packages are lint-gated locally — their only gate, as
+CI never sees them.
+
 ## Graduation
 
 Both directions are deliberate PRs, never drive-bys. Up: a second

@@ -9,13 +9,14 @@ multi-turn generation with training.
 
 Mechanism vs policy (LIN-531): the **engine** exposes a ``submit`` / ``poll`` /
 ``finalize_if_drained`` / ``abort`` interface over a background drain (see
-:class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`); this **trainer**
-owns the *policy* —
+:class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`), consumed
+through the driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine`
+(group assembly + versioned buffering); this **trainer** owns the *policy* —
 
 * **Producer** — keep the rollout slab saturated: ``submit`` a pool of fresh prompt
-  siblings + resumed carried partials, ``poll`` completed trajectories, bucket them by
-  root id into complete GRPO groups (:class:`_GroupAssembler`), and push each into a
-  staleness-bounded :class:`_GroupBuffer`.
+  siblings + resumed carried partials and ``poll`` completed trajectories; the facade
+  buckets them by root id into complete GRPO groups and stamps each into its
+  staleness-bounded versioned buffer.
 * **Consumer** — drain the freshest ``batch_size`` complete groups (within
   ``buffer_max_staleness``), reward + GRPO advantage + one optimizer step (reusing
   :class:`AgenticTrainer`'s helpers), then **quiesce + sync**: ``abort`` the in-flight
@@ -43,13 +44,14 @@ import inspect
 import logging
 import sys
 import time
-from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.rollout.engine.asynchronous import AsyncAgenticRolloutEngine, root_of
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -61,118 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
-# Producer-side bookkeeping
-# --------------------------------------------------------------------------- #
-
-
-class _GroupAssembler:
-    """Bucket a flat stream of terminal trajectories into complete GRPO groups.
-
-    The agentic engine ``poll`` returns variable-depth trajectory ``Sample``s; a
-    prompt's ``n`` siblings share its slash-free **root id**
-    (``sample.parts[0].sample_ids[0]``). A group is *complete* once all ``n`` of a
-    root's siblings are terminal. Variable-depth trajectories are NOT concatenated —
-    a group is kept as a ``List[Sample]`` (the trainer flattens their gen Parts at
-    train time, like :meth:`AgenticTrainer.train_step`).
-    """
-
-    def __init__(self, n: int) -> None:
-        self._n = int(n)
-        self._by_root: Dict[str, List[Sample]] = {}
-
-    @staticmethod
-    def root_of(traj: Sample) -> str:
-        return traj.parts[0].sample_ids[0]
-
-    def add_completed(self, trajs: List[Sample]) -> None:
-        """Accumulate terminal (poll-completed) trajectories, bucketed by root id."""
-        for t in trajs:
-            self._by_root.setdefault(self.root_of(t), []).append(t)
-
-    def pop_complete_groups(self) -> List[List[Sample]]:
-        """Emit + drop every root that has all ``n`` siblings terminal (each group a
-        ``List[Sample]`` of exactly ``n`` trajectories)."""
-        ready = [root for root, sibs in self._by_root.items() if len(sibs) >= self._n]
-        out: List[List[Sample]] = []
-        for root in ready:
-            sibs = self._by_root.pop(root)
-            out.append(sibs[: self._n])
-        return out
-
-    def pending_roots(self) -> Set[str]:
-        """Roots with some-but-not-all siblings terminal (their done siblings are held
-        here; their unfinished siblings are carried by the trainer for resume)."""
-        return set(self._by_root)
-
-    def discard_roots(self, roots: Iterable[str]) -> int:
-        """Drop incomplete buckets for abandoned roots.
-
-        Returns the number of terminal sibling trajectories that were being held
-        while the other siblings were still in flight.
-        """
-        discarded = 0
-        for root in set(roots):
-            discarded += len(self._by_root.pop(root, []))
-        return discarded
-
-    def size(self) -> int:
-        return len(self._by_root)
-
-
-class _GroupBuffer:
-    """Staleness-bounded buffer of complete GRPO groups (the ``AsyncARTrainer._RolloutBuffer``
-    shape, but each item is a ``List[Sample]`` group of variable-depth trajectories).
-
-    A group is stamped with the ``weight_version`` it *completed* under and a monotonic
-    ``gen_id`` for freshness ordering. The per-token ratio corrects the within-trajectory
-    version spread (a carried trajectory's turns); this buffer only bounds how stale a
-    *completed* group may be before the consumer trains it.
-    """
-
-    def __init__(self) -> None:
-        self._items: List[Tuple[List[Sample], int, int]] = []  # (group, weight_version, gen_id)
-        self._evicted: List[List[Sample]] = []
-
-    def put(self, group: List[Sample], *, weight_version: int, gen_id: int) -> None:
-        self._items.append((list(group), int(weight_version), int(gen_id)))
-
-    def size(self) -> int:
-        return len(self._items)
-
-    def drain_freshest(
-        self,
-        n: int,
-        *,
-        current_version: Optional[int] = None,
-        max_staleness: Optional[int] = None,
-    ) -> Optional[List[List[Sample]]]:
-        """Pop the ``n`` freshest complete groups, evicting over-stale ones first.
-
-        Returns ``None`` if fewer than ``n`` groups remain after eviction (the consumer
-        then waits for the producer to fill more).
-        """
-        if max_staleness is not None and current_version is not None:
-            kept: List[Tuple[List[Sample], int, int]] = []
-            for item in self._items:
-                if current_version - item[1] <= max_staleness:
-                    kept.append(item)
-                else:
-                    self._evicted.append(item[0])
-            self._items = kept
-        if len(self._items) < n:
-            return None
-        self._items.sort(key=lambda it: it[2], reverse=True)  # freshest gen_id first
-        picked, self._items = self._items[:n], self._items[n:]
-        return [grp for grp, _, _ in picked]
-
-    def pop_evicted_groups(self) -> List[List[Sample]]:
-        """Return and clear groups rejected by the latest staleness checks."""
-        evicted, self._evicted = self._evicted, []
-        return evicted
-
-
-# --------------------------------------------------------------------------- #
-# The trainer
+# The trainer (producer-side bookkeeping lives in AsyncAgenticRolloutEngine)
 # --------------------------------------------------------------------------- #
 
 
@@ -230,14 +121,13 @@ class AsyncAgenticTrainer(AgenticTrainer):
         self._tail_policy = str(tail_policy)
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
-        self._weight_version = 0
         # Monotonic per-DRIVE nonce. ``rollout_id`` alone does not make root ids
         # unique: :meth:`_next_batch` refills re-submit under the SAME rollout_id, and a
         # data source may restart its ids on every ``get_samples`` (DefaultDataSource
         # numbers by batch position, not prompt identity). Two drives would then
-        # namespace different source rows identically, and :class:`_GroupAssembler`
-        # — which buckets purely by root id — would merge siblings of unrelated
-        # prompts into one GRPO group and overwrite their ``_gt_by_root`` answers.
+        # namespace different source rows identically, and the facade's group
+        # assembler — which buckets purely by root id — would merge siblings of
+        # unrelated prompts into one GRPO group and overwrite their ``_gt_by_root`` answers.
         self._drive_seq = 0
         self._carried_tail_trajectories = 0
         self._dropped_tail_trajectories = 0
@@ -336,21 +226,8 @@ class AsyncAgenticTrainer(AgenticTrainer):
 
     def _submit_drive(self, carried: List[Sample], rollout_id: int) -> None:
         """Submit a fresh over-sampled drive (non-blocking). Call only when the prior
-        drive is finalized/``abort``ed (else two drains would double-pull)."""
-        self.rollout.submit(self._build_tasks(carried, rollout_id))
-
-    def _ingest_completed(self, completed: List[Sample]) -> int:
-        """Ingest terminal trajectories and promote newly complete groups."""
-        if completed:
-            self._assembler.add_completed(completed)
-            for group in self._assembler.pop_complete_groups():
-                self._buffer.put(group, weight_version=self._weight_version, gen_id=self._gen_id)
-                self._gen_id += 1
-        return len(completed)
-
-    def _pump(self) -> int:
-        """Poll completed trajectories into the assembler and buffer."""
-        return self._ingest_completed(self.rollout.poll()[0])
+        drive is finalized/quiesced (else two drains would double-pull)."""
+        self._engine.submit(self._build_tasks(carried, rollout_id))
 
     def _apply_tail_policy(self, carried: List[Sample], rollout_id: int) -> List[Sample]:
         """Keep resumable tails or purge all state belonging to dropped roots."""
@@ -359,8 +236,8 @@ class AsyncAgenticTrainer(AgenticTrainer):
             logger.info("rollout %d async: carry tail=%d trajectories", rollout_id, len(carried))
             return carried
 
-        roots = {self._assembler.root_of(sample) for sample in carried}
-        discarded_completed = self._assembler.discard_roots(roots)
+        roots = {root_of(sample) for sample in carried}
+        discarded_completed = self._engine.discard_roots(roots)
         for root in roots:
             self._gt_by_root.pop(root, None)
         self._dropped_tail_trajectories += len(carried)
@@ -384,42 +261,35 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 "async/dropped_tail_trajectories": self._dropped_tail_trajectories,
                 "async/dropped_tail_roots": self._dropped_tail_roots,
                 "async/discarded_completed_trajectories": self._discarded_completed_trajectories,
-                "async/assembler_pending_roots": self._assembler.size(),
+                "async/assembler_pending_roots": self._engine.pending_groups(),
             },
         )
 
     def _drain_buffer(self, n: int, *, max_staleness: int) -> Optional[List[List[Sample]]]:
         """Drain fresh groups and forget ground truth for stale evictions."""
-        picked = self._buffer.drain_freshest(
-            n,
-            current_version=self._weight_version,
-            max_staleness=max_staleness,
-        )
-        for group in self._buffer.pop_evicted_groups():
+        picked = self._engine.drain_freshest(n, max_staleness=max_staleness)
+        for group in self._engine.pop_evicted():
             if group:
-                self._gt_by_root.pop(self._assembler.root_of(group[0]), None)
+                self._gt_by_root.pop(root_of(group[0]), None)
         return picked
 
     def _next_batch(self, rollout_id: int) -> List[List[Sample]]:
         """Pump the producer until the buffer holds ``batch_size`` complete groups within
         the staleness bound, then drain the freshest ones. If the in-flight drive drains
         without filling the buffer (staleness eviction / failures / small over-sample),
-        refill with a fresh drive (resuming any carried partials)."""
+        refill with a fresh drive."""
         stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
         refills = 0
         while True:
-            self._pump()
+            self._engine.poll()
             picked = self._drain_buffer(self.batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
-            completed = self.rollout.finalize_if_drained()[0]
-            if completed is None:
+            # finalize_if_drained joins the drain and ingests its last completions
+            # atomically, before a new submit is allowed to reset worker buffers.
+            if self._engine.finalize_if_drained() is None:
                 time.sleep(self._POLL_INTERVAL_S)  # in-flight drive still generating; back off
                 continue
-
-            # Atomic engine finalization joins the drain and returns its last
-            # completions before a new submit is allowed to reset worker buffers.
-            self._ingest_completed(completed)
             picked = self._drain_buffer(self.batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
@@ -428,11 +298,10 @@ class AsyncAgenticTrainer(AgenticTrainer):
             if refills > self._MAX_REFILLS:
                 raise RuntimeError(
                     f"async-agentic rollout {rollout_id}: buffer underflow after {refills} refills "
-                    f"(buffer={self._buffer.size()} < batch={self.batch_size}); raise "
+                    f"(buffer={self._engine.buffered_groups()} < batch={self.batch_size}); raise "
                     f"oversample_batch_size or buffer_max_staleness."
                 )
-            self._submit_drive(self._pending_carried, rollout_id)
-            self._pending_carried = []
+            self._submit_drive([], rollout_id)  # fresh refill (carried tails resubmit at sync time)
 
     # ------------------------------------------------------------------
     # Consumer — reward + GRPO advantage + one optimizer step over a group batch
@@ -485,10 +354,10 @@ class AsyncAgenticTrainer(AgenticTrainer):
             extra_metrics={
                 "agent/mean_turns": (sum(depths) / len(depths)) if depths else 0.0,
                 "agent/max_turns": max(depths) if depths else 0,
-                "async/buffer_groups": self._buffer.size(),
-                "async/weight_version": self._weight_version,
+                "async/buffer_groups": self._engine.buffered_groups(),
+                "async/weight_version": self._engine.weight_version,
                 "async/version_span": (max(versions) - min(versions)) if versions else 0,
-                "async/assembler_pending_roots": self._assembler.size(),
+                "async/assembler_pending_roots": self._engine.pending_groups(),
                 "async/carried_tail_trajectories": self._carried_tail_trajectories,
                 "async/dropped_tail_trajectories": self._dropped_tail_trajectories,
                 "async/dropped_tail_roots": self._dropped_tail_roots,
@@ -532,10 +401,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
             },
         )
 
-        self._buffer = _GroupBuffer()
-        self._assembler = _GroupAssembler(self._n)
-        self._pending_carried: List[Sample] = []
-        self._gen_id = start_rollout
+        self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
 
         if start_rollout < num_rollouts and start_rollout and self.weight_sync is not None:
             self.weight_sync.sync()  # push restored weights into the fresh engine
@@ -558,8 +424,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 if need_save or need_sync:
                     # ONE turn-boundary quiesce for both: checkpoint the in-flight tail so
                     # the engine is decode-idle (safe to sync / save), then resume it.
-                    checkpointed = self.rollout.abort()[0]
-                    self._pump()  # grab trajectories that completed DURING the quiesce (before submit resets)
+                    checkpointed = self._engine.quiesce()
                     carried = self._apply_tail_policy(checkpointed, rollout_id)
                     if checkpointed:
                         self._log_tail_metrics(step)
@@ -573,14 +438,13 @@ class AsyncAgenticTrainer(AgenticTrainer):
                         )
                     if need_sync:
                         self.weight_sync.sync()
-                        self._weight_version += 1
+                        self._engine.bump_weight_version()
                     if step < num_rollouts:
                         self._submit_drive(carried=carried, rollout_id=step)  # resume safe tails + fresh
         finally:
             active_error = sys.exc_info()[0] is not None
             try:
-                checkpointed = self.rollout.abort()[0]  # stop the resident drive; leak no drives
-                self._pump()
+                checkpointed = self._engine.quiesce()  # stop the resident drive; leak no drives
                 self._apply_tail_policy(checkpointed, num_rollouts)
                 if checkpointed:
                     self._log_tail_metrics(num_rollouts)
