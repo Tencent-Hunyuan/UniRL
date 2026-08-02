@@ -37,6 +37,7 @@ from unirl.rollout.engine.vllm_omni.patches.runtime import (
     OmniTensorLoRARequest,
     VLLMOmniHijack,
 )
+from unirl.rollout.engine.vllm_omni.tp_readback import wrap_tp_rank_results
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +428,35 @@ class BucketedIPCReceiveMixin:
     # the ``compute_*_checksums`` helpers in ``weight_sync.checksum``.
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _diffrl_gather_tp_rank_results(local_result: dict) -> dict:
+        """Gather this rank's checksum map into the reply rank 0 sends back.
+
+        ``collective_rpc`` runs the method on every rank but only rank 0's
+        return value survives, so a per-rank readback has to be gathered
+        worker-side. Doing it here keeps vLLM-Omni's control-plane protocol
+        untouched — the driver still receives exactly one reply, it just
+        carries every rank's entry.
+
+        This is a collective: every rank must reach it. The callers' early
+        ``return {}`` paths are uniform across ranks (they test worker-class
+        state, not per-rank state), so they cannot desynchronise it.
+        """
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return wrap_tp_rank_results([local_result])
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp_group = get_tp_group()
+        world_size = int(tp_group.world_size)
+        if world_size <= 1:
+            return wrap_tp_rank_results([local_result])
+
+        per_rank: list = [None] * world_size
+        group = getattr(tp_group, "cpu_group", None) or tp_group.device_group
+        torch.distributed.all_gather_object(per_rank, local_result, group=group)
+        return wrap_tp_rank_results(per_rank)
+
     def _diffrl_loaded_param_checksums(
         self,
         names: Optional[list] = None,
@@ -467,7 +497,7 @@ class BucketedIPCReceiveMixin:
             if target is not None and name not in target:
                 continue
             out[name] = fingerprint_tensor(p)
-        return out
+        return self._diffrl_gather_tp_rank_results(out)
 
     def _diffrl_loaded_lora_checksums(
         self,
@@ -536,7 +566,7 @@ class BucketedIPCReceiveMixin:
                         if isinstance(sub, torch.Tensor):
                             per_field[f"{field}.{i}"] = fingerprint_tensor(sub)
             out[layer_name] = per_field
-        return out
+        return self._diffrl_gather_tp_rank_results(out)
 
 
 __all__ = ["BucketedIPCReceiveMixin"]
