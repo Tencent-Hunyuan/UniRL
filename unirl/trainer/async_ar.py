@@ -19,11 +19,12 @@ slime's thread+asyncio). The async behavior is set by **two numeric knobs**:
   regime). ``>0`` = **off-policy continuous buffer**: generations may run ahead
   across syncs, bounded by eviction; the rollout-anchored DRPO ratio absorbs it.
 
-Generation is launched as **non-blocking Ray futures** by
-``RayGenerationDispatcher`` and reaped by ``AsyncRolloutScheduler`` on the
-single driver thread — no producer thread, no locks. Draining all in-flight
-generations before each weight sync is **mandatory** (the engine corrupts an
-in-flight generation when weights + KV cache update mid-flight); this is the
+Generation runs through :class:`~unirl.rollout.engine.asynchronous.AsyncBatchRolloutEngine`
+(non-blocking Ray futures over the rollout Handle) on the single driver thread —
+no producer thread, no locks; the trainer's ``_next_step`` loop owns the policy
+(launch ceiling, launch-then-reap order). Draining all in-flight generations
+before each weight sync is **mandatory** (the engine corrupts an in-flight
+generation when weights + KV cache update mid-flight); this is the
 single-threaded ``_drain_all`` quiesce.
 
 Subclasses ``ARTrainer`` to reuse ``_build_request_sample``/``evaluate`` and ``BaseTrainer``
@@ -43,12 +44,8 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.async_runtime import (
-    AsyncRolloutScheduler,
-    BufferedRolloutGroup,
-    InflightGeneration,
-    RayGenerationDispatcher,
-)
+from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
+from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -57,6 +54,21 @@ from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
+
+
+def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
+    """Compute the rollout Handle's DP width before constructing GPU roles."""
+    from unirl.distributed.group.handle import _parallel_shape_from_init_kwargs
+
+    role_cls = rollout_parsed["role_cls"]
+    init_kwargs = {key: value for key, value in rollout_parsed.items() if key != "role_cls"}
+    sp_size, tp_size, pp_size, _ = _parallel_shape_from_init_kwargs(
+        init_kwargs,
+        int(world_size),
+        role_cls,
+    )
+    non_dp_width = sp_size if sp_size > 1 else tp_size * pp_size
+    return int(world_size) // int(non_dp_width)
 
 
 class AsyncARTrainer(ARTrainer):
@@ -80,6 +92,7 @@ class AsyncARTrainer(ARTrainer):
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
+        advantage_mode: str = "grpo",
         balance_shards: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
@@ -91,6 +104,12 @@ class AsyncARTrainer(ARTrainer):
         max_inflight: int = 1,
         buffer_max_staleness: Optional[int] = None,
     ) -> None:
+        validate_qwen3_5_training_contract(
+            pipeline_cfg=pipeline_cfg,
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+            stack_cfg=stack_cfg,
+        )
         # Call BaseTrainer.__init__ directly: ARTrainer.__init__ opens the
         # colocate ``placement(fraction=1.0)`` block, which is exactly what we
         # must NOT run. (ARTrainer itself just calls BaseTrainer.__init__ here.)
@@ -100,6 +119,9 @@ class AsyncARTrainer(ARTrainer):
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
+        self.advantage_mode = str(advantage_mode).strip().lower()
+        if self.advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         self.balance_shards = bool(balance_shards)
         self.eval_interval = int(eval_interval)
         _num = int(eval_num_prompts)
@@ -110,12 +132,23 @@ class AsyncARTrainer(ARTrainer):
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         self.weight_sync = None
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+            raise ValueError(
+                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
+                "separate slab; the trainside direct-sampling engine needs the pipeline "
+                "as a local sibling and cannot live cross-slab."
+            )
+        # Inherited ``ARTrainer.evaluate`` reads this but only ``ARTrainer.__init__``
+        # sets it, which we skip above. The disaggregated layout is always the SPMD
+        # rollout path — the anchored branch is colocate-only — so None is the
+        # correct value, and it keeps ``evaluate`` on its ``nullcontext``/non-anchored path.
+        self._rollout_anchor_device = None
 
         # ---- async state ----
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
         self._buffer_max_staleness = buffer_max_staleness
-        self._weight_version = 0  # driver-tracked policy version (# of weight syncs issued)
         # DP size of the TRAIN slab — the divisor for balance_shards (the parent
         # uses self.num_devices because colocate training spans the whole pool;
         # here training only spans the train slab).
@@ -140,10 +173,15 @@ class AsyncARTrainer(ARTrainer):
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
                 f"slab size {self._train_devices}; adjust batch_size / samples_per_prompt / train_fraction."
             )
-        if prompts % self._rollout_devices != 0:
+        rollout_dp_size = _rollout_dp_size_from_parsed_config(
+            rollout_parsed,
+            world_size=self._rollout_devices,
+        )
+        if prompts % rollout_dp_size != 0:
             raise ValueError(
-                f"batch_size = {prompts} prompts is not divisible by the rollout slab size "
-                f"{self._rollout_devices} (each prompt-tree DP-scatters whole); adjust batch_size / train_fraction."
+                f"batch_size = {prompts} prompts is not divisible by the rollout DP size "
+                f"{rollout_dp_size} ({self._rollout_devices} rollout GPUs; each prompt-tree "
+                "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
             )
 
         # ---- two disjoint top-level slabs (diffusion.py:115-129 template) ----
@@ -162,17 +200,21 @@ class AsyncARTrainer(ARTrainer):
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
         # Rollout slab = the rest (fraction is relative to the WHOLE pool).
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                raise ValueError(
-                    "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
-                    "separate slab; the trainside direct-sampling engine needs the pipeline "
-                    "as a local sibling and cannot live cross-slab."
-                )
             self.rollout = remote(**rollout_parsed)
 
         if self.weight_sync is not None:
             self._connect_separate(sync_cfg)
+
+    def _prepare_rollout(self, *, sync_weights: bool) -> bool:
+        """Sync a resident separate-slab engine without colocate handoffs."""
+        if sync_weights and self.weight_sync is not None:
+            self.weight_sync.sync()
+        return False
+
+    def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
+        """Keep the separate rollout slab resident across train/eval phases."""
+        if train_state_offloaded:
+            raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208).
@@ -190,11 +232,16 @@ class AsyncARTrainer(ARTrainer):
                 f"(NCCLWeightSync); got sync._target_={target!r}."
             )
         addr, port = self.weight_sync.pick_master()[0]
-        self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
+        tp_size = self.rollout.tp_size
+        pp_size = self.rollout.pp_size
+        targets = self.rollout.tp_zero_workers
+        self.weight_sync.set_rollout_targets(targets, self.rollout.role_name)
         self.weight_sync.connect(
             master_addr=addr,
             master_port=port,
-            num_rollout_gpus=len(self.rollout.workers),
+            num_rollout_gpus=len(targets) * tp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
         )
 
     # ------------------------------------------------------------------
@@ -205,20 +252,16 @@ class AsyncARTrainer(ARTrainer):
         """Consume one data batch and build the request Sample for ``gen_id``."""
         return self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
 
-    def _score_completed(
-        self,
-        job: InflightGeneration,
-        completed: Sample,
-    ) -> List[Sample]:
+    def _score_completed(self, gen_id: int, completed: Sample) -> List[Sample]:
         """Score a completed Sample and split it into tree-complete groups.
 
-        Scoring must precede ``_drop_decoded`` (the reward reads the decoded
-        primitive). Keyed by ``gen_id`` so media panels behave like the old path.
-        The filled ``Sample`` is self-contained (it carries its input Parts), so
-        no request handle is kept on the in-flight record.
+        Runs at reap time inside the engine. Scoring must precede
+        ``_drop_decoded`` (the reward reads the decoded primitive). Keyed by
+        ``gen_id`` so media panels behave like the old path. The filled
+        ``Sample`` is self-contained (it carries its input Parts).
         """
         scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=job.gen_id)
+        self._drop_decoded(scored, rollout_id=gen_id)
         return scored.split()
 
     def _drain_all(self) -> None:
@@ -228,7 +271,7 @@ class AsyncARTrainer(ARTrainer):
         when weights + KV cache update mid-flight), before eval/checkpoint (shared
         engine), and in ``finally`` (no leaked ObjectRefs).
         """
-        self._async_scheduler.drain_all(self._score_completed)
+        self._async_engine.quiesce()
 
     # ------------------------------------------------------------------
     # Train tail (mirrors ar.py:152-182, minus wake/sleep) — reward parity
@@ -250,7 +293,11 @@ class AsyncARTrainer(ARTrainer):
         if part.rewards is not None:
             part.rewards = hydrate(part.rewards)
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-        part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+        if self.advantage_mode == "grpo":
+            part = part.compute_advantages(
+                normalize=self.normalize_adv_by_std,
+                scope=self.adv_normalization_scope,
+            )
         sample = sample.with_parts([*sample.parts[:-1], part])
         train_part = part
         if self.balance_shards:
@@ -305,11 +352,12 @@ class AsyncARTrainer(ARTrainer):
             },
         )
 
-        self._async_scheduler = AsyncRolloutScheduler(
-            RayGenerationDispatcher(self.rollout),
-            groups_per_step=self.batch_size,
+        # gen_id is seeded by start_rollout so launches stay 1:1 with rollout_id.
+        self._async_engine = AsyncBatchRolloutEngine(
+            self.rollout,
+            complete=self._score_completed,
+            start_gen_id=start_rollout,
         )
-        self._async_scheduler.reset(start_rollout)
 
         if resumed and self.weight_sync is not None:
             self.weight_sync.sync()  # push restored weights into the fresh engine
@@ -322,7 +370,7 @@ class AsyncARTrainer(ARTrainer):
                 picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
                 # Reassemble the drained per-prompt group Samples into one batched
                 # Sample [input(P), gen(P*N)] — the inverse of Sample.split.
-                sample = Sample.concat([item.sample for item in picked])
+                sample = Sample.concat(picked)
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
                     sample, training_progress=training_progress, rollout_id=rollout_id, t0=t0
@@ -341,7 +389,7 @@ class AsyncARTrainer(ARTrainer):
                 if step % interval == 0 and self.weight_sync is not None:
                     self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
                     self.weight_sync.sync()
-                    self._weight_version += 1
+                    self._async_engine.bump_weight_version()
         finally:
             # Match BaseTrainer._finish_wandb: cleanup failures must not mask
             # the exception that caused teardown.
@@ -362,23 +410,27 @@ class AsyncARTrainer(ARTrainer):
         M: int,
         stale: int,
         num_rollouts: int,
-    ) -> List[BufferedRolloutGroup]:
+    ) -> List[Sample]:
         """Top up launches, reap completed generations, and return the freshest
-        ``groups_per_step`` (``batch_size``) groups for ``rollout_id`` (blocking
-        on the oldest in-flight generation if the buffer is short).
+        ``batch_size`` scored group Samples for ``rollout_id`` (blocking on the
+        oldest in-flight generation if the buffer is short).
 
         The launch clamp is the load-bearing on-policy guarantee: a generation
         launched now is consumed later, so bound how far ahead we launch to
         ``stale`` weight-syncs. ``stale=0`` ⇒ never launch into a future
         sync-window ⇒ no generation crosses a sync ⇒ ``ratio≈1`` (on-policy).
         """
-        return self._async_scheduler.next_step(
-            rollout_id=rollout_id,
-            sync_interval=interval,
-            max_inflight=M,
-            max_staleness=stale,
-            num_rollouts=num_rollouts,
-            current_version=self._weight_version,
-            build_sample=self._build_async_sample,
-            on_complete=self._score_completed,
-        )
+        engine = self._async_engine
+        while True:
+            ceiling = min(num_rollouts, ((rollout_id // interval) + 1 + stale) * interval)
+            while engine.next_gen_id < ceiling and engine.inflight < M:
+                engine.submit(self._build_async_sample(engine.next_gen_id))
+            engine.poll()
+            picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
+            engine.pop_evicted()  # over-stale groups are discarded on the batch path
+            if picked is not None:
+                return picked
+            if engine.inflight:
+                engine.wait_oldest()
+            else:
+                raise RuntimeError("async rollout buffer underflow with no in-flight generations")

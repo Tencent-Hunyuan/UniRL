@@ -39,6 +39,11 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from unirl.rollout.engine.sglang.backends.base import (
+    _filter_server_args_or_raise,
+    _normalize_cuda_visible_devices,
+)
+
 logger = logging.getLogger(__name__)
 
 #: Sentinel for :meth:`HTTPBackend._post`'s ``timeout``: apply the per-path
@@ -52,17 +57,70 @@ _TIERED_TIMEOUT: Any = object()
 # ---------------------------------------------------------------------------
 
 
-def kill_process_tree(pid: int) -> None:
-    """Send SIGTERM to ``pid`` and its descendants."""
+def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
+    """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``.
+
+    The parent may observe a boot failure before the spawned child has executed
+    :func:`os.setsid`.  In that race the child still belongs to the Ray
+    worker/trainer's process group, so signaling that inherited group would
+    terminate the launcher too.  A session leader owns a group whose id equals
+    its pid; only that group is safe to fan out to.
+    """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        pgid = os.getpgid(pid)
     except ProcessLookupError:
-        pass
+        # The session leader may already have exited while scheduler children
+        # remain in the group it created with setsid().  That group's id is
+        # still the leader pid, so target it directly.  If setsid() never ran,
+        # no such group exists and killpg() is a harmless ESRCH.
+        pgid = pid
     except PermissionError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        pgid = None
+
+    try:
+        if pgid == pid:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def kill_process_tree(pid: int) -> None:
+    """Send SIGTERM to ``pid`` and descendants in its owned process group."""
+    _signal_process_tree(pid, signal.SIGTERM)
+
+
+def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: float = 10.0) -> None:
+    """Best-effort bounded teardown for a started SRT server process tree."""
+    pid = getattr(process, "pid", None)
+    if pid is None:
+        return
+
+    kill_process_tree(int(pid))
+    try:
+        process.join(timeout=float(timeout_s))
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+
+    try:
+        alive = process.is_alive()
+    except Exception:
+        logger.exception("Failed to inspect SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+    if not alive:
+        return
+
+    logger.warning("SGLang SRT server process pid=%s ignored SIGTERM; sending SIGKILL", pid)
+    _signal_process_tree(int(pid), signal.SIGKILL)
+    try:
+        process.join(timeout=1.0)
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGKILL", pid)
+        return
+    if process.is_alive():
+        logger.error("SGLang SRT server process pid=%s is still alive after SIGKILL", pid)
 
 
 def wait_server_healthy(
@@ -125,6 +183,24 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
         "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
     }
+
+
+def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
+    """HTTP server target with child-local launch environment overrides."""
+    # The backend tears this subprocess tree down with killpg().  A
+    # multiprocessing child inherits the launcher's process group by default,
+    # so without a fresh session that cleanup also SIGTERMs the Ray worker,
+    # training driver, and any other process in the launcher's group.
+    os.setsid()
+
+    if env_overrides:
+        # Must run before importing SGLang or touching torch.cuda in the
+        # spawned child: CUDA_VISIBLE_DEVICES can be cached after CUDA init.
+        os.environ.update(env_overrides)
+
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    return launch_server(server_args)
 
 
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
@@ -238,19 +314,25 @@ class HTTPBackend:
         advertise_host: str,
         concurrency: int,
         health_timeout_s: float = 300.0,
+        cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "HTTPBackend":
         """Filter intent against ServerArgs, spawn the SRT server, await health.
 
         ``server_intent`` is the config-spelled ServerArgs intent (reserved
         ports already overlaid as ``port`` / ``nccl_port`` — real ServerArgs
         fields, so no port env manipulation happens anywhere). We filter it to
-        the real ServerArgs fields here (the only place that knows them —
-        non-ServerArgs escape-hatch keys drop harmlessly), then spawn.
+        the real ServerArgs fields here (the only place that knows them).
+        Non-ServerArgs escape-hatch keys drop harmlessly; explicitly requested
+        UniRL correctness flags fail closed if the installed runtime lacks them.
         """
         rt = _import_sglang_runtime()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
+        server_kwargs = _filter_server_args_or_raise(
+            server_intent,
+            allowed=allowed,
+            backend_name="HTTP",
+        )
 
         # --- Env quarantine: everything the SRT subprocess needs, set at the
         # spawn boundary (the spec's documented last resort) — never in the
@@ -294,15 +376,36 @@ class HTTPBackend:
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         server_args = rt["ServerArgs"](**server_kwargs)
-        process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
+
+        tp_size = int(server_kwargs.get("tp_size", 1))
+        visible_devices = _normalize_cuda_visible_devices(
+            cuda_visible_devices,
+            tp_size=tp_size,
+        )
+        env_overrides: Dict[str, str] = {}
+        if visible_devices is not None:
+            # The restricted list is re-indexed to logical ordinals 0..TP-1.
+            server_args.base_gpu_id = 0
+            env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        process = multiprocessing.Process(
+            target=_launch_server_with_env,
+            args=(server_args, env_overrides),
+        )
         process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
-        wait_server_healthy(
-            base_url,
-            timeout_s=float(health_timeout_s),
-            is_alive_fn=lambda: process.is_alive(),
-        )
+        try:
+            wait_server_healthy(
+                base_url,
+                timeout_s=float(health_timeout_s),
+                is_alive_fn=lambda: process.is_alive(),
+            )
+        except BaseException:
+            # Construction has not returned a backend object yet, so no caller
+            # can invoke shutdown().  Reap the child here or its independent
+            # session can retain scheduler descendants and GPU memory.
+            _terminate_server_process(process)
+            raise
         # Bind-mapping gate (GPU smoke): the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles
         # them shows up here.
@@ -513,11 +616,11 @@ class HTTPBackend:
 
     def shutdown(self) -> None:
         """Kill the SRT server (idempotent via the None-swap)."""
-        if self._server_process is not None:
-            logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
-            kill_process_tree(self._server_process.pid)
-            self._server_process.join(timeout=10)
-            self._server_process = None
+        process = self._server_process
+        self._server_process = None
+        if process is not None:
+            logger.info("Shutting down SGLang SRT server (pid=%s)", process.pid)
+            _terminate_server_process(process)
 
     # ------------------------------------------------------------------ #
     # Weight-sync verbs — HTTP POSTs to the SRT post-training endpoints

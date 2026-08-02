@@ -55,9 +55,9 @@ weight_sync_interval: 4
 # max_inflight: concurrent generations. MUST be 1: the trajectory-segment
 # cross-slab transfer (NCCL send) runs on the rollout worker; a second in-flight
 # generation co-tenanting that worker blocks the send behind it (~150s/rollout).
-# With max_inflight=1 the shared async runtime (reap_before_launch) reaps and
-# transfers each generation in the idle window before launching the next, then
-# overlaps that next generation with the train step. Real overlap needs
+# With max_inflight=1 the trainer polls (reaps) before topping up launches, so
+# each generation transfers in the idle window before the next launch, then
+# that next generation overlaps the train step. Real overlap needs
 # weight_sync_interval>1 (interval=1 drains every step).
 # buffer_max_staleness: how many weight syncs a buffered group may cross.
 #   0 = never crosses a regular rollout-weight sync (~174s/rollout on BAGEL 4+4).

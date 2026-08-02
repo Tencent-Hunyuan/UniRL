@@ -8,10 +8,8 @@ stored ``segment.sde_logp`` (or its slice when ``step_indices`` subsets).
 
 Diffusion stages populate ``log_probs`` and ``prev_sample_means`` (the
 mean of the SDE Gaussian — μ_θ — used as the second moment in the KL
-penalty). AR stages currently return a plain ``Tensor`` (signature
-divergence with diffusion is intentional for now); when AR replay grows
-``logits``-based KL support, the ``logits`` field on this result will be
-the canonical home.
+penalty). AR stages return a plain ``Tensor`` for policy-only replay, or
+a :class:`ReplayResult` when optional critic ``values`` are requested.
 """
 
 from __future__ import annotations
@@ -41,6 +39,10 @@ class ReplayResult:
     ``[B, S', V]`` for AR. Reserved for future full-categorical KL
     or entropy penalty support; not needed for Binary KL (which uses
     only per-token log-probs). Currently not populated."""
+
+    values: Optional[torch.Tensor] = None
+    """Per-token critic predictions ``V_t``. Packed ``[total_tokens]`` for AR.
+    ``None`` when replay did not request a value head."""
 
 
 __all__ = ["ReplayResult"]

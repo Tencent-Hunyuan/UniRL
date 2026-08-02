@@ -20,6 +20,7 @@ from unirl.distributed.group.remote import Remote
 
 if TYPE_CHECKING:
     from unirl.types.conditions import Condition
+    from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
 
 
@@ -439,6 +440,15 @@ class StageAlgorithm(Remote, ABC):
                 must NOT mutate fields that the rollout already populated.
         """
         return None
+
+    def prepare_part(self, part: "Part") -> "Part":
+        """Optional post-anchor hook over the complete arranged worker shard.
+
+        Runs after per-micro anchor fields have been reassembled and before any
+        optimizer update. PPO uses it to derive GAE from frozen critic values;
+        other algorithms keep the part unchanged.
+        """
+        return part
 
     @abstractmethod
     def compute_loss_and_backward(

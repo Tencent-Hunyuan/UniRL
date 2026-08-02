@@ -50,6 +50,19 @@ environment, not the code. Reward and actor share one Python process, so
 recipe `requirements.txt` files may only ADD packages, never re-pin the
 core stack.
 
+## Deliberately not ported from the legacy core path
+
+Cut on the tier's minimalism rule (features return only with a recipe that
+needs them; see the placement comment in `trainer.py`):
+
+- **Periodic eval** (`eval_interval` / `eval_sample` / `eval_cfg_text_scale` /
+  multi-reward `eval_rewards` suites, from #202) — the training reward curve is
+  this package's success signal; bring eval back via `unirl.trainer.eval_suites`
+  when a recipe needs checkpoint selection.
+- **`reward_fraction` cross-slab reward placement** — colocated-only here.
+- `param_checksum` debug probe, `activation_checkpoint_vae` knob (checkpointing
+  is unconditionally on in the grad decode paths).
+
 ## Verification
 
 | Config | Hardware | Head | Status |

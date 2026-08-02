@@ -8,7 +8,7 @@ agentic rollout. The distributed runtime is
 ## Contracts
 
 - `RolloutEnginePort.generate(sample) -> Sample` fills one generation frontier. The production
-  agentic engine requires its inner engine to implement `BaseSingleTurnRolloutEngine`.
+  agentic engine requires its inner engine to implement `SyncRolloutEngine`.
 - `Environment.reset(request) -> Sample` performs per-trajectory setup and may augment or replace
   the request.
 - `Environment.step(sample) -> (observation, done, info)` consumes the latest generated action.

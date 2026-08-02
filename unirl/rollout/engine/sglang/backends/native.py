@@ -46,6 +46,7 @@ import threading
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, TypeVar
 
+from unirl.rollout.engine.sglang.backends.base import _filter_server_args_or_raise
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
@@ -281,7 +282,17 @@ class NativeBackend:
         rt = _import_sglang_engine()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        engine_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
+        engine_kwargs = _filter_server_args_or_raise(
+            server_intent,
+            allowed=allowed,
+            backend_name="native",
+        )
+        tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
+        if tp_size > 1:
+            raise NotImplementedError(
+                "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
+                "use backend='http' for rollout TP/EP."
+            )
         # The Engine entrypoint defaults log_level to "error" (the HTTP
         # server path runs at "info") — restore parity so scheduler logs and
         # this module's post-init lines stay visible. Intent overrides win.

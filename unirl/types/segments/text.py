@@ -43,6 +43,10 @@ class TextSegment(Segment):
     # Original engine emission retained when an algorithm replaces ``log_probs``
     # with a train-side replay anchor.
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
+    # Optional PPO critic state, aligned one-to-one with packed response tokens.
+    values: Optional[torch.Tensor] = packed_field(default=None)
+    returns: Optional[torch.Tensor] = packed_field(default=None)
+    token_advantages: Optional[torch.Tensor] = packed_field(default=None)
 
     def as_condition_with(self, encoder: Callable[..., Any]) -> Condition:
         """Re-embed packed tokens via the supplied encoder into a TextEmbedCondition.

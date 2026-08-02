@@ -1,7 +1,6 @@
 """REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop).
 
-The video sibling of :class:`unirl.trainer.refl.RewardBackpropTrainer`: two
-roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
+Two roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
 grad BPTT sampling + optimizer) and a frozen differentiable video reward
 (:class:`unirl.reward.service.RewardService`), colocated on the same worker
 slab so decoded video never leaves the GPU. Each step runs, under the

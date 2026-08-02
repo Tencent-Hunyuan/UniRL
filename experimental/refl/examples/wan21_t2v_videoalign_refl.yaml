@@ -18,7 +18,7 @@ max_grad_norm: 1.0
 actor:
   _target_: experimental.refl.roles.ReflActorRole
   # Family selector — swap pipeline_target + model_config for another family,
-  # no code changes (mirrors ReFLPolicy's pipeline_target contract).
+  # no code changes (the pipeline_target contract).
   pipeline_target: experimental.refl.models.wan21.Wan21ReflPipeline
   block_class_names: ["WanTransformerBlock"]
   # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.

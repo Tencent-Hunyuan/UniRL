@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from itertools import count
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import ray
 
@@ -95,35 +95,47 @@ def reset_role_name_counter() -> None:
     _role_name_counter.clear()
 
 
-def _sp_size_from_init_kwargs(init_kwargs: Optional[Dict[str, Any]], world_size: int) -> int:
-    """Ulysses ``sp_size`` for the rank layout.
+def _cfg_get(cfg: Any, key: str, default: int) -> int:
+    # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
+    # arrive here as PLAIN DICTS, not instantiated configs. Read dict keys and
+    # object attrs alike.
+    if isinstance(cfg, dict):
+        val = cfg.get(key, default)
+    else:
+        val = getattr(cfg, key, default)
+    return int(val or default)
 
-    A role takes the SP layout if either (a) it is itself the VeOmni training
-    backend, created with an ``fsdp_cfg`` carrying ``sp_size`` (or a bare
-    ``sp_size`` kwarg), or (b) it holds a sibling ``HandleRef`` to an SP-enabled
-    role — e.g. the train stack (``fsdp_backend=<SP backend>``) or a trainside
-    rollout (which samples through the same SP model). Case (b) is essential:
-    such a role's ``DP_SCATTER`` must shard over the SAME ``dp_size`` as the
-    model's mesh, else the two ranks of an SP pair get different shards and the
-    Ulysses all-to-all desyncs (mismatched shapes -> NCCL hang). Layout-agnostic
-    siblings (``BROADCAST``-only weight sync) inherit it too but are unaffected.
 
-    Returns 1 unless the resolved ``sp_size > 1`` and evenly divides
-    ``world_size``.
+def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
+    """True if ``role_cls`` opts into per-rank rollout-TP kwargs.
+
+    SGLangRolloutEngine sets ``_accepts_rollout_tp_kwargs = True`` so Handle
+    injects ``tp_rank``/``tp_size``/``tp_visible_devices``/``pp_rank``/``ep_size``
+    into its ``__init__``. Other roles (weight sync, reward, algorithms) do NOT
+    set this flag — they share the rollout Handle's layout via ``HandleRef``
+    but their ``__init__`` doesn't accept these kwargs, so injecting would
+    raise ``TypeError``. A class-attribute flag (vs a string name check) survives
+    rename and subclassing without silently dropping the injection.
+    """
+    cls = _owning_class(role_cls)
+    return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
+
+
+def _parallel_shape_from_init_kwargs(
+    init_kwargs: Optional[Dict[str, Any]],
+    world_size: int,
+    role_cls: Type[Remote],
+) -> Tuple[int, int, int, int]:
+    """Resolve ``(sp, tp, pp, ep)`` layout hints for this handle.
+
+    ``sp_size`` keeps the existing VeOmni/Ulysses inheritance behavior. Rollout
+    TP/PP/EP is only read from ``SGLangRolloutEngine`` config (or inherited from
+    a sibling ``HandleRef`` such as ``rollout=...`` on weight sync roles) so
+    diffusion engines with their own ``tp_size`` config do not accidentally adopt
+    the AR rollout layout.
     """
     if not init_kwargs:
-        return 1
-
-    def _cfg_get(cfg: Any, key: str, default: int) -> int:
-        # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
-        # (e.g. fsdp_cfg) arrive here as PLAIN DICTS, not instantiated configs —
-        # getattr(dict, "sp_size") would silently return the default. Read the
-        # key for dicts and the attr for instantiated configs alike.
-        if isinstance(cfg, dict):
-            val = cfg.get(key, default)
-        else:
-            val = getattr(cfg, key, default)
-        return int(val or default)
+        return 1, 1, 1, 1
 
     sp = 1
     fsdp_cfg = init_kwargs.get("fsdp_cfg")
@@ -131,34 +143,151 @@ def _sp_size_from_init_kwargs(init_kwargs: Optional[Dict[str, Any]], world_size:
         sp = _cfg_get(fsdp_cfg, "sp_size", 1)
     elif "sp_size" in init_kwargs:
         sp = int(init_kwargs.get("sp_size") or 1)
-    # Inherit from the largest SP-enabled sibling handle (case (b) above).
+
+    tp = int(init_kwargs.get("tp_size") or 1)
+    pp = int(init_kwargs.get("pp_size") or 1)
+    ep = int(init_kwargs.get("ep_size") or 1)
+
+    if _is_sglang_rollout_role(role_cls):
+        cfg = init_kwargs.get("config")
+        if cfg is not None:
+            tp = max(tp, _cfg_get(cfg, "tp_size", 1))
+            pp = max(pp, _cfg_get(cfg, "pp_size", 1))
+            ep = max(ep, _cfg_get(cfg, "ep_size", 1))
+
+    # Inherit from sibling handles. This preserves the existing SP behavior and
+    # lets colocated weight-sync roles adopt their rollout sibling's TP layout.
     for value in init_kwargs.values():
         if isinstance(value, HandleRef):
             sp = max(sp, int(getattr(value, "sp_size", 1) or 1))
-    return sp if (sp > 1 and world_size % sp == 0) else 1
+            tp = max(tp, int(getattr(value, "tp_size", 1) or 1))
+            pp = max(pp, int(getattr(value, "pp_size", 1) or 1))
+            ep = max(ep, int(getattr(value, "ep_size", 1) or 1))
+
+    sp = sp if (sp > 1 and world_size % sp == 0) else 1
+    tp = max(1, tp)
+    pp = max(1, pp)
+    ep = max(1, ep)
+    if sp > 1 and (tp > 1 or pp > 1):
+        raise ValueError(f"sp_size ({sp}) cannot be combined with rollout tp/pp layout ({tp=}, {pp=})")
+    inner = tp * pp
+    if world_size % inner != 0:
+        raise ValueError(f"world_size ({world_size}) must be divisible by tp_size*pp_size ({inner})")
+    return sp, tp, pp, ep
 
 
-def _build_rank_infos(world_size: int, sp_size: int = 1) -> List[RankInfo]:
-    """Contiguous (dp, sp) rank layout: rank ``i`` -> ``dp_rank i//sp``, ``sp_rank i%sp``.
+def _build_rank_infos(
+    world_size: int,
+    sp_size: int = 1,
+    tp_size: int = 1,
+    pp_size: int = 1,
+    ep_size: int = 1,
+) -> List[RankInfo]:
+    """Build contiguous rank layout.
 
-    Matches VeOmni's ``init_sequence_parallel`` SP grouping
-    (``range(j*sp, (j+1)*sp)``) so the controller's data dispatch and VeOmni's
-    sequence-parallel groups agree: ranks in one SP group share a ``dp_rank``
-    (DP_SCATTER feeds them the same shard) and only ``sp_rank==0`` is collected.
-    ``sp_size=1`` reproduces the flat one-rank-per-dp layout exactly.
+    The default ``tp=pp=sp=1`` reproduces the flat one-rank-per-DP layout.
+    Ulysses SP keeps its historical contiguous ``(dp, sp)`` layout. Rollout TP
+    uses ``(dp, pp, tp)`` with TP rank fastest so one SGLang engine owns a
+    contiguous ``tp_size`` block of workers.
     """
-    dp_size = world_size // sp_size
+    if sp_size > 1:
+        dp_size = world_size // sp_size
+        return [
+            RankInfo(
+                rank=i,
+                world_size=world_size,
+                dp_rank=i // sp_size,
+                dp_size=dp_size,
+                sp_rank=i % sp_size,
+                sp_size=sp_size,
+            )
+            for i in range(world_size)
+        ]
+
+    inner = tp_size * pp_size
+    dp_size = world_size // inner
     return [
         RankInfo(
             rank=i,
             world_size=world_size,
-            dp_rank=i // sp_size,
+            dp_rank=i // inner,
             dp_size=dp_size,
-            sp_rank=i % sp_size,
-            sp_size=sp_size,
+            tp_rank=i % tp_size,
+            tp_size=tp_size,
+            pp_rank=(i // tp_size) % pp_size,
+            pp_size=pp_size,
+            ep_rank=0,
+            ep_size=ep_size,
         )
         for i in range(world_size)
     ]
+
+
+def _build_tp_visible_device_map(
+    rank_infos: Sequence[RankInfo],
+    *,
+    node_ips: Sequence[str],
+    cuda_visible_devices: Sequence[str],
+) -> Dict[int, List[str]]:
+    """Map each TP worker index to its node-local Ray CUDA token list.
+
+    ``DevicePool.device_ids`` are cluster-global placement indices. They are
+    not CUDA ordinals on nodes after the first one, and Ray may expose UUID or
+    MIG tokens instead of integers. Querying each Worker is therefore the only
+    reliable source of the scheduler visibility list.
+
+    TP groups must be node-local because one SGLang engine spawns all of its TP
+    scheduler processes from the ``tp_rank==0`` Worker. Invalid topology fails
+    before any role is constructed or GPU process is started.
+    """
+    size = len(rank_infos)
+    if len(node_ips) != size or len(cuda_visible_devices) != size:
+        raise ValueError(
+            "TP worker metadata length mismatch: "
+            f"rank_infos={size}, node_ips={len(node_ips)}, "
+            f"cuda_visible_devices={len(cuda_visible_devices)}"
+        )
+
+    groups: Dict[Tuple[int, int], List[int]] = {}
+    for index, rank_info in enumerate(rank_infos):
+        if int(rank_info.tp_size) > 1:
+            groups.setdefault((int(rank_info.dp_rank), int(rank_info.pp_rank)), []).append(index)
+
+    result: Dict[int, List[str]] = {}
+    for group_key, indices in groups.items():
+        ordered = sorted(indices, key=lambda index: int(rank_infos[index].tp_rank))
+        tp_size = int(rank_infos[ordered[0]].tp_size)
+        tp_ranks = [int(rank_infos[index].tp_rank) for index in ordered]
+        if len(ordered) != tp_size or tp_ranks != list(range(tp_size)):
+            raise ValueError(f"incomplete TP group {group_key}: expected ranks 0..{tp_size - 1}, got {tp_ranks}")
+
+        group_nodes = [str(node_ips[index]).strip() for index in ordered]
+        if any(not node for node in group_nodes) or len(set(group_nodes)) != 1:
+            raise ValueError(
+                f"each SGLang TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
+            )
+
+        tokens: List[str] = []
+        for index in ordered:
+            raw = str(cuda_visible_devices[index]).strip()
+            if not raw:
+                raise ValueError(f"SGLang TP worker {index} has an empty CUDA_VISIBLE_DEVICES token")
+            split = [token.strip() for token in raw.split(",") if token.strip()]
+            if len(split) != 1:
+                raise ValueError(
+                    "each SGLang TP Worker must expose exactly one CUDA_VISIBLE_DEVICES "
+                    f"token; worker={index}, value={raw!r}"
+                )
+            tokens.append(split[0])
+        if len(set(tokens)) != len(tokens):
+            raise ValueError(
+                "CUDA_VISIBLE_DEVICES tokens within an SGLang TP group must be unique; "
+                f"group={group_key}, tokens={tokens}"
+            )
+
+        for index in ordered:
+            result[index] = list(tokens)
+    return result
 
 
 @dataclass(frozen=True)
@@ -183,6 +312,52 @@ class HandleRef:
 
     role_name: str
     sp_size: int = 1
+    tp_size: int = 1
+    pp_size: int = 1
+    ep_size: int = 1
+
+
+class PendingHandleCall:
+    """Future-like result of :meth:`Handle.launch_nowait`: launched, not yet collected.
+
+    ``ready()`` probes without blocking; ``wait()`` blocks without collecting;
+    ``result()`` blocks if needed, then runs the rebind + collect half of
+    ``handle_fn`` and returns the method's collected value. The collect half
+    runs at most once — rebind registers GC finalizers on the result refs — so
+    a successful ``result()`` caches its value and later calls return it; a
+    ``result()`` that raised may be retried.
+    """
+
+    def __init__(self, handle: "Handle", method_name: str, refs: List[Any], worker_local: bool) -> None:
+        self._handle = handle
+        self._method_name = method_name
+        self._refs = refs
+        self._worker_local = worker_local
+        self._consumed = False
+        self._value: Any = None
+
+    def ready(self) -> bool:
+        """True once every worker's ref is resolved (non-blocking probe)."""
+        done, _ = ray.wait(self._refs, num_returns=len(self._refs), timeout=0)
+        return len(done) == len(self._refs)
+
+    def wait(self) -> None:
+        """Block until every worker finishes, without collecting; re-raises worker errors."""
+        ray.get(self._refs)
+
+    def result(self) -> Any:
+        """Block if needed, then rebind + collect: the method's collected return value."""
+        if self._consumed:
+            return self._value
+        handle = self._handle
+        results = ray.get(self._refs)
+        results = [
+            handle._rebind_tree(r, handle.workers[i], worker_local=self._worker_local) for i, r in enumerate(results)
+        ]
+        _, _, collect_fn, _ = handle._method_configs[self._method_name]
+        self._value = collect_fn(handle, results)
+        self._consumed = True
+        return self._value
 
 
 class Handle:
@@ -240,33 +415,80 @@ class Handle:
             "GROUP_NAME": self.role_name,
         }
 
-        # Register role on each Worker with dist_env
-        # Sequence parallelism (Ulysses): a VeOmni backend created with
-        # fsdp_cfg.sp_size>1 lays out ranks as contiguous SP blocks matching
-        # VeOmni's mesh; roles that hold an SP sibling (or get an explicit
-        # ``sp_size=`` layout hint) inherit it; everything else stays flat
-        # (sp=1). See _build_rank_infos / _sp_size_from_init_kwargs.
-        sp_size = _sp_size_from_init_kwargs(init_kwargs, self.world_size)
-        self.rank_infos = _build_rank_infos(self.world_size, sp_size)
+        # Register role on each Worker with dist_env. Sequence parallelism
+        # (Ulysses) keeps the historical contiguous (dp, sp) layout. SGLang
+        # rollout TP/PP uses a (dp, pp, tp) layout with TP fastest; colocated
+        # weight sync inherits that layout from its rollout HandleRef.
+        sp_size, tp_size, pp_size, ep_size = _parallel_shape_from_init_kwargs(init_kwargs, self.world_size, role_cls)
+        self.rank_infos = _build_rank_infos(
+            self.world_size,
+            sp_size=sp_size,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+        )
         logger.info(
-            "Handle layout: role=%s world=%d dp_size=%d sp_size=%d",
+            "Handle layout: role=%s world=%d dp=%d sp=%d tp=%d pp=%d ep=%d",
             self.role_name,
             self.world_size,
             self.rank_infos[0].dp_size,
             self.rank_infos[0].sp_size,
+            self.rank_infos[0].tp_size,
+            self.rank_infos[0].pp_size,
+            self.rank_infos[0].ep_size,
         )
-        # ``sp_size`` is a reserved handle-layout hint, not a role constructor
-        # arg (e.g. the trainside rollout, whose model is SP-parallelized but
-        # whose __init__ takes no sp_size) — consume it before forwarding.
-        if init_kwargs:
-            init_kwargs.pop("sp_size", None)
+        # Layout hints are consumed by Handle; per-rank rollout layout values
+        # are injected below for constructors that must branch before
+        # Remote.setup() installs rank_info. Only SGLangRolloutEngine accepts
+        # these kwargs — weight sync / reward / algorithm roles do not, so gate
+        # the injection on the role class to avoid TypeError on sibling roles
+        # that share the rollout Handle's layout via HandleRef.
+        is_tp_engine = _is_sglang_rollout_role(role_cls)
+        tp_visible_device_map: Dict[int, List[str]] = {}
+        if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
+            # Query the live Workers rather than deriving CUDA ordinals from
+            # cluster-global DevicePool ids. Ray may use numeric, GPU UUID, or
+            # MIG UUID tokens, and ids repeat across nodes.
+            node_ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
+            cuda_visible_devices = ray.get([worker.get_cuda_visible_devices.remote() for worker in self.workers])
+            tp_visible_device_map = _build_tp_visible_device_map(
+                self.rank_infos,
+                node_ips=node_ips,
+                cuda_visible_devices=cuda_visible_devices,
+            )
+        base_init_kwargs = dict(init_kwargs or {})
+        # These layout hints were consumed by _parallel_shape_from_init_kwargs
+        # above; strip them so they don't leak into role_cls.__init__ as
+        # unexpected kwargs (weight sync / reward roles don't accept them).
+        for key in ("sp_size", "tp_size", "pp_size", "ep_size"):
+            base_init_kwargs.pop(key, None)
+
+        def _rank_init_kwargs(i: int) -> Dict[str, Any]:
+            kwargs = dict(base_init_kwargs)
+            ri = self.rank_infos[i]
+            if not is_tp_engine or (ri.tp_size <= 1 and ri.pp_size <= 1 and ri.ep_size <= 1):
+                return kwargs
+            kwargs.update(
+                {
+                    "tp_rank": ri.tp_rank,
+                    "tp_size": ri.tp_size,
+                    "pp_rank": ri.pp_rank,
+                    "pp_size": ri.pp_size,
+                    "ep_rank": ri.ep_rank,
+                    "ep_size": ri.ep_size,
+                }
+            )
+            if ri.tp_size > 1:
+                kwargs["tp_visible_devices"] = tp_visible_device_map[i]
+            return kwargs
+
         ray.get(
             [
                 w.add_remote.remote(
                     self.role_name,
                     role_cls,
                     self.rank_infos[i],
-                    init_kwargs=init_kwargs or {},
+                    init_kwargs=_rank_init_kwargs(i),
                     dist_env={"RANK": str(i), **self._dist_env_base},
                 )
                 for i, w in enumerate(self.workers)
@@ -274,6 +496,7 @@ class Handle:
         )
 
         # Bind @distributed methods as handle functions
+        self._method_configs: Dict[str, tuple] = {}
         self._bind_methods(role_cls)
 
         # Counter for unique call_id generation within enable_grad contexts.
@@ -292,6 +515,31 @@ class Handle:
         Read by ``_to_marker`` when this handle is passed as a sibling so the
         dependent role inherits the same (dp, sp) layout (see ``HandleRef``)."""
         return self.rank_infos[0].sp_size if self.rank_infos else 1
+
+    @property
+    def tp_size(self) -> int:
+        """Tensor-parallel degree of this handle's rank layout."""
+        return self.rank_infos[0].tp_size if self.rank_infos else 1
+
+    @property
+    def pp_size(self) -> int:
+        """Pipeline-parallel degree of this handle's rank layout."""
+        return self.rank_infos[0].pp_size if self.rank_infos else 1
+
+    @property
+    def ep_size(self) -> int:
+        """Expert-parallel degree requested for rollout-side engines."""
+        return self.rank_infos[0].ep_size if self.rank_infos else 1
+
+    @property
+    def tp_zero_workers(self) -> List[Any]:
+        """Worker actor handles that host a SGLang engine (tp_rank==0).
+
+        With rollout TP, one SGLang engine per TP group is hosted by its
+        tp_rank==0 worker; the others are no-op shells. Weight sync targets and
+        server-actor discovery must use this filtered list. ``tp_size==1``
+        returns every worker (identical to ``self.workers``)."""
+        return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
 
     # ── User-facing initialize ──
 
@@ -338,6 +586,7 @@ class Handle:
             else:
                 execute_fn = self._execute_rank_zero
 
+            self._method_configs[name] = (config["dispatch_mode"], dispatch_fn, collect_fn, execute_fn)
             bound = self._make_handle_fn(name, config["dispatch_mode"], dispatch_fn, collect_fn, execute_fn)
             setattr(self, name, bound)
 
@@ -355,6 +604,9 @@ class Handle:
         TensorMetas and append an RPCBackwardNode for later auto-backward.
         grad_mode and call_id are passed as dedicated parameters to Worker.call
         (not via kwargs) so dispatch internals remain unaware of grad state.
+
+        The non-blocking twin is :meth:`launch_nowait` +
+        :meth:`PendingHandleCall.result` below — keep the halves in parity.
         """
 
         def handle_fn(*args, **kwargs):
@@ -423,6 +675,40 @@ class Handle:
         handle_fn.__name__ = method_name
         handle_fn.__doc__ = f"SPMD handle: {method_name} (dispatch={dispatch_fn.__name__})"
         return handle_fn
+
+    # ── Non-blocking launch ──
+
+    def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
+        """Launch a @distributed method without blocking: the dispatch → localize →
+        execute half of ``handle_fn``, stopping before ``ray.get``.
+
+        Always ``grad_mode=False`` / ``call_id=None`` (a pending call is never
+        valid under a GradContext, so the ``_grad_call_counter`` single-thread
+        assumption is untouched). Kept in line-parity with ``handle_fn`` above —
+        same divisibility gate, same localize. ``result()`` on the returned
+        :class:`PendingHandleCall` runs the collect half.
+        """
+        try:
+            dispatch_mode, dispatch_fn, _, execute_fn = self._method_configs[method_name]
+        except KeyError:
+            raise AttributeError(
+                f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
+            ) from None
+
+        batch_size = infer_batch_size(args, kwargs)
+        if (
+            dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
+            and batch_size is not None
+            and batch_size % self.dp_size != 0
+        ):
+            raise ValueError(f"batch_size={batch_size} not divisible by dp_size={self.dp_size}")
+
+        shards = dispatch_fn(self, args, kwargs, batch_size)
+        transport_cls = self.pool.transport_cls
+        worker_local = issubclass(transport_cls, WorkerLocalTransport)
+        shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
+        refs = execute_fn(method_name, shards, grad_mode=False, call_id=None)
+        return PendingHandleCall(self, method_name, refs, worker_local)
 
     # ── Execute strategies ──
 
