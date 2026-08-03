@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
+from unirl.models.types.bundle import Bundle
 from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -20,8 +20,7 @@ from .vendor import (
 )
 
 
-@dataclass
-class MiniMaxH3Bundle:
+class MiniMaxH3Bundle(Bundle):
     """Loaded MiniMax-H3 components.
 
     No scheduler is held. MiniMax-H3's two rectified-flow grids are plain
@@ -31,17 +30,36 @@ class MiniMaxH3Bundle:
     and a ``MiniMaxH3Scheduler`` instance would be a second source of truth.
     """
 
-    transformer: nn.Module
-    vae: nn.Module
-    audio_vae: nn.Module
-    text_encoder: nn.Module
-    processor: Any
-    tokenizer: Any
-    dtype: torch.dtype
-    device: torch.device
-    pretrained_path: str
-    text_encoder_hidden_layer: int
-    max_sequence_length: int
+    def __init__(
+        self,
+        *,
+        transformer: nn.Module,
+        vae: nn.Module,
+        audio_vae: nn.Module,
+        text_encoder: nn.Module,
+        processor: Any,
+        tokenizer: Any,
+        dtype: torch.dtype,
+        device: torch.device,
+        pretrained_path: str,
+        text_encoder_hidden_layer: int,
+        max_sequence_length: int,
+    ) -> None:
+        super().__init__()
+        self.transformer = transformer
+        self.vae = vae
+        self.audio_vae = audio_vae
+        self.text_encoder = text_encoder
+        self.processor = processor
+        self.tokenizer = tokenizer
+        self.dtype = dtype
+        # NOTE: ``Remote.setup`` later rebinds this to the worker's device
+        # STRING (e.g. "cuda:0"), so never assume ``torch.device`` attributes
+        # (``.type``) off it -- pass it straight to ``.to()`` / ``device=``.
+        self.device = device
+        self.pretrained_path = pretrained_path
+        self.text_encoder_hidden_layer = text_encoder_hidden_layer
+        self.max_sequence_length = max_sequence_length
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":

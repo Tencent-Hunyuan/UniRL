@@ -164,9 +164,12 @@ class MiniMaxH3DiffusionStage:
         ).to(dtype=video_schedule.dtype)
 
     def _autocast(self):
-        if self.bundle.device.type != "cuda":
+        # Gated on the dtype, not on the device: ``Remote.setup`` rebinds
+        # ``bundle.device`` to a plain string, so ``.type`` is not available
+        # here. Same shape as every other diffusion stage in the repo.
+        if self.autocast_dtype == torch.float32:
             return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+        return torch.autocast("cuda", dtype=self.autocast_dtype)
 
     def generate(
         self,
