@@ -71,7 +71,10 @@ class MiniMaxH3TextEmbedStage:
         length. (``fl2va`` interleaves a keyframe vision block whose rows are
         tagged VIDEO -- that arrives with keyframes, not before.)
         """
-        prompts: List[str] = list(texts.to_list()) if hasattr(texts, "to_list") else list(texts)
+        # ``Texts.texts`` is the raw list[str]; ``Texts.to_list()`` returns
+        # list[Text] dataclass wrappers, which the tokenizer rejects. Same
+        # accessor ltx2 and wan21 use.
+        prompts: List[str] = list(texts.texts)
         require(len(prompts) > 0, "MiniMaxH3TextEmbedStage: no prompts to embed")
 
         num_layers = len(self._decoder.layers)
