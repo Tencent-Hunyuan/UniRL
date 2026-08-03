@@ -83,8 +83,6 @@ class TensorSpan(Generic[T]):
     def __len__(self) -> int:
         return self.stop - self.start
 
-    # ── delegated metadata: shape (sliced) / dtype / device — read by nccl_recv and repr. Handle-specific identity (store_key/source_id/object_ref) is reached via ``span.handle`` in the worker-local backends, not off the span.
-
     @property
     def shape(self) -> tuple:
         handle_shape = tuple(self.handle.shape)
@@ -334,7 +332,6 @@ def hydrate(value: Any) -> Any:
         return value
     if not value.spans:
         return None
-    # materialize(None) = per-span local() fetch + cat_rows (each span slices its handle; ragged 2D parts follow the documented right-pad contract).
     return value.materialize(backend=None)
 
 

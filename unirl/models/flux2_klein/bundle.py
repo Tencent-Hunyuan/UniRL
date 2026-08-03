@@ -194,7 +194,7 @@ class Flux2KleinBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): architecture only, no per-rank weight allocation; the backend materializes + loads from the stashed dir after sharding. build_meta_init_transformer keeps init-computed non-persistent buffers real and captures them into meta_init_state (stashed on the bundle below). The guidance- embedder quirk (see module docstring) is handled separately by a deferred zero-init of the checkpoint-absent params, since to_empty leaves them as garbage (not meta) — _materialize_meta_tensors wouldn't catch them.
+            # Zero-init checkpoint-absent guidance parameters after meta materialization.
             transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Flux2Transformer2DModel.from_config(transformer_config), dtype=dtype

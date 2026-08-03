@@ -47,7 +47,6 @@ class TrainingConfig:
     gradient_checkpointing: bool = False
     disable_flash_attn2: bool = False
 
-    # Train-only — kept as no-op defaults so __init__ accepts them.
     max_length: Optional[int] = None
     dataset_num_proc: Optional[int] = None
     center_rewards_coefficient: Optional[float] = None
@@ -88,7 +87,6 @@ class PEFTLoraConfig:
     num_lora_modules: int = -1
 
     def __post_init__(self) -> None:
-        # Mirror the upstream normalisation: a single-element list is flattened to a scalar so peft's ``target_modules`` accepts it.
         if isinstance(self.lora_target_modules, list) and len(self.lora_target_modules) == 1:
             self.lora_target_modules = self.lora_target_modules[0]
         if isinstance(self.lora_namespan_exclude, list) and len(self.lora_namespan_exclude) == 1:
@@ -108,7 +106,6 @@ class ModelConfig:
 
     output_dim: int = 1
 
-    # Whether the checkpoint introduces ``<|VQ_reward|>`` / ``<|MQ_reward|>`` / ``<|TA_reward|>`` special tokens (matches the ``detailed_special`` prompt template). When True, the reward is read from those token positions instead of the last token.
     use_special_tokens: bool = False
 
     freeze_vision_tower: bool = field(default=False)
@@ -125,7 +122,6 @@ class ModelConfig:
 
     reward_token: Literal["last", "mean", "special"] = "last"
 
-    # Bradley-Terry / regression flavour — train-only. Inference ignores this entirely; kept for round-trip compatibility with ``model_config.json``.
     loss_type: Literal["bt", "reg", "btt", "margin", "constant_margin", "scaled", "regular"] = "regular"
 
     def __post_init__(self) -> None:

@@ -43,7 +43,6 @@ class WeightSync:
         uses_lora: bool,
     ) -> None:
         self._backend = backend
-        # Pipeline prefix embedded in canonical LoRA wire keys, e.g. "transformer." for SD3/WAN or "model." for HunyuanImage3 — stripped before SGLang sees them.
         self._pipeline_prefix = pipeline_prefix
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
@@ -127,13 +126,11 @@ class WeightSync:
         ``lora_adapters`` registry never evicts other nicknames, so each sync
         would strand one GPU-resident adapter copy (~34 MB/sync measured).
         """
-        # Canonical wire keys are "<pipeline_prefix><module>.lora_A.weight"; SGLang's lora_layers dict is keyed from inside the transformer, so strip the prefix. We do NOT inject per-layer ".alpha" keys anymore (no peft_config here): the LoRA scale is delivered adapter-wide via ``lora_alpha`` below, which needs no per-layer name alignment and so is robust to param renaming.
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
         )
         nickname = adapter_name
-        # Adapter-level LoRA alpha (one value for the whole adapter). Harmless on an older fork whose set_lora ignores the kwarg (the backend then forwards lora_alpha=None).
         adapter_alpha = None
         if peft_config is not None:
             adapter_alpha = peft_config.get("lora_alpha")

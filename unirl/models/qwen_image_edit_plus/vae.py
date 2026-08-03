@@ -25,7 +25,7 @@ from unirl.types.primitives import Images
 
 from .bundle import QwenImageEditPlusBundle
 
-# Upstream ``QwenImageEditPlusPipelineConfig`` (sglang/diffusers) resizes the source image to a fixed total pixel area of ``1024 * 1024`` while preserving aspect ratio (see ``VAE_IMAGE_SIZE`` in ``sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py``). The trainsite encoder MUST match this — using the generation grid (e.g. 384²) instead yields a different ``image_latent`` shape than the sglang/vllm_omni rollout engines, breaking the trainsite-vs-separate-engine parity contract the recipe YAMLs promise.
+# Resize source images to the upstream 1024-square grid so rollout latent shapes match.
 _VAE_IMAGE_AREA = 1024 * 1024
 _VAE_SIZE_ALIGN = 32
 
@@ -128,7 +128,6 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
         vae_f32 = vae.to(torch.float32)
 
         pixels = pixels.to(device=device, dtype=torch.float32)
-        # Resize to the upstream VAE_IMAGE_SIZE grid (aspect-preserving, ≈1024²) — NOT to the generation (height, width).
         src_h = int(pixels.shape[-2])
         src_w = int(pixels.shape[-1])
         vae_w, vae_h = _vae_size_for_aspect(src_w, src_h)
@@ -137,15 +136,12 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
 
         scaled = pixels * 2.0 - 1.0
 
-        # Lift to 5D [B, 3, 1, H, W] — Qwen-Image VAE is a video VAE (``_encode`` unpacks ``_, _, num_frame, height, width = x.shape``; a 4D input raises ``ValueError: not enough values to unpack``).
         scaled_5d = scaled.unsqueeze(2)
 
-        # Deterministic latents (mode). AutoencoderKLQwenImage.encode returns a latent_dist; .mode() is the deterministic posterior mean.
         image_latents = vae_f32.encode(scaled_5d).latent_dist.mode()
 
         image_latents = image_latents.squeeze(2)
 
-        # Per-channel normalize — mirrors upstream ``QwenImageEditPlusPipeline._encode_vae_image`` (pipeline_qwen_image_edit_plus.py:489-499): the VAE was trained on latents shifted/scaled by ``vae.config.latents_mean`` / ``latents_std``. The decode side (``QwenImageVAEDecodeStage``) applies the inverse, so skipping this would put the source-image latent on a different scale than the transformer expects.
         z_dim = int(vae.config.z_dim)
         latents_mean = (
             torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32)

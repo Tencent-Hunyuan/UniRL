@@ -49,8 +49,6 @@ class Flux2KleinAdapter(ImageAdapter):
     def schedule_policy(self):
         return self.model_config.build_schedule_policy()
 
-    # Request side: ti2i delta (no-op without an image) ---- #
-
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
         """T2I payload, plus the source image when the request carries one.
 
@@ -75,7 +73,6 @@ class Flux2KleinAdapter(ImageAdapter):
         pil_images = image_batches[0].to_pils()
         if len(pil_images) != len(prompts):
             raise ValueError(f"image count {len(pil_images)} != prompt count {len(prompts)}")
-        # One source image per group, first-seen order (mirrors the prompt collapse; ``pil_images[::k]`` would misalign interleaved group_ids).
         if k > 1:
             unique_pils = self._first_per_group(pil_images, list(gen_part.group_ids))
             if len(unique_pils) != len(unique_prompts):

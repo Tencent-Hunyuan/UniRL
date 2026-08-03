@@ -75,7 +75,6 @@ class DRPOConfig(BaseAlgorithmConfig):
     loss_agg_mode: str = "token-mean"
     horizon: int = 8192
     sampling_temperature: Optional[float] = None
-    # "rollout" (default) anchors the ratio on the rollout engine's emitted logprobs for ALL num_updates_per_batch steps (verl bypass-mode parity); "replay" freezes a train-side π_old in prepare_segment at pre-update weights instead (mb1 ratio≈1, isolates policy drift from the engine gap).
     old_logp_source: str = "rollout"
 
 
@@ -177,7 +176,6 @@ class DRPO(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         super().__init__()
-        # v2-only: the trainer injects the shared ``pipeline`` (remote_hydra(algorithm_cfg, pipeline=...)) and we resolve the stage from it. There is no v1 ``stage=`` path — DRPO is v2-only.
         if pipeline is None:
             raise ValueError("DRPO: `pipeline` must be provided (the v2 trainer injects it)")
         self.stage = getattr(pipeline, stage_attr)
@@ -185,14 +183,12 @@ class DRPO(StageAlgorithm):
         self.penalty_mu_weighted = bool(penalty_mu_weighted)
         self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
-        # replay rescales logits by this temperature so its log-softmax matches the rollout sampling distribution (log_softmax(logits / T)); MUST equal sampling.temperature. Falls back to the ARSamplingParams default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
         self.conditions_cls = conditions_cls
-        # π_old (the PPO ratio denominator) source. "rollout" = the rollout engine's emitted segment.log_probs, kept as the anchor for ALL num_updates_per_batch steps — exact parity with the released verl SPO-DPPO runs (rollout_correction.bypass_mode=True: old_log_probs := rollout logprobs across their 4 mini-batch steps). Both anchors are frozen for the whole rollout batch, so multi-update is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"DRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -230,7 +226,6 @@ class DRPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision — do NOT downcast to whatever dtype the engine emitted, so the anchor stays as close as possible to new_logp's fp32 replay (mirrors FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(
@@ -249,7 +244,6 @@ class DRPO(StageAlgorithm):
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # old_logp = the frozen π_old anchor (segment.log_probs). old_logp_source ='rollout' (default) keeps the rollout engine's logp; 'replay' means prepare_segment already overwrote it with a frozen train-side replay at pre-update weights. Either way the anchor is frozen, so the ratio stays anchored across all num_updates_per_batch optimizer steps.
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         adv_per_token = GRPO._expand_advantages_to_tokens(

@@ -78,7 +78,6 @@ class RewardService(Remote):
     ) -> None:
         super().__init__()
         self.backend = backend
-        # How to score AR generations that hit max_new_tokens (sglang finish=="length"): "zero" — force reward 0 on truncated traces (anti-ramble; the default). "keep" — keep the raw score on the partial text (= verl dapo reward manager with overlong_buffer.enable=False: no zeroing, no penalty). "soft" — verl DAPO overlong reward shaping (overlong_buffer.enable=True): a graded NEGATIVE penalty over the last `overlong_buffer_len` tokens before max_new_tokens — never a hard zero.
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
@@ -165,7 +164,6 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
-        # Length-based reward shaping for AR generations that hit max_new_tokens (sglang finish == "length"). A non-terminating trace whose text happens to contain a matching answer (e.g. a mid-reasoning \boxed{}) can teach the model to ramble up to the token cap — a real failure mode at long max_new_tokens.
         sp = frontier.sampling_params
         if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:
             seg_lengths = getattr(frontier.segment, "lengths", None)

@@ -57,13 +57,11 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     schedule = params.sigmas.to(pipeline.bundle.device)
-    # Single CFG derivation feeding the chat template, ``_encode_cond_image``, and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
     cfg_factor = 2 if cfg else 1
 
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # VAE encode + ViT-cond duplication for CFG, all via the upstream ``_encode_cond_image`` so per-sample list shapes match what the unified-MM forward iterates with at hunyuan.py:1903.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=cfg_factor
     )

@@ -166,7 +166,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
     @staticmethod
     def _temporal_subsample_clips(video: torch.Tensor, num_clips: int, frames_per_clip: int) -> List[torch.Tensor]:
-        # RewardRequest.videos exposes each sample as [C, T, H, W]. Keep that layout throughout ImageBind preprocessing; treating dim 0 as time would sample RGB channels instead of frames.
         T = video.shape[1]
         clips = []
         for i in range(num_clips):

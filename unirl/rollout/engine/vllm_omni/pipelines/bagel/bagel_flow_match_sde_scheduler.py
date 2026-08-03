@@ -88,7 +88,6 @@ class BagelFlowSDEScheduler:
     """
 
     def __init__(self, *, eta: float = 1.0, sigma_max: float = 0.99) -> None:
-        # ``eta == 0`` is allowed (every step degenerates to Euler ODE; the SDE branch is gated on ``_sde_indices``, not eta).
         if eta < 0.0:
             raise ValueError(f"BagelFlowSDEScheduler.eta must be >= 0; got {eta!r}.")
         self._eta = float(eta)
@@ -96,7 +95,6 @@ class BagelFlowSDEScheduler:
         self._sde_indices_set: Optional[frozenset] = None
         self._trajectory_dtype: torch.dtype = torch.float32
         self._step_index: int = 0
-        # generator is required instead of the reseeded global RNG.
         self._noise_generator: Optional[torch.Generator] = None
         self._image_token_sizes: Optional[List[int]] = None
         self._traj_latents: List[torch.Tensor] = []
@@ -157,8 +155,6 @@ class BagelFlowSDEScheduler:
         self._initial_latent = None
         self._initial_timestep = None
 
-    # Per-step transition (BAGEL generate_image contract)
-
     def step(
         self,
         model_output: torch.Tensor,
@@ -191,7 +187,6 @@ class BagelFlowSDEScheduler:
 
         step_idx = self._step_index
 
-        # Position-0 capture: stash the input x_T + its σ (== full[0]) on the first step so ``drain_trajectory`` can return a dense [T+1] latent trajectory and reconstruct the full [T+1] σ schedule. BAGEL builds its σ schedule internally (no ``set_timesteps(sigmas=)`` hook), so the genuine "did the worker use the trainer's schedule?" check is to reconstruct it from the σ the loop actually visited: full[0] = the first step's ``sigma``; full[1..T] = each step's ``sigma_next`` (the σ AFTER the step, matching the post-step latent at that position).
         if self._initial_latent is None:
             self._initial_latent = sample.detach().to(self._trajectory_dtype).clone()
             self._initial_timestep = sigma.detach().clone()
@@ -214,12 +209,11 @@ class BagelFlowSDEScheduler:
                 )
             clamp_sigma = torch.where(sigma == 1, torch.as_tensor(self._sigma_max, device=sigma.device), sigma)
             std_dev_t = torch.sqrt(sigma / (1 - clamp_sigma)) * self._eta
-            # EXACTLY FlowSDEStrategy.step (unirl/sde/kernels.py): note the asymmetry — the ``sample`` term has ``· dt`` INSIDE the (1 + …); the ``v_t`` term has ``· dt`` OUTSIDE, scaling the whole product.
             prev_sample_mean = (
                 sample_f32 * (1 + std_dev_t**2 / (2 * sigma) * dt_t)
                 + v_t_f32 * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt_t
             )
-            # Draw z_t from a PER-REQUEST generator, NOT the global RNG (``generator=None``). Correct for cfg_parallel_size=1 (the current recipe): CFG is combined on a single rank, so z_t is drawn once per step here. cfg_parallel_size>1 would need care — with CFG branches on separate ranks, os.urandom gives each rank a different z_t and the branches diverge; there z_t must be drawn deterministically (seed by (base_seed, group_id, step) on every rank, or draw on rank 0 and broadcast across cfg_group like x_t).
+            # Draw SDE noise per request; global RNG breaks branch alignment.
             if self._noise_generator is None:
                 self._noise_generator = torch.Generator(device=v_t_f32.device)
                 self._noise_generator.manual_seed(int.from_bytes(os.urandom(8), "big"))
@@ -232,7 +226,6 @@ class BagelFlowSDEScheduler:
             std_var = std_dev_t * torch.sqrt(-dt_t)
             prev_sample = prev_sample_mean + std_var * noise
 
-            # Storage dtype round-trip BEFORE the log-prob (mirrors FlowSDEStrategy._finalize_logp): the rollout records the density of the stored (possibly bf16-rounded) sample so replay — reading the same stored latent — matches.
             prev_sample = prev_sample.to(self._trajectory_dtype)
             prev_for_logp = prev_sample.to(torch.float32)
             log_prob_elem = (
@@ -245,12 +238,10 @@ class BagelFlowSDEScheduler:
             else:
                 log_prob = torch.stack([chunk.mean() for chunk in log_prob_elem.split(self._image_token_sizes, dim=0)])
         else:
-            # Pure Euler ODE: x_{t+1} = x_t + v·dt. CRITICAL: no SDE drift correction even when eta>0 — trainside replay drives non-SDE steps with eta=0 (plain Euler), so an SDE-form mean here would push the rollout off the replay manifold and bias every SDE-step log-prob.
             prev_sample_mean = sample_f32 + v_t_f32 * dt_t
             prev_sample = prev_sample_mean.to(self._trajectory_dtype)
             log_prob = None
 
-        # Dense latent/timestep capture; sparse log-prob capture. The captured timestep is ``sigma_next`` (the σ AFTER this step) so the stacked post-step σ reconstruct full[1..T] — together with the position-0 ``sigma`` that is full[0], this rebuilds the exact [T+1] schedule the loop ran on for the response-side σ verify.
         self._traj_latents.append(prev_sample.detach().clone())
         self._traj_timesteps.append(sigma_next.detach().clone())
         if log_prob is not None:
@@ -259,7 +250,6 @@ class BagelFlowSDEScheduler:
 
         self._step_index += 1
 
-        # Return prev_sample in the model's working dtype so the loop's next forward sees a consistent dtype (matches BAGEL's no-scheduler branch which keeps x_t in the autocast dtype).
         return BagelSDEStepOutput(
             prev_sample=prev_sample.to(original_dtype),
             log_prob=log_prob,

@@ -42,7 +42,6 @@ from unirl.utils.memory_utils import _cpu_rss_gb, _truthy
 
 logger = logging.getLogger(__name__)
 
-# Memory-probe phase specs: ``(trainer attr path, method, phase name)``. Missing/uncallable attrs are skipped, so one table covers all five trainers.
 _MEM_PHASE_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("rollout", "wake_up", "wake_up"),
     ("rollout", "generate", "generate"),
@@ -148,7 +147,7 @@ class MemoryMonitor:
                 reset_peak=True,
                 log_stage=f"{phase}:begin" if self.log_boundaries else None,
             )
-            self._fold(begin)  # pre-reset reading also covers the gap since the last probe
+            self._fold(begin)
             try:
                 return fn(*args, **kwargs)
             finally:
@@ -221,7 +220,7 @@ class MemoryMonitor:
                 dump_tag = f"step{step}"
             closing = self._probe(self._fallback, reset_peak=True, dump_snapshot_tag=dump_tag)
             self._fold(closing)
-            for r in closing:  # driver-side log so the report reaches the training console
+            for r in closing:
                 report = r.get("snapshot_report")
                 if report:
                     logger.info("memory: snapshot %s (rank %d)\n%s", dump_tag, int(r.get("rank", 0)), report)

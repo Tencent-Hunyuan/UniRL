@@ -56,7 +56,6 @@ class TensorWorker:
 
     def __init__(self, device_id: int):
         self.device_id = device_id
-        # Handles produced by this TW are owned by the slot0 worker on this GPU. source_id is a worker_id string so controller-side locality (handle._unwrap, pool.device_id_of) resolves it; all slots on this GPU share this TW.
         self.source_id = f"dw{device_id}"
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
@@ -72,7 +71,6 @@ class TensorWorker:
         self._counter = 0
         self._global_pg = None
 
-        # ipc_collect is deferred: called only when cumulative freed count OR bytes hits a threshold, amortizing the ~620 µs cost across many decref→0 events. In the normal flow (Worker closes IPC view BEFORE controller GC fires decref), del buf + empty_cache() already returns memory to CUDA without needing ipc_collect().
         self._limbo_count: int = 0
         self._limbo_bytes: int = 0
         self._ipc_collect_count: int = int(os.environ.get("MMRL_IPC_COLLECT_COUNT", "128"))
@@ -260,7 +258,7 @@ class TensorWorker:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
-        # Reserve the communicator before role models consume the device. In lazy mode, the first unbatched send/recv creates a two-rank NCCL communicator at peak memory and can fail even for a tiny transfer.
+        # Reserve NCCL communicators before models consume device memory.
         self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:

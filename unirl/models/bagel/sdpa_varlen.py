@@ -92,7 +92,7 @@ def flash_attn_varlen_func(
 
         attn_mask = None
         if causal:
-            # Bottom-right alignment: query i (0..lq) attends key j (0..lk) iff j <= i + (lk - lq). lq==lk -> usual lower-triangular; decode (lq=1,lk=N) -> all N keys visible. Every row keeps >=1 key (lk>=lq here), so no all-masked row / NaN.
+            # Use bottom-right causal masking so decode rows see all prior keys.
             qi_idx = torch.arange(lq, device=q.device).unsqueeze(1)
             ki_idx = torch.arange(lk, device=q.device).unsqueeze(0)
             attn_mask = ki_idx <= (qi_idx + (lk - lq))

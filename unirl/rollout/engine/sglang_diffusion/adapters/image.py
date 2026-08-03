@@ -34,9 +34,7 @@ class ImageAdapter(ModelAdapter):
     """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
     segment_factory = staticmethod(make_image_segment)
-    # Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are squeezed to images. Legacy image-path video families set this False (drop 4-D instead).
     squeeze_single_frame_4d: bool = True
-    # Whether to pad (not drop) the attention mask when shorter than embeds. Only Edit-Plus sets this (its embeds carry image-token slots).
     pad_mask_to_embeds: bool = False
 
     def build_inputs(self, sample: Sample, *, initial_noise: Any) -> Dict[str, Any]:
@@ -69,7 +67,6 @@ class ImageAdapter(ModelAdapter):
             "build_inputs: the gen Part must carry diffusion sampling_params",
         )
 
-        # σ is the SSOT, pinned onto ``diffusion.sigmas`` by the engine before this runs. Never recompute here; ``build_sampling`` slices it.
         require(
             diffusion.sigmas is not None,
             "build_inputs: diffusion.sigmas must be pinned by the engine before "
@@ -83,7 +80,6 @@ class ImageAdapter(ModelAdapter):
 
         sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs or {})
 
-        # Negative-prompt CFG invariant: SGLang gates CFG on guidance_scale>1 independently of return_negative_prompt_embeds — without pinning the latter, rollout conditions on the negative prompt while replay falls back to zero negative embeds (silent GRPO ratio mismatch). Fail fast.
         neg_prompt = sampler_kwargs.get("negative_prompt")
         return_neg_embeds = bool(sampler_kwargs.get("return_negative_prompt_embeds", False))
         require(
@@ -100,7 +96,6 @@ class ImageAdapter(ModelAdapter):
         kwargs: Dict[str, Any] = dict(sampler_kwargs)
         kwargs.update(self.build_prompts(sample))
         kwargs.update(self.build_sampling(sample, diffusion=diffusion))
-        # Layer 3: engine pins — RL-loop invariants, not model knobs. Stock upstream has no ``init_same_noise`` field; its default draws per-output noise (== the fork's ``init_same_noise=False``), and any group-sharing pattern is already carried by ``initial_noise`` below, so the fork flag is simply dropped.
         kwargs.update(
             {
                 "save_output": False,
@@ -110,22 +105,21 @@ class ImageAdapter(ModelAdapter):
             }
         )
 
-        # ``return_prompt_embeds`` / ``return_negative_prompt_embeds`` are the conditions-path opt-in flags re-hosted onto stock upstream by ``_patches/patch_conditions`` (+ ``patch_sampling_io`` makes them genuine ``SamplingParams`` fields). Only request them when the engine populates conditions; positives are always emitted under ``populate_conditions``, negatives only when CFG is actually active in the rollout (SGLang's CFG gate: ``guidance_scale > 1`` AND a negative prompt present) — the same invariant the ``require`` above enforces from the opposite direction.
+        # Request negative prompt embeds only when CFG is active.
         if self.cfg.populate_conditions:
             kwargs["return_prompt_embeds"] = True
             if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
-        # Per-step SDE noise key. Keyed on sample_ids (unique per sample) so each sample explores its own per-step SDE noise; the fork keyed on group_ids (same-group samples shared per-step noise). x_T is already per-sample via the initial_noise injection below, so within-group diversity does not depend on this; it is a secondary exploration knob.
+        # Key per-step SDE noise by sample ID to preserve within-group exploration.
         if initial_noise is not None:
             kwargs["initial_noise"] = initial_noise
             if gen_part.sample_ids:
                 kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
 
-        # Layer 4: the upstream rollout machinery is ALWAYS on — the patched stack returns the per-output-sliced T+1 trajectory + σ echo ONLY via ``rollout_trajectory_data.dit_trajectory`` (gated on ``rollout_return_dit_trajectory``); the flat ``trajectory_latents`` field is unsliced across outputs and lacks the x_T prepend, so it cannot back the RawResult contract. The ODE branch pins ``rollout_sde_type="ode"`` + ``rollout_log_prob_no_const=True``: an ODE step's normalized log-prob is undefined, so upstream asserts the flag is set and emits a zero placeholder this path never reads (``emit_native_logprob`` is False for a forward process).
+        # RawResult must use dit_trajectory; trajectory_latents omits x_T and is not output-sliced.
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
-        # ``r.trajectory_latents`` (consumed by tracks.py) is set from ``ctx.trajectory_latents``, which ``_record_trajectory`` only fills when ``return_trajectory_latents`` is True (it defaults False in rollout_api). The base DenoisingStage path apparently has it on; LTX-2's custom denoising leaves it off, so request it explicitly.
         kwargs["return_trajectory_latents"] = True
         if is_forward_process(sde_indices):
             kwargs["rollout_sde_type"] = "ode"
@@ -193,7 +187,6 @@ class ImageAdapter(ModelAdapter):
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
-        # Best-effort native log-prob emission: only meaningful when the algorithm requested SDE steps (a forward process — NFT / eval — has none). Whether the emitted anchor is *used* or recomputed is the training layer's call (``algorithm.old_logp_source``), not an engine flag.
         emit_native_logprob = not is_forward_process(sde_indices)
 
         segment = self.build_segment(
@@ -209,7 +202,6 @@ class ImageAdapter(ModelAdapter):
         if self.cfg.populate_conditions:
             conditions = self.build_condition(raw)
 
-        # Fill the frontier gen Part; ``with_filled_frontier`` preserves every preceding part (the prompt head and any chained inputs).
         primitives = {primitive_modality_key(decoded): decoded} if decoded is not None else {}
         return sample.with_filled_frontier(segment=segment, primitives=primitives, conditions=conditions)
 

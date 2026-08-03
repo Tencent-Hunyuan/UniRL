@@ -161,7 +161,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                     return_dict=False,
                 )[0]
                 negative_noise_pred_packed = negative_noise_pred_packed[:, :noise_seq_len]
-                # Norm-corrected CFG blend (same as base Qwen-Image).
                 comb = negative_noise_pred_packed + guidance_scale * (noise_pred_packed - negative_noise_pred_packed)
                 cond_norm = torch.norm(noise_pred_packed, dim=-1, keepdim=True)
                 comb_norm = torch.norm(comb, dim=-1, keepdim=True)

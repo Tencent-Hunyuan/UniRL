@@ -48,10 +48,8 @@ class WAN22PipelineConfig(WAN21PipelineConfig):
 
     num_train_timesteps: int = 1000
 
-    # Override path for the low-noise transformer when it is NOT co-located under the main pretrained path's ``transformer_2`` subfolder. Defaults to ``None`` → fall back to ``pretrained_model_ckpt_path/transformer_2``.
     transformer_2_pretrained_path: Optional[str] = None
 
-    # Optional LoRA hints for rollout-side engines (sglang in particular). The SGLang rollout server still needs to know at construction time whether to boot in LoRA mode and which target modules to wrap — those flags travel through this model_config.
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 

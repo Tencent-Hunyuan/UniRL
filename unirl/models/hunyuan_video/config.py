@@ -47,30 +47,23 @@ class HunyuanVideoPipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # FlowMatchSchedulePolicy shift -- static (HunyuanVideo-1.0 does not use dynamic shifting).
     shift: float = 5.0
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Meta-init the transformer (build on the meta device; the backend loads weights after sharding) instead of eager ``from_pretrained``.
     meta_init_transformer: bool = False
 
-    # VAE latent channel count. ``None`` lets both the driver and the stage fall back to ``HunyuanVideoDiffusionStage.DEFAULT_LATENT_CHANNELS`` (16) which matches the HunyuanVideo checkpoint.
     latent_channels: Optional[int] = None
 
     vae_use_tiling: bool = False
 
-    # Text-encoder shape parameters LLaMA: tokenizer max_length (after the prompt template prefix is prepended).
     llama_max_length: int = 256
-    # Number of prefix tokens to crop after the LLaMA encoder forward (the prompt template system header length).
     crop_start: int = 95
     clip_max_length: int = 77
-    # LLaMA hidden layer used as the text conditioning: the embedding is taken from ``hidden_states[-(hidden_state_skip_layer + 1)]``. (Set ``0`` for the last hidden state, e.g. to reproduce the legacy skip=0 baseline.)
     hidden_state_skip_layer: int = 2
 
     use_lora: bool = False

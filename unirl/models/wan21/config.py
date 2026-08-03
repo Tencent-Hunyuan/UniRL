@@ -33,14 +33,12 @@ class WAN21PipelineConfig:
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None
     text_encoder_ckpt_path: Optional[str] = None
-    # I2V (CLIP vision tower) override. Setting this on a ``image_dim == 0`` checkpoint raises — there is no silent fallback.
     image_encoder_ckpt_path: Optional[str] = None
     vae_dtype: Any = None
     text_encoder_dtype: Any = None
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on WAN21DiffusionParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
@@ -51,11 +49,9 @@ class WAN21PipelineConfig:
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Optional LoRA hints for rollout-side engines (sglang in particular). The SGLang rollout server still needs to know at construction time whether to boot in LoRA mode and which target modules to wrap — those flags travel through this model_config.
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Meta-init the transformer (build on the meta device; the backend loads weights after sharding) instead of eager ``from_pretrained``.
     meta_init_transformer: bool = False
 
     load_vae: bool = True

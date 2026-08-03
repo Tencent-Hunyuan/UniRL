@@ -101,12 +101,9 @@ class BagelFlowUniGRPO(FlowGRPO):
             conditions_cls=conditions_cls,
         )
         self.mse_weight = float(mse_weight)
-        # ratio_norm (GRPO-Guard): normalize the flow importance ratio per SDE step so PPO clipping actually engages (the ratio is otherwise left-shifted, mean<1). grad_reweight (×1/|dt|) is the optional 2nd component, off by default.
         self.ratio_norm = bool(ratio_norm)
         self.grad_reweight = bool(grad_reweight)
-        # Under old_logp_source="replay" the train stack recomputes these per 1-sample micro-slice and cats them back (UnifiedModelTrainStack.prepare_segment). RatioNorm needs μ_old (sde_means) refreshed at the SAME replay geometry as π_old (sde_logp) — base FlowGRPO only refreshes sde_logp — so declare both when ratio_norm is on.
         self.anchor_fields = ("sde_logp", "sde_means") if self.ratio_norm else ("sde_logp",)
-        # Full-FT v_ref: a frozen bf16 snapshot of the base (pre-training) weights, captured lazily on the first v_ref swap (before the first optimizer step) from each trainable param's local shard, keyed by param id, and swapped in per step via in-place copy.
         self._ref_snapshot: Optional[Dict[int, torch.Tensor]] = None
 
     @staticmethod
@@ -210,7 +207,6 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        # Clipped surrogate (own backward). RatioNorm (GRPO-Guard) replaces the plain FlowGRPO ratio with the per-step normalized one when enabled; otherwise the inherited FlowGRPO surrogate.
         if self.ratio_norm:
             result = self._ratio_norm_surrogate(
                 conditions=conditions,
@@ -233,16 +229,13 @@ class BagelFlowUniGRPO(FlowGRPO):
         if not target_steps or segment.sigmas is None:
             return result
 
-        # Velocity-MSE regularizer toward the LoRA-disabled base, at the SDE steps. Separate backward -> grads accumulate into the same step.
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         device = next(self.stage.model.transformer.parameters()).device
         schedule = segment.sigmas.to(device)
-        # Rebuild the conditioning KV contexts from text ONCE (the und-path prefill) and reuse the resulting forward kwargs across every SDE step and both v_theta / v_ref. The conditions now carry only text (see BagelDiffusionConditions), and the context is a detached constant, so one build serves all steps.
         forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
         transformer = self.stage.model.transformer
-        # v_ref source: LoRA -> adapters off (cheap); full FT -> a frozen bf16 snapshot of the base weights, captured lazily on the first _reference_weights swap (= the pre-trained base, before the first optimizer step).
         full_ft_ref = not self._has_lora(transformer)
-        # Compute ALL v_ref FIRST, under a SINGLE base-weight swap, storing only the detached velocity tensors (tiny [seq,C] each — no autograd graphs). This keeps the expensive base-weight swap (a full fp32 master-sized stash under full FT) OUT of the window where the N retained v_theta graphs + activations are live — the peak that OOM'd a per-step swap. v_ref is a detached constant either way (it is `.detach()`ed into the MSE), so hoisting it changes nothing numerically.
+        # Compute reference velocities before retaining trainable graphs to reduce peak memory.
         with torch.no_grad():
             if full_ft_ref:
                 ref_ctx = self._reference_weights(transformer)
@@ -265,7 +258,6 @@ class BagelFlowUniGRPO(FlowGRPO):
                     ).detach()
                     for s in target_steps
                 ]
-        # Return the freed stash + v_ref activation blocks to the driver before the v_theta graphs build, so this step's peak does not carry both (mirrors the train stack's post-churn defrag under num_updates_per_batch>1). Full-FT only — the LoRA path's v_ref leaves no stash to reclaim.
         if full_ft_ref and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -336,7 +328,6 @@ class BagelFlowUniGRPO(FlowGRPO):
         mu_old = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
             dtype=mu_theta.dtype, device=mu_theta.device
         )
-        # std_var must use the same sigma_max as the SDE step that produced old/new log_probs (diffuse/replay pass schedule[1]); otherwise the two disagree at the σ=1 step.
         sde_sigma_max = float(segment.sigmas[1]) if int(segment.sigmas.shape[0]) > 1 else float(segment.sigmas[0])
         std_var = self._sde_std_var(
             segment.sigmas,
@@ -354,7 +345,6 @@ class BagelFlowUniGRPO(FlowGRPO):
 
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
-        # Feed the RatioNorm'd ratio: new' − old = log r̂, so _grpo_clip_loss uses exp(log r̂) = r̂.
         loss_per_elem, ratio_metrics = _grpo_clip_loss(
             new_logp=old_logp + log_r_hat, old_logp=old_logp, advantages=adv_b, clip_range=clip_range
         )

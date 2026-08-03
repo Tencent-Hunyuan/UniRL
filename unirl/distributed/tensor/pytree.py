@@ -148,7 +148,6 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
         return [tuple(split_elems[j][i] for j in range(len(value))) for i in range(dp_size)]
 
     elif isinstance(value, Batch):
-        # Kind-aware split, mirroring pytree_cat's Batch.concat delegation on the collect side: Batch.chunk slices each field by its kind (CONCAT/PACKED split, SHARED/reduction passed through) and recomputes cu_seqlens for packed fields. TensorRef rides this path too (it IS a Batch): Batch.chunk -> its overridden slice/select_ranges chunks by ROW, so no TensorRef-specific branch is needed and single-span / non-uniform-span refs split into equal row shards.
         if value.batch_size != batch_size:
             return [value] * dp_size
         return value.chunk(dp_size)

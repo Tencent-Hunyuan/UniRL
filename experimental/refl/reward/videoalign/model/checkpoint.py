@@ -111,7 +111,6 @@ def load_model_from_checkpoint(
     lora_ckpt = os.path.join(checkpoint_path, "adapter_model.safetensors")
     non_lora_ckpt = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
 
-    # Upstream checkpoints use the old Qwen2VL layout (LM at base_model.model.model.*, vision at base_model.model.visual.*); transformers 5.6 nests them under model.language_model / model.visual. Applied to every loaded dict — LoRA keys embed module paths too — and idempotent for already-new-layout keys.
     def _remap_qwen_layout(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         new_state_dict: Dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():

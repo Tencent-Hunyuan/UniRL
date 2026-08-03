@@ -14,9 +14,6 @@ import torch
 
 from unirl.distributed.tensor.batch import Batch
 
-# ── CUDA IPC compatibility ──
-
-# cudaMalloc-backed IPC handles always have a 66-byte device handle (CUDA_IPC_HANDLE_SIZE=64 + 2 bytes padding). Expandable-segments (VMM) allocations produce shorter handles because they use pidfd_getfd for cross-process sharing instead of the legacy IPC path.
 _CUDA_IPC_HANDLE_BYTES = 66
 
 

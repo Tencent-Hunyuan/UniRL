@@ -31,11 +31,10 @@ class HunyuanImage3PipelineConfig:
     pretrained_model_ckpt_path: str
     vit_ckpt_path: Optional[str] = None
     vae_dtype: Any = None
-    text_encoder_dtype: Any = None  # honored for the shared embedding lookup precision
+    text_encoder_dtype: Any = None
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on the per-stage Params) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
@@ -46,7 +45,6 @@ class HunyuanImage3PipelineConfig:
 
     guidance_scale: float = 2.5
 
-    # Trainer-side ``trainable_module()`` returns ``self.model.transformer.model`` (bare ``HunyuanImage3Model`` decoder). We prepend ``"model."`` so the LoRA out_name resolves correctly on the rollout side.
     weight_sync_param_name_prefix: str = "model."
 
     def __post_init__(self) -> None:

@@ -80,7 +80,6 @@ class REFLTrainer(BaseTrainer):
             )
         self.sampling_params = params
 
-        # Reward shares the actor's workers: decoded video stays on-GPU for scoring. (Cross-slab reward placement — DiffusionTrainer's reward_fraction — is deliberately not supported here; add it only when a recipe actually cannot colocate.)
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.actor = remote_hydra(cfg.actor)
             self.reward = remote_hydra(cfg.reward)
@@ -143,7 +142,7 @@ class REFLTrainer(BaseTrainer):
         save_mode = str(save_mode if save_mode is not None else cfg.get("save_mode", "adapter"))
 
         start = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        for _ in range(start):  # fast-forward the data stream on resume
+        for _ in range(start):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:

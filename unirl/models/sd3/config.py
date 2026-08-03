@@ -30,24 +30,20 @@ class SD3PipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on SD3DiffusionParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
-    # See SD3DiffusionStage.batch_replay_steps; exposed here so non-trainside recipes can opt in via SD3Pipeline.from_config.
     batch_replay_steps: bool = False
 
     shift: float = 3.0
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Optional LoRA hints for rollout-side engines (sglang in particular). The SGLang rollout server still needs to know at construction time whether to boot in LoRA mode and which target modules to wrap — those flags travel through this model_config.
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
     load_vae: bool = True
 
-    # VeOmniBackend lifecycle: build the transformer on the meta device (architecture only, no weight allocation). VeOmni's parallelize asserts meta init, materializes storage via ``to_empty``, and the backend loads real weights from ``<pretrained>/transformer`` after sharding.
     meta_init_transformer: bool = False
 
     def __post_init__(self) -> None:

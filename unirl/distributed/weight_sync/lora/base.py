@@ -90,7 +90,6 @@ class LoraWeightSyncBase(Remote):
                 "is unsupported; target attention/shared non-EP modules instead."
             )
         self._param_prefix = str(param_prefix or "")
-        # None defers to the backend's single source of truth (the EMA shadow "old" for DiffusionNFT, else "default"); an explicit value overrides.
         self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
         self._verify = bool(verify)
         self._track_prefix = str(track_prefix or "")
@@ -104,7 +103,6 @@ class LoraWeightSyncBase(Remote):
         lora_tensors, peft_config = _extract_canonical_lora(
             self._backend, param_prefix=self._param_prefix, adapter_name=self._adapter_name
         )
-        # Prefix keys so a ComposedRolloutEngine can demux to one child.
         if self._track_prefix:
             lora_tensors = {f"{self._track_prefix}.{k}": v for k, v in lora_tensors.items()}
         return lora_tensors, peft_config
@@ -185,7 +183,6 @@ class LoraWeightSyncBase(Remote):
                         f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id} rank {rank_idx}: "
                         "engine returned no loaded LoRA layers."
                     )
-                # Plain layers expose ``lora_a`` / ``lora_b`` directly. Flatten both shapes into the same multisets before comparing with the trainer.
                 act_a = sorted(
                     checksum
                     for fields in layer_map.values()

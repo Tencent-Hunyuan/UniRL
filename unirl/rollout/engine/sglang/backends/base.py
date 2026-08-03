@@ -117,9 +117,7 @@ class RawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
-    # generation — synchronous and safe for CONCURRENT callers: the agentic drain calls it from one thread per trajectory, and the impl must keep the in-flight requests batching together on the runtime (never serialize them).
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
-    # best-effort controls
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None: ...
     def pause(self) -> None: ...
     def resume(self) -> None: ...
@@ -162,8 +160,6 @@ class Backend(Protocol):
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None: ...
-
-    # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
 
 
 __all__ = ["Backend", "RawResult"]

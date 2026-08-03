@@ -77,7 +77,6 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
     cond_vae_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Per-sample TRUE prompt length [B] long — set only on the two-engine AR path (``response._build_ar_fused_condition``), where ``input_ids`` is right-padded across variable-length per-request prompts. A plain 1D CONCAT field (cat, not _pad_attn) so it survives Batch merges.
     prompt_lengths: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
@@ -230,7 +229,6 @@ class HunyuanImage3DiffusionConditions(Batch):
     cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Opaque ``apply_chat_template`` output — used by the KV-cache path's first ``_update_model_kwargs_for_generation`` call to drive the gather-down from the full L sequence to the L' changed slice. ``None`` means the kernel falls back to the stateless path.
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod

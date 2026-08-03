@@ -47,7 +47,6 @@ from unirl.utils.graceful_shutdown import terminate_descendants
 
 logger = logging.getLogger(__name__)
 
-# vllm-omni renames its engine processes via setproctitle, so both the stage engine core and the TP workers carry this prefix.
 _ENGINE_PROC_PREFIX = "VLLM::"
 
 
@@ -185,7 +184,6 @@ class VLLMOmniBackend:
         :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
         temp file. See the module docstring for the load-bearing boot order.
         """
-        # Patches first: install() wraps mp.Process so spawn children re-run the hijack at startup — the primary mechanism for propagating patches across the spawn boundary.
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
@@ -199,14 +197,12 @@ class VLLMOmniBackend:
 
         rt = _import_omni_runtime()
 
-        # Scoped-env last resort: HI3 multi-GPU stages need to see ALL physical GPUs so vllm-omni can pin each stage to its yaml ``runtime.devices``. Permanent pop, matching v1 (a restore-after- boot is a post-parity follow-up; see _HI3 colocate landmine note in the adapter).
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # Spawn Omni off the pristine YAML asset + the assembled kwargs. Eight simultaneous boots burst past the pod's k8s memcg limit and the kernel OOM-kills raylet/python (LIN-382 qwen probe, 2026-06-07: "Memory cgroup out of memory: Killed process ... anon-rss: 20216496kB", raylet SIGKILL -> ActorUnavailableError).
         import fcntl
 
-        # Return the host process's reserved-but-unallocated CUDA pool to the driver before spawning the engine. boot() runs inside the trainer's ray actor: the colocate flow full-loads the model per rank before FSDP shards it, leaving ~35-40 GiB reserved in THIS process's torch caching allocator — memory the engine SUBPROCESS cannot see or use (LIN-382 qwen probe-c: engine model 53.7 GiB + dummy run hit "116 MiB free" on a 95 GiB GPU with the trainer's pool holding the rest).
+        # Release the trainer CUDA cache before spawning the engine process.
         try:
             import torch
 
@@ -267,7 +263,6 @@ class VLLMOmniBackend:
                 omni,
                 rt,
                 tokenizer=tokenizer,
-                # The runtime's own merged per-stage configs — authoritative, no YAML re-read.
                 tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
             )
         except BaseException:
@@ -319,11 +314,9 @@ class VLLMOmniBackend:
 
     def _build_sampling_params(self, sampling: StageSampling, *, attach_lora: bool) -> Any:
         if sampling.kind == STAGE_KIND_AR:
-            # ``logprobs=1`` rides in the kwargs (the adapter sets it) so vLLM emits per-token logp on the sampled token.
             return self._rt["VLLMSamplingParams"](**sampling.kwargs)
         sp = self._rt["OmniDiffusionSamplingParams"](**sampling.kwargs)
         if attach_lora:
-            # Without the attach, vllm-omni's DiT worker resets the active adapter to None on every forward and the loaded adapter would silently never run on the rollout pass.
             sp.lora_request = self._lora_request()
             sp.lora_scale = 1.0
         return sp
@@ -394,7 +387,6 @@ class VLLMOmniBackend:
                 stage_ids=[int(sid)],
             )
         if torch.cuda.is_available():
-            # Mirrors AsyncOmni.wake_up's synchronize(); ensures pool restoration is visible before the next generate.
             torch.cuda.synchronize()
 
     def ping(self) -> bool:
@@ -409,7 +401,6 @@ class VLLMOmniBackend:
             finally:
                 self._omni = None
 
-        # close() returning is not proof the tree is gone: the orchestrator acknowledges the shutdown message before the stage engine's TP workers have actually exited, and a worker parked in a collective never gets to process it at all. Whatever is left here is holding device memory that the next boot on this GPU will need.
         reaped = terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
         if reaped:
             logger.warning("Reaped %d engine process(es) that outlived the vLLM-Omni shutdown", reaped)
@@ -436,7 +427,6 @@ class VLLMOmniBackend:
             "replica_rank": replica_rank,
         }
         for sid in self._stage_ids():
-            # stage_id rides the kwargs so the worker extension's zmq-handle computation sees it.
             omni.engine.collective_rpc(
                 method="update_weights_from_ipc",
                 args=(),
@@ -566,7 +556,6 @@ class VLLMOmniBackend:
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
-        # Pass primitive fields, not an ``OmniTensorLoRARequest``: vllm's msgspec wire encoder doesn't recognise our Struct subclass and decodes it positionally as a list. The inner tensors can't survive the msgpack wire either — encode via the vendored serializer; the worker mixin deserialises and rebuilds the struct locally.
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             MultiprocessingSerializer,
         )
@@ -670,8 +659,6 @@ class VLLMOmniBackend:
                 )
             except Exception:
                 pass
-
-    # Post-load value-correctness read-back
 
     def param_checksums(self, *, names: List[str]) -> dict:
         """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks.

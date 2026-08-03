@@ -122,17 +122,14 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     pretrained_model_ckpt_path: str = ""
 
-    # Adapter selection (registry key; None = derived from image_token)
     model_family: Optional[str] = None
 
-    # Parallelism & GPU ``tp_size`` / ``pp_size`` / ``ep_size`` are read by Handle to build the rollout rank layout; ``tp_size>1`` is what makes a multi-GPU SGLang engine. Leave None unless a SGLang server-level dp override is explicitly needed.
     tp_size: Optional[int] = None
     pp_size: Optional[int] = None
     ep_size: Optional[int] = None
     dp_size: Optional[int] = None
     enable_expert_parallel: Optional[bool] = None
 
-    # SGLang network ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts cross-node connections). ``port`` is kept for config-shape parity with the predecessor; the engine self-reserves its ports — inject a typed ``SGLangPorts`` (tests) instead of pinning this field.
     host: Optional[str] = None
     port: Optional[int] = None
 
@@ -140,27 +137,21 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     concurrency: int = 8
 
-    # Colocated memory lifecycle Optional so existing SGLang recipes retain upstream ServerArgs defaults. Colocated trainers opt in explicitly when they need sleep/wake to hand GPU ownership between rollout and FSDP.
     enable_memory_saver: Optional[bool] = None
     enable_weights_cpu_backup: Optional[bool] = None
     skip_server_warmup: Optional[bool] = None
 
-    # Sample expansion contract VLMTrainer pre-expands the request by samples_per_prompt (P prompts → P*N entries, one per GRPO sibling), so the engine must emit exactly ONE completion per entry (n=1) — matching the trainside pipeline, else samples double-count (P*N entries × N each).
     samples_pre_expanded: bool = False
 
-    # VLM multimodal Non-None selects the VLM adapter and loads AutoProcessor. Typed image content still goes through the checkpoint's official chat template and processor; this value is not injected as the complete image marker.
     image_token: Optional[str] = None
 
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 0
-    # Exact tokenizer tokens excluded from response sampling via SGLang's logit_bias. A train-side replay path must exclude the same ids before log-softmax to preserve log-prob parity.
     response_forbidden_tokens: Optional[List[str]] = None
 
-    # Chat template System message prepended to every prompt (e.g. "/no_think" to suppress Qwen3's thinking mode), used as the fallback when a per-request stage config doesn't carry one. Must match the trainside pipeline's system_instruction so generation and replay see the same prompt.
     system_instruction: Optional[str] = None
-    # Extra kwargs forwarded to tokenizer.apply_chat_template (e.g. {enable_thinking: false} for Qwen3 — without it the model emits a long <think> block that overruns max_new_tokens before reaching the answer).
     chat_template_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     engine_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
@@ -180,7 +171,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.pp_size is None or self.pp_size >= 1,
             f"SGLangEngineConfig.pp_size must be >= 1 when set; got {self.pp_size!r}",
         )
-        # pp_size>1 is currently unsupported end-to-end: ``Handle`` would build one Remote per pp_rank while a single SGLang ``Engine`` also spawns its own tp*pp scheduler subprocesses internally, so the two layouts would double-book the GPUs (see backends' spawn-scoped CVD mapping). ``NCCLWeightSync.connect`` already raises NotImplementedError for pp_size>1; fail closed at config-time so users hit a clear error before rollout boot.
         require(
             self.pp_size is None or self.pp_size == 1,
             "SGLangEngineConfig.pp_size>1 is not supported yet: UniRL Handle "
@@ -194,7 +184,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.ep_size is None or self.ep_size >= 1,
             f"SGLangEngineConfig.ep_size must be >= 1 when set; got {self.ep_size!r}",
         )
-        # SGLang derives moe_tp_size = tp_size // ep_size with plain integer division, so a non-divisible ep_size silently builds a wrong MoE group layout instead of erroring. Fail closed at config-time.
         effective_tp = self.tp_size if self.tp_size is not None else 1
         require(
             self.ep_size is None or (self.ep_size <= effective_tp and effective_tp % self.ep_size == 0),
@@ -206,7 +195,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.dp_size is None or self.dp_size >= 1,
             f"SGLangEngineConfig.dp_size must be >= 1 when set; got {self.dp_size!r}",
         )
-        # dp_size>1 is unsupported for the same double-booking reason as pp_size>1: UniRL's Handle sizes its Remote layout from tp*pp only, while SGLang ServerArgs.dp_size>1 spawns dp_size*tp_size scheduler subprocesses — the extra replicas would silently claim GPUs the Handle believes are free. Fail closed at config-time.
         require(
             self.dp_size is None or self.dp_size == 1,
             "SGLangEngineConfig.dp_size>1 is not supported yet: UniRL Handle "
@@ -238,7 +226,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.backend must be 'http' or 'native'; got {self.backend!r}",
         )
 
-        # Adapter selection: derive from the predecessor's VLM switch when not explicit, then validate against the live registry (importing it registers the families).
         if self.model_family is None:
             self.model_family = "vlm" if self.image_token is not None else "text"
         self.model_family = str(self.model_family).strip().lower()
@@ -299,7 +286,6 @@ class SGLangEngineConfig(BaseEngineConfig):
         if runtime_overrides:
             intent.update(runtime_overrides)
 
-        # Record explicit load-bearing UniRL fields before adding default fallbacks. If a runtime lacks one of these ServerArgs, silently dropping it would change correctness or memory-lifecycle semantics.
         required_server_args = sorted(set(intent) & _LOAD_BEARING_SERVER_ARGS)
         if required_server_args:
             intent[_REQUIRED_SERVER_ARGS_METADATA_KEY] = required_server_args

@@ -184,11 +184,9 @@ def main() -> None:
     else:
         merged = dict(state_dict)
 
-    # DCP full saves intentionally omit frozen/meta entries.
     if checkpoint.get("_checkpoint_format") == "dcp" and checkpoint.get("save_mode", "full") == "full":
         merged = overlay_partial_state_dict(model.state_dict(), merged)
 
-    # strict: naming drift between checkpoint and base class is a hard error, not a silently half-loaded export.
     model.load_state_dict({k: v.to(dtype) if v.is_floating_point() else v for k, v in merged.items()}, strict=True)
     model.save_pretrained(args.output)
     print(f"wrote {args.output}")

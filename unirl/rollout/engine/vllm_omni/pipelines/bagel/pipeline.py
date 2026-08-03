@@ -45,8 +45,6 @@ class RLBagelPipeline(BagelPipeline):
         self._pending_batched_latents: Optional[list] = None
         self._trajectory_dtype: torch.dtype = torch.float32
 
-    # install — once per pipeline lifetime, idempotent
-
     def _install_sde_scheduler(self) -> None:
         """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always
         installed (even eta=0) since replay needs the captured trajectory; kwargs empty."""
@@ -87,7 +85,6 @@ class RLBagelPipeline(BagelPipeline):
                 sin = emb.sin()
             cos = cos * rotary.attention_scaling
             sin = sin * rotary.attention_scaling
-            # Return fp32 (not bf16): keeps q/k fp32 through rotary_op so the rotated q/k match trainside (the attention forward downcasts to bf16 itself).
             return cos.to(dtype=torch.float32), sin.to(dtype=torch.float32)
 
         rotary.forward = fp32_forward  # type: ignore[assignment]
@@ -113,7 +110,6 @@ class RLBagelPipeline(BagelPipeline):
             orig = module.forward
 
             def fp32_forward(x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-                # Fused add-then-norm isn't on the gen velocity path; defer to the original kernel to keep its contract.
                 if residual is not None:
                     return orig(x, residual)
                 input_dtype = x.dtype
@@ -145,7 +141,6 @@ class RLBagelPipeline(BagelPipeline):
 
         def tapped(*args: Any, **kw: Any) -> Any:
             spp = pipeline_self._pending_spp
-            # Grouped t2i: replicate the single prompt's KV span ``spp``× so ``prepare_input`` builds ``spp`` packed image blocks (each attends its own copy of the shared prompt KV).
             if spp > 1 and "image_sizes" in kw and len(kw["image_sizes"]) == 1:
                 kw = dict(kw)
                 kw["image_sizes"] = list(kw["image_sizes"]) * spp
@@ -222,8 +217,6 @@ class RLBagelPipeline(BagelPipeline):
         self.bagel.generate_image = generate_image_grouped  # type: ignore[assignment]
         self._generate_image_tap_installed = True
 
-    # arm — every request (stale-leak guards)
-
     def _arm_sde(self, req: OmniDiffusionRequest, image_token_sizes: Optional[list] = None) -> None:
         """This request's SDE strength + sparse step gate + σ_max + storage dtype."""
         sp = req.sampling_params
@@ -235,7 +228,6 @@ class RLBagelPipeline(BagelPipeline):
             if traj_dtype_name
             else self._trajectory_dtype
         )
-        # σ_max (trainside schedule[1]): load-bearing for the first SDE step's std_dev_t clamp — must match trainside or the ratio drifts off 1.
         sigma_max = extra.get("sigma_max")
         self._sde_scheduler.set_for_request(
             eta=eta,
@@ -276,14 +268,12 @@ class RLBagelPipeline(BagelPipeline):
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
         self._install_noise_tap()
-        # fp32 RoPE + RMSNorm: bit-match the trainside forward so the rollout↔replay log-prob ratio stays ≈ 1 (see the install methods).
         self._install_rope_fp32()
         self._install_rmsnorm_fp32()
 
         spp = getattr(req.sampling_params, "num_outputs_per_prompt", 1)
         if spp > 1:
             if not self._is_batchable_t2i(req):
-                # Adapter should keep sample-level requests when packing is off; refuse the broken "num_outputs>1 on the single-image path".
                 raise RuntimeError(
                     f"RLBagelPipeline: num_outputs_per_prompt={spp} requires pure t2i "
                     f"with cfg_text_scale<=1 and cfg_img_scale<=1 present in "
@@ -323,7 +313,6 @@ class RLBagelPipeline(BagelPipeline):
                     f"RLBagelPipeline batched forward: generate_image tap captured "
                     f"{0 if not lats else len(lats)} latents, expected spp={spp}."
                 )
-            # Reuse upstream PIL for latents[0] — avoid a second VAE decode + D2H.
             first = None
             raw = out.output
             if isinstance(raw, dict):

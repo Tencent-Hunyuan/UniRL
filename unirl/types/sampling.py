@@ -112,9 +112,8 @@ class DiffusionSamplingParams(BaseSamplingParams):
     init_same_noise: bool = False
     noise_group_ids: Optional[List[str]] = None
     init_noise_latent_shape: Optional[List[int]] = None
-    # Driver-x_T opt-out (debug escape hatch). When True the trainer is NOT authoring x_T: the engine adapter skips the init_noise_group_ids recipe and each engine falls back to its own RNG.
+    # Debug opt-out: let each rollout engine generate its own initial noise.
     disable_driver_xt: bool = False
-    # Resolved σ schedule for this rollout, pinned by the rollout-engine adapter before generation (single source of truth).
     sigmas: Optional[torch.Tensor] = None
 
     eta: float = 1.0
@@ -124,12 +123,10 @@ class DiffusionSamplingParams(BaseSamplingParams):
 
     sampler_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    # precision
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # model-specific (optional, unused fields ignored)
     max_sequence_length: Optional[int] = None
     taylor_cache_interval: Optional[int] = None
     taylor_cache_order: Optional[int] = None
@@ -137,7 +134,6 @@ class DiffusionSamplingParams(BaseSamplingParams):
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
 
-    # backward compat (removed once all consumers migrate)
     num_samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:

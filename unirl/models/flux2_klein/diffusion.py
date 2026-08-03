@@ -419,7 +419,6 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         )
         sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
 
-        # Klein's transformer keeps `.eval()` mode during sampling (matches legacy Flux2Sampler.sample). Caller is responsible for restoring `.train()` after rollout finishes.
         self.model.transformer.eval()
 
         for i in range(T):

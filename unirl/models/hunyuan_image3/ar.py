@@ -175,7 +175,6 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         input_ids: torch.Tensor = fused.input_ids
         batch_size = int(input_ids.shape[0])
 
-        # Pre-build a ``HunyuanStaticCache`` sized for prompt + max_new_tokens, mirroring upstream ``_prepare_model_inputs`` (hunyuan.py:2326-2333). Falls back to ``None`` (HF default DynamicCache) when the upstream symbol isn't accessible -- e.g. fake-bundle unit tests.
         prompt_len = int(input_ids.shape[1])
         past_kv_initial = self._build_kv_cache(
             transformer, batch_size=batch_size, max_cache_len=prompt_len + int(max_new_tokens)
@@ -190,13 +189,11 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
                 "attention_mask": cond_vit.attn_mask,
             }
 
-        # i2t / it2i cond-VAE half (HI3-Instruct dual cond-image: VAE latents + a cond timestep alongside the ViT patches). The forward scatters these into the VAE <img> slots in any mode; without them the 4096 VAE slots stay bare <img> embeddings → garbage comprehension.
         cond_vae = conditions.cond_vae
         cond_vae_images = cond_vae.latents if cond_vae is not None else None
 
         model_kwargs: Dict[str, Any] = {
             "mode": "gen_text",
-            # Newer checkpoints' _update_model_kwargs_for_generation reads model_kwargs["rope_image_info"] unconditionally; AR (gen_text) has no image tokens, so pass an empty per-sample list.
             "rope_image_info": [[] for _ in range(batch_size)],
             "attention_mask": fused.attention_mask,
             "position_ids": fused.position_ids,
@@ -214,7 +211,6 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         if conditions.tokenizer_output is not None:
             model_kwargs["tokenizer_output"] = conditions.tokenizer_output
 
-        # Newer checkpoints' gen_text forward reads runtime attrs off ``self`` that a prior diffusion/FlowGRPO pass may leave stale (or never sets on this snapshot).
         transformer.post_token_len = None
         transformer.num_image_tokens = 0
         transformer.num_special_tokens = None
@@ -240,13 +236,11 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         batch_size = int(state.input_ids.shape[0])
         model_kwargs = state.model_kwargs
 
-        # Cond-image scatter (i2t/it2i) only applies on the prefill: the cond VAE + ViT embeds land in the full-sequence hidden states and are cached, so decode steps (a single new token with no <img> positions) pass None. ``_encode_cond_image``/the wrapper supply the VAE half (cond_vae_images + cond_timesteps + cond_*_image_mask / cond_timesteps_index) — the upstream forward asserts they come as a set and scatters cond-VAE in gen_text mode too (not mode-gated).
         cond_kwargs: Dict[str, Any] = {}
         if state.step_idx == 0:
             cond_kwargs = {
                 "cond_vit_images": model_kwargs.get("cond_vit_images"),
                 "cond_vit_image_mask": model_kwargs.get("cond_vit_image_mask"),
-                # Newer (Instruct) forward reads the ViT attn/spatial kwargs under cond_vit_image_kwargs; older ones use vit_kwargs.
                 "cond_vit_image_kwargs": model_kwargs.get("vit_kwargs"),
                 "cond_vae_images": model_kwargs.get("cond_vae_images"),
                 "cond_vae_image_mask": model_kwargs.get("cond_vae_image_mask"),
@@ -273,12 +267,10 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         if logits is None:
             raise RuntimeError("HunyuanImage3ARStep.step: model output has no .logits in mode='gen_text'.")
 
-        # Under ``device_map="auto"`` the model's lm_head returns logits on whichever shard owns it (often cuda:N≠0). Gather the predicting-position slice on logits' own device, then move the small ``[B, vocab]`` slice to the AR loop's home device so subsequent sampling ops live on a single device.
         logits_device = logits.device
         if state.step_idx == 0 and conditions.tokenizer_output is not None:
             real_pos = getattr(conditions.tokenizer_output, "real_pos", None)
             if real_pos is not None:
-                # ``real_pos`` is the *next* write position (one past the last valid input token under right-padding); the last valid input position is ``real_pos - 1``.
                 real_pos_t = real_pos.to(device=logits_device, dtype=torch.long)
                 if real_pos_t.dim() == 2:
                     real_pos_t = real_pos_t[:, -1]
@@ -295,7 +287,6 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
 
         state.input_ids = torch.cat([state.input_ids, token_id.unsqueeze(-1)], dim=1)
         updated = transformer._update_model_kwargs_for_generation(out, model_kwargs)
-        # Replace model_kwargs entirely. Upstream's ``_update_model_kwargs_for_generation`` returns a *new* dict that intentionally drops ``attention_mask`` and ``tokenizer_output`` -- carrying the prompt's [B, 1, L, L] 4D mask into decode steps would mismatch SDPA's expected [B, H, q_len=1, kv_len] shape.
         new_kwargs: Dict[str, Any] = dict(updated)
         for carry in ("cond_vit_images", "cond_vit_image_mask", "vit_kwargs", "custom_pos_emb", "rope_image_info"):
             if carry not in new_kwargs and carry in model_kwargs:
@@ -497,7 +488,6 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                 "HunyuanImage3ARStage.replay: segment requires tokens with "
                 "framework-managed cu_seqlens (construct via TextSegment.pack)"
             )
-        # Fail closed on cond-image replay: the rollout conditioned the response on scattered VAE+ViT cond-image embeds, but this teacher-forced replay rebuilds inputs_embeds from input_ids only (no cond scatter). Replaying i2t/it2i this way would silently drop the image → wrong logp.
         if conditions.cond_vit is not None or conditions.cond_vae is not None:
             raise NotImplementedError(
                 "HunyuanImage3ARStage.replay: cond-image (i2t / it2i) replay is not "
@@ -508,11 +498,10 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             )
 
         prompt_ids_padded = fused.input_ids
-        # Drive the forward on the MODEL's device, not the conditions' device: the AR fused/segment come back from the engine via the transport store as CPU tensors (and DP-shard keeps them on CPU), while the trainable backbone lives on cuda. Using prompt_ids' device would feed CPU input_ids into a cuda embedding → index_select device mismatch.
         device = self.model.transformer.model.wte.weight.device
         batch_size = int(prompt_ids_padded.shape[0])
 
-        # Per-sample TRUE prompt lengths. Fail closed rather than silently fall back to the padded length, which would corrupt per-token logp for short samples.
+        # Require true prompt lengths; padded lengths corrupt per-token log probabilities.
         if fused.prompt_lengths is None:
             raise ValueError(
                 "HunyuanImage3ARStage.replay: fused.prompt_lengths is None. The "
@@ -546,7 +535,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             mask_4d = torch.full((1, 1, L_full, L_full), neg_inf, dtype=param_dtype, device=device)
             mask_4d.masked_fill_(causal.unsqueeze(0).unsqueeze(0), 0.0)
 
-            # Reset image/rope runtime state — FlowGRPO earlier in the same step sets num_image_tokens=4096; the text-only AR forward must run with 0 image tokens or rope/attention indexing goes OOB → NaN. Per forward because each sample's seq_len differs (forces rope rebuild).
+            # Reset image RoPE state before text-only AR forwards.
             transformer.post_token_len = None
             transformer.num_special_tokens = None
             transformer.num_image_tokens = 0
@@ -568,7 +557,6 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             if logits is None:
                 raise RuntimeError("HunyuanImage3ARStage.replay: model output has no .logits")
 
-            # logits[0, pl-1+t] predicts resp_b[t]. T=1 both sides is the verl/OpenRLHF/TRL convention — temperature is a rollout exploration knob, not part of the policy-gradient logp).
             raw_logits = logits[0, pl - 1 : pl - 1 + rl, :].float()
             log_probs_full = F.log_softmax(raw_logits, dim=-1)
             flat.append(log_probs_full.gather(-1, resp_b.unsqueeze(-1)).squeeze(-1))

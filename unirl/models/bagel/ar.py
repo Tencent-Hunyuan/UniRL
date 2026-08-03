@@ -87,7 +87,6 @@ class BagelARStep(ARStep):
 
         scaled = logits.float() / self.temperature
 
-        # Behavior log-prob under the temperature-scaled distribution, BEFORE top-k/top-p truncation, so old_logp == replay new_logp at the same weights (rl_ops.score_response computes log_softmax(logits / T)).
         log_probs_full = F.log_softmax(scaled, dim=-1)
 
         if self.top_k > 0 and self.top_k < scaled.shape[-1]:
@@ -129,13 +128,11 @@ class BagelARStage(ARStage[BagelARConditions]):
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="BagelARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="BagelARStage.logprob_precision")
-        # Replay scorer for the GRPO ratio's new_logp: "train" — one grad forward_train per sample (nested mask: image full + text causal); the und path INCLUDING the image is trained. Exact attention, but a different kernel than the rollout's forward_inference, so the on-policy ratio is ~1±1e-2. "inference" — image prefilled no_grad (frozen) + one grad forward_inference over [prompt+response]; same kernel as rollout (ratio ~1), FSDP-safe, but the image understanding is not trained.
         self.replay_mode = str(replay_mode).strip().lower()
         require(
             self.replay_mode in ("train", "inference"),
             f"BagelARStage: replay_mode must be 'train' or 'inference'; got {replay_mode!r}.",
         )
-        # A checkpoint trained with freeze_und detaches the und hidden states in forward_train — a signal the und path was never meant to train. (Chain guarded so fake bundles without the full config tree construct.)
         llm_cfg = getattr(getattr(getattr(model, "model", None), "config", None), "llm_config", None)
         require(
             not getattr(llm_cfg, "freeze_und", False),

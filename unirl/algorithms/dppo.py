@@ -90,7 +90,6 @@ class DPPOConfig(BaseAlgorithmConfig):
     loss_agg_mode: str = "token-mean"
     horizon: int = 8192
     sampling_temperature: Optional[float] = None
-    # "rollout" (default) keeps the rollout engine's emitted logprobs as mu for ALL num_updates_per_batch steps (verl bypass-mode parity, = the behavior policy DPPO anchors on); "replay" freezes a train-side pi_old at pre-update weights in prepare_segment instead.
     old_logp_source: str = "rollout"
 
 
@@ -120,12 +119,10 @@ def _dppo_mask(
     Returns:
         ``keep`` mask ``[total_tokens]`` (float 0/1), detached.
     """
-    # Compute the divergence in fp32 regardless of the logprob dtype: a bf16 subtraction of two near-equal probabilities loses the small shift to rounding. The recipe pins logprob_precision=fp32, but this keeps DPPO correct under a bf16-logprob config too.
     prob = torch.exp(new_logp.float())
     old_prob = torch.exp(old_logp.float())
     D_t = (prob - old_prob).abs()  # Binary-TV divergence D_t
 
-    # Keep rule (= CPPO Eq. 10 with c_t collapsed to the constant delta): always keep updates that move pi back toward mu, and keep diverging updates only while D_t stays within the threshold.
     toward_mu = (advantages * (ratio - 1.0)) <= 0.0
     feasible = D_t <= delta
     keep = toward_mu | feasible
@@ -210,7 +207,6 @@ class DPPO(StageAlgorithm):
         conditions_cls: Stage-typed conditions container.
     """
 
-    # old_logp (the ratio denominator and the Binary-TV mu) is the rollout (SGLang) log-prob, frozen on the segment and unchanged across mini-batch updates — so reusing it across num_updates_per_batch>1 is the deliberate rollout-anchored trust region (verl bypass_mode=True parity), matching GRPO / DRPO / CPPO.
     supports_multi_update = True
 
     def __init__(
@@ -237,14 +233,12 @@ class DPPO(StageAlgorithm):
             raise ValueError(f"DPPO: dppo_delta must be > 0; got {self.dppo_delta}")
         self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
-        # replay rescales logits by this temperature so its log-softmax matches the rollout sampling distribution (log_softmax(logits / T)); MUST equal sampling.temperature. Falls back to the ARSamplingParams default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
         self.conditions_cls = conditions_cls
-        # pi_old / mu source. "rollout" = the rollout engine's emitted segment.log_probs, kept as the anchor for ALL num_updates_per_batch steps (= the behavior policy DPPO's trust region anchors on; verl bypass-mode parity). "replay" = prepare_segment recomputes a frozen train-side pi_old at pre-update weights. Both anchors are frozen for the whole rollout batch, so multi-update is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"DPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -272,7 +266,6 @@ class DPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision so the anchor stays as close as possible to new_logp's fp32 replay (mirrors CPPO / DRPO / FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(

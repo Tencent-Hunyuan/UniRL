@@ -163,7 +163,6 @@ class PhaseTimer:
         return time.perf_counter() - self._t0
 
 
-# (handle attr, method, phase name) — the standard per-step collaborator handles every v2 trainer drives; missing ones (e.g. trainside has no ``weight_sync``) are skipped by :func:`install_phase_timing`.
 _STEP_PHASE_SPECS = (
     ("rollout", "wake_up", "wake_up"),
     ("rollout", "generate", "generate"),
@@ -212,7 +211,6 @@ def install_phase_timing(trainer: Any) -> None:
 
     @functools.wraps(inner)
     def _first_step(*args, **kwargs):
-        # First step is the earliest point the collaborators and the live logger are all constructed; wrap them once, then rebind to the lean steady wrapper so later steps just re-arm (no per-step branch, no latch flag).
         trainer._step_timer = PhaseTimer()
         _wrap_step_collaborators(trainer)
         trainer.train_step = _steady_step
@@ -242,7 +240,6 @@ def _wrap_step_collaborators(trainer: Any) -> None:
             continue
         setattr(handle, method, _timed_call(trainer, fn, phase))
 
-    # Inject the phases we collected into the logger boundary, unless the trainer already passed its own.
     log_inner = trainer.wandb_logger.log_rollout_step
 
     @functools.wraps(log_inner)
@@ -318,7 +315,6 @@ class UniRLWandBLogger:
         self.tags = tags if tags is not None else ["unirl"]
         self.run_id = run_id
         self._initialized = False
-        # Optimizer-step counter for the ``train/`` panel (moved here from BaseTrainer so all step-axis bookkeeping lives in the logger).
         self._optimizer_step = int(optimizer_step)
         self.memory_monitor = None
 
@@ -361,7 +357,6 @@ class UniRLWandBLogger:
             return
 
         try:
-            # Convert config to dict if needed
             config_dict = None
             if config is not None:
                 if isinstance(config, dict):
@@ -382,7 +377,6 @@ class UniRLWandBLogger:
             if self.entity:
                 init_kwargs["entity"] = self.entity
             if self.run_id:
-                # Resume the checkpoint's run ("allow": append if the id exists, else create it) so curves continue in one run.
                 init_kwargs["id"] = self.run_id
                 init_kwargs["resume"] = "allow"
             wandb.init(**init_kwargs)
@@ -399,10 +393,9 @@ class UniRLWandBLogger:
         try:
             wandb.define_metric("train/step")
             wandb.define_metric("train/*", step_metric="train/step")
-            # Two-level train namespaces (unified-model logs train/ar/* and train/image/* per optimizer update) bound EXPLICITLY: a "train/*" glob may not match across the extra "/", which silently drops these onto wandb's global Step → the per-update curves (e.g. image/rn_raw_ratio_mean) then render on the wrong, faster axis (every wandb.log call) instead of train/step (every optimizer update).
+            # Bind nested train metrics explicitly so W&B uses train/step.
             wandb.define_metric("train/ar/*", step_metric="train/step")
             wandb.define_metric("train/image/*", step_metric="train/step")
-            # rollout/step tracks the outer rollout-train loop step. It behaves like a framework-level global step, but is not the same thing as optimizer update count when one rollout yields multiple updates.
             wandb.define_metric("rollout/step")
             wandb.define_metric("rollout/*", step_metric="rollout/step")
             wandb.define_metric("perf/*", step_metric="rollout/step")
@@ -654,7 +647,6 @@ class UniRLWandBLogger:
                         .permute(1, 0, 2, 3)
                         .numpy()
                     )
-                    # Mux audio into mp4 when available (T2AV); otherwise plain array.
                     audio_wf = audios[idx] if idx < len(audios) else None
                     if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
                         arr_hwc = arr.transpose(0, 2, 3, 1)
@@ -670,7 +662,6 @@ class UniRLWandBLogger:
         except Exception as e:
             print(f"Warning: Failed to log generated media: {e}")
         finally:
-            # wandb.Video copies the file into the run dir on construction, so the temp mp4s are safe to remove once logging is done. Avoids leaking a /tmp mp4 per muxed sample every media-log step.
             for _p in _muxed_paths:
                 try:
                     os.unlink(_p)
@@ -740,11 +731,9 @@ class UniRLWandBLogger:
         previews via :meth:`log_generated_media` at this same step value and
         frees them before dispatch.
         """
-        # Memory step boundary runs BEFORE the wandb early-out: the closing probe re-arms peak counters and fires snapshot dumps (Level 2), neither of which should depend on wandb being enabled.
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
             return
-        # Lazy import keeps wandb_logger importable without the training stack.
         from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
         step = rollout_id + 1
@@ -792,7 +781,6 @@ class UniRLWandBLogger:
             return
 
         if isinstance(results, dict):
-            # Per track: an ordered list of per-update metric dicts — a multi-update track uses ``per_update``, a single-update track its one aggregate.
             per_track_updates: Dict[str, List[Dict[str, Any]]] = {}
             for name, result in results.items():
                 per_update = getattr(result, "per_update", ()) or ()
@@ -873,7 +861,6 @@ class UniRLWandBLogger:
                     parts += f"±{ratio_std:.4f}"
             if clip_fraction is not None:
                 parts += f" clip={clip_fraction:.2f}"
-            # Rollout↔replay alignment gate (AR): k3 KL surrogate + |Δlogp|. On an on-policy first update both are ~0; they surface a temperature / weight-sync / position-encoding mismatch that ratio alone hides.
             k3_mean = _metric(metrics, "k3_mean")
             absdiff_mean = _metric(metrics, "rollout_replay_logp_absdiff_mean")
             if k3_mean is not None:
@@ -1012,7 +999,6 @@ def aggregate_stage_results(results: List[Any]) -> Dict[str, float]:
     """
     if not results:
         return {}
-    # Lazy import — keeps wandb_logger.py importable without pulling in the training stack on cold paths (e.g. tests).
     from unirl.utils.misc import aggregate_numeric_metrics
 
     per_actor_dicts: List[Dict[str, Any]] = []

@@ -32,7 +32,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 SCAN_DIRS = ["examples", "experimental", "CPPO", "DRPO", "FlowDPPO", "unirl"]
 SKIP_PARTS = {".git", "vendor"}
-# The only packages ``_TARGET_RE`` accepts, so the only ones worth indexing; the regex alternation is derived from this tuple so the two cannot drift apart.
 PACKAGES = ("unirl", "experimental")
 
 _TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?((?:%s)\.[A-Za-z0-9_.]+)['"]?\s*$""" % "|".join(PACKAGES))
@@ -61,7 +60,6 @@ def _scan() -> tuple[dict[str, Path], list[Path]]:
                         modules[".".join((*parts, stem))] = path
                 elif not skipped and fnmatch.fnmatch(name, "*.y*ml"):
                     recipes.append(path)
-    # A module file shadows a package of the same name, keeping the probe order this check has always used (``pkg/sub.py`` before ``pkg/sub/__init__.py``); note that Python's own import machinery resolves the other way round.
     return {**packages, **modules}, sorted(recipes)
 
 
@@ -129,7 +127,6 @@ def main() -> int:
         if names is None or hit[1] not in names:
             failures.append(f"{path.relative_to(ROOT)}:{lineno}: unresolved _target_ '{dotted}'")
         if dotted.startswith("experimental."):
-            # Tier direction: only experimental's own recipes may wire experimental code, and only within their own package (mirrors check_experimental_boundaries).
             rel = path.relative_to(ROOT)
             if rel.parts[0] != "experimental":
                 tier.append(

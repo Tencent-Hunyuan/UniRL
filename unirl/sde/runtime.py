@@ -400,7 +400,6 @@ class FlowMatchSchedulePolicy:
         I.4). Each Pipeline's ``build_schedule_policy()`` knows its own
         dynamic-shift posture and passes the right hints.
         """
-        # Local JSON dir unreadable — either no path given, or an HF repo ID not yet on disk. Both fall back the same way: require_dynamic → build from overrides (raises if absent); otherwise static-only.
         root = Path(path) if path is not None else None
         if root is None or not root.exists():
             if require_dynamic:
@@ -419,7 +418,6 @@ class FlowMatchSchedulePolicy:
         sched_path = root / "scheduler" / "scheduler_config.json"
         sched = _read_json(sched_path)
         if sched is None:
-            # Dynamic-shift information lives in this JSON; silent fallback to static would mis-shift a dynamic-shift model (caught by ``verify_engine_used_sigmas`` at rollout time but worth surfacing here so the cause is obvious in logs).
             logger.warning(
                 "FlowMatchSchedulePolicy.from_pretrained: %s not found; "
                 "dynamic-shift fields default to static-only behavior. "

@@ -43,7 +43,6 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
-# Tags backed up to CPU rather than dropped.
 _CPU_BACKUP_TAGS = ("vae", "text_encoder")
 
 
@@ -91,7 +90,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             config.populate_conditions,
         )
 
-        # Ports — engine-reserved on this node at the last moment before the spawn.
         if config.local_mode and ports is None:
             ports = SGLangDiffusionPorts.reserve()
 
@@ -114,7 +112,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
 
         self.schedule_policy = self.adapter.schedule_policy()
 
-        # The DiffGenerator backend is synchronous and its scheduler client is not request-concurrent-safe; the lock serializes concurrent generate callers.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -139,7 +136,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             int(gen.batch_size) > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        # σ SSOT: pin once onto the gen part's (shared) sampling_params, so every forward-batch chunk sees the same schedule.
         self._ensure_sample_sigmas(sample)
 
         fbs = self.cfg.forward_batch_size
@@ -147,7 +143,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
-        # Slice the gen frontier into chunks; ``replace_frontier`` keeps the input part(s) whole (mirrors trainside; preserves any chained inputs).
         gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
@@ -213,16 +208,13 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             base_seed=int(diffusion.seed),
         )
 
-    # Lifecycle — the offload flag lives here; decorators re-applied (synchronous.py footgun)
-
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        # Idempotent, symmetric with ``wake_up``: a second ``sleep()`` while already offloaded would issue ``release_memory_occupation`` to the scheduler twice.
+        # Skip duplicate sleep calls because memory release is not idempotent.
         if self._is_offloaded:
             return
         self._backend.release_memory(tags=_OFFLOAD_TAGS, cpu_backup_tags=_CPU_BACKUP_TAGS)
         self._is_offloaded = True
-        # The released tags include the transformer weights → the loaded LoRA pool is gone; the next weight sync must re-push.
         self._weight_sync.mark_weights_released()
         logger.info("sglang_diffusion engine slept (release_memory_occupation).")
 
@@ -238,7 +230,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
         return self._is_offloaded
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
-        # Diffusion release/resume is all-or-nothing on one tag set, so onloading weights == waking.
         del track_prefix
         self.wake_up()
 
@@ -254,8 +245,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True
-
-    # Weight sync — frozen synchronous.py surface; thin forwards to the component. Un-decorated: reached per worker via the raw ``Worker.call`` RPC, not through ``@distributed``.
 
     def update_weights_from_tensor(
         self,
@@ -343,8 +332,6 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed before generate."""
         return self._weight_sync.lora_dirty
-
-    # ``update_weights_from_ipc`` is deliberately NOT defined — the base raises NotImplementedError (SGLang has no bucketed-IPC receiver).
 
 
 __all__ = ["SGLangDiffusionRolloutEngine"]

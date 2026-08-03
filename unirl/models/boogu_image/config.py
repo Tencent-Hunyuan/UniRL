@@ -49,7 +49,6 @@ class BooguImagePipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on DiffusionSamplingParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
@@ -63,15 +62,12 @@ class BooguImagePipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Separate-engine recipes can skip loading the frozen Qwen3-VL encoder on actors that never embed text (qwen_image precedent).
     load_text_encoder: bool = True
 
     load_vae: bool = True
 
-    # Build the 10.29B DiT on the meta device and materialize per-rank shards after FSDP wrapping (avoids the per-rank full-model load spike). Boogu's transformer has no registered buffers or init-computed plain tensors, so this is the trivial ``finalize_meta_init`` case.
     meta_init_transformer: bool = False
 
-    # Vendored attention processors are pinned to SDPA; "flash2_varlen" requests a post-load processor swap (identical parameter names, so checkpoints/LoRA are backend-independent).
     attention_backend: str = "sdpa"
 
     def __post_init__(self) -> None:

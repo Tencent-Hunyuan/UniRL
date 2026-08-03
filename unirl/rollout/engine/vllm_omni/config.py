@@ -58,25 +58,19 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
         return VLLMOmniRolloutEngine(config=self, **deps)
 
-    # Required: model checkpoint path.
     model_path: str = MISSING
-    # Adapter registry key — one of ``registered_adapters()`` (family-namespaced, e.g. ``hi3_t2i``). Kept as ``str`` because OmegaConf structured configs reject ``Literal[...]``; ``__post_init__`` validates against the live registry.
     modality: str = "hi3_t2i"
 
-    # Overlay ``enable_sleep_mode: True`` onto each stage's ``engine_args`` at boot so worker.sleep()/wake_up() (level 2) can run. Disable to fall back to the upstream YAML defaults (CuMemAllocator pool off, sleep raises).
     enable_sleep_mode: bool = True
 
     stage_yaml_override: Optional[str] = None
 
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
-    # Adapter-side cap used when an anchored engine is created without the training model config. Multimodal prompts cannot be truncated safely.
     max_prompt_length: Optional[int] = None
-    # Explicit Qwen3-Omni processor settings. These duplicate the bundle-side values intentionally: anchored rollout actors must not silently fall back when model_config wiring changes.
     video_fps: Optional[float] = None
     video_max_pixels: Optional[int] = None
     use_audio_in_video: Optional[bool] = None
-    # Model chat-template kwargs. AgenticRolloutEngine injects environment tool schemas here before constructing the inner engine; adapters that do not use a chat template ignore the field.
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -120,7 +114,6 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             "enable_sleep_mode": bool(self.enable_sleep_mode),
             "ports": ports,
         }
-        # Adapter boot extras: stage_yaml / stage_yaml_source / needs_driver_tokenizer / clear_cuda_visible.
         intent.update(extra)
 
         if self.stage_yaml_override:

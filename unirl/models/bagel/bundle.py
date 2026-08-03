@@ -72,7 +72,6 @@ class BagelBundle(Bundle):
         super().__init__()
         self.config = config
         self.model = model
-        # The trainable MoT (where the *_moe_gen experts live). Same object the vendored generate_image / _forward_flow run on, so FSDP2 fully_shard (in-place) on this reference shards the gen forward too.
         self.transformer = model.language_model
         self.vae = vae
         self.tokenizer = tokenizer
@@ -143,7 +142,6 @@ class BagelBundle(Bundle):
             if config.enable_vit:
                 model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 
-        # force_hooks=True attaches accelerate AlignDevicesHooks (matching flow_grpo/train_bagel.py) so the vendored inferencer / generate_image path — which builds packed index tensors on CPU and calls submodule forwards directly — has its inputs auto-moved to the model device. Phase 6 (UniRL FSDP) must remove these hooks before fully_shard (accelerate.hooks.remove_hook_from_module(model, recurse=True)).
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_dir, "ema.safetensors"),
@@ -157,16 +155,14 @@ class BagelBundle(Bundle):
         tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        # Image transforms (image-conditioned paths only; pure T2I never exercises them, but the inferencer constructor requires both). NB: the ViT resize STRIDE must equal the SigLIP patch size (14) — patchify() asserts h % patch_size == 0, so a stride that is not a multiple of 14 makes non-square image inputs crash. flow_grpo's stride 7 (half a patch) is that bug; use 14 to keep resized dims patch-aligned.
         vae_transform = ImageTransform(512, 256, 8)
         vit_transform = ImageTransform(490, 112, 14)
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)
-        # Freeze the whole MoT. Full fine-tuning (use_lora=False) instead unfreezes the MoT decoder blocks below.
         model.requires_grad_(False)
         if not config.use_lora:
-            # Full fine-tuning: unfreeze ONLY the Qwen2MoTDecoderLayer blocks (the und + gen experts) — the exact set the backend FSDP-wraps (block_class_names=[BAGEL_FSDP_BLOCK_CLASS]). embed/norm/lm_head, the VAE and the gen heads stay frozen so (a) the trainable set == the sharded block set and (b) the unsharded leftovers (root_wrap=false) carry no grad — which keeps fsdp_wrap's no-root-wrap DP-sync guard satisfied. The backend (no lora_cfg) then builds the optimizer over these params; per-expert LRs (param_group_lrs={moe_gen: ...}) match by name exactly as in the LoRA path. fsdp_wrap reads requires_grad here to decide the fp32-master upcast, so this MUST run before the backend wrap.
+            # Unfreeze decoder blocks before FSDP wrapping so trainable and sharded parameter sets match.
             n_blocks = 0
             for module in model.language_model.modules():
                 if type(module).__name__ == BAGEL_FSDP_BLOCK_CLASS:

@@ -74,7 +74,6 @@ class LTX2Bundle(Bundle):
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
-        # Frozen non-trainable components (VAE / Gemma3 / connectors) optionally stay on CPU — for sglang-rollout configs the trainside never invokes them, and parking them off-GPU frees the headroom the sglang DiT-resume needs in colocate. The trainable transformer always loads to ``device``.
         aux_device = torch.device("cpu") if getattr(config, "aux_components_on_cpu", False) else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
@@ -93,7 +92,6 @@ class LTX2Bundle(Bundle):
         )
         vae.requires_grad_(False)
 
-        # Text encoder — Gemma3 (frozen). LTX-2 uses Gemma-3-12B whose config is nested (text_config/vision_config); loading it with the v1 GemmaForCausalLM class crashes in GenerationConfig.from_model_config ('dict' has no attribute 'to_dict').
         text_encoder = (
             Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
             .to(aux_device)
@@ -103,7 +101,6 @@ class LTX2Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        # Connectors (Gemma per-layer hidden states → video/audio text embeddings, frozen). REQUIRED for LTX-2.0: the DiT was trained on connector outputs, not raw Gemma hidden states — diffusers declares ``connectors`` in the pipeline's component sequence.
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
         connectors = (
@@ -120,7 +117,6 @@ class LTX2Bundle(Bundle):
                 from diffusers import AutoencoderKLLTX2Audio
                 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 
-                # low_cpu_mem_usage=False: the vocoder holds non-persistent anti-alias filter buffers (``*.upsample.filter`` / ``*.downsample.filter``) that are computed at init, NOT stored in the checkpoint. With the default meta-device load path those buffers stay on ``meta`` (HF warns "newly initialized"), and the subsequent ``.to(device)`` raises "Cannot copy out of meta tensor".
                 audio_vae = (
                     AutoencoderKLLTX2Audio.from_pretrained(
                         path, subfolder="audio_vae", torch_dtype=vae_dtype, low_cpu_mem_usage=False

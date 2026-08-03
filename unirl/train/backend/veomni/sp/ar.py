@@ -69,7 +69,6 @@ def apply_ar_sequence_parallelism(model: nn.Module, sp_size: int) -> None:
     sp_attn_impl = _select_sp_attn_impl()
     _install_b1_dense_attn_patch(sp_attn_impl)
 
-    # Set the SP attn impl on the model config and every sub-config that carries one (transformers resolves the attention fn per-forward via this field, so setting it on the already-built model re-dispatches).
     _set_attn_impl(model.config, sp_attn_impl)
     for m in model.modules():
         cfg = getattr(m, "config", None)
@@ -119,7 +118,6 @@ def _install_b1_dense_attn_patch(sp_attn_impl: str) -> None:
         return
 
     _PACK_KEYS = (
-        # Local-length hints to strip for B=1; the last two are alt-spellings absent from the 5.x signature, popped defensively against renames.
         "position_ids",
         "cu_seq_lens_q",
         "cu_seq_lens_k",

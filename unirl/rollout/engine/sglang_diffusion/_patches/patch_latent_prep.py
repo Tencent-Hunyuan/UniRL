@@ -76,11 +76,9 @@ def patch_latent_prep() -> None:
     def forward(self, batch, server_args):
         latents = getattr(batch, "latents", None)
 
-        # Pure randn branch: upstream handles shape/ids/packing correctly.
         if latents is None or not torch.is_tensor(latents):
             return orig(self, batch, server_args)
 
-        # Provided-latents branch: drive the same sequence the randn branch runs, so packed pipelines (FLUX.2-Klein etc.) get batch.latent_ids populated and batch.latents arrives at DenoisingStage in packed form.
         device = get_local_torch_device()
         batch_size = int(batch.batch_size)
         nopp = int(getattr(batch, "num_outputs_per_prompt", 1) or 1)
@@ -88,7 +86,6 @@ def patch_latent_prep() -> None:
 
         latents = _expand_initial_noise(latents, batch_size, nopp).to(device=device)
 
-        # Insert the singleton frame axis for image-form 5-D DiTs (Z-Image). The driver ships frame-less image-form noise [B, C, H, W] (from the model's latent_shape), but Z-Image's S3-DiT denoises in 5-D [B, C, 1, H, W]: ``ZImageTransformer2DModel._as_image_list`` treats a 4-D tensor as a SINGLE [C, F, H, W] image, folding the 16 channels into the token count so the x_embedder matmul fails.
         try:
             num_frames = int(getattr(batch, "num_frames", 1) or 1)
             expected = tuple(int(d) for d in pcfg.prepare_latent_shape(batch, batch_size, num_frames))
@@ -101,7 +98,6 @@ def patch_latent_prep() -> None:
             ):
                 latents = latents.reshape(expected)
         except Exception as exc:  # pragma: no cover - defensive; preserve prior behavior on any failure
-            # Surface at normal log level (not _DEBUG-gated): a swallowed reconcile leaves un-reshaped latents that fail later inside the DiT, far from here.
             logger.warning("latent_prep frame-axis reconcile skipped: %s: %s", type(exc).__name__, exc)
 
         latent_ids = pcfg.maybe_prepare_latent_ids(latents)
@@ -162,7 +158,6 @@ def _patch_grouped_initial_noise_slice() -> None:
                 audio_shape = getattr(audio_lat, "shape", None)
                 if audio_lat is not None and audio_shape is not None and len(audio_shape) >= 1 and audio_shape[0] == n:
                     req.audio_latents = audio_lat[i : i + 1]
-                # denoise_seeds [K] -> [this output's seed] (the per-step generator list is built from it; len must equal the per-output batch=1). This per-Req slice is what makes each sample's SDE noise independent (with sample_ids keys) -- the missing-rename of this block is what crashed the B=1 grouped forward (LIN-365).
                 seeds = getattr(req, "denoise_seeds", None)
                 if isinstance(seeds, (list, tuple)) and len(seeds) == n:
                     req.denoise_seeds = [seeds[i]]

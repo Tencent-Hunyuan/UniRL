@@ -75,7 +75,6 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         prompt_embeds = text.embeds.to(dev)
         pooled_prompt_embeds = text.pooled.to(dev) if text.pooled is not None else None
 
-        # Cast latent/embeds to the transformer's param dtype before the bf16 pos_embed conv — autocast doesn't reliably catch the first conv input under FSDP2 wrap (the DiffusionNFT forward-process path hits this; GRPO/FlowDPPO replay feeds already-bf16 latents). Idempotent when dtype matches.
         try:
             model_dtype = next(model.transformer.parameters()).dtype
         except StopIteration:
@@ -272,7 +271,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         self.latent_channels = latent_channels
-        # Batched-step replay: stack all S SDE steps into one [S*B] transformer forward (+ vectorized SDE transition), cutting per-replay forwards / FSDP all-gathers from S to 1. Under old_logp_source='replay' the anchor and train forward share this path, so the on-policy ratio stays exactly 1.
         self.batch_replay_steps = batch_replay_steps
 
     def diffuse(
@@ -337,7 +335,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
         sde_sorted: List[int] = sorted(sde_set)
 
-        # Stored positions: SDE pairs ∪ {T} so VAE decode always has the clean latent.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
 
@@ -433,7 +430,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
                 f"SD3DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
             )
 
-        # Dedicated-engine (vLLM-Omni) rollouts hand the trajectory back on CPU; pin replay to the model's (CUDA) device so the forward and the autocast context match the transformer weights.
         device = torch.device(self.model.device)
         sigmas = segment.sigmas.to(device)
         sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
@@ -444,7 +440,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
             else nullcontext()
         )
 
-        # Fast path (see batch_replay_steps in __init__): stateless SDE strategies only (step_index unused by .step), and only when S > 1.
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
                 return self._replay_batched_steps(
@@ -546,7 +541,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
                 "SD3DiffusionStage._replay_batched_steps: strategy returned None log-prob "
                 "(deterministic mode); batched replay requires a stochastic SDE strategy."
             )
-        # [S*B] -> [S, B] -> [B, S] so slot s aligns with segment.sde_logp ordering.
         log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
         means_t = None
         if prev_mean_all is not None:

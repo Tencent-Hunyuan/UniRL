@@ -19,7 +19,6 @@ DIFFRL_LORA_INT_ID: int = 1
 DIFFRL_LORA_NAME: str = "diffrl_lora"
 DIFFRL_LORA_PATH: str = "diffrl_lora_in_memory"
 
-# Default ZMQ-IPC root. Override per call by passing zmq_handle directly or by setting DIFFRL_IPC_DIR in the env before construction.
 _DEFAULT_IPC_DIR: str = os.environ.get("DIFFRL_IPC_DIR", "/tmp")
 
 

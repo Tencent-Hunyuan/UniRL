@@ -34,7 +34,6 @@ from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
 
-# SGLang ``finish_reason`` → terminal :class:`SegmentStatus` (LIN-531). The agentic rollout engine reads this per-candidate status to tell a *terminal* turn (COMPLETED / TRUNCATED / ABORTED) apart from an unfinished one; unknown reasons (or a partial carrying none) fall back to PENDING.
 _FINISH_TO_STATUS = {
     "stop": SegmentStatus.COMPLETED,
     "length": SegmentStatus.TRUNCATED,
@@ -79,7 +78,6 @@ class TextLMAdapter(ModelAdapter):
         prompt_token_ids: List[List[int]] = []
 
         if use_template:
-            # Render the whole trajectory (role-tagged turns), de-expanded to the unique conversations the backend fans out ``n`` per. Degenerates to a single user turn on single-turn requests (byte-identical to before).
             conversations, k = build_text_conversations(sample, sampling.system_instruction)
             require(
                 k == sampling.n,
@@ -94,7 +92,6 @@ class TextLMAdapter(ModelAdapter):
                 prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
-            # Raw-text completion mode — no chat template, so no roles/turns: encode the raw prompt so the replay's prompt condition still carries the ids the server tokenized.
             for prompt in self.extract_prompts(sample):
                 payload = self.base_payload(sampling)
                 payload["text"] = prompt
@@ -138,7 +135,6 @@ class TextLMAdapter(ModelAdapter):
         (bad ``chat_template_kwargs``, jinja error) is a config bug — silently
         switching the run's prompt format would corrupt training.
         """
-        # tokenize=True + return_dict=False yields a bare List[int]. transformers >=5 defaults return_dict=True, handing back a BatchEncoding that then leaks into the JSON /generate payload ("Object of type BatchEncoding is not JSON serializable").
         template_kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
             "tokenize": True,
@@ -183,7 +179,6 @@ class TextLMAdapter(ModelAdapter):
             conditions=self.build_conditions(sample, prepared, raw),
             status=self.build_status(raw),
         )
-        # Preserve every input Part: multi-input multimodal chains image / cot_text input Parts before the gen shell, so the filled gen Part's parent id must stay in the returned chain (text-only: parts[:-1] == [head], unchanged).
         return Sample(parts=[*sample.parts[:-1], filled])
 
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:

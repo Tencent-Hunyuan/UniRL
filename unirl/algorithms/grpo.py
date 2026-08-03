@@ -60,7 +60,6 @@ class GRPO(StageAlgorithm):
             :class:`ARSamplingParams` default when no engine is configured.
     """
 
-    # old_logp is the rollout (SGLang) log-prob, which is frozen on the segment and does NOT change across mini-batch updates — so reusing it across num_updates_per_batch>1 is the deliberate rollout-anchored PPO ratio (verl bypass_mode=True parity), matching DRPO.
     supports_multi_update = True
 
     def __init__(

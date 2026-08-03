@@ -170,7 +170,7 @@ def _patch_rollout_variance_noise_device() -> None:
         local_shape = tuple(model_output.shape)
         B = local_shape[0]
         if isinstance(generator, torch.Generator):
-            # Fallback: the denoise_seeds AROUND-wrap on ``DenoisingStage._run_denoising_step`` did not fire (a model-specific stage subclass overrode the method), so upstream's default ``extra_step_kwargs["generator"] = batch.generator`` reached us. Fix (mirrors ``BagelFlowSDEScheduler.step`` in ``vllm_omni/pipelines/bagel/bagel_flow_match_sde_scheduler.py``): replace the shared generator with a per-request generator seeded deterministically from ``(base_seed, sample_id)`` via ``_resolve_fallback_seed`` so it stays reproducible AND per-sample independent (``os.urandom`` only when no stable key exists).
+            # Seed fallback generators per request when a subclass bypasses the denoising wrapper.
             assert B == 1, "Generator must be a list if batch size is not 1"
             gen = getattr(batch, "_unirl_noise_gen", None)
             if gen is None:

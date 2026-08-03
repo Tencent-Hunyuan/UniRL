@@ -90,7 +90,6 @@ class FieldKind(Enum):
 
 _REDUCTION_KINDS = frozenset({FieldKind.MAX, FieldKind.MIN, FieldKind.SUM, FieldKind.MEAN})
 
-# Cache of dataclasses.field's accepted kwargs so the generic ``field()`` below can route arbitrary keyword args between dc.field params and free-form metadata.
 _DC_FIELD_PARAMS = frozenset(_inspect.signature(_dc_field).parameters)
 
 
@@ -443,7 +442,6 @@ def _concat_packed_data(values: List[Optional[torch.Tensor]]) -> Optional[torch.
     if not non_none:
         return None
     if all(isinstance(v, Batch) for v in non_none):
-        # Transport placeholders (e.g. TensorRef returned from a DP_SCATTER dispatch) carry routing handles, not real tensors — defer to their own concat, exactly like _concat_value's Batch branch. A raw torch.cat would choke on them ("expected Tensor ... but got TensorRef").
         return type(non_none[0]).concat(non_none)
     return torch.cat(non_none, dim=0)
 
@@ -544,7 +542,6 @@ class Batch:
     properties; there is no setter and no constructor argument.
     """
 
-    # Hidden cumulative-offsets metadata for ``packed_field`` values on this instance. Never set directly by user code — read via :attr:`cu_seqlens` / :attr:`lengths`.
     _packed_cu_seqlens: Optional[torch.Tensor] = None
 
     @property

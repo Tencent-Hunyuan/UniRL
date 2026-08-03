@@ -16,7 +16,7 @@ from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_sam
 
 logger = logging.getLogger(__name__)
 
-# Upper bound (seconds) on the teardown checkpoint/weight-sync flush, applied ONLY on the exception path. A healthy exit (Ctrl-C, a driver-side error) drains an in-flight async DCP save well within this; a worker wedged in an NCCL collective (e.g. one that OOM'd mid-backward) cannot service the flush's ray.get, so the bound stops it hanging forever and masking the primary exception.
+# Bound exception-path flushes so wedged workers cannot mask the primary error.
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
 
 
@@ -141,7 +141,6 @@ class BaseTrainer:
         cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
     ) -> None:
-        # Device topology and tensor transport are driven entirely by top-level cfg keys (num_devices / devices_per_node / workers_per_device / transport_kind / transfer_queue), so the base owns the whole pool + TransferQueue bootstrap here. Subclasses never thread these through: they hand us ``cfg`` and get the configured pool for free.
         self.num_devices = cfg.num_devices
         self.pool = DevicePool(
             num_devices=cfg.num_devices,
@@ -149,28 +148,22 @@ class BaseTrainer:
             workers_per_device=int(cfg.get("workers_per_device", 1)),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
-            # Default 1 keeps every existing trainer's single-threaded-actor semantics byte-identical; the agentic rollout's rank-0 coordinator opts in (>=3) so it can run generate + its own drain + serve next_task pulls concurrently on a threaded Worker (LIN-519/LIN-522).
             worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
         )
         self.pool.setup()
 
-        # Driver/rank-0 wandb logger. Starts as a disabled null-object so trainers can call ``self.wandb_logger.X(...)`` without guards even before _init_wandb runs; _init_wandb replaces it with the configured (possibly live) logger.
         from unirl.utils.wandb_logger import UniRLWandBLogger
 
         self.logging_cfg = logging_cfg
         self.wandb_logger = UniRLWandBLogger(enabled=False)
-        # Driver-side state from a resumed checkpoint's trainer_state.json (wandb run id / step axis); populated by maybe_load_checkpoint, consumed by _init_wandb.
         self._resume_state: Dict[str, Any] = {}
 
-        # Reclaim per-rollout transport buffers after every train_step, centrally, so each subclass train loop doesn't have to remember to.
         self._install_train_step_reset_hook()
 
-        # Time the standard step collaborators (rollout / weight_sync / reward / stack) and surface them as perf/<phase>_time_s, centrally, so every trainer gets step attribution without per-trainer edits.
         from unirl.utils.wandb_logger import install_phase_timing
 
         install_phase_timing(self)
 
-        # verl-parity memory monitoring (perf/max_memory_* + [mem] boundary lines). Only constructed here — the collaborators to wrap don't exist until the subclass __init__ finishes, so install() runs in _init_wandb.
         from unirl.utils.memory_monitor import install_memory_monitoring
 
         self._memory_monitor = install_memory_monitoring(self)
@@ -305,7 +298,6 @@ class BaseTrainer:
             from unirl.types.media_preview import build_media_preview_for_part
 
             multi = len(gen_parts) > 1
-            # Frontier-aligned conditioning: captions (the prompt Texts) + the it2i source image (the chained image input Part), row-aligned 1:1 with the frontier gen samples — exactly what the preview pairs.
             cond = sample.conditioning()
             default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
             input_image = next((c for c in cond if isinstance(c, Images)), None)
@@ -313,7 +305,6 @@ class BaseTrainer:
                 name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
                 preview = part.media_preview
                 if preview is None and part.primitives:
-                    # default_prompts is frontier-aligned (Sample.conditioning), so caption only the frontier gen Part; a non-frontier image Part (none today — the non-frontier AR Part is text → returns None) would otherwise be paired with the wrong-length caption list.
                     preview = build_media_preview_for_part(
                         part=part,
                         max_items=wb.media_max_items,
@@ -367,7 +358,7 @@ class BaseTrainer:
     def _finish_wandb(self) -> None:
         """Flush pending work, clean transport artifacts, and close wandb."""
         active_exception = sys.exc_info()[0] is not None
-        # On the exception path, bound the flush's ray.get: a worker wedged in an NCCL collective (e.g. one that OOM'd mid-backward) can't service it, so an unbounded flush would hang forever and mask the primary exception. A healthy crash (Ctrl-C, a driver-side error) still drains the in-flight async DCP save -- well within the bound -- so the last checkpoint is not left half-written.
+        # Bound teardown flushes so wedged workers cannot mask the primary exception.
         timeout = _TEARDOWN_FLUSH_TIMEOUT_S if active_exception else None
         try:
             self._wait_for_checkpoints(timeout=timeout)
@@ -375,7 +366,6 @@ class BaseTrainer:
         except Exception:
             if not active_exception:
                 raise
-            # GetTimeoutError (a wedged worker) or any flush error: keep the primary exception, just record the failed best-effort flush.
             logger.exception("Failed to flush checkpoint/weight-sync state during trainer teardown")
         finally:
             if self.wandb_logger is not None:
@@ -414,13 +404,11 @@ class BaseTrainer:
         self.backend.save(path, step=step, mode=save_mode)
         if self._memory_monitor is not None:
             self._memory_monitor.boundary("ckpt_save:end", self.backend)
-        # Driver-owned state rides beside the worker-written checkpoint data: the wandb run id + train/ step axis let a resume append to the SAME wandb run instead of starting a fresh, misaligned one.
         trainer_state_path = os.path.join(path, "trainer_state.json")
         trainer_state_tmp = f"{trainer_state_path}.tmp"
         with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
         os.replace(trainer_state_tmp, trainer_state_path)
-        # An async DCP save (checkpoint_format="dcp" + checkpoint_async) writes its shards on a background thread, normally drained by the next save. The final checkpoint has no next save, so block until it is on disk before train() returns and the workers are torn down.
         if step >= num_rollouts:
             self._wait_for_checkpoints()
 

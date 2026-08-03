@@ -117,9 +117,7 @@ class BagelPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
-        # Encode side of the codec (target images → packed clean latents). Rollout never calls it; diffusion SFT does.
         self.vae_encode = BagelVAEEncodeStage(bundle)
-        # AR (text-out) stage for t2t / i2t / it2t; resolvable via the trainside engine's ``stage_attrs=["ar"]``. Shares the bundle (same MoT root).
         self.ar = BagelARStage(
             model=bundle,
             autocast_precision=autocast_precision,
@@ -127,7 +125,6 @@ class BagelPipeline(Pipeline):
             replay_mode=replay_mode,
         )
         self.autocast_precision = autocast_precision
-        # FlowMatch time-shift for the σ schedule policy (read by the hosting engine via build_schedule_policy → ensure_sample_sigmas).
         self.shift = shift
         cache_config = getattr(bundle, "config", None)
         cache_t2i_contexts = (
@@ -283,7 +280,6 @@ class BagelPipeline(Pipeline):
         inf = self.bundle.inferencer
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        # eval() is load-bearing (same contract as ``BagelDiffusionStage._build_contexts_from_prompt`` and ``rl_ops.forward_flow``): navit dispatches ``forward_train`` vs ``forward_inference`` on ``self.training`` and these prefills use the packed-query inference signature — in train() they TypeError. SFT/trainside callers can reach here mid-training, so guard and restore rather than assume the mode.
         mot = self.bundle.transformer
         was_training = mot.training
         mot.eval()
@@ -472,7 +468,6 @@ class BagelPipeline(Pipeline):
         image_shape = (int(params.height), int(params.width))
 
         if task == "t2i" and pil_images is None and self._t2i_cache_enabled():
-            # Image-free path: dedup the prompt prefill across the N identical GRPO siblings (frozen und → contexts are prompt-only + run-stable).
             contexts = [self._build_contexts_cached(prompt) for prompt in prompts]
         else:
             contexts = [
@@ -606,11 +601,9 @@ class BagelPipeline(Pipeline):
         for i in range(n):
             splits: List[Dict[str, Any]] = []
             if pil_images is not None:
-                # Understanding preproc chain (inferencer.py:249-250, vae=False): rgb → vae resize → vit_transform; store the FINAL pixels so rollout and replay consume byte-identical inputs.
                 img = self._resize_input_image(pil_images[i])
                 splits.append({"kind": "vit", "image": self.bundle.vit_transform(img)})
             if prompts is not None:
-                # bos/eos (<|im_start|>/<|im_end|>) wrap, as prepare_prompts does (vendor bagel.py:246) — stored wrapped so replay is tokenizer-free.
                 ids = [ntk["bos_token_id"]] + tokenizer.encode(prompts[i]) + [ntk["eos_token_id"]]
                 splits.append({"kind": "text", "ids": torch.tensor(ids, dtype=torch.long)})
             splits_per_sample.append(splits)
@@ -694,7 +687,6 @@ class BagelPipeline(Pipeline):
                 "the hosting engine must pin the schedule before generate."
             )
 
-        # Resolve prompts against the AR frontier, not the final image frontier: Sample.conditioning always expands ancestors to its current last Part.
         ar_texts = [value for value in sample.conditioning_at(ar_idx) if isinstance(value, Texts)]
         if len(ar_texts) != 1:
             raise TypeError(
@@ -740,7 +732,6 @@ class BagelPipeline(Pipeline):
         )
         partially_filled = sample.with_parts(new_parts)
 
-        # The now-filled AR Part is an ancestor of the image shell, so the conditioning walk expands both prompt and thought from P*N to P*N*M.
         image_texts = [value for value in partially_filled.conditioning() if isinstance(value, Texts)]
         if len(image_texts) < 2:
             raise RuntimeError(

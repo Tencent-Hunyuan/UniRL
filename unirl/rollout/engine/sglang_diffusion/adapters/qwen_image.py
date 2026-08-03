@@ -75,7 +75,5 @@ class QwenImageAdapter(ImageAdapter):
             segment_factory=self.segment_factory,
         )
 
-    # build_condition: inherited from ImageAdapter. If the mask is genuinely absent, trainside replay raises (fail loud) rather than fabricating an all-ones mask that is wrong for mixed-length batches.
-
 
 __all__ = ["QwenImageAdapter"]

@@ -24,7 +24,6 @@ import torch
 MAX_TORCH_SEED = (1 << 63) - 1
 
 
-# Group-id prefix selecting prompt-content seeding: x_T is keyed only on the prompt text (rank/step-independent), so the same prompt yields the same image across steps/checkpoints. Used by eval for reproducible, comparable generations.
 PROMPT_SEED_PREFIX = "prompt:"
 
 
@@ -76,7 +75,6 @@ def derive_denoise_step_seed(base_seed: int, step_index: int, sample_id: str) ->
     """Derive the cross-engine per-sample, per-step SDE-noise seed."""
     payload = (f"{int(base_seed)}::step::{int(step_index)}::sample::{str(sample_id)}").encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
-    # Match the SGLang rollout contract exactly.
     return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
 
 

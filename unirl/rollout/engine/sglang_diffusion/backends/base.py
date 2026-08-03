@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 EncoderOutputs = Union["torch.Tensor", Sequence["torch.Tensor"], None]
 
-# A decoded ``samples`` payload — SGLang returns bare tensors / numpy arrays / PIL images / ``(video, audio)`` 2-tuples without a typed wrapper.
 MediaPayload = Union["torch.Tensor", "np.ndarray", "PILImage", tuple, list, None]
 
 
@@ -61,7 +60,6 @@ class RawResult(Protocol):
     negative_prompt_embeds: EncoderOutputs
     negative_audio_prompt_embeds: EncoderOutputs
     neg_pooled_prompt_embeds: EncoderOutputs
-    # Mask paired with ``negative_prompt_embeds`` — variable-length encoders (Qwen-VL) require it for mask-consuming replay conditioning.
     negative_attention_mask: EncoderOutputs
 
 
@@ -114,8 +112,6 @@ class Backend(Protocol):
         lora_alpha: Optional[float] = None,
     ) -> None: ...
     def weights_checksum(self, *, module_names: List[str]) -> dict: ...
-
-    # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
 
 
 __all__ = ["Backend", "RawResult", "EncoderOutputs", "MediaPayload"]

@@ -54,7 +54,6 @@ class MediaPreview(Batch):
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
-    # Per-sample audio waveforms (mono [L] float32 CPU tensors) for muxing into the mp4 upload. Parallel to ``videos`` — same length.
     audios: List[Any] = concat_field(default_factory=list)
     audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
@@ -167,7 +166,6 @@ def build_media_preview_for_part(
         return None
     limit = max(1, int(max_items))
 
-    # ``decoded`` reaches the driver dehydrated (its tensor leaf is a ``TensorRef`` proxy partitioned by DP shard). Slice to the smallest ref-boundary prefix covering ``limit`` samples, then hydrate only that shard so we pull one shard instead of the full decoded batch.
     from unirl.distributed.tensor import hydrate, map_tree
 
     prefix = _ref_aligned_prefix_len(decoded, limit)
@@ -192,7 +190,6 @@ def build_media_preview_for_part(
             return None
         input_pixels = None
         if isinstance(input_image, Images) and input_image.pixels is not None:
-            # The source image reaches the driver through the same dehydrated transport path as decoded output. Hydrate it before shape checks and indexing; a TensorRef is metadata, not a tensor.
             input_image = map_tree(input_image, hydrate)
             input_pixels = input_image.pixels
         show_edit_pairs = input_pixels is not None and int(input_pixels.shape[0]) >= int(pixels.shape[0])

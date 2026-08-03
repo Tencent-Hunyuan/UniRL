@@ -219,7 +219,6 @@ class TokenBudgetPlanner:
         perm, plan = _arrange_packed(
             samples, num_updates=num_updates, token_budget=self.token_budget, cost_model=self.cost_model
         )
-        # One up-front gather reorders the whole track (segment / conditions / advantages stay sample-aligned) so the packed micros are contiguous.
         return part.select(perm), plan
 
     def validate(self, algorithm: StageAlgorithm) -> None:

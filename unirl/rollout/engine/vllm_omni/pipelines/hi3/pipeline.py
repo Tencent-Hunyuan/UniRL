@@ -70,13 +70,10 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         super().__init__(od_config)
         self._upstream_scheduler = None
-        # Conditioning-tap state: armed (reset) every request, filled by the tap's first per-request call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._pending_initial_noise_recipe: Optional[NoiseRecipe] = None
         self._initial_noise_injector_installed: bool = False
-
-    # install — once per pipeline lifetime, idempotent
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler.
@@ -131,7 +128,6 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         if self._conditioning_tap_installed:
             return
 
-        # Force inner pipeline materialization so the model ref is live.
         _ = self.pipeline
         transformer = self._pipeline.model
 
@@ -196,7 +192,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
                     int(latent_channel),
                     *[int(s) // int(f) for s, f in zip(image_size, factors)],
                 )
-                # The recipe must arrive already aligned to THIS call's batch: the engine ships one gid per single-prompt dit_recaption generate (batch_size=1) and one gid per prompt for batched modalities (batch_size=N). ``batch_size`` here is the un-doubled prompt count (any CFG expansion happens later, inside the denoise loop), so a length mismatch means the engine dispatch forwarded the wrong gid slice — fail loud rather than let for_batch silently slice gids[0] onto every image (the x_T-collapse class of bug).
+                # Reject mismatched noise-group IDs instead of broadcasting the first ID.
                 gids = recipe.noise_group_ids
                 if gids and len(gids) != batch_size:
                     raise RuntimeError(
@@ -205,7 +201,6 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
                         f"The engine must ship gids aligned to the per-call batch (see "
                         f"VLLMOmniRolloutEngine.generate's dit_recaption per-prompt slice)."
                     )
-                # Fill the post-AR shape; gids already match the batch (asserted), so for_batch is a no-op slice. Resolution is shared with the trainside pipelines — only the shape's fill site differs.
                 latents = recipe.for_batch(batch_size, latent_shape=per_sample_shape).resolve(
                     device=device, dtype=dtype
                 )
@@ -213,8 +208,6 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
 
         inner.prepare_latents = injecting
         self._initial_noise_injector_installed = True
-
-    # arm — every request (stale-leak guards)
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
@@ -242,7 +235,6 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
             drain_trajectory_into(out, self.scheduler)
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
-        # ``None`` if upstream's ``prepare_inputs_for_generation`` was never called (unexpected for image modalities) — the driver side treats absence as "old-style" empty conditions and raises with the pipeline_class diagnosis.
         if self._captured_conditioning is not None:
             stamp_custom_output(out, "fused_mm_capture", self._captured_conditioning)
 

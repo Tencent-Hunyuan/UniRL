@@ -39,7 +39,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import BooguImageBundle
 
-# Fixed system prompts — exact strings from the reference pipeline (pipeline_boogu.py:231-232).
 SYSTEM_PROMPT_T2I = (
     "You are a helpful assistant that generates high-quality images based on "
     "user instructions. The instructions are as follows."
@@ -98,7 +97,6 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         dtype = next(bundle.text_encoder.parameters()).dtype
 
         message_lists = [self._messages(prompt) for prompt in prompts]
-        # Exact reference kwargs (pipeline_boogu.py:1299-1308 with the __call__ defaults max_sequence_length=1280, truncation off).
         vlm_inputs = bundle.processor.apply_chat_template(
             message_lists,
             padding="longest",

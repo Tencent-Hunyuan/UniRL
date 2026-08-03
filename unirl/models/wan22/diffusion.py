@@ -148,7 +148,6 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         else:
             sample_cat = sample_cast
 
-        # I2V CLIP-vision: forward ``encoder_hidden_states_image`` only when the slot is populated. WAN 2.2's mainstream checkpoints have ``image_dim == 0`` and never see this kwarg; the composite :class:`WanDualTransformer` transparently routes ``**kwargs`` to both ``high_noise`` and ``low_noise``.
         image_embed = conditions.image_embed
         image_embeds = image_embed.embeds if image_embed is not None and image_embed.embeds is not None else None
         extra: Dict[str, Any] = {}
@@ -420,7 +419,6 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         )
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
-        # Per-stage CFG scale: prefer the request-time value if provided, else fall back to the bundle-time default (which itself defaults to None → reuse the primary guidance scale).
         guidance_scale_2 = (
             params.guidance_scale_2 if params.guidance_scale_2 is not None else self.model.guidance_scale_2
         )
@@ -460,7 +458,6 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp ``modality=VIDEO`` via the factory helper — same reasoning as in WAN 2.1 (see ``models/wan21/diffusion.py``).
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,

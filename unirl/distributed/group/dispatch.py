@@ -32,13 +32,11 @@ if TYPE_CHECKING:
 
 Shard: TypeAlias = Tuple[Tuple[Any, ...], Dict[str, Any]]
 
-# Signature contract for entries in DISPATCH_MODE_REGISTRY["dispatch_fn"].
 DispatchFn: TypeAlias = Callable[
     ["Handle", Tuple[Any, ...], Dict[str, Any], Optional[int]],
     List[Shard],
 ]
 
-# Signature contract for entries in DISPATCH_MODE_REGISTRY["collect_fn"].
 CollectFn: TypeAlias = Callable[["Handle", List[Any]], Any]
 
 
@@ -239,7 +237,6 @@ def resolve_backward_dispatch_mode(
             f"Do not call this method inside enable_grad()."
         )
 
-    # DP_SCATTER_HEAD → DP_SCATTER (all ranks must participate in backward) DP_SCATTER → DP_SCATTER (unchanged)
     return Dispatch.DP_SCATTER
 
 
@@ -284,6 +281,5 @@ def distributed(
         return wrapper
 
     if _func is not None:
-        # Called as @distributed without parentheses
         return decorator(_func)
     return decorator

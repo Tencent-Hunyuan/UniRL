@@ -35,7 +35,6 @@ from .conditions import Qwen3_5ARConditions
 
 logger = logging.getLogger(__name__)
 
-# Qwen3.5 has hybrid attention: 3 GDN (linear_attention) + 1 full per 4 layers. GDN layers do not support flash/flex sparse-block kernels, and UniRL's gate is stage-level (cannot per-layer branch), so packed replay is fully disabled — every replay goes through the dense padded path.
 _SPARSE_PACKED_ATTN: Tuple[str, ...] = ()
 
 
@@ -334,7 +333,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         if igt is not None:
             igt = igt.to(device)
 
-        # VeOmni 0.1.11's patched Qwen3.5-MoE GDN explicitly rejects the one-token cached-update path. Its EP-capable model exposes get_parallel_plan(); recompute the growing prefix there so trainside generation remains correct.
         use_cache = not callable(getattr(transformer, "get_parallel_plan", None))
 
         model_kwargs: Dict[str, Any] = {
@@ -343,7 +341,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             "past_key_values": None,
         }
         if use_cache and pv is not None:
-            # GenerationMixin normally prepares Qwen3.5's 4-D M-RoPE ids before entering its decode loop. This stage owns the loop, so do that setup explicitly and let _update_model_kwargs_for_generation extend position/mm ids one text token at a time.
             model_kwargs["image_grid_thw"] = igt
             model_kwargs["mm_token_type_ids"] = _build_mm_token_type_ids(transformer, input_ids)
             model_kwargs["position_ids"] = transformer._prepare_position_ids_for_generation(
@@ -379,7 +376,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
 
                 model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
             else:
-                # VeOmni GDN fallback: no KV cache, so every forward sees the full prefix and must receive the image inputs and dense sequence boundaries again.
                 model_inputs = {
                     "input_ids": cur_input_ids,
                     "attention_mask": model_kwargs["attention_mask"],
@@ -411,7 +407,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                 next_logits = next_logits.to(device)
 
             token_id, log_prob = step.step(next_logits)
-            # One device→host transfer per step (not per element): per-element .item() in this loop is O(B*N) blocking CUDA syncs.
             token_list = token_id.tolist()
             logp_list = log_prob.tolist()
             for b in range(batch_size):
@@ -499,7 +494,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
 
         pad_id = self.model.tokenizer.pad_token_id or 0
 
-        # Re-pad RIGHT→LEFT so every sample's real prompt ends at index ``max_real_len - 1`` and the response starts at ``max_real_len``. Cross-actor concat right-pads prompts to a global max; without re-padding, samples shorter than the batch max have pad tokens between prompt and response, the uniform ``resp_hidden`` slice at ``prompt_len - 1`` reads a pad-position hidden state, and response RoPE positions shift by ``max_real_len - n_real``.
         if int(real_lens.min().item()) < max_real_len:
             left_padded_ids = torch.full_like(prompt_ids, pad_id)
             left_padded_mask = torch.zeros_like(prompt_mask)
@@ -526,7 +520,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
-        # Rollout excludes multimodal placeholder ids from the response distribution. Never rewrite a stored action during replay: doing so would gather a different token's log-prob and condition every later position on the wrong prefix.
         for token_id in _reserved_generation_token_ids(self.model.transformer):
             if bool(((response_tokens == token_id) & response_mask.bool()).any().item()):
                 raise ValueError(

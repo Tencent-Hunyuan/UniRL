@@ -118,7 +118,6 @@ class TransferQueueRuntime:
 
         from transfer_queue import TransferQueueController, process_zmq_server_info
 
-        # The `transfer_queue:` block is a standard Hydra _target_ config (the backend and its nested zero_copy both carry `_target_`), so instantiate it directly.
         self.backend = instantiate(tq_cfg)
         self.controller = TransferQueueController.remote()
         controller_info = process_zmq_server_info(self.controller)
@@ -135,7 +134,6 @@ class TransferQueueRuntime:
         ray.get(refs)
 
     def reset_actors_zero_copy_buffer_free(self, actors: list) -> None:
-        # Zero-copy buffer free-list reset is Mooncake-specific; skip it for other backends (e.g. the simple in-Ray storage backend has no such buffers, so the upstream reset call is meaningless there).
         if self.backend is None or self.backend.manager_type != "MooncakeStorageManager":
             return
         import ray
@@ -154,12 +152,10 @@ class TransferQueueRuntime:
         from transfer_queue import AsyncTransferQueueClient, TransferQueueClient
 
         if handoff.get("manager_type") == "MooncakeStorageManager":
-            # Mooncake binds to LOCAL_IP; otherwise it picks a random interface.
             local_ip = os.getenv("LOCAL_IP", _get_local_ip())
             os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             handoff["local_hostname"] = local_ip
 
-            # Per-process GPU↔HCA affinity. Without it, every client binds to the first listed bond regardless of GPU placement, causing `-800` on wrong-NUMA ranks once CUDA initializes.
             os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
             if not handoff.get("device_name"):
                 from unirl.distributed.tensor.backend.transfer_queue.topology import list_rdma_bonds

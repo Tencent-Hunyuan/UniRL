@@ -61,7 +61,7 @@ class StepStrategy(ABC):
         sample = sample.float()
         if prev_sample is not None:
             prev_sample = prev_sample.float()
-        # Ensure sigma/sigma_next are float32 to match sglang's explicit `sigma = self.sigmas[step_indices].to(sample.device).to(sample.dtype)`. Without this, sigma may arrive as float64 (torch.linspace default), causing prev_sample_mean / std_var to compute in float64 while sglang uses float32 — a systematic precision mismatch amplified by 1/(2σ²).
+        # Use fp32 sigmas to match SGLang transition math.
         sigma = sigma.float()
         sigma_next = sigma_next.float()
 
@@ -306,7 +306,6 @@ class CPSSDEStrategy(SDEStrategy):
         eta: float,
         sigma_max: float = 0.99,
     ) -> torch.Tensor:
-        # CPS adds noise as std_dev_t * noise (no sqrt(-dt)), so the transition Gaussian std IS std_dev_t -- the KL must not multiply by sqrt(-dt).
         return self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
     def step(
@@ -398,9 +397,6 @@ class DanceSDEStrategy(SDEStrategy):
         std_var = std_dev_t * torch.sqrt(-dt)
 
         return prev_sample, prev_sample_mean, std_var
-
-
-# DPM2 deterministic ODE strategy (migrated from sd3_sampler.py)
 
 
 @dataclass

@@ -115,7 +115,6 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
                 f"be [B, 3, H, W], got {tuple(pixels.shape)}"
             )
 
-        # Convert each sample to PIL RGB for upstream's image_processor. Each sample's tensors are stacked across its (potentially multiple) cond images so the per-sample shape is ``[n_cond, ...]`` -- the convention the unified-MM forward iterates with at ``hunyuan.py:1903-1904``.
         joint_image_info: List[List[Any]] = []
         cond_vit_images: List[torch.Tensor] = []
         spatial_shapes_list: List[torch.Tensor] = []
@@ -125,13 +124,11 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
             if pil_image.mode != "RGB":
                 pil_image = pil_image.convert("RGB")
             if hasattr(image_processor, "preprocess"):
-                # Older checkpoint API: preprocess -> JointImageInfo with vision_image_info.image_tensor + vision_encoder_kwargs.
                 info = image_processor.preprocess(pil_image)
                 cond_item = info
                 vit_tensor = info.vision_image_info.image_tensor
                 ve_kwargs = info.vision_encoder_kwargs
             else:
-                # Newer (Instruct) API: get_image_with_size -> CondImage.
                 cond_image = image_processor.get_image_with_size(
                     pil_image, return_type=image_processor.cond_image_type
                 )[0]
@@ -141,7 +138,6 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
                 ve_kwargs = vit_t.vision_encoder_kwargs
             joint_image_info.append([cond_item])
 
-            # [1, S, D] -- keep the leading 1-dim so the per-sample tensor is [n_cond=1, S, D].
             cond_vit_images.append(vit_tensor)
 
             spatial_shapes_list.append(torch.stack([ve_kwargs["spatial_shapes"]], dim=0))

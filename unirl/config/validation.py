@@ -57,7 +57,6 @@ _SGLANG_ENGINE_TARGET_SUFFIX = "SGLangDiffusionRolloutEngine"
 _VLLM_OMNI_ENGINE_TARGET_SUFFIX = "VLLMOmniRolloutEngine"
 _TRAINSIDE_ENGINE_TARGET_SUFFIX = "TrainsideRolloutEngine"
 _DIRECT_SAMPLING_ENGINE_SUFFIXES: tuple = (_TRAINSIDE_ENGINE_TARGET_SUFFIX,)
-# Sync handlers that only one engine implements. Listed here so the validator can fail fast on a mismatched pairing.
 _IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})
 
 
@@ -185,7 +184,6 @@ def validate_keep_local_contract(cfg: DictConfig) -> None:
         "cfg.training.execution.keep_local=True is mutually exclusive with "
         "transfer_queue (both move data off the driver); enable exactly one.",
     )
-    # Keep-local shards each rollout by prompt-group across the train actors; the gathered path instead re-balances samples evenly on the driver. The two partitions — and thus each rank's mean loss and the FSDP-averaged gradient — coincide only when the prompt groups split evenly across actors, so require that here.
     actor_count = cfg.training.topology.get("actor_count", None)
     if actor_count is not None:
         n = int(actor_count)

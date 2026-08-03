@@ -105,7 +105,6 @@ def _flowdppo_kl_adv_loss(
         ratio_std = ratio.std()
     else:
         ratio_std = torch.zeros((), dtype=ratio.dtype, device=ratio.device)
-    # Mask breakdown: kl_mask_fraction: fraction of elements where KL >= threshold (high divergence) pos_rm_fraction: fraction masked by positive-direction conflict neg_rm_fraction: fraction masked by negative-direction conflict masked_fraction: total fraction of elements zeroed out (the key metric) unmasked_fraction: fraction of elements that contribute to gradient
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_std": ratio_std.detach(),
@@ -171,14 +170,11 @@ class FlowDPPO(StageAlgorithm):
         conditions_cls: Stage-typed conditions container.
     """
 
-    # prepare_segment freezes segment.sde_logp + sde_means once, so the ratio and KL anchor stay fixed across every num_updates_per_batch optimizer step.
     supports_multi_update = True
-    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2 trainer must inject the FSDP backend (the trainable model lives on it).
     requires_backend = True
     anchor_fields = ("sde_logp", "sde_means")
 
     def recomputes_anchor(self) -> bool:
-        # FlowDPPO always replays sde_means for the KL term (regardless of old_logp_source), so the anchor always needs train-time geometry.
         return True
 
     def __init__(
@@ -326,7 +322,6 @@ class FlowDPPO(StageAlgorithm):
                 params=self.params,
                 target_steps=target_steps,
             ).to(dtype=new_means.dtype, device=new_means.device)
-            # The beta term is the true Gaussian KL (eq.17): always normalize by the SDE transition std, independent of add_kl_coefficient (which only governs the KL-ADV masking gate above), so it matches FlowGRPO's beta term.
             kl_sigma_t = _transition_sigma(
                 self.stage,
                 segment=segment,

@@ -172,7 +172,6 @@ class BagelInputAdapter(DitInputAdapter):
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
 
-        # σ contract self-check: the engine-pinned Part schedule for T steps must have T+1 points. We don't SEND sigmas (BAGEL ignores them), but assert the engine resolved the schedule for the same T the worker will loop.
         _ = sigmas_list_from_diffusion(diff_params, T)
 
         extra_args: Dict[str, Any] = {
@@ -185,10 +184,8 @@ class BagelInputAdapter(DitInputAdapter):
         sde_indices = getattr(diff_params, "sde_indices", None)
         if sde_indices is not None:
             extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
-        # σ_max for the SDE std_dev_t clamp. The worker MUST use the SAME value or the first SDE step's std_dev_t / log-prob diverges and the GRPO ratio drifts off 1 (observed ratio ≈ 0.8 with the hardcoded 0.99 default).
         if diff_params.sigmas is not None and int(diff_params.sigmas.shape[0]) > 1:
             extra_args["sigma_max"] = float(diff_params.sigmas[1].item())
-        # Tell the worker scheduler the trajectory storage dtype so its SDE log-prob round-trip matches the trainside trajectory_precision.
         traj_prec = getattr(diff_params, "trajectory_precision", None)
         if traj_prec is not None:
             extra_args["trajectory_precision"] = str(traj_prec)

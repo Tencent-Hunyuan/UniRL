@@ -40,7 +40,6 @@ class MathVerifyRewardScorer(LocalRewardBackend):
         self.model = "math_verify"
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        # Lazy import so the dependency is only needed where scoring runs.
         from math_verify import parse, verify
 
         generated = request.texts
@@ -54,7 +53,6 @@ class MathVerifyRewardScorer(LocalRewardBackend):
                 continue
             gt = str(meta["answer"]).strip()
             try:
-                # Gold wrapped in \boxed{} (math-verify's canonical gold form); the prediction is parsed free-form (math-verify finds the final answer via \boxed{} else the last expression). verify(gold, target). parsing_timeout=None / timeout_seconds=None disable math-verify's signal.alarm() timeouts. Answers here are short, so no timeout is needed.
                 ok = bool(
                     verify(
                         parse("\\boxed{" + gt + "}", parsing_timeout=None),

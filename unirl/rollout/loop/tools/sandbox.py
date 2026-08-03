@@ -33,7 +33,6 @@ from typing import Any, Dict, Optional
 
 from unirl.rollout.loop.tools.tool import StatefulTool
 
-# Runs in the child process. User output is captured into a StringIO (never the real pipe), so a chatty cell can't deadlock the pipe — only the single framed response reaches the parent.
 _WORKER_SRC = r"""
 import ast, io, json, sys, contextlib, traceback
 

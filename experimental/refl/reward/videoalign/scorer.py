@@ -114,7 +114,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
                 f"VideoAlignRewardScorer: prompts length {len(prompts)} != batch size {int(media_tensor.shape[0])}."
             )
 
-        # The wrapper expects per-sample [T, C, H, W] in [-1, 1]. NOTE: ``.clamp(-1.0, 1.0)`` mirrors mmrl's ``role.score`` — VAE decode can produce slightly out-of-range pixels (e.g. -1.02 / 1.03), and ``_pixels_neg1_to_255`` only clamps the [0, 1] midpoint afterwards, so values can still spill above 255 or below 0 without this safeguard.
         per_sample_videos: List[torch.Tensor] = []
         for v in media_tensor:
             v = v.to(self.device).permute(1, 0, 2, 3).clamp(-1.0, 1.0).contiguous()

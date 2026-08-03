@@ -72,11 +72,9 @@ class PEPipeline(Pipeline):
         super().__init__()
         self.diffusion_pipeline = diffusion_pipeline
         self.llm_pipeline = llm_pipeline
-        # PE prompt-rewrite knobs, mirroring the sglang ComposedRolloutEngine (composed/config.py): ``pe_instruction`` is injected as the LLM child's chat ``system_instruction`` so the rewriter actually enhances the prompt; ``pe_marker`` (+ optional ``pe_max_chars``) governs the marker-based extraction of the cleaned rewrite from the LLM output before it conditions the diffusion child. Both default to ``None``, which preserves the prior "forward the bare prompt verbatim" behavior.
         self.pe_instruction = pe_instruction
         self.pe_marker = pe_marker
         self.pe_max_chars = pe_max_chars
-        # Surfaces the composed bundle so downstream code (training-side weight policies, eval introspection, ...) can reach pe_pipeline.bundle.{diffusion, llm} without duplicating the child-pipeline reference.
         self.bundle = PEBundle(
             diffusion=diffusion_pipeline.bundle,
             llm=llm_pipeline.bundle,
@@ -168,11 +166,9 @@ class PEPipeline(Pipeline):
                 f"(expected {P * N}, got {len(rewritten.texts) if isinstance(rewritten, Texts) else 'None'})"
             )
 
-        # Optional marker-based PE extraction (mirrors ComposedRolloutEngine): keep only the substring after pe_marker so the diffusion child conditions on the cleaned rewrite; off-format / empty outputs fall back to the user prompt. Rewrite onto the ar Part's primitive so wandb / logging see the same text.
         rewritten = self._extract_pe(rewritten, prompts, N)
         ar_part = ar_part.fill(primitives={"text": rewritten})
 
-        # ── Level 2: P*N → P*N*M images. The PE ids ("p0/0") are non-root, so they can't be a child Sample's root input.
         pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives={"text": rewritten})
         diff_child_shell = pe_input.fork(
             M,

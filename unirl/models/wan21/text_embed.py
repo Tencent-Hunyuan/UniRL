@@ -103,7 +103,6 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             )
             embeds = encoder_out.last_hidden_state
 
-        # WAN-specific padding policy: zero out padded positions in the encoder output BEFORE the diffusion transformer sees it. This is the training-time convention from WAN's reference implementation; skipping it shifts the distribution and produces systematically different rewards from rollout (which always applies the mask).
         embeds = embeds * attention_mask.unsqueeze(-1).to(dtype=embeds.dtype)
 
         return TextEmbedCondition(

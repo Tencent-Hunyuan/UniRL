@@ -33,7 +33,6 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# Map dtype string (str(torch.dtype)) → torch.dtype for receiver-side tensor allocation. Add new entries as needed; KeyError surfaces a missing dtype loudly.
 _DTYPE_FROM_STR: Dict[str, torch.dtype] = {
     "torch.float16": torch.float16,
     "torch.float32": torch.float32,
@@ -62,7 +61,6 @@ class NcclBroadcastReceiveMixin:
     """Adds ``init_weights_update_group`` + ``update_weights_from_distributed``
     to a vllm-omni worker via multiple inheritance."""
 
-    # Per-group handles created by ``init_weights_update_group``. Keyed by ``group_name`` so the trainer can run several groups concurrently if ever needed.
     _diffrl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
 
     def init_weights_update_group(
@@ -158,7 +156,6 @@ class NcclBroadcastReceiveMixin:
             dist.broadcast(tensor, src=0, group=group)
             bucket.append((str(name), tensor))
 
-        # Route to whichever loader the underlying worker exposes; AR worker has no ``load_weights`` directly, only ``model_runner.model.load_weights``.
         loader = getattr(self, "_diffrl_load_weights", None)
         if loader is None:
             self.load_weights(bucket)

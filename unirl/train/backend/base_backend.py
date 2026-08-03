@@ -142,7 +142,6 @@ class BaseFSDP2Backend(Remote):
     loaded, optimizer/scheduler/EMA built).
     """
 
-    # attribute contract (set by the leaf ctor + _finalize_construction)
     _bundle: object
     _rank: int
     _device: torch.device
@@ -247,7 +246,6 @@ class BaseFSDP2Backend(Remote):
         self.optimizer = build_optimizer(
             optimizer_cfg,
             params=list(trainable_params(model)),
-            # Names enable OptimizerConfig.param_group_lrs (per-substring LR groups, e.g. BAGEL UniGRPO's und vs "moe_gen" experts); ignored when unset.
             named_params=list(model.named_parameters()),
         )
         self.scheduler = build_lr_scheduler(
@@ -264,7 +262,6 @@ class BaseFSDP2Backend(Remote):
             )
         self._checkpoint_format: str = checkpoint_format
         self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
-        # Checkpointed for export tooling: the LoRA fold needs scaling = alpha / rank, and alpha is not derivable from the weights.
         active_lora = lora_cfg or ema_lora_cfg
         recorded_target_modules = None
         if active_lora is not None:
@@ -278,7 +275,6 @@ class BaseFSDP2Backend(Remote):
             {
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
-                # Store the selector actually passed to PEFT. For prefixed LoRA this is a regex, so exported adapters keep the same subtree restriction instead of matching equivalent suffixes elsewhere.
                 "target_modules": recorded_target_modules,
                 "exclude_modules": active_lora.exclude_modules,
                 "dropout": active_lora.dropout,
@@ -288,9 +284,8 @@ class BaseFSDP2Backend(Remote):
             if active_lora is not None
             else None
         )
-        # Single source of truth for "which adapter the rollout samples under": the EMA shadow ("old") for DiffusionNFT adapter-EMA, else the trainable "default". The in-process eval-EMA swap and the weight sync to a SEPARATE engine both derive from this, so they cannot disagree.
         self._rollout_adapter_name = str(ema_lora_cfg.shadow_adapter) if ema_lora_cfg is not None else "default"
-        # No-sync gradient accumulation (see set_grad_sync). Only active under ZeRO-2 (reshard_after_forward=False); a no-op under ZeRO-3, where the per-micro reshard/re-gather interacts badly with deferred sync.
+        # Deferred gradient sync is supported only under ZeRO-2.
         self._defer_grad_sync = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
         self._grad_sync_enabled = True
 
@@ -341,7 +336,6 @@ class BaseFSDP2Backend(Remote):
         grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
 
         if not math.isfinite(grad_norm):
-            # On a skipped step (already discarded), pinpoint which params carry the non-finite grad (sharded DTensor -> check the local shard) so the offending module is identifiable from the log. Runs only on this skip path, so it adds nothing to healthy steps.
             bad_params = []
             total_with_grad = 0
             for _name, _p in self.model.named_parameters():
@@ -454,7 +448,6 @@ class BaseFSDP2Backend(Remote):
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
 
-        # The gathers above populate dist rank 0 only — that rank writes. (NOT self._rank: that is a constructor kwarg, identical on every worker.)
         if _current_rank() != 0:
             return
         os.makedirs(path, exist_ok=True)
@@ -493,7 +486,7 @@ class BaseFSDP2Backend(Remote):
         """
         import torch.distributed.checkpoint as dcp
 
-        # Finish any in-flight async save before snapshotting fresh state: two concurrent DCP collectives can deadlock. The future is process-wide because PE can colocate two independent backends on the same workers.
+        # Finish an async save before starting another DCP collective.
         self._drain_checkpoint()
         self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
@@ -514,7 +507,7 @@ class BaseFSDP2Backend(Remote):
 
         pg = None
         if self._checkpoint_async:
-            # async_save stages to CPU and coordinates on a CPU collective, so it needs a process group with a CPU (gloo) backend. The train PG is NCCL-only (fully_shard auto-init / backend="nccl"), which makes async_save assert "A CPU backend must be enabled for async save", so hand it a lazily-created, memoized gloo group.
+            # Async DCP saves require a CPU-capable process group.
             if dist.is_available() and dist.is_initialized():
                 from unirl.utils.distributed_utils import init_gloo_group
 
@@ -560,12 +553,11 @@ class BaseFSDP2Backend(Remote):
         Adapter-mode checkpoints load non-strict — only the LoRA keys are
         present; the frozen base keeps the weights the bundle loaded.
         """
-        # Defensive: flush an in-flight async save before reading from disk (a save-then-load of the same dir in one process must see the shards).
+        # Finish an async save before reading its checkpoint.
         self._drain_checkpoint()
         dcp_metadata_path = os.path.join(path, ".metadata")
         metadata_path = os.path.join(path, "metadata.pt")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
-        # Agree on visibility BEFORE the collectives: on multi-node, a rank whose node does not mount the checkpoint path would raise alone and strand the others in the load collective until the NCCL timeout.
         local_visible = {
             "dcp": os.path.exists(dcp_metadata_path),
             "metadata": os.path.exists(metadata_path),

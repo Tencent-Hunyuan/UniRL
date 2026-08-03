@@ -66,7 +66,6 @@ class Qwen3Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        # Mirror SD3Pipeline: build the stages from the (shared) bundle when not supplied, so the v2 trainer can construct the pipeline via ``remote_hydra(pipeline_cfg, bundle=...)`` and share ONE bundle across the pipeline (rollout) and the FSDPBackend (training) — required for on-policy trainside PE.
         self.chat_template = chat_template if chat_template is not None else Qwen3ChatTemplateStage(bundle)
         self.ar = (
             ar
@@ -158,7 +157,6 @@ class Qwen3Pipeline(Pipeline):
                 f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
 
-        # Full role-tagged trajectory (one turn per message), frontier-aligned — text_conditioning() fails loud on any non-text turn.
         turns = sample.text_conditioning()
         conds = self._conditions_for(turns, sample.parts[0].control)
 

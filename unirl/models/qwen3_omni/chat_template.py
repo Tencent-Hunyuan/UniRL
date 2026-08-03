@@ -36,7 +36,6 @@ class Qwen3OmniChatTemplateStage:
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # Cross-worker CONCAT requires a common sequence length when enabled.
         self.pad_to_max_length = bool(pad_to_max_length)
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None

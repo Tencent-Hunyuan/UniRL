@@ -46,7 +46,6 @@ def patch_scheduler() -> None:
     )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
-    # NOTE: ``logger`` (the scheduler module's logger) is bound here so the verbatim handler bodies below — nested fns whose free ``logger`` resolves to THIS enclosing scope (LEGB) — log through the exact upstream object, keeping log routing identical to the fork. Imported from the UniRL single-definition sites so they are the SAME objects the adapter sends (dispatch is keyed by identity of `type(req)`).
     from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         EncodePromptReqInput,
@@ -254,7 +253,6 @@ def patch_scheduler() -> None:
         _handle_generation._unirl_sleep_dirty_guard = True  # type: ignore[attr-defined]
         Scheduler._handle_generation = _handle_generation
 
-    # AROUND-wrap _handle_update_weights_from_disk: guards + clear The fork's disk handler is identical to upstream's body EXCEPT it adds the `_clear_dirty_modules` call on success. Upstream does not clear, so wrap to add it after a successful disk update (parse the success flag off the returned OutputBatch.error, which upstream sets to None on success).
     if not getattr(Scheduler._handle_update_weights_from_disk, _DISK_SENTINEL, False):
         _orig_handle_disk = Scheduler._handle_update_weights_from_disk
 

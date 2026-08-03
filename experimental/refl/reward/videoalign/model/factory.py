@@ -94,7 +94,6 @@ def create_model_and_processor(
         processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
-    # Build the reward model. Quantisation is intentionally not supported here — the reward path expects full-precision (or bf16/fp16) weights.
     model = Qwen2VLRewardModelBT.from_pretrained(
         model_config.model_name_or_path,
         output_dim=model_config.output_dim,
@@ -115,9 +114,7 @@ def create_model_and_processor(
     if training_args.fp16:
         model.to(torch.float16)
 
-    # Optional LoRA wrapping — required to *load* a LoRA-split checkpoint.
     if peft_lora_config.lora_enable:
-        # peft is an optional dep for the non-LoRA inference path; import lazily so users who only ever load full-state-dict ckpts don't need it installed.
         from peft import LoraConfig, get_peft_model
 
         namespan_exclude = list(peft_lora_config.lora_namespan_exclude or [])

@@ -109,7 +109,6 @@ class AsyncARTrainer(ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
-        # Call BaseTrainer.__init__ directly: ARTrainer.__init__ opens the colocate ``placement(fraction=1.0)`` block, which is exactly what we must NOT run.
         BaseTrainer.__init__(self, cfg=cfg, logging_cfg=logging_cfg)
 
         self.batch_size = batch_size
@@ -135,20 +134,18 @@ class AsyncARTrainer(ARTrainer):
                 "separate slab; the trainside direct-sampling engine needs the pipeline "
                 "as a local sibling and cannot live cross-slab."
             )
-        # Inherited ``ARTrainer.evaluate`` reads this but only ``ARTrainer.__init__`` sets it, which we skip above. The disaggregated layout is always the SPMD rollout path — the anchored branch is colocate-only — so None is the correct value, and it keeps ``evaluate`` on its ``nullcontext``/non-anchored path.
         self._rollout_anchor_device = None
 
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
         self._buffer_max_staleness = buffer_max_staleness
-        # DP size of the TRAIN slab — the divisor for balance_shards (the parent uses self.num_devices because colocate training spans the whole pool; here training only spans the train slab).
         self._train_devices = int(round(self.num_devices * self._train_fraction))
         if self._train_devices <= 0 or self._train_devices >= self.num_devices:
             raise ValueError(
                 f"train_fraction={train_fraction} yields {self._train_devices} train "
                 f"devices of {self.num_devices}; must leave a non-empty rollout slab."
             )
-        # DP_SCATTER divisibility: per-rollout sample count must split evenly over BOTH slabs (training over the train slab, generation over the rollout slab). Fail early with a clear message rather than mid-run in dispatch.
+        # Require rollout batches to divide evenly across train and rollout slabs.
         self._rollout_devices = self.num_devices - self._train_devices
         prompts = int(self.batch_size)
         total = prompts * total_samples_per_prompt(self.sampling_params)
@@ -168,7 +165,6 @@ class AsyncARTrainer(ARTrainer):
                 "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
             )
 
-        # two disjoint top-level slabs (diffusion.py:115-129 template) The train scope must FULLY EXIT before the rollout scope opens, else a nested placement would carve a sub-slab instead of a disjoint slab.
         with placement(self.pool, fraction=self._train_fraction, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
@@ -177,7 +173,6 @@ class AsyncARTrainer(ARTrainer):
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             if sync_cfg is not None:
-                # NCCL handler: rollout is cross-slab and wired via the handshake below — it takes only ``backend`` (no rollout sibling).
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
             self.rollout = remote(**rollout_parsed)
@@ -282,7 +277,6 @@ class AsyncARTrainer(ARTrainer):
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
-        # train_step is bypassed, so BaseTrainer's per-step reset hook never fires; reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
         return result, mean_reward
 
@@ -297,13 +291,11 @@ class AsyncARTrainer(ARTrainer):
         save_mode: str = "full",
     ) -> None:
         interval = max(1, weight_sync_interval)
-        # Staleness budget: how many weight-syncs a generation may cross before it is evicted.
         stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
         M = self._max_inflight
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Single-threaded: exactly one get_samples(batch_size) per launch and launches are 1:1 with rollout_id, so replaying start_rollout times restores the exact stream position (deterministic resume).
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
@@ -316,7 +308,6 @@ class AsyncARTrainer(ARTrainer):
             },
         )
 
-        # gen_id is seeded by start_rollout so launches stay 1:1 with rollout_id.
         self._async_engine = AsyncBatchRolloutEngine(
             self.rollout,
             complete=self._score_completed,
@@ -344,7 +335,7 @@ class AsyncARTrainer(ARTrainer):
                     self._drain_all()
                     self.evaluate(rollout_id=rollout_id)
                 if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()  # consistent engine + deterministic resume
+                    self._drain_all()
                     self.maybe_save_checkpoint(
                         rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                     )
@@ -353,7 +344,6 @@ class AsyncARTrainer(ARTrainer):
                     self.weight_sync.sync()
                     self._async_engine.bump_weight_version()
         finally:
-            # Match BaseTrainer._finish_wandb: cleanup failures must not mask the exception that caused teardown.
             active_exception = sys.exc_info()[0] is not None
             try:
                 self._drain_all()
@@ -388,7 +378,7 @@ class AsyncARTrainer(ARTrainer):
                 engine.submit(self._build_async_sample(engine.next_gen_id))
             engine.poll()
             picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
-            engine.pop_evicted()  # over-stale groups are discarded on the batch path
+            engine.pop_evicted()
             if picked is not None:
                 return picked
             if engine.inflight:

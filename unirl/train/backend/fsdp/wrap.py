@@ -61,7 +61,6 @@ def fsdp_wrap(
     from torch.distributed.tensor import DTensor
 
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
-    # Optional high-precision optimizer master for the TRAINABLE (LoRA) params. When set (e.g. fp32) the trainable params are upcast to this dtype in the cast loop below — even under mixed precision — while the frozen base and the all-gathered COMPUTE copy stay param_dtype (bf16) via MixedPrecisionPolicy, so the forward math (and the on-policy GRPO ratio) is unchanged and only the optimizer accumulation gains precision.
     trainable_dtype = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype is not None else None
     )
@@ -86,7 +85,7 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy), applied uniformly to EVERY param — blocks and leftovers alike; the wrap topology below is orthogonal to the dtype policy: explicit master_dtype → upcast the TRAINABLE (LoRA) params to it even under mixed precision; the mp_policy still all-gathers them as param_dtype for compute, so only the optimizer master gains precision (the bf16-base + fp32-LoRA-master case). no mp_policy → storage dtype IS the compute dtype, so pre-cast every param to param_dtype. mixed precision, no master_dtype → do NOT pre-cast: fully_shard keeps shards in the loaded dtype and casts to mp_policy.param_dtype per forward, so an fp32-loaded model gets Megatron-style fp32 master weights for free. Pre-casting to bf16 here would round away the ~1e-6 AdamW steps.
+    # Keep trainable masters at master_dtype; bf16 pre-casting can erase small optimizer steps.
     for p in model.parameters():
         if isinstance(p, DTensor) or not p.dtype.is_floating_point:
             continue  # already-wrapped params and ints never cast
@@ -104,12 +103,12 @@ def fsdp_wrap(
         fully_shard(layer, **fsdp_kwargs)
 
     if root_wrap and not isinstance(model, FSDPModule):
-        # Root wrap: claim the leftover params (everything the block wraps above did not own — embed / final norm / lm_head / time+patch embeds) into a root fully_shard group. The root group must NOT inherit reshard_after_forward: FSDP2's auto policy never reshards the root after forward, keeping its params materialized for post-forward direct submodule calls (Qwen3's chunked lm_head) and activation-checkpoint recomputes.
+        # Root-wrap leftover parameters but keep them materialized after forward.
         root_kwargs = dict(fsdp_kwargs)
         root_kwargs.pop("reshard_after_forward", None)
         fully_shard(model, **root_kwargs)
     else:
-        # No root wrap: a TRAINABLE param outside every fully_shard group would receive grads no collective ever DP-syncs (the manual sync_unsharded_grads net was removed with the default root wrap), so its replicas would silently drift apart across ranks. Fail fast rather than corrupt the run.
+        # Reject trainable parameters outside FSDP groups to prevent rank drift.
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -122,7 +121,6 @@ def fsdp_wrap(
             )
 
     if forward_prefetch:
-        # Cross-block forward prefetch: chain each FSDP group to prefetch the NEXT group's all-gather during its own forward, in forward (named_modules) order — root → group 0 → … → group N — so the per-group all-gather overlaps compute instead of stalling the critical path (a multi-node win; ~no-op over NVLink). Needs the root wrapped (the default root wrap above) so FSDP2 has initialized the shared all-gather comm context.
         if not isinstance(model, FSDPModule):
             raise ValueError(
                 "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
@@ -172,9 +170,6 @@ def fsdp_wrap(
         )
 
 
-# Block-class discovery (ported from FSDPPolicy)
-
-
 def _discover_block_classes(model: nn.Module, stage: object) -> Tuple[str, ...]:
     for cls in type(model).__mro__:
         attr = getattr(cls, "_no_split_modules", None)
@@ -203,9 +198,6 @@ def _enumerate_block_instances(
         return ()
     names = set(class_names)
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
-
-
-# HSDP mesh (ported from FSDPPolicy)
 
 
 def _create_device_mesh(fsdp_mode: str) -> Optional[object]:

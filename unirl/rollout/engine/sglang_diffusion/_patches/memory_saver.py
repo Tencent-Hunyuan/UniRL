@@ -38,7 +38,6 @@ _COMPONENT_TO_REGION = {
 }
 _ALL_REGION_TAGS = list(dict.fromkeys(_COMPONENT_TO_REGION.values()))
 
-# Request-scoped caches that become invalid after weight updates.
 _REQUEST_SCOPED_ATTRS = {
     ("GLMSelfAttention", "k_cache"),
     ("GLMSelfAttention", "v_cache"),
@@ -153,7 +152,6 @@ class MemorySaverHandler:
         """
         state: dict = {"params_and_buffers": {}, "unregistered": {}}
         for name, m in self.modules_for_tag(tag).items():
-            # Use named_parameters() + named_buffers() instead of state_dict() because state_dict() excludes persistent=False buffers (e.g. CLIP position_ids)
             saved: dict[str, torch.Tensor] = {}
             for k, v in m.named_parameters():
                 saved[k] = self._clone_gpu_tensor_to_cpu(v, (tag, name, k))
@@ -206,8 +204,6 @@ class MemorySaverHandler:
             if submod is not None:
                 submod.__dict__[attr_name] = self._move_saved_to_device(saved_value, device, non_blocking=non_blocking)
 
-    # -- release / resume orchestration
-
     def release(
         self,
         tags: list[str] | None = None,
@@ -232,7 +228,6 @@ class MemorySaverHandler:
                 torch.cuda.synchronize()
             t_stash = time.monotonic()
 
-            # Pause each tag (zero-copy since enable_cpu_backup=False)
             for tag in all_tags:
                 self.adapter.pause(tag)
             t_pause = time.monotonic()
@@ -293,7 +288,6 @@ class MemorySaverHandler:
             t_start = time.monotonic()
             tags_to_resume = set(tags) if tags is not None else set(self._paused_tags)
 
-            # Resume all tags (zero-copy remap)
             for tag in tags_to_resume:
                 self.adapter.resume(tag)
             t_resume = time.monotonic()

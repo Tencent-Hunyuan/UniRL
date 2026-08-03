@@ -40,11 +40,9 @@ class Qwen3OmniPipelineConfig:
     video_max_pixels: Optional[int] = None
     use_audio_in_video: bool = False
 
-    # Unsupported until the FSDP loader remaps checkpoint ``thinker.`` keys.
     meta_init_transformer: bool = False
 
     system_instruction: Optional[str] = None
-    # Extra non-structural kwargs forwarded to the processor chat template (for example tool schemas). Required tensor/tokenization return-shape kwargs are enforced by the chat-template stage.
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

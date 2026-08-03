@@ -151,7 +151,7 @@ def convert_split(rows, split: str, out_dir: str, fname: str, max_edge: int, con
                 continue  # skip rows we cannot turn into a verifiable MC example
             rel = f"images/{config}_{split}_{n}.png"
             pil = pil.convert("RGB")
-            pil.thumbnail((max_edge, max_edge))  # downscale-only, preserves aspect
+            pil.thumbnail((max_edge, max_edge))
             pil.save(os.path.join(out_dir, rel))
             record = {
                 "prompt": f"Look at the image. {question}\n\nAnswer with the letter only.",

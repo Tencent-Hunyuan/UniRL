@@ -40,8 +40,6 @@ class GPUStoreTransport(WorkerLocalTransport):
     def is_ref(self, value: Any) -> bool:
         return isinstance(value, TensorRef)
 
-    # ── resolve helpers: batched borrow + zero-copy IPC views ──
-
     def _batch_borrow(self, handles: List[GPUTensorHandle]) -> Dict[str, tuple]:
         """One ``batch_borrow`` RPC for all not-yet-open CUDA store_keys.
 
@@ -54,7 +52,6 @@ class GPUStoreTransport(WorkerLocalTransport):
         return dict(zip(unique, ray.get(self._tw.batch_borrow.remote(unique))))
 
     def _resolve_handles(self, handles: List[GPUTensorHandle]) -> List[torch.Tensor]:
-        # One batched borrow for the CUDA blocks, then resolve each handle to its full base. The base's get/get_batch slice the spans' rows (a zero-copy view of the open IPC mapping).
         borrow_map = self._batch_borrow(handles)
         resolved: Dict[str, torch.Tensor] = {}
         return [self._resolve_one(h, borrow_map, resolved) for h in handles]
@@ -62,7 +59,6 @@ class GPUStoreTransport(WorkerLocalTransport):
     def _resolve_one(
         self, h: GPUTensorHandle, borrow_map: Dict[str, tuple], resolved: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
-        # Resolve one handle to its full base, deduped per store_key within this resolve. The base owns the open IPC mapping via storage refcount, so the view stays mapped exactly as long as a slice off it is alive — the mapping closes itself once the caller drops the resolved tensor (no release step).
         if h.object_ref is not None:
             return ray.get(h.object_ref).detach()
         base = resolved.get(h.store_key)
@@ -152,7 +148,6 @@ class GPUStoreTransport(WorkerLocalTransport):
 
     @classmethod
     def _is_local(cls, ref: Any, dst_worker_id: str, dst_device_id: int, pool: Any) -> bool:
-        # gpu's per-GPU TensorWorker is shared by all slots → a same-device ref (any slot) is already resolvable on the dst worker; only cross-device needs NCCL.
         return ref.source_id == dst_worker_id or pool.device_id_of(ref.source_id) == dst_device_id
 
     def setup_transfer(self, global_rank: int, world_size: int) -> None:

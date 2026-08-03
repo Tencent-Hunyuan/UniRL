@@ -106,7 +106,6 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         device = sample.device
         dtype = prompt_embeds.dtype
 
-        # Sigma -> timestep scaling. Always cast to a [B]-shape tensor on the model's compute dtype.
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size)
         elif sigma.shape[0] != batch_size:
@@ -117,7 +116,6 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
 
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=dtype)
 
-        # No channel-dim packing (in_channels=16, sample is already the correct shape).
         hidden_states = sample.to(dtype)
 
         kwargs: Dict = {
@@ -128,7 +126,6 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             "guidance": guidance,
             "return_dict": False,
         }
-        # encoder_attention_mask is optional; only pass if we have it (some prompts may have variable-length sequences that need masking).
         if attention_mask is not None:
             kwargs["encoder_attention_mask"] = attention_mask
 
@@ -299,7 +296,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             cfg = getattr(vae, "config", None)
             ch = int(getattr(cfg, "latent_channels", 0)) if cfg is not None else 0
             if not ch:
-                # Fall back to transformer's reported out_channels.
                 tx_cfg = getattr(model.transformer, "config", None)
                 ch = int(getattr(tx_cfg, "out_channels", self.DEFAULT_LATENT_CHANNELS))
             latent_channels = ch
@@ -421,7 +417,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp modality=VIDEO via the factory so downstream ``segment.modality``-based routing doesn't mistake video latents for image latents.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,

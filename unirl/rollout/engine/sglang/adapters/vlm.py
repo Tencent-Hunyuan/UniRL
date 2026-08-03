@@ -60,7 +60,6 @@ class VLMAdapter(TextLMAdapter):
             mm = self.encode_mm(messages, images)
             mm_encs.append(mm)
             payload = self.base_payload(sampling)
-            # Send the chat-templated TEXT (single placeholder) + image_data so SRT's processor expands the placeholder and the model actually attends the image.
             payload["text"] = mm.text
             payload["image_data"] = pil_to_base64(mm.image)
             wire.append(payload)
@@ -97,7 +96,6 @@ class VLMAdapter(TextLMAdapter):
             "tokenize": False,
         }
         template_kwargs.update(self.cfg.chat_template_kwargs or {})
-        # Multimodal processors inspect every message as a list of typed content blocks. Normalize a system/text string so that scan does not iterate over its characters (Qwen3.5 raises TypeError otherwise).
         processor_messages = [
             {
                 **message,

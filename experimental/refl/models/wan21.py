@@ -36,7 +36,6 @@ from unirl.train.lora import adapters_disabled
 from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import DiffusionSamplingParams
 
-# Matches the mainline module-level constant in unirl/models/wan21/diffusion.py. Not imported directly to keep the recipe decoupled from the mainline's private surface.
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
 MAX_TORCH_SEED = (1 << 63) - 1
@@ -264,7 +263,6 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
             grad_enabled = i >= mid_timestep
 
             if use_cfg:
-                # REFL parity: the conditional branch follows the BPTT grad window, while the uncond/negative branch is always stop-grad. Batched CFG would incorrectly add a ``(1 - guidance_scale) * d(uncond)/dθ`` term.
                 cond_ctx = nullcontext() if grad_enabled else torch.no_grad()
                 with cond_ctx, autocast_ctx:
                     noise_pred_cond = step.predict_noise(
@@ -299,7 +297,6 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
                 noise_pred = noise_pred.float()
                 kl_pred = noise_pred
 
-            # Per-step KL against the LoRA-disabled reference (REFL-style). When CFG is enabled, this intentionally computes KL on the conditional prediction before the stop-grad uncond CFG mix.
             if kl_weight != 0.0 and grad_enabled:
                 with torch.no_grad(), autocast_ctx, adapters_disabled(transformer):
                     ref_pred = step.predict_noise(

@@ -119,7 +119,6 @@ class ModelAdapter(ABC):
         target_modules = list(self.cfg.target_modules or ("transformer",))
         return prefix, target_modules
 
-    # validation (default: require shift + ckpt)
     def validate(self) -> None:
         mc = self.model_config
         require(

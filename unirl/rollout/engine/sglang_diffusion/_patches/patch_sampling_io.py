@@ -65,10 +65,8 @@ from dataclasses import field
 
 logger = logging.getLogger(__name__)
 
-# Thread-local stash for the per-prompt ``condition_image`` index. It indexes ``image_path`` per prompt via ``_resolve_image_paths_per_prompt`` but does NOT index ``condition_image`` -- so every per-prompt ``sampling_params`` carries the WHOLE list, and ``InputValidationStage.preprocess_condition_image`` (input_validation.py:117) then uses ``batch.condition_image[-1]`` as the source image.
 _local = threading.local()
 
-# Fork field name -> (default, human-readable type) for SamplingParams injection. They must be genuine SamplingParams fields so (a) DiffGenerator.generate's per-prompt ``dataclasses.replace`` preserves them and (b) they reach the worker as ``req.return_prompt_embeds`` -- Req has no such field, so ``Req.__getattr__`` delegates the read to ``sampling_params`` (where this injection lands them).
 _SP_INJECT_FIELDS = {
     "sigmas": (None, "list[float] | None"),
     "timesteps": (None, "list[float] | None"),
@@ -78,7 +76,6 @@ _SP_INJECT_FIELDS = {
     "max_sequence_length": (None, "int | None"),
     "return_prompt_embeds": (False, "bool"),
     "return_negative_prompt_embeds": (False, "bool"),
-    # Edit-Plus source-image PIL. ``Req.condition_image`` is a real dataclass field (schedule_batch.py:59), but ``SamplingParams`` lacks it, so without injection a PIL passed in sampling kwargs would be dropped at ``SamplingParams`` construction.
     "condition_image": (None, "Any"),
 }
 
@@ -101,24 +98,21 @@ def patch_sampling_io() -> None:
 
     _install_sampling_params_fields(SamplingParams)
 
-    # Re-apply the injection lazily at the construction chokepoint so that model-specific subclasses (e.g. Flux2KleinSamplingParams) imported *after* install -- the registry resolves and imports them inside from_user_sampling_params_args, before it constructs them -- are covered.
     _wrap_from_user_sampling_params_args(SamplingParams)
 
-    # Add the one missing Req field so denoise_seeds lands on Req directly (latents / sigmas / timesteps already exist upstream).
     _install_req_denoise_seeds(sb_mod)
 
     _wrap_prepare_request(utils_mod, SamplingParams)
 
-    # Make sampling_params._json_safe tolerate the injected Tensor fields (initial_noise / timesteps) so _set_output_file_name's params->filename JSON hash (json.dumps(_json_safe(asdict(self)))) doesn't crash on a Tensor.
     _install_json_safe_tensor_guard(sp_mod)
 
-    # Bypass the I2I ``image_path`` requirement when ``condition_image`` is set. Upstream's ``_validate_with_pipeline_config`` raises ``ValueError`` for I2I task types when ``image_path is None`` — without this bypass the first ``generate()`` crashes before the PIL ever reaches ``InputValidationStage`` (which checks ``batch.condition_image is not None`` BEFORE ``image_path`` at input_validation.py:108, so the PIL path is correct once validation passes).
+    # Allow condition_image to satisfy I2I validation when image_path is absent.
     _wrap_validate_with_pipeline_config(SamplingParams)
 
-    # Index ``condition_image`` per prompt. Upstream's per-prompt loop in ``DiffGenerator.generate`` indexes ``image_path`` but NOT ``condition_image``, so a multi-prompt batch would condition every prompt on the last source image (input_validation.py:117).
+    # Index condition_image per prompt because upstream does not.
     _wrap_diff_generator_generate()
 
-    # Upstream's ``InputValidationStage.forward`` only calls ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via ``config.preprocess_vae_image``) inside the ``if batch.image_path is not None`` branch. Edit-Plus ships the source image as a PIL via ``condition_image`` with ``image_path=None``, so that branch is skipped and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises ``TypeError: 'NoneType' object is not iterable``.
+    # Preprocess PIL-only requests so Edit-Plus receives VAE image sizes.
     _wrap_input_validation_condition_image()
 
 
@@ -143,7 +137,6 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     def _json_safe(obj):
         if torch.is_tensor(obj):
             return f"<tensor:{tuple(obj.shape)}:{obj.dtype}>"
-        # PIL.Image.Image (Edit-Plus ``condition_image``) — not JSON serializable; only feeds the output-filename hash, so a placeholder is harmless.
         if obj.__class__.__name__ == "Image" or obj.__class__.__module__.startswith("PIL."):
             return f"<pil:{getattr(obj, 'size', None)}:{getattr(obj, 'mode', None)}>"
         if isinstance(obj, dict):
@@ -156,7 +149,6 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     sp_mod._json_safe = _json_safe
 
 
-# Stand-in image_path used only for the duration of the wrapped validation call — never persisted, never dereferenced (upstream 0.5.12.post1 only None-checks image_path inside _validate_with_pipeline_config).
 _CONDITION_IMAGE_PATH_SENTINEL = "<unirl:condition_image>"
 
 
@@ -248,13 +240,11 @@ def _wrap_diff_generator_generate() -> None:
         return
 
     def generate(self, sampling_params_kwargs=None, *args, **kwargs):
-        # Stash the per-prompt condition_image list BEFORE the per-prompt loop so _wrap_prepare_request can index it. Reset the counter regardless so a leftover stash from a prior call can't corrupt this one.
         ci = (sampling_params_kwargs or {}).get("condition_image")
         if isinstance(ci, list) and len(ci) > 1:
             _local.condition_image_per_prompt = ci
             _local.condition_image_idx = 0
         else:
-            # Clear any stale stash so _wrap_prepare_request falls back to the scalar-PIL passthrough (single prompt or T2I).
             _local.condition_image_per_prompt = None
             _local.condition_image_idx = 0
         try:
@@ -307,20 +297,17 @@ def _wrap_input_validation_condition_image() -> None:
     def forward(self, batch, server_args, __orig=orig_forward):
         batch = __orig(self, batch, server_args)
 
-        # Only act on the PIL-only path: condition_image set, image_path None, and vae_image_sizes not yet populated (upstream didn't call preprocess_condition_image).
         condition_image = getattr(batch, "condition_image", None)
         image_path = getattr(batch, "image_path", None)
         vae_image_sizes = getattr(batch, "vae_image_sizes", None)
         if condition_image is None or image_path is not None or vae_image_sizes is not None:
             return batch
 
-        # Mirror upstream's preprocess_condition_image entry (input_validation.py:131-165): it needs a single PIL to read width/height, and calls config.preprocess_vae_image(batch, self.vae_image_processor) which populates batch.vae_image_sizes.
         img = condition_image[-1] if isinstance(condition_image, list) else condition_image
         condition_image_width = img.width
         condition_image_height = img.height
         batch.original_condition_image_size = (condition_image_width, condition_image_height)
 
-        # Preserve the driver-pinned output dims. The driver-authoritative ``initial_noise`` was created at 384², so a clobbered 1024² makes ``maybe_pack_latents`` reshape against the wrong grid → ``RuntimeError: shape '[1,16,64,2,64,2]' is invalid for input of size 36864``.
         saved_height = batch.height
         saved_width = batch.width
         self.preprocess_condition_image(batch, server_args, condition_image_width, condition_image_height)
@@ -337,7 +324,6 @@ def _make_dataclass_field(name: str, default, type_str: str):
     f = field(default=default)
     f.name = name
     f.type = type_str
-    # Mark as a real (init=True) dataclass field so fields()/replace()/asdict() treat it like any source-declared field.
     f._field_type = dataclasses._FIELD
     return f
 
@@ -380,20 +366,17 @@ def _register_and_wrap_init(cls) -> None:
     """
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:
-        # Not the class's own dict (inherited view) -- give it its own so the injected entry is visible to fields(cls)/replace(cls-instance).
         own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
         cls.__dataclass_fields__ = own_fields
 
     for name, (default, type_str) in _SP_INJECT_FIELDS.items():
         if name not in own_fields:
             own_fields[name] = _make_dataclass_field(name, default, type_str)
-        # Class-level default so plain ``getattr(sp, name)`` works pre-construction and ``_merge_with_user_params`` (reads ``getattr(type(self), name)``) sees a sane default rather than raising.
         if name not in cls.__dict__:
             setattr(cls, name, default)
 
     orig_init = cls.__dict__.get("__init__")
     if orig_init is None or getattr(orig_init, _SP_INIT_SENTINEL, False):
-        # Either inherits __init__ (will be reached via a patched ancestor's wrapper -- but every dataclass defines its own, so this is rare) or is already wrapped.
         return
 
     inject_names = tuple(_SP_INJECT_FIELDS)
@@ -473,17 +456,14 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
 
         req = orig(server_args, sampling_params, *args, **kwargs)
 
-        # Req.sigmas shadows SamplingParams.sigmas (both fields); assigning to the Req field sets it on the Req directly.
         sigmas = getattr(sampling_params, "sigmas", None)
         if sigmas is not None:
             req.sigmas = sigmas
 
-        # Req.timesteps is a Tensor downstream (handed to scheduler.set_timesteps); coerce exactly as the fork does.
         timesteps = getattr(sampling_params, "timesteps", None)
         if timesteps is not None:
             req.timesteps = torch.as_tensor(timesteps, dtype=torch.float32)
 
-        # Driver-authoritative x_T: LatentPreparationStage consumes Req.latents.
         initial_noise = getattr(sampling_params, "initial_noise", None)
         if initial_noise is not None:
             req.latents = initial_noise
@@ -500,10 +480,8 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         if max_sequence_length is not None:
             req.max_sequence_length = int(max_sequence_length)
 
-        # Edit-Plus source-image PIL. Req.condition_image is a real dataclass field (schedule_batch.py:59), so this assignment lands on the Req directly (not delegated to sampling_params).
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:
-            # Multi-prompt indexing: when the adapter emitted a list of PILs (one per unique prompt), upstream's per-prompt loop in ``DiffGenerator.generate`` carries the WHOLE list on every per-prompt ``sampling_params`` (it indexes ``image_path`` but not ``condition_image``). ``_wrap_diff_generator_generate`` stashed the list in thread-local state at the start of ``generate``; index it per Req here, mirroring ``image_paths_per_prompt[i]``.
             stash = getattr(_local, "condition_image_per_prompt", None)
             if isinstance(stash, list) and len(stash) > 1:
                 idx = getattr(_local, "condition_image_idx", 0)
@@ -522,7 +500,7 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
     setattr(prepare_request, _PREP_SENTINEL, True)
     utils_mod.prepare_request = prepare_request
 
-    # CRITICAL: ``from ...entrypoints.utils import prepare_request`` binds the name BY VALUE in importing modules at import time (e.g. ``diffusion_generator``, whose ``generate()`` calls its own module-level ``prepare_request``). Patching ``utils_mod.prepare_request`` alone therefore never reaches the real caller -- the Req would ship without sigmas / initial_noise / denoise_seeds.
+    # Rebind imported prepare_request aliases; patching the source module alone is ineffective.
     import sys
 
     for _mod in list(sys.modules.values()):

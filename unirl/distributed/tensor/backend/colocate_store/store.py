@@ -147,7 +147,6 @@ class TensorStore:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
-        # ProcessGroupNCCL otherwise creates a new two-rank communicator on the first unbatched send/recv. Eager initialization reserves the global communicator while the workers are still empty; send/recv then reuse it instead of allocating at the training-step memory peak.
         self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:

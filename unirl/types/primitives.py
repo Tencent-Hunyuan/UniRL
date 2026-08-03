@@ -221,7 +221,6 @@ class Videos(Batch):
         channels = {int(frames.shape[1]) for frames in frames_list}
         if len(channels) != 1:
             raise ValueError(f"Videos.from_list requires a consistent channel count, got {sorted(channels)}")
-        # Packed videos can be ragged in time, but torch.cat still requires the non-packed C/H/W dimensions to match. Resize (not zero-pad) ragged clips to the batch-max H/W so mixed-resolution inputs don't get black borders; model-specific encoders still resize to their requested resolution later.
         if len({tuple(frames.shape[1:]) for frames in frames_list}) != 1:
             max_h = max(int(frames.shape[-2]) for frames in frames_list)
             max_w = max(int(frames.shape[-1]) for frames in frames_list)
@@ -233,7 +232,6 @@ class Videos(Batch):
                     ).to(frames.dtype)
                 resized.append(frames)
             frames_list = resized
-        # Delegate to ``Batch.pack`` so the framework computes and attaches ``_packed_cu_seqlens``.
         return cls.pack(frames=frames_list)
 
     @classmethod
@@ -281,7 +279,6 @@ class Audios(Batch):
     def from_list(cls, items: List[Audio]) -> "Audios":
         if not items:
             raise ValueError("Cannot build Audios from an empty list")
-        # Delegate to ``Batch.pack`` so the framework computes and attaches ``_packed_cu_seqlens``.
         return cls.pack(waveform=[a.waveform for a in items])
 
     def to_list(self) -> List[Audio]:
@@ -304,7 +301,6 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
-# The batched single-modality primitive union — a Part's raw content (text / image / video / audio). Mirrors ``sample.Primitive`` without importing the Sample module and creating a cycle.
 PrimitiveValue = Union[Texts, Images, Videos, Audios]
 
 

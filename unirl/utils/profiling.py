@@ -141,7 +141,7 @@ class TrainStepProfiler:
         except Exception:
             self._stopped = True
             try:
-                self._prof.stop()  # release CUPTI hooks so later steps carry no overhead
+                self._prof.stop()
             except Exception:
                 pass
             logger.warning("TrainStepProfiler: profiling/export failed; training continues", exc_info=True)
@@ -160,7 +160,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     """
     if not profile_enabled():
         return None
-    # The caller passes a backend-specific rank that is 0 on every worker for some backends (e.g. FSDP colocate lacks `_rank`). Prefer the true global rank from the process group so UNIRL_PROFILE_RANKS actually restricts to one worker — profiling every rank makes 8 CUPTI trace-flushes contend and stall the export.
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
@@ -168,7 +167,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     if not _rank_enabled(int(rank)):
         return None
 
-    # Default = capture ONE full step (wait1 + warmup1 + active1) so a bare UNIRL_PROFILE=train already produces a small, Perfetto-loadable trace.
     wait = _int_env("UNIRL_PROFILE_WAIT", 1)
     warmup = _int_env("UNIRL_PROFILE_WARMUP", 1)
     active = _int_env("UNIRL_PROFILE_ACTIVE", 1)
@@ -177,7 +175,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     os.makedirs(out_dir, exist_ok=True)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
-    # CUDA (CUPTI) activity can be disabled with UNIRL_PROFILE_CUDA=0. On some torch/driver/CUPTI combos the CUDA kineto trace-finalize (stop_trace) hangs the export; a CPU-only trace still opens in Perfetto and shows the step structure + cudaLaunchKernel timeline.
     if _truthy(os.environ.get("UNIRL_PROFILE_CUDA"), default=True) and torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 

@@ -24,7 +24,6 @@ silently cuts the graph.
 
 from __future__ import annotations
 
-# Runs on the shared core stack — reward and actor share one process, so there is no separate env to pin. Never filter by forward-signature: under PEFT that resolves to ``LoraModel.forward(*args, **kwargs)`` and silently drops the video tensors.
 import json
 import logging
 import os
@@ -115,7 +114,6 @@ class VideoRewardWrapper:
             config_path
         )
 
-        # We only need two fields out of the data_config block — the template type and the eval-dim list. Stash them directly without constructing the full dataclass.
         self.prompt_template_type = data_config_dict.get("prompt_template_type", "none")
         self.eval_dim = data_config_dict.get("eval_dim", "VQ")
         self.inference_config = inference_config
@@ -127,14 +125,12 @@ class VideoRewardWrapper:
             load_from_pretrained=checkpoint_dir,
             load_from_pretrained_step=-1,
             gradient_checkpointing=False,
-            # sdpa — deterministic on the locked stack; flash-attn 2 is not part of it.
             disable_flash_attn2=True,
             bf16=(dtype == torch.bfloat16),
             fp16=(dtype == torch.float16),
             output_dir="",
         )
 
-        # transformers 5.6 loads the fast (tensor-native) image processor by default; gradient flow requires it — the slow variant round-trips through PIL and severs autograd.
         model, processor, _ = create_model_and_processor(
             model_config=model_config,
             peft_lora_config=peft_lora_config,
@@ -282,7 +278,6 @@ class VideoRewardWrapper:
         for start in range(0, len(video_tensors), self.micro_batch_size):
             end = start + self.micro_batch_size
             batch = self.prepare_batch_from_frames(video_tensors[start:end], prompts[start:end])
-            # 5.x processors inject mm_token_type_ids; the backbone doesn't accept it (see module NOTE — pop, never signature-filter).
             batch.pop("mm_token_type_ids", None)
             logits = self.model(**batch, return_dict=True)["logits"]
             vq, mq, ta = logits[:, 0], logits[:, 1], logits[:, 2]

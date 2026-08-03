@@ -123,7 +123,7 @@ def _match_admissible(action: str, admissible: List[str]) -> str:
         if a in cl or cl in a:
             return c
     at = set(a.split())
-    best, best_score = action, 0.5  # threshold: only snap on a real overlap
+    best, best_score = action, 0.5
     for c in admissible:
         ct = set(c.strip().lower().split())
         if not ct:
@@ -160,9 +160,7 @@ class AlfworldEnv:
         self._alfworld_cfg: Any = None
         self._ready = False
 
-    # ALFWorld backend — lazy + isolated so tests can inject a mock episode.
     def _ensure_backend(self) -> None:
-        # Double-checked lock: concurrent trajectory threads all reach here on the first rollout; only ONE may run the setup (it mutates sys.argv around load_config(), which is not thread-safe).
         if self._ready:
             return
         with self._lock:
@@ -222,7 +220,6 @@ class AlfworldEnv:
         root = request.parts[0]
         sid = str(root.sample_ids[0])
         meta = (root.metadata or [None])[0] or {}
-        # Prefer the exact game FILE from the data row (author-selected set); fall back to indexing this worker's game list.
         game_file = meta.get("game_file")
         if not game_file and self._games:
             game_file = self._games[int(meta.get("game_index", 0)) % len(self._games)]
@@ -266,7 +263,6 @@ class AlfworldEnv:
             logger.warning("AlfworldEnv: env.step failed (%s: %s); ending episode.", type(exc).__name__, exc)
             with self._lock:
                 self._episodes.pop(eid, None)
-            # NaN reward = "engine bug, not a policy failure": the trainer excludes it from the GRPO group (neutral, zero advantage) so a crash doesn't penalize the trajectory's actions. Drop (don't reuse) a template whose game just errored.
             return None, True, {"reward": float("nan"), "success": 0.0, "steps": ep.steps, "error": True}
         ep.steps += 1
         ep.admissible = self._admissible(infos)

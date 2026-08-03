@@ -60,7 +60,6 @@ def patch_gpu_worker() -> None:
             self._sleep_restore_map: dict[str, str] = {}
             self._weights_update_groups: dict = {}
 
-            # Memory saver handler (zero-copy sleep/wake). NOTE: stock-upstream multimodal_gen ServerArgs lacks ``enable_memory_saver`` (only ``pin_cpu_memory`` exists), so read both defensively via getattr -- see RISKS.
             self._memory_saver = MemorySaverHandler(
                 adapter=TorchMemorySaverAdapter.create(enable=getattr(self.server_args, "enable_memory_saver", False)),
                 pipeline=self.pipeline,
@@ -297,7 +296,6 @@ def _encode_prompt(self, prompts: list[str]) -> dict:
         if seq_embeds:
             result["prompt_embeds"] = torch.cat(seq_embeds, dim=1) if len(seq_embeds) > 1 else seq_embeds[0]
 
-        # pooled_prompt_embeds: from 2D embeds first, fallback to pooled_list (don't merge both — Flux has duplicates across the two sources)
         if not pooled_embeds:
             pooled_embeds = list(pooled_list)
         if pooled_embeds:
@@ -493,7 +491,6 @@ def _move_modules(self, names: list[str], device: str) -> bool:
         logger.warning(
             f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
         )
-        # TODO (mengyang, chenyang): If exception is raised
         for name in moved:
             module = modules.get(name)
             src_dev = src_device_map.get(name)
@@ -528,8 +525,6 @@ def _release_memory_occupation(self, tags: list[str] | None = None, cpu_backup_t
         result = self._memory_saver.release(tags, cpu_backup_tags)
         self._sleeping = result.get("sleeping", False)
         return result
-
-    # legacy path: .to("cpu") offload Accept any tags (or None) — legacy path moves all modules regardless.
 
     try:
         modules = get_updatable_modules(self.pipeline)
@@ -585,7 +580,6 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "message": "pipeline not initialized",
         }
 
-    # memory_saver path: per-component region resume
     if self._memory_saver.enabled:
         result = self._memory_saver.resume(tags)
         self._sleeping = result.get("sleeping", False)
@@ -620,6 +614,3 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "sleeping": self._sleeping,
             "message": f"resume failed; rolled back to keep state consistent: {e}",
         }
-
-
-# RISKS (upstream gaps vs. the fork) -- surfaced per task requirements. Upstream has since refactored this into a @staticmethod ``GPUWorker._req_to_output_batch(result)`` whose OutputBatch ALREADY carries the native-logprob payload via ``rollout_trajectory_data`` (schedule_batch OutputBatch:416) and ``trajectory_latents`` -- so the trajectory/log-prob needs of the SD3/dance pilots are met without any wrap.

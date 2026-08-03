@@ -41,7 +41,6 @@ class Qwen3OmniARConditions(Batch):
         if self.prompt is None:
             raise ValueError("Qwen3OmniARConditions.to_dict: prompt field is None")
         out: Dict[str, Any] = {"prompt": self.prompt}
-        # Omit absent video fields from text-only tracks.
         if self.pixel_values_videos is not None:
             out["pixel_values_videos"] = self.pixel_values_videos
         if self.video_grid_thw is not None:

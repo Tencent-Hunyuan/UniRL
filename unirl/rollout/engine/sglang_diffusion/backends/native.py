@@ -171,7 +171,6 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        # SGLang populates arch_config.vae_scale_factor lazily in vae_config.post_init(); our standalone call here (init_same_noise path) can run before that hook fired — populate it idempotently.
         vae_cfg = getattr(pcfg, "vae_config", None)
         arch = getattr(vae_cfg, "arch_config", None)
         if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):

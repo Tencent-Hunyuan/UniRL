@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+# Copyright 2023-2024 SGLang Team; SPDX-License-Identifier: Apache-2.0
 """Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow.
 
 Vendored verbatim (minus NPU/MUSA branches and the ``pybase64`` dependency)
@@ -32,7 +32,6 @@ from typing import Callable, List, Tuple, Union
 import torch
 from torch.multiprocessing import reductions
 
-# The signature has not been changed for years, and we will not need this when the next version is released, so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
@@ -253,7 +252,6 @@ class SafeUnpickler(pickle.Unpickler):
     }
 
     def find_class(self, module, name):
-        # Block deterministic attacks
         if (module, name) in self.DENY_CLASSES:
             raise RuntimeError(
                 f"Blocked unsafe class loading ({module}.{name}), to prevent exploitation of CVE-2025-10164"

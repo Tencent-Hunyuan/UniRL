@@ -69,14 +69,12 @@ class Worker:
         else:
             self.device = "cpu"
 
-        # Snapshot recording (UNIRL_MEMSNAP=1) must start in this process; dumps fire later via Remote.get_memory_stats.
         from unirl.utils.memory_utils import init_process_snapshot_sampler
 
         init_process_snapshot_sampler(rank=nccl_rank if nccl_rank is not None else device_id)
 
         self.worker_id = f"dw{device_id}" if slot == 0 else f"dw{device_id}_s{slot}"
 
-        # Backend dependencies: tw (gpu) is injected after spawn via set_tensor_worker(); tq_handoff (transfer_queue) arrives here in the constructor from DevicePool.
         self.tw = None
         self.tq_handoff = tq_handoff
         self.transport: Optional[TensorTransport] = None
@@ -84,7 +82,6 @@ class Worker:
         self._roles: Dict[str, Remote] = {}
         self._reserved_sockets: Dict[int, socket.socket] = {}
 
-        # colocate + transfer_queue build immediately — their deps are ready at construction (in-process store / the driver handoff). gpu defers until DevicePool injects the shared per-GPU TensorWorker via set_tensor_worker().
         if self.transport_kind in ("colocate_store", "colocate", "transfer_queue", "tq"):
             self.build_and_install_transport()
 
@@ -133,7 +130,6 @@ class Worker:
                 world_size=self.world_size,
             )
         )
-        # No return: the transport is not Ray-serializable (holds locks / actor handles); DevicePool calls this via RPC and must not receive it.
 
     def _install_transport(self, transport: TensorTransport) -> None:
         """Install the Worker's transport as the process backend.
@@ -281,7 +277,6 @@ class Worker:
         """
         role = self._roles[role_name]
 
-        # Resolve: collect TensorRef leaves (tree order), batch-fetch, substitute. Keys are positional indices so get_batch results align with the walk.
         in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
         in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
@@ -293,7 +288,6 @@ class Worker:
         resolved_kwargs = map_tree(kwargs, resolve)
 
         if grad_mode:
-            # Cross-RPC autograd can only propagate gradients back to controller-side TensorRef inputs recorded by Handle as input_metas.
             tensors = [fetched[str(i)] for i in range(len(in_metas))]
             for t in tensors:
                 t.requires_grad_(True)
@@ -303,7 +297,6 @@ class Worker:
         result = getattr(role, method_name)(*resolved_args, **resolved_kwargs)
 
         if grad_mode:
-            # Save output tensors BEFORE pack so backward can use grad_fn.
             role._grad_outputs[call_id] = collect_leaves(result, Tensor)
 
         out_tensors = self._collect(result, Tensor)

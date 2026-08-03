@@ -54,12 +54,9 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
         self._upstream_scheduler = self.scheduler
-        # Conditioning-tap state: armed (reset) every request, filled by the tap's first call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._pending_initial_noise: Optional[torch.Tensor] = None
-
-    # install — once per pipeline lifetime, idempotent
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (from_config keeps
@@ -109,8 +106,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
         self.encode_prompt = tapped  # type: ignore[assignment]
         self._conditioning_tap_installed = True
-
-    # arm — every request (stale-leak guards)
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
@@ -191,7 +186,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         with self._sigma_override(req):
             out = super().forward(req, **kwargs)
 
-        # The engine post-processes out.output into PIL frames, but for video those do NOT survive the worker->client wire — only tensors carried in custom_output / trajectory_* cross; PIL image lists are dropped, so the trainer-side response would see empty ``images`` (LIN-382). Stamp the decoded video tensor (CHW-by-frame, [B, C, F, H, W]) onto custom_output so ``collect_dit_outputs`` can recover frames for the reward.
         decoded = getattr(out, "output", None)
         if decoded is not None:
             stamp_custom_output(out, "rl_decoded_video", detach_cpu(decoded))

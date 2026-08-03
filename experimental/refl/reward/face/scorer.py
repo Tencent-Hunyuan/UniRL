@@ -97,7 +97,6 @@ class FaceRewardScorer(LocalRewardBackend):
         self._ref_max_frames = int(self.model_kwargs.get("ref_max_frames", 81))
         self._ref_max_pixels = int(self.model_kwargs.get("ref_max_pixels", 480 * 480))
         self._differentiable = bool(self.model_kwargs.get("differentiable", True))
-        # Bounded LRU: reference embeddings are small, but a many-identity dataset must not grow GPU residency without bound.
         self._ref_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:

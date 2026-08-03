@@ -33,7 +33,7 @@ class BenchmarkSpec:
     grader: Optional[str] = None
     gen: Dict = field(default_factory=dict)
     t2i_linspace_sigmas: bool = False
-    t2i_prompt_seed: bool = False  # t2i: seed each image per prompt content (reproducible), CPU generator
+    t2i_prompt_seed: bool = False
     notes: str = ""
 
     def data_path(self) -> Path:
@@ -89,9 +89,8 @@ _ALL = (
         data="datasets/geneval2/synthetic/test.jsonl",
         prompt_field="prompt",
         rewards=("geneval2",),
-        send_metadata=True,  # ships each record's vqa_list, so the scorer needs no dataset_path config
-        samples_per_prompt=1,  # reproduction protocol: 1 image/prompt
-        # DPPO GenEval2 reproduction regime.
+        send_metadata=True,
+        samples_per_prompt=1,
         gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512, "max_sequence_length": 256},
         t2i_linspace_sigmas=True,
         t2i_prompt_seed=True,
@@ -103,7 +102,7 @@ _ALL = (
         data="benchmarks/image/geneval/data/evaluation_metadata.jsonl",
         prompt_field="prompt",
         rewards=("geneval",),
-        send_metadata=True,  # ships tag/include/exclude, which the geneval scorer hard-requires
+        send_metadata=True,
         notes="Official GenEval (Mask2Former + CLIP); enable the 'geneval' scorer in the reward service (off by default).",
     ),
     BenchmarkSpec(

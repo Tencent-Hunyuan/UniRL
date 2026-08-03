@@ -156,7 +156,6 @@ def _reshape_by_grid(video: torch.Tensor, view_grid: Tuple[int, int]) -> torch.T
     if n_frames * grid_t < total_frames:
         video = video[:, : n_frames * grid_t]
     elif n_frames * grid_t > total_frames:
-        # pad with zeros if we need more frames
         pad = n_frames * grid_t - total_frames
         video = torch.cat([video, torch.zeros(3, pad, h, w, dtype=video.dtype, device=video.device)], dim=1)
 
@@ -393,7 +392,6 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
             if new_key in flat_model_keys:
                 filtered_state[new_key] = filtered_state.pop(old_key)
 
-    # Log match stats for debugging checkpoint compatibility
     matched = sum(1 for k in filtered_state if k in model_state)
     skipped = len(filtered_state) - matched
     if skipped:
@@ -431,7 +429,6 @@ class _VideoAlignInference:
         """Load model, config, processor, and checkpoint weights."""
         from transformers import AutoConfig, AutoModelForTextToVideo, AutoProcessor
 
-        # Load model config to determine architecture flags
         config_path = os.path.join(checkpoint_dir, "model_config.json")
         with open(config_path) as f:
             cfg = json.load(f)
@@ -447,7 +444,6 @@ class _VideoAlignInference:
         self._prompt_template_type = data_cfg.get("prompt_template_type", "detailed_special")
         self._sample_type = data_cfg.get("sample_type", "uniform")
 
-        # Processor. The base Qwen2-VL-2B model location: prefer an explicit env override (so launches from any cwd work), else a sibling of the checkpoint dir, else the original DanceGRPO-relative default.
         qwen_path = os.environ.get("VIDEOALIGN_QWEN_CKPT", "")
         if not qwen_path:
             _sibling = os.path.join(os.path.dirname(checkpoint_dir.rstrip("/")), "Qwen2-VL-2B-Instruct")
@@ -557,7 +553,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         self._ta_coef = float(getattr(config, "ta_coef", 1.0))
 
     def _load_model(self) -> None:
-        # Ensure decord is used (torchvision.io.read_video removed in newer versions)
         os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
         checkpoint_path = self.model_kwargs.get("checkpoint_path") or os.environ.get("VIDEOALIGN_CKPT")
         if not checkpoint_path:

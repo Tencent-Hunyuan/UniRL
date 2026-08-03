@@ -181,7 +181,7 @@ class PPO(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        del advantages  # PPO consumes packed GAE, not the compatibility summary on Part.
+        del advantages
         if segment.tokens is None or segment.lengths is None or segment.log_probs is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         if int(segment.tokens.numel()) == 0:

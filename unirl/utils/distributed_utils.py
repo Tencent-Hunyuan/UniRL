@@ -69,7 +69,6 @@ def init_process_group(
         store.set_timeout(timeout)
         store = PrefixStore(group_name, store)
 
-    # Detect the correct keyword for process group options. PyTorch renamed this parameter across versions: < 2.6 : pg_options 2.6-2.x: backend_options some builds: neither (positional only or removed) Introspect the actual signature to avoid version-string comparison bugs.
     import inspect
 
     _npg_sig = inspect.signature(_new_process_group_helper)

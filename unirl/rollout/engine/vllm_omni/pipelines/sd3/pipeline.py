@@ -59,15 +59,11 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Upstream ``__init__`` constructs ``self.scheduler`` at ``pipeline_sd3.py:191``; stash it as the config donor for the SDE swap. We never swap back — our scheduler is installed for the lifetime of this pipeline instance.
         self._upstream_scheduler: FlowMatchEulerDiscreteScheduler = self.scheduler
-        # Conditioning-tap state: armed (reset) every request, filled by the tap's first call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._t5_workaround_installed: bool = False
         self._pending_initial_noise: Optional[torch.Tensor] = None
-
-    # install — once per pipeline lifetime, idempotent
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (the from_config
@@ -171,8 +167,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
         self._get_t5_prompt_embeds = patched_get_t5_prompt_embeds  # type: ignore[assignment]
         self._t5_workaround_installed = True
-
-    # arm — every request (stale-leak guards)
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""

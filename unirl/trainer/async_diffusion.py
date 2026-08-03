@@ -68,7 +68,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         buffer_max_staleness: Optional[int] = None,
         **diffusion_kwargs: Any,
     ) -> None:
-        # Async needs disjoint train/rollout slabs; force the separate layout.
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
@@ -129,7 +128,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            # Hydrate in place so the wandb reward/advantage stats reuse this fetch instead of re-pulling the TensorRef from the worker.
             part.rewards = hydrate(part.rewards)
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
@@ -138,7 +136,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         sample = sample.replace_frontier(part)
         result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
-        # train_step is bypassed, so BaseTrainer's per-step reset hook never fires; reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
         return result, mean_reward
 
@@ -158,7 +155,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Single-threaded: exactly one get_samples(batch_size) per launch and launches are 1:1 with gen_id, so replaying start_rollout times restores the exact stream position (deterministic resume).
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
@@ -171,7 +167,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             },
         )
 
-        # gen_id is seeded by start_rollout so launches stay 1:1 with rollout_id.
         self._async_engine = AsyncBatchRolloutEngine(
             self.rollout,
             complete=self._score_completed,
@@ -181,7 +176,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         if resumed and self.weight_sync is not None:
             self.weight_sync.sync()
         if self.eval_interval > 0:
-            # Evaluate the policy already resident on the rollout slab. Eval must neither advance the async weight version nor offload this engine.
             self.evaluate(start_rollout, sync_weights=False, sleep_after=False)
 
         try:
@@ -200,7 +194,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                     self._drain_all()
                     self.evaluate(step, sync_weights=False, sleep_after=False)
                 if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()  # consistent engine + deterministic resume
+                    self._drain_all()
                     self.maybe_save_checkpoint(
                         rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                     )
@@ -248,7 +242,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             while engine.next_gen_id < ceiling and engine.inflight < M:
                 engine.submit(self._build_async_sample(engine.next_gen_id))
             picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
-            engine.pop_evicted()  # over-stale groups are discarded on the batch path
+            engine.pop_evicted()
             if picked is not None:
                 return picked
             if engine.inflight:

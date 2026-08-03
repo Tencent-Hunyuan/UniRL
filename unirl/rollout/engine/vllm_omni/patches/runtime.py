@@ -45,10 +45,6 @@ class OmniTensorLoRARequest(OmniLoRARequest):
     lora_tensors: dict = field(default=None)
 
 
-# Subprocess propagation — make spawn children also run hijack vllm-omni's ``multiproc_executor`` calls ``mp.set_start_method("spawn", force=True)``. Without this hook, ``patch_fp32_skip`` (and other patches whose targets are imported by the child) take effect in the driver but NOT in the worker subprocesses where vllm.lora.utils.from_layer is actually called during model loading — fp32 router gate then crashes punica.
-
-
-# Pid of the process at the ROOT of the spawn chain (the Ray actor hosting ``Omni``). Exported into the environment so it survives every subsequent spawn level: the AR stage's ``StageEngineCoreProc`` and the vLLM ``Worker_TP*`` processes it spawns all watch the same anchor.
 _FATE_ANCHOR_ENV = "UNIRL_FATE_ANCHOR_PID"
 _FATE_POLL_SECONDS = 5.0
 
@@ -90,14 +86,12 @@ def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
         try:
             import ctypes
 
-            # PR_SET_PDEATHSIG == 1. SIGKILL rather than vllm-omni's SIGTERM: by the time it fires the creator thread is already gone, so there is nobody left to hand a graceful shutdown to.
             ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
         except Exception:  # noqa: BLE001 - best effort; the watchdog below is the real guarantee
             pass
 
     root = os.environ.get(_FATE_ANCHOR_ENV)
     root_pid = int(root) if root else int(anchor_pid)
-    # Children spawned from here inherit the environment, so the whole tree converges on one anchor instead of a fragile parent-of-parent chain.
     os.environ[_FATE_ANCHOR_ENV] = str(root_pid)
 
     original_ppid = os.getppid()
@@ -107,7 +101,6 @@ def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
             time.sleep(_FATE_POLL_SECONDS)
             if not _pid_alive(root_pid):
                 os._exit(1)
-            # Reparenting is the earlier signal when the immediate parent dies but the anchor is still up (e.g. the engine core crashed alone).
             if original_ppid != 1 and os.getppid() != original_ppid:
                 os._exit(1)
 
@@ -240,7 +233,7 @@ def patch_dit_lora_loader() -> None:
 
             peft_helper = PEFTHelper.from_local_dir(
                 lora_path,
-                max_position_embeddings=None,  # no need in diffusion
+                max_position_embeddings=None,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
             )
 
@@ -378,7 +371,6 @@ def patch_ar_merged_lora_fused_tensor() -> None:
         _set_lora._diffrl_fused_merged_tolerant = True  # type: ignore[attr-defined]
         return _set_lora
 
-    # Patch every merged class that defines its own ``set_lora``; subclasses that only inherit it are covered transitively by the base-class patch.
     for _name in (
         "MergedColumnParallelLinearWithLoRA",
         "MergedQKVParallelLinearWithLoRA",
@@ -435,7 +427,7 @@ def patch_fp32_skip() -> None:
     _patched_from_layer._diffrl_fp32_skip = True  # type: ignore[attr-defined]
     _lora_utils.from_layer = _patched_from_layer
 
-    # Rebind stale references in modules that did `from vllm.lora.utils import from_layer` at top level before our patch ran.
+    # Rebind modules that imported from_layer before this patch ran.
     import importlib as _importlib
 
     for _modname in (
@@ -482,7 +474,7 @@ def patch_lora_request_passthrough() -> None:
                 self.engine._diffrl_pending_lora_request = None
                 raise
             if py_generator:
-                # ``_orig`` returned a generator — wrap so we clear the stash only when the generator is exhausted / closed.
+
                 def _wrapped(gen, engine):
                     try:
                         yield from gen
@@ -579,7 +571,6 @@ def patch_per_request_ar_seed() -> None:
 
     def _patched(self, *args, sampling_params_list=None, _orig=_orig, **kwargs):
         if sampling_params_list is not None:
-            # SamplingParams is a msgspec.Struct shared across the N add_request calls; ``structs.replace`` produces a brand-new instance per request so the worker queue does not see one object holding the last seed.
             sampling_params_list = [
                 _msgspec.structs.replace(sp, seed=int.from_bytes(_os.urandom(4), "big"))
                 if isinstance(sp, VLLMSamplingParams) and getattr(sp, "seed", None) is None
@@ -666,7 +657,6 @@ def patch_hi3_flow_alignment() -> None:
 
     import threading as _threading
 
-    # Thread-local position_ids stash. Single denoise call chain (DecoderLayer.forward → self_attn → image_attn → _update_image_kv_caches) is synchronous in one thread, so the wrapper sets _tls.position_ids on entry and the patched _update reads it back down the stack.
     _tls = _threading.local()
 
     _orig_save = _ImageKVCacheManager._save_image_kv_caches
@@ -745,7 +735,6 @@ class VLLMOmniHijack:
 
     @staticmethod
     def hijack() -> None:
-        # MUST run first: install the mp.Process wrap so any subsequent spawn-spawned subprocesses also run this hijack() at startup. Without this, patches that target functions imported during the child's model-loading phase (notably patch_fp32_skip → from_layer) never take effect in the worker subprocesses.
         wrap_mp_process_for_children()
 
         patch_qwen3_omni_thinker_lora()

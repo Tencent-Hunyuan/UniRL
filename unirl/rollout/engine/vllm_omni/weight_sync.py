@@ -43,10 +43,8 @@ class WeightSync:
     ) -> None:
         self._backend = backend
         self._uses_lora = bool(uses_lora)
-        # HI3 two-engine stages are TP>1: the wake-time re-push must use the byte-copy transport (the zero-copy handle's one-shot fd pops after the first consumer, crashing ranks 2..N).
         self._lora_copy_transport = bool(lora_copy_transport)
         self._lora_loaded = False
-        # The runtime released its memory since the last push (sleep) — the worker-side adapter pool may be gone until the wake-time re-push.
         self._weights_released = False
         self._last_lora_name: Optional[str] = None
         self._last_lora_tensors: Optional[Dict[str, Any]] = None
@@ -76,7 +74,6 @@ class WeightSync:
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
-        # Phase-2 LoRA sync (peft_config + base_sync_done) has registered the adapter on every worker — flip the activation flag so the next generate attaches a lora_request (without it, vllm-omni's per-request ``set_active_adapter(None)`` deactivates the adapter we just synced and rollout silently runs base weights).
         if peft_config and base_sync_done:
             self._lora_loaded = True
             self._weights_released = False
@@ -173,8 +170,6 @@ class WeightSync:
         else:
             self._last_lora_tensors = lora_tensors
         self._last_peft_config = dict(peft_config or {})
-
-    # Post-load value-correctness read-back
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
         return self._backend.param_checksums(names=list(names))

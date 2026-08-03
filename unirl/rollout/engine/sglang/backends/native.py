@@ -53,8 +53,6 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-# Wire mapping — pure, module-level (CPU-testable without sglang)
-
 _GENERATE_PASSTHROUGH = (
     "input_ids",
     "sampling_params",
@@ -232,9 +230,7 @@ class NativeBackend:
         self._concurrency = int(concurrency)
         self._rt = runtime
         self._logged_first_response = False
-        # The backend owns the serve/park lifecycle of engine.loop, so the rollout engine never handles a raw event loop or thread.
         self._lt = LoopThread(engine.loop, label="sglang NativeBackend")
-        # One semaphore bounding concurrent in-flight requests across ALL callers (3.12 binds it to engine.loop on first use — every coroutine runs there, so the bound spans concurrent trajectory threads too).
         self._sem = asyncio.Semaphore(int(concurrency))
 
     @classmethod
@@ -268,12 +264,8 @@ class NativeBackend:
                 "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
                 "use backend='http' for rollout TP/EP."
             )
-        # The Engine entrypoint defaults log_level to "error" (the HTTP server path runs at "info") — restore parity so scheduler logs and this module's post-init lines stay visible.
         engine_kwargs.setdefault("log_level", "info")
 
-        # Env quarantine: the HTTP impl's block minus the no_proxy whitelist (no HTTP warmup self-check to misroute). The rest is unchanged because the schedulers are still subprocesses.
-
-        # CUDA-IPC tensor sync requires the non-expandable allocator on older kernels (<5.10) that lack pidfd_getfd; matches PE rollout_actor.py.
         try:
             import torch
 
@@ -281,7 +273,6 @@ class NativeBackend:
         except Exception:
             pass
 
-        # NCCL transport defaults — required for cross-process NCCL groups used by weight sync to establish P2P/CUMEM channels. sglang's _set_envs_and_config() defaults these to "0" when enable_symm_mem is False, breaking broadcast with "Cuda failure 'invalid argument'".
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 
@@ -292,11 +283,9 @@ class NativeBackend:
             engine_kwargs.get("nccl_port"),
         )
 
-        # ``set_start_method`` is process-global; matches the HTTP impl so torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        # Bind-mapping gate twin: the settled ServerArgs must echo the reserved ports verbatim — a runtime upgrade that silently re-settles them shows up here.
         settled = getattr(engine, "server_args", None)
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
@@ -362,8 +351,6 @@ class NativeBackend:
             if isinstance(item, BaseException):
                 raise item
         return [item for sublist in nested for item in sublist]
-
-    # Abort / pause — best-effort controls, bounded-wait while serving.
 
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         self._lt.run_control(self._aabort(abort_all=abort_all, rid=rid))
@@ -479,7 +466,6 @@ class NativeBackend:
             pids = self._engine.get_all_child_pids()
             for pid in pids:
                 os.kill(pid, 0)
-            # An empty pid list after a successful boot means the children are gone.
             return bool(pids)
         except Exception:
             return False

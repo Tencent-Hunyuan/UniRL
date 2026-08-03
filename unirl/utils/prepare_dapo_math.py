@@ -90,7 +90,7 @@ def _convert(
     try:
         ds = load_dataset(hf_id, split=split)
     except Exception as e:
-        # Shard-inconsistent side columns (e.g. DPAO_filter's extra_info is {index: string} in one shard and struct<index,split> in another) make schema unification fail. Retry reading only the columns we use — the column set is source-specific (verl-style sources carry prompt/reward_model; the AIME sets don't), so callers opt in.
+        # Read only required columns when shard schemas cannot unify.
         if retry_columns is None:
             raise
         print(f"  full-schema load failed ({type(e).__name__}); retrying with pruned columns")

@@ -49,7 +49,6 @@ class IPCWeightSync(FullWeightSync):
         track_prefix: str = "",
         wire_dtype: Any = None,
     ) -> None:
-        # 2048 MB default: the buffer must fit the largest single tensor in one bucket (BucketedWeightSender asserts this).
         super().__init__(
             backend=backend,
             bucket_size_mb=bucket_size_mb,

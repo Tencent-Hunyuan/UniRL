@@ -108,7 +108,6 @@ class HunyuanVideoPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideoVAEDecodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine can build the FlowMatchSchedulePolicy at startup. Static shift only (HunyuanVideo-1.0 doesn't use dynamic mu).
         self.shift = shift
 
     @classmethod
@@ -166,7 +165,6 @@ class HunyuanVideoPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            # Pass through the config-side override so the stage uses the same channel count the driver assumed in ``latent_shape``.
             latent_channels=config.latent_channels,
         )
         vae_decode = HunyuanVideoVAEDecodeStage(bundle)
@@ -231,7 +229,6 @@ class HunyuanVideoPipeline(Pipeline):
         hv_conds = self.build_conditions(texts)
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a pre-shipped initial_latents tensor (on the gen part's segment) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(hv_conds, schedule=schedule, params=params, initial_latents=initial_latents)

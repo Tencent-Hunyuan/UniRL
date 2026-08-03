@@ -65,8 +65,6 @@ class BaseRolloutEngine(Remote, ABC):
     def generate(self, sample: Sample) -> RolloutOutput:
         """Synchronously run rollout generation; each concrete contract owns its dispatch mode."""
 
-    # Control plane — reached via raw Worker.call, so calls interleave with an in-flight generate.
-
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
         del ids

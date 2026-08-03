@@ -112,7 +112,6 @@ class HunyuanVideo15Bundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): architecture only, no per-rank weight allocation; the backend materializes + loads from the stashed dir after sharding. build_meta_init_transformer keeps init-computed non-persistent buffers (rope tables) real and captures them into meta_init_state (stashed on the bundle below).
             transformer_config = HunyuanVideo15Transformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: HunyuanVideo15Transformer3DModel.from_config(transformer_config), dtype=dtype
@@ -122,7 +121,6 @@ class HunyuanVideo15Bundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             )
             transformer = transformer.to(device=device, dtype=dtype)
-        # Reject meanflow checkpoints — replay path doesn't thread timestep_r yet.
         if bool(getattr(getattr(transformer, "config", None), "use_meanflow", False)):
             raise NotImplementedError(
                 "HunyuanVideo15Bundle does not support transformers with "

@@ -124,7 +124,6 @@ class NCCLWeightSync(FullWeightSync):
         if self._rollout_role is None:
             raise RuntimeError("NCCLWeightSync.connect: call set_rollout_targets() first")
 
-        # PP>1 needs a per-stage rank_offset map (each PP stage holds a disjoint slice of the model). Fail closed until that lands; the tp/dp path is the supported one today.
         if pp_size > 1:
             raise NotImplementedError(
                 "NCCLWeightSync.connect: rollout pp_size>1 is not implemented "

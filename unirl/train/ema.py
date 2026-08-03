@@ -152,7 +152,6 @@ def inject_nft(
     inject_adapter_in_model(peft_cfg, model, adapter_name=default)
     inject_adapter_in_model(peft_cfg, model, adapter_name=shadow)
 
-    # peft's inject_adapter_in_model installs the LoRA layers but does not flip diffusers' PeftAdapterMixin `_hf_peft_config_loaded` flag, so the model-level `set_adapter` raises "No adapter loaded". Activate `default` the same per-LoraLayer way swap_out does (works for diffusers + plain modules), and mark the flag so downstream diffusers adapter ops stay consistent.
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
     _activate_keep_grad(model, default, trainable=default, frozen=shadow)

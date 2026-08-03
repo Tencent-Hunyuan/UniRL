@@ -69,7 +69,6 @@ class WAN22Pipeline(Pipeline):
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
     ) -> None:
-        # Stages default to None and are built from the (trainer-injected) bundle — mirrors SD3Pipeline so the v2 trainer can construct the pipeline via ``remote_hydra(pipeline_cfg, bundle=self.bundle)`` without reloading the dual transformer.
         super().__init__()
         self.bundle = bundle
         self.text_embed = (
@@ -125,7 +124,6 @@ class WAN22Pipeline(Pipeline):
         """
         bundle = WAN22Bundle.from_config(config)
 
-        # WAN 2.1's text embed stage expects a ``WAN21Bundle``-compatible object — we satisfy that contract with ``WAN22Bundle`` (it exposes the same ``text_encoder`` / ``tokenizer`` / ``max_sequence_length`` / ``device`` fields). The stage uses duck-typing so no isinstance check fires.
         text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(config.max_sequence_length))
         step = WAN22DiffusionStep()
         diffusion = WAN22DiffusionStage(
@@ -197,7 +195,6 @@ class WAN22Pipeline(Pipeline):
                 "in unirl.models.types.pipeline."
             )
 
-        # conditioning() surfaces [text, image?] in turn order — the i2v first-frame rides as a chained input Part (Part.input_child) on the request.
         conditioning = sample.conditioning()
         texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
@@ -212,7 +209,6 @@ class WAN22Pipeline(Pipeline):
         effective_guidance = max(primary_g, low_g)
         wan_conds = self.build_conditions(texts, guidance_scale=effective_guidance)
 
-        # Image conditioning depends on diffusion geometry and is attached after the public text-only condition builder.
         if images_prim is not None:
             if images_prim.pixels is None or int(images_prim.pixels.shape[0]) != len(texts.texts):
                 raise ValueError(
@@ -239,7 +235,6 @@ class WAN22Pipeline(Pipeline):
 
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(

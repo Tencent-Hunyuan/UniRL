@@ -65,7 +65,6 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
     ``latents``), so the T2I unpack is correct.
     """
 
-    # Edit-Plus text embeds carry image-placeholder tokens beyond the text mask, so the mask must be padded (not dropped) to match embeds length.
     pad_mask_to_embeds = True
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
@@ -99,7 +98,6 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
             raise ValueError(
                 f"build_prompts: prompt count {len(prompts)} != diffusion sample count {len(gen_part.sample_ids)}"
             )
-        # Collapse PILs in parallel with prompts: one source image per group. Mirror ``deexpand_prompts_from_groups``'s group logic (first image per group, in first-seen group order) rather than assuming a contiguous group-major layout — ``pil_images[::k]`` would misalign images vs prompts if ``group_ids`` are interleaved ([A,B,A,B,...]).
         if k > 1:
             unique_pils = self._first_per_group(pil_images, list(gen_part.group_ids))
             if len(unique_pils) != len(unique_prompts):
@@ -168,7 +166,6 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
             latent_w = int(vae_width) // _VAE_SCALE_FACTOR
             spatial = _unpack_latents(packed, latent_h=latent_h, latent_w=latent_w)
             tensors.append(spatial)
-        # All source-image latents share the same vae_size-derived grid (upstream normalizes to ~1024²), so dim-0 concat is safe.
         shapes = {tuple(t.shape) for t in tensors}
         if len(shapes) > 1:
             raise RuntimeError(

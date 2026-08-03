@@ -31,11 +31,9 @@ def patch_dance() -> None:
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
-    # Allow "dance" through request-path validation + CLI choices. Both `RLRolloutArgs.validate` and `add_cli_args` read this module global at call time, so reassigning the attribute is sufficient.
     if "dance" not in rl_rollout._VALID_ROLLOUT_SDE_TYPES:
         rl_rollout._VALID_ROLLOUT_SDE_TYPES = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES) + ("dance",)
 
-    # REPLACE flow_sde_sampling with the dance-aware version. Idempotent.
     if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_dance", False):
         return
     srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_dance
@@ -125,7 +123,6 @@ def _flow_sde_sampling_with_dance(
         log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
     elif effective_sde_type == "dance":
-        # DanceGRPO: identical to the "sde" branch except std_dev_t is the CONSTANT eta (not sigma-dependent).
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)

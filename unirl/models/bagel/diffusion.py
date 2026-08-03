@@ -107,7 +107,6 @@ class BagelDiffusionParams(DiffusionSamplingParams):
         )
 
 
-# The vendored ``prepare_*`` helpers build their packed index tensors on CPU; the MoT forward needs them on the model device.
 _to_device = rl_ops._to_device
 
 
@@ -137,7 +136,6 @@ class BagelDiffusionStep:
         scalar ``t_cur``) and does the CFG combine internally (gen / cfg_text /
         cfg_img contexts in ``forward_kwargs`` + the gated scales).
         """
-        # The pristine ``_forward_flow`` reads ``language_model.model.enable_taylorseer`` (the official ``generate_image`` sets it; the RL path calls ``_forward_flow`` directly). Set it here — the single chokepoint before every velocity call — so the TaylorSeer cache is off (per-step determinism for replay).
         rl_ops.disable_inference_cache(bagel)
         seq = int(x_t.shape[0])
         timestep = torch.full((seq,), float(t_cur), device=x_t.device)
@@ -255,7 +253,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
     ) -> None:
-        # ``model`` is the bundle (kept name-compatible with the other stages so the pipeline / FSDPPolicy treat it uniformly).
         self.model = model
         self.step = step if step is not None else BagelDiffusionStep()
         self.strategy = strategy if strategy is not None else FlowSDEStrategy()
@@ -283,11 +280,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         inf = self.model.inferencer
         device = torch.device(self.model.device)
-        # Match the worker pipeline's prompt preprocessing EXACTLY (vllm_omni/diffusion/models/bagel/pipeline_bagel.py): it strips any ``<|im_start|>`` / ``<|im_end|>`` wrappers before ``prepare_prompts`` so bos/eos aren't double-added. If replay tokenized a differently-wrapped prompt, the KV context (and thus every step's v_t / log-prob) would diverge from rollout — a silent rollout↔replay mismatch.
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        # eval() is load-bearing (same contract as ``rl_ops.forward_flow``): navit dispatches ``forward_train`` vs ``forward_inference`` on ``self.training`` and ``update_context_text`` uses the packed-query inference signature, while ``TrainStack.train_track`` leaves the model in train() before the gradient-bearing replay.
         mot = self.model.transformer
         was_training = mot.training
         mot.eval()
@@ -449,14 +444,12 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         self.strategy.init_schedule(schedule)
 
-        # Store SDE step boundaries (x_t before AND after each SDE step) so replay can re-score them, plus the final clean latent (T) for VAE decode.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
         stored_pairs: List[Tuple[int, torch.Tensor]] = []
         if 0 in needed:
             stored_pairs.append((0, x_t.detach().clone()))
         sde_logp_list: List[torch.Tensor] = []
-        # Per-SDE-step mean μ_old (the deterministic transition mean), recorded on the same SDE steps as sde_logp; consumed by BagelFlowUniGRPO(ratio_norm=True).
         sde_means_list: List[torch.Tensor] = []
 
         with torch.no_grad(), self._autocast_ctx(device):
@@ -483,7 +476,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     stored_pairs.append((i + 1, x_t.detach().clone()))
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
-                    # Nested on purpose: prev_mean is non-None on every step, so appending it outside this block would misalign sde_means with sde_logp / sde_indices.
                     if prev_mean is not None:
                         sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
 

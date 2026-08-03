@@ -132,7 +132,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         device = sample.device
         dtype = prompt_embeds.dtype
 
-        # T2V channel-dim packing: zero cond_latents (same shape as latents) + zero cond_mask (single channel). The transformer's ``in_channels`` is ``2 * latent_channels + 1`` by contract.
         sample_cast = sample.to(dtype)
         cond_latents = torch.zeros_like(sample_cast)
         cond_mask = torch.zeros(batch_size, 1, latent_t, latent_h, latent_w, device=device, dtype=dtype)
@@ -145,7 +144,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             dtype=dtype,
         )
 
-        # Sigma → timestep scaling. Always cast to a [B]-shape tensor on the model's compute dtype.
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size)
         elif sigma.shape[0] != batch_size:
@@ -338,7 +336,7 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         "HunyuanVideo15TokenRefiner",
     )
 
-    # VAE downsample defaults from upstream; overridden at construction if the bundle's VAE exposes ``spatial_compression_ratio`` / ``temporal_compression_ratio`` attributes (it does on the canonical checkpoint). ``HunyuanVideo15Pipeline.latent_shape`` reads ``model_config.latent_channels`` first (config-side override) and falls back to this default; the stage init reads VAE config first and falls back to the transformer's ``out_channels`` and then to this constant — three layers of inference, with a runtime fail-fast in ``diffuse(initial_latents=...)`` when driver and stage disagree.
+    # Fail if inferred latent geometry differs between driver and stage.
     DEFAULT_SPATIAL_DOWNSAMPLE: ClassVar[int] = 16
     DEFAULT_TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
     DEFAULT_LATENT_CHANNELS: ClassVar[int] = 32
@@ -387,7 +385,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             cfg = getattr(vae, "config", None)
             ch = int(getattr(cfg, "latent_channels", 0)) if cfg is not None else 0
             if not ch:
-                # Fall back to transformer's reported out_channels.
                 tx_cfg = getattr(model.transformer, "config", None)
                 ch = int(getattr(tx_cfg, "out_channels", self.DEFAULT_LATENT_CHANNELS))
             latent_channels = ch
@@ -517,7 +514,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp modality=VIDEO via the factory so downstream ``segment.modality``-based routing doesn't mistake video latents for image latents.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,

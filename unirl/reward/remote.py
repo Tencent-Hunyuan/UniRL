@@ -163,7 +163,6 @@ class RemoteRewardBackend(RewardBackend):
 
         self._remote_rewards_validated = False
 
-        # Disable proxy env vars — reward services are typically on an internal network where corporate HTTP proxies (squid etc.) would return 503.
         self._session = http_requests.Session()
         self._session.trust_env = False
 
@@ -464,14 +463,12 @@ class RemoteRewardBackend(RewardBackend):
             weights: List[float] = []
             error_parts: List[str] = []
 
-            # Validation contract: every reward this sample asked for must come back. When per-sample required_rewards arrives for multi-turn rollouts (the wire format already supports it via wire_requests[i]["required_rewards"]), replace the loop source with `request.required_rewards[i]` — the failure semantics ("asked-for not returned") stay identical.
             for reward_name in self.required_rewards:
                 if reward_name in sample_result:
                     sub_metrics = sample_result[reward_name]
-                    # Any non-finite sub-metric fails the whole reward for this sample (a partially-broken output is suspect), even an axis the reduction below would not select.
                     non_finite = self._first_non_finite(sub_metrics)
                     if non_finite is not None:
-                        # NaN/inf/null marks an unusable score: the scorer hit a per-item failure (e.g. OCR could not read the image), or a NaN serialized to JSON null on the wire. Flag the sample as failed instead of feeding a non-finite value into advantage normalization, where it would poison the whole group.
+                        # Reject non-finite scores before they poison group normalization.
                         metric_name, bad_value = non_finite
                         component_rewards[reward_name].append(0.0)
                         error_parts.append(
@@ -487,7 +484,6 @@ class RemoteRewardBackend(RewardBackend):
                     if reward_name in sample_errors_dict:
                         error_parts.append(f"{reward_name}: {sample_errors_dict[reward_name]}")
                     else:
-                        # Asked-for reward absent without explanation: server bug, not legitimate omission.
                         error_parts.append(f"{reward_name}: missing from server response without error")
 
             if scores:
@@ -538,7 +534,6 @@ class RemoteRewardBackend(RewardBackend):
         computation.
         """
         for name, value in sub_metrics.items():
-            # bool is an int subclass, so reject it explicitly before the numeric check — a True/False reward is junk, not a 1.0/0.0 score.
             if (
                 value is None
                 or isinstance(value, bool)
@@ -579,7 +574,6 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
     required_rewards: Tuple[str, ...] = ()
     reward_weights: Optional[Dict[str, float]] = None
     batch_size: int = 8
-    # Per-attempt HTTP read timeout. Keep it above the RewardService server's per-reward score_timeout_s (ServerCfg default 120s) so a server-side reward timeout comes back as a structured errors[i][reward] instead of the client timing out first and re-POSTing the whole batch (burning the retry budget).
     timeout: float = 300.0
     max_retries: int = 3
     retry_delay: float = 1.0

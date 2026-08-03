@@ -37,7 +37,6 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
     """
     if not media_refs or not any(media_refs):
         return None
-    # Local imports keep PIL / torchvision off the import path for text-only training runs that never touch this code.
     import PIL.Image
     import torchvision.transforms.functional as TF
 
@@ -323,7 +322,6 @@ class MultimodalRLDataSource:
         self._iter: Optional[Iterator] = None
         self._eval_dataset_ready = False
         self._shuffle_generator = torch.Generator()
-        # ``self.seed`` may be None (run.seed=null) — torch.Generator needs an int, so draw from OS entropy. Per-process shuffle order then becomes non-reproducible, matching the seed=null contract.
         if self.seed is None:
             _shuffle_seed = int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF
         else:

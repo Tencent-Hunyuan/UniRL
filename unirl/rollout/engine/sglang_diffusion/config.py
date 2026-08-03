@@ -58,7 +58,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
     populate_conditions: bool = True
 
-    # Engine-internal noise fallback (only when caller didn't pre-ship latents)
     init_same_noise: bool = False
 
     num_gpus: int = 1
@@ -138,7 +137,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         """
         intent: Dict[str, Any] = {}
 
-        # Layer 1: escape-hatch (lowest priority). Non-ServerArgs keys are dropped by the backend's allowed-keys filter, so passing them through is harmless.
         intent.update(self.engine_kwargs or {})
 
         if model_config.pretrained_model_ckpt_path:

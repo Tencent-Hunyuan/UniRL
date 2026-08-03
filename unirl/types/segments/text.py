@@ -36,7 +36,6 @@ class TextSegment(Segment):
 
     tokens: Optional[torch.Tensor] = packed_field(default=None)
     log_probs: Optional[torch.Tensor] = packed_field(default=None)
-    # Immutable engine emission. ``log_probs`` may be replaced by a train-side replay anchor before PPO/GSPO updates.
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
     loss_mask: Optional[torch.Tensor] = packed_field(default=None)
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)

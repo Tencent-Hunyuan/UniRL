@@ -259,7 +259,6 @@ class MemorySnapshotSampler:
         if self._recording or not torch.cuda.is_available():
             return
         try:
-            # Capture PYTHON allocation stacks so summarize_snapshot can attribute live memory to a file:line. stacks="all" gives C++ unwind frames (useless here — everything collapses to torch::unwind); "python" is what yields real .py:line sites. Fall back to the minimal call on older torch that lacks the context/stacks keywords.
             try:
                 torch.cuda.memory._record_memory_history(max_entries=self.max_entries, context="all", stacks="python")
             except TypeError:
@@ -322,8 +321,6 @@ class MemorySnapshotSampler:
         sampler.start()
         return sampler
 
-
-# ── Process-level sampler registry The sampler must record inside the worker process, but the dump trigger arrives via ``Remote.get_memory_stats`` (defined on a base class with no Worker back-reference).
 
 _PROCESS_SAMPLER: Optional[MemorySnapshotSampler] = None
 

@@ -83,9 +83,7 @@ class FlowGRPO(StageAlgorithm):
             forwards the dict verbatim (unit-test path).
     """
 
-    # prepare_segment freezes segment.sde_logp once, so the PPO ratio stays anchored across every num_updates_per_batch optimizer step.
     supports_multi_update = True
-    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2 trainer must inject the FSDP backend (the trainable model lives on it).
     requires_backend = True
     anchor_fields = ("sde_logp",)
 

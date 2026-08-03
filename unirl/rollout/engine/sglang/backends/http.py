@@ -61,7 +61,6 @@ def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
-        # The session leader may already have exited while scheduler children remain in the group it created with setsid(). That group's id is still the leader pid, so target it directly.
         pgid = pid
     except PermissionError:
         pgid = None
@@ -171,11 +170,9 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 
 def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
     """HTTP server target with child-local launch environment overrides."""
-    # The backend tears this subprocess tree down with killpg(). A multiprocessing child inherits the launcher's process group by default, so without a fresh session that cleanup also SIGTERMs the Ray worker, training driver, and any other process in the launcher's group.
     os.setsid()
 
     if env_overrides:
-        # Must run before importing SGLang or touching torch.cuda in the spawned child: CUDA_VISIBLE_DEVICES can be cached after CUDA init.
         os.environ.update(env_overrides)
 
     from sglang.srt.entrypoints.http_server import launch_server
@@ -191,9 +188,6 @@ def asdict_drop_none(req: Any) -> Dict[str, Any]:
     reach the server).
     """
     return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
-
-
-# Wire deserialization — pure, module-level (CPU-testable without sglang)
 
 
 @dataclass(frozen=True)
@@ -300,9 +294,6 @@ class HTTPBackend:
             backend_name="HTTP",
         )
 
-        # Env quarantine: everything the SRT subprocess needs, set at the spawn boundary (the spec's documented last resort) — never in the engine ctor.
-
-        # CUDA-IPC tensor sync requires the non-expandable allocator on older kernels (<5.10) that lack pidfd_getfd; matches PE rollout_actor.py.
         try:
             import torch
 
@@ -310,11 +301,9 @@ class HTTPBackend:
         except Exception:
             pass
 
-        # NCCL transport defaults — required for cross-process NCCL groups used by weight sync to establish P2P/CUMEM channels. sglang's _set_envs_and_config() defaults these to "0" when enable_symm_mem is False, breaking broadcast with "Cuda failure 'invalid argument'".
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 
-        # http://{host}:{port}/model_info which honors HTTP(S)_PROXY env vars
         _extra_no_proxy = f"0.0.0.0,127.0.0.1,localhost,{advertise_host}"
         _cur_no_proxy = os.environ.get("no_proxy", "") or os.environ.get("NO_PROXY", "")
         os.environ["no_proxy"] = f"{_cur_no_proxy},{_extra_no_proxy}" if _cur_no_proxy else _extra_no_proxy
@@ -328,7 +317,6 @@ class HTTPBackend:
             server_kwargs.get("nccl_port"),
         )
 
-        # ``set_start_method`` is process-global; PE-tested, Ray-compatible. Forcing matches the predecessor so torch CUDA init in the child happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         server_args = rt["ServerArgs"](**server_kwargs)
 
@@ -355,10 +343,8 @@ class HTTPBackend:
                 is_alive_fn=lambda: process.is_alive(),
             )
         except BaseException:
-            # Construction has not returned a backend object yet, so no caller can invoke shutdown().
             _terminate_server_process(process)
             raise
-        # Bind-mapping gate (GPU smoke): the settled ServerArgs must echo the reserved ports verbatim — a runtime upgrade that silently re-settles them shows up here.
         logger.info(
             "SGLang SRT server healthy at %s (settled ServerArgs: port=%s nccl_port=%s host=%s)",
             base_url,
@@ -431,8 +417,6 @@ class HTTPBackend:
                 time.sleep(1)
         return {}
 
-    # Abort / pause — best-effort sync POSTs (bounded 10s, swallow + warn).
-
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"rid": rid} if rid is not None else {"abort_all": bool(abort_all)}
         self._post_best_effort("/abort_request", payload)
@@ -462,7 +446,7 @@ class HTTPBackend:
         """
         url = f"{self._base_url}{path}"
         if timeout is _TIERED_TIMEOUT:
-            # Weight-update + LoRA hot-reload endpoints can stall server-side (NCCL init / broadcast, or SGLang's LoRA-pool unload+reload which takes ~2 min from the 2nd sync on — LIN-287). Give them the long timeout so a legitimately-slow-but-succeeding op isn't killed at 120s.
+            # Use the long timeout for weight updates and LoRA reloads.
             timeout = 600 if ("weights" in path or "update" in path or "lora" in path) else 120
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(

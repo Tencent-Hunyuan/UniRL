@@ -29,7 +29,6 @@ from unirl.distributed.utils import get_node_ip_and_port
 
 logger = logging.getLogger(__name__)
 
-# Shared budget for asking every worker to close its roles. Sized for an engine shutdown that is merely slow, not for one that is wedged — a wedged actor is what ray.kill is for.
 _ROLE_TEARDOWN_TIMEOUT_S = 45.0
 
 
@@ -69,24 +68,20 @@ class DevicePool:
                 f"colocate_store supports one worker per device (got workers_per_device="
                 f"{self.workers_per_device}); use transport_kind='gpu_store' for colocated multi-slot."
             )
-        # Driver's TransferQueue actor handoff; required when transport_kind is transfer_queue (fanned to each Worker before it builds its transport).
         self.tq_handoff = tq_handoff
 
-        # Ray actor ``max_concurrency`` for every Worker. The async rollout path opts in (>1) so a control RPC (``abort``/``pause``) can be serviced WHILE an in-flight ``generate`` blocks the actor — the engine still serializes the real work on its own event loop.
         self.worker_max_concurrency = max(1, int(worker_max_concurrency))
 
         self.workers: List[ray.actor.ActorHandle] = []
 
         self._tw_by_device: Dict[int, Any] = {}
 
-        # MASTER_ADDR/PORT forwarded to TensorWorker actors so their cross-GPU NCCL PG can bind.
         self._master_addr: Optional[str] = None
         self._master_port: Optional[str] = None
 
         self._pgs: List = []
         self._next_device: int = 0
 
-        # Devices reserved by a top-level placement scope. Subsequent sibling scopes carve from the complement; nested scopes carve from their parent's slab and do not touch this set.
         self._claimed: Set[int] = set()
 
         self._worker_id_to_device_id: Dict[str, int] = {}
@@ -94,7 +89,6 @@ class DevicePool:
         self._device_to_workers: Dict[int, List] = {}
         self._worker_by_id: Dict[str, Any] = {}
 
-    # Keep num_gpus as a read-only alias for backward compatibility
     @property
     def num_gpus(self) -> int:
         return self.num_devices
@@ -130,7 +124,6 @@ class DevicePool:
 
         self._create_placement_groups()
         self._create_workers()
-        # GLOBAL transports (transfer_queue) resolve refs from any process and have no cross-worker NCCL; only worker-local backends (colocate/gpu) need the global PG.
         if self.num_devices > 1 and issubclass(self.transport_cls, WorkerLocalTransport):
             self._setup_nccl()
 
@@ -184,7 +177,6 @@ class DevicePool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
-        # >1 makes the Worker a threaded Ray actor so control RPCs interleave with an in-flight blocking call.
         if self.worker_max_concurrency > 1:
             options["max_concurrency"] = self.worker_max_concurrency
         if env_vars:
@@ -207,7 +199,6 @@ class DevicePool:
         self._worker_id_to_device_id[worker_id] = device_id
         self._worker_id_to_slot[worker_id] = slot
 
-        # gpu_store defers its transport build: the shared per-GPU TensorWorker is created after the Worker exists, so inject it then build. colocate and transfer_queue build in Worker.__init__ (deps ready at construction).
         if self.transport_kind in ("gpu_store", "gpu"):
             tw = self._get_or_create_tw(device_id)
             ray.get(w.set_tensor_worker.remote(tw))
@@ -228,7 +219,6 @@ class DevicePool:
 
         pg = self._pgs[device_id // self.devices_per_node]
         bundle_index = device_id % self.devices_per_node
-        # The TensorWorker shares the bundle's physical GPU with the slot0 Worker(s). With num_gpus=0 Ray hides all GPUs from the actor (CUDA_VISIBLE_DEVICES=""); disable that override and mirror the slot0 Worker's CUDA_VISIBLE_DEVICES so the TW sees exactly that one GPU as cuda:0.
         cvd = ray.get(self.slot0_worker(device_id).get_cuda_visible_devices.remote())
         tw = (
             ray.remote(TensorWorker)
@@ -389,7 +379,6 @@ class DevicePool:
             elif n_gpus is not None:
                 device_ids = self.allocate(n_gpus)
             else:
-                # Implicit defaults: full pool, slot 0. Does NOT touch _claimed — bare calls opt out of scope tracking.
                 device_ids = list(range(self.num_devices))
         if slot_id is None:
             slot_id = 0
@@ -450,5 +439,4 @@ class DevicePool:
             try:
                 ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
             except Exception:
-                # Expected when an actor is stuck in a long call: Ray actors are single-threaded, so teardown queues behind it. ray.kill next.
                 logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)

@@ -41,7 +41,6 @@ class ZImagePipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on DiffusionSamplingParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
@@ -50,7 +49,6 @@ class ZImagePipelineConfig:
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Z-Image text token budget for the Qwen3 encoder. The diffusers reference pads/truncates to this length before encoding; see ``ZImageTextEmbedStage`` for the slicing contract.
     max_sequence_length: int = 512
 
     use_lora: bool = False

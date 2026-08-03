@@ -110,7 +110,7 @@ def _replay_aware_forward(
 
     _require_value_head_for_replay(self, return_values)
 
-    # cuDNN's fused SDPA backward (ScaledDotProductCudnnAttentionBackward0) returns NaN grads on some bf16 sequences while the forward stays finite (confirmed via torch.autograd.detect_anomaly): it floods every parameter grad and forces the optimizer to skip the whole step (~half of them, observed on Qwen3-4B-Base AR RL). Disable the cuDNN SDPA backend so PyTorch uses the stable flash / mem-efficient attention kernels for the replay forward.
+    # Disable cuDNN SDPA because its bf16 backward can produce NaN gradients.
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
 
@@ -120,12 +120,10 @@ def _replay_aware_forward(
     with autocast_ctx:
         hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
 
-    # Chunked lm_head outside autocast: FP32 logp matching SGLang's log_softmax(logits/T). The chunk scales inversely with batch so the [B, chunk, vocab] FP32 transient stays ~1.2 GiB, and each chunk is gradient-checkpointed (recomputed in backward rather than held).
     T = float(temperature) if float(temperature) > 0.0 else 1.0
     value_head = getattr(self, "value_head", None) if return_values else None
 
     if packed_predict_index is not None:
-        # Packed varlen replay: ``hidden`` is one packed row [1, L_total, H] holding every sequence back-to-back (block-causal mask built by transformers from the restarting position_ids). Predictions for the FLAT response stream (``response_tokens`` = segment-order targets, [T_total]) live at ``packed_predict_index`` — gather those hidden states and run the same chunked fp32 ``x[tok] - logsumexp(x)`` over the flat stream.
         h_pred = hidden[0].index_select(0, packed_predict_index)
         targets = response_tokens
 
@@ -219,7 +217,6 @@ def _finalize_replay_output(
     return ReplayResult(log_probs=log_probs, values=values.float())
 
 
-# Attention backends with a sparse packed kernel (skip cross-sequence blocks): flex via BlockMask, flash_attention_2 via flash_attn_varlen + cu_seqlens. Under either, packed replay is always a win; on any other backend (sdpa/eager) it is gated on length variance (see packed_replay).
 @dataclass
 class Qwen3ARParams:
     """Per-request AR-mode knobs for Qwen3.
@@ -268,7 +265,6 @@ class Qwen3ARStep(ARStep):
 
         scaled = logits.float() / self.temperature
 
-        # Behavior log-prob under the temperature-scaled distribution, computed BEFORE top-k/top-p truncation so it matches Qwen3ARStage.replay's log_softmax(logits / T): old_logp == replay new_logp at the same weights. Storing the untempered log_softmax(logits) only matched when T == 1 (mirrors the QwenVL behavior-logprob fix in #165).
         log_probs_full = F.log_softmax(scaled, dim=-1)
 
         if self.top_k > 0 and self.top_k < scaled.shape[-1]:
@@ -308,10 +304,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         logprob_precision: str = "fp32",
     ) -> None:
         self.model = model
-        # ``replay`` runs the transformer forward under an explicit autocast scope so softmax / layer_norm stay FP32 (mirrors SD3DiffusionStage); ``logprob_dtype`` then forces the per-token log-prob into FP32 so the GRPO ratio / clip math starts from FP32.
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
-        # Install the dual-mode forward (see ``_replay_aware_forward``) as an INSTANCE attribute: it wins over the class forward, survives the FSDP2 class swap (only ``__class__`` changes) and LoRA injection, and is idempotent via the ``__func__`` identity check.
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
@@ -351,7 +345,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        # Qwen3ChatTemplateStage right-pads prompts to the in-batch max. Re-pad to LEFT here so mixed-length batches decode correctly too (no-op when already equal length, e.g. the same-prompt-group recipe).
         pad_id = self.model.tokenizer.pad_token_id or 0
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
@@ -364,7 +357,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         )
         max_new = int(sampling_params.max_new_tokens)
 
-        # Transformers 5.6 no longer maintains ``cache_position`` in ``_update_model_kwargs_for_generation``. Instead, ``prepare_inputs_for_generation`` requires ``next_sequence_length`` to slice a cached decode down to the newly appended token.
         model_kwargs = {
             "attention_mask": attention_mask,
             "use_cache": True,
@@ -377,7 +369,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
-        # NOTE: this decode loop calls the ROOT module every token, so FSDP hooks fire normally in both wrap modes. Per-block groups re-gather per step according to ``reshard_after_forward``; under the default root wrap the leftover group (embed / final norm / lm_head) stays gathered after the first step — the root group never reshards after forward — so only the blocks pay per-token gather traffic.
         for _ in range(max_new):
             model_inputs = transformer.prepare_inputs_for_generation(
                 cur_input_ids,
@@ -402,7 +393,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 per_token_logps[b].append(float(log_prob[b].item()))
                 if tid in stop_ids:
                     finished[b] = True
-            # Synchronize finished status across all FSDP ranks. If any rank still has unfinished samples, all ranks must keep running forward passes (FSDP AllGather requires every rank to participate), so the collective runs every step under a real multi-rank group.
             local_done = all(finished)
             if dist.is_initialized() and dist.get_world_size() > 1:
                 done = torch.tensor([1 if local_done else 0], device=device)
@@ -495,7 +485,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         for b in range(batch_size):
             n_p = int(real_prompt_lens_p[b].item())
             n_r = lengths[b]
-            # The predict-index math below (offset + n_p - 1) assumes each stream has >=1 real prompt token; n_p == 0 would gather the PRIOR stream's last hidden state (silent cross-sequence logp corruption), so fail loud.
             assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
             seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
             streams.append(seq)
@@ -506,7 +495,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         packed_ids = torch.cat(streams).unsqueeze(0)
         packed_pos = torch.cat(pos_parts).unsqueeze(0)
         predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
-        # Bucket the packed length to a multiple of 1024 so flex_attention compiles O(10) shapes instead of one per distinct L (a ~40s first-compile per shape). Filler tokens carry restarting position_ids, forming their own isolated "sequence" under the packed block-causal mask (no prediction gathered from them). sdpa/eager only pay filler FLOPs, so skip bucketing.
         bucket = 1024
         L = int(packed_ids.shape[1])
         target = ((L + bucket - 1) // bucket) * bucket
@@ -562,7 +550,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 "cu_seqlens (construct via TextSegment.pack)"
             )
 
-        # Pin inputs to the transformer's parameter device. A decoupled rollout engine (SGLang) returns ray-serialized CPU tensors, so conditions land on CPU while the FSDP model is on cuda; without this the FSDP transformer hits an index_select cpu-vs-cuda mismatch in Embedding (trainside is already on-device, so these .to calls are no-ops).
         device = next(self.model.transformer.parameters()).device
         prompt_ids = conditions.prompt.input_ids.to(device)
         prompt_mask = conditions.prompt.attention_mask.to(device)
@@ -583,7 +570,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
-        # Re-pad RIGHT→LEFT so every sample's real prompt ends at index ``prompt_len - 1`` and the response starts at ``prompt_len``. Cross-actor concat in TextTokenCondition.concat right-pads to a global max; without re-padding, samples shorter than the global max have pad tokens between prompt and response, response RoPE positions shift by ``prompt_len - n_real``, and the prediction at ``logits[:, prompt_len - 1, :]`` reads a pad-position hidden state instead of the last-real-prompt one.
         real_prompt_lens = prompt_mask.long().sum(dim=-1)
         if int(real_prompt_lens.min().item()) < prompt_len:
             left_padded_ids = torch.full_like(prompt_ids, pad_id)
@@ -597,7 +583,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             prompt_ids = left_padded_ids
             prompt_mask = left_padded_mask
 
-        # Trim the prompt block to THIS batch's true max length. After the LEFT re-pad all real tokens sit at the right end, so dropping the leading all-pad columns preserves prompt-end position (= new prompt_len - 1) and the cumsum position_ids below are pad-invariant.
+        # Trim left padding to each batch's true maximum prompt length.
         max_real_prompt = int(real_prompt_lens.max().item())
         if 0 < max_real_prompt < prompt_len:
             prompt_ids = prompt_ids[:, prompt_len - max_real_prompt :]
@@ -611,10 +597,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             full_ids = prompt_ids
             full_mask = prompt_mask
 
-        # Cumsum-derived position_ids so RoPE matches SGLang's positions under any padding pattern. HF's modeling_qwen3 default falls back to ``arange(0, L)`` and ignores ``attention_mask``.
         position_ids = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
 
-        # Replay goes through the patched dual-mode ``forward`` (see ``_replay_aware_forward``): the decoder body + chunked lm_head run INSIDE the root forward, so this is topology-independent (FSDP2 root-wrapped or plain) and never materializes [B, L, vocab] logits. The cuda-vs-cpu autocast decision lives here; dtype validity and the autocast scope live in the patched forward.
         out = self.model.transformer(
             input_ids=full_ids,
             attention_mask=full_mask,
@@ -670,7 +654,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 ids.extend(int(t) for t in eos)
             else:
                 ids.append(int(eos))
-        # Deduplicate while preserving order.
         seen: set = set()
         out: List[int] = []
         for t in ids:

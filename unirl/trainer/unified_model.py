@@ -153,16 +153,13 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
-        # Colocate memory dance: offload the FSDP train state (base + grads + optimizer) to CPU during rollout so the awake engines fit, onload before the train backward. HI3's ~150GB base needs this → default True.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
 
-        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*; eval_interval=0 disables it. Scores only the image track, generated at the deterministic best-quality setting (CFG=eval_cfg_text_scale, eta=eval_eta) — same knobs/semantics as DiffusionTrainer; extra eval-only rewards: unirl.trainer.eval_suites.
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
 
-        # Intrusive debug dump: per rollout, write original prompt + AR output text (= the think/recaption that conditions DiT) + decoded images + rewards under ``dump_dir/rollout_<id>/``. Best-effort — never breaks training (see :meth:`_dump_rollout`).
         self.dump_dir = str(dump_dir) if dump_dir else None
         self._dump_rollout_id = 0
         if self.dump_dir:
@@ -179,12 +176,10 @@ class UnifiedModelTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
             self.reward = remote_hydra(reward_cfg)
-            # Extra eval-only rewards (eval_rewards) — siblings of the training reward on this slab; see unirl.trainer.eval_suites.
             self._eval_suites = build_eval_suites(
                 eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
             )
 
-            # Two algorithms over the SAME shared pipeline (each resolves its own stage via ``stage_attr``: ar→pipeline.ar, image→pipeline.diffusion).
             self.ar_algorithm = remote_hydra(ar_algorithm_cfg, pipeline=self.pipeline)
             self.image_algorithm = remote_hydra(image_algorithm_cfg, pipeline=self.pipeline)
 
@@ -195,7 +190,6 @@ class UnifiedModelTrainer(BaseTrainer):
                 image_algorithm=self.image_algorithm,
             )
 
-            # Rollout wiring. Single-engine (M=1 / UniGRPO — a trainside or single engine on the SHARED pipeline) short-circuits the two-engine HI3 path below: no GPU partition, no weight sync, and (trainside) no base offload since it samples the live FSDP modules.
             self._single_engine = rollout_cfg is not None
             diffusion_params = self.sampling_params.get("diffusion")
             self._shared_advantage = int(diffusion_params.samples_per_prompt) == 1
@@ -221,13 +215,13 @@ class UnifiedModelTrainer(BaseTrainer):
                     "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
                 )
 
-            # COLOCATE MEMORY: offload the ~150GB frozen base to CPU BEFORE booting the engines. Each engine grabs ~70GB (AR) / ~45GB (DiT) on its 4 cards at boot; with the FSDP base still resident (~19GB/card) that overlaps to >78GB and OOMs.
+            # Offload the frozen base before engine boot to avoid colocated OOMs.
             if self._enable_fsdp_offload:
                 self.backend.offload()
 
-            # Two standalone vLLM-Omni engines, each ONE multi-GPU actor anchored on a DISTINCT worker (AR→device 0, DiT→device 4). The anchor is load-bearing: plain remote() binds the engine to the whole fraction=1.0 scope (all 8 devices, shared base worker), so BOTH engines land in the same worker process and their device-env setup collides — vllm-omni's set_stage_devices then remaps DiT's yaml "4,5,6,7" back onto physical 0-3, overlapping AR → OOM.
+            # Anchor AR and DiT engines on distinct workers to prevent GPU overlap.
             per_node = self.pool.devices_per_node
-            # Each replica pins ONE (AR 0-3, DiT 4-7) engine pair to a single node, anchored at base+1 / base+4 with base = r*per_node. That layout needs >= 8 cards on the node; with fewer, base+4 spills onto the next node and silently splits the pair cross-node.
+            # Require at least eight GPUs per node so engine pairs do not split across nodes.
             if per_node < 8:
                 raise ValueError(
                     "UnifiedModelTrainer: HI3 needs >= 8 devices/node for one "
@@ -239,19 +233,17 @@ class UnifiedModelTrainer(BaseTrainer):
             self.dit_rollouts = []
             for r in range(self.dp):
                 base = r * per_node
-                # SERIALIZE engine boot: build one engine, then immediately .sleep() it before building the next. If the AR engine were anchored there too (base==0 for replica 0), it shares that one worker PROCESS, and RemoteLoraWeightSync.push() — which runs on rank 0 and does ray.get([... set_lora on the AR engine ...]) — would block-call its own actor (the set_lora task queues behind the in-flight push) → self-deadlock (push never returns, AR set_lora never runs; DiT on device 4 is a separate process so it loads fine). base+1 keeps the AR host worker off device 0 while the engine still uses cards 0-3 via its stage YAML's runtime.devices.
+                # Boot engines serially and off rank 0 to avoid warmup and LoRA-sync deadlocks.
                 ar = self._wire_engine(ar_rollout_cfg, anchor_device=base + 1)
                 ar.sleep()
                 self.ar_rollouts.append(ar)
                 dit = self._wire_engine(dit_rollout_cfg, anchor_device=base + 4)
                 dit.sleep()
                 self.dit_rollouts.append(dit)
-            # Back-compat aliases for replica 0 (single-node code paths, dump, debug, and any single-engine references still use these).
             self.ar_rollout = self.ar_rollouts[0]
             self.dit_rollout = self.dit_rollouts[0]
 
             if sync_cfg is not None:
-                # LoRA sync gets ONLY the backend (a same-worker sibling); the engines are cross-slab. RemoteLoraWeightSync.sync() extracts on the train workers and pushes from rank 0 to EACH engine via a plain Ray RPC, so hand it every replica's (role, workers) here.
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
                 self.weight_sync.set_rollout_targets(
                     [(eng.role_name, eng.workers) for eng in self.ar_rollouts + self.dit_rollouts]
@@ -296,7 +288,6 @@ class UnifiedModelTrainer(BaseTrainer):
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
-        # Driver-x_T opt-out: env DISABLE_DRIVER_XT (parity with DiffusionTrainer) OR a recipe-set params flag. The hi3 DiT adapter skips init_noise_group_ids when set, so every engine falls back to its own RNG (the debug escape hatch).
         disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(getattr(diff_params, "disable_driver_xt", False))
         diffusion = dataclasses.replace(
             diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
@@ -391,7 +382,6 @@ class UnifiedModelTrainer(BaseTrainer):
         n_img = int(image_shell.sampling_params.samples_per_prompt)
         rid = int(self._dump_rollout_id)
 
-        # ── Level 1: AR. The hi3_ar_recaption adapter reads its AR slice for sampling AND the diffusion slice's height/width, so ship the AR shell's params whole.
         ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
         n_ar = len(ar_texts.texts)
         ar_input = Part.input(
@@ -399,7 +389,6 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives={"text": ar_texts},
             control=dict(input_part.control),
         )
-        # The hi3_ar_recaption adapter (carries_target_size) reads the diffusion gen Part's height/width for the recaption prompt, so the AR request carries a params-only diffusion shell ahead of the AR frontier. Only the AR stage runs (stages=("ar",)), so that shell is never generated/filled — it just supplies the canvas size; the "ar" output still fills the AR frontier (gen Parts are located by sampling_params type, not position).
         ar_request = (
             Sample.request(ar_input)
             .fork(1, sampling_params=image_shell.sampling_params)
@@ -421,7 +410,6 @@ class UnifiedModelTrainer(BaseTrainer):
 
         dit_prompts = Texts(texts=[prompts.texts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
         dit_cot = Texts(texts=[recaptions.texts[i] for i in range(n_ar) for _ in range(n_img)])
-        # Re-root from the globally-unique image-shell lineage (flatten the path into a legal root id) rather than replica-local ``d{k}``: the DiT engine derives the x_T noise key from these ids, and ``d{k}`` restarts at 0 per dp>1 replica so images on different replicas would collide on identical noise. The shell ids are row-aligned with ``dit_prompts`` and the map-back is positional, so only the noise key changes — restoring the pre-migration lineage-based key.
         dit_input = Part.input(
             [sid.replace("/", "_") for sid in image_shell.sample_ids], primitives={"text": dit_prompts}
         )
@@ -443,7 +431,7 @@ class UnifiedModelTrainer(BaseTrainer):
             media_preview=img_gen.media_preview,
         )
 
-        # Each anchored engine returns its part as ONE transport handle (a single ref spanning all samples); the train side is num_devices-way DP and can't intra-handle-slice a single ref ("does not align to ref boundaries"). Materialize to real tensors on the driver here; the reward / advantage / train DP dispatch then re-shards real tensors.
+        # Materialize engine outputs before DP reshards a single transport handle.
         deep_hydrate(ar_part)
         deep_hydrate(image_part)
         return Sample(parts=[input_part, ar_part, image_part])
@@ -464,10 +452,8 @@ class UnifiedModelTrainer(BaseTrainer):
         """
         t0 = time.perf_counter()
         if self._single_engine:
-            # Single-engine UniGRPO runs the Sample-native composed rollout directly. The trainside variant shares the live FSDP module, so it must not participate in the two-engine offload/sync choreography.
             sample = self.run_rollout(sample)
         else:
-            # Colocate memory dance (150GB base can't coexist with an awake engine on the same card). Steady state on entry: base offloaded, engines asleep.
             if sync_weights and self.weight_sync is not None:
                 if self._enable_fsdp_offload:
                     self.backend.onload()
@@ -489,9 +475,7 @@ class UnifiedModelTrainer(BaseTrainer):
         ar_idx = sample.gen_part_index(ARSamplingParams)
         img_idx = sample.gen_part_index(DiffusionSamplingParams)
 
-        # Score the frontier (image) Part only — the AR TextSegment is not directly scorable; its reward is credit-assigned below. The reward derives each image's prompt context from the lineage (conditioning), so no manual req expansion is needed.
         sample = self.reward.score_and_attach(sample)
-        # propagate_rewards reshapes child rewards directly (no hydration), so realize the worker-returned TensorRef first.
         img_part = sample.parts[img_idx]
         if img_part.rewards is not None:
             img_part.rewards = hydrate(img_part.rewards)
@@ -508,7 +492,6 @@ class UnifiedModelTrainer(BaseTrainer):
         if self.dump_dir:
             self._dump_rollout(self._dump_rollout_id, sample)
 
-        # AR always groups by prompt. In single-engine M=1 mode the image Part is 1:1 with the AR Part, so share the prompt-level advantage; computing an image advantage by rewrite would produce size-1 groups.
         new_parts = list(sample.parts)
         new_parts[ar_idx] = new_parts[ar_idx].compute_advantages(normalize=True)
         if self._shared_advantage:
@@ -522,9 +505,7 @@ class UnifiedModelTrainer(BaseTrainer):
             new_parts[img_idx] = new_parts[img_idx].compute_advantages(normalize=True)
         sample = sample.with_parts(new_parts)
 
-        # Captions for the image previews fall back to the frontier-aligned prompt texts (``Sample.conditioning``), so no per-track caption override is needed.
         self._drop_decoded(sample, rollout_id=rollout_id)
-        # Two backward (shared backbone) → one optimizer step. Pass the whole [input, ar, image] lineage so the stack DP-scatters it as a unit (Sample.chunk tree-shards both stages at the SAME prompt boundaries); passing the two Parts separately replicates the P*N*M image Part at dp>1.
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             sample,
             training_progress=float(training_progress),
@@ -537,7 +518,6 @@ class UnifiedModelTrainer(BaseTrainer):
             extra_metrics={"sync_weights": float(bool(sync_weights))},
         )
 
-        # Back to steady state (base on CPU) so the next rollout's engines have room to wake.
         if self._enable_fsdp_offload and not self._single_engine:
             self.backend.offload()
         return results, mean_reward
@@ -576,7 +556,6 @@ class UnifiedModelTrainer(BaseTrainer):
             if image_part is not None and image_part.rewards is not None:
                 rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
 
-            # Save images (best-effort): hydrate pixels and write per-sample PNGs.
             n_imgs = 0
             if img_decoded is not None and getattr(img_decoded, "pixels", None) is not None:
                 from torchvision.utils import save_image
@@ -638,7 +617,6 @@ class UnifiedModelTrainer(BaseTrainer):
         rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
         forced False).
         """
-        # Override only the "diffusion" entry of the modality-keyed sampling dict. CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params and in ``guidance_scale`` on the standard DiffusionSamplingParams (HI3, ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
         base_diffusion = self.sampling_params.get("diffusion")
         replace_kwargs = dict(eta=self.eval_eta)
         if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
@@ -647,7 +625,6 @@ class UnifiedModelTrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        # Two-engine: sync the CURRENT adapter once for the whole eval (PUSH needs awake engines, so it rides one short wake/sleep cycle here).
         if not self._single_engine and self.weight_sync is not None:
             if self._enable_fsdp_offload:
                 self.backend.onload()
@@ -742,7 +719,6 @@ class UnifiedModelTrainer(BaseTrainer):
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Fast-forward the data stream to the resume point — exact when run.seed is set (deterministic shuffle); with seed=null the stream is non-reproducible anyway.
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
@@ -754,7 +730,6 @@ class UnifiedModelTrainer(BaseTrainer):
                 self._dump_rollout_id = rollout_id
                 inputs = self.data_source.get_samples(self.batch_size)
                 sample = self._build_request_sample(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet). On resume, force the first sync — the engine booted with fresh weights and needs the restored adapter before generate.
                 force_sync = (resumed and rollout_id == start_rollout) or (
                     rollout_id == 0 and bool(os.environ.get("HI3_SYNC_FIRST"))
                 )
@@ -765,16 +740,13 @@ class UnifiedModelTrainer(BaseTrainer):
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
-                # Per-track console line (ar / image) with the step-0 ratio probe (π_old vs π_θ alignment): on rollout 0 the LoRA is ~0 so a correct replay should give ratio≈1, std≈0; a systematic offset means the logp convention (temperature / top-k-p filtering / full-vs-renorm softmax) doesn't match vLLM's sampler.
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
-                # eval(k) BEFORE save(checkpoint-k) at the same step, so a resumed checkpoint re-runs the same eval (A/B consistency).
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         except Exception:
-            # Surface the real failure (e.g. a worker CUDA OOM re-raised by ray.get) at the point we catch it -- before _finish_wandb runs -- so it lands in the log immediately instead of being masked by a hanging teardown.
             logger.exception("Training loop aborted at rollout %s", locals().get("rollout_id", "?"))
             raise
         finally:

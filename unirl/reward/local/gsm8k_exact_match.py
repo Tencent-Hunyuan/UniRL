@@ -18,7 +18,6 @@ from unirl.types.reward import RewardRequest
 from .base import LocalRewardBackend
 
 _HASH_ANSWER_PATTERN = re.compile(r"####\s*([-+]?\d[\d,]*\.?\d*)")
-# Any integer / decimal (fallback: take the last one in the text).
 _NUMERIC_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
 
 

@@ -39,7 +39,6 @@ def install() -> None:
     try:
         from vllm.model_executor import utils as vllm_mu
     except ImportError:
-        # vllm not installed in this process — nothing to patch (the import is the worker's, not the smoke test's).
         return
 
     original = getattr(vllm_mu, "get_moe_expert_mapping", None)

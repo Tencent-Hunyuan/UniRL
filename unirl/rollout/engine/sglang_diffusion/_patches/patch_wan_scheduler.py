@@ -41,9 +41,7 @@ def patch_wan_scheduler() -> None:
         return
 
     def initialize_pipeline(self, server_args) -> None:
-        # Stock init builds the (UniPC) scheduler + nothing else; run it so any future additions survive, then overwrite the scheduler module.
         orig(self, server_args)
-        # ``flow_shift`` is a pipeline_config field typed ``float | None``: WAN variants set a concrete value (3/5/8/…), but the base default is None, which is a LEGAL config meaning "use the scheduler's own default shift". We cannot forward None (the scheduler computes ``shift * sigmas / …`` and ``None * sigmas`` would raise), so map None to the scheduler default (1.0).
         flow_shift = server_args.pipeline_config.flow_shift
         if flow_shift is None:
             flow_shift = 1.0
@@ -52,7 +50,6 @@ def patch_wan_scheduler() -> None:
     initialize_pipeline._unirl_flowmatch_scheduler = True  # type: ignore[attr-defined]
     WanPipeline.initialize_pipeline = initialize_pipeline
 
-    # WAN 2.2-A14B dual-expert: sglang's dual-transformer denoising path wraps the scheduler/cache so that ``DenoisingStage.prepare_extra_func_kwargs`` inspects a step with a generic ``**kwargs`` signature. (wan21 single-transformer keeps the explicit step signature, so eta is filtered and never reaches here.) Drop the stray ``eta`` so the dual-expert path matches wan21 semantics.
     step_orig = FlowMatchEulerDiscreteScheduler.step
     if not getattr(step_orig, "_unirl_drop_eta", False):
 

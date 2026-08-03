@@ -61,7 +61,6 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
         forward_batch_size: Optional[int] = None,
     ) -> None:
         self.pipeline = pipeline
-        # Resolve the trainable module(s) to eval-scope around generate(). A pre-resolved ``stage`` (the v1 train actor passes one) wins; otherwise resolve ``stage_attrs`` off the pipeline.
         if stage is not None:
             stages = [stage]
         else:
@@ -72,7 +71,6 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
-        # Build a σ-schedule only when a diffusion stage is present (PE wraps both diffusion + ar, so check the resolved list, not the lone `stage` param which is None on the stage_attrs path); AR-only needs none.
         if any(isinstance(s, DiffusionStage) for s in stages):
             if hasattr(pipeline, "build_schedule_policy"):
                 self.schedule_policy = pipeline.build_schedule_policy()
@@ -82,10 +80,8 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
                     shift=float(pipeline.shift),
                 )
         else:
-            # AR stage — no diffusion schedule needed
             self.schedule_policy = None
 
-        # The pipeline is synchronous and shares one GPU context; the lock serializes concurrent generate callers (this engine's concurrency story under the sync contract).
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -135,7 +131,6 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
                     end = min(start + fbs, bs)
                     chunk = self.pipeline.generate(Sample(parts=[*input_parts, gen.slice(start, end)]))
                     gen_chunks.append(chunk.parts[-1])
-                    # LIN-387: no per-chunk empty_cache() — it forced allocator re-warm on the next chunk (decode 0.87s -> 2.76s spikes). Chunking alone bounds the live-tensor peak; cached blocks are reused, not leaked.
                 return Sample(parts=[*input_parts, Part.concat(gen_chunks)])
         finally:
             for m, mode in zip(self._models, prev_modes):

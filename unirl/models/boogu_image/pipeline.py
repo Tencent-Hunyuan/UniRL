@@ -110,7 +110,6 @@ class BooguImagePipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BooguImageVAEDecodeStage(bundle)
-        # Retained so the hosting engine can read it when constructing the FlowMatchSchedulePolicy at startup (static shift, e^{1.15}).
         self.shift = shift
 
     @classmethod
@@ -241,7 +240,6 @@ class BooguImagePipeline(Pipeline):
         conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a pre-shipped initial_latents tensor still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(conds, schedule=schedule, params=params, initial_latents=initial_latents)

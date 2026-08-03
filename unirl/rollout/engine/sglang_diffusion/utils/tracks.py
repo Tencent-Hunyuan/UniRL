@@ -166,7 +166,6 @@ def build_latent_segment(
         results=results,
     )
 
-    # Selective trim: when only a subset of trajectory positions is referenced by the SDE step set, drop unused columns to save Ray IPC bandwidth. ``compute_trajectory_positions`` returns only the (i, i+1) pairs for SDE-gated steps; we always preserve the terminal position T so the clean image latent (``seg.latents[:, -1]``) stays available for VAE decode.
     traj_len = int(trajectories_tensor.shape[1])
     if aux_trajectory is not None:
         require(
@@ -192,11 +191,9 @@ def build_latent_segment(
         if keep_cols and len(keep_cols) < traj_len:
             trajectories_tensor = trajectories_tensor[:, keep_cols]
             indices_t = torch.tensor(keep_cols, dtype=torch.long)
-            # Trim the audio trajectory to the SAME kept columns so it stays indexed by the same sparse positions as the video latents.
             if aux_trajectory is not None:
                 aux_trajectory = aux_trajectory[:, keep_cols]
 
-    # sde_indices: always populated (trainer needs to know which steps to replay). sde_logp: best-effort native emission; whether it is used or recomputed is the training layer's call (``algorithm.old_logp_source``), not an engine flag.
     sde_indices_t: Optional[torch.Tensor] = (
         torch.tensor(list(sde_indices), dtype=torch.long)
         if sde_indices is not None
@@ -385,7 +382,6 @@ def _aligned_mask(
             embeds_seq,
         )
         return None
-    # mask_seq < embeds_seq: pad with ones only when the adapter opts in (Edit-Plus prompt_embeds carry image-token slots beyond the text mask).
     if not allow_pad:
         logger.debug(
             "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
@@ -442,7 +438,6 @@ def fuse_text_conditions(
         if neg_pooled is not None:
             neg_pooled_list.append(neg_pooled.detach().cpu())
 
-        # Negative mask: required alongside negative embeds by mask-consuming replay paths (Qwen-VL conditioning) — fused symmetrically with the positive mask rather than dropped.
         neg_mask = fuse_encoder_outputs(result.negative_attention_mask)
         if neg_mask is not None:
             neg_mask_list.append(neg_mask.detach().cpu())

@@ -60,7 +60,6 @@ def gather_sde_field(
             f"(ensure prepare_segment ran before compute_loss_and_backward)."
         )
     target_t = torch.tensor(target_steps, dtype=sde_indices.dtype, device=sde_indices.device)
-    # Ensure sde_indices is sorted (searchsorted requirement)
     sort_order = sde_indices.argsort()
     sde_indices = sde_indices[sort_order]
     tensor = tensor[:, sort_order.tolist()]
@@ -362,12 +361,9 @@ class StageAlgorithm(Remote, ABC):
 
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
-    # Whether the v2 DiffusionTrainer must inject the FSDP ``backend`` sibling so the algorithm can reach the trainable model — e.g. FlowGRPO / FlowDPPO disable its LoRA adapter to forward the reference policy π_ref for the ``beta`` KL term. Independent of ``requires_ema_rollout`` (DiffusionNFT needs the backend for its EMA shadow).
     requires_backend: bool = False
-    # Whether the loss requires per-sample advantages.
     requires_advantages: bool = True
     loss_weighting: str = "sample"
-    # Segment fields this algorithm freezes as the π_old anchor in :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO: ``("sde_logp", "sde_means")``). When the anchor is recomputed (:meth:`recomputes_anchor`), the train stack re-slices and reassembles exactly these fields at train-time geometry — it never hardcodes them.
     anchor_fields: Tuple[str, ...] = ()
 
     def recomputes_anchor(self) -> bool:

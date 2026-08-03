@@ -114,7 +114,6 @@ class NoiseRecipe:
         """
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
-        # Explicit per-request opt-out: neither an encoded initial-latent tensor nor a reproducible seed recipe is driver-authored in this mode. The rollout backend/pipeline must use its native RNG instead.
         if bool(getattr(diffusion, "disable_driver_xt", False)):
             return cls()
         seg = gen.segment

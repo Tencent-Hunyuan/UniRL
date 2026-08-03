@@ -150,7 +150,6 @@ class ToolEnvironment:
             sessions[tool.name] = sid
         control = dict(root.control or {})
         control["tool_sessions"] = sessions
-        # ``_part_with_field`` swaps only ``control`` — preserving the encoded prompt (``primitives``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
         return Sample.request(_part_with_field(root, "control", control))
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
@@ -186,7 +185,6 @@ class ToolEnvironment:
         if (not any_call) or (turn >= self.max_turns):
             return None, True, info
 
-        # Row-aligned observation: the tool result for rows that called a tool; "" placeholder for rows that already produced a final answer while siblings continue (the n>1 heterogeneous case — a known follow-up that belongs to the loop/Sample layer, not the environment).
         observation = Texts(texts=[r if r is not None else "" for r in results])
         return observation, False, info
 

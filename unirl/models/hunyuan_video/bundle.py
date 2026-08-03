@@ -96,7 +96,6 @@ class HunyuanVideoBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): architecture only, no per-rank weight allocation; the backend materializes + loads from the stashed dir after sharding. build_meta_init_transformer keeps init-computed non-persistent buffers (rope tables) real and captures them into meta_init_state (stashed on the bundle below).
             transformer_config = HunyuanVideoTransformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: HunyuanVideoTransformer3DModel.from_config(transformer_config), dtype=dtype

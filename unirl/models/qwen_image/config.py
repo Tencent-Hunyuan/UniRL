@@ -67,17 +67,14 @@ class QwenImagePipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on QwenImageDiffusionParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Static-shift fallback for FlowMatchSchedulePolicy when the pretrained path is not a real local directory (HF repo ID / tests). In practice the real Qwen-Image checkpoint enables dynamic shifting and the ``shift`` value here is ignored — kept aligned with diffusers' default to avoid surprising any ad-hoc consumer.
     shift: float = 3.0
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Qwen-Image-specific: text token budget for the Qwen-VL encoder. Hard upper bound is 1024 (the tokenizer cap, including the chat template prefix); see ``QwenImageTextEmbedStage`` for the slicing contract.
     max_sequence_length: int = 512
 
     use_lora: bool = False
@@ -85,10 +82,8 @@ class QwenImagePipelineConfig:
 
     load_text_encoder: bool = True
     load_vae: bool = True
-    # VeOmniBackend lifecycle: build the transformer on the meta device (architecture only, no weight allocation). VeOmni's parallelize asserts meta init, materializes storage via ``to_empty``, and the backend loads real weights from ``<pretrained>/transformer`` after sharding.
     meta_init_transformer: bool = False
 
-    # Dynamic-shift declaration for vllm_omni / sglang engines that build ``FlowMatchSchedulePolicy`` from the model_config alone (they don't have a Pipeline instance at engine-init time). Qwen-Image was trained with dynamic shifting; without this declaration, an HF-repo-id path (e.g. ``Qwen/Qwen-Image``) would silently fall back to ``static_only`` because ``scheduler/scheduler_config.json`` isn't locally readable at policy-build time.
     use_dynamic_shifting: bool = True
     dynamic_shift_overrides: Dict[str, Any] = field(default_factory=_qwen_image_dynamic_overrides)
 

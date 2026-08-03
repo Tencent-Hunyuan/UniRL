@@ -84,7 +84,6 @@ def load_ep_model_state_dict(
             ep_rank=_ep_rank(ps),
         )
 
-    # Every rank loaded the single checkpoint file and now carries its own [E/ep,...] expert block. Broadcasting rank 0 here would recreate the bug.
     load_model_state_dict(
         model,
         local_state,

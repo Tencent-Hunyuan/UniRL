@@ -98,7 +98,6 @@ def tokenize_agent_target(
     if isinstance(eos_id, (list, tuple)):
         eos_id = eos_id[0] if eos_id else None
     if eos_id is not None and eos_id in target_ids:
-        # Templates commonly append a newline after <|im_end|>. It is not part of the assistant turn and follows the model's stop token.
         last_eos = len(target_ids) - 1 - target_ids[::-1].index(eos_id)
         target_ids = target_ids[: last_eos + 1]
     return target_ids
@@ -292,8 +291,6 @@ class SupervisedDataSource:
     def epoch(self) -> float:
         """Fractional epochs consumed — for logging."""
         return self._epoch + self._pos / max(1, len(self.dataset))
-
-    # resume cursor
 
     def state_dict(self) -> Dict[str, int]:
         return {"epoch": self._epoch, "position": self._pos, "seed": self.seed}

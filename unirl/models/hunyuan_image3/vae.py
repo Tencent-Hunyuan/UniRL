@@ -57,7 +57,6 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             )
         clean = s.latents[:, -1]
 
-        # Scaling factor lookup mirrors the SD3 pattern; HunyuanImage3's 3D-VAE config exposes the same attribute.
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:

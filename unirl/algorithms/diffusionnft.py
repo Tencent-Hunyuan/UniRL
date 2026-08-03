@@ -63,18 +63,13 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     """
 
     beta: float = 1.0
-    # Clip the rollout advantages to ``[-adv_clip_max, +adv_clip_max]`` before the linear remap into ``r in [0, 1]``.
     adv_clip_max: float = 5.0
-    # Only ``"raw"`` is wired. Other modes (sign / binary / one_only / ranked / per-timestep) can be reintroduced if a recipe needs them.
     adv_mode: str = "raw"
-    # When True: divide each per-sample MSE by its mean-abs-error to equalize scales across timesteps (matches the original DiffusionNFT recipe).
     use_adaptive_weight: bool = True
     train_timestep_mode: str = "all"
     shuffle_train_timesteps: bool = True
     apply_time_shift_in_loss: bool = False
-    # Slice of the resolved timestep set kept after dropping terminal zero, expressed as a fraction of the schedule length.
     training_timestep_fraction: float = 0.99
-    # KL penalty against the un-adapted base model. Not implemented in this revision; ``> 0`` raises so recipes can't silently drop the term.
     kl_coef: float = 0.0
 
 
@@ -127,7 +122,6 @@ class DiffusionNFT(StageAlgorithm):
         kl_coef: float = 0.0,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
-        # Flat-kwarg constructor: each field matches a ``DiffusionNFTConfig`` attribute. The dataclass exists for typing / documentation; the runtime accepts the fields directly so YAML recipes don't need to nest a ``config:`` block.
         if stage is None and pipeline is not None:
             stage = getattr(pipeline, stage_attr)
         if stage is None:
@@ -179,8 +173,6 @@ class DiffusionNFT(StageAlgorithm):
             kl_coef=float(kl_coef),
         )
 
-    # StageAlgorithm contract
-
     def compute_loss_and_backward(
         self,
         *,
@@ -225,13 +217,11 @@ class DiffusionNFT(StageAlgorithm):
             )
 
         typed_conds = _typed_conditions(conditions, self.conditions_cls)
-        # Reward → r in [0, 1]. Independent of t, so computed once.
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
         adv_clipped = torch.clamp(adv, -self.config.adv_clip_max, self.config.adv_clip_max)
         r = (adv_clipped / self.config.adv_clip_max) / 2.0 + 0.5
         r = torch.clamp(r, 0.0, 1.0)
 
-        # Each iteration runs one (forward, backward) at a scalar ``t`` broadcast to the whole batch; the gradient is scaled by 1/K so the K iterations cumulatively produce one optimizer-step's worth of signal.
         per_iter_metrics: List[Dict[str, float]] = []
         total_loss = 0.0
         has_backward = False
@@ -315,7 +305,6 @@ class DiffusionNFT(StageAlgorithm):
         reduce_dims = tuple(range(1, x0.ndim))
         x0_for_mse = x0.to(dtype=new_pred.dtype)
         if self.config.use_adaptive_weight:
-            # Per-sample mean-abs-error in float64 (low-precision can underflow when ``xt`` is close to ``x0``). The clamp floor prevents division by zero when prediction matches target exactly.
             with torch.no_grad():
                 weight_pos = (
                     (x0_pos.detach().double() - x0_for_mse.double())
@@ -335,7 +324,6 @@ class DiffusionNFT(StageAlgorithm):
             pos_loss = ((x0_pos - x0_for_mse) ** 2).mean(dim=reduce_dims)
             neg_loss = ((x0_neg - x0_for_mse) ** 2).mean(dim=reduce_dims)
 
-        # ``adv_clip_max`` factors back in so the gradient magnitude is invariant to the choice of clip range (the ``r`` remap divides by it; multiplying outside restores the original scale).
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
         total = policy_loss * float(self.config.adv_clip_max)
 
@@ -377,7 +365,6 @@ class DiffusionNFT(StageAlgorithm):
                     "Set train_timestep_mode='random' instead."
                 )
             ts = segment.sigmas.detach().to(device=device, dtype=dtype).flatten()
-            # ``sigma == 0`` collapses ``xt`` to ``x0`` (no noise) and yields no gradient, so the terminal entry is excluded.
             if (
                 ts.numel() > 1
                 and torch.isclose(
@@ -394,7 +381,6 @@ class DiffusionNFT(StageAlgorithm):
                 eff_end = min(int(n * end), n)
                 ts = ts[eff_start:eff_end] if eff_start < eff_end else ts[:0]
             if ts.numel() == 0:
-                # The slice can be empty when the schedule is short and the fraction tight; fall back to a single random ``t`` so the train step still produces a gradient.
                 ts = torch.rand(1, device=device, dtype=dtype) * frac
         elif mode == "random":
             ts = torch.rand(B, device=device, dtype=dtype) * frac

@@ -54,7 +54,6 @@ class Qwen3OmniBundle(Bundle):
         thinker_cfg = full_cfg.thinker_config
 
         if config.meta_init_transformer:
-            # FSDP sharded loading requires remapping checkpoint ``thinker.`` keys.
             raise NotImplementedError(
                 "Qwen3OmniBundle: meta_init_transformer=True is not yet supported "
                 "(needs a strip-'thinker.' key remap in the sharded loader). Use "

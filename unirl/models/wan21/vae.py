@@ -79,7 +79,6 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         with nullcontext() if grad else torch.no_grad():
             decoded = self._vae_decode(clean)
 
-        # Decoded layout is [B, C, T_dec, H_dec, W_dec] in [-1, 1]. Normalize to [0, 1] and clamp before packing.
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
 
         return self._pack_videos(decoded)

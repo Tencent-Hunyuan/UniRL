@@ -157,7 +157,6 @@ class TQTransport(TensorTransport):
             return {}
 
         async def _put_batch() -> Dict[str, TensorRef]:
-            # Group keys by leading-dim batch size: a TensorDict requires one uniform batch_size, so a mixed-dim object (e.g. a rollout's 96-row per-sample tensors alongside an 11-step trajectory) must split into one async_put per distinct leading dim. Same-dim tensors stay in one TensorDict, preserving the column-union single round-trip.
             def _bs(t: Any) -> int:
                 if isinstance(t, torch.Tensor):
                     return int(t.shape[0]) if t.dim() > 0 else 1

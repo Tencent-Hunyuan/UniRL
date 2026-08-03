@@ -29,10 +29,8 @@ class ComposedRolloutEngineConfig(BaseEngineConfig):
 
     sleep_diffusion_on_start: bool = True
 
-    # System instruction injected into the AR child's ``task_config`` so the LLM rewrites the user's prompt (PE = prompt enhancement).
     pe_instruction: Optional[str] = None
 
-    # If set (e.g. ``"Revised Prompt:"``), only the suffix after the LAST occurrence of the marker is forwarded to diffusion; off-format outputs fall back to the original user prompt.
     pe_marker: Optional[str] = None
 
     pe_max_chars: Optional[int] = None

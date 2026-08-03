@@ -42,7 +42,6 @@ def _fuse_mm_embeds(
                 return_dict=True,
             )
         except TypeError as exc:
-            # Older Transformers releases reject ``return_dict`` here.
             if "unexpected keyword argument 'return_dict'" not in str(exc):
                 raise
             audio_outputs = transformer.get_audio_features(
@@ -65,7 +64,6 @@ def _fuse_mm_embeds(
             return_dict=True,
         )
     except TypeError as exc:
-        # Transformers releases differ here: older Qwen3-Omni returns ``(video_embeds, deepstack_features)`` and rejects return_dict.
         if "unexpected keyword argument 'return_dict'" not in str(exc):
             raise
         video_outputs = transformer.get_video_features(pixel_values_videos, video_grid_thw)
@@ -103,7 +101,6 @@ def _replay_aware_forward(
                 return f(self, **kw)
         raise RuntimeError("_replay_aware_forward: no class-level forward found in the MRO")
 
-    # Avoid unstable cuDNN SDPA backward for bf16 replay.
     if torch.cuda.is_available():
         torch.backends.cuda.enable_cudnn_sdp(False)
 
@@ -308,7 +305,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         if vgt is not None:
             model_kwargs["video_grid_thw"] = vgt
         if vspg is not None:
-            # TMRoPE needs seconds per grid for the temporal axis.
             model_kwargs["video_second_per_grid"] = vspg
         if ivf is not None:
             model_kwargs["input_features"] = ivf
@@ -408,7 +404,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
-        # Move CONCAT padding before prompts so responses start at one boundary.
         real_prompt_lens = prompt_mask.long().sum(dim=-1)
         if int(real_prompt_lens.min().item()) < prompt_len:
             left_ids = torch.full_like(prompt_ids, pad_id)
@@ -451,7 +446,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         }
 
         if pvv is None:
-            # Cumulative positions keep text RoPE invariant to padding.
             forward_kwargs["input_ids"] = full_ids
             forward_kwargs["attention_mask"] = full_mask
             forward_kwargs["position_ids"] = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
@@ -462,7 +456,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             if use_audio:
                 ivf = ivf.to(device=device, dtype=self.model.dtype)
                 fam = fam.to(device=device)
-            # ``use_audio_in_video`` is a batch-wide Transformers flag. Build positions per sample so a video without an audio track does not consume the following sample's video grid as text.
             sample_video_grids = conditions.video_grid_thw or [None] * batch_size
             sample_seconds = conditions.video_second_per_grid or [None] * batch_size
             sample_features = conditions.input_features or [None] * batch_size
@@ -485,9 +478,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                     second_per_grids=(sample_second.to(device=device) if sample_second is not None else None),
                 )
                 position_parts.append(sample_position_ids)
-            # Preserve the [3, B, seq] temporal/height/width position layout.
             position_ids = torch.cat(position_parts, dim=1)
-            # Integer positions prevent FSDP mixed precision from rounding indices.
             position_ids = position_ids.long()
             forward_kwargs["pixel_values_videos"] = pvv
             forward_kwargs["video_grid_thw"] = vgt

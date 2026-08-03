@@ -153,7 +153,6 @@ class Flux2KleinVAEEncodeStage:
         device = self.bundle.device
         vae_f32 = vae.to(torch.float32)
 
-        # Resize the source image to the generation size. The data source loads condition images at native resolution (arbitrary H×W), but the VAE patchify requires H,W divisible by 16 (8× VAE + 2× patch), and a consistent token count across a GRPO group needs a fixed size.
         pixels = pixels.to(device=device, dtype=torch.float32)
         if int(pixels.shape[-2]) != int(height) or int(pixels.shape[-1]) != int(width):
             pixels = torch.nn.functional.interpolate(
@@ -162,7 +161,6 @@ class Flux2KleinVAEEncodeStage:
 
         scaled = pixels * 2.0 - 1.0
 
-        # Deterministic latents (mode), patchify, BN-normalize.
         image_latents = vae_f32.encode(scaled).latent_dist.mode()
         image_latents = patchify_latents(image_latents)
         image_latents = normalize_patchified_latents(image_latents, vae_f32)

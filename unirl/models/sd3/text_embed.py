@@ -93,7 +93,6 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             pooled_1 = clip1_out.text_embeds
             clip1_hidden = clip1_out.hidden_states[-2]
 
-        # CLIP 2 — same shape contract as CLIP 1.
         clip2_inputs = bundle.tokenizer_2(
             prompts,
             padding="max_length",

@@ -69,7 +69,6 @@ class TrainStepResult:
     has_backward: bool
     micros: List[AlgorithmStepResult]
     metrics: Mapping[str, object]
-    # Per-optimizer-step metrics when num_updates_per_batch > 1 (one Mapping per update, in order); empty for the single-update path. Lets the trainer log one wandb point per optimizer step instead of averaging the updates.
     per_update: Tuple[Mapping[str, object], ...] = ()
 
 
@@ -160,7 +159,6 @@ class TrainStack(Remote):
         self.algorithm = algorithm
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
-        # Composition: the micro-batch grouping strategy. The planner also owns the algorithm precondition its grouping requires (e.g. token-budget packing needs a seq-mean loss), checked once here at construction.
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
 
@@ -243,7 +241,7 @@ class TrainStack(Remote):
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
         last_micro = len(micros) - 1
         for i, (start, end) in enumerate(micros):
-            # Defer the per-block gradient reduce-scatter to the last micro-batch so it runs once per optimizer step instead of once per micro-batch (no-op unless defer_grad_sync + ZeRO-2). Must precede the backward.
+            # Defer gradient reduce-scatter until the final microbatch.
             self.fsdp_backend.set_grad_sync(i == last_micro)
             micro_part = part if single_micro else part.slice(start, end)
             result = self.algorithm.compute_loss_and_backward(
@@ -255,7 +253,6 @@ class TrainStack(Remote):
             )
             micro_results.append(result)
             if global_weight is None:
-                # Match the sample-share factors used for backward. Summing raw micro means would make train/loss scale with the micro count (FlowMatchSFT with bs=1 micros was the visible case).
                 total_loss += result.loss * loss_scales[i]
             else:
                 weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end)
@@ -265,7 +262,7 @@ class TrainStack(Remote):
             [r.metrics for r in micro_results if r.metrics]
         )
 
-        # Under defer_grad_sync the deferred reduce-scatter only runs inside a backward that executes after set_grad_sync(True) — the last micro's. If that micro skipped backward while earlier ones ran, the accumulated grads were never synced: the optimizer would silently step on empty grads now, and the stale unsharded accumulation (which zero_grad cannot reach) would leak into the NEXT step's reduce-scatter.
+        # The last microbatch must run backward when deferred gradient sync is enabled.
         if has_backward and not micro_results[-1].has_backward and self.fsdp_backend.grad_sync_deferred:
             raise RuntimeError(
                 f"{type(self).__name__}._run_update: defer_grad_sync deferred the gradient "
@@ -291,11 +288,9 @@ class TrainStack(Remote):
             }
 
         if global_weight is None:
-            # DP_SCATTER gives every data rank the same sample count, so the optimized sample objective is the mean of these rank-local means. Reduce over the backend's actual FSDP mesh, matching its gradient averaging instead of returning rank 0's local proxy.
             (global_loss_sum,) = self._all_reduce_sums([total_loss])
             total_loss = global_loss_sum / self._loss_weight_world()
         else:
-            # Exact global token-mean of this update's loss: every rank enters this collective (micro counts are rank-symmetric), so the logged number equals the optimized objective — not a rank-local proxy (the class of display bugs verl fixed in its #102).
             (global_loss_sum,) = self._all_reduce_sums([weighted_loss_sum])
             total_loss = global_loss_sum / global_weight
             aggregated_metrics = {**dict(aggregated_metrics), "global_loss_weight": global_weight}
@@ -333,7 +328,6 @@ class TrainStack(Remote):
         weighting = str(getattr(self.algorithm, "loss_weighting", "sample"))
         if weighting == "sample":
             update_total = sum(end - start for start, end in micros)
-            # Sample-share weighting: the algorithm's micro loss is a MEAN over the micro's sequences (seq-mean agg modes), so the update gradient equals the whole-update mean only when each micro is weighted by its share of samples.
             return [(end - start) / update_total for start, end in micros], None
         if weighting != "token":
             raise ValueError(
@@ -341,7 +335,7 @@ class TrainStack(Remote):
             )
         rank_info = getattr(self, "rank_info", None)
         if rank_info is not None and rank_info.sp_size > 1:
-            # Sequence parallelism shards tokens WITHIN a rank's samples; the denominator group would have to include the SP dimension too (the exact undercount verl hit at CP>1 in its #5983). Fail loudly until that path is built and verified.
+            # Reject sequence parallelism until loss denominators include the SP dimension.
             raise ValueError(
                 f"{type(self).__name__}: loss_weighting='token' is not validated under "
                 f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
@@ -452,10 +446,8 @@ class TrainStack(Remote):
         ``num_updates_per_batch`` optimizer steps run over disjoint updates, and
         ``on_rollout_end`` runs once — see :meth:`_run_updates`.
         """
-        # Freeze the old-policy anchor without train-mode stochasticity (notably dropout). The gradient-bearing replay below switches back to train mode so HF gradient checkpointing, which is gated on ``self.training``, engages.
         self.fsdp_backend.model.eval()
         self._align_track_inputs(part)
-        # Arrange once: reorder the track so packed micros are contiguous (no-op for CountPlanner) and produce the plan. The SAME (track, plans) feed both the anchor freeze and the train loop so both run the exact same geometry.
         part, plans = self.micro_planner.arrange(
             part,
             num_updates=self.num_updates_per_batch,
@@ -503,7 +495,6 @@ class TrainStack(Remote):
         each update's own metrics are attached on ``per_update`` (see
         :func:`_aggregate_update_results`).
         """
-        # UNIRL_PROFILE=one-update: wrap each optimizer update in a one-shot profiler (fires once, on rank0, past warmup) so the trace captures ONLY one update (forward + backward + cross-GPU comm + optimizer) — the compute/comm overlap window.
         from unirl.utils.profiling import maybe_profile_update, profile_scope
 
         scope_update = profile_scope() == "one-update"
@@ -519,7 +510,6 @@ class TrainStack(Remote):
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)
-        # Attach each optimizer step's own metrics (in order) so the trainer can log one wandb point per optimizer step — the on-policy update0 and the off-policy update1 stay distinct series instead of being averaged into one misleading ``ratio_mean``. Structured data on the result object, which the DP collect (``pytree_cat``) returns whole, so it rides along.
         per_update = tuple(
             {**dict(r.metrics), "loss": float(r.loss), "grad_norm": float(r.grad_norm), "lr": float(r.lr)}
             for r in results

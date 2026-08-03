@@ -110,7 +110,6 @@ class QwenVLPipeline(Pipeline):
                 f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
 
-        # Full role-tagged trajectory (text + chained image turns), frontier-aligned — vision_conditioning() fails loud on a no-image or extra-modality request.
         turns, _images = sample.vision_conditioning()
         conds = self._conditions_for(turns, sample.parts[0].control)
 

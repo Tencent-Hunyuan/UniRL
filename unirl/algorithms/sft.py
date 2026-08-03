@@ -102,8 +102,6 @@ class SFT(StageAlgorithm):
         self.conditions_cls = conditions_cls
         self.loss_weighting = "token" if self.loss_agg_mode == "token-mean" else "sample"
 
-    # StageAlgorithm contract
-
     def compute_loss_and_backward(
         self,
         *,
@@ -286,8 +284,6 @@ class FlowMatchSFT(StageAlgorithm):
         self.sigma_min = sigma_min
         self.eval_seed = eval_seed
 
-    # StageAlgorithm contract
-
     def compute_loss_and_backward(
         self,
         *,
@@ -362,7 +358,6 @@ class FlowMatchSFT(StageAlgorithm):
         x0 = segment.latents[:, -1]
         if x0.numel() == 0:
             return None
-        # fp32 endpoint math — bf16 loses precision when σ approaches 0 or 1 (same rationale as DiffusionNFT's fp32 timestep path).
         return x0.float()
 
     def _draw_sigma(self, batch: int, device: torch.device, generator: Optional[torch.Generator]) -> torch.Tensor:
@@ -421,7 +416,6 @@ class FlowMatchSFT(StageAlgorithm):
         xt = (1.0 - s) * x0 + s * noise
         v_target = noise - x0
 
-        # Single-sample micros pass a 0-dim σ — accepted by every stage (SD3 broadcasts; Bagel's packed forward requires the scalar form).
         sigma_arg = sigma if batch > 1 else sigma.reshape(())
         v_pred = self.stage.predict_noise_at_step(typed_conds, sample=xt, sigma=sigma_arg, params=self.params)
         if v_pred.ndim == x0.ndim - 1:

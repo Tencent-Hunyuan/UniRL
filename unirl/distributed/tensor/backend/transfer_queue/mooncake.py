@@ -36,7 +36,6 @@ class MooncakeBackendConfig:
     local_buffer_size_gb: int = 10
     client_name: str = "MooncakeStorageClient"
     protocol: str = "rdma"
-    # ``device_name`` is auto-discovered at runtime by ``runtime.create_client`` (sysfs walk → comma-separated HCA list → Mooncake's per-process PIX selection via ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``). Override at the CLI with ``transfer_queue.device_name=<name>`` only for ops debugging.
     device_name: Optional[str] = None
     zero_copy: MooncakeZeroCopyConfig = field(default_factory=MooncakeZeroCopyConfig)
 

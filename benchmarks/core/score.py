@@ -19,7 +19,6 @@ import requests
 class RewardServiceClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        # Reward services live on the internal network; corporate proxy env vars would 503 them (same rationale as unirl/reward/remote.py).
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -219,7 +218,6 @@ def check_geneval2_metadata(client: RewardServiceClient) -> None:
         )
 
 
-# GPQA's official baseline parses "The correct answer is (X)"; we also accept \boxed{X}.
 _BOXED_LETTER = re.compile(r"\\boxed\{\s*\(?([A-Da-d])\)?\s*\}")
 _ANSWER_IS = re.compile(r"(?i)answer\s*(?:is)?\s*:?\s*\(?([A-D])\)?")
 

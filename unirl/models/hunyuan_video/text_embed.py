@@ -27,8 +27,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import HunyuanVideoBundle
 
-# LLaMA prompt template. The system header instructs the model to describe video content; ``crop_start`` (default 95) is the prefix token count to strip after encoding.
-
 PROMPT_TEMPLATE = {
     "template": (
         "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
@@ -89,14 +87,12 @@ class HunyuanVideoTextEmbedStage:
         dtype = next(text_encoder.parameters()).dtype
         crop_start = self.crop_start
 
-        # cuDNN SDPA can abort in native code under NVIDIA's CUDA forward-compat layer (for example, a CUDA 13 runtime on a 535 driver). Keep SDPA enabled, but route it through PyTorch's stable flash / memory-efficient kernels instead of the cuDNN backend.
         if torch.cuda.is_available():
             torch.backends.cuda.enable_cudnn_sdp(False)
 
         template = PROMPT_TEMPLATE["template"]
         formatted = [template.format(p if p else "") for p in prompts]
 
-        # Tokenize with padding to (llama_max_length + crop_start) so that after cropping we have exactly llama_max_length tokens.
         text_inputs = tokenizer(
             formatted,
             padding="max_length",
@@ -113,7 +109,6 @@ class HunyuanVideoTextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        # Canonical HunyuanVideo text conditioning: take the ``hidden_state_skip_layer``-th-from-last LLaMA hidden state (default 2 -> ``hidden_states[-3]``), matching the official HunyuanVideo release and diffusers' ``HunyuanVideoPipeline`` (``num_hidden_layers_to_skip=2``) and the sglang rollout. ``skip=0`` reproduces the legacy last-hidden-state baseline.
         hidden_states = getattr(outputs, "hidden_states", None)
         selected_from_end = self.hidden_state_skip_layer + 1
         if hidden_states is None or selected_from_end > len(hidden_states):

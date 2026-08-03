@@ -37,8 +37,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import HunyuanVideo15Bundle
 
-# Chat-template constants. Changing either requires also retraining the transformer.
-
 PROMPT_TEMPLATE_SYSTEM_MESSAGE = (
     "You are a helpful assistant. Describe the video by detailing the following aspects: "
     "1. The main content and theme of the video. "
@@ -60,7 +58,6 @@ def _extract_glyph_texts(prompt: str) -> Optional[str]:
     """
     matches = _GLYPH_PATTERN.findall(prompt)
     result = [m[0] or m[1] for m in matches]
-    # Dedup while preserving order when there are multiple snippets.
     result = list(dict.fromkeys(result)) if len(result) > 1 else result
     if not result:
         return None
@@ -136,7 +133,6 @@ class HunyuanVideo15TextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        # Use the (skip_layers + 1)-th-from-last hidden state, NOT the final hidden state — matches the upstream pipeline.
         prompt_embeds = outputs.hidden_states[-(self.mllm_skip_layers + 1)]
 
         if crop_start > 0:
@@ -165,7 +161,6 @@ class HunyuanVideo15TextEmbedStage:
         for raw in prompts:
             glyph = _extract_glyph_texts(raw or "")
             if glyph is None:
-                # No glyph snippets — emit a zero placeholder so the batch concat below stays uniform.
                 emb = torch.zeros(1, max_length, d_model, device=device, dtype=enc_dtype)
                 mask = torch.zeros(1, max_length, device=device, dtype=torch.int64)
             else:

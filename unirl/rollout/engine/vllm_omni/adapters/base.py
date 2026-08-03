@@ -75,15 +75,10 @@ class ModelAdapter(ABC):
     stage_yaml: str = ""
     stage_yaml_source: str = "local"
     omni_mode: Optional[str] = None
-    # Request carries a diffusion gen Part → pin σ onto its ``DiffusionSamplingParams.sigmas`` (v1 ``_DIT_BEARING_MODALITIES``; AR-only requests have no diffusion gen Part to pin).
     needs_sigmas: bool = True
-    # Driver-side tokenizer for ``build_prompt_tokens`` (v1 engine.py:322 — everything except sd35_t2i / t2v, including dit_recaption, which loads one without using it; kept for parity).
     needs_driver_tokenizer: bool = True
-    # HI3 AR-prelude family: pass ``lora_request`` as a top-level ``Omni.generate`` kwarg (requires the passthrough patch; v1 ``_HI3_MODALITIES`` — see patches/__init__ for the DELETE-WHEN).
     ar_lora_passthrough: bool = False
-    # HI3 multi-GPU stages: clear ``CUDA_VISIBLE_DEVICES`` before boot so vllm-omni pins stages to their yaml ``runtime.devices`` (v1 ``_HI3_MULTI_GPU_MODALITIES``). ⚠️ Safe only when the engine is wired as a single multi-GPU actor — see the v1 colocate-landmine note.
     clear_cuda_visible: bool = False
-    # Re-push LoRA after wake via the byte-copy transport (TP>1 stages where the zero-copy handle crashes ranks 2..N; v1 wake branch).
     lora_copy_transport: bool = False
 
     def __init__(
@@ -142,7 +137,6 @@ class ModelAdapter(ABC):
         )
 
     def validate(self) -> None:
-        # ``shift`` parametrizes the FlowMatch σ schedule and only matters for adapters that actually run one. AR-only adapters (``needs_sigmas`` is False) never call :meth:`schedule_policy`, so requiring a diffusion ``model_config.shift`` from them is spurious.
         if self.needs_sigmas:
             mc = self.model_config
             require(

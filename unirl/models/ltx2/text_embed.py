@@ -131,7 +131,6 @@ class LTX2TextEmbedStage:
         padding_side="left")`` returns a 3-tuple
         ``(video_text_embedding, audio_text_embedding, binary_attn_mask)``.
         """
-        # diffusers >=0.38 accepts stacked 4-D Gemma states and performs the masked normalization itself. Support both without normalizing twice on the newer path.
         import inspect
 
         params = inspect.signature(self.connectors.forward).parameters

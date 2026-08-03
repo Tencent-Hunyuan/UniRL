@@ -39,7 +39,6 @@ from torch import nn
 
 _EXPERT_RE = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<idx>\d+)\.(?P<proj>gate_and_up_proj|down_proj)\.weight$")
 
-# FQN globs relative to the module VeOmniBackend wraps (the bare decoder, transformer.model) -> ``layers.*`` (NOT ``model.layers.*``).
 _EP_PLAN = {
     "layers.*.mlp.experts.gate_and_up_proj": 0,
     "layers.*.mlp.experts.down_proj": 0,
@@ -139,7 +138,6 @@ class FusedHunyuanMoE(nn.Module):
         shared = self.shared_mlp(hidden_states) if self.shared_mlp is not None else None
         topk_weights, topk_idx = self.gate(hidden_states, topk_impl="easy")
         topk_weights = topk_weights.to(hidden_states.dtype)
-        # The EP-sharded expert params are DTensors (each rank's local experts). The Triton grouped-GEMM kernel needs raw local tensors, not DTensors.
         gate_up = self.experts.gate_and_up_proj
         down = self.experts.down_proj
         if isinstance(gate_up, DTensor):

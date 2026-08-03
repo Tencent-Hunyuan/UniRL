@@ -102,7 +102,6 @@ def build_eval_suites(
             )
         suite_source = None
         if eval_path:
-            # Own prompt set: clone the trainer's data-source cfg with both paths pointed at the suite file (a suite source only ever serves eval batches; data_path merely backs the class's load-time existence check).
             ds_cfg = OmegaConf.create(OmegaConf.to_container(data_source_cfg, resolve=True))
             ds_cfg.args.run.data_path = str(eval_path)
             ds_cfg.args.run.eval_data_path = str(eval_path)

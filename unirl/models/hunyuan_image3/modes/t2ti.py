@@ -125,7 +125,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "pin σ before pipeline.generate."
         )
 
-    # Resolve prompts against the AR frontier, not the final image frontier: Sample.conditioning always expands ancestors to its current last Part, so the frontier view carries P*N*M rows while the AR Part holds P*N.
     ar_texts = [value for value in sample.conditioning_at(ar_idx) if isinstance(value, Texts)]
     require(
         len(ar_texts) == 1,
@@ -150,7 +149,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     tok_bot_task = _tokenizer_bot_task(bot_task)
     batch = len(texts.texts)
 
-    # AR phase: generate the CoT use_system_prompt defaults to the en_think_recaption preset for the think_recaption chain (vllm-omni prompt_utils._BOT_TASK_PRESETS parity) — get_system_prompt's ``dynamic`` branch would resolve the same preset via the mapped "think", but only when the checkpoint's gen_config default is ``dynamic``.
     use_sp = ar_cfg.get("use_system_prompt")
     if use_sp is None and bot_task == "think_recaption":
         use_sp = "en_think_recaption"
@@ -191,7 +189,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=ar_sampling, params=ar_params)
 
-    # bridge: AR text -> diffusion cot_text Markers must survive decoding (skip_special_tokens=False) so the truncate / normalize helpers and the wrapper's section parsing see the literal ``</think>`` / ``</recaption>`` tags.
     raw = pipeline._detokenize_text_segment(text_seg, skip_special_tokens=False)
     cots = [_normalize_cot_text(_truncate_at_cot_end(t)) for t in raw.texts]
 
@@ -201,7 +198,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     partially_filled = sample.with_parts(new_parts)
 
-    # diffusion phase: condition on prompt + CoT The now-filled AR Part is an ancestor of the image shell, so the conditioning walk expands both prompt and CoT from P*N to P*N*M.
     image_texts = [value for value in partially_filled.conditioning() if isinstance(value, Texts)]
     require(
         len(image_texts) >= 2,

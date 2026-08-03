@@ -138,7 +138,6 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
             ref_image_hidden_states=None,
         )
 
-        # Boogu CFG gate: 1.0 == off (unlike z_image's 0.0). Sequential negative forward — positive/negative embeds are padded to different lengths, and the reference runs branches sequentially.
         use_cfg = guidance_scale > 1.0 and conditions.negative_text is not None
         if use_cfg:
             neg = conditions.negative_text
@@ -364,7 +363,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        # Latent grid: 2 * (H // (vae_scale_factor * 2)) — equals the reference's H // 8 after its ×16 pixel-size floor (pipeline_boogu.py:2994-2997, 863-867) and guarantees the patch-2 divisibility flat_and_pad_to_seq needs.
         vsf = int(self.vae_scale_factor)
         latent_h = 2 * (int(params.height) // (vsf * 2))
         latent_w = 2 * (int(params.width) // (vsf * 2))

@@ -286,7 +286,6 @@ def decode_text(
     past = ctx["past_key_values"]
     stop_set = set(int(t) for t in stop_ids)
 
-    # Hoisted index pools — per-step values are views (kv indexes grow by one contiguous slot per token, so arange slices cover every step).
     max_new = int(max_new_tokens)
     all_indexes = torch.arange(kv_len + max_new, dtype=torch.long, device=device)
     all_positions = torch.arange(pos, pos + max_new, dtype=torch.long, device=device)
@@ -295,7 +294,6 @@ def decode_text(
     curr = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
     tokens: List[int] = []
     logps: List[float] = []
-    # Always run a FIXED ``max_new`` forwards (no early EOS break). Under an FSDP-sharded MoT each forward triggers an all-gather collective; a data-dependent forward count per rank (early break at a sample's own EOS) desyncs the collective and deadlocks.
     done = False
     for j in range(max_new):
         emb = lm.model.embed_tokens(curr)

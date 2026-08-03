@@ -47,12 +47,11 @@ def load_ep_experts(
     for name, param in model.named_parameters():
         if not is_expert_key(name):
             continue
-        if not isinstance(param, DTensor):  # ep_size==1: plain replicated param
+        if not isinstance(param, DTensor):
             if rank0:
                 param.data.copy_(expert_state_dict[name].to(device=param.device, dtype=param.dtype))
             n += 1
             continue
-        # The param's dim-0 is ALREADY this rank's local experts (E/ep). Per-block (not full-[E,...]) so every rank's transient stays [E/ep,...] — the EP memory saving must hold at LOAD time too, else an 80B model OOMs here even when the sharded steady state fits.
         local_experts = param.shape[0]
         block_shape = (local_experts, *param.shape[1:])
         full = expert_state_dict[name].to(device=param.device, dtype=param.dtype) if rank0 else None

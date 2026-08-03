@@ -50,7 +50,6 @@ class CLAPRewardScorer(LocalRewardBackend):
             raise ImportError("transformers with ClapModel/ClapProcessor is required for the CLAP reward") from e
 
         model_id = self.model_kwargs.get("model_id", "laion/larger_clap_general")
-        # float32 required: CLAP audio encoder uses BatchNorm, which is unstable / unsupported in fp16/bf16.
         self.model = ClapModel.from_pretrained(model_id).to(self.device).eval()
         self.model = self.model.to(dtype=torch.float32)
         self.processor = ClapProcessor.from_pretrained(model_id)

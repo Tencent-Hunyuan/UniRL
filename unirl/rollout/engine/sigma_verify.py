@@ -115,7 +115,6 @@ def verify_engine_used_sigmas(
             f"scheduler.set_timesteps(sigmas=...) without modification."
         )
 
-    # Dynamic scale normalization (ported from main-repo commit 43642ac1).
     actual_max = float(actual_t.abs().max().item()) if actual_t.numel() > 0 else 0.0
     expected_max = float(expected_f32.abs().max().item()) if expected_f32.numel() > 0 else 0.0
     if actual_max > 10.0 and expected_max > 0:

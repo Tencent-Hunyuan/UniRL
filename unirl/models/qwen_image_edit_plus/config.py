@@ -23,8 +23,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from unirl.config.validation import validate_precision_type
-
-# Edit-Plus shares base Qwen-Image's canonical dynamic-shift params verbatim (same VAE scale factor 8, patch size 2, scheduler_config.json shape); the shift is derived from the noise latent's ``image_seq_len`` only — the source-image concat happens inside ``predict_noise`` after the schedule is fixed. ``pipeline.build_schedule_policy`` uses the same function.
 from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
 
 
@@ -57,7 +55,6 @@ class QwenImageEditPlusPipelineConfig:
 
     max_sequence_length: int = 512
 
-    # True: source image → Qwen2.5-VL (Picture 1 + vision tokens). False: Edit text-only (edit template, drop 64, no vision tokens).
     use_condition_image_prompt: bool = True
 
     use_lora: bool = False

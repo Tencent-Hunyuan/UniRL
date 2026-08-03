@@ -82,7 +82,6 @@ class QwenImagePipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        # No default text-embed stage without a loaded text encoder (load_text_encoder=False — separate-engine recipes' trainer side).
         if text_embed is None and bundle.text_encoder is not None:
             text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
         self.text_embed = text_embed
@@ -97,7 +96,6 @@ class QwenImagePipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else QwenImageVAEDecodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine (TrainsideRolloutEngine / VLLMOmniRolloutEngine / SGLangDiffusionRolloutEngine) can read it when constructing the FlowMatchSchedulePolicy at startup. For Qwen-Image, the checkpoint's scheduler_config.json enables dynamic shifting, so the static ``shift`` value is only used as a fallback when the pretrained path is not a local directory.
         self.shift = shift
 
     def build_schedule_policy(self):
@@ -267,7 +265,6 @@ class QwenImagePipeline(Pipeline):
         qwen_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(

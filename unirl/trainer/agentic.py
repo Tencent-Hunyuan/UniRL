@@ -189,7 +189,7 @@ class AgenticTrainer(ARTrainer):
         (answer vs env) is already resolved into ``rewards``/``group_ids`` by the caller.
         ``extra_metrics`` are merged into the logged ``agent/*`` metrics (e.g. the partial
         trainer's committed/carried/dropped counts)."""
-        # A NaN reward marks a crashed trajectory (env bug, not a policy outcome) — excluded from the reported mean and from GRPO (see _group_advantages).
+        # Exclude crashed trajectories from reward means and GRPO.
         finite = torch.isfinite(rewards)
         mean_reward = float(rewards[finite].mean().item()) if bool(finite.any()) else 0.0
 
@@ -201,12 +201,10 @@ class AgenticTrainer(ARTrainer):
             for gp in tr.gen_parts():
                 gp = _part_with_field(gp, "advantages", torch.full((gp.batch_size,), adv_i, dtype=torch.float32))
                 gp = _part_with_field(gp, "primitives", {})
-                # Drop any per-trajectory env reward: it rides only the TERMINAL turn (a TensorRef on 1 of the trajectory's k gen parts), so concatenating turns would leave a short, misaligned rewards field that breaks DP scatter.
                 gp = _part_with_field(gp, "rewards", None)
                 train_parts.append(gp)
 
         depths = [len(tr.gen_parts()) for tr in trajs]
-        # Per-trajectory turn distribution — the workload's depth VARIANCE (a straggler-cut only pays when this is wide; ~uniform means over-sample-and-drop is pure waste).
         logger.info(
             "rollout %d trajectory turns: n=%d mean=%.2f min=%d max=%d hist=%s",
             rollout_id,
@@ -224,7 +222,6 @@ class AgenticTrainer(ARTrainer):
         train_part = self._pad_to_dp_multiple(train_part)
         result = self.stack.train_track(train_part, training_progress=float(training_progress))
 
-        # Logging sample: one row per trajectory whose gen frontier carries the reward + advantage (compute_rollout_sample_metrics reads gen_parts). Built from the computed tensors so it is independent of the reward SOURCE (answer vs env).
         log_sample = self._build_log_sample(trajs, rewards, advantages, rollout_id)
         metrics: Dict[str, Any] = {
             "agent/mean_turns": (sum(depths) / len(depths)) if depths else 0.0,
@@ -291,7 +288,7 @@ class AgenticTrainer(ARTrainer):
         )
         scoring = self.reward.score_and_attach(scoring)
         rewards = hydrate(scoring.parts[-1].rewards).to(torch.float32)
-        # A failed trajectory was still graded above (its empty answer scores as a miss); overwrite with NaN so _group_advantages excludes it from the group's mean/std and gives it zero advantage instead of a real negative signal.
+        # Mark failed trajectories as NaN so they receive zero advantage.
         failed = torch.tensor([_is_failed(tr) for tr in trajs], dtype=torch.bool)
         if bool(failed.any()):
             logger.warning(
@@ -328,7 +325,7 @@ class AgenticTrainer(ARTrainer):
         completion order is fine). ``adv_normalization_scope='global'`` z-scores the
         whole batch; ``normalize_adv_by_std=False`` mean-centers only."""
         r = rewards.to(torch.float32)
-        # NaN reward = crashed trajectory: excluded from the group's mean/std and given ZERO advantage (neutral), so an env crash neither rewards nor penalizes its actions. All-finite (the answer-graded path) is byte-identical to before.
+        # Give NaN failures zero advantage and exclude them from group statistics.
         finite = torch.isfinite(r)
         if self.adv_normalization_scope == "global":
             rf = r[finite]

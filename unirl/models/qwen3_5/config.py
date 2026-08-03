@@ -24,7 +24,6 @@ class Qwen3_5PipelineConfig:
     trust_remote_code: bool = False
 
     model_precision: Any = "bf16"
-    # HF attention backend for the TRAIN-side model. Qwen3.5 has hybrid attention (3 GDN + 1 full per 4 layers); the GDN layers do not support flash/flex, so packed-varlen replay is NOT safe.
     attn_implementation: Optional[str] = None
     device: Any = None
 
@@ -43,11 +42,9 @@ class Qwen3_5PipelineConfig:
     min_pixels: int = 256 * 28 * 28
     max_pixels: int = 1280 * 28 * 28
 
-    # Meta-init the transformer (build on the meta device; the backend loads weights after sharding from the checkpoint root) instead of eager ``from_pretrained``.
     meta_init_transformer: bool = False
 
     system_instruction: Optional[str] = None
-    # Chat-template thinking switch; MUST agree with the rollout engine's chat_template_kwargs.enable_thinking or train/rollout prompts diverge.
     enable_thinking: bool = False
 
     def __post_init__(self) -> None:

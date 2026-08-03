@@ -95,11 +95,9 @@ class HunyuanImage3TextEmbedStage:
         config = transformer.config
         gen_config = transformer.generation_config
 
-        # The wrapper around the HF tokenizer (which knows how to splice in <boi>, <eoi>, <img>, <timestep>, <img_ratio_*> markers) is lazily populated upstream — ``load_tokenizer`` must be called explicitly after ``from_pretrained``. Newer (Instruct) snapshots expose the wrapper as ``_tokenizer``; older ones auto-populate ``_tkwrapper``.
         if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
-        # transformers 5.x loads HunyuanImage3TokenizerFast's Rust backend char-level (pre_tokenizer/decoder=None) -> char-level, space-less prompts -> char-by-char generation. Re-attach the correct BPE backend from tokenizer.json.
         repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
 
         _cond_kw = (
@@ -252,7 +250,6 @@ class HunyuanImage3TextEmbedStage:
             batch_cond_image_info=batch_cond_image_info,
         )
 
-        # Upstream (hunyuan.py:2306-2310) sizes the rope to ``generation_config.max_length`` for ``mode="gen_text"`` so decode steps' position_ids (which advance past the prompt) stay in range.
         prompt_len = int(output.tokens.shape[1])
         rope_seq_len = int(getattr(gen_config, "max_length", prompt_len))
         rope_seq_len = max(rope_seq_len, prompt_len)
@@ -261,11 +258,9 @@ class HunyuanImage3TextEmbedStage:
             output, sections, rope_seq_len=rope_seq_len
         )
 
-        # HI3-Instruct cond images are dual-encoded: the wrapper also splices VAE <img> slots + a cond <timestep> token (i2t/it2i). Pin them so the AR forward can scatter the VAE latents (else those slots stay bare <img> embeddings → garbage comprehension).
         cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), _device)
         cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), _device)
 
-        # Per-sample TRUE prompt length for the right-padded batch. Without it, ``replay`` would fall back to the padded length and compute per-token logp at pad-shifted positions for short samples → silent GRPO ratio error.
         prompt_lengths: Optional[torch.Tensor] = None
         real_pos = getattr(output, "real_pos", None)
         if real_pos is not None:
@@ -379,7 +374,6 @@ class HunyuanImage3TextEmbedStage:
             raise ValueError("HunyuanImage3TextEmbedStage.embed_for_gen_image: prompts is empty")
         cfg_factor = 2 if cfg else 1
 
-        # Image info from explicit (h, w). The method name differs across HI3 checkpoints: Base ships ``build_image_info``, Instruct ships ``build_gen_image_info`` (same semantics, two default kwargs we don't need).
         ip = transformer.image_processor
         if hasattr(ip, "build_image_info"):
             image_info = ip.build_image_info(f"{int(height)}x{int(width)}")
@@ -423,7 +417,6 @@ class HunyuanImage3TextEmbedStage:
             cond_vit_image_mask=cond_vit_image_mask,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
         )
-        # Opaque tokenizer wrapper output. Carries the slice info the KV-cache path's first ``_update_model_kwargs_for_generation`` call needs to gather position_ids / attention_mask / gen_timestep_scatter_index down from full-L to the L' changed slice (timestep + image tokens) for steps 1..T-1.
         return {"fused": fused, "tokenizer_output": output}
 
 

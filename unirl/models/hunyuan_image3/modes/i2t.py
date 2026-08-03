@@ -76,12 +76,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # HI3-Instruct represents a cond image as a DUAL VAE + ViT block (the chat template splices VAE <img> slots + a cond <timestep> alongside the ViT <img> slots). Without the VAE half, the 4096 VAE <img> slots stay bare <img> embeddings → the model sees garbage and can't comprehend the image.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=1
     )
 
-    # ``cond_vae_images`` is the raw VAE-input image (float). The AR forward runs the bf16 VAE encoder WITHOUT autocast (the diffusion path wraps its forward in torch.autocast; the autoregress loop does not), so a float input hits bf16 conv weights → dtype mismatch.
     def _cast_floats(x: Any) -> Any:
         if isinstance(x, torch.Tensor):
             return x.to(dtype=pipeline.bundle.dtype) if x.is_floating_point() else x
@@ -91,7 +89,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     cond_vae_images = _cast_floats(cond_vae_images)
 
-    # Chat template path: pass batch_cond_image_info so the wrapper splices in the cond-image markers; the resulting cond_vae_image_mask / cond_vit_image_mask / cond_timestep_scatter_index (now on ``fused``) pin which ``input_ids`` positions hold the VAE / ViT / timestep scatter targets.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
         bot_task=tok_bot_task,

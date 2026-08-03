@@ -157,7 +157,6 @@ class Remote:
         saved_out: List[torch.Tensor] = self._grad_outputs.pop(call_id, [])
         saved_in: List[torch.Tensor] = self._grad_inputs.pop(call_id, [])
 
-        # Pre-assign existing in_grads so PyTorch accumulates via grad +=
         for t, g in zip(saved_in, in_grads):
             if g is not None:
                 t.grad = g
@@ -217,6 +216,6 @@ class Remote:
             sampler = get_process_snapshot_sampler()
             if sampler is not None:
                 report = sampler.dump(dump_snapshot_tag)
-                if report:  # carried to the driver so it lands in the training console
+                if report:
                     out["snapshot_report"] = report
         return out

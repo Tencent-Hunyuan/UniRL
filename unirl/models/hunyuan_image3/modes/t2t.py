@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
 
-# The upstream tokenizer's apply_chat_template asserts ``bot_task in {"image", "auto", "think", "recaption", "img_ratio"}`` — the composite presets must be mapped before any template call.
 _TOKENIZER_BOT_TASKS = {"think_recaption": "think", "vanilla": "image"}
 
 
@@ -70,7 +69,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     bot_task = str(ar_params.bot_task)
     tok_bot_task = _tokenizer_bot_task(bot_task)
 
-    # Resolve the system prompt. Uses the MAPPED bot_task — upstream get_system_prompt's ``dynamic`` branch only knows {think, recaption, image}.
     system_prompt = _resolve_system_prompt(
         pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
     )
@@ -161,7 +159,6 @@ def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
     transformer = bundle.transformer
     tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
     if tkw is None:
-        # Bundle hasn't had its tokenizer loaded yet (fake-bundle path or pre-prefill). Return empty -- ``autoregress`` then runs to ``max_tokens`` without an early stop.
         return []
 
     eos = getattr(tkw, "eos_token_id", None)
@@ -193,5 +190,4 @@ def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
         if extra_auto_stops:
             return extra_auto_stops
         return [int(boi)] if boi is not None else []
-    # Unknown bot_task -- fall back to eos.
     return [int(eos)] if eos is not None else []

@@ -109,7 +109,6 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             "diffusion": self._diffusion,
         }
 
-        # The whole AR→diffusion transition is one serialized operation because the children share wake/sleep state. Composed owns no weights and propagates each child's stamp rather than stamping its own version.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -224,7 +223,6 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             f"ComposedRolloutEngine: AR child returned {len(ar_part.sample_ids)} samples; expected {P}*{N}={P * N}",
         )
 
-        # PE extraction: clean the AR text the diffusion child conditions on (rewritten onto the AR Part's text primitive so logging sees it too).
         pe_texts = ar_part.primitives.get("text")
         require(
             isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
@@ -237,7 +235,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         self._ar.sleep()
         self._diffusion.wake_up()
 
-        # ── Stage 2: diffusion child The PE ids ("p0/0") are non-root, so they cannot be a child Sample's root input. Re-root the PE prompts onto fresh ids, fork the diffusion shell off them (preserving the shell's sampling params + x_T segment), generate, then map the per-sample outputs back onto our lineage-correct diffusion_shell — row order matches (both group-by-parent, branch=M, same parent order).
+        # Re-root diffusion prompts because composed PE IDs are not valid child roots.
         pe_input = Part.input(
             sample_ids=[f"pe{k}" for k in range(P * N)],
             primitives={"text": pe_texts},
@@ -254,7 +252,6 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
             f"samples; expected {P}*{N}*{M}={P * N * M}",
         )
-        # Carry the diffusion child's weight version onto the frontier part — composed owns no weights, so it propagates the child's stamp rather than its own 0.
         diffusion_part = diffusion_shell.fill(
             segment=diff_child.segment,
             primitives=dict(diff_child.primitives),
@@ -265,8 +262,6 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         )
 
         return Sample(parts=[input_part, ar_part, diffusion_part])
-
-    # Control plane — forwarded to both children (best-effort).
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation on both children. Partials surface via the

@@ -10,11 +10,8 @@ LoraModuleSelection = Union[str, Tuple[str, ...]]
 class LoraConfig:
     rank: int = 8
     alpha: int = 16
-    # A tuple uses PEFT's exact/suffix matching; a string is preserved for regular-expression matching and the special ``all-linear`` shorthand. ``Any`` is intentional: OmegaConf 2.3 rejects unions containing containers.
     target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
-    # Modules matched by ``target_modules`` but explicitly excluded from injection. Like ``target_modules``, tuples match exact names/suffixes and strings are regular expressions.
     exclude_modules: Any = None
-    # Restrict sequence-style target suffixes to a named model subtree. This cannot be combined with regex or ``all-linear`` target strings.
     module_prefix: str = ""
     dropout: float = 0.0
     bias: str = "none"
@@ -56,21 +53,15 @@ class FSDPConfig:
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
     use_torch_compile: bool = False
-    # Opt-in no-sync gradient accumulation: defer the per-block FSDP2 gradient reduce-scatter to the last micro-batch of an optimizer step, so one reduce-scatter runs per step instead of one per micro-batch (the standard FSDP2 no-sync pattern; a multi-node win, ~no-op over NVLink). Only takes effect under ZeRO-2 (reshard_after_forward=False); ignored otherwise.
+    # Defer FSDP2 gradient reduce-scatter only under ZeRO-2.
     defer_grad_sync: bool = False
-    # Opt-in FSDP2 cross-block forward prefetch: overlap each block's all-gather with compute (a multi-node win, ~no-op over NVLink). Chains the default root wrap to prefetch block 0, then block i to prefetch block i+1; needs the root wrap (raises if root_wrap=False).
     forward_prefetch: bool = False
-    # Optional high-precision master dtype for the TRAINABLE params (e.g. "fp32").
     master_dtype: Optional[str] = None
-    # Root fully_shard (default ON): after the per-block wrap, fully_shard the model root so the leftover params (embed / final norm / lm_head) are sharded + mp_policy'd like everything else instead of staying plain replicated tensors (which need manual grad sync and keep full fp32 masters per rank). Set false for models whose stages call submodules of the wrapped object directly outside a root forward (bagel's vendored code) or whose wrapped object carries frozen mixed-dtype sibling sub-models that must not be sharded (hunyuan_image3's VAE/ViT).
+    # Disable root sharding when stages call submodules outside the root forward.
     root_wrap: bool = True
-    # Checkpoint storage backend. "torch" (default) keeps the legacy path: gather a full state dict to rank 0 and torch.save a single checkpoint.pt. "dcp" uses torch.distributed.checkpoint sharded save/load — each rank reads/writes only its own shard (no rank-0 full-tensor gather), which enables meta-init bundles (80B) to checkpoint, parallelizes I/O across ranks, and resumes under a different world size. load auto-detects the on-disk format, so legacy checkpoint.pt dirs still resume regardless.
     checkpoint_format: str = "torch"
-    # dcp only: background (async) save (dcp.async_save) so the train loop is not blocked on the shard I/O — staging is synchronous, the flush runs on a background thread, drained before the next save and after the final one. Ignored under checkpoint_format="torch".
     checkpoint_async: bool = False
-    # Ulysses sequence-parallel degree (default 1 = disabled, a true no-op). Must divide the world size and the model's attention head count.
     sp_size: int = 1
-    # Expert-parallel degree for MoE models (default 1 = disabled, a true no-op). When >1 the VeOmni backend registers an "ep" extra-parallel submesh in init_parallel_state (ep x ep_fsdp), shards fused experts, and requires the bundle to implement prepare_for_expert_parallel() so the trainable model exposes get_parallel_plan() (Shard(0) on stacked expert weights).
     ep_size: int = 1
 
 

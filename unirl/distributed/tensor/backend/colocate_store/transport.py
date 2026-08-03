@@ -64,8 +64,6 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def decref(self, key: Any) -> None:
         self._store.decref(key)
 
-    # locality: colocate is single-slot per device, so a ref is local only if produced by the dst worker itself — exactly WorkerLocalTransport's default _is_local.
-
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         self._store.setup_global_pg(global_rank, world_size)
 
@@ -77,7 +75,6 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return self._store._nccl_recv(src_rank, shapes, dtypes)
 
 
-# Backwards-compatible alias (older name).
 TensorStoreTransport = ColocateStoreTransport
 
 __all__ = ["ColocateStoreTransport", "TensorStoreTransport"]

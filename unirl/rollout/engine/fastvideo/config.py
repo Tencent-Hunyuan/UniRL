@@ -47,10 +47,8 @@ class FastVideoEngineConfig(BaseEngineConfig):
 
     model_family: str = "wan2.1"
 
-    # Native log-prob (PR #1222 ForwardBatch.RLData path). When False the engine returns only the trajectory and the trainer recomputes log-probs via replay (algorithm.old_logp_source=replay).
     native_logprob: bool = True
 
-    # Engine-internal noise fallback. FastVideo currently uses one seed for x_T and SDE noise, so True shares the whole random stream, not only x_T.
     init_same_noise: bool = False
 
     num_gpus: int = 1
@@ -60,7 +58,6 @@ class FastVideoEngineConfig(BaseEngineConfig):
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # Output concat cadence (None = collect the whole shard, concat once). NOT a GPU batch size: _drive_fastvideo runs FastVideo one video at a time (per-sample seeds preclude batching), so peak GPU activation is one video regardless.
     forward_batch_size: Optional[int] = None
 
     target_modules: Optional[Tuple[str, ...]] = None

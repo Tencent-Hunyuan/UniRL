@@ -87,7 +87,6 @@ class SD3Bundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # VeOmniBackend lifecycle: parameters on the meta device (no weight allocation); real weights load post-parallelize from the stashed path. SD3's PatchEmbed registers its sincos pos_embed as a NON-PERSISTENT buffer — absent from checkpoints, clobbered by to_empty. build_meta_init_transformer puts the params on meta while keeping that buffer real on CPU and captures it; meta_init_state is stashed on the bundle below and restored by load_trainable_weights.
             transformer_config = SD3Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: SD3Transformer2DModel.from_config(transformer_config), dtype=dtype

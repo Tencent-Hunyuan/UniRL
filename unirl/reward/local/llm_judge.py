@@ -42,7 +42,7 @@ _DEFAULT_JUDGE_PROMPT = (
     "'incorrect'."
 )
 
-# Verdict patterns, checked NEGATIVE-first: "incorrect" contains the substring "correct", and a verbose judge may write "not correct" / "wrong" — the old ``"correct" in content and "incorrect" not in content`` test misreads both ("not correct" -> scored 1.0). The prompt asks for a single word, so double-negatives ("not incorrect") are out of scope; ambiguous replies score 0.0 (under-reward on uncertainty, matching the judge-failure convention).
+# Check negative verdicts first because "incorrect" contains "correct".
 _INCORRECT_RE = re.compile(r"\b(?:incorrect|not\s+correct|isn'?t\s+correct|wrong|not\s+equivalent)\b")
 _CORRECT_RE = re.compile(r"\b(?:correct|equivalent|yes)\b")
 

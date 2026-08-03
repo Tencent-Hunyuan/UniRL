@@ -42,17 +42,14 @@ class Flux2KleinPipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on Flux2KleinDiffusionParams) because these are operator/runtime knobs, not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Static-shift fallback for FlowMatchSchedulePolicy when the pretrained path is not a real local directory (HF repo ID, tests). In practice Klein's checkpoint enables empirical-mu shifting and this value is ignored — kept aligned with the diffusers Klein default to avoid surprising any ad-hoc consumer.
     shift: float = 1.0
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Meta-init the transformer (build on the meta device; the backend loads weights after sharding) instead of eager ``from_pretrained``. The Klein guidance-embedder quirk is handled by a deferred zero-init of checkpoint-absent params.
     meta_init_transformer: bool = False
 
     max_sequence_length: int = 512

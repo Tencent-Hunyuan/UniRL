@@ -32,7 +32,7 @@ def _normalize_answer(answer: str) -> str:
         return chr(ord("A") + ord(a) - ord("1"))
     if len(a) == 1 and a in "ABCD":
         return a
-    return a  # fallback
+    return a
 
 
 def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:

@@ -88,7 +88,7 @@ class Qwen3Bundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): parameters on the meta device, materialized + loaded by the backend from the checkpoint root after sharding (AR layout: no transformer/ subfolder, so the stashed dir is the root). build_meta_init_transformer keeps buffers/attrs real on CPU: HF rotary inv_freq / original_inv_freq are non-persistent buffers computed in __init__ and absent from the checkpoint, so to_empty later clobbers them -> garbage RoPE. It captures them; meta_init_state is stashed on the BUNDLE below and restored by load_trainable_weights after the sharded weight load.
+            # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
@@ -129,7 +129,6 @@ class Qwen3Bundle(Bundle):
             transformer_device = next(transformer.parameters()).device
             transformer.value_head = ValueHead(hidden_size, device=transformer_device)
             if config.meta_init_transformer:
-                # The base checkpoint has no value_head.* tensors. ``to_empty`` materializes the meta head as uninitialized storage, so reset it only after the sharded checkpoint load has completed.
                 _stamp_value_head_reset(transformer)
 
         bundle = cls(

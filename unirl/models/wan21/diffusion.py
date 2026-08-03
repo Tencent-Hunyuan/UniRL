@@ -107,7 +107,6 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         else:
             sample_cat = sample_cast
 
-        # I2V CLIP-vision: when patch embeddings are present, forward them as ``encoder_hidden_states_image``. Only emitted when the WAN 2.1 transformer declares ``image_dim > 0`` (T2V never sets this slot, so the kwarg is conditional to avoid leaking an unknown kwarg to a T2V transformer signature).
         image_embed = conditions.image_embed
         image_embeds = image_embed.embeds if image_embed is not None and image_embed.embeds is not None else None
         extra: Dict[str, Any] = {}
@@ -268,10 +267,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
 
-    # WAN VAE spatial/temporal downsampling factors. These are fixed for the AutoencoderKLWan architecture (8× spatial, 4× temporal) and not configurable per-request, so they live on the stage.
     _SPATIAL_DOWNSAMPLE: ClassVar[int] = 8
     _TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
-    # Latent channel count fallback when ``vae.config.z_dim`` is absent.
     _DEFAULT_LATENT_CHANNELS: ClassVar[int] = 16
 
     def __init__(
@@ -375,7 +372,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
         sde_sorted: List[int] = sorted(sde_set)
 
-        # Stored positions: SDE pairs ∪ {T} so VAE decode always has the clean latent.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
 
@@ -417,7 +413,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
             if log_prob is not None:
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # Pack into LatentSegment. WAN latents are 5D [B, C, T_lat, H_lat, W_lat] so stacked is [B, K, C, T_lat, H_lat, W_lat].
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
@@ -426,7 +421,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp ``modality=VIDEO`` via the factory helper. Plain ``LatentSegment(...)`` would leave the ClassVar default ``Modality.IMAGE`` in place, which is wrong for WAN T2V — any downstream generic segment routing that branches on ``segment.modality`` would mistake video latents for image latents and (e.g.) try the image-only ``as_condition`` / decode paths.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,

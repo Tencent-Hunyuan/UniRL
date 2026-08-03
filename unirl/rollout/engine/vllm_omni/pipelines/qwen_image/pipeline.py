@@ -78,15 +78,11 @@ class RLQwenImagePipeline(QwenImagePipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Upstream ``__init__`` constructs ``self.scheduler``; stash it as the config donor for the SDE swap. We never swap back — our scheduler is installed for the lifetime of this pipeline instance.
         self._upstream_scheduler: FlowMatchEulerDiscreteScheduler = self.scheduler
-        # Conditioning-tap state: armed (reset to a fresh dict) every request, filled by the tap's first/second call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._pending_initial_noise: Optional[torch.Tensor] = None
         self._harvest_hw: Optional[Tuple[int, int]] = None
-
-    # install — once per pipeline lifetime, idempotent
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (the from_config
@@ -129,8 +125,6 @@ class RLQwenImagePipeline(QwenImagePipeline):
 
         self.encode_prompt = tapped  # type: ignore[assignment]
         self._conditioning_tap_installed = True
-
-    # arm — every request (stale-leak guards)
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
@@ -226,7 +220,6 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self._arm_sde(req)
         self._arm_initial_noise(req)
         self._arm_conditioning_tap()
-        # Mirror upstream forward's H/W resolution (defaults + 16-alignment) so the harvest unpack uses the exact grid the loop ran on.
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)

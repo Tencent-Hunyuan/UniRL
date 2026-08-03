@@ -63,7 +63,6 @@ from .base import (
 class GSPOConfig(BaseAlgorithmConfig):
     stage_attr: str = "ar"
     conditions_cls: str = ""
-    # GSPO's sequence-level ratio has much lower variance than GRPO's per-token ratio, so the clip range is ~10-30x tighter (paper: ε≈3e-4).
     clip_range: float = 3e-4
     clip_schedule: str = "constant"
     old_logp_source: str = "rollout"
@@ -101,14 +100,12 @@ class GSPO(StageAlgorithm):
             denominator at pre-update train-side weights.
     """
 
-    # prepare_segment freezes either the rollout emission or a pre-update replay on the segment, so the denominator stays fixed across every mini-batch.
     supports_multi_update = True
     anchor_fields = ("log_probs", "rollout_log_probs")
 
     def recomputes_anchor(self) -> bool:
         return self.old_logp_source == "replay"
 
-    # Upper bound on the per-sequence log-ratio before exp(), guarding against overflow to inf when the sequence is far off-policy (early training).
     _MAX_LOG_RATIO = 10.0
 
     def __init__(
@@ -196,7 +193,6 @@ class GSPO(StageAlgorithm):
         if seq_new.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
-        # ratio_i = exp(s_i) with s_i = mean_t(new) - mean_t(old). Clamp the log-ratio before _grpo_clip_loss exponentiates it (numerical stability).
         log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = _grpo_clip_loss(
             new_logp=log_ratio,
@@ -215,7 +211,6 @@ class GSPO(StageAlgorithm):
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
             **rollout_replay_logp_absdiff(new_logp, rollout_logp),
-            # Rollout↔replay drift on the raw PER-TOKEN log-probs (before the sequence reduction) — the direct autoregress-vs-replay correctness gauge. k3 is the calibrated KL surrogate (p=replay new, q=rollout old); on-policy it is ~0 and rises if any misaligns between rollout and replay.
             **rollout_replay_k3(new_logp, rollout_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }

@@ -14,7 +14,6 @@ from typing import Any, Optional
 
 from unirl.config.validation import validate_precision_type
 
-# LTX-2 3D-VAE geometry (fixed for the LTX-2 / LTX-2.3 family): 32x spatial, 8x temporal compression, 128 latent channels. Module-level so both import without a cycle.
 LTX2_SPATIAL_COMPRESSION = 32
 LTX2_TEMPORAL_COMPRESSION = 8
 LTX2_LATENT_CHANNELS = 128
@@ -38,7 +37,6 @@ class LTX2PipelineConfig:
     text_encoder_dtype: Any = None
     device: Any = None
 
-    # Stage-level precision / numerical policy.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
@@ -49,7 +47,6 @@ class LTX2PipelineConfig:
 
     enable_audio: bool = False
 
-    # When True (and the bundle has audio), video+audio form a SINGLE joint SDE policy: audio is SDE-stepped with the same ``eta`` as video, emits its own per-step log-prob, and the two are merged by an element-weighted mean (the mean a single SDE over the concatenated ``[video|audio]`` latent would produce). No effect for ``enable_audio=False`` (T2V): the audio stream is then a synthetic placeholder that is never decoded or rewarded, so it stays out of the policy regardless of this flag.
     audio_joint_sde: bool = True
 
     default_height: int = 512
@@ -62,7 +59,6 @@ class LTX2PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[list] = None
 
-    # Keep the frozen NON-trainable components (VAE, Gemma3 text encoder, connectors) on CPU instead of the train device. For sglang-rollout configs the trainside only replays the DiT for the policy gradient — encoding, decoding and generation all happen in the sglang server — so these components are dead weight on the train GPU and, being non-FSDP, stay resident during sglang generation, starving its DiT-resume of headroom in colocate.
     aux_components_on_cpu: bool = False
 
     def __post_init__(self) -> None:

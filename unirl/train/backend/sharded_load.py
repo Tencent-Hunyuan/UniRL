@@ -67,12 +67,11 @@ def load_trainable_weights(
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
         load_sharded(model, weights_path, device=device, strict=False)
-        # Recover init-computed non-persistent state (RoPE inv_freq, sincos tables, …) clobbered by meta-init `to_empty` and not carried by the checkpoint. Without this the train model keeps garbage RoPE -> garbage replay log-probs -> the DRPO rollout/replay ratio collapses (~0.05) and nothing learns.
+        # Restore init-only state lost during meta materialization.
         from unirl.models.types.meta_init import restore_init_state
 
-        # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos tables, …) captured on the bundle before meta-init's to_empty clobbered them.
         n_recovered = restore_init_state(model, getattr(bundle, "_meta_init_state", None))
-        # Re-establish TIED weights (lm_head <-> embed_tokens). For tie_word_embeddings models, meta-init's to_empty breaks the tie and the checkpoint carries NO separate lm_head.weight, so it stays uninitialized -> uniform logits -> garbage replay log-probs (the DRPO rollout/replay ratio collapses to ~0.05 and nothing learns; SGLang ties its own lm_head so old_logp is fine). tie_weights() re-points lm_head.weight at the loaded embed_tokens.weight.
+        # Re-tie shared weights after meta materialization.
         retied = False
         if getattr(getattr(model, "config", None), "tie_word_embeddings", False) and hasattr(model, "tie_weights"):
             model.tie_weights()
@@ -123,7 +122,6 @@ def load_sharded(
     common path for single-module trainables whose weights live in a dedicated
     directory (diffusion ``<ckpt>/transformer``, AR ``<ckpt>`` root).
     """
-    # Expert-parallel models shard stacked expert weights on a 2D composed mesh (``ep_fsdp x ep``); torch's rank-0-broadcast loader mis-slices that layout. Each rank reads ONLY its own expert block from the (local) safetensors via mmap'd ``get_slice`` and uses DTensor-native ``distribute_tensor`` to fill its exact local shard.
     if hasattr(module, "_extra_parallel_param_groups"):
         if _module_has_meta_param(module):
             module.to_empty(device=device)
@@ -302,7 +300,6 @@ def _load_state_dict_ep_sliced(
             cand = f"{stem.removesuffix('.base_layer')}.{leaf}" if stem.endswith(".base_layer") else name
             ckpt_key = cand if cand in ckpt_keys else name
         if ckpt_key not in ckpt_keys:
-            # HF original (per-expert split) checkpoint: the fused expert param (``...experts.gate_up_proj`` / ``...experts.down_proj``) is absent; rebuild THIS ep rank's block from the per-expert ``experts.{e}.*`` keys (VeOmni's CheckpointTensorConverter mapping, applied per rank).
             block = build_local_fused_block(
                 fused_param_name=name,
                 expected_shape=tuple(dst.shape),
@@ -389,7 +386,6 @@ def _load_state_dict_sharded(
         module.to_empty(device=device)
 
     if _current_rank() == 0:
-        # Align raw-checkpoint keys to the constructed model's key layout before Qwen MoE packing and the LoRA base_layer hop, then guard against a silent no-load.
         state_dict = _remap_hf_checkpoint_keys(state_dict, module)
         state_dict = _pack_qwen_moe_expert_keys(state_dict, module)
         state_dict = _remap_lora_base_keys(state_dict, module)
@@ -566,7 +562,6 @@ def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> State
         for key in source_keys:
             state_dict.pop(key)
 
-    # Qwen3.5 checkpoints may carry a standalone MTP speculative-prediction head even when the ForConditionalGeneration training model intentionally omits it. Those auxiliary expert keys are not a partially packed main model.
     has_target_mtp = any("mtp" in name.split(".") for name in model_tensors)
     if not has_target_mtp:
         mtp_keys = [key for key in state_dict if "mtp" in key.split(".")]
@@ -603,11 +598,10 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         from transformers import PreTrainedModel
         from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import WeightRenaming
-    except Exception as exc:  # older / patched transformers without the API
+    except Exception as exc:
         logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
         return state_dict
 
-    # The backend may wrap the HF model in an FSDP subclass, while the reference build still needs the original HF class. Ask Transformers for the rules from that reference model instead of pre-gating on ``get_checkpoint_conversion_mapping(config.model_type)``: newer Transformers releases can register the rules on the model/converter even when that legacy lookup returns ``None``.
     unwrapped = getattr(model, "module", model)
     config = getattr(unwrapped, "config", None)
     if config is None:
@@ -624,7 +618,6 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
     if not issubclass(hf_cls, PreTrainedModel):
         return state_dict
 
-    # The live module is sharded and restructured, so take the rules and the canonical key set from a meta-built reference model (no weights, cheap).
     try:
         with init_empty_weights(include_buffers=False):
             ref = hf_cls(config)

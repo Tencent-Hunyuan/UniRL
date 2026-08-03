@@ -101,7 +101,6 @@ class ZImagePipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else ZImageVAEDecodeStage(bundle)
-        # ``shift`` is retained so the hosting engine can read it when constructing the FlowMatchSchedulePolicy at startup. Z-Image is static-shift, so this value (3.0) is the schedule shift.
         self.shift = shift
 
     @classmethod
@@ -230,7 +229,6 @@ class ZImagePipeline(Pipeline):
         z_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a pre-shipped initial_latents tensor still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(z_conds, schedule=schedule, params=params, initial_latents=initial_latents)

@@ -752,7 +752,6 @@ class WanVideoVAE(nn.Module):
         self.upsampling_factor = 8
         self.z_dim = z_dim
 
-        # diffusers-compatible config for WanPipeline.__init__ compatibility. ``scaling_factor`` is exposed only as a legacy fallback — the real un-normalization always uses ``latents_mean`` / ``latents_std``.
         self.config = _SimpleConfig(
             scale_factor_temporal=4,
             scale_factor_spatial=8,

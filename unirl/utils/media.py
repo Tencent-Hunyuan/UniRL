@@ -21,7 +21,6 @@ def tensor_frame_to_pil(frame: torch.Tensor) -> Any:
         raise ValueError(f"Expected CHW frame tensor, got shape={tuple(frame.shape)}")
 
     frame = frame.detach().float().cpu()
-    # A temporary fix for wandb - TODO: check the dataflow of wandb media logging
     frame = frame.clamp(0.0, 1.0)
     if frame.shape[0] == 1:
         frame = frame.repeat(3, 1, 1)
