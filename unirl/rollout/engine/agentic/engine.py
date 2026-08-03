@@ -3,7 +3,8 @@
 The engine is a ``BaseRolloutEngine`` on a DP-replicated slab. Each worker builds its **own local**
 inner single-turn engine + environment (the ``ComposedRolloutEngine`` build-inner pattern) and runs
 a **pool of drain threads** (``per_worker_concurrency`` of them) that pull single-trajectory tasks
-from a central queue and run each as a plain synchronous multi-turn agent loop on its own thread:
+from a central queue and run each through the configured harness (the multi-turn agent loop,
+:class:`~unirl.rollout.harness.tool_agent.ToolAgentHarness`) on its own thread:
 per-turn ``inner.generate`` (the inner engine is safe for concurrent callers — its backend keeps
 the in-flight requests batching together) and ``env.step`` (the env is re-entrant across threads).
 
@@ -59,6 +60,8 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
 from unirl.rollout.engine.synchronous import BaseRolloutEngine, SyncRolloutEngine
+from unirl.rollout.harness.protocol import HarnessContext, RolloutHarness
+from unirl.rollout.harness.tool_agent import ToolAgentHarness
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import total_samples_per_prompt
 
@@ -114,6 +117,12 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             "they are set independently in the recipe and must agree.",
         )
         self._concurrency = int(config.per_worker_concurrency)
+
+        self._harness: RolloutHarness = ToolAgentHarness(env=self._env, sampling=self._sp, max_turns=self._max_turns)
+        self._harness_ctx = HarnessContext(
+            engines={"policy": self._inner.generate},
+            suspend=lambda: self._stopping,
+        )
 
         self._workers: List[Any] = []
         self._role: str = ""
@@ -327,46 +336,32 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             raise
 
     def _run_one(self, task: Sample) -> Tuple[Sample, bool]:
-        """One trajectory's agent loop, on this drain thread. Returns ``(sample, done)``.
+        """One trajectory, on this drain thread: delegate to the harness. Returns ``(sample, done)``.
 
-        ``done=True`` — terminal (the env said done, or ``max_turns`` reached).
-        ``done=False`` — **checkpointed** at a turn boundary because ``self._stopping``
-        (partial rollout): the trajectory is carried and resumed next drive.
+        ``done=True`` — terminal (``completed``/``failed`` outcome).
+        ``done=False`` — **checkpointed** at a harness-chosen safe point
+        (``suspended``, partial rollout): carried and resumed next drive.
 
-        Resume-aware: ``turns_done = len(gen_parts())`` (a carried partial continues
-        from where it stopped; ``env.reset`` is idempotent/turn-derived). The
-        ``_stopping`` check is at the **top of each turn**, so the in-flight turn
-        finishes naturally first (turn boundary, no mid-turn abort). Failure-isolated:
-        never raises into the drain.
+        The harness owns the task-internal control flow (turn loop, stop
+        conditions, teardown) and returns ``failed`` for task-level faults;
+        this runtime keeps the last-resort net (a harness BUG must not sink
+        the drain) and the tensor-side jobs: attaching an env-sourced reward,
+        and NaN-marking failures so an infrastructure fault never enters GRPO
+        as a legitimate low-scoring sibling (trainers give NaN zero advantage).
+        Failure-isolated: never raises into the drain.
         """
-        sample = task
-        env_reward: Optional[float] = None
         try:
-            sample = self._env.reset(task)
-            turns_done = len(sample.gen_parts())
-            for _ in range(self._max_turns - turns_done):
-                if self._stopping:
-                    return sample, False
-                sample = self._inner.generate(sample.fork(1, sampling_params=self._sp))
-                observation, done, info = self._env.step(sample)
-                if isinstance(info, dict) and info.get("reward") is not None:
-                    env_reward = float(info["reward"])
-                if done:
-                    return self._attach_env_reward(sample, env_reward), True
-                if observation is not None:
-                    sample = sample.observe(observation)
-            return self._attach_env_reward(sample, env_reward), True
-        except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
-            # Mark infrastructure failures as NaN so GRPO assigns zero advantage.
-            logger.warning("AgenticRolloutEngine: trajectory failed, marking failed: %s", exc, exc_info=True)
-            return self._attach_env_reward(sample, float("nan")), True
-        finally:
-            close = getattr(self._env, "close", None)
-            if close is not None:
-                try:
-                    close(sample)
-                except Exception:  # noqa: BLE001 — teardown must not sink the drain
-                    logger.warning("AgenticRolloutEngine: env.close failed during teardown", exc_info=True)
+            outcome = self._harness.run(task, self._harness_ctx)
+            if outcome.status == "completed":
+                return self._attach_env_reward(outcome.sample, outcome.env_reward), True
+            if outcome.status == "suspended":
+                return outcome.sample, False
+            if outcome.status == "failed":
+                return self._attach_env_reward(outcome.sample, float("nan")), True
+            raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
+        except Exception as exc:  # noqa: BLE001 — harness bug; the partial trace is lost, the drain survives
+            logger.warning("AgenticRolloutEngine: harness outcome failed, marking failed: %s", exc, exc_info=True)
+            return self._attach_env_reward(task, float("nan")), True
 
     @staticmethod
     def _attach_env_reward(sample: Sample, reward: Optional[float]) -> Sample:

@@ -4,7 +4,7 @@ ALFWorld (text-only ``AlfredTWEnv``) is the field's canonical multi-turn agentic
 benchmark: a household task where the agent issues text commands (``go to shelf 1``,
 ``take mug 1``, ``clean mug 1 with sinkbasin 1`` …) and the simulator returns the next
 observation, ending with a binary task-success reward. Unlike the stateless
-:class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`, each trajectory is its
+:class:`~unirl.rollout.env.tool_environment.ToolEnvironment`, each trajectory is its
 own **episode with evolving state** and the **reward comes from the simulator**.
 
 Fits the engine's ``reset(sample)->Sample`` / ``step(sample)->(obs, done, info)``
