@@ -204,6 +204,15 @@ sampling:
   width: 768
   num_frames: 124
   eta: 0.7
+  # MEASURED CONSTRAINT, not a preference. replay() builds ONE autograd graph
+  # across every replayed step, and at ~22k packed rows each step retains
+  # ~12 GB of activation-checkpoint boundaries (50 layers x 21982 x 5376 bf16).
+  # Replaying all 10 steps needs >100 GB/rank and OOMs an H20 (95 GB) during
+  # compute_loss_and_backward, AFTER a ~10-minute rollout. Only these indices
+  # record SDE log-probs, so only these are replayed and trained on -- the
+  # standard flow-GRPO timestep-subset lever. Raise only if the rank has room.
+  # LTX-2 gets away without this because its sequence is ~10x shorter.
+  sde_indices: [0, 3, 6, 9]
   samples_per_prompt: 4
   seed: 42
   init_same_noise: false
