@@ -97,12 +97,20 @@ class MiniMaxH3PipelineConfig:
     # path (False) gets that from ``from_pretrained`` natively.
     meta_init_transformer: bool = False
 
-    # Keep the frozen aux (both VAEs, the 32B Qwen3-VL conditioner) on CPU
-    # instead of the train device. The conditioner alone is ~64 GB in bf16 and
-    # is only needed to embed prompts, which the pipeline caches -- so for any
-    # recipe that is not encoding fresh prompts every step this is close to
-    # free headroom. MUST stay False if the trainside pipeline encodes on-device.
+    # Keep the frozen 32B Qwen3-VL conditioner on CPU instead of the train
+    # device. It is ~64 GB in bf16 -- larger than the trainable DiT's per-rank
+    # shard -- and is only needed to embed prompts, once per rollout, so the
+    # transfer cost is negligible against a 22k-row denoising loop. This is what
+    # makes an 8-GPU trainside recipe fit at all.
     aux_components_on_cpu: bool = False
+
+    # The two VAEs are a SEPARATE decision from the conditioner, and default to
+    # the train device even when the conditioner is parked. Together they are
+    # only ~10 GB fp32, and decoding 124 frames of 768x768 through the video VAE
+    # on CPU takes minutes per sample -- enough to dominate a rollout that
+    # spends ~2 minutes denoising. Set True only if GPU memory genuinely forces
+    # it, and expect decode to become the bottleneck.
+    vae_components_on_cpu: bool = False
 
     weight_sync_param_name_prefix: str = "transformer."
 

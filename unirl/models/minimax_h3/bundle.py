@@ -75,9 +75,14 @@ class MiniMaxH3Bundle(Bundle):
             device = torch.device(device)
         # The frozen aux here is unusually heavy -- the Qwen3-VL conditioner is
         # 32B (~64 GB bf16) on its own, more than the trainable DiT's shard on
-        # any sane mesh. Parking it (and the two fp32 VAEs) on CPU is what makes
-        # an 8-GPU trainside recipe fit at all.
+        # any sane mesh. Parking it on CPU is what makes an 8-GPU trainside
+        # recipe fit at all; it runs once per rollout, so the cost is noise.
+        #
+        # The VAEs are a separate call and default to the train device: they are
+        # ~10 GB fp32 together, but decoding 124 frames of 768x768 on CPU takes
+        # MINUTES per sample and would dominate the rollout.
         aux_device = torch.device("cpu") if config.aux_components_on_cpu else device
+        vae_device = torch.device("cpu") if config.vae_components_on_cpu else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_dtype = parse_torch_dtype(config.vae_dtype, field_name="vae_dtype")
@@ -106,7 +111,7 @@ class MiniMaxH3Bundle(Bundle):
 
         # Video VAE (frozen, fp32).
         vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-        vae = vae.to(aux_device).eval()
+        vae = vae.to(vae_device).eval()
         vae.requires_grad_(False)
 
         # Audio VAE (frozen, fp32). Do NOT let a global bf16 cast reach this:
@@ -114,7 +119,7 @@ class MiniMaxH3Bundle(Bundle):
         audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
             vae_path, subfolder="audio_vae", torch_dtype=audio_vae_dtype
         )
-        audio_vae = audio_vae.to(aux_device).eval()
+        audio_vae = audio_vae.to(vae_device).eval()
         audio_vae.requires_grad_(False)
 
         # Conditioner -- Qwen3-VL-32B (frozen). H3 reads an intermediate hidden

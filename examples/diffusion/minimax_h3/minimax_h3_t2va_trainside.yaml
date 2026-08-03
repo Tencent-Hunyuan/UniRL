@@ -54,10 +54,15 @@ bundle:
     text_encoder_hidden_layer: 50
     audio_joint_sde: true
     # The Qwen3-VL conditioner is 32B (~64 GB bf16) — larger than the trainable
-    # DiT's per-rank shard. Parking it and the two fp32 VAEs on CPU is what
-    # makes 8x80GB fit. Prompts are embedded once per rollout, so the transfer
+    # DiT's per-rank shard. Parking it on CPU is what makes 8x80GB fit. Prompts
+    # are embedded once per rollout (measured: 0.8s on CPU), so the transfer
     # cost is negligible against a 22k-row denoising loop.
     aux_components_on_cpu: true
+    # The VAEs stay on the train device. They are only ~10 GB fp32 together
+    # against a 7.75 GB/rank DiT shard, and decoding 124 frames of 768x768 on
+    # CPU takes MINUTES per sample — it would dominate a rollout that spends
+    # ~2 minutes denoising.
+    vae_components_on_cpu: false
     # 33B eager-loads ~66 GB per rank. Meta-init defers materialization until
     # after sharding; the bundle hands the fp32 pin list through so the
     # mixed-dtype layout survives `to_empty`.
