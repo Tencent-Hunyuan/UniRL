@@ -1,0 +1,365 @@
+"""MiniMax-H3 diffusion step + stage.
+
+Two things here are unlike every other diffusion package in this repo, and both
+are checkpoint contracts:
+
+**The velocity is data-ward.** MiniMax-H3's transformer predicts ``v`` such that
+``x0 = x_t + sigma * v``; diffusers -- and therefore UniRL's ``FlowSDEStrategy``
+-- assume ``x0 = x_t - sigma * v``. Writing H3's Euler update as its own
+reference does, ``x_next = r*x_t + (1-r)*x0`` with ``r = sigma_next/sigma``::
+
+    x_next = r*x_t + (1-r)*(x_t + sigma*v) = x_t + (sigma - sigma_next)*v
+           = x_t - dt*v                                  (dt = sigma_next - sigma)
+           = x_t + dt*(-v)
+
+which is exactly ``FlowSDEStrategy`` at ``eta=0``, whose ``prev_sample_mean``
+collapses to ``sample + noise_pred*dt``. So negating the transformer output ONCE,
+in ``predict_noise``, makes the entire existing SDE / log-prob / replay stack
+apply unchanged. Get the sign wrong and nothing crashes -- the policy just
+optimises in reverse.
+
+**The two modalities run different schedules.** Video uses ``shift=12``, audio
+``shift=3``. LTX-2.3, the only other joint audio+video RL model here, shares one
+grid between its streams; H3 does not, so the stage carries both and steps each
+on its own ``(sigma, sigma_next)``.
+"""
+
+from __future__ import annotations
+
+from contextlib import nullcontext
+from typing import ClassVar, List, Optional, Tuple
+
+import torch
+
+from unirl.config.require import require
+from unirl.models.types.replay_result import ReplayResult
+from unirl.sde.kernels import StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
+from unirl.sde.runtime import get_sigma_schedule
+from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
+from unirl.types.segments.latent import LatentSegment, make_video_segment
+from unirl.utils.dtypes import parse_torch_dtype
+
+from .bundle import MiniMaxH3Bundle
+from .conditions import MiniMaxH3Conditions
+from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
+
+
+def _combine_modality_logp(
+    video_logp: torch.Tensor,
+    audio_logp: torch.Tensor,
+    n_video: int,
+    n_audio: int,
+) -> torch.Tensor:
+    """Element-weighted mean of the per-step video/audio log-probs.
+
+    Both streams are stepped by the same stateless strategy and each returns a
+    per-sample log-prob already meaned over its own latent dims, so weighting by
+    element count reproduces the mean a single SDE over the concatenated
+    ``[video|audio]`` latent would produce. That the two sit at DIFFERENT noise
+    levels does not change this: they are independent Gaussians, and the joint
+    log-prob of independent factors is the sum -- the weighting just restores
+    the per-element scale the video-only path had. Mirrors LTX-2's
+    ``_combine_modality_logp``.
+    """
+    total = n_video + n_audio
+    return (video_logp * n_video + audio_logp * n_audio) / total
+
+
+class MiniMaxH3DiffusionStep:
+    """Per-step MiniMax-H3 denoising kernel -- stateless.
+
+    One transformer forward per step, covering every row of the packed sequence
+    at once and returning both modalities' velocities. There is no CFG batching
+    here on purpose: the checkpoint is guidance-distilled, so there is no
+    unconditional branch to run and ``guidance_scale`` has no meaning.
+    """
+
+    def __init__(self, bundle: MiniMaxH3Bundle) -> None:
+        self.bundle = bundle
+
+    def predict_noise(
+        self,
+        conditions: MiniMaxH3Conditions,
+        *,
+        video_sample: torch.Tensor,
+        audio_sample: torch.Tensor,
+        video_sigma: torch.Tensor,
+        audio_sigma: torch.Tensor,
+        layout,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One forward -> ``(video_velocity, audio_velocity)``, sign-corrected.
+
+        Latents stay ``[B=1, rows, C]`` throughout, which lands directly on the
+        transformer's batch dim -- no ``[None]`` / ``[0]`` reshaping.
+        """
+        unique_timesteps, timestep_indices = row_timestep_plan(layout, video_sigma=video_sigma, audio_sigma=audio_sigma)
+        device = video_sample.device
+        video_velocity, audio_velocity = self.bundle.transformer(
+            hidden_states=video_sample,
+            audio_hidden_states=audio_sample,
+            encoder_hidden_states=conditions.text.embeds,
+            timestep=unique_timesteps.to(device),
+            timestep_indices=timestep_indices.to(device),
+            token_tags=layout.token_tags.to(device),
+            position_ids=layout.position_ids.to(device),
+            video_indices=layout.video_indices.to(device),
+            audio_indices=layout.audio_indices.to(device),
+            text_indices=layout.text_indices.to(device),
+            return_dict=False,
+        )
+        # The one line that reconciles H3's data-ward velocity with the
+        # noise-ward convention every downstream SDE path assumes. See module
+        # docstring for the algebra.
+        return -video_velocity, -audio_velocity
+
+
+class MiniMaxH3DiffusionStage:
+    """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``.
+
+    Video latents live in ``LatentSegment.latents``; the co-denoised audio
+    stream lives in ``aux_latents``, the slot LTX-2 introduced for exactly this.
+    """
+
+    _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
+
+    def __init__(
+        self,
+        bundle: MiniMaxH3Bundle,
+        strategy: StepStrategy,
+        *,
+        audio_shift: float,
+        audio_joint_sde: bool = True,
+        autocast_precision: str = "bf16",
+        trajectory_precision: str = "fp16",
+        logprob_precision: str = "fp32",
+    ) -> None:
+        self.bundle = bundle
+        self.step = MiniMaxH3DiffusionStep(bundle)
+        self.strategy = strategy
+        self.audio_shift = float(audio_shift)
+        self.audio_joint_sde = bool(audio_joint_sde)
+        self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
+        self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
+        self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+
+    def trainable_module(self) -> torch.nn.Module:
+        return self.bundle.transformer
+
+    def audio_schedule(self, video_schedule: torch.Tensor) -> torch.Tensor:
+        """The audio sigma grid, derived from the video one.
+
+        MiniMax-H3's grids are both plain rectified flow -- ``linspace(1, 0, N)``
+        put through ``shift*t / (1 + (shift-1)*t)`` -- which is precisely
+        ``get_sigma_schedule``'s static branch. Deriving audio here rather than
+        pinning a second schedule onto the generation Part keeps
+        ``LatentSegment.sigmas`` and ``DiffusionSamplingParams`` untouched: the
+        audio grid is a pure function of ``(num_steps, audio_shift)``, so there
+        is nothing for a rollout engine to disagree with.
+        """
+        return get_sigma_schedule(
+            num_steps=int(video_schedule.shape[0]) - 1,
+            shift=self.audio_shift,
+            device=video_schedule.device,
+        ).to(dtype=video_schedule.dtype)
+
+    def _autocast(self):
+        if self.bundle.device.type != "cuda":
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+
+    def generate(
+        self,
+        conditions: MiniMaxH3Conditions,
+        *,
+        params: DiffusionSamplingParams,
+        sigmas: torch.Tensor,
+        geometry: MiniMaxH3Geometry,
+        initial_latents: torch.Tensor,
+        initial_audio_latents: torch.Tensor,
+        sde_indices: Optional[List[int]] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
+    ) -> LatentSegment:
+        """Run the joint video+audio denoising loop and build the segment."""
+        require(
+            conditions.batch_size == 1,
+            f"MiniMaxH3DiffusionStage: batch-1 only (got {conditions.batch_size}). The packed sequence carries "
+            f"unbatched per-row metadata, so callers chunk instead: set rollout.forward_batch_size=1 and "
+            f"stack.micro_batch_size=1. Mirrors the bagel navit recipe.",
+        )
+        num_text_tokens = int(conditions.text.embeds.shape[1])
+        layout = build_t2va_layout(geometry, num_text_tokens)
+        audio_sigmas = self.audio_schedule(sigmas)
+
+        num_steps = int(sigmas.shape[0]) - 1
+        require(
+            num_steps == int(params.num_inference_steps),
+            f"MiniMaxH3DiffusionStage: schedule holds {num_steps} transitions but params.num_inference_steps="
+            f"{params.num_inference_steps}. MiniMax-H3 counts the terminal sigma inside its step count; UniRL's "
+            f"get_sigma_schedule(n) returns n+1 grid points for n transitions. Pin one convention in the recipe.",
+        )
+
+        device = self.bundle.device
+        x = initial_latents.to(device=device, dtype=self.trajectory_dtype)
+        a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
+
+        sde_sorted = sorted(sde_indices) if sde_indices is not None else list(range(num_steps))
+        needed = set(compute_trajectory_positions(sde_sorted))
+        step_generators = make_denoise_step_generators(
+            keys=denoise_seed_keys, base_seed=denoise_base_seed, device=device
+        )
+
+        stored_pairs: List[Tuple[int, torch.Tensor]] = []
+        stored_audio: List[torch.Tensor] = []
+        sde_logp_list: List[torch.Tensor] = []
+        if 0 in needed:
+            stored_pairs.append((0, x.detach().clone()))
+            stored_audio.append(a.detach().clone())
+
+        audio_in_policy = self.audio_joint_sde
+        with self._autocast():
+            for step_idx in range(num_steps):
+                step_eta = float(params.eta) if step_idx in set(sde_sorted) else 0.0
+                video_pred, audio_pred = self.step.predict_noise(
+                    conditions,
+                    video_sample=x,
+                    audio_sample=a,
+                    video_sigma=sigmas[step_idx],
+                    audio_sigma=audio_sigmas[step_idx],
+                    layout=layout,
+                )
+
+                x_next, log_prob, _ = self.strategy.denoise(
+                    noise_pred=video_pred,
+                    sample=x,
+                    sigma=sigmas[step_idx],
+                    sigma_next=sigmas[step_idx + 1],
+                    eta=step_eta,
+                    generator=step_generators,
+                    step_index=step_idx,
+                )
+                # Audio steps its OWN grid -- the divergence from LTX-2.3.
+                audio_eta = step_eta if audio_in_policy else 0.0
+                a_next, audio_log_prob, _ = self.strategy.denoise(
+                    noise_pred=audio_pred,
+                    sample=a,
+                    sigma=audio_sigmas[step_idx],
+                    sigma_next=audio_sigmas[step_idx + 1],
+                    eta=audio_eta,
+                    step_index=step_idx,
+                )
+                x = x_next.to(dtype=self.trajectory_dtype)
+                a = a_next.to(dtype=self.trajectory_dtype)
+
+                if (step_idx + 1) in needed:
+                    stored_pairs.append((step_idx + 1, x.detach().clone()))
+                    stored_audio.append(a.detach().clone())
+                if log_prob is not None:
+                    if audio_in_policy and audio_log_prob is not None:
+                        log_prob = _combine_modality_logp(
+                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
+                        )
+                    sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
+
+        positions = [p for p, _ in stored_pairs]
+        return make_video_segment(
+            latents=torch.stack([t for _, t in stored_pairs], dim=1),
+            indices=torch.tensor(positions, dtype=torch.long, device=device),
+            sigmas=sigmas.detach().clone(),
+            sde_logp=torch.stack(sde_logp_list, dim=1) if sde_logp_list else None,
+            sde_indices=(torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None),
+            aux_latents=torch.stack(stored_audio, dim=1),
+            initial_latents=initial_latents.detach().clone(),
+        )
+
+    def replay(
+        self,
+        conditions: MiniMaxH3Conditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+        geometry: Optional[MiniMaxH3Geometry] = None,
+        step_indices: Optional[List[int]] = None,
+    ) -> ReplayResult:
+        """Recompute log-probs for the stored transitions (training path).
+
+        Same loop as :meth:`generate` with ``prev_sample`` supplied, so
+        ``strategy.denoise`` evaluates the stored transition instead of drawing
+        fresh noise. The audio state at each step is read back from
+        ``aux_latents``: the transformer sees both streams in one packed
+        sequence, so the video velocity depends on the audio state and replay
+        cannot reconstruct it from the video trajectory alone.
+        """
+        require(
+            segment.sde_indices is not None and segment.latents is not None and segment.sigmas is not None,
+            "MiniMaxH3DiffusionStage.replay: segment.sde_indices / latents / sigmas missing",
+        )
+        require(
+            segment.aux_latents is not None,
+            "MiniMaxH3DiffusionStage.replay: segment.aux_latents (audio trajectory) missing -- the packed forward "
+            "couples video to the per-step audio state, so replay needs it. Was the segment produced by generate()?",
+        )
+        require(geometry is not None, "MiniMaxH3DiffusionStage.replay: geometry is required to rebuild the row layout")
+
+        sigmas = segment.sigmas.to(self.bundle.device)
+        audio_sigmas = self.audio_schedule(sigmas)
+        num_text_tokens = int(conditions.text.embeds.shape[1])
+        layout = build_t2va_layout(geometry, num_text_tokens)
+
+        stored = [int(i) for i in segment.sde_indices.tolist()]
+        targets = [int(i) for i in (step_indices if step_indices is not None else stored)]
+
+        log_probs: List[torch.Tensor] = []
+        means: List[torch.Tensor] = []
+        with self._autocast():
+            for step_idx in targets:
+                x = segment.latents_at(step_idx).to(self.bundle.device)
+                a = segment.aux_latents_at(step_idx).to(self.bundle.device)
+                prev_x = segment.latents_at(step_idx + 1).to(self.bundle.device)
+                prev_a = segment.aux_latents_at(step_idx + 1).to(self.bundle.device)
+
+                video_pred, audio_pred = self.step.predict_noise(
+                    conditions,
+                    video_sample=x,
+                    audio_sample=a,
+                    video_sigma=sigmas[step_idx],
+                    audio_sigma=audio_sigmas[step_idx],
+                    layout=layout,
+                )
+                _, log_prob, mean = self.strategy.denoise(
+                    noise_pred=video_pred,
+                    sample=x,
+                    sigma=sigmas[step_idx],
+                    sigma_next=sigmas[step_idx + 1],
+                    eta=float(params.eta),
+                    prev_sample=prev_x,
+                    step_index=step_idx,
+                )
+                if self.audio_joint_sde:
+                    _, audio_log_prob, _ = self.strategy.denoise(
+                        noise_pred=audio_pred,
+                        sample=a,
+                        sigma=audio_sigmas[step_idx],
+                        sigma_next=audio_sigmas[step_idx + 1],
+                        eta=float(params.eta),
+                        prev_sample=prev_a,
+                        step_index=step_idx,
+                    )
+                    if audio_log_prob is not None:
+                        log_prob = _combine_modality_logp(
+                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
+                        )
+                log_probs.append(log_prob.to(dtype=self.logprob_dtype))
+                means.append(mean)
+
+        return ReplayResult(
+            log_probs=torch.stack(log_probs, dim=1),
+            prev_sample_means=torch.stack(means, dim=1) if means else None,
+        )
+
+
+__all__ = [
+    "MiniMaxH3DiffusionStage",
+    "MiniMaxH3DiffusionStep",
+]

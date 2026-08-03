@@ -13,7 +13,7 @@ weight load.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -159,17 +159,53 @@ def recover_rope_inv_freq(model: nn.Module) -> int:
     return n
 
 
-def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Module:
+def _pin_fp32(transformer: nn.Module, keep_in_fp32: Sequence[str]) -> int:
+    """Re-cast params/buffers whose name matches ``keep_in_fp32`` back to fp32.
+
+    Entries are matched as **substrings of the parameter name**, the convention
+    diffusers' own ``_keep_in_fp32_modules`` uses. On meta the re-cast is
+    metadata-only, so ``to_empty`` later allocates each tensor at its own dtype
+    and the sharded load lands a mixed-dtype module exactly as the checkpoint
+    stores it.
+    """
+    patterns = tuple(keep_in_fp32)
+    pinned = 0
+    for name, tensor in list(transformer.named_parameters()) + list(transformer.named_buffers()):
+        if tensor.dtype == torch.float32 or not tensor.dtype.is_floating_point:
+            continue
+        if any(pattern in name for pattern in patterns):
+            tensor.data = tensor.data.to(torch.float32)
+            pinned += 1
+    return pinned
+
+
+def finalize_meta_init(
+    transformer: nn.Module,
+    *,
+    dtype: torch.dtype,
+    keep_in_fp32: Optional[Sequence[str]] = None,
+) -> nn.Module:
     """Apply the shared post-build contract for a meta transformer.
 
     The dtype cast is metadata-only on meta parameters, so ``to_empty`` later
     allocates the requested master dtype directly. VeOmni calls
     ``init_weights`` after materialization; replace it with a no-op because the
     real checkpoint is loaded immediately afterwards.
+
+    ``keep_in_fp32`` is an **opt-in** escape from the single-dtype assumption,
+    for checkpoints that are genuinely mixed-precision (MiniMax-H3 keeps its
+    patch projections, timestep MLP and output heads in fp32 while the block
+    stack is bf16). ``None`` -- the default -- reproduces the historical
+    uniform cast exactly, so no existing bundle changes behaviour. Pass the
+    model's own ``_keep_in_fp32_modules`` explicitly; it is deliberately NOT
+    auto-detected, because several diffusers classes declare that attribute
+    while their UniRL bundles have always loaded (and trained) uniformly.
     """
     if not any(param.is_meta for param in transformer.parameters()):
         raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
     transformer = transformer.to(dtype)
+    if keep_in_fp32:
+        _pin_fp32(transformer, keep_in_fp32)
     transformer.init_weights = lambda: None
     return transformer
 
@@ -178,6 +214,7 @@ def build_meta_init_transformer(
     factory: Callable[[], nn.Module],
     *,
     dtype: torch.dtype,
+    keep_in_fp32: Optional[Sequence[str]] = None,
 ) -> Tuple[nn.Module, dict]:
     """Build ``factory()`` on meta, capturing init-computed non-persistent state.
 
@@ -196,7 +233,7 @@ def build_meta_init_transformer(
     with init_empty_weights(include_buffers=False):
         transformer = factory()
     captured = capture_init_state(transformer)
-    transformer = finalize_meta_init(transformer, dtype=dtype)
+    transformer = finalize_meta_init(transformer, dtype=dtype, keep_in_fp32=keep_in_fp32)
     return transformer, captured
 
 
