@@ -192,7 +192,9 @@ class WeightSync:
         discarded; re-sending after wake ensures rollout uses the adapted
         model. Fail-fast on failure: clears the activation flag and raises so
         the training loop crashes instead of shipping silent base-model
-        rollouts (the caller — the engine's ``wake_up`` — stays offloaded).
+        rollouts (the caller — the engine's ``wake_up`` — rolls the engine back
+        to offloaded, or latches its ``_wake_failed`` guard when even the
+        rollback fails, so ``generate`` refuses either way).
         """
         if not (self._lora_loaded and self._last_lora_tensors is not None):
             self._weights_released = False

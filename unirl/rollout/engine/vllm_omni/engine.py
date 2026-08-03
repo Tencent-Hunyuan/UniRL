@@ -68,6 +68,13 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        # Degraded-wake latch, separate from the physical offload flag: True iff
+        # the engine is physically awake but its last LoRA restore failed AND the
+        # rollback sleep failed too (double fault). ``generate`` refuses while
+        # set, so the engine can never silently serve base weights; ``wake_up``
+        # retries just the restore from this state, and a successful ``sleep``
+        # clears it (the engine is consistently offloaded again).
+        self._wake_failed = False
         logger.info(
             "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
             config,
@@ -114,9 +121,14 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
+        # Defense-in-depth for the wake-failure path: a failed LoRA re-push
+        # leaves the engine either offloaded (rollback slept it) or latched
+        # ``_wake_failed`` (rollback failed too), so this guard catches callers
+        # that swallowed the wake_up exception either way — the engine must
+        # never silently generate with base weights.
         require(
-            not self._is_offloaded,
-            "VLLMOmniRolloutEngine.generate: engine is offloaded (wake_up first).",
+            not self._is_offloaded and not self._wake_failed,
+            "VLLMOmniRolloutEngine.generate: engine is offloaded or its last wake failed (wake_up first).",
         )
         self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
@@ -145,30 +157,50 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
             return
         self._backend.sleep_task()
         self._is_offloaded = True
+        # A successful sleep also clears a degraded wake: the engine is
+        # consistently offloaded again and the next wake retries the restore.
+        self._wake_failed = False
         self._weight_sync.mark_weights_released()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
-        if not self._is_offloaded:
+        if self._is_offloaded:
+            # This body executes INSIDE each colocated train actor (BROADCAST).
+            # Return the actor's train-phase allocation peak to the driver before
+            # the engine subprocess re-maps its ~50 GiB weight pool: without
+            # activation checkpointing the peak stays reserved in the actor's
+            # caching allocator and the post-wake generate OOMs at a 2 MiB
+            # allocation (LIN-382 qwen e2e-c/d — a driver-side flush in
+            # trainer.train_step demonstrably does NOT reach this process).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self._backend.wake_task()
+            self._is_offloaded = False  # physical state changed before LoRA restore
+        elif not self._wake_failed:
             return
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        self._backend.wake_task()
-        self._is_offloaded = False  # physical state changed before LoRA restore
+        # else: degraded-wake retry — the engine is already physically awake but
+        # the last LoRA restore failed and the rollback sleep failed too; skip
+        # wake_task and retry just the restore.
         try:
             self._weight_sync.restore_lora_after_wake()
         except Exception:
-            # Roll back the physically awakened engine. If rollback itself
-            # fails, leave the flag false so the caller's cleanup sleep retries.
+            # Roll back the physically awakened engine. If rollback itself fails,
+            # latch ``_wake_failed`` (NOT ``_is_offloaded``): the physical flag
+            # stays truthful so the caller's cleanup sleep retries, while the
+            # latch keeps ``generate`` fail-fast — without it a swallowed wake
+            # exception would let the next generate silently serve base weights.
             try:
                 self._backend.sleep_task()
             except Exception:
+                self._wake_failed = True
                 logger.exception("vLLM-Omni rollback sleep failed after LoRA restore error")
             else:
                 self._is_offloaded = True
+                self._wake_failed = False
                 self._weight_sync.mark_weights_released()
             raise
+        self._wake_failed = False
 
     @property
     def is_offloaded(self) -> bool:
