@@ -32,6 +32,7 @@ from typing import ClassVar, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
@@ -66,7 +67,7 @@ def _combine_modality_logp(
     return (video_logp * n_video + audio_logp * n_audio) / total
 
 
-class MiniMaxH3DiffusionStep:
+class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]):
     """Per-step MiniMax-H3 denoising kernel -- stateless.
 
     One transformer forward per step, covering every row of the packed sequence
@@ -114,7 +115,7 @@ class MiniMaxH3DiffusionStep:
         return -video_velocity, -audio_velocity
 
 
-class MiniMaxH3DiffusionStage:
+class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
     """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``.
 
     Video latents live in ``LatentSegment.latents``; the co-denoised audio
@@ -303,7 +304,15 @@ class MiniMaxH3DiffusionStage:
             "MiniMaxH3DiffusionStage.replay: segment.aux_latents (audio trajectory) missing -- the packed forward "
             "couples video to the per-step audio state, so replay needs it. Was the segment produced by generate()?",
         )
-        require(geometry is not None, "MiniMaxH3DiffusionStage.replay: geometry is required to rebuild the row layout")
+        # The training path reaches replay through ``StageAlgorithm``, whose
+        # contract is ``replay(conditions, segment=, params=, step_indices=)`` --
+        # there is no geometry kwarg to pass. That is fine: geometry is a pure
+        # function of the SHARED (height, width, num_frames) on ``params``, the
+        # same values ``generate`` resolved from, so rebuilding it here yields
+        # the identical row layout. The explicit argument stays as an override
+        # for callers that already hold one.
+        if geometry is None:
+            geometry = MiniMaxH3Geometry.from_params(params)
 
         sigmas = segment.sigmas.to(self.bundle.device)
         audio_sigmas = self.audio_schedule(sigmas)

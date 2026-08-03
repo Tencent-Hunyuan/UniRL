@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Tuple
 
 from unirl.config.require import require
+from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.noise_recipe import NoiseRecipe
@@ -25,7 +26,7 @@ from .vae import (
 from .vendor import MINIMAX_H3_AUDIO_CHANNELS, patchify_video_latents
 
 
-class MiniMaxH3Pipeline:
+class MiniMaxH3Pipeline(Pipeline):
     """Text -> video+audio via one packed-sequence denoising loop."""
 
     def __init__(
@@ -38,6 +39,7 @@ class MiniMaxH3Pipeline:
         audio_decode: MiniMaxH3AudioDecodeStage,
         config: MiniMaxH3PipelineConfig,
     ) -> None:
+        super().__init__()
         self.bundle = bundle
         self.text_embed = text_embed
         self.diffusion = diffusion
