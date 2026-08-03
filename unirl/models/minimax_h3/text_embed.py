@@ -30,6 +30,12 @@ class MiniMaxH3TextEmbedStage:
     * The call goes to ``text_encoder.model``, the decoder submodule, not to
       ``text_encoder``. H3 never uses the language-model head, and skipping it
       avoids a vocabulary-wide projection over every token.
+
+    ``text_encoder`` is 32B and the recipe parks it on CPU
+    (``aux_components_on_cpu``), so every input tensor is built on the
+    ENCODER's device and only the resulting hidden state moves to the train
+    device. Building inputs on ``bundle.device`` instead would hand CUDA ids to
+    a CPU module.
     """
 
     def __init__(self, bundle: "MiniMaxH3Bundle") -> None:
@@ -39,6 +45,22 @@ class MiniMaxH3TextEmbedStage:
         self.hidden_layer = bundle.text_encoder_hidden_layer
         self.dtype = bundle.dtype
         self.device = bundle.device
+
+    @property
+    def _encoder_device(self) -> torch.device:
+        return next(self.text_encoder.parameters()).device
+
+    @property
+    def _decoder(self):
+        """The decoder stack that owns ``.layers``.
+
+        transformers 5.x nests Qwen3-VL as ``model.{visual,language_model}``,
+        so the text layers are at ``model.language_model.layers``; older layouts
+        put them directly on ``model``. Resolve rather than assume -- the
+        attribute is only used to bound-check ``hidden_layer``.
+        """
+        model = self.text_encoder.model
+        return getattr(model, "language_model", model)
 
     @torch.no_grad()
     def embed(self, texts: Texts) -> TextEmbedCondition:
@@ -52,23 +74,24 @@ class MiniMaxH3TextEmbedStage:
         prompts: List[str] = list(texts.to_list()) if hasattr(texts, "to_list") else list(texts)
         require(len(prompts) > 0, "MiniMaxH3TextEmbedStage: no prompts to embed")
 
-        num_layers = len(self.text_encoder.model.layers)
+        num_layers = len(self._decoder.layers)
         require(
-            num_layers > MINIMAX_H3_TEXT_ENCODER_LAYER,
+            num_layers >= MINIMAX_H3_TEXT_ENCODER_LAYER,
             f"MiniMaxH3TextEmbedStage: MiniMax-H3 conditions on hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}] of "
-            f"its Qwen3-VL conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
+            f"its Qwen3-VL conditioner, which needs at least {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
             f"the loaded conditioner has {num_layers}.",
         )
 
+        encoder_device = self._encoder_device
         embeds = []
         for prompt in prompts:
             token_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+            input_ids = torch.tensor([token_ids], dtype=torch.long, device=encoder_device)
             # Qwen3-VL lays its 3D rotary positions out per modality run, read
             # off the token type ids the processor derives (0 text, 1 image,
             # 2 video). Text-only here, but the conditioner still wants them.
             mm_token_type_ids = torch.tensor(
-                self.processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=self.device
+                self.processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=encoder_device
             )
             outputs = self.text_encoder.model(
                 input_ids=input_ids,
