@@ -129,8 +129,11 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
     ``prepare_inputs_for_generation``. For think_recaption mode different
     prompts produce different AR output lengths → different ``L`` per
     capture; right-pad shorter sequences to ``max_L`` (pad 0 for input_ids,
-    False for masks, 0.0 for rope_cache) so the dim-0 concat works. t2i
-    scope: the it2i ``cond_*`` fields stay unpopulated.
+    False for masks) so the dim-0 concat works. t2i scope: the it2i
+    ``cond_*`` fields stay unpopulated. ``rope_cache`` is deliberately NOT
+    shipped: the engine's rope tables use vllm-omni's own layout and are not
+    compatible with the HF-side replay forward — replay rebuilds rope
+    natively from ``gen_image_mask`` (see ``models/hunyuan_image3/diffusion.py``).
     """
     captures = [(getattr(d, "custom_output", None) or {}).get("fused_mm_capture") for d in diff_outputs]
     if any(c is None for c in captures):
@@ -183,14 +186,6 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
                     "position_ids": _pad_to(c.get("position_ids"), max_L, dim=-1, value=0),
                     "gen_image_mask": _pad_to(c.get("gen_image_mask"), max_L, dim=-1, value=False),
                     "gen_timestep_scatter_index": c.get("gen_timestep_scatter_index"),
-                    "rope_cache": (
-                        (
-                            _pad_to(c["rope_cache"][0], max_L, dim=-2, value=0.0),
-                            _pad_to(c["rope_cache"][1], max_L, dim=-2, value=0.0),
-                        )
-                        if c.get("rope_cache") is not None and isinstance(c["rope_cache"], tuple)
-                        else c.get("rope_cache")
-                    ),
                 }
             )
 
@@ -201,15 +196,9 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
         "gen_image_mask": torch.cat([c["gen_image_mask"] for c in padded_captures], dim=0),
         "gen_timestep_scatter_index": torch.cat([c["gen_timestep_scatter_index"] for c in padded_captures], dim=0),
     }
-    cos_parts = [c["rope_cache"][0] for c in padded_captures]
-    sin_parts = [c["rope_cache"][1] for c in padded_captures]
-    fused_dict["rope_cache"] = (
-        torch.cat(cos_parts, dim=0),
-        torch.cat(sin_parts, dim=0),
-    )
-
     # ``from_dict`` skips optional fields when absent; cond_* fields stay
-    # ``None`` for t2i (out of scope for the it2i extension).
+    # ``None`` for t2i (out of scope for the it2i extension) and rope_cache is
+    # never shipped on this path (engine-internal layout — see docstring).
     return {"fused": HunyuanImage3FusedMultimodalCondition.from_dict(fused_dict)}
 
 
@@ -377,7 +366,40 @@ class Hi3InputAdapter:
         return sampling
 
     def build(self, sample: Sample) -> List[GenerateCall]:
-        return [GenerateCall(prompts=self.build_prompts(sample), sampling=self.build_sampling(sample))]
+        prompts = self.build_prompts(sample)
+        ar_part, diff_part = self._stage_parts(sample)
+        if "dit" not in self.stages or diff_part is None:
+            return [GenerateCall(prompts=prompts, sampling=self.build_sampling(sample))]
+
+        diff_params = diff_part.sampling_params
+        explicit_keys = list(diff_part.init_noise_group_ids or [])
+        share = bool(getattr(diff_params, "init_same_noise", False))
+        recipe_keys = explicit_keys or (diff_part.group_ids if share else list(diff_part.sample_ids))
+        if bool(getattr(diff_params, "disable_driver_xt", False)):
+            recipe_keys = []
+        if not recipe_keys:
+            return [GenerateCall(prompts=prompts, sampling=self.build_sampling(sample))]
+        if len(recipe_keys) != len(prompts):
+            raise ValueError(
+                f"{self.modality}: x_T recipe key count {len(recipe_keys)} != prompt count {len(prompts)}."
+            )
+
+        # vLLM-Omni executes every prompt as a B=1 DiT request while one
+        # StageSampling object is otherwise shared across all prompts. Slice the
+        # generation Part so each request receives only its own x_T key.
+        calls: List[GenerateCall] = []
+        for index, prompt in enumerate(prompts):
+            one = diff_part.slice(index, index + 1)
+            calls.append(
+                GenerateCall(
+                    prompts=[prompt],
+                    sampling=[
+                        self._ar_sampling(ar_part.sampling_params),
+                        self._dit_sampling(one, one.sampling_params),
+                    ],
+                )
+            )
+        return calls
 
     def _decorate(self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any) -> None:
         """The per-entry extras, derived from the constructor flags."""
@@ -432,9 +454,10 @@ class Hi3InputAdapter:
         # per-sample id) + seed; NO shape — the pipeline's prepare_latents hook
         # fills the AR-resolved shape and regenerates the byte-identical x_T via
         # NoiseRecipe.for_batch.
+        explicit_keys = list(gen_part.init_noise_group_ids or [])
         share = bool(getattr(diff_params, "init_same_noise", False))
-        keys = gen_part.group_ids if share else list(gen_part.sample_ids)
-        if keys:
+        keys = explicit_keys or (gen_part.group_ids if share else list(gen_part.sample_ids))
+        if keys and not bool(getattr(diff_params, "disable_driver_xt", False)):
             extra_args["init_noise_group_ids"] = [str(g) for g in keys]
             extra_args["init_noise_seed"] = int(seed) if seed is not None else 0
 

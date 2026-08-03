@@ -136,7 +136,8 @@ class SD3Pipeline(Pipeline):
     ) -> SD3Conditions:
         """Encode prompts (+ optional CFG negatives) into ``SD3Conditions``.
 
-        Shared by :meth:`generate` and the ReFL draft path (``draft_generate``).
+        Shared by :meth:`generate` and grad-sampling adaptations (e.g. the
+        experimental ReFL pipeline).
         Applies SD3's empty-negative default (diffusers parity) when CFG is on and
         no negative was supplied — see the rationale quoted in :meth:`generate`.
         """

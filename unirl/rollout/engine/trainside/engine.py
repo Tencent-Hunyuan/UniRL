@@ -18,14 +18,14 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.types.ar import ARStage
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
-from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
+from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.sample import Part, Sample
 
 Stage = Union[DiffusionStage, ARStage]
 
 
-class TrainsideRolloutEngine(BaseSingleTurnRolloutEngine):
+class TrainsideRolloutEngine(SyncRolloutEngine):
     """In-process rollout engine: the train actor's Pipeline IS the sampler.
 
     Args:

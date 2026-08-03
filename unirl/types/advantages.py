@@ -71,6 +71,34 @@ def compute_gae_advantages(
     return advantages, returns
 
 
+def scatter_terminal_rewards(
+    rewards_per_sample: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter each trajectory reward onto its final packed response token."""
+    if rewards_per_sample.ndim != 1:
+        raise ValueError(f"scatter_terminal_rewards: expected 1D rewards, got shape {tuple(rewards_per_sample.shape)}")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() == 0:
+        raise ValueError("scatter_terminal_rewards: cu_seqlens must be a non-empty 1D tensor")
+    batch_size = int(cu_seqlens.numel()) - 1
+    if int(rewards_per_sample.numel()) != batch_size:
+        raise ValueError(
+            f"scatter_terminal_rewards: rewards batch ({int(rewards_per_sample.numel())}) "
+            f"!= packed batch ({batch_size})"
+        )
+
+    cu = [int(offset) for offset in cu_seqlens.tolist()]
+    if cu[0] != 0 or any(end < start for start, end in zip(cu, cu[1:])):
+        raise ValueError(f"scatter_terminal_rewards: invalid cumulative offsets {cu}")
+
+    token_rewards = rewards_per_sample.new_zeros(cu[-1])
+    for reward, start, end in zip(rewards_per_sample, cu, cu[1:]):
+        if end > start:
+            token_rewards[end - 1] = reward
+    return token_rewards
+
+
 def _gae_1d(
     rewards: torch.Tensor,
     values: torch.Tensor,

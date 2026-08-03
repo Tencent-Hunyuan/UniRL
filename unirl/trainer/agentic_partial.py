@@ -16,8 +16,9 @@ barrier is *how the rollout completes*:
 Motivation (LIN-531 ALFWorld comparison): the fully-async trainer *lost* on ALFWorld because
 disaggregation halves the generation GPUs; colocate+partial keeps all GPUs for generation while
 still cutting the straggler tail — the slime "over-sample + abort + recycle" / verl `bypass_mode`
-pattern. The engine interface (`submit`/`poll`/`finalize_if_drained`/`abort`) and `_GroupAssembler`/
-`_GroupBuffer` are reused verbatim; only the colocate wake/sync/sleep choreography is new.
+pattern. The driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine`
+(submit/poll/finalize_if_drained/quiesce + group assembly and versioned buffering) is shared with
+``AsyncAgenticTrainer``; only the colocate wake/sync/sleep choreography is new.
 
 Correctness: `TensorWeightSync.sync` writes the live SRT weight pool, so it must run **awake +
 decode-idle** — sync sits at the top (post-`wake_up`, pre-`submit`, barrier parity) and `abort`
@@ -34,8 +35,8 @@ import time
 from collections import Counter
 from typing import Dict, List, Literal, Optional
 
+from unirl.rollout.engine.asynchronous import AsyncAgenticRolloutEngine, root_of
 from unirl.trainer.agentic import AgenticTrainer
-from unirl.trainer.agentic_async import _GroupAssembler, _GroupBuffer
 from unirl.trainer.agentic_env import _EnvRewardSource
 from unirl.types.sample import Part, Sample
 
@@ -75,7 +76,6 @@ class AgenticPartialTrainer(AgenticTrainer):
         self._tail_policy = str(tail_policy)
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
-        self._weight_version = 0
         # Refills happen under the same optimizer ``rollout_id``. Keep a
         # per-drive nonce so data sources whose ids restart on every draw cannot
         # mix unrelated siblings in the root-keyed group assembler.
@@ -105,19 +105,6 @@ class AgenticPartialTrainer(AgenticTrainer):
         tasks.extend(carried)
         return tasks
 
-    def _ingest_completed(self, completed: List[Sample]) -> int:
-        """Ingest terminal trajectories and promote newly complete groups."""
-        if completed:
-            self._assembler.add_completed(completed)
-            for group in self._assembler.pop_complete_groups():
-                self._buffer.put(group, weight_version=self._weight_version, gen_id=self._gen_id)
-                self._gen_id += 1
-        return len(completed)
-
-    def _pump(self) -> int:
-        """Poll completed trajectories → assembler → promote complete groups into the buffer."""
-        return self._ingest_completed(self.rollout.poll()[0])
-
     def _reconstruct_request(self, trajs: List[Sample]) -> Sample:
         """A request whose root Part carries every trajectory's root id + ground-truth answer,
         so the inherited answer-grader (`_rewards_and_groups`) works unchanged. The env-reward
@@ -134,10 +121,10 @@ class AgenticPartialTrainer(AgenticTrainer):
             self._carried = carried
             return
 
-        roots = {self._assembler.root_of(sample) for sample in carried}
+        roots = {root_of(sample) for sample in carried}
         self._last_dropped_trajectories = len(carried)
         self._last_dropped_roots = len(roots)
-        self._last_discarded_completed_trajectories = self._assembler.discard_roots(roots)
+        self._last_discarded_completed_trajectories = self._engine.discard_roots(roots)
         for root in roots:
             self._gt_by_root.pop(root, None)
         self._carried = []
@@ -151,14 +138,10 @@ class AgenticPartialTrainer(AgenticTrainer):
 
     def _drain_buffer(self, n: int, *, max_staleness: int) -> Optional[List[List[Sample]]]:
         """Drain fresh groups and forget ground truth for stale evictions."""
-        picked = self._buffer.drain_freshest(
-            n,
-            current_version=self._weight_version,
-            max_staleness=max_staleness,
-        )
-        for group in self._buffer.pop_evicted_groups():
+        picked = self._engine.drain_freshest(n, max_staleness=max_staleness)
+        for group in self._engine.pop_evicted():
             if group:
-                self._gt_by_root.pop(self._assembler.root_of(group[0]), None)
+                self._gt_by_root.pop(root_of(group[0]), None)
         return picked
 
     def _collect_until(self, batch_size: int, rollout_id: int, stale: int) -> List[List[Sample]]:
@@ -167,18 +150,15 @@ class AgenticPartialTrainer(AgenticTrainer):
         buffer (small over-sample / failures / eviction), refill with a fresh drive."""
         refills = 0
         while True:
-            self._pump()
+            self._engine.poll()
             picked = self._drain_buffer(batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
-            completed = self.rollout.finalize_if_drained()[0]
-            if completed is None:
+            # finalize_if_drained joins + ingests the drive's final completions
+            # atomically, before submit() can reset the worker buffers for a refill.
+            if self._engine.finalize_if_drained() is None:
                 time.sleep(self._POLL_INTERVAL_S)  # in-flight drive still generating; back off
                 continue
-
-            # Join and drain the worker buffers atomically before submit() can
-            # reset them for a refill.
-            self._ingest_completed(completed)
             picked = self._drain_buffer(batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
@@ -187,10 +167,10 @@ class AgenticPartialTrainer(AgenticTrainer):
             if refills > self._MAX_REFILLS:
                 raise RuntimeError(
                     f"colocate-partial rollout {rollout_id}: buffer underflow after {refills} refills "
-                    f"(buffer={self._buffer.size()} < batch={batch_size}); raise oversample_batch_size "
+                    f"(buffer={self._engine.buffered_groups()} < batch={batch_size}); raise oversample_batch_size "
                     f"or buffer_max_staleness."
                 )
-            self.rollout.submit(self._build_tasks([], rollout_id))  # fresh refill (carried already in flight)
+            self._engine.submit(self._build_tasks([], rollout_id))  # fresh refill (carried already in flight)
 
     # ------------------------------------------------------------------
     # One colocate partial drive: wake → sync → submit → collect-N → abort → sleep
@@ -202,13 +182,13 @@ class AgenticPartialTrainer(AgenticTrainer):
         # SRT weight pool, which a full sleep() would release.
         if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
-            self._weight_version += 1
+            self._engine.bump_weight_version()
         tasks = self._build_tasks(self._carried, rollout_id)  # fresh + carried
         self._carried = []  # consumed into this drive
-        self.rollout.submit(tasks)
+        self._engine.submit(tasks)
         groups = self._collect_until(self.batch_size, rollout_id, stale)
-        carried = self.rollout.abort()[0]  # checkpoint the in-flight tail (turn boundary) → decode-idle, still awake
-        self._pump()  # grab trajectories that completed DURING the quiesce (before next submit resets buffers)
+        # Turn-boundary checkpoint + final poll for quiesce-time completions → decode-idle, still awake.
+        carried = self._engine.quiesce()
         self.rollout.sleep()  # engine quiesced → safe to offload → frees GPU for the train step
         # Diagnostic (LIN-531): the tail we cut — its turn depths show whether the commit-N actually
         # skipped stragglers (wide tail depth) or just wasted uniform-depth over-sample.
@@ -259,10 +239,8 @@ class AgenticPartialTrainer(AgenticTrainer):
             },
         )
 
-        self._buffer = _GroupBuffer()
-        self._assembler = _GroupAssembler(self._n)
+        self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
         self._carried = []
-        self._gen_id = start_rollout
 
         try:
             if self.eval_interval > 0:
@@ -277,7 +255,7 @@ class AgenticPartialTrainer(AgenticTrainer):
                 groups = self._drive_partial(rollout_id, sync_weights, stale)
                 trajs: List[Sample] = [t for group in groups for t in group]
                 rewards, group_ids = self._rewards_and_groups(self._reconstruct_request(trajs), trajs, rollout_id)
-                for root in {self._assembler.root_of(traj) for traj in trajs}:
+                for root in {root_of(traj) for traj in trajs}:
                     self._gt_by_root.pop(root, None)
                 result, mean_reward = self._advantage_train_and_log(
                     trajs,
@@ -292,9 +270,9 @@ class AgenticPartialTrainer(AgenticTrainer):
                         "partial/dropped_trajectories": self._last_dropped_trajectories,
                         "partial/dropped_roots": self._last_dropped_roots,
                         "partial/discarded_completed_trajectories": self._last_discarded_completed_trajectories,
-                        "partial/assembler_pending_roots": self._assembler.size(),
-                        "partial/buffer_groups": self._buffer.size(),
-                        "partial/weight_version": self._weight_version,
+                        "partial/assembler_pending_roots": self._engine.pending_groups(),
+                        "partial/buffer_groups": self._engine.buffered_groups(),
+                        "partial/weight_version": self._engine.weight_version,
                     },
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
@@ -307,8 +285,7 @@ class AgenticPartialTrainer(AgenticTrainer):
         finally:
             active_error = sys.exc_info()[0] is not None
             try:
-                carried = self.rollout.abort()[0]  # stop any drive left running
-                self._pump()
+                carried = self._engine.quiesce()  # stop any drive left running
                 self._apply_tail_policy(carried, num_rollouts)
             except BaseException:  # noqa: BLE001 — preserve an active training failure
                 if active_error:

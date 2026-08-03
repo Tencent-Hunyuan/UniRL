@@ -312,11 +312,6 @@ class Worker:
             # Cross-RPC autograd can only propagate gradients back to controller-side
             # TensorRef inputs recorded by Handle as input_metas.
             tensors = [fetched[str(i)] for i in range(len(in_metas))]
-            if len(tensors) != len(in_metas):
-                raise RuntimeError(
-                    f"Worker.call grad input mismatch for {method_name} call_id={call_id}: "
-                    f"saved {len(tensors)} tensors for {len(in_metas)} TensorRef inputs"
-                )
             for t in tensors:
                 t.requires_grad_(True)
                 t.retain_grad()

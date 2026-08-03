@@ -288,12 +288,25 @@ class BagelPipeline(Pipeline):
         inf = self.bundle.inferencer
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx():
-            if image is not None:
-                gen = self._update_context_image(self._resize_input_image(image), gen, vae=True, vit=True)
-            cfg_text = deepcopy(gen)  # snapshot before the prompt text → drop-text branch
-            gen = inf.update_context_text(prompt, gen)
-            cfg_img = inf.update_context_text(prompt, cfg_img)
+        # eval() is load-bearing (same contract as ``BagelDiffusionStage._build_contexts_from_prompt``
+        # and ``rl_ops.forward_flow``): navit dispatches ``forward_train`` vs ``forward_inference``
+        # on ``self.training`` and these prefills use the packed-query inference signature — in
+        # train() they TypeError. SFT/trainside callers can reach here mid-training, so guard
+        # and restore rather than assume the mode. The transformer handle is sufficient: vae and
+        # vit_model stay in their load-time eval() (bundle.py) — training mode-flips only the
+        # ``transformer`` trainable module, and siglip has no signature dispatch anyway.
+        mot = self.bundle.transformer
+        was_training = mot.training
+        mot.eval()
+        try:
+            with torch.no_grad(), self._autocast_ctx():
+                if image is not None:
+                    gen = self._update_context_image(self._resize_input_image(image), gen, vae=True, vit=True)
+                cfg_text = deepcopy(gen)  # snapshot before the prompt text → drop-text branch
+                gen = inf.update_context_text(prompt, gen)
+                cfg_img = inf.update_context_text(prompt, cfg_img)
+        finally:
+            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
     def _t2i_cache_enabled(self) -> bool:

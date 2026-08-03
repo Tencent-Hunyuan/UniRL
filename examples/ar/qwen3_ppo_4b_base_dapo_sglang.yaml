@@ -1,0 +1,156 @@
+# @package _global_
+# PPO + GAE on Qwen3-4B-Base / DAPO-Math with colocated SGLang rollout.
+#
+# Prepare data:
+#   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+#
+# Run:
+#   DATA_PATH=data/dapo_math/train.jsonl \
+#   EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen3_ppo_4b_base_dapo_sglang
+
+num_devices: 32
+batch_size: 64
+num_rollouts: 800
+weight_sync_interval: 1
+eval_interval: 10
+
+# PPO prepares per-token GAE on each train worker after the micro-batched
+# pre-update critic replay. The driver must not replace it with GRPO scores.
+advantage_mode: gae
+balance_shards: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-ppo
+  run_name: ppo_qwen3-4b-base_dapo_sglang
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [ppo, gae, qwen3, 4b-base, dapo, sglang, v2]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    model_precision: fp32
+    use_gradient_checkpointing: true
+    use_value_head: true
+    attn_implementation: flex_attention
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    samples_pre_expanded: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      rl_on_policy_target: fsdp
+      mem_fraction_static: 0.3
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.ppo.PPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: null
+  clip_schedule: constant
+  cliprange_value: 0.2
+  vf_coef: 0.5
+  gae_gamma: 1.0
+  gae_lambda: 0.95
+  loss_agg_mode: seq-mean-token-mean
+  horizon: 8192
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+  # The rollout model has no critic; never send train-only value-head tensors.
+  name_remap: {"value_head.*": null}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 64
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

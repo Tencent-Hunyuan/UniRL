@@ -1,0 +1,229 @@
+# @package _global_
+# HunyuanImage3 image-EDIT (it2i) GRPO — TRAINSIDE (single-engine) + remote EditReward.
+#
+# Text + source image -> edited image, scored remotely by the model-agnostic
+# EditReward service (RemoteRewardBackend builds the [source, edited] pair from the
+# request's input image — no model code on the reward side).
+#
+# WHY TRAINSIDE (not the 2-engine vLLM-Omni path): hi3 it2i needs only a SINGLE
+# diffusion stage — the source-image conditioning (VAE latents + ViT features) is
+# encoded inside the DiT forward (modes/it2i.py: "Single diffusion stage with
+# cond-image scatter"); the AR stage in the vllm-omni it2i config only produces an
+# OPTIONAL CoT/recaption text, NOT a required prefill. So we run trainside in-process:
+#   - ONE model on all GPUs (FSDP); rollout REUSES the trained model directly.
+#   - Rollout captures its per-step log-probs; training recomputes pi_new via replay.
+#     With old_logp_source=rollout (native) pi_old IS the rollout log-prob, so the
+#     first-update importance ratio is 1 *iff sampling and replay run the same
+#     forward*. Two things make them diverge for hi3, both handled here:
+#       (a) CFG asymmetry — guided sampling (guidance_scale>1 -> fused cond+uncond
+#           N=2) vs unguided replay (N=1). Fixed by training at guidance_scale=1.0
+#           (train cfg=1; eval/deploy with cfg>1 — the flow_grpo cfg=1 paradigm).
+#       (b) KV-cached sampling decode vs replay full-prefill. Set
+#           bundle.config.diffuse_kv_cache=false (as this recipe does) so
+#           sampling ALSO full-prefills every step.
+#     Together => native ratio=1.0000 (velocity bit-identical). Update-2+ ratio!=1 =
+#     real gradient signal. (old_logp_source=replay also works — ratio=1 by
+#     construction on update-1 — but adds an extra pi_old replay forward per update.)
+#
+#   GUIDED TRAINING (guidance_scale>1): supported and on-policy, but NOT bit-exact.
+#   The rollout samples the guided velocity from a [cond; uncond] (N=2B) fused batch;
+#   a naive replay recomputes UNGUIDED (N=1B) -> ratio drifts to ~0.998. modes/it2i.py
+#   stores the fused cond-only (``fused``) plus its uncond branch (``fused_uncond``) —
+#   both B-batched so they survive the B-sample track transport — and
+#   HunyuanImage3DiffusionStage re-stacks [cond; uncond] so predict_noise runs cfg=True
+#   for BOTH sampling and replay. That recovers the guided ratio to ~0.9999 (clip=0),
+#   but a ~1e-4 residual remains: verified with byte-identical replay inputs (same
+#   tokens/cond/L), it is the N=2 guided forward's own bf16 non-reproducibility
+#   AMPLIFIED ~guidance_scale x by the cfg combine v_uncond + s*(v_cond - v_uncond).
+#   cfg=1 (N=1) is bit-exact (ratio=1.0000) — the recommended on-policy mode, per
+#   flow_grpo #198. Use guidance_scale>1 only if guided-sample training is worth the
+#   small non-exact (but non-clipping) ratio.
+#
+# Deploy (EditReward OFF the training GPUs — see PODS_AND_ENV 8+1 split):
+#   reward node: standalone MiMo EditReward HTTP server on :8080.
+#   train node:  export REWARD_SERVICE_URL=http://<reward_node_ip>:8080
+#                export PRETRAINED_MODEL=... EDIT_DATA_PATH=... EDIT_EVAL_DATA_PATH=...
+#                PYTHONPATH=$PWD python -m unirl.train_diffusion --config-name unified_model/hi3_it2i
+#
+# Smoke (8 GPUs): keep batch_size=8; override num_rollouts=2 logging.report_to_wandb=false.
+# Compose check (CPU): python -m unirl.train_diffusion --config-name unified_model/hi3_it2i --cfg job --resolve
+
+num_devices: 8
+batch_size: 8                  # prompts/rollout. The first TRAINSIDE DP_SCATTER splits prompts
+                               # before group expansion, so batch_size itself MUST be divisible by
+                               # num_devices. 8x2=16 -> 2 images/GPU.
+adv_use_global_std: false      # per-group GRPO normalization
+num_rollouts: 10000            # intentionally large; stop manually
+
+# Periodic eval is DISABLED: not yet validated for it2i (the eval path must
+# carry the source-image condition end-to-end). The old blocker — the trainer
+# replacing the BAGEL-only ``cfg_text_scale`` sampling field (TypeError on hi3)
+# — was fixed by #202 (field-checked, falls back to ``guidance_scale``), so
+# this can be enabled once an it2i eval run is validated.
+eval_interval: 0
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# Pin the it2i edit task: every sample MUST carry a source image (dataset media
+# role: condition). HunyuanImage3Pipeline.generate routes task=it2i -> modes/it2i.
+task_config:
+  task: it2i
+  bot_task: image              # direct edit, no CoT (template flag for embed_for_gen_image)
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,hi3-editreward}
+  run_name: hi3_editreward_it2i_lora
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [hi3, it2i, edit, editreward, lora, trainside]
+  log_media: true              # source|edited side-by-side preview
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  # 80B meta-init (no per-rank full load): FSDPBackend wraps the meta decoder + DCP-loads
+  # each rank's shard. from_config (the .to(device) path) would OOM one GPU.
+  _target_: unirl.models.hunyuan_image3.bundle.HunyuanImage3Bundle.from_meta_config
+  config:
+    _target_: unirl.models.hunyuan_image3.config.HunyuanImage3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    model_precision: bf16
+    vae_dtype: fp32              # VAE runs in fp32 (bf16 unsupported by the 3D-VAE convs). it2i's
+                                 # source-image encode feeds an fp32 image; bf16 VAE would mismatch.
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact (ratio=1); do NOT lower
+    logprob_precision: fp32
+    shift: 3.0
+    guidance_scale: 1.0          # TRAIN cfg=1 (see header (a)): sampling & replay both unguided.
+                                 # Eval/deploy with cfg>1 for edit-instruction adherence.
+    diffuse_kv_cache: false      # Full-prefill sampling (see header (b)): bit-match replay for
+                                 # the exact native ratio=1. REQUIRED with old_logp_source=rollout.
+
+pipeline:
+  # Trainside pipeline (the SAME module the FSDPBackend trains -> rollout reuses it).
+  _target_: unirl.models.hunyuan_image3.pipeline.HunyuanImage3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["HunyuanImage3DecoderLayer"]   # verified in the 2x8 H20 smoke
+  trainable_attr: transformer
+  # it2i trainside encodes the SOURCE image in-process: the VAE (cond_vae latents)
+  # and ViT (cond_vit features) must be MATERIALIZED off meta (with_aux), which also
+  # applies vae_dtype=fp32 so the VAE Conv3d matches the fp32 source image.
+  with_aux: [vae, vit]
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32                # fp32 LoRA master + Adam (reward-collapse guard)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true    # 80B + multi-step replay: required
+    use_torch_compile: false
+    root_wrap: false                  # frozen mixed-dtype VAE/ViT siblings live under the trainable attr
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - qkv_proj
+      - o_proj
+
+# TRAINSIDE direct-sampling rollout: reuses the trained pipeline in-process (no
+# separate engine, no weight sync). forward_batch_size=1 = one sample per generate call.
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+# Remote EditReward (own GPU/node). Model-agnostic: RemoteRewardBackend builds the
+# [source, edited] pair from the request's input image.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: mean
+      aggregation_method: weighted_sum
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # native (rollout) pi_old: reuse the rollout log-prob (no extra replay forward).
+  # Exact ratio=1 on update-1 requires the cfg=1 + diffuse_kv_cache=false discipline
+  # above; switch to `replay` for the ratio-1-by-construction (extra-forward) variant.
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2         # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # Editing instruction + SOURCE image (role: condition).
+      # NOTE: source images should share ONE resolution/aspect — cond_vit's
+      # ``spatial_shapes`` is a SHARED field, so a dp>1 track merge keeps
+      # replica-0's per-sample list; heterogeneous ViT grids would silently
+      # cross-feed at replay (the per-sample-tensors follow-up removes this).
+      data_path: ${oc.env:EDIT_DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EDIT_EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  samples_per_prompt: 2          # GRPO group size. Pinned at 2: samples_per_prompt>2 trips a
+                                 # cond_vit list-merge (spatial_shapes/attn_mask are Python lists)
+                                 # in the DP merge — see the PR's "future work" note.
+  num_inference_steps: 8
+  guidance_scale: 1.0            # TRAIN cfg=1 (matches bundle.config.guidance_scale)
+  height: 1024
+  width: 1024
+  eta: 1.0                       # SDE exploration
+  seed: 42                       # base_seed of the driver-authored x_T recipe: x_T is deterministic
+                                 # per (seed, rollout_id, sample_id). seed=null -> engine RNG.
+  init_same_noise: false         # per-sample x_T -> diverse GRPO groups
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

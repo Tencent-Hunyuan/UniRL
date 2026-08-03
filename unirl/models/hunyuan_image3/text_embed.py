@@ -107,6 +107,13 @@ class HunyuanImage3TextEmbedStage:
         # object. Newer (Instruct) snapshots expose the wrapper as
         # ``_tokenizer``; older ones auto-populate ``_tkwrapper``.
         if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
+            # ``load_tokenizer`` reads ``self.config.model_version`` and forwards it
+            # to ``HunyuanImage3TokenizerFast.from_pretrained``. Some checkpoints'
+            # config.json omit ``model_version`` (the tokenizer only takes it as an
+            # inert **kwargs passthrough — never reads it), so the attribute access
+            # raises AttributeError. Default it so the load proceeds; value unused.
+            if not hasattr(config, "model_version"):
+                config.model_version = "instruct"
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
         # transformers 5.x loads HunyuanImage3TokenizerFast's Rust backend
@@ -150,7 +157,7 @@ class HunyuanImage3TextEmbedStage:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
         Optional[torch.Tensor],
     ]:
         """Tensor prep shared by the AR and gen_image paths.
@@ -199,7 +206,11 @@ class HunyuanImage3TextEmbedStage:
         # via ``instantiate_vit_image_tokens``.
         cond_vit_image_mask = _optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device)
 
-        return device, input_ids, attention_mask, position_ids, (cos, sin), cond_vit_image_mask
+        # Stack (cos, sin) into a single [N, 2, L, D] tensor so rope_cache is a
+        # first-class per-sample CONCAT tensor (rides transport/merge/scatter like
+        # input_ids); consumers unbind to (cos, sin) at the model boundary.
+        rope_cache = torch.stack([cos, sin], dim=1)
+        return device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask
 
     # ------------------------------------------------------------------
     # Chat-template-driven input prep — canonical AR entry point.
@@ -256,7 +267,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[B, L] long``,
                                   attention_mask ``[B, 1, L, L] bool``,
                                   position_ids ``[B, L] long``,
-                                  rope_cache ``(cos, sin)`` each ``[B, L, D] float``,
+                                  rope_cache ``[B, 2, L, D] float`` (stacked cos/sin),
                                   cond_vit_image_mask ``[B, L] bool`` (i2t / it2i;
                                   ``None`` for t2t).
                 tokenizer_output: opaque upstream apply_chat_template output (carries
@@ -403,7 +414,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[N, L] long``,
                                   attention_mask ``[N, 1, L, L] bool``,
                                   position_ids ``[N, L] long``,
-                                  rope_cache ``(cos, sin)`` ``([N, L, D], [N, L, D]) float``,
+                                  rope_cache ``[N, 2, L, D] float`` (stacked cos/sin),
                                   gen_image_mask ``[N, L] bool``,
                                   gen_timestep_scatter_index ``[N, K] long``,
                                   cond_vae_image_mask / cond_vit_image_mask /

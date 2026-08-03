@@ -64,6 +64,13 @@ sglang = [
   "torch==2.11.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
+  # Flash-Linear-Attention (FLA) fast path for Qwen3.5 hybrid attention layers
+  # (3 GDN + 1 full per 4). Without it, transformers falls back to the torch
+  # implementation ("The fast path is not available because one of the required
+  # library is not installed"). The [conv1d] extra pulls causal-conv1d, the
+  # [tilelang] extra is already satisfied transitively. Pin to the version
+  # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
+  "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
 ]
 # CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
 vllm = [

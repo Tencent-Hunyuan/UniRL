@@ -48,9 +48,9 @@ stay swappable by `_target_`.
   whole `Sample` so AR and image Parts are sharded by the same prompt trees.
   Agentic engines return a `List[Sample]` of variable-depth trajectories; their
   trainers assign each trajectory's advantage to all generated turns and
-  concatenate those turn Parts for training. `RewardBackpropTrainer` is the one
-  intentional exception: ReFL differentiates directly through decoded images and
-  therefore does not use rollout Samples or advantages.
+  concatenate those turn Parts for training. (ReFL — which differentiates
+  directly through decoded media and uses no rollout Samples or advantages —
+  lives outside core as `experimental/refl`.)
 
 The current trainer surface is:
 
@@ -63,10 +63,16 @@ The current trainer surface is:
 | `AsyncDiffusionTrainer` | buffered diffusion `Sample` groups → one `TrainStack` | The same separate-slab async loop for DiT. Requires `max_inflight=1` and reaps each generation before launching the next, so the cross-slab trajectory transfer never queues behind a fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
-| `RewardBackpropTrainer` | differentiable image reward → policy step | ReFL/DRaFT-K path; no rollout engine, `Sample`, GRPO advantage, replay ratio, or weight sync. |
 | `AgenticTrainer` / `AgenticEnvTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Barrier multi-turn tool use. The base variant scores terminal answers; the env variant consumes per-trajectory environment returns. |
 | `AgenticPartialTrainer` / `AgenticEnvPartialTrainer` | freshest complete trajectory groups → concatenated turn `Part` | Colocated over-sample/commit/abort loop. `carry` is for Sample-resumable stateless tools; `drop` purges tails from stateful environments that restart episodes. |
 | `AsyncAgenticTrainer` / `AsyncAgenticEnvTrainer` | buffered complete trajectory groups → concatenated turn `Part` | Disaggregated train/rollout slabs, resident agentic drive, weight-version staleness control, and the same explicit `carry`/`drop` tail policy. |
+
+The async variants program against the driver-side async engines in
+`unirl/rollout/engine/asynchronous.py`: `AsyncBatchRolloutEngine` (AR/diffusion — non-blocking
+batched generations, launch-time version stamps) and `AsyncAgenticRolloutEngine`
+(partial/async agentic — trajectory drives, group assembly, completion-time stamps).
+The trainers keep the policy: launch ceilings, reap-vs-launch order, quiesce points,
+and tail carry/drop.
 
 **Extending it:** a new domain is a new `<Domain>Trainer(BaseTrainer)` that builds its
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the
@@ -234,8 +240,8 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - `ARTrainer` evaluates the requested prompt set in bounded batches and reports
   mean reward, also exposed as avg@k accuracy for binary evaluators.
   `AsyncARTrainer` quiesces its resident engine first.
-- `DiffusionTrainer`, `PETrainer`, `UnifiedModelTrainer`, and
-  `RewardBackpropTrainer` report image reward; optional `eval_rewards` suites can
+- `DiffusionTrainer`, `PETrainer`, and `UnifiedModelTrainer` report image
+  reward; optional `eval_rewards` suites can
   score the same generated samples or their own prompt sets. PE scores only the
   diffusion/image frontier. `AsyncDiffusionTrainer` quiesces first and then scores
   the policy already resident in its rollout engine, without a weight sync and

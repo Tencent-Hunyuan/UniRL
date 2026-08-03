@@ -91,12 +91,9 @@ def deep_hydrate(obj: Any) -> Any:
     which works from the driver — we walk the nested Batch/dict/list/TUPLE
     structure and apply it to every ``TensorRef``.
 
-    NB: this walks TUPLES too (rebuilding them), unlike ``_collect_leaves``
-    which skips them. HunyuanImage3's fused condition stores ``rope_cache`` as a
-    ``tuple`` of two TensorRef; the DP scatter's driver-side
-    ``Part.concat`` pads that rope (``conditions.concat`` → ``_pad_seq``
-    → ``t.ndim``), so the rope MUST be real tensors here. (dp=1 never concats on
-    the driver, so it never tripped on this.)
+    NB: this walks tuples too (rebuilding them), unlike ``_collect_leaves``.
+    HI3's trainside rope is now a stacked ``[B, 2, L, D]`` CONCAT tensor;
+    the tuple case remains supported for other nested transport payloads.
     """
     if isinstance(obj, TensorRef):
         return hydrate(obj)
@@ -138,6 +135,7 @@ class UnifiedModelTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
+        task_config: Optional[Dict[str, Any]] = None,
         ar_rollout_cfg: Optional[DictConfig] = None,
         dit_rollout_cfg: Optional[DictConfig] = None,
         rollout_cfg: Optional[DictConfig] = None,
@@ -185,6 +183,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
 
         # Set below from the `sync` block; None means no sync (e.g. trainside).
         self.weight_sync = None
@@ -384,6 +383,7 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="UnifiedModelTrainer._build_request_sample",
+            root_control=dict(self._task_config),
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
@@ -400,15 +400,9 @@ class UnifiedModelTrainer(BaseTrainer):
         scatter/concat correctness; issuing the per-replica ``generate()`` as Ray
         futures for true concurrent throughput is the follow-up (handoff §8).
 
-        CAVEAT — the fused condition's rope_cache is a ``shared_field``, so
-        ``Sample.concat`` (→ ``Part.concat``) keeps replica-0's tensor verbatim:
-        the merged condition carries a rope_cache whose batch dim is replica-0's
-        sample count, NOT the global P*N*M. Harmless TODAY because HI3 replay
-        rebuilds rope from gen_image_mask + the real latent shape and never reads
-        the part's rope_cache — it only rides along in the KV-propagation kwargs.
-        If a future change makes replay consume ``fused.rope_cache``, dp>1 would
-        SILENTLY feed replica-0 rope to every sample (wrong gradient, no crash);
-        make rope_cache a tuple-aware CONCAT field before relying on it.
+        HI3 trainside carries rope_cache as a stacked per-sample CONCAT tensor,
+        so DP concat preserves row alignment. The vLLM-Omni response deliberately
+        omits its engine-layout rope and replay rebuilds an HF-native rope instead.
         """
         valid_layout = (
             len(sample.parts) == 3
@@ -504,6 +498,7 @@ class UnifiedModelTrainer(BaseTrainer):
             segment=ar_gen.segment,
             primitives={"text": recaptions},
             conditions=dict(ar_gen.conditions),
+            weight_version=ar_gen.weight_version,
         )
 
         # ── Level 2: DiT. P*N*M pre-expanded (original prompt + recaption cot_text),
@@ -517,7 +512,9 @@ class UnifiedModelTrainer(BaseTrainer):
         # are row-aligned with ``dit_prompts`` and the map-back is positional, so only
         # the noise key changes — restoring the pre-migration lineage-based key.
         dit_input = Part.input(
-            [sid.replace("/", "_") for sid in image_shell.sample_ids], primitives={"text": dit_prompts}
+            [sid.replace("/", "_") for sid in image_shell.sample_ids],
+            primitives={"text": dit_prompts},
+            control=dict(input_part.control),
         )
         cot_input = dit_input.input_child(primitives={"text": dit_cot})
         dit_out = dit_engine.generate(
@@ -535,6 +532,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitive_metadata=dict(img_gen.primitive_metadata),
             conditions=dict(img_gen.conditions),
             media_preview=img_gen.media_preview,
+            weight_version=img_gen.weight_version,
         )
 
         # Each anchored engine returns its part as ONE transport handle (a single

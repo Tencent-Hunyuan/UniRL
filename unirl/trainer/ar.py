@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.types.sample import Sample
@@ -59,6 +60,7 @@ class ARTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
+        advantage_mode: str = "grpo",
         balance_shards: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
@@ -68,6 +70,12 @@ class ARTrainer(BaseTrainer):
         rollout_anchor_device: Optional[int] = None,
         enable_fsdp_offload: bool = True,
     ) -> None:
+        validate_qwen3_5_training_contract(
+            pipeline_cfg=pipeline_cfg,
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+            stack_cfg=stack_cfg,
+        )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         # "group" (textbook GRPO, default) or "global" (v1 baseline parity).
@@ -76,6 +84,9 @@ class ARTrainer(BaseTrainer):
         # group std. False = mean-center only (reward - group_mean), NO std division —
         # removes the difficulty bias that over-amplifies low-std (hard) prompts.
         self.normalize_adv_by_std = normalize_adv_by_std
+        self.advantage_mode = str(advantage_mode).strip().lower()
+        if self.advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         # verl trainer.balance_batch parity: driver-side reorder of the rollout
         # batch so each DP shard receives a similar total-token workload. FSDP
         # collectives sync all ranks every micro, so a step runs at the SLOWEST
@@ -101,7 +112,7 @@ class ARTrainer(BaseTrainer):
         self._rollout_anchor_device: Optional[int] = (
             int(rollout_anchor_device) if rollout_anchor_device is not None else None
         )
-        # Meaningful only for the anchored rollout path.
+        # Controls manual FSDP GPU ownership handoff for separate rollout paths.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
@@ -113,6 +124,7 @@ class ARTrainer(BaseTrainer):
 
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
+        self._supports_staged_wake = False
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
@@ -125,13 +137,62 @@ class ARTrainer(BaseTrainer):
 
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
             if self._rollout_anchor_device is None:
-                # Default SPMD rollout path.
-                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
-                else:
-                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang TP=1
-                if sync_cfg is not None:
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+                # Default SPMD rollout path.  For a separate colocated rollout
+                # engine, release FSDP before boot so SGLang sizes its fixed
+                # pools against rollout-phase capacity rather than temporarily
+                # resident training state.
+                self._supports_staged_wake = "tags" in inspect.signature(rollout_parsed["role_cls"].wake_up).parameters
+                bootstrap_offload = sync_cfg is not None and self._enable_fsdp_offload
+                bootstrap_offloaded = False
+                rollout_boot_started = False
+                rollout_constructed = False
+                rollout_sleep_attempted = False
+                rollout_memory_released = False
+                try:
+                    if bootstrap_offload:
+                        try:
+                            self.backend.offload()
+                            bootstrap_offloaded = True
+                        except BaseException:
+                            # No rollout engine exists yet, so restoring FSDP is safe.
+                            self.backend.onload()
+                            raise
+
+                    rollout_boot_started = True
+                    if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                        self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                    else:
+                        self.rollout = remote(**rollout_parsed)  # for vllm / sglang
+                    rollout_constructed = True
+                    if sync_cfg is not None:
+                        self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+
+                    # Match the colocated lifecycle used by verl: keep the
+                    # inference engine asleep while the training state owns the
+                    # GPU. A trainside rollout has no sync role and shares the
+                    # live training model, so it must stay awake.
+                    if self.weight_sync is not None:
+                        rollout_sleep_attempted = True
+                        self.rollout.sleep()
+                        rollout_memory_released = True
+                    if bootstrap_offloaded:
+                        self.backend.onload()
+                except BaseException:
+                    if bootstrap_offloaded and not rollout_boot_started:
+                        self.backend.onload()
+                    elif bootstrap_offloaded and rollout_constructed and not rollout_sleep_attempted:
+                        try:
+                            self.rollout.sleep()
+                        except BaseException:
+                            logger.exception("Failed to release rollout memory after bootstrap failure")
+                        else:
+                            self.backend.onload()
+                    elif bootstrap_offloaded and rollout_memory_released:
+                        # The rollout is already safely asleep; preserve the
+                        # original error (for example, a failed FSDP onload)
+                        # without retrying it.
+                        pass
+                    raise
             else:
                 # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
                 # unified models; replace it with first-class TP/DP/PP support.
@@ -260,6 +321,71 @@ class ARTrainer(BaseTrainer):
                     cleanup_error.add_note(f"anchored cleanup operation: {operation}")
                     raise cleanup_error
 
+    def _prepare_rollout(self, *, sync_weights: bool) -> bool:
+        """Wake/sync the SPMD rollout and optionally offload train state.
+
+        Returns whether the train state was offloaded and must be restored by
+        :meth:`_finish_rollout`. Anchored rollout uses
+        :meth:`_anchored_rollout_session` instead.
+        """
+        do_offload = self._enable_fsdp_offload and self.weight_sync is not None
+        do_sync = sync_weights and self.weight_sync is not None
+        train_state_maybe_offloaded = False
+        full_wake_after_train_offload_in_progress = False
+
+        try:
+            if do_sync and do_offload and self._supports_staged_wake:
+                # Keep the large KV and CUDA-graph regions paused during the full
+                # FSDP gather. A following full wake resumes only those remaining
+                # regions because SGLangRolloutEngine tracks the weights stage.
+                self.rollout.wake_up(tags=["weights"])
+                self.weight_sync.sync()
+                train_state_maybe_offloaded = True
+                self.backend.offload()
+                # If this call fails after SGLang resumed only some tags (or the
+                # response is lost), its lifecycle flags cannot prove which
+                # regions are live. Fail closed with FSDP left on CPU rather
+                # than risk a double-resident onload.
+                full_wake_after_train_offload_in_progress = True
+                self.rollout.wake_up()
+                full_wake_after_train_offload_in_progress = False
+            elif do_sync:
+                self.rollout.wake_up()
+                self.weight_sync.sync()
+                if do_offload:
+                    # Non-SGLang backends have no tagged wake, so their full
+                    # wake and sync must precede the training-state handoff.
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
+            elif do_offload:
+                # No sync needs the train model this round, so release it before
+                # restoring any SGLang/vLLM region.
+                train_state_maybe_offloaded = True
+                self.backend.offload()
+                full_wake_after_train_offload_in_progress = True
+                self.rollout.wake_up()
+                full_wake_after_train_offload_in_progress = False
+            else:
+                self.rollout.wake_up()
+        except BaseException:
+            # Recover when the ownership state is known. During a failed full
+            # wake after offload, keep the training state parked as above.
+            if full_wake_after_train_offload_in_progress:
+                raise
+            self._finish_rollout(train_state_offloaded=train_state_maybe_offloaded)
+            raise
+
+        return train_state_maybe_offloaded
+
+    def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
+        """Sleep rollout before restoring the colocated training state."""
+        # If sleep fails, do not put the training state back on the same GPUs:
+        # the inference regions may still be live and an onload would turn the
+        # original lifecycle error into a process-killing OOM.
+        self.rollout.sleep()
+        if train_state_offloaded:
+            self.backend.onload()
+
     def _build_request_sample(
         self,
         inputs: Sample,
@@ -303,12 +429,14 @@ class ARTrainer(BaseTrainer):
         t0 = time.perf_counter()
         anchored = self._rollout_anchor_device is not None
         if not anchored:
-            # SPMD path: rollout sibling of every train rank; sync + generate + sleep in-place.
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
-            sample = self.rollout.generate(sample)
-            self.rollout.sleep()
+            # SPMD path: rollout sibling of every train rank; sync with train
+            # model live, optionally hand GPU ownership to rollout for generate,
+            # then sleep rollout before restoring train state.
+            train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
+            try:
+                sample = self.rollout.generate(sample)
+            finally:
+                self._finish_rollout(train_state_offloaded=train_state_offloaded)
         else:
             # TODO: This TP>1 AR anchored rollout path is temporarily migrated from
             # unified models; replace it with first-class TP/DP/PP support.
@@ -332,7 +460,11 @@ class ARTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            part = part.compute_advantages(normalize=self.normalize_adv_by_std, scope=self.adv_normalization_scope)
+            if self.advantage_mode == "grpo":
+                part = part.compute_advantages(
+                    normalize=self.normalize_adv_by_std,
+                    scope=self.adv_normalization_scope,
+                )
             sample = sample.with_parts([*sample.parts[:-1], part])
 
         self._dump_rollout_samples(sample, rollout_id)
@@ -404,10 +536,9 @@ class ARTrainer(BaseTrainer):
             self.eval_temperature,
             anchored,
         )
+        train_state_offloaded = False
         if not anchored:
-            self.rollout.wake_up()
-            if self.weight_sync is not None:
-                self.weight_sync.sync()
+            train_state_offloaded = self._prepare_rollout(sync_weights=self.weight_sync is not None)
         # Anchored eval keeps FSDP offloaded and vLLM awake for the entire eval
         # set. Training still uses one _anchored_rollout_session per rollout in
         # train_step(), so its sleep/wake and onload/offload lifecycle is unchanged.
@@ -459,7 +590,7 @@ class ARTrainer(BaseTrainer):
                     )
         finally:
             if not anchored:
-                self.rollout.sleep()
+                self._finish_rollout(train_state_offloaded=train_state_offloaded)
 
         acc = reward_sum / max(1, reward_n)
         logger.info(

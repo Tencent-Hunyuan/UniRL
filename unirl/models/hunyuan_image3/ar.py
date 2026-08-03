@@ -220,7 +220,9 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             "rope_image_info": [[] for _ in range(batch_size)],
             "attention_mask": fused.attention_mask,  # [B, 1, L, L] bool
             "position_ids": fused.position_ids,  # [B, L] long
-            "custom_pos_emb": fused.rope_cache,  # ([B, L, D], [B, L, D])
+            # rope_cache is a stacked [B, 2, L, D] tensor; unbind to the model's
+            # (cos, sin) custom_pos_emb pair (non-None: checked in autoregress).
+            "custom_pos_emb": (fused.rope_cache[:, 0], fused.rope_cache[:, 1]),
             "use_cache": True,
             "past_key_values": past_kv_initial,
             "cond_vit_images": cond_vit_images,

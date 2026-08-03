@@ -69,6 +69,9 @@ class Qwen3PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    # Attach a scalar critic to the causal LM for PPO / GAE training.
+    use_value_head: bool = False
+
     system_instruction: Optional[str] = None
     # Chat-template thinking switch; MUST agree with the rollout engine's
     # chat_template_kwargs.enable_thinking or train/rollout prompts diverge.
