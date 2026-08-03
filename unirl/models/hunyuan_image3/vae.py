@@ -60,9 +60,20 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
-            latents_f32 = lat.to(dtype=torch.float32) / scaling_factor
-            latents_f32 = latents_f32.unsqueeze(2)
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
+            latents_f32 = lat.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
+            latents_f32 = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
+            # Force per-rank decode; the distributed path returns data only on rank 0.
+            import torch.distributed as _dist
+
+            _orig_is_init = _dist.is_initialized
+            _dist.is_initialized = lambda: False
+            try:
+                out = self.bundle.vae.to(torch.float32).decode(latents_f32)
+            finally:
+                _dist.is_initialized = _orig_is_init
+            # Accept both DecoderOutput and bare-tensor decode results.
+            decoded = out.sample if hasattr(out, "sample") else out
+            # Decoded shape: [B, 3, T, H, W].
             if decoded.dim() == 5:
                 decoded = decoded.squeeze(2)
             return decoded

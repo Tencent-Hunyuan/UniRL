@@ -45,6 +45,10 @@ class HunyuanImage3PipelineConfig:
 
     guidance_scale: float = 2.5
 
+    # Disable sampling KV cache when rollout log-probs must match replay.
+    diffuse_kv_cache: bool = True
+
+    # Prefix rollout weight names because training exposes the bare decoder.
     weight_sync_param_name_prefix: str = "model."
 
     def __post_init__(self) -> None:

@@ -195,9 +195,10 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         model_kwargs: Dict[str, Any] = {
             "mode": "gen_text",
             "rope_image_info": [[] for _ in range(batch_size)],
-            "attention_mask": fused.attention_mask,
-            "position_ids": fused.position_ids,
-            "custom_pos_emb": fused.rope_cache,
+            "attention_mask": fused.attention_mask,  # [B, 1, L, L] bool
+            "position_ids": fused.position_ids,  # [B, L] long
+            # Unbind stacked RoPE into the model's (cos, sin) pair.
+            "custom_pos_emb": (fused.rope_cache[:, 0], fused.rope_cache[:, 1]),
             "use_cache": True,
             "past_key_values": past_kv_initial,
             "cond_vit_images": cond_vit_images,

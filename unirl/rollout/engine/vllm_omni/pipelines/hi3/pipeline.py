@@ -14,12 +14,16 @@ upstream's stages
   ``segment.latents`` and only this scheduler captures the trajectory.
 - A conditioning **tap** on the transformer's
   ``prepare_inputs_for_generation``: captures the fused multimodal tensors
-  (``input_ids`` / ``attention_mask`` / ``position_ids`` / ``rope_cache`` /
+  (``input_ids`` / ``attention_mask`` / ``position_ids`` /
   ``gen_image_mask`` / ``gen_timestep_scatter_index``) on the **first**
   per-request call — subsequent steps under KV-cache reuse pass the
   gathered-down ``L'`` slice which is not what training-side replay needs.
-  Read back driver-side as ``conditions["fused"]`` for
-  ``HunyuanImage3DiffusionConditions.from_dict``.
+  ``custom_pos_emb`` is deliberately NOT captured: the engine builds its rope
+  with vllm-omni's own ``build_2d_rope`` n_elem convention ([.., 64] tables),
+  which is not layout-compatible with the HF-side replay forward's
+  ``apply_rotary_pos_emb`` ([.., 128]); replay rebuilds rope natively from
+  ``gen_image_mask`` instead. Read back driver-side as ``conditions["fused"]``
+  for ``HunyuanImage3DiffusionConditions.from_dict``.
 - An initial-noise **injection** wrapping the inner pipeline's
   ``prepare_latents``: HI3's DiT latent shape is AR-dynamic (only known once
   upstream resolves ``image_size`` post-AR), so the driver ships a RECIPE
@@ -57,7 +61,6 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler i
 )
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     detach_cpu,
-    detach_cpu_pair,
     drain_trajectory_into,
     stamp_custom_output,
 )
@@ -137,11 +140,11 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         def tapped(*args: Any, **kw: Any) -> Any:
             if pipeline_self._captured_conditioning is None:
                 input_ids = args[0] if args else kw.get("input_ids")
+                # Do not capture engine-specific RoPE tables; replay rebuilds them.
                 pipeline_self._captured_conditioning = {
                     "input_ids": detach_cpu(input_ids),
                     "attention_mask": detach_cpu(kw.get("attention_mask")),
                     "position_ids": detach_cpu(kw.get("position_ids")),
-                    "rope_cache": detach_cpu_pair(kw.get("custom_pos_emb")),
                     "gen_image_mask": detach_cpu(kw.get("image_mask")),
                     "gen_timestep_scatter_index": detach_cpu(kw.get("gen_timestep_scatter_index")),
                 }

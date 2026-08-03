@@ -72,6 +72,9 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
     out.
     """
 
+    # Store RoPE as a CONCAT tensor so DP transport preserves per-sample rows.
+    rope_cache: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, 2, L, D]
+
     gen_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
     gen_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, K] long
     cond_vae_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
@@ -97,6 +100,14 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
         ):
             if name in d and d[name] is not None:
                 kwargs[name] = d[name]
+        rope_cache = kwargs.get("rope_cache")
+        if rope_cache is not None and not isinstance(rope_cache, torch.Tensor):
+            # Reject legacy RoPE tuples at the transport boundary.
+            raise TypeError(
+                "HunyuanImage3FusedMultimodalCondition.from_dict: rope_cache "
+                f"must be a stacked [B, 2, L, D] tensor; got {type(rope_cache).__name__}. "
+                "Producers must stack (cos, sin) pairs via torch.stack(pair, dim=1)."
+            )
         return cls(**kwargs)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -129,7 +140,11 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
         differs across items (e.g. cross-actor merge).
 
         This override pads all items to ``max_L`` on the L dimension before
-        delegating to the base concat.
+        delegating to the base concat. It also MATERIALIZES any lazy
+        ``TensorRef`` L-fields (they can arrive as refs during a DP-merge)
+        before padding, so the delegated base concat only ever sees homogeneous
+        real tensors — the generic ``Batch.concat`` / ``_concat_value`` needs no
+        tuple- or ref-specific special-casing for hi3's ragged-L path.
         """
         if not items or len(items) <= 1:
             from unirl.distributed.tensor.batch import Batch
@@ -147,14 +162,21 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
         max_L = max(seq_lens)
 
+        def _materialize(t):
+            # Materialize lazy CONCAT fields before padding and merging.
+            if t is not None and not isinstance(t, torch.Tensor) and hasattr(t, "materialize"):
+                return t.materialize()
+            return t
+
         def _pad_seq(t, dim=-1, value=0):
+            t = _materialize(t)
             if t is None:
                 return None
             cur = t.shape[dim]
             if cur >= max_L:
                 return t
             pad_size = max_L - cur
-            ndim = t.ndim
+            ndim = len(t.shape)
             pad_spec = [0] * (2 * ndim)
             actual_dim = dim if dim >= 0 else ndim + dim
             pad_idx = (ndim - 1 - actual_dim) * 2
@@ -162,6 +184,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
             return torch.nn.functional.pad(t, pad_spec, value=value)
 
         def _pad_attn(mask):
+            mask = _materialize(mask)
             if mask is None:
                 return None
             if mask.shape[-1] >= max_L:
@@ -171,35 +194,22 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
             padded[:, :, :L, :L] = mask
             return padded
 
-        padded_items = []
-        for item in items:
-            if item.input_ids is not None and item.input_ids.shape[-1] < max_L:
-                rope = item.rope_cache
-                if rope is not None and isinstance(rope, tuple) and len(rope) == 2:
-                    rope = (
-                        _pad_seq(rope[0], dim=-2, value=0.0),
-                        _pad_seq(rope[1], dim=-2, value=0.0),
-                    )
-                padded_items.append(
-                    cls(
-                        input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
-                        attention_mask=_pad_attn(item.attention_mask),
-                        position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
-                        rope_cache=rope,
-                        gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
-                        gen_timestep_scatter_index=item.gen_timestep_scatter_index,
-                        cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, dim=-1, value=False)
-                        if item.cond_vae_image_mask is not None
-                        else None,
-                        cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, dim=-1, value=False)
-                        if item.cond_vit_image_mask is not None
-                        else None,
-                        cond_timestep_scatter_index=item.cond_timestep_scatter_index,
-                        prompt_lengths=item.prompt_lengths,
-                    )
-                )
-            else:
-                padded_items.append(item)
+        # Materialize every shard so concatenation never mixes tensors and TensorRefs.
+        padded_items = [
+            cls(
+                input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
+                attention_mask=_pad_attn(item.attention_mask),
+                position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
+                rope_cache=_pad_seq(item.rope_cache, dim=-2, value=0.0),
+                gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
+                gen_timestep_scatter_index=item.gen_timestep_scatter_index,
+                cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, dim=-1, value=False),
+                cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, dim=-1, value=False),
+                cond_timestep_scatter_index=item.cond_timestep_scatter_index,
+                prompt_lengths=item.prompt_lengths,  # [B] — not L-padded
+            )
+            for item in items
+        ]
 
         from unirl.distributed.tensor.batch import Batch
 
@@ -226,6 +236,8 @@ class HunyuanImage3DiffusionConditions(Batch):
     """
 
     fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    # Store CFG's unconditional branch separately so B-sample transport preserves it.
+    fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
     cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
@@ -260,8 +272,16 @@ class HunyuanImage3DiffusionConditions(Batch):
                 f"to be an ImageEmbedCondition or absent, "
                 f"got {type(cond_vit).__name__}"
             )
+        fused_uncond = d.get("fused_uncond")
+        if fused_uncond is not None and not isinstance(fused_uncond, HunyuanImage3FusedMultimodalCondition):
+            raise TypeError(
+                f"HunyuanImage3DiffusionConditions.from_dict: expected d['fused_uncond'] "
+                f"to be a HunyuanImage3FusedMultimodalCondition or absent, "
+                f"got {type(fused_uncond).__name__}"
+            )
         return cls(
             fused=fused,
+            fused_uncond=fused_uncond,
             cond_vae=cond_vae,
             cond_vit=cond_vit,
             cond_timestep=d.get("cond_timestep"),
@@ -276,6 +296,8 @@ class HunyuanImage3DiffusionConditions(Batch):
                 "None — required for the diffusion stage to consume."
             )
         out: Dict[str, Any] = {"fused": self.fused}
+        if self.fused_uncond is not None:
+            out["fused_uncond"] = self.fused_uncond
         if self.cond_vae is not None:
             out["cond_vae"] = self.cond_vae
         if self.cond_vit is not None:
