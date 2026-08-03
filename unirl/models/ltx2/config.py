@@ -51,7 +51,7 @@ class LTX2PipelineConfig:
 
     default_height: int = 512
     default_width: int = 768
-    default_num_frames: int = 121
+    default_num_frames: int = 121  # ~5s at 24fps
     default_frame_rate: float = 24.0
 
     weight_sync_param_name_prefix: str = "transformer."

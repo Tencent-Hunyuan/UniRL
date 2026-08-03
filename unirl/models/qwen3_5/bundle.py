@@ -47,7 +47,7 @@ def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
         grid_ws = [row[2] for row in grid_thw_list]
-        device = grid_thw.device
+        device = grid_thw.device  # verl fix: device from grid_thw, not pos_embed
 
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]

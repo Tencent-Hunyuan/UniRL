@@ -123,7 +123,7 @@ def _match_admissible(action: str, admissible: List[str]) -> str:
         if a in cl or cl in a:
             return c
     at = set(a.split())
-    best, best_score = action, 0.5
+    best, best_score = action, 0.5  # threshold: only snap on a real overlap
     for c in admissible:
         ct = set(c.strip().lower().split())
         if not ct:

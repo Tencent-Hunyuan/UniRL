@@ -27,7 +27,7 @@ from .bundle import QwenImageEditPlusBundle
 
 # Resize source images to the upstream 1024-square grid so rollout latent shapes match.
 _VAE_IMAGE_AREA = 1024 * 1024
-_VAE_SIZE_ALIGN = 32
+_VAE_SIZE_ALIGN = 32  # upstream rounds to 32-pixel multiples
 
 
 def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:

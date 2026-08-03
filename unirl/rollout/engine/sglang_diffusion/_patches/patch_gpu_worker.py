@@ -326,7 +326,7 @@ def _get_weights_detail(self, module_names: list[str] | None = None) -> dict:
         from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
             iter_materialized_weights,
         )
-    except ImportError:
+    except ImportError:  # pre-reorg flat layout (<= v0.5.12.post1)
         from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
             iter_materialized_weights,
         )

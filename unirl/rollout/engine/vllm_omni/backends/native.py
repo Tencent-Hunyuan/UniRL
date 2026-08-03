@@ -85,7 +85,7 @@ def _resolve_stage_yaml(name: str, source: str) -> str:
             raise FileNotFoundError(f"_resolve_stage_yaml: local YAML not found at {path}")
         return path
     if source == "upstream":
-        import vllm_omni
+        import vllm_omni  # runtime import — sanctioned here only
 
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(vllm_omni.__file__)))
         path = os.path.join(project_root, "vllm_omni", "model_executor", "stage_configs", name)

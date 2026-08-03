@@ -80,7 +80,7 @@ class CheckpointWeightSync(FullWeightSync):
             track_prefix=track_prefix,
             wire_dtype=wire_dtype,
         )
-        self._rollout = rollout
+        self._rollout = rollout  # local engine sibling (colocate)
         scope = self._track_prefix or type(rollout).__name__
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "default"
         self._dir = os.path.join(str(sync_dir), _shared_run_id(run_id), scope)

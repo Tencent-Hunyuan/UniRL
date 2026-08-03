@@ -179,7 +179,7 @@ def _patch_rollout_variance_noise_device() -> None:
                 try:
                     batch._unirl_noise_gen = gen  # type: ignore[attr-defined]
                 except AttributeError:
-                    pass
+                    pass  # immutable batch — generator is still valid for this step
             generator = [gen]
         else:
             assert len(generator) == B, "Generator list must have the same length as batch size"

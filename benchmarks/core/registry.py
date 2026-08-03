@@ -30,9 +30,9 @@ class BenchmarkSpec:
     samples_per_prompt: int = 4
     rewards: Tuple[str, ...] = ()
     send_metadata: bool = False
-    grader: Optional[str] = None
+    grader: Optional[str] = None  # text benchmarks: "math_verify" | "mc_letter"
     gen: Dict = field(default_factory=dict)
-    t2i_linspace_sigmas: bool = False
+    t2i_linspace_sigmas: bool = False  # Use an explicit flow-match sigma grid.
     t2i_prompt_seed: bool = False
     notes: str = ""
 

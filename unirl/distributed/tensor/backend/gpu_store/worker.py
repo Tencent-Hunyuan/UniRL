@@ -65,7 +65,7 @@ class TensorWorker:
             self.device = "cpu"
 
         self._store: Dict[str, Tensor] = {}
-        self._pending: Dict[str, Tensor] = {}
+        self._pending: Dict[str, Tensor] = {}  # allocated but not yet written
         self._ref_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
         self._counter = 0
@@ -165,8 +165,8 @@ class TensorWorker:
                 buf = self._store.pop(key)
                 del self._ref_counts[key]
                 self._limbo_count += 1
-                self._limbo_bytes += buf.nbytes
-                del buf
+                self._limbo_bytes += buf.nbytes  # accumulate before del
+                del buf  # IPC counter goes 1→0, storage enters Limbo
                 if self._limbo_count >= self._ipc_collect_count or self._limbo_bytes >= self._ipc_collect_bytes:
                     do_collect = True
         if do_collect:

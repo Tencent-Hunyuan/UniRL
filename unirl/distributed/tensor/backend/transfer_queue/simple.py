@@ -20,8 +20,8 @@ class SimpleBackendConfig:
     if you've measured a need. For production-tunable sizing, use Mooncake.
     """
 
-    num_units: int = 16
-    unit_size: int = 1024
+    num_units: int = 16  # in-process Ray storage actors
+    unit_size: int = 1024  # per-unit item capacity
 
     def __post_init__(self) -> None:
         require(

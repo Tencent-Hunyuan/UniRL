@@ -26,7 +26,7 @@ def patch_pipeline() -> None:
         from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
             get_global_component_residency_manager,
         )
-    except ImportError:
+    except ImportError:  # pre-reorg flat layout (<= v0.5.12.post1)
         from sglang.multimodal_gen.runtime.managers.component_manager import (
             get_global_component_residency_manager,
         )

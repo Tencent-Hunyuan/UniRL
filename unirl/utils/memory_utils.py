@@ -214,7 +214,7 @@ def summarize_snapshot(snapshot, top: int = 15) -> str:
 
     from collections import defaultdict
 
-    by_site: Dict[str, list] = defaultdict(lambda: [0, 0])
+    by_site: Dict[str, list] = defaultdict(lambda: [0, 0])  # site -> [bytes, count]
     total_live = 0
     total_blocks = 0
     for seg in snapshot.get("segments", []):

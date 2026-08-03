@@ -122,7 +122,7 @@ class SandboxTool(StatefulTool):
             raise ValueError("python tool requires a non-empty 'code' string argument")
         with self._store_lock:
             session = self._sessions.get(session_id)
-            if session is None:
+            if session is None:  # Tolerate callers that skip session_start.
                 session = self._sessions.setdefault(session_id, _Session({}))
         with session.lock:
             if self._ensure_proc(session) is None:

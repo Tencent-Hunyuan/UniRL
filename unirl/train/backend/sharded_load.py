@@ -639,7 +639,7 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
     ref_keys = {n for n, _ in ref.named_parameters()} | {n for n, _ in ref.named_buffers()}
     matched_old = sum(k in ref_keys for k in state_dict)
     matched_new = sum(k in ref_keys for k in renamed)
-    if matched_new <= matched_old:
+    if matched_new <= matched_old:  # keys already matched — keep the original
         return state_dict
     logger.info(
         "sharded_load: applied HF checkpoint key-renaming (%d -> %d / %d keys matched)",

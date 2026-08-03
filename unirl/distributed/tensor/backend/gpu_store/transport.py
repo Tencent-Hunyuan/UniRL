@@ -117,7 +117,7 @@ class GPUStoreTransport(WorkerLocalTransport):
                 else:
                     emitted.add(id(t))
                     handle = h
-            elif isinstance(t, torch.Tensor):
+            elif isinstance(t, torch.Tensor):  # CPU tensor → Ray plasma
                 handle = GPUTensorHandle(
                     store_key=None,
                     source_id=self.worker_id,

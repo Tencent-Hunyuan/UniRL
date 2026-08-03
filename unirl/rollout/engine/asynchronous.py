@@ -263,7 +263,7 @@ class AsyncBatchRolloutEngine:
         self._pool.wait_oldest()
 
     def _on_complete(self, gen_id: int, weight_version: int, completed: "Sample") -> None:
-        groups = self._complete(gen_id, completed)
+        groups = self._complete(gen_id, completed)  # fallible (scoring) before any buffer put
         for group in groups:
             self._buffer.put(group, weight_version=weight_version, gen_id=gen_id)
 

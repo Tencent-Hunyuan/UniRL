@@ -103,8 +103,8 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             )
         self._inner: SyncRolloutEngine = inner
 
-        self._sp = config.episode_sampling
-        self._n = total_samples_per_prompt(self._sp)
+        self._sp = config.episode_sampling  # per-turn sampling params; carries n via samples_per_prompt
+        self._n = total_samples_per_prompt(self._sp)  # GRPO group size
         self._max_turns = int(config.max_turns)
         self._partial_rollout = bool(getattr(config, "partial_rollout", False))
         _env_mt = getattr(self._env, "max_turns", None)
@@ -119,7 +119,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._role: str = ""
         self._queue: Deque[Sample] = deque()
         self._qlock = threading.Lock()
-        self._drain_refs: List[Any] = []
+        self._drain_refs: List[Any] = []  # Rank-0 outstanding drain calls.
 
         self._completed: List[Sample] = []
         self._checkpointed: List[Sample] = []
@@ -317,7 +317,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         try:
             while not self._stopping:
                 task = self._pull(coordinator, role_name)
-                if task is None:
+                if task is None:  # sentinel: queue drained
                     break
                 sample, done = self._run_one(task)  # never raises (failure-isolated)
                 with self._buf_lock:

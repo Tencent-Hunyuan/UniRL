@@ -94,8 +94,8 @@ class HunyuanImage3ARState:
     transported. AR mirror of ``HunyuanImage3DiffusionState``.
     """
 
-    input_ids: torch.Tensor
-    model_kwargs: Dict[str, Any]
+    input_ids: torch.Tensor  # [B, T] long; grows by one column per step
+    model_kwargs: Dict[str, Any]  # HF-style kwargs threaded across steps
     step_idx: int = 0
 
 

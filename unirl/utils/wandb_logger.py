@@ -644,12 +644,12 @@ class UniRLWandBLogger:
                         .clamp(0.0, 1.0)
                         .mul(255.0)
                         .to(dtype=torch.uint8)
-                        .permute(1, 0, 2, 3)
+                        .permute(1, 0, 2, 3)  # [C, T, H, W] -> [T, C, H, W]
                         .numpy()
                     )
                     audio_wf = audios[idx] if idx < len(audios) else None
                     if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
-                        arr_hwc = arr.transpose(0, 2, 3, 1)
+                        arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
                         path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
                         _muxed_paths.append(path)
                         wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))

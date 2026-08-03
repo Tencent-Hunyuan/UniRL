@@ -41,7 +41,7 @@ def load_ep_experts(
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
     ps = get_parallel_state()
-    ep_rank = ps.extra_parallel_rank("ep")
+    ep_rank = ps.extra_parallel_rank("ep")  # this rank's index in the EP group
     ep_size = ps.ep_size
     n = 0
     for name, param in model.named_parameters():
@@ -101,8 +101,8 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
     """
     from torch.distributed.tensor import DTensor
 
-    full_cache: Dict[int, nn.Parameter] = {}
-    sharded_cache: Dict[int, nn.Parameter] = {}
+    full_cache: Dict[int, nn.Parameter] = {}  # id(module) -> full all-gathered weight
+    sharded_cache: Dict[int, nn.Parameter] = {}  # id(module) -> sharded weight (mid-call only)
 
     def _pre(m, args):
         w = m.weight

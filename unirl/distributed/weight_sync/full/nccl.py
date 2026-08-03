@@ -72,8 +72,8 @@ class NCCLWeightSync(FullWeightSync):
             wire_dtype=wire_dtype,
         )
         self._group_name = str(group_name)
-        self._model_update_group = None
-        self._rollout_targets: List[Any] = []
+        self._model_update_group = None  # set on rank 0 in connect()
+        self._rollout_targets: List[Any] = []  # rollout Worker actor handles (rank 0 only)
         self._rollout_role: Optional[str] = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
@@ -174,7 +174,7 @@ class NCCLWeightSync(FullWeightSync):
         is_rank0 = self._my_rank == 0
         for bucket, is_last in self._iter_buckets():
             if not is_rank0:
-                continue
+                continue  # ranks >= 1 only drive the train-mesh all-gather
             names = [n for n, _ in bucket]
             dtypes = [str(t.dtype) for _, t in bucket]
             shapes = [list(t.shape) for _, t in bucket]

@@ -82,7 +82,7 @@ class IPCWeightSync(FullWeightSync):
         )
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import zmq_handle
 
-        replica_rank = self._my_rank
+        replica_rank = self._my_rank  # distinct per colocate engine → unique socket
 
         try:
             tp_per_stage = {int(stage_id): int(tp_size) for stage_id, tp_size in self._rollout.tp_per_stage().items()}

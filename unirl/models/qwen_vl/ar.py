@@ -454,8 +454,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             if n_r > 0:
                 pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
             offset += int(seq.numel())
-        packed_ids = torch.cat(streams).unsqueeze(0)
-        packed_pos = torch.cat(pos_parts, dim=1).unsqueeze(1)
+        packed_ids = torch.cat(streams).unsqueeze(0)  # [1, L]
+        packed_pos = torch.cat(pos_parts, dim=1).unsqueeze(1)  # [4, L] -> [4, 1, L]
         predict_index = torch.cat(pred_parts) if pred_parts else torch.zeros(0, dtype=torch.long, device=device)
 
         if predict_index.numel() == 0:

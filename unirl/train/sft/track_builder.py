@@ -325,7 +325,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             )
         pad = torch.tensor([0.0 if p else 1.0 for p in _pad_flags(records)], dtype=torch.float32)
         segment = make_image_segment(
-            latents=latents.unsqueeze(1),
+            latents=latents.unsqueeze(1),  # [B, 1, ...] — clean x0 at the last (only) position
             loss_mask=pad.to(latents.device),
         )
         return Part(
@@ -352,7 +352,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             img = _load_pil_image(uris[0])
             if img.size != (self.width, self.height):
                 img = img.resize((self.width, self.height), PILImage.BICUBIC)
-            arr = np.asarray(img, dtype=np.float32) / 255.0
+            arr = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 3]
             rows.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
         return torch.stack(rows, dim=0)
 

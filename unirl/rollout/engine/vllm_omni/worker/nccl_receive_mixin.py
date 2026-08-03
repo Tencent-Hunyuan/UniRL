@@ -134,7 +134,7 @@ class NcclBroadcastReceiveMixin:
         """Receive a bucket of named tensors via ``dist.broadcast`` from rank 0,
         then forward to ``self.load_weights``.
         """
-        del target_modules, flush_cache
+        del target_modules, flush_cache  # accepted for SGLang-shape parity
         group = type(self)._diffrl_weight_groups.get(group_name)
         if group is None:
             raise RuntimeError(

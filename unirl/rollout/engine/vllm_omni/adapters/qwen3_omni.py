@@ -324,7 +324,7 @@ class Qwen3OmniThinkerInputAdapter:
         temperature = float(ar.temperature)
         top_p = float(ar.top_p)
         top_k_val = int(ar.top_k)
-        top_k = top_k_val if top_k_val > 0 else -1
+        top_k = top_k_val if top_k_val > 0 else -1  # vLLM: -1 disables top_k
         stop_token_id = ar.stop_token_id
 
         base_sampling_kwargs: Dict[str, Any] = {

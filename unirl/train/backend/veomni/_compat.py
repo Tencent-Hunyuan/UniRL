@@ -72,7 +72,7 @@ def _stub_package(name: str, path: str) -> types.ModuleType:
 def _install_path_stubs() -> None:
     """Stub ``veomni`` and ``veomni.models`` so their inits never execute."""
     if "veomni" not in sys.modules:
-        spec = importlib.util.find_spec("veomni")
+        spec = importlib.util.find_spec("veomni")  # locates; does not execute
         if spec is None or spec.origin is None:
             raise ModuleNotFoundError(
                 'veomni is not installed — install unirl with the [veomni] extra (uv pip install -e ".[...,veomni]")'

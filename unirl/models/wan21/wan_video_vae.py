@@ -1214,7 +1214,7 @@ def _convert_upblock_key(key: str, rb_map: dict) -> str:
 
     if rest.startswith("upsamplers.0."):
         suffix = rest[len("upsamplers.0.") :]
-        flat_idx = base + 3
+        flat_idx = base + 3  # upsampler comes after 3 resnets
         return f"upsamples.{flat_idx}." + suffix
 
     raise ValueError(f"Unknown up_block key: {key}")

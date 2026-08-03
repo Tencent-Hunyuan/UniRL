@@ -53,10 +53,10 @@ class RPCBackwardNode:
     """
 
     role_proxy: "Handle"
-    call_id: str
-    dispatch_mode: "Dispatch"
-    input_metas: List["TensorRef"]
-    output_metas: List["TensorRef"]
+    call_id: str  # key prefix for worker _grad_inputs/_grad_outputs
+    dispatch_mode: "Dispatch"  # backward dispatch mode (always DP_SCATTER currently)
+    input_metas: List["TensorRef"]  # forward input TensorMetas, in traversal order
+    output_metas: List["TensorRef"]  # forward output TensorMetas, in traversal order
 
 
 class GradContext:

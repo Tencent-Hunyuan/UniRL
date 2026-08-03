@@ -112,7 +112,7 @@ class REFLTrainer(BaseTrainer):
             rewards = self.reward.score_differentiable(gen.decoded, list(texts.texts), records)
             loss_metrics = self.actor.forward_backward_loss(rewards=rewards, kl_loss=gen.kl_loss)
         step_result = self.actor.step(max_grad_norm=self.max_grad_norm)
-        if isinstance(step_result, list):
+        if isinstance(step_result, list):  # BROADCAST → one result per worker
             step_result = step_result[0]
 
         return {

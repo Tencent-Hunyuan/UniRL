@@ -40,9 +40,9 @@ class TQTensorHandle:
       fetch.
     """
 
-    meta: Any
-    field: str
-    orig_shape: Optional[Tuple[int, ...]] = None
+    meta: Any  # Upstream SampleMeta or BatchMeta.
+    field: str  # the field name the tensor occupies in its put's TensorDict
+    orig_shape: Optional[Tuple[int, ...]] = None  # shape to restore on fetch (None for non-tensors)
 
     def _gkey(self) -> tuple:
         """Originating-put identity: same key ⇒ column-unionable in one get."""
@@ -68,7 +68,7 @@ def _store_shape(t: torch.Tensor) -> torch.Tensor:
     if t.dim() == 0:
         return t.reshape(1, 1)
     if t.dim() == 1:
-        return t.unsqueeze(1)
+        return t.unsqueeze(1)  # (N,) -> (N, 1)
     return t
 
 
@@ -160,7 +160,7 @@ class TQTransport(TensorTransport):
             def _bs(t: Any) -> int:
                 if isinstance(t, torch.Tensor):
                     return int(t.shape[0]) if t.dim() > 0 else 1
-                return 1
+                return 1  # list / NonTensorData → one row
 
             groups: Dict[int, list] = {}
             for k, t in tensors.items():

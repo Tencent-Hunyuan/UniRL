@@ -178,7 +178,7 @@ class BucketedIPCReceiveMixin:
         ``FlattenedTensorBucket`` dataclass to round-trip the pickle. The pod
         venv that runs the rollout actor and the worker shares this dep.
         """
-        del target_modules, flush_cache
+        del target_modules, flush_cache  # accepted for SGLang-shape parity
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             FlattenedTensorBucket,
             MultiprocessingSerializer,

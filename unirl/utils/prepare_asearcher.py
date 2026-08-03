@@ -44,7 +44,7 @@ def _iter_source(source: Optional[str], hf_name: str, split: str) -> Iterator[Di
                 if line:
                     yield json.loads(line)
         return
-    from datasets import load_dataset
+    from datasets import load_dataset  # lazy: only needed when downloading
 
     # Stream raw rows to bypass inconsistent Hugging Face schemas.
     for row in load_dataset(hf_name, split=split, streaming=True):

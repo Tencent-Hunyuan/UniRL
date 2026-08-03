@@ -189,7 +189,7 @@ class TensorRef(Batch):
         :class:`TensorSpan` (nested spans flatten in the ctor). No sort/dedup, so
         out-of-order, overlapping, and empty range lists behave as given.
         """
-        span_offsets = self._offsets()
+        span_offsets = self._offsets()  # cumulative row boundaries; span_offsets[-1] == total rows
         selected: List[TensorSpan] = []
         for range_start, range_stop in ranges:
             range_start, range_stop = int(range_start), int(range_stop)

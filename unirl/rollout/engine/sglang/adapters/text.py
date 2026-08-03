@@ -142,11 +142,11 @@ class TextLMAdapter(ModelAdapter):
         }
         template_kwargs.update(self.cfg.chat_template_kwargs or {})
         ids = self._tokenizer.apply_chat_template(messages, **template_kwargs)
-        if hasattr(ids, "input_ids"):
+        if hasattr(ids, "input_ids"):  # BatchEncoding (return_dict re-enabled)
             ids = ids["input_ids"]
-        if hasattr(ids, "tolist"):
+        if hasattr(ids, "tolist"):  # torch / numpy tensor (return_tensors)
             ids = ids.tolist()
-        if ids and isinstance(ids[0], (list, tuple)):
+        if ids and isinstance(ids[0], (list, tuple)):  # leading batch dim of 1
             ids = ids[0]
         return [int(t) for t in ids]
 

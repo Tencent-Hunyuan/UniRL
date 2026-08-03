@@ -226,7 +226,7 @@ def grade_math(answer: str, responses: List[str]) -> float:
     """avg@k exact-math correctness via HuggingFace math-verify (same grader as
     ``unirl.reward.local.mathverify``, including the ``\\boxed{}``-wrapped gold —
     bare golds like ``\\left(3, \\frac{\\pi}{2}\\right)`` mis-parse otherwise)."""
-    from math_verify import parse, verify
+    from math_verify import parse, verify  # lazy: pip install math-verify
 
     gold = parse("\\boxed{" + str(answer).strip() + "}")
     correct = 0

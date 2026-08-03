@@ -51,7 +51,7 @@ class GPUTensorHandle:
         self.device = device
         self.worker_handle = None
         self._finalized = False
-        self.object_ref = object_ref
+        self.object_ref = object_ref  # Ray ObjectRef for CPU tensors in plasma store
 
     def rebind(self, worker_handle) -> None:
         """Attach worker actor handle and register release finalizer.
@@ -122,7 +122,7 @@ class GPUTensorHandle:
         self.device = state["device"]
         self.worker_handle = None
         self._finalized = False
-        self.object_ref = state.get("object_ref")
+        self.object_ref = state.get("object_ref")  # None for CUDA handles
 
     @staticmethod
     def _release(worker_handle, store_key: str) -> None:

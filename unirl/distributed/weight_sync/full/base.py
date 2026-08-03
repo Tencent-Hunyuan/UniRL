@@ -272,7 +272,7 @@ class FullWeightSync(Remote):
                 )
                 del full
             elif expert_kind is not None:
-                stacked = full
+                stacked = full  # ep_size==1: already the full [E,…]
             else:
                 out = _apply_name_remap(name, remap)
                 if out is not None:

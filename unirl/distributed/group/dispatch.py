@@ -55,17 +55,17 @@ def _unwrap_broadcast(args: tuple, kwargs: dict):
 class Dispatch(Enum):
     """How to distribute input to workers."""
 
-    BROADCAST = auto()
-    SCATTER = auto()
-    DP_SCATTER = auto()
-    DP_SCATTER_HEAD = auto()
+    BROADCAST = auto()  # Same data to every worker
+    SCATTER = auto()  # Split N ways across world (one shard per worker)
+    DP_SCATTER = auto()  # One shard per DP group; all ranks receive it.
+    DP_SCATTER_HEAD = auto()  # One shard per DP group; only its head receives it.
 
 
 class Execute(Enum):
     """Which workers execute."""
 
-    ALL = auto()
-    RANK_ZERO = auto()
+    ALL = auto()  # All workers execute
+    RANK_ZERO = auto()  # Only rank 0 executes
 
 
 def _dispatch_broadcast(

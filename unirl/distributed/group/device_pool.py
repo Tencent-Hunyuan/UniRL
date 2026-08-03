@@ -86,8 +86,8 @@ class DevicePool:
 
         self._worker_id_to_device_id: Dict[str, int] = {}
         self._worker_id_to_slot: Dict[str, int] = {}
-        self._device_to_workers: Dict[int, List] = {}
-        self._worker_by_id: Dict[str, Any] = {}
+        self._device_to_workers: Dict[int, List] = {}  # device_id → [slot0, slot1, ...]
+        self._worker_by_id: Dict[str, Any] = {}  # worker_id → handle
 
     @property
     def num_gpus(self) -> int:

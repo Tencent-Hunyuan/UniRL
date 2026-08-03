@@ -217,7 +217,7 @@ class BagelVAEEncodeStage:
             raise RuntimeError("BagelVAEEncodeStage: bundle.vae has no .reg gaussian — vendored API changed?")
         x = (pixels.to(device=self.bundle.device, dtype=self.bundle.vae_dtype) * 2.0 - 1.0).contiguous()
         prev_sample = reg.sample
-        reg.sample = False
+        reg.sample = False  # deterministic posterior mean, not a draw
         try:
             spatial = vae.encode(x)
         finally:

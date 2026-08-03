@@ -12,9 +12,9 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ResolvedCkpt:
-    base: str
-    adapter: Optional[str]
-    tag: str
+    base: str  # HF repo id or local path, loadable by from_pretrained
+    adapter: Optional[str]  # PEFT adapter dir (adapter_config.json), or None
+    tag: str  # results directory name
 
 
 def _slug(name: str) -> str:
