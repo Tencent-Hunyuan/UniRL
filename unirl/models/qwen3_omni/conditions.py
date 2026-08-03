@@ -19,6 +19,7 @@ class Qwen3OmniARConditions(Batch):
     video_second_per_grid: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     input_features: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     feature_attention_mask: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
+    use_audio_in_video: Optional[List[bool]] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Qwen3OmniARConditions":
@@ -35,13 +36,13 @@ class Qwen3OmniARConditions(Batch):
             video_second_per_grid=d.get("video_second_per_grid"),
             input_features=d.get("input_features"),
             feature_attention_mask=d.get("feature_attention_mask"),
+            use_audio_in_video=d.get("use_audio_in_video"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
         if self.prompt is None:
             raise ValueError("Qwen3OmniARConditions.to_dict: prompt field is None")
         out: Dict[str, Any] = {"prompt": self.prompt}
-        # Omit absent video fields from text-only tracks.
         if self.pixel_values_videos is not None:
             out["pixel_values_videos"] = self.pixel_values_videos
         if self.video_grid_thw is not None:
@@ -52,6 +53,8 @@ class Qwen3OmniARConditions(Batch):
             out["input_features"] = self.input_features
         if self.feature_attention_mask is not None:
             out["feature_attention_mask"] = self.feature_attention_mask
+        if self.use_audio_in_video is not None:
+            out["use_audio_in_video"] = self.use_audio_in_video
         return out
 
 

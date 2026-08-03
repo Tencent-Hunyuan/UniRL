@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from unirl.models.types.conversations import build_omni_messages
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample, Turn
@@ -104,6 +105,7 @@ class Qwen3OmniPipeline(Pipeline):
         self,
         turns: List[Turn],
         control: Optional[Dict[str, Any]] = None,
+        prompt_media_refs: Optional[List[List[Any]]] = None,
     ) -> Qwen3OmniARConditions:
         """Render the trajectory using config plus root-Part chat overrides."""
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
@@ -130,7 +132,12 @@ class Qwen3OmniPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
-        return chat_stage.embed(turns)
+        conversations = build_omni_messages(
+            turns,
+            system_instruction,
+            prompt_media_refs=prompt_media_refs,
+        )
+        return chat_stage.embed_messages(conversations)
 
     def generate(self, sample: Sample) -> Sample:
         """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""
@@ -139,7 +146,9 @@ class Qwen3OmniPipeline(Pipeline):
         assert isinstance(ar, ARSamplingParams)
 
         turns = sample.turns()
-        conds = self._conditions_for(turns, sample.parts[0].control)
+        metadata = sample.root_metadata()
+        prompt_media_refs = [list((row or {}).get("_media_refs") or []) for row in metadata]
+        conds = self._conditions_for(turns, sample.parts[0].control, prompt_media_refs)
 
         params = Qwen3OmniARParams(
             max_tokens=ar.max_new_tokens,

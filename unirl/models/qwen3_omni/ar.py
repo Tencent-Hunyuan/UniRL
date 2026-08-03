@@ -27,12 +27,12 @@ logger = logging.getLogger(__name__)
 def _fuse_mm_embeds(
     transformer: Any,
     full_ids: torch.Tensor,
-    pixel_values_videos: torch.Tensor,
-    video_grid_thw: torch.Tensor,
+    pixel_values_videos: Optional[torch.Tensor] = None,
+    video_grid_thw: Optional[torch.Tensor] = None,
     input_features: Optional[torch.Tensor] = None,
     feature_attention_mask: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
-    """Prepare audio, video, and DeepStack inputs inside the root FSDP forward."""
+) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[torch.Tensor]]:
+    """Prepare audio, video, and DeepStack inputs inside FSDP."""
     inputs_embeds = transformer.get_input_embeddings()(full_ids)
     if input_features is not None:
         try:
@@ -58,35 +58,42 @@ def _fuse_mm_embeds(
         audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
         _, _, audio_mask = transformer.get_placeholder_mask(full_ids, inputs_embeds=inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
-    try:
-        video_outputs = transformer.get_video_features(
-            pixel_values_videos,
-            video_grid_thw,
-            return_dict=True,
+
+    visual_multiscale: Optional[List[torch.Tensor]] = None
+    visual_mask: Optional[torch.Tensor] = None
+    legacy_visual_outputs = False
+
+    def _unpack_visual(outputs: Any) -> Tuple[torch.Tensor, List[torch.Tensor], bool]:
+        if hasattr(outputs, "pooler_output"):
+            return outputs.pooler_output, list(outputs.deepstack_features), False
+        embeds, multiscale = outputs
+        return embeds, list(multiscale), True
+
+    if pixel_values_videos is not None:
+        try:
+            video_outputs = transformer.get_video_features(
+                pixel_values_videos,
+                video_grid_thw,
+                return_dict=True,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'return_dict'" not in str(exc):
+                raise
+            video_outputs = transformer.get_video_features(pixel_values_videos, video_grid_thw)
+        video_embeds, video_multiscale, video_legacy = _unpack_visual(video_outputs)
+        video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+        _, video_mask, _ = transformer.get_placeholder_mask(
+            full_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
         )
-    except TypeError as exc:
-        # Transformers releases differ here: older Qwen3-Omni returns
-        # ``(video_embeds, deepstack_features)`` and rejects return_dict.
-        if "unexpected keyword argument 'return_dict'" not in str(exc):
-            raise
-        video_outputs = transformer.get_video_features(pixel_values_videos, video_grid_thw)
-    if hasattr(video_outputs, "pooler_output"):
-        video_embeds = video_outputs.pooler_output
-        video_embeds_multiscale = video_outputs.deepstack_features
-        legacy_video_outputs = False
-    else:
-        video_embeds, video_embeds_multiscale = video_outputs
-        # The legacy text model reduces this expanded mask in
-        # ``_deepstack_process``; pre-reducing it here indexes the batch axis.
-        legacy_video_outputs = True
-    video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-    _, video_mask, _ = transformer.get_placeholder_mask(
-        full_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
-    )
-    inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-    deepstack_embeds = list(video_embeds_multiscale)
-    visual_pos_masks = video_mask if legacy_video_outputs else video_mask[..., 0]
-    return inputs_embeds, deepstack_embeds, visual_pos_masks
+        inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+        visual_multiscale = video_multiscale
+        visual_mask = video_mask[..., 0]
+        legacy_visual_outputs = video_legacy
+
+    visual_pos_masks = None
+    if visual_mask is not None:
+        visual_pos_masks = visual_mask.unsqueeze(-1).expand_as(inputs_embeds) if legacy_visual_outputs else visual_mask
+    return inputs_embeds, visual_multiscale, visual_pos_masks
 
 
 def _replay_aware_forward(
@@ -114,20 +121,21 @@ def _replay_aware_forward(
     pixel_values_videos = kw.pop("pixel_values_videos", None)
     input_features = kw.pop("input_features", None)
     feature_attention_mask = kw.pop("feature_attention_mask", None)
-    if pixel_values_videos is not None:
-        video_grid_thw = kw.pop("video_grid_thw")
+    if pixel_values_videos is not None or input_features is not None:
+        video_grid_thw = kw.pop("video_grid_thw", None)
         fuse_full_ids = kw.pop("fuse_full_ids")
         inputs_embeds, deepstack_embeds, visual_pos_masks = _fuse_mm_embeds(
             self,
             fuse_full_ids,
-            pixel_values_videos,
-            video_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
             input_features=input_features,
             feature_attention_mask=feature_attention_mask,
         )
         kw["inputs_embeds"] = inputs_embeds
-        kw["deepstack_visual_embeds"] = deepstack_embeds
-        kw["visual_pos_masks"] = visual_pos_masks
+        if deepstack_embeds is not None:
+            kw["deepstack_visual_embeds"] = deepstack_embeds
+            kw["visual_pos_masks"] = visual_pos_masks
 
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
@@ -241,6 +249,44 @@ def _merge_audio(
     return torch.cat(features, dim=0), torch.cat(masks, dim=0)
 
 
+def _per_sample_rope(
+    transformer: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    conditions: Qwen3OmniARConditions,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build TMRoPE positions without applying a batch-wide audio/video flag."""
+    batch_size = int(input_ids.shape[0])
+    device = input_ids.device
+    video_grids = conditions.video_grid_thw or [None] * batch_size
+    seconds = conditions.video_second_per_grid or [None] * batch_size
+    features = conditions.input_features or [None] * batch_size
+    feature_masks = conditions.feature_attention_mask or [None] * batch_size
+    audio_in_video = conditions.use_audio_in_video or [False] * batch_size
+    position_parts: List[torch.Tensor] = []
+    delta_parts: List[torch.Tensor] = []
+    for row in range(batch_size):
+        feature = features[row]
+        feature_mask = feature_masks[row]
+        has_audio = feature is not None and feature_mask is not None
+        audio_seqlens = feature_mask.to(device=device).sum(-1) if has_audio else None
+        position_ids, rope_delta = transformer.get_rope_index(
+            input_ids[row : row + 1],
+            image_grid_thw=None,
+            video_grid_thw=video_grids[row].to(device=device) if video_grids[row] is not None else None,
+            attention_mask=attention_mask[row : row + 1],
+            use_audio_in_video=bool(audio_in_video[row]),
+            audio_seqlens=audio_seqlens,
+            second_per_grids=seconds[row].to(device=device) if seconds[row] is not None else None,
+        )
+        position_parts.append(position_ids)
+        delta_parts.append(torch.as_tensor(rope_delta, device=device).reshape(1, -1))
+    position_ids = torch.cat(position_parts, dim=1).long()
+    rope_deltas = torch.cat(delta_parts, dim=0)
+    rope_deltas = rope_deltas - (1 - attention_mask.long()).sum(dim=-1, keepdim=True)
+    return position_ids, rope_deltas
+
+
 class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
     """Rollout-level AR stage for the Qwen3-Omni thinker."""
 
@@ -319,7 +365,12 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         if ivf is not None:
             model_kwargs["input_features"] = ivf
             model_kwargs["feature_attention_mask"] = fam
-            model_kwargs["use_audio_in_video"] = True
+            model_kwargs["use_audio_in_video"] = any(conditions.use_audio_in_video or [])
+        if pvv is not None or ivf is not None:
+            position_ids, rope_deltas = _per_sample_rope(transformer, input_ids, attention_mask, conditions)
+            model_kwargs["position_ids"] = position_ids
+            if hasattr(transformer, "model") and hasattr(transformer.model, "rope_deltas"):
+                transformer.model.rope_deltas = rope_deltas
 
         cur_input_ids = input_ids
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
@@ -335,6 +386,8 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                 "use_cache": True,
             }
             if is_first_step:
+                if "position_ids" in model_kwargs:
+                    prep_kwargs["position_ids"] = model_kwargs["position_ids"]
                 if "pixel_values_videos" in model_kwargs:
                     prep_kwargs["pixel_values_videos"] = model_kwargs["pixel_values_videos"]
                 if "video_grid_thw" in model_kwargs:
@@ -344,7 +397,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                 if "input_features" in model_kwargs:
                     prep_kwargs["input_features"] = model_kwargs["input_features"]
                     prep_kwargs["feature_attention_mask"] = model_kwargs["feature_attention_mask"]
-                    prep_kwargs["use_audio_in_video"] = True
+                    prep_kwargs["use_audio_in_video"] = model_kwargs["use_audio_in_video"]
 
             model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
             with torch.no_grad():
@@ -457,56 +510,25 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             "autocast_dtype": (self.autocast_dtype if device.type == "cuda" else None),
         }
 
-        if pvv is None:
+        if pvv is None and ivf is None:
             # Cumulative positions keep text RoPE invariant to padding.
             forward_kwargs["input_ids"] = full_ids
             forward_kwargs["attention_mask"] = full_mask
             forward_kwargs["position_ids"] = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
         else:
-            # Compute TMRoPE here, but defer parameter reads to the FSDP forward.
-            pvv = pvv.to(device=device, dtype=self.model.dtype)
-            vgt = vgt.to(device=device)
-            use_audio = ivf is not None
-            if use_audio:
+            # Compute per-row TMRoPE here, but defer tower parameter reads to FSDP.
+            position_ids, _ = _per_sample_rope(transformer, full_ids, full_mask, conditions)
+            if pvv is not None:
+                forward_kwargs["pixel_values_videos"] = pvv.to(device=device, dtype=self.model.dtype)
+                forward_kwargs["video_grid_thw"] = vgt.to(device=device)
+            if ivf is not None:
                 ivf = ivf.to(device=device, dtype=self.model.dtype)
                 fam = fam.to(device=device)
-            # ``use_audio_in_video`` is a batch-wide Transformers flag. Build
-            # positions per sample so a video without an audio track does not
-            # consume the following sample's video grid as text.
-            sample_video_grids = conditions.video_grid_thw or [None] * batch_size
-            sample_seconds = conditions.video_second_per_grid or [None] * batch_size
-            sample_features = conditions.input_features or [None] * batch_size
-            sample_feature_masks = conditions.feature_attention_mask or [None] * batch_size
-            position_parts: List[torch.Tensor] = []
-            for b in range(batch_size):
-                sample_grid = sample_video_grids[b]
-                sample_second = sample_seconds[b]
-                sample_feature = sample_features[b]
-                sample_feature_mask = sample_feature_masks[b]
-                sample_has_audio = sample_feature is not None and sample_feature_mask is not None
-                sample_audio_seqlens = sample_feature_mask.to(device=device).sum(-1) if sample_has_audio else None
-                sample_position_ids, _ = transformer.get_rope_index(
-                    full_ids[b : b + 1],
-                    image_grid_thw=None,
-                    video_grid_thw=sample_grid.to(device=device) if sample_grid is not None else None,
-                    attention_mask=full_mask[b : b + 1],
-                    use_audio_in_video=sample_has_audio,
-                    audio_seqlens=sample_audio_seqlens,
-                    second_per_grids=(sample_second.to(device=device) if sample_second is not None else None),
-                )
-                position_parts.append(sample_position_ids)
-            # Preserve the [3, B, seq] temporal/height/width position layout.
-            position_ids = torch.cat(position_parts, dim=1)
-            # Integer positions prevent FSDP mixed precision from rounding indices.
-            position_ids = position_ids.long()
-            forward_kwargs["pixel_values_videos"] = pvv
-            forward_kwargs["video_grid_thw"] = vgt
+                forward_kwargs["input_features"] = ivf
+                forward_kwargs["feature_attention_mask"] = fam
             forward_kwargs["fuse_full_ids"] = full_ids
             forward_kwargs["attention_mask"] = full_mask
             forward_kwargs["position_ids"] = position_ids
-            if use_audio:
-                forward_kwargs["input_features"] = ivf
-                forward_kwargs["feature_attention_mask"] = fam
         per_token = transformer(**forward_kwargs)  # [B, T_max] FP32
 
         if T_max == 0:

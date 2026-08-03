@@ -7,8 +7,8 @@ from typing import Optional
 import numpy as np
 
 
-def extract_audio_from_video_pyav(path: str, target_sr: int = 16000) -> Optional[np.ndarray]:
-    """Decode a video's audio track to a mono float32 waveform."""
+def load_audio_pyav(path: str, target_sr: int = 16000) -> Optional[np.ndarray]:
+    """Decode the first audio stream to a mono float32 waveform."""
     import av
 
     container = av.open(path)
@@ -31,4 +31,9 @@ def extract_audio_from_video_pyav(path: str, target_sr: int = 16000) -> Optional
     return waveform if waveform.size else None
 
 
-__all__ = ["extract_audio_from_video_pyav"]
+def extract_audio_from_video_pyav(path: str, target_sr: int = 16000) -> Optional[np.ndarray]:
+    """Decode a video's embedded audio track."""
+    return load_audio_pyav(path, target_sr)
+
+
+__all__ = ["extract_audio_from_video_pyav", "load_audio_pyav"]

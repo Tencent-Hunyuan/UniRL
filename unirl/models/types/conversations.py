@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from unirl.types.primitives import Images, Texts, Videos
+from unirl.types.primitives import Audios, Images, Texts, Videos
 from unirl.types.sample import Turn
 
 # One sample's chat conversation: an ordered list of role-tagged messages.
@@ -178,9 +178,93 @@ def build_video_messages(
     return conversations
 
 
+def build_omni_messages(
+    turns: List[Turn],
+    system_instruction: Optional[str] = None,
+    *,
+    prompt_media_refs: Optional[List[List[Any]]] = None,
+) -> List[Conversation]:
+    """Render Qwen3-Omni text/audio/video conversations per row.
+
+    ``prompt_media_refs`` is the sparse request-side channel used by mixed
+    batches. Each row contains normalized refs with ``modality`` and ``uri``;
+    refs are prepended to the first user message without forcing a rectangular
+    media primitive Part.
+    """
+    if not turns:
+        return []
+    supported = (Texts, Videos, Audios)
+    unsupported = [type(turn.content).__name__ for turn in turns if not isinstance(turn.content, supported)]
+    if unsupported:
+        raise ValueError(f"build_omni_messages: unsupported turn content {unsupported}.")
+
+    n_rows = len(turns[0].content)
+    mismatched = [i for i, turn in enumerate(turns) if len(turn.content) != n_rows]
+    if mismatched:
+        raise ValueError(
+            f"build_omni_messages: frontier-aligned turns must share batch size {n_rows}; "
+            f"mismatched turn indices {mismatched}."
+        )
+    refs_by_row = prompt_media_refs if prompt_media_refs is not None else [[] for _ in range(n_rows)]
+    if len(refs_by_row) != n_rows:
+        raise ValueError(f"build_omni_messages: media-ref rows {len(refs_by_row)} != text rows {n_rows}.")
+
+    roles = [turn.role for turn in turns]
+    role_groups = _group_consecutive_roles(roles)
+    prefix = _system_prefix(system_instruction, roles)
+    columns: List[List[Any]] = []
+    for turn in turns:
+        if isinstance(turn.content, Texts):
+            columns.append(list(turn.content.texts))
+        elif isinstance(turn.content, Videos):
+            columns.append(_video_rows(turn.content))
+        else:
+            columns.append([audio.waveform for audio in turn.content.to_list()])
+
+    conversations: List[Conversation] = []
+    for row in range(n_rows):
+        messages: Conversation = list(prefix)
+        for role, indices in role_groups:
+            media_blocks: List[Dict[str, Any]] = []
+            text_blocks: List[Dict[str, Any]] = []
+            for index in indices:
+                content = turns[index].content
+                value = columns[index][row]
+                if isinstance(content, Texts):
+                    text_blocks.append({"type": "text", "text": value})
+                elif isinstance(content, Videos):
+                    media_blocks.append({"type": "video", "video": value})
+                else:
+                    media_blocks.append({"type": "audio", "audio": value})
+            messages.append({"role": role, "content": media_blocks + text_blocks})
+
+        sparse_blocks: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for ref in refs_by_row[row] or []:
+            modality = str(ref.get("modality") if isinstance(ref, dict) else getattr(ref, "modality", "")).lower()
+            uri = ref.get("uri") if isinstance(ref, dict) else getattr(ref, "uri", None)
+            if modality not in {"audio", "video"}:
+                raise ValueError(f"build_omni_messages: unsupported prompt media modality {modality!r}.")
+            if modality in seen:
+                raise ValueError(f"build_omni_messages: row {row} has more than one {modality} prompt input.")
+            seen.add(modality)
+            sparse_blocks.append({"type": modality, modality: uri})
+        if sparse_blocks:
+            user_message = next((message for message in messages if message.get("role") == "user"), None)
+            if user_message is None:
+                messages.append({"role": "user", "content": sparse_blocks})
+            elif isinstance(user_message.get("content"), list):
+                user_message["content"] = sparse_blocks + user_message["content"]
+            else:
+                user_message["content"] = sparse_blocks + [{"type": "text", "text": str(user_message["content"])}]
+        conversations.append(messages)
+    return conversations
+
+
 __all__ = [
     "Conversation",
     "build_text_messages",
+    "build_omni_messages",
     "build_video_messages",
     "build_vision_messages",
 ]
