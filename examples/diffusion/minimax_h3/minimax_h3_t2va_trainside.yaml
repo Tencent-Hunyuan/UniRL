@@ -111,11 +111,18 @@ backend:
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
-    # Attention + FFN only, all strictly INSIDE MiniMaxH3TransformerBlock.
-    # Deliberately NOT the fp32-pinned projections (proj_in / proj_out /
-    # time_embedder) and NOT adaln_proj: adapting a module the wrap keeps in
-    # fp32 outside every FSDP group would put a trainable param outside all
-    # groups, whose grads no collective would DP-sync.
+    # LOAD-BEARING alongside root_wrap=false. The suffixes below also occur in
+    # `token_refiner.refiner_blocks.*` (MiniMaxH3TokenRefinerBlock — a plain
+    # pre-norm block over the text stream, NOT in block_class_names), so an
+    # unscoped target list injects 24 LoRA params that sit outside every
+    # fully_shard group and whose grads no collective would DP-sync. fsdp_wrap
+    # rejects exactly that. module_prefix scopes the suffixes to the 50-layer
+    # denoising stack, which is what this recipe means to adapt.
+    module_prefix: transformer_blocks
+    # Attention + FFN only. Deliberately NOT the fp32-pinned projections
+    # (proj_in / proj_out / time_embedder) and NOT adaln_proj: adapting a module
+    # the wrap keeps in fp32 outside every FSDP group would put a trainable
+    # param outside all groups, with the same un-synced-grad failure.
     target_modules:
       - attn.to_q
       - attn.to_k
