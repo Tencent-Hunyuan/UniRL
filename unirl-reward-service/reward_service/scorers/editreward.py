@@ -21,40 +21,50 @@ from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
 
 if TYPE_CHECKING:
-    from PIL import Image
+    pass
 
 
 class EditRewardScorer(BaseScorer):
     """Multi-head edit reward scorer backed by EditRewardInferencer."""
 
     name = "editreward"
+    version = "1"
+    input_kind = "image"
+    supports_offload = True
     sub_metric_names = ("edit_following", "edit_quality")
 
     def __init__(
         self,
         checkpoint_path: str,
         config_path: str | None = None,
+        model_name_or_path: str | None = None,
         device: str = "cuda",
         dtype: str = "bfloat16",
         rm_head_type: str = "ranknet_multi_head",
+        offload_between_calls: bool = False,
     ) -> None:
         import os
 
         from reward_service.scorers._editreward import EditRewardInferencer
 
-        self._device = device if torch.cuda.is_available() else "cpu"
+        self._target_device = device if torch.cuda.is_available() else "cpu"
+        self._offload_between_calls = bool(offload_between_calls and self._target_device != "cpu")
+        initial_device = "cpu" if self._offload_between_calls else self._target_device
         self._rm_head_type = rm_head_type
 
         # If checkpoint_path looks like a HF repo ID (not a local dir),
         # download it via huggingface_hub first.
         if not os.path.isdir(checkpoint_path) and "/" in checkpoint_path:
             from huggingface_hub import snapshot_download
+
             checkpoint_path = snapshot_download(repo_id=checkpoint_path)
 
         self.inferencer = EditRewardInferencer(
             config_path=config_path,
             checkpoint_path=checkpoint_path,
-            device=self._device,
+            model_name_or_path=model_name_or_path,
+            dtype=dtype,
+            device=initial_device,
             reward_dim="dim1",
             rm_head_type=rm_head_type,
         )
@@ -64,6 +74,15 @@ class EditRewardScorer(BaseScorer):
         if not items:
             return []
 
+        try:
+            if self._offload_between_calls:
+                self.onload()
+            return self._score_batch(items)
+        finally:
+            if self._offload_between_calls:
+                self.offload()
+
+    def _score_batch(self, items: list[ScoreItem]) -> list[dict[str, float]]:
         # Score ALL valid items in ONE batched inferencer.reward() call. The
         # previous loop ran the 7B VLM once PER item (a batch of 1), so a
         # rollout's worth of scoring was N sequential forwards (~2h at 896
@@ -78,9 +97,7 @@ class EditRewardScorer(BaseScorer):
         for i, item in enumerate(items):
             try:
                 if len(item.history) < 2:
-                    raise ValueError(
-                        f"EditReward requires 2 history turns (source + edited), got {len(item.history)}"
-                    )
+                    raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
                 prompt, source_image = item.history[0]
                 _, edited_image = item.history[1]
                 if source_image is None or edited_image is None:
@@ -151,9 +168,7 @@ class EditRewardScorer(BaseScorer):
             history[1] = (prompt, edited_image)
         """
         if len(item.history) < 2:
-            raise ValueError(
-                f"EditReward requires 2 history turns (source + edited), got {len(item.history)}"
-            )
+            raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
 
         prompt, source_image = item.history[0]
         _, edited_image = item.history[1]
@@ -203,6 +218,16 @@ class EditRewardScorer(BaseScorer):
 
         # Fallback
         return {k: float("nan") for k in self.sub_metric_names}
+
+    def onload(self) -> None:
+        self.inferencer.model.to(self._target_device)
+        self.inferencer.device = self._target_device
+
+    def offload(self) -> None:
+        self.inferencer.model.to("cpu")
+        self.inferencer.device = "cpu"
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def close(self) -> None:
         if hasattr(self, "inferencer"):

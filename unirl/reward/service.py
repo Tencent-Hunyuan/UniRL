@@ -157,6 +157,12 @@ class RewardService(Remote):
     def dispose(self) -> None:
         self.backend.dispose()
 
+    def shutdown(self) -> None:
+        """Worker teardown hook: release backend sessions and managed children."""
+        self.dispose()
+
+    close = shutdown
+
 
 __all__ = [
     "RewardService",
