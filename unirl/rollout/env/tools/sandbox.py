@@ -1,9 +1,9 @@
 """SandboxTool — a persistent Python-REPL subprocess tool (LIN-533).
 
-The first out-of-process :class:`~unirl.rollout.loop.tools.tool.StatefulTool`: each session owns a
+The first out-of-process :class:`~unirl.rollout.env.tools.base.StatefulTool`: each session owns a
 long-lived ``python`` subprocess whose global namespace **persists across turns**, so ``x = 40`` on
 one turn and ``x + 2`` on the next returns ``42`` — the cross-turn capability a stateless
-:class:`~unirl.rollout.loop.tools.tool.Tool` cannot express.
+:class:`~unirl.rollout.env.tools.base.Tool` cannot express.
 
 Lifecycle (all off the shared event loop — ``execute_session``/``session_end`` run in
 ``ToolEnvironment``'s executor):
@@ -31,7 +31,7 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
-from unirl.rollout.loop.tools.tool import StatefulTool
+from unirl.rollout.env.tools.base import StatefulTool
 
 # Runs in the child process. Protocol: read one JSON line ``{"code": ...}`` from stdin; exec it in a
 # persistent namespace with stdout+stderr captured; if the last top-level statement is an expression,

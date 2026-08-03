@@ -1,6 +1,6 @@
 """VisitTool — read webpage(s) and summarize toward a goal (LIN-519, hardened).
 
-A concrete :class:`~unirl.rollout.loop.tools.tool.Tool` for the deep-research
+A concrete :class:`~unirl.rollout.env.tools.base.Tool` for the deep-research
 agent: fetch a URL's content with the Jina reader (needs ``$JINA_API_KEYS``) and
 summarize the parts relevant to a stated goal with an OpenAI-compatible LLM
 (hosted out-of-band; ``$SUMMARY_URL`` / ``$SUMMARY_MODEL`` or the constructor
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from unirl.rollout.loop.tools.tool import Tool
+from unirl.rollout.env.tools.base import Tool
 
 _JINA_READ = "https://r.jina.ai/"
 # Structured extractor (mirrors AReaL's EXTRACTOR_PROMPT): evidence + summary.

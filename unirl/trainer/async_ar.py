@@ -45,7 +45,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine
+from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -447,7 +447,7 @@ class AsyncARTrainer(ARTrainer):
         """
         engine = self._async_engine
         while True:
-            ceiling = min(num_rollouts, ((rollout_id // interval) + 1 + stale) * interval)
+            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
             while engine.next_gen_id < ceiling and engine.inflight < M:
                 engine.submit(self._build_async_sample(engine.next_gen_id))
             engine.poll()

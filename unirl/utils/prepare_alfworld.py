@@ -5,7 +5,7 @@ not a jsonl field. This emits N driver rows, one per game,
 ``{"prompt": <placeholder>, "metadata": {"game_index": i}}``, so
 ``MultimodalRLDataSource`` drives N rollouts and :meth:`AlfworldEnv.reset` maps each
 ``game_index`` to a game. The index ordering matches
-:func:`unirl.rollout.loop.alfworld_env.list_alfworld_games`, so the row and the env
+:func:`unirl.rollout.env.alfworld.list_alfworld_games`, so the row and the env
 agree on which game an index selects (and the ``n`` GRPO siblings of a prompt share the
 same game). The prompt is a non-empty placeholder only because the data source rejects
 empty-prompt rows — :meth:`AlfworldEnv.reset` discards it and uses the env observation.
@@ -19,7 +19,7 @@ import argparse
 import json
 import os
 
-from unirl.rollout.loop.alfworld_env import list_alfworld_games
+from unirl.rollout.env.alfworld import list_alfworld_games
 
 # Non-empty so the data source keeps the row; AlfworldEnv.reset() replaces it with the
 # environment's initial observation, so the text itself is never used for generation.

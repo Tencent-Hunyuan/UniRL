@@ -50,7 +50,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine
+from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
@@ -274,7 +274,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         """
         engine = self._async_engine
         while True:
-            ceiling = min(num_rollouts, ((rollout_id // interval) + 1 + stale) * interval)
+            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
             engine.poll()
             while engine.next_gen_id < ceiling and engine.inflight < M:
                 engine.submit(self._build_async_sample(engine.next_gen_id))

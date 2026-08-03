@@ -3,7 +3,7 @@
 A ``Tool`` is the two things the environment needs: a JSON schema (so the rollout prompt can
 advertise the tool to the model via ``tokenizer.apply_chat_template(tools=...)``) and an executor
 (run the parsed call, return a text result). One concrete tool per module; see
-:class:`~unirl.rollout.loop.tools.calculator.CalculatorTool`.
+:class:`~unirl.rollout.env.tools.calculator.CalculatorTool`.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class Tool(ABC):
     def execute(self, arguments: Dict[str, Any]) -> str:
         """Run the tool on parsed ``arguments`` and return the result as text.
 
-        May raise on bad input — :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`
+        May raise on bad input — :class:`~unirl.rollout.env.tool_environment.ToolEnvironment`
         catches and surfaces the error to the model as the observation, so the policy can recover.
         """
         ...
@@ -39,7 +39,7 @@ class StatefulTool(Tool):
 
     Where :class:`Tool` is a pure function (args in, text out, holds nothing), a ``StatefulTool``
     carries state across turns — a code-interpreter namespace, an editing canvas, a connection.
-    :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment` dispatches on
+    :class:`~unirl.rollout.env.tool_environment.ToolEnvironment` dispatches on
     ``isinstance(tool, StatefulTool)`` (one protocol, no code fork), so the stateless ``Tool`` path
     is byte-for-byte unchanged.
 
@@ -52,8 +52,8 @@ class StatefulTool(Tool):
       ``execute_session``, which runs off-loop in an executor.
     - ``execute_session(session_id, arguments)`` — per turn. Operates on the (lazily opened)
       per-session handle; runs in the executor via
-      :meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.step`.
-    - ``session_end(session_id)`` — once, guaranteed: the engine's ``finally`` hook calls it even on
+      :meth:`~unirl.rollout.env.tool_environment.ToolEnvironment.step`.
+    - ``session_end(session_id)`` — once, guaranteed: the harness's ``finally`` hook calls it even on
       a crashed/aborted trajectory (via ``ToolEnvironment.close``). Must be **idempotent**, a no-op
       on an unknown/never-opened id, and **must not raise**.
 
@@ -69,7 +69,7 @@ class StatefulTool(Tool):
     def execute_session(self, session_id: str, arguments: Dict[str, Any]) -> str:
         """Run the tool for ``session_id`` on parsed ``arguments``; return the result as text.
 
-        May raise on bad input — :class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`
+        May raise on bad input — :class:`~unirl.rollout.env.tool_environment.ToolEnvironment`
         catches and surfaces the error to the model as the observation.
         """
         ...

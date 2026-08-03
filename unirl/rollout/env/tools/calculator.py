@@ -1,6 +1,6 @@
 """CalculatorTool — a safe arithmetic tool (LIN-492).
 
-The first concrete :class:`~unirl.rollout.loop.tools.tool.Tool`: evaluates an arithmetic
+The first concrete :class:`~unirl.rollout.env.tools.base.Tool`: evaluates an arithmetic
 expression with no infrastructure (no sandbox, no network). Evaluation is a hand-rolled AST walk
 over a numeric whitelist — never :func:`eval` — so a hallucinated ``__import__(...)``, name, or
 attribute access is rejected rather than executed.
@@ -12,7 +12,7 @@ import ast
 import operator
 from typing import Any, Dict
 
-from unirl.rollout.loop.tools.tool import Tool
+from unirl.rollout.env.tools.base import Tool
 
 # Binary / unary operators the calculator allows. Anything else (names, calls, attributes,
 # comparisons, subscripts, ...) is rejected by ``_eval`` below.

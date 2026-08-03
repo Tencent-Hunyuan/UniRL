@@ -786,7 +786,7 @@ class Sample(Batch):
     def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
         """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
 
-        The world-response half of an agentic turn (``unirl/rollout/loop/README.md``): the
+        The world-response half of an agentic turn (``unirl/rollout/env/README.md``): the
         observation rides as a chained input Part — one child per frontier sample, ids
         extended by ``/0`` — carrying no ``sampling_params``. So it is excluded from
         :meth:`gen_parts` (never trained) and surfaced to the next turn by

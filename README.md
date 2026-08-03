@@ -126,7 +126,7 @@ their `Sample` contains everything needed to resume, while stateful environment
 episodes and tool sessions must currently be dropped. Cross-worker stateful resume
 is deferred until its resource ownership and teardown contract is implemented.
 
-See the [agent-loop guide](unirl/rollout/loop/README.md) for the environment,
+See the [agent environment guide](unirl/rollout/env/README.md) for the environment,
 tool, trajectory, and partial-resume contracts.
 
 ## Getting Started ⚡
