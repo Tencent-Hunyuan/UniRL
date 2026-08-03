@@ -11,9 +11,9 @@ from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
+from . import rl_ops
 from .config import BagelPipelineConfig
 from .vendor.data.data_utils import add_special_tokens
-from .vendor.data.transforms import ImageTransform
 from .vendor.inferencer import InterleaveInferencer
 from .vendor.modeling.autoencoder import load_ae
 from .vendor.modeling.bagel import (
@@ -126,8 +126,11 @@ class BagelBundle(Bundle):
         tokenizer = Qwen2Tokenizer.from_pretrained(model_dir)
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
-        vae_transform = ImageTransform(512, 256, 8)
-        vit_transform = ImageTransform(490, 112, 14)
+        # Image transforms (image-conditioned paths only; pure T2I never exercises
+        # them, but the inferencer constructor requires both). The geometry lives in
+        # rl_ops so the vllm_omni worker's it2i prefill builds the SAME pair — see
+        # rl_ops.build_image_transforms for the sizes and the stride-14 rationale.
+        vae_transform, vit_transform = rl_ops.build_image_transforms()
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)

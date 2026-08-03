@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -10,17 +13,23 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 __all__ = [
+    "build_image_transforms",
+    "clone_context",
     "decode_text",
     "disable_inference_cache",
     "forward_flow",
     "init_und_context",
     "pack_und_forward_inputs",
+    "inference_dispatch_scope",
     "prefill_text_split",
     "prefill_vit_split",
     "require_inference_dispatch",
+    "resize_input_image",
     "score_response",
     "score_response_with_prompt",
     "und_replay_logits",
+    "update_context_image",
+    "update_context_text",
 ]
 
 
@@ -96,6 +105,187 @@ def _pack_text_ids(text_ids: torch.Tensor, *, kv_len: int, rope_start: int) -> D
 def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Move every tensor value onto ``device`` (non-tensors pass through)."""
     return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
+
+
+@contextmanager
+def inference_dispatch_scope(model: Any) -> Iterator[None]:
+    """Force the MoT into ``eval()`` for the duration of a packed-INFERENCE call.
+
+    Every navit module routes ``forward_train`` vs ``forward_inference`` on
+    ``self.training``, so the packed-inference call shape (the
+    ``forward_cache_update_*`` prefills) dies with ``TypeError: forward_train() got an
+    unexpected keyword argument 'packed_query_sequence'`` when the module is in train
+    mode. And it IS: ``TrainStack.train_track`` puts the model in train mode before
+    the optimizer step, so the vllm_omni deferred-context REBUILD — which runs inside
+    ``replay`` — has to force eval itself, exactly as :func:`forward_flow` already
+    does for the velocity call.
+
+    Unlike ``forward_flow`` this restores the previous mode unconditionally: the
+    rebuild runs under ``no_grad``, so no activation-checkpointing recompute can land
+    back inside this scope during a later ``backward()``.
+    """
+    lm = model.language_model
+    was_training = lm.training
+    if was_training:
+        lm.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            lm.train()
+
+
+# ---------------------------------------------------------------------------
+# Image-input context prefill (shared by rollout + replay)
+# ---------------------------------------------------------------------------
+
+#: Canonical BAGEL input-image transform geometry, ``(max_size, min_size, stride)``.
+#: Sizes follow the official inference setup (flow_grpo: vae 512/256, vit 490/112).
+#: NB: the ViT resize STRIDE must equal the SigLIP patch size (14) — ``patchify``
+#: asserts ``h % patch_size == 0``, so a stride that is not a multiple of 14 makes
+#: non-square image inputs crash. flow_grpo's stride 7 (half a patch) is that bug.
+BAGEL_VAE_TRANSFORM_GEOMETRY = (512, 256, 8)
+BAGEL_VIT_TRANSFORM_GEOMETRY = (490, 112, 14)
+
+
+def build_image_transforms() -> Tuple[Any, Any]:
+    """The ``(vae_transform, vit_transform)`` pair every BAGEL image path must use.
+
+    ONE definition for both sides of the RL loop: :class:`BagelBundle` builds the
+    trainer's pair from here, and the vllm_omni worker pipeline builds its own from
+    here too. Were these to drift apart, rollout and replay would prefill differently
+    resized source images — the exact failure :func:`update_context_image` exists to
+    prevent.
+    """
+    from .vendor.data.transforms import ImageTransform
+
+    return ImageTransform(*BAGEL_VAE_TRANSFORM_GEOMETRY), ImageTransform(*BAGEL_VIT_TRANSFORM_GEOMETRY)
+
+
+def resize_input_image(bundle: Any, image: Any) -> Any:
+    """Canonical input-image preproc (inferencer.py:249): rgb → aspect-preserving
+    stride-8 resize.
+
+    Every image-input task funnels through this before the VAE/ViT branches so the
+    chain has one home — and so the trainside rollout and the vllm_omni replay feed
+    :func:`update_context_image` byte-identical pixels.
+    """
+    from .vendor.data.data_utils import pil_img2rgb
+
+    return bundle.vae_transform.resize_transform(pil_img2rgb(image))
+
+
+def _encode_vae_posterior_mean(vae: Any, x: torch.Tensor) -> torch.Tensor:
+    """Encode with the deterministic posterior mean, never a Gaussian draw."""
+    reg = getattr(vae, "reg", None)
+    if reg is None or not hasattr(reg, "chunk_dim"):
+        raise RuntimeError("BAGEL VAE has no compatible diagonal-Gaussian regulator.")
+    encoded = vae.encoder(x)
+    mean, _ = torch.chunk(encoded, 2, dim=int(reg.chunk_dim))
+    return vae.scale_factor * (mean - vae.shift_factor)
+
+
+def clone_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a BAGEL KV context for copy-on-write cache updates."""
+    cache = ctx["past_key_values"]
+    cloned_cache = type(cache)(cache.num_layers)
+    cloned_cache.key_cache = dict(cache.key_cache)
+    cloned_cache.value_cache = dict(cache.value_cache)
+    return {
+        "kv_lens": list(ctx["kv_lens"]),
+        "ropes": list(ctx["ropes"]),
+        "past_key_values": cloned_cache,
+    }
+
+
+def update_context_text(
+    bundle: Any,
+    text: str,
+    ctx: Dict[str, Any],
+    *,
+    differentiable: bool = False,
+) -> Dict[str, Any]:
+    """Prefill text, optionally bypassing the vendor's inference-only decorator."""
+    bagel = bundle.model
+    generation_input, kv_lens, ropes = bagel.prepare_prompts(
+        curr_kvlens=ctx["kv_lens"],
+        curr_rope=ctx["ropes"],
+        prompts=[text],
+        tokenizer=bundle.tokenizer,
+        new_token_ids=bundle.new_token_ids,
+    )
+    generation_input = _to_device(generation_input, torch.device(bundle.device))
+    update = _raw(type(bagel).forward_cache_update_text) if differentiable else bagel.forward_cache_update_text
+    past = (
+        update(bagel, ctx["past_key_values"], **generation_input)
+        if differentiable
+        else update(ctx["past_key_values"], **generation_input)
+    )
+    return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+
+
+def update_context_image(
+    bundle: Any,
+    image: Any,
+    ctx: Dict[str, Any],
+    *,
+    vae: bool,
+    vit: bool,
+    differentiable: bool = False,
+) -> Dict[str, Any]:
+    """Prefill one input image into a KV context (VAE and/or ViT branch).
+
+    Mirrors the vendored ``InterleaveInferencer.update_context_image``
+    (vendor/inferencer.py:62-96) with explicit device pinning: the vendored
+    ``prepare_vae_images`` / ``prepare_vit_images`` build their tensors on CPU and
+    the bundle's VAE carries no accelerate hooks, so ``padded_images`` (and the
+    packed index tensors) must be moved before the cache update. ``image`` is
+    already :func:`resize_input_image`-ed. Caller owns no_grad + autocast.
+    """
+    bagel = bundle.model
+    device = torch.device(bundle.device)
+    if vae:
+        gi, kv_lens, ropes = bagel.prepare_vae_images(
+            curr_kvlens=ctx["kv_lens"],
+            curr_rope=ctx["ropes"],
+            images=[image],
+            transforms=bundle.vae_transform,
+            new_token_ids=bundle.new_token_ids,
+        )
+        gi = _to_device(gi, device)
+        # Sticky-fp32 VAE after decode; vendor only calls .encode then vae2llm.
+        vae_mod, proj = bundle.vae, bagel.vae2llm
+        vae_dtype = next(vae_mod.parameters()).dtype
+        projection_dtype = next(proj.parameters()).dtype
+
+        def _vae_encode(x: torch.Tensor) -> torch.Tensor:
+            return _encode_vae_posterior_mean(vae_mod, x.to(dtype=vae_dtype)).to(dtype=projection_dtype)
+
+        update_vae = _raw(type(bagel).forward_cache_update_vae) if differentiable else bagel.forward_cache_update_vae
+        vae_proxy = SimpleNamespace(encode=_vae_encode)
+        past = (
+            update_vae(bagel, vae_proxy, ctx["past_key_values"], **gi)
+            if differentiable
+            else update_vae(vae_proxy, ctx["past_key_values"], **gi)
+        )
+        ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+    if vit:
+        gi, kv_lens, ropes = bagel.prepare_vit_images(
+            curr_kvlens=ctx["kv_lens"],
+            curr_rope=ctx["ropes"],
+            images=[image],
+            transforms=bundle.vit_transform,
+            new_token_ids=bundle.new_token_ids,
+        )
+        gi = _to_device(gi, device)
+        update_vit = _raw(type(bagel).forward_cache_update_vit) if differentiable else bagel.forward_cache_update_vit
+        past = (
+            update_vit(bagel, ctx["past_key_values"], **gi)
+            if differentiable
+            else update_vit(ctx["past_key_values"], **gi)
+        )
+        ctx = {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+    return ctx
 
 
 def prefill_text_split(
