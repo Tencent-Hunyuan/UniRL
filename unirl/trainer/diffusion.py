@@ -531,8 +531,9 @@ class DiffusionTrainer(BaseTrainer):
 
         Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
         Generates at the deterministic best-quality setting (``cfg_text_scale=
-        eval_cfg_text_scale``, ``eta=eval_eta``; ``eval_samples_per_prompt`` x_T per
-        prompt) and scores. The training reward plus every shared-set
+        eval_cfg_text_scale``, ``eta=eval_eta`` — at ``eval_eta=0`` the SDE gate
+        is also cleared, so the request is pure ODE; ``eval_samples_per_prompt``
+        x_T per prompt) and scores. The training reward plus every shared-set
         ``eval_rewards`` suite scores the SAME generated images over the default
         eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
         own-set suite then gets its own generation pass over its own prompts.
@@ -555,6 +556,11 @@ class DiffusionTrainer(BaseTrainer):
             samples_per_prompt=self.eval_samples_per_prompt,
             eta=self.eval_eta,
         )
+        if self.eval_eta <= 0.0:
+            # Deterministic eval must also clear the SDE gate: eta=0 with gated
+            # steps is a contradictory request — the central kernel degrades such
+            # steps to ODE, but worker-resident schedulers (BAGEL) refuse the pair.
+            replace_kwargs.update(sde_indices=[], scheduler=None)
         if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
             replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
         else:
