@@ -172,12 +172,16 @@ class MiniMaxH3Pipeline(Pipeline):
         videos = self.video_decode.decode(final_rows, geometry)
         audios = self.audio_decode.decode(final_audio_rows, geometry)
 
-        return gen.fill(
+        filled = gen.fill(
             segment=segment,
             primitives={"video": videos, "audio": audios},
             primitive_metadata={"audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE}},
             conditions=conditions.to_dict(),
         )
+        # `Part.fill` returns a PART; the engine does `chunk.parts[-1]` on what
+        # generate() hands back, so the whole Sample has to come back out.
+        # Same shape as sd3 / wan21 / ltx2.
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["MiniMaxH3Pipeline"]
