@@ -17,9 +17,9 @@
 #      weights and pushes the merged full model (FastVideo serves merged weights;
 #      it has no separate adapter path here).
 #
-# FastVideo dependency: https://github.com/Zcchill/FastVideo at or after
-# 7fe1d7db9a0b8aebb46679e7924f597431f23665. Set $FASTVIDEO_PATH to that
-# checkout; FastVideo is lazy-imported by the rollout engine only.
+# FastVideo dependency: install UniRL's `fastvideo` extra. pyproject.toml pins
+# the unmodified hao-ai-lab/FastVideo source snapshot validated by UniRL's
+# fail-closed runtime patches. FASTVIDEO_PATH remains a development override.
 #
 # This recipe defaults to replay log-probs. Native mode is enabled by setting
 # rollout.config.native_logprob=true and algorithm.old_logp_source=rollout;

@@ -65,6 +65,13 @@ vllm = [
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
 ]
+# Exact upstream source snapshot that the fail-closed FastVideo patch package is
+# verified against. This is hao-ai-lab/FastVideo PR #1222's source commit, not
+# Zcchill/FastVideo's UniRL-modified fork; UniRL re-hosts the required RL
+# contracts under unirl/rollout/engine/fastvideo/_patches.
+fastvideo = [
+  "fastvideo @ git+https://github.com/hao-ai-lab/FastVideo.git@2095477eac7e289c7a7ab13acb367ca60687c304 ; sys_platform == 'linux'",
+]
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
