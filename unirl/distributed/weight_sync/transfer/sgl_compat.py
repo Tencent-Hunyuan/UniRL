@@ -1,16 +1,4 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
+# Copyright 2023-2024 SGLang Team Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
 """Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow.
 
 Vendored verbatim (minus NPU/MUSA branches and the ``pybase64`` dependency)
@@ -44,12 +32,7 @@ from typing import Callable, List, Tuple, Union
 import torch
 from torch.multiprocessing import reductions
 
-# ---------------------------------------------------------------------------
-# patch_torch (CUDA branch only)
-# ---------------------------------------------------------------------------
-
-# The signature has not been changed for years, and we will not need this when
-# the next version is released, so it looks safe to use a constant.
+# The signature has not been changed for years, and we will not need this when the next version is released, so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
@@ -98,11 +81,6 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
-# ---------------------------------------------------------------------------
-# tensor_bucket
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class FlattenedTensorMetadata:
     """Metadata for a tensor in a flattened bucket"""
@@ -121,7 +99,6 @@ class FlattenedTensorBucket:
     while preserving all metadata needed for reconstruction.
     """
 
-    # This field is solely for users of to check whether the class supports this feature
     supports_multi_dtypes = True
 
     def __init__(
@@ -138,22 +115,18 @@ class FlattenedTensorBucket:
             metadata: Pre-computed metadata (for reconstruction)
         """
         if named_tensors is not None:
-            # Create bucket from named tensors
             self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
             self.flattened_tensor: torch.Tensor = None
 
             if not named_tensors:
                 raise ValueError("Cannot create empty tensor bucket")
 
-            # Collect metadata and flatten tensors
             current_idx = 0
             flattened_tensors: List[torch.Tensor] = [None] * len(named_tensors)
 
             for i, (name, tensor) in enumerate(named_tensors):
                 flattened = tensor.flatten().view(torch.uint8)
                 flattened_tensors[i] = flattened
-
-                # Store metadata
 
                 numel = flattened.numel()
                 metadata_obj = FlattenedTensorMetadata(
@@ -167,10 +140,8 @@ class FlattenedTensorBucket:
                 self.metadata[i] = metadata_obj
                 current_idx += numel
 
-            # Concatenate all flattened tensors
             self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
         else:
-            # Initialize from pre-flattened data
             if flattened_tensor is None or metadata is None:
                 raise ValueError("Must provide either named_tensors or both flattened_tensor and metadata")
             self.flattened_tensor = flattened_tensor
@@ -189,7 +160,6 @@ class FlattenedTensorBucket:
         Reconstruct original tensors from flattened tensor with optimized performance.
         Uses memory-efficient operations to minimize allocations and copies.
         """
-        # preallocate the result list
         reconstructed = [None] * len(self.metadata)
 
         for i, meta in enumerate(self.metadata):
@@ -198,11 +168,6 @@ class FlattenedTensorBucket:
             reconstructed[i] = (meta.name, tensor)
 
         return reconstructed
-
-
-# ---------------------------------------------------------------------------
-# MultiprocessingSerializer / SafeUnpickler
-# ---------------------------------------------------------------------------
 
 
 class MultiprocessingSerializer:
@@ -224,7 +189,6 @@ class MultiprocessingSerializer:
         output = buf.read()
 
         if output_str:
-            # Convert bytes to base64-encoded string
             output = base64.b64encode(output).decode("utf-8")
 
         return output
@@ -241,7 +205,6 @@ class MultiprocessingSerializer:
             The deserialized Python object.
         """
         if isinstance(data, str):
-            # Decode base64 string to bytes
             data = base64.b64decode(data, validate=True)
 
         return SafeUnpickler(io.BytesIO(data)).load()
@@ -249,7 +212,6 @@ class MultiprocessingSerializer:
 
 class SafeUnpickler(pickle.Unpickler):
     ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
         "builtins.",
         "collections.",
         "copyreg.",
@@ -258,28 +220,23 @@ class SafeUnpickler(pickle.Unpickler):
         "operator.",
         "types.",
         "weakref.",
-        # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
         "torch.storage.",
         "torch.nn.parameter.",
         "torch.autograd.function.",
-        # --- torch distributed ---
         "torch.distributed.",
         "torch.distributed._shard.",
         "torch.distributed._composable.",
         "torch._C._distributed_c10d.",
         "torch._C._distributed_fsdp.",
         "torch.distributed.optim.",
-        # --- multiprocessing ---
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
         "pickletools.",
-        # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
         "huggingface_hub.",
-        # --- unirl (vendored reductions + tensor bucket live here) ---
         "unirl.",
     }
 
@@ -301,9 +258,7 @@ class SafeUnpickler(pickle.Unpickler):
             raise RuntimeError(
                 f"Blocked unsafe class loading ({module}.{name}), to prevent exploitation of CVE-2025-10164"
             )
-        # Allowlist of safe-to-load modules.
         if any((module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES):
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(f"Blocked unsafe class loading ({module}.{name}), to prevent exploitation of CVE-2025-10164")

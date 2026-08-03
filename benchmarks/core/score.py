@@ -19,8 +19,7 @@ import requests
 class RewardServiceClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        # Reward services live on the internal network; corporate proxy env vars
-        # would 503 them (same rationale as unirl/reward/remote.py).
+        # Reward services live on the internal network; corporate proxy env vars would 503 them (same rationale as unirl/reward/remote.py).
         self.session = requests.Session()
         self.session.trust_env = False
 
@@ -191,10 +190,6 @@ def score_images_local_geneval2(
     return rows, n_errors
 
 
-# geneval2 metadata canary: a 64x64 white PNG plus one deliberately false VQA
-# question about it. A scorer that honors request-metadata vqa_lists (Soft-TIFA)
-# scores ~0; a pre-metadata scorer ignores it and answers its generic
-# "does the image match the prompt" template on the trivially true prompt (~1).
 _CANARY_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAYElEQVR4nO3PQQ0AIBDAMMC/50MEj4ZkVbDtmVk/OzrgVQNaA1oDWgNa"
     "A1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgNaA1oDWgPaBXKqA31N0fbGAAAAAElFTkSuQmCC"
@@ -233,7 +228,7 @@ def grade_math(answer: str, responses: List[str]) -> float:
     """avg@k exact-math correctness via HuggingFace math-verify (same grader as
     ``unirl.reward.local.mathverify``, including the ``\\boxed{}``-wrapped gold —
     bare golds like ``\\left(3, \\frac{\\pi}{2}\\right)`` mis-parse otherwise)."""
-    from math_verify import parse, verify  # lazy: pip install math-verify
+    from math_verify import parse, verify
 
     gold = parse("\\boxed{" + str(answer).strip() + "}")
     correct = 0

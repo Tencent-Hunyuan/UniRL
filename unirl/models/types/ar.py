@@ -120,7 +120,7 @@ def left_pad_prompt(
     every row is already full-length and the output is byte-identical to the
     input. Only mixed-length batches (currently mis-decoded) are rewritten.
     """
-    real_lens = attention_mask.long().sum(dim=1)  # [B]
+    real_lens = attention_mask.long().sum(dim=1)
     if real_lens.numel() == 0:
         return input_ids, attention_mask
     max_real = int(real_lens.max().item())
@@ -136,7 +136,6 @@ def left_pad_prompt(
         n = int(real_lens[b].item())
         if n == 0:
             continue
-        # Gather row b's real tokens (mask==1, in order) and right-align them.
         real_tokens = input_ids[b][bool_mask[b]][:max_real]
         lp_ids[b, max_real - n :] = real_tokens
         lp_mask[b, max_real - n :] = 1

@@ -72,17 +72,13 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
     out.
     """
 
-    gen_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
-    gen_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, K] long
-    cond_vae_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
-    cond_vit_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
-    cond_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, K] long
-    # Per-sample TRUE prompt length [B] long — set only on the two-engine AR
-    # path (``response._build_ar_fused_condition``), where ``input_ids`` is
-    # right-padded across variable-length per-request prompts. ``ARStage.replay``
-    # uses it to slice each sample's real prompt (no padding corruption). A plain
-    # 1D CONCAT field (cat, not _pad_attn) so it survives Batch merges.
-    prompt_lengths: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B] long
+    gen_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    gen_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    cond_vae_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    cond_vit_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    cond_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    # Per-sample TRUE prompt length [B] long — set only on the two-engine AR path (``response._build_ar_fused_condition``), where ``input_ids`` is right-padded across variable-length per-request prompts. A plain 1D CONCAT field (cat, not _pad_attn) so it survives Batch merges.
+    prompt_lengths: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "HunyuanImage3FusedMultimodalCondition":
@@ -200,7 +196,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
                         if item.cond_vit_image_mask is not None
                         else None,
                         cond_timestep_scatter_index=item.cond_timestep_scatter_index,
-                        prompt_lengths=item.prompt_lengths,  # [B] — not L-padded
+                        prompt_lengths=item.prompt_lengths,
                     )
                 )
             else:
@@ -234,12 +230,7 @@ class HunyuanImage3DiffusionConditions(Batch):
     cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Opaque ``apply_chat_template`` output — used by the KV-cache path's
-    # first ``_update_model_kwargs_for_generation`` call to drive the
-    # gather-down from the full L sequence to the L' changed slice. Carries
-    # ``joint_image_slices`` / ``gen_image_slices`` / etc. internally; we
-    # treat it as opaque. Non-transportable; lives only for one diffuse()
-    # call. ``None`` means the kernel falls back to the stateless path.
+    # Opaque ``apply_chat_template`` output — used by the KV-cache path's first ``_update_model_kwargs_for_generation`` call to drive the gather-down from the full L sequence to the L' changed slice. ``None`` means the kernel falls back to the stateless path.
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod

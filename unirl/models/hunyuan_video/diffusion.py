@@ -68,7 +68,6 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
     compatible because Python protocols are non-strict on extra kwargs.
     """
 
-    # Sigma -> transformer timestep scale (sigma in [0, 1] -> t in [0, 1000]).
     TIMESTEP_SCALE: ClassVar[float] = 1000.0
 
     def predict_noise(
@@ -107,8 +106,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         device = sample.device
         dtype = prompt_embeds.dtype
 
-        # Sigma -> timestep scaling. Always cast to a [B]-shape tensor on
-        # the model's compute dtype.
+        # Sigma -> timestep scaling. Always cast to a [B]-shape tensor on the model's compute dtype.
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size)
         elif sigma.shape[0] != batch_size:
@@ -117,14 +115,11 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             timestep = sigma
         timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
 
-        # Guidance embedding: pass guidance_scale as a [B] tensor.
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=dtype)
 
-        # No channel-dim packing (in_channels=16, sample is already the
-        # correct shape). No CFG (guidance_embeds handles this).
+        # No channel-dim packing (in_channels=16, sample is already the correct shape).
         hidden_states = sample.to(dtype)
 
-        # Build kwargs for the transformer forward.
         kwargs: Dict = {
             "hidden_states": hidden_states,
             "timestep": timestep,
@@ -133,14 +128,11 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             "guidance": guidance,
             "return_dict": False,
         }
-        # encoder_attention_mask is optional; only pass if we have it
-        # (some prompts may have variable-length sequences that need masking).
+        # encoder_attention_mask is optional; only pass if we have it (some prompts may have variable-length sequences that need masking).
         if attention_mask is not None:
             kwargs["encoder_attention_mask"] = attention_mask
 
         return model.transformer(**kwargs)[0]
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -263,10 +255,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("HunyuanVideoTransformerBlock",)
 
-    # VAE downsample defaults from upstream; overridden at construction
-    # if the bundle's VAE exposes ``spatial_compression_ratio`` /
-    # ``temporal_compression_ratio`` attributes.
-    # HunyuanVideo-1.0: spatial=8x, temporal=4x, latent_channels=16.
     DEFAULT_SPATIAL_DOWNSAMPLE: ClassVar[int] = 8
     DEFAULT_TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
     DEFAULT_LATENT_CHANNELS: ClassVar[int] = 16
@@ -291,8 +279,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
 
-        # VAE geometry: prefer attributes on the VAE itself, then the VAE
-        # config, then the dataclass-level defaults.
         vae = model.vae
         if spatial_compression_ratio is None:
             spatial_compression_ratio = (
@@ -318,10 +304,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
                 ch = int(getattr(tx_cfg, "out_channels", self.DEFAULT_LATENT_CHANNELS))
             latent_channels = ch
         self.latent_channels = int(latent_channels)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def _latent_shape(self, *, height: int, width: int, num_frames: int) -> Tuple[int, int, int]:
         latent_t = (int(num_frames) - 1) // self.temporal_compression_ratio + 1
@@ -431,7 +413,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             if log_prob is not None:
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # 6D stacked storage: [B, K, C, T_lat, H_lat, W_lat].
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
@@ -440,9 +421,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp modality=VIDEO via the factory so downstream
-        # ``segment.modality``-based routing doesn't mistake video latents
-        # for image latents.
+        # Stamp modality=VIDEO via the factory so downstream ``segment.modality``-based routing doesn't mistake video latents for image latents.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,
@@ -450,10 +429,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -535,10 +510,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
-
     def predict_noise_at_step(
         self,
         conditions: HunyuanVideoConditions,
@@ -555,10 +526,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             conditions,
             guidance_scale=float(params.guidance_scale),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the FSDP wrap target -- the bundle's transformer."""

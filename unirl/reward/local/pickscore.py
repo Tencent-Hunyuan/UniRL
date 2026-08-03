@@ -40,9 +40,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
         self.model = self.model.to(dtype=torch.float32)
 
-        # Differentiable image preprocessing (for compute_rewards_differentiable):
-        # replicate the CLIP image processor's resize/center-crop/normalize on a
-        # grad-carrying tensor (the PIL processor path detaches). Mirrors clip.py.
+        # Differentiable image preprocessing (for compute_rewards_differentiable): replicate the CLIP image processor's resize/center-crop/normalize on a grad-carrying tensor (the PIL processor path detaches).
         import torch.nn as nn
         import torchvision.transforms as T
 
@@ -162,7 +160,6 @@ class PickScoreRewardScorer(LocalRewardBackend):
             )
             text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
 
-            # Image path keeps grad; text/logit_scale are constants.
             image_embs = _extract_tensor(self.model.get_image_features(pixel_values=px))
             image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
             with torch.no_grad():

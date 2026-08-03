@@ -21,13 +21,10 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-# Inclusive max for torch.Generator.manual_seed and torch initial_seed conventions.
 MAX_TORCH_SEED = (1 << 63) - 1
 
 
-# Group-id prefix selecting prompt-content seeding: x_T is keyed only on the prompt text
-# (rank/step-independent), so the same prompt yields the same image across steps/checkpoints.
-# Used by eval for reproducible, comparable generations.
+# Group-id prefix selecting prompt-content seeding: x_T is keyed only on the prompt text (rank/step-independent), so the same prompt yields the same image across steps/checkpoints. Used by eval for reproducible, comparable generations.
 PROMPT_SEED_PREFIX = "prompt:"
 
 

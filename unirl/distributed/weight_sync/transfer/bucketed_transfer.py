@@ -49,8 +49,7 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
     func, args = handle
     list_args = list(args)
     if device_id is not None:
-        # the key is to change device id to the current device id
-        # in case two processes have different CUDA_VISIBLE_DEVICES
+        # the key is to change device id to the current device id in case two processes have different CUDA_VISIBLE_DEVICES
         list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
@@ -101,9 +100,7 @@ class BucketedWeightSender:
         bucket_size_mb: int = 2048,
         use_shm: bool = False,
     ) -> None:
-        # 2048 MB so the largest single tensor in HI3 (``lm_head.weight``,
-        # ~1 GiB at bf16) fits in one bucket. The upstream default of 512 MB
-        # would trip the per-tensor assertion below for that param.
+        # 2048 MB so the largest single tensor in HI3 (``lm_head.weight``, ~1 GiB at bf16) fits in one bucket. The upstream default of 512 MB would trip the per-tensor assertion below for that param.
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = int(bucket_size_mb)
         self.bucket_size = self.bucket_size_mb << 20
@@ -127,9 +124,7 @@ class BucketedWeightSender:
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             async for name, weight in _ensure_async_iterator(weights):
-                # model parameters are in fp32 full precision; preserve their
-                # dtype rather than force-casting (some — e.g. moe gates — must
-                # stay fp32). Receiver will cast on demand if it wants.
+                # model parameters are in fp32 full precision; preserve their dtype rather than force-casting (some — e.g. moe gates — must stay fp32).
                 if offset + weight.nbytes > self.bucket_size:
                     torch.cuda.synchronize()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
@@ -299,8 +294,7 @@ class BucketedWeightReceiver:
         if self.socket is not None:
             self.socket.close()
             self.socket = None
-        # Synchronize before releasing the buffer to ensure all async ops
-        # referencing it (e.g. clone, .to()) have completed.
+        # Synchronize before releasing the buffer to ensure all async ops referencing it (e.g. clone, .to()) have completed.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         del self.buffer

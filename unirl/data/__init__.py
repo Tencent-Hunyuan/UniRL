@@ -12,10 +12,8 @@ from .datasets import (
 )
 
 __all__ = [
-    # Data sources
     "MultimodalRLDataSource",
     "DefaultDataSource",
-    # Datasets
     "PromptExampleDataset",
     "TextPromptDataset",
     "normalize_prompt_example",

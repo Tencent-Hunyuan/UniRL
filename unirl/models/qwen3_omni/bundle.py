@@ -50,7 +50,6 @@ class Qwen3OmniBundle(Bundle):
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
-        # Build the standalone thinker from its nested config.
         full_cfg = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
         thinker_cfg = full_cfg.thinker_config
 
@@ -67,7 +66,6 @@ class Qwen3OmniBundle(Bundle):
         if getattr(config, "attn_implementation", None):
             load_kwargs["attn_implementation"] = str(config.attn_implementation)
 
-        # ``base_model_prefix`` maps full-checkpoint keys to the standalone thinker.
         transformer = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
             path,
             config=thinker_cfg,
@@ -76,7 +74,6 @@ class Qwen3OmniBundle(Bundle):
             **load_kwargs,
         ).to(device)
 
-        # Freeze the top-level encoders while leaving the decoder trainable.
         if config.freeze_vision_tower and hasattr(transformer, "visual"):
             transformer.visual.requires_grad_(False)
             logger.info("Froze thinker vision tower (%d params).", sum(1 for _ in transformer.visual.parameters()))
@@ -93,7 +90,6 @@ class Qwen3OmniBundle(Bundle):
                     type(transformer).__name__,
                 )
 
-        # Load multimodal preprocessing assets from the checkpoint root.
         processor = AutoProcessor.from_pretrained(
             path,
             trust_remote_code=bool(config.trust_remote_code),

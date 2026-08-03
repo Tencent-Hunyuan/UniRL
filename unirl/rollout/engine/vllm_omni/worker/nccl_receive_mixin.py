@@ -33,10 +33,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# Map dtype string (str(torch.dtype)) → torch.dtype for receiver-side
-# tensor allocation. Trainer ships ``str(t.dtype)`` per parameter; we
-# decode here. Add new entries as needed; KeyError surfaces a missing
-# dtype loudly.
+# Map dtype string (str(torch.dtype)) → torch.dtype for receiver-side tensor allocation. Add new entries as needed; KeyError surfaces a missing dtype loudly.
 _DTYPE_FROM_STR: Dict[str, torch.dtype] = {
     "torch.float16": torch.float16,
     "torch.float32": torch.float32,
@@ -54,7 +51,6 @@ _DTYPE_FROM_STR: Dict[str, torch.dtype] = {
 def _resolve_dtype(name: str) -> torch.dtype:
     if name in _DTYPE_FROM_STR:
         return _DTYPE_FROM_STR[name]
-    # Some callers may pass bare 'float16' / 'bfloat16'; tolerate.
     short = name.replace("torch.", "")
     full = f"torch.{short}"
     if full in _DTYPE_FROM_STR:
@@ -66,14 +62,8 @@ class NcclBroadcastReceiveMixin:
     """Adds ``init_weights_update_group`` + ``update_weights_from_distributed``
     to a vllm-omni worker via multiple inheritance."""
 
-    # Per-group handles created by ``init_weights_update_group``. Keyed
-    # by ``group_name`` so the trainer can run several groups concurrently
-    # if ever needed.
+    # Per-group handles created by ``init_weights_update_group``. Keyed by ``group_name`` so the trainer can run several groups concurrently if ever needed.
     _diffrl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
-
-    # ------------------------------------------------------------------
-    # Process-group bring-up
-    # ------------------------------------------------------------------
 
     def init_weights_update_group(
         self,
@@ -133,10 +123,6 @@ class NcclBroadcastReceiveMixin:
         """
         type(self)._diffrl_weight_groups.pop(group_name, None)
 
-    # ------------------------------------------------------------------
-    # Per-bucket broadcast receive
-    # ------------------------------------------------------------------
-
     def update_weights_from_distributed(
         self,
         *,
@@ -150,7 +136,7 @@ class NcclBroadcastReceiveMixin:
         """Receive a bucket of named tensors via ``dist.broadcast`` from rank 0,
         then forward to ``self.load_weights``.
         """
-        del target_modules, flush_cache  # accepted for SGLang-shape parity
+        del target_modules, flush_cache
         group = type(self)._diffrl_weight_groups.get(group_name)
         if group is None:
             raise RuntimeError(
@@ -172,8 +158,7 @@ class NcclBroadcastReceiveMixin:
             dist.broadcast(tensor, src=0, group=group)
             bucket.append((str(name), tensor))
 
-        # Route to whichever loader the underlying worker exposes; AR worker
-        # has no ``load_weights`` directly, only ``model_runner.model.load_weights``.
+        # Route to whichever loader the underlying worker exposes; AR worker has no ``load_weights`` directly, only ``model_runner.model.load_weights``.
         loader = getattr(self, "_diffrl_load_weights", None)
         if loader is None:
             self.load_weights(bucket)

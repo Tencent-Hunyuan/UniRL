@@ -12,15 +12,13 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class ResolvedCkpt:
-    base: str  # HF repo id or local path, loadable by from_pretrained
-    adapter: Optional[str]  # PEFT adapter dir (adapter_config.json), or None
-    tag: str  # results directory name
+    base: str
+    adapter: Optional[str]
+    tag: str
 
 
 def _slug(name: str) -> str:
-    # Local paths keep their last two components: UniRL checkpoints are conventionally
-    # named checkpoint-<step>, so basename alone collides across training runs — and a
-    # colliding tag would silently resume/rescore another run's outputs.
+    # Local paths keep their last two components: UniRL checkpoints are conventionally named checkpoint-<step>, so basename alone collides across training runs — and a colliding tag would silently resume/rescore another run's outputs.
     parts = Path(name).parts if Path(name).exists() else name.rstrip("/").split("/")[-1:]
     return re.sub(r"[^A-Za-z0-9._-]+", "-", "-".join(parts[-2:]).lstrip("-/")) or "ckpt"
 

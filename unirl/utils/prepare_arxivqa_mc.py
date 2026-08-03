@@ -133,7 +133,7 @@ def iter_rows(paths: list):
 def convert_split(rows, split: str, out_dir: str, fname: str, max_edge: int, config: str) -> int:
     from PIL import Image
 
-    Image.MAX_IMAGE_PIXELS = None  # Vero has legit multi-thousand-px figures.
+    Image.MAX_IMAGE_PIXELS = None
     images_dir = os.path.join(out_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
     out_path = os.path.join(out_dir, fname)
@@ -144,7 +144,7 @@ def convert_split(rows, split: str, out_dir: str, fname: str, max_edge: int, con
                 continue
             gold = gold_letter(row)
             if gold not in LETTERS:
-                continue  # mc_exact_match supports A-D only
+                continue
             question = IMAGE_TOKEN.sub("", question_text(row.get("prompt"), row.get("extra_info"))).strip()
             pil = to_pil(row.get("image"))
             if not question or pil is None:

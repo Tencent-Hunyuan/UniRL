@@ -30,7 +30,6 @@ from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-# Qwen-Image patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
 _QWEN_DOWNSAMPLE = 16
 
 
@@ -76,12 +75,7 @@ class QwenImageAdapter(ImageAdapter):
             segment_factory=self.segment_factory,
         )
 
-    # build_condition: inherited from ImageAdapter. The engine emits Qwen-Image's
-    # embeds-aligned ``prompt_embeds_mask`` (the mask the server's DiT attends under)
-    # via ``_patches/patch_conditions``, and ``utils.tracks.fuse_text_conditions``
-    # mounts it whenever it aligns with the embeds — so no model-specific backfill is
-    # needed. If the mask is genuinely absent, trainside replay raises (fail loud)
-    # rather than fabricating an all-ones mask that is wrong for mixed-length batches.
+    # build_condition: inherited from ImageAdapter. If the mask is genuinely absent, trainside replay raises (fail loud) rather than fabricating an all-ones mask that is wrong for mixed-length batches.
 
 
 __all__ = ["QwenImageAdapter"]

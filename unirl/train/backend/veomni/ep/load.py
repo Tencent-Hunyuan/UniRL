@@ -41,7 +41,7 @@ def load_ep_experts(
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
     ps = get_parallel_state()
-    ep_rank = ps.extra_parallel_rank("ep")  # this rank's index in the EP group
+    ep_rank = ps.extra_parallel_rank("ep")
     ep_size = ps.ep_size
     n = 0
     for name, param in model.named_parameters():
@@ -52,13 +52,7 @@ def load_ep_experts(
                 param.data.copy_(expert_state_dict[name].to(device=param.device, dtype=param.dtype))
             n += 1
             continue
-        # The param's dim-0 is ALREADY this rank's local experts (E/ep). Send each
-        # ep_rank's [E/ep,...] block separately (one broadcast per EP group) and keep
-        # only the block this rank owns, then re-shard it with the param's own
-        # mesh/placement (handles the dim-1 ep_fsdp shard). Per-block (not full-[E,...])
-        # so every rank's transient stays [E/ep,...] — the EP memory saving must hold
-        # at LOAD time too, else an 80B model OOMs here even when the sharded steady
-        # state fits. Broadcast-only (no scatter) to work on every NCCL build.
+        # The param's dim-0 is ALREADY this rank's local experts (E/ep). Per-block (not full-[E,...]) so every rank's transient stays [E/ep,...] — the EP memory saving must hold at LOAD time too, else an 80B model OOMs here even when the sharded steady state fits.
         local_experts = param.shape[0]
         block_shape = (local_experts, *param.shape[1:])
         full = expert_state_dict[name].to(device=param.device, dtype=param.dtype) if rank0 else None
@@ -108,8 +102,8 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
     """
     from torch.distributed.tensor import DTensor
 
-    full_cache: Dict[int, nn.Parameter] = {}  # id(module) -> full all-gathered weight
-    sharded_cache: Dict[int, nn.Parameter] = {}  # id(module) -> sharded weight (mid-call only)
+    full_cache: Dict[int, nn.Parameter] = {}
+    sharded_cache: Dict[int, nn.Parameter] = {}
 
     def _pre(m, args):
         w = m.weight
@@ -134,7 +128,7 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
         leaf = name.rsplit(".", 1)[-1]
         if isinstance(mod, nn.Embedding):
             kind = "wte"
-        elif leaf == "ln_f":  # the model's final RMSNorm (per-layer norms unshard via FSDP)
+        elif leaf == "ln_f":
             kind = "ln_f"
         elif leaf == "lm_head":
             kind = "lm_head"

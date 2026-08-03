@@ -20,11 +20,6 @@ if TYPE_CHECKING:
     from torch import device as TorchDevice
 
 
-# ---------------------------------------------------------------------------
-# copy / clone / move  (leaf utilities)
-# ---------------------------------------------------------------------------
-
-
 def copy_mapping(mapping: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     """Shallow-copy a mapping, turning list/tuple values into owned lists."""
     result: Dict[str, Any] = {}
@@ -66,11 +61,6 @@ def batch_move(value: Any, device: Union[str, "TorchDevice"]) -> Any:
     if isinstance(value, set):
         return {batch_move(v, device) for v in value}
     return value
-
-
-# ---------------------------------------------------------------------------
-# batch_slice
-# ---------------------------------------------------------------------------
 
 
 def batch_slice(
@@ -120,11 +110,6 @@ def batch_slice(
     return batch_clone(value) if deep_clone else value
 
 
-# ---------------------------------------------------------------------------
-# batch_pad
-# ---------------------------------------------------------------------------
-
-
 def batch_pad(
     value: Any,
     *,
@@ -144,11 +129,6 @@ def batch_pad(
         pad = value[-1:].repeat(pad_count, *([1] * (value.dim() - 1)))
         return torch.cat([value, pad], dim=0)
     return value
-
-
-# ---------------------------------------------------------------------------
-# batch_concat
-# ---------------------------------------------------------------------------
 
 
 def batch_concat(
@@ -227,11 +207,6 @@ def batch_concat(
     return [batch_clone(v) for v in values]
 
 
-# ---------------------------------------------------------------------------
-# batch_reindex
-# ---------------------------------------------------------------------------
-
-
 def batch_reindex(
     value: Any,
     *,
@@ -269,10 +244,6 @@ def batch_reindex(
         return value[indices.to(value.device)]
     return batch_clone(value) if deep_clone else value
 
-
-# ---------------------------------------------------------------------------
-# __all__
-# ---------------------------------------------------------------------------
 
 __all__ = [
     "batch_clone",

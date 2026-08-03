@@ -71,11 +71,9 @@ class CLAPRewardScorer(LocalRewardBackend):
             if wf.isnan().any() or wf.isinf().any():
                 wf = torch.zeros_like(wf)
             if wf.ndim == 2:
-                # Reduce the channel axis to mono regardless of [C, L] vs [L, C]:
-                # the channel axis is the smaller of the two.
                 ch_axis = 0 if wf.shape[0] <= wf.shape[1] else 1
                 wf = wf.mean(dim=ch_axis)
-            wf = wf.reshape(-1)  # (L,)
+            wf = wf.reshape(-1)
 
             if src_sample_rate != self.CLAP_SAMPLE_RATE:
                 wf = AF.resample(

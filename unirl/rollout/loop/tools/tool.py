@@ -15,7 +15,6 @@ from typing import Any, Dict
 class Tool(ABC):
     """A single callable tool: a name, a JSON function-schema, and an executor."""
 
-    #: The tool name the model emits in ``<tool_call>{"name": ...}</tool_call>``.
     name: str
 
     @abstractmethod

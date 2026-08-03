@@ -37,8 +37,6 @@ class VideoRewardScorer(RewardBackend):
         inner_scorer_cls = resolve_builtin_reward_scorer_class(inner_model)
         inner_spec_cls = resolve_builtin_reward_spec_class(inner_model)
         inner_spec = inner_spec_cls()
-        # Outer VideoSpec overrides what the inner Spec accepts. OCR has no
-        # device/batch_size; everything else does — hasattr keeps this generic.
         overrides = {
             field_name: getattr(config, field_name)
             for field_name in ("device", "batch_size")

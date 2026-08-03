@@ -189,8 +189,7 @@ class Qwen3OmniChatTemplateStage:
                 inputs = processor(**processor_kwargs)
             else:
                 template_kwargs.update(mm_kwargs)
-                # These define the replay-condition wire shape and cannot be
-                # overridden by recipe-level chat kwargs.
+                # These define the replay-condition wire shape and cannot be overridden by recipe-level chat kwargs.
                 template_kwargs.update(
                     add_generation_prompt=True,
                     tokenize=True,
@@ -235,7 +234,6 @@ class Qwen3OmniChatTemplateStage:
             mask = inp["attention_mask"].squeeze(0)
             attention_mask[i, :L] = mask[:L].to(device)
 
-        # Keep media as per-sample CONCAT lists.
         pixel_values_videos: List[Optional[torch.Tensor]] = []
         video_grid_thw: List[Optional[torch.Tensor]] = []
         video_second_per_grid: List[Optional[torch.Tensor]] = []

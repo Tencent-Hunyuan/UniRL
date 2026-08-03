@@ -65,7 +65,7 @@ class REFLTrainer(BaseTrainer):
 
     def __init__(self, *, cfg: DictConfig) -> None:
         super().__init__(cfg=cfg, logging_cfg=cfg.get("logging"))
-        self.cfg = cfg  # train() reads run-length/checkpoint defaults from it
+        self.cfg = cfg
         self.batch_size = int(cfg.batch_size)
         self.max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
         self.data_source = instantiate(cfg.data_source)
@@ -80,15 +80,11 @@ class REFLTrainer(BaseTrainer):
             )
         self.sampling_params = params
 
-        # Reward shares the actor's workers: decoded video stays on-GPU for
-        # scoring. (Cross-slab reward placement — DiffusionTrainer's
-        # reward_fraction — is deliberately not supported here; add it only
-        # when a recipe actually cannot colocate.)
+        # Reward shares the actor's workers: decoded video stays on-GPU for scoring. (Cross-slab reward placement — DiffusionTrainer's reward_fraction — is deliberately not supported here; add it only when a recipe actually cannot colocate.)
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.actor = remote_hydra(cfg.actor)
             self.reward = remote_hydra(cfg.reward)
         self.actor.initialize()
-        # BaseTrainer.maybe_save/load_checkpoint operate on ``self.backend``.
         self.backend = self.actor
 
         adp, rdp = self.actor.dp_size, self.reward.dp_size
@@ -117,7 +113,7 @@ class REFLTrainer(BaseTrainer):
             rewards = self.reward.score_differentiable(gen.decoded, list(texts.texts), records)
             loss_metrics = self.actor.forward_backward_loss(rewards=rewards, kl_loss=gen.kl_loss)
         step_result = self.actor.step(max_grad_norm=self.max_grad_norm)
-        if isinstance(step_result, list):  # BROADCAST → one result per worker
+        if isinstance(step_result, list):
             step_result = step_result[0]
 
         return {

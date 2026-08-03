@@ -57,24 +57,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     schedule = params.sigmas.to(pipeline.bundle.device)
-    # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
-    # and the vit_kwargs duplication below — they must agree on the batch axis.
+    # Single CFG derivation feeding the chat template, ``_encode_cond_image``, and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
     cfg_factor = 2 if cfg else 1
 
-    # 1. ViT cond features. Returns joint_image_info (forwarded to chat
-    #    template), cond_vit_images, vit_kwargs.
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # 2. VAE encode + ViT-cond duplication for CFG, all via the upstream
-    #    ``_encode_cond_image`` so per-sample list shapes match what the
-    #    unified-MM forward iterates with at hunyuan.py:1903.
+    # VAE encode + ViT-cond duplication for CFG, all via the upstream ``_encode_cond_image`` so per-sample list shapes match what the unified-MM forward iterates with at hunyuan.py:1903.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=cfg_factor
     )
 
-    # 3. vit_kwargs duplicated for CFG -- mirror upstream pipeline
-    #    (hunyuan.py:2298-2299).
     vit_kwargs = vit["vit_kwargs"]
     if cfg_factor > 1:
         vit_kwargs = {
@@ -82,7 +75,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "attention_mask": vit_kwargs["attention_mask"] * cfg_factor,
         }
 
-    # 4. Build the unified-MM tensors with cond-image markers spliced in.
     bot_task = str((sample.parts[0].control or {}).get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
@@ -93,10 +85,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
-    # 5. Pack into the typed conditions container. The chat-template
-    #    path drives the fused sequence via input_ids; cond-image data
-    #    flows through the typed ImageLatentCondition / ImageEmbedCondition
-    #    primitives.
     cond_vae = ImageLatentCondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
         embeds=cond_vit_images,

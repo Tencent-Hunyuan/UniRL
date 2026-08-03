@@ -19,13 +19,11 @@ import requests
 
 from .checkpoints import ResolvedCkpt
 
-# CLI override name -> diffusers pipeline kwarg (None values are dropped -> pipeline defaults)
 T2I_KWARGS = {"steps": "num_inference_steps", "guidance": "guidance_scale", "height": "height", "width": "width"}
 
 
 def _session() -> requests.Session:
-    # Serving endpoints / reward hosts live on the internal network; corporate proxy
-    # env vars would 503 them (same rationale as unirl/reward/remote.py).
+    # Serving endpoints / reward hosts live on the internal network; corporate proxy env vars would 503 them (same rationale as unirl/reward/remote.py).
     session = requests.Session()
     session.trust_env = False
     return session
@@ -51,10 +49,7 @@ def _load_pipe(ckpt: ResolvedCkpt):
 
     pipe = AutoPipelineForText2Image.from_pretrained(ckpt.base, torch_dtype=torch.bfloat16).to("cuda")
     if ckpt.adapter:
-        # PEFT-native load (NOT pipe.load_lora_weights): the exported adapter keeps
-        # PEFT's 'base_model.model.' key format, which diffusers' loader silently
-        # drops, and diffusers ignores adapter_config.json's lora_alpha. PEFT honors
-        # both; merging restores the stock module type and inference speed.
+        # PEFT-native load (NOT pipe.load_lora_weights): the exported adapter keeps PEFT's 'base_model.model.' key format, which diffusers' loader silently drops, and diffusers ignores adapter_config.json's lora_alpha.
         from peft import PeftModel
 
         peft_model = PeftModel.from_pretrained(pipe.transformer, ckpt.adapter)
@@ -91,8 +86,7 @@ def run_t2i(
     pipe = _load_pipe(ckpt)
     call_kwargs = dict(gen_kwargs)
     if linspace_sigmas:
-        # Flow-match sigma grid linspace(1, 1/steps, steps) (endpoint 1/N) instead of the diffusers
-        # pipeline default (endpoint ~0); static shift still applied by the scheduler.
+        # Flow-match sigma grid linspace(1, 1/steps, steps) (endpoint 1/N) instead of the diffusers pipeline default (endpoint ~0); static shift still applied by the scheduler.
         steps = int(gen_kwargs.get("num_inference_steps") or 0)
         if steps <= 0:
             raise ValueError("linspace_sigmas requires num_inference_steps in gen defaults/CLI")

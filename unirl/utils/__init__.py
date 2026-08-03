@@ -19,15 +19,12 @@ from .wandb_logger import (
 )
 
 __all__ = [
-    # misc
     "load_function",
     "set_seed",
     "configure_logger",
     "clear_memory",
     "flatten_dict",
-    # adapter_utils
     "switch_adapter",
-    # wandb_logger
     "UniRLWandBLogger",
     "init_logger",
     "aggregate_metrics",

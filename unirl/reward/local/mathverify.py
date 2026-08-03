@@ -54,15 +54,7 @@ class MathVerifyRewardScorer(LocalRewardBackend):
                 continue
             gt = str(meta["answer"]).strip()
             try:
-                # Gold wrapped in \boxed{} (math-verify's canonical gold form); the
-                # prediction is parsed free-form (math-verify finds the final answer
-                # via \boxed{} else the last expression). verify(gold, target).
-                #
-                # parsing_timeout=None / timeout_seconds=None disable math-verify's
-                # signal.alarm() timeouts. Those only work on the main thread and
-                # RAISE ("signal only works in main thread") under the reward's Ray
-                # worker thread — the except below would then swallow it and score 0
-                # for EVERY sample. Answers here are short, so no timeout is needed.
+                # Gold wrapped in \boxed{} (math-verify's canonical gold form); the prediction is parsed free-form (math-verify finds the final answer via \boxed{} else the last expression). verify(gold, target). parsing_timeout=None / timeout_seconds=None disable math-verify's signal.alarm() timeouts. Answers here are short, so no timeout is needed.
                 ok = bool(
                     verify(
                         parse("\\boxed{" + gt + "}", parsing_timeout=None),

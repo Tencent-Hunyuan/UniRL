@@ -20,8 +20,8 @@ class SimpleBackendConfig:
     if you've measured a need. For production-tunable sizing, use Mooncake.
     """
 
-    num_units: int = 16  # in-process Ray storage actors
-    unit_size: int = 1024  # per-unit item capacity
+    num_units: int = 16
+    unit_size: int = 1024
 
     def __post_init__(self) -> None:
         require(
@@ -45,8 +45,7 @@ class SimpleBackend(Backend):
         self._storage_units: Dict[int, "ActorHandle"] = {}
 
     def bootstrap(self, *, controller_info: Any) -> dict:
-        # Deferred upstream import: schema registration must work without the
-        # transfer_queue runtime lib (compose tests don't need it).
+        # Deferred upstream import: schema registration must work without the transfer_queue runtime lib (compose tests don't need it).
         from transfer_queue import SimpleStorageUnit, get_placement_group, process_zmq_server_info
 
         placement_group = get_placement_group(self._num_units, num_cpus_per_actor=1)

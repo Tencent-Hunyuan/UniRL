@@ -50,15 +50,15 @@ class AgentLoop:
     def run(self, engine: RolloutEnginePort, request: Sample) -> Sample:
         """Drive the episode: ``fork -> generate -> env.step -> observe`` until ``done`` / ``max_turns``."""
         sample = self.environment.reset(request)
-        branch = total_samples_per_prompt(self.sampling_params)  # GRPO fan-out on the first turn
+        branch = total_samples_per_prompt(self.sampling_params)
         for _ in range(self.max_turns):
             sample = engine.generate(sample.fork(branch, sampling_params=self.sampling_params))
-            observation, done, _info = self.environment.step(sample)  # the environment decides termination
+            observation, done, _info = self.environment.step(sample)
             if done:
                 break
             if observation is not None:
                 sample = sample.observe(observation)
-            branch = 1  # continuations are one sample each
+            branch = 1
         return sample
 
 

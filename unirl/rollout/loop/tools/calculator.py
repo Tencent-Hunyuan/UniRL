@@ -14,8 +14,7 @@ from typing import Any, Dict
 
 from unirl.rollout.loop.tools.tool import Tool
 
-# Binary / unary operators the calculator allows. Anything else (names, calls, attributes,
-# comparisons, subscripts, ...) is rejected by ``_eval`` below.
+# Binary / unary operators the calculator allows. Anything else (names, calls, attributes, comparisons, subscripts, ...) is rejected by ``_eval`` below.
 _BINOPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,

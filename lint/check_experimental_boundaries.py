@@ -43,8 +43,7 @@ def _normalize(name: str) -> str:
 
 def _py_files(base: Path):
     for path in sorted(base.rglob("*.py")):
-        # Intersect repo-relative parts: an absolute-path match would let a checkout
-        # that merely lives under a directory named "vendor" skip every rule.
+        # Intersect repo-relative parts: an absolute-path match would let a checkout that merely lives under a directory named "vendor" skip every rule.
         if not SKIP_PARTS.intersection(path.relative_to(ROOT).parts):
             yield path
 

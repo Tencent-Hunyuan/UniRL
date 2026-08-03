@@ -118,8 +118,6 @@ class Remote:
         """
         pass
 
-    # ── Auto-backward (framework-injected, not user-facing) ───────────────────
-
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def _auto_backward(
         self,
@@ -164,7 +162,6 @@ class Remote:
             if g is not None:
                 t.grad = g
 
-        # Run backward for outputs that have an external gradient
         pairs = [
             (t, g) for t, g in zip(saved_out, out_grads) if g is not None and (t.requires_grad or t.grad_fn is not None)
         ]

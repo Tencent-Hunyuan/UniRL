@@ -65,7 +65,7 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError(
                 f"QwenImageVAEDecodeStage.decode: expected latents shape [N, K, C, H, W], got {tuple(s.latents.shape)}"
             )
-        clean = s.latents[:, -1]  # [B, C, H, W]
+        clean = s.latents[:, -1]
 
         vae = self.bundle.vae
         z_dim = int(vae.config.z_dim)
@@ -73,15 +73,13 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32)
-            # Lift to 5D for the video VAE (T=1).
-            latents_5d = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
+            latents_5d = latents_f32.unsqueeze(2)
             latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32).view(
                 1, z_dim, 1, 1, 1
             )
             latents_std = torch.tensor(vae.config.latents_std, device=device, dtype=torch.float32).view(
                 1, z_dim, 1, 1, 1
             )
-            # Recover raw latents: x = z * std + mean.
             latents_5d = latents_5d * latents_std + latents_mean
             return vae.to(torch.float32).decode(latents_5d, return_dict=False)[0]
 
@@ -92,7 +90,6 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
                 decoded = _decode(clean)
-        # Drop the temporal dim (Qwen-Image t2i uses T=1) and clamp.
         pixels = ((decoded[:, :, 0] + 1.0) / 2.0).clamp(0.0, 1.0)
         return Images(pixels=pixels)
 

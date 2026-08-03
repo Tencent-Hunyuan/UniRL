@@ -107,7 +107,6 @@ def configure_logger(
         handlers=handlers,
     )
 
-    # Reduce verbosity of some libraries
     logging.getLogger("ray").setLevel(logging.WARNING)
     logging.getLogger("torch").setLevel(logging.WARNING)
 

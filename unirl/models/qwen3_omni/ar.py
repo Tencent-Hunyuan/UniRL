@@ -65,8 +65,7 @@ def _fuse_mm_embeds(
             return_dict=True,
         )
     except TypeError as exc:
-        # Transformers releases differ here: older Qwen3-Omni returns
-        # ``(video_embeds, deepstack_features)`` and rejects return_dict.
+        # Transformers releases differ here: older Qwen3-Omni returns ``(video_embeds, deepstack_features)`` and rejects return_dict.
         if "unexpected keyword argument 'return_dict'" not in str(exc):
             raise
         video_outputs = transformer.get_video_features(pixel_values_videos, video_grid_thw)
@@ -76,8 +75,6 @@ def _fuse_mm_embeds(
         legacy_video_outputs = False
     else:
         video_embeds, video_embeds_multiscale = video_outputs
-        # The legacy text model reduces this expanded mask in
-        # ``_deepstack_process``; pre-reducing it here indexes the batch axis.
         legacy_video_outputs = True
     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
     _, video_mask, _ = transformer.get_placeholder_mask(
@@ -133,14 +130,14 @@ def _replay_aware_forward(
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
     with autocast_ctx:
-        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state  # [B, L, H]
+        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
 
     T = float(temperature) if float(temperature) > 0.0 else 1.0
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
     def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        lf = self.lm_head(h).float() / T  # [B, chunk, vocab] FP32
+        lf = self.lm_head(h).float() / T
         chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
         return chosen - torch.logsumexp(lf, dim=-1)
 
@@ -254,7 +251,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3OmniARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3OmniARStage.logprob_precision")
-        # The instance override survives FSDP class swapping and LoRA injection.
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
@@ -294,7 +290,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         )
         max_new = int(sampling_params.max_new_tokens)
 
-        # Reset cached TMRoPE offsets between requests.
         if hasattr(transformer, "model") and hasattr(transformer.model, "rope_deltas"):
             transformer.model.rope_deltas = None
 
@@ -304,7 +299,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             "past_key_values": None,
             "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
-        # Multimodal tensors are consumed on the first decode step.
         pvv = _merge_video(conditions.pixel_values_videos)
         vgt = _merge_video(conditions.video_grid_thw)
         vspg = _merge_video(conditions.video_second_per_grid)
@@ -445,7 +439,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         if hasattr(transformer, "model") and hasattr(transformer.model, "rope_deltas"):
             transformer.model.rope_deltas = None
 
-        # Merge per-sample CONCAT media for the thinker.
         pvv = _merge_video(conditions.pixel_values_videos)
         vgt = _merge_video(conditions.video_grid_thw)
         ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
@@ -463,16 +456,13 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             forward_kwargs["attention_mask"] = full_mask
             forward_kwargs["position_ids"] = (full_mask.long().cumsum(dim=-1) - 1).clamp(min=0)
         else:
-            # Compute TMRoPE here, but defer parameter reads to the FSDP forward.
             pvv = pvv.to(device=device, dtype=self.model.dtype)
             vgt = vgt.to(device=device)
             use_audio = ivf is not None
             if use_audio:
                 ivf = ivf.to(device=device, dtype=self.model.dtype)
                 fam = fam.to(device=device)
-            # ``use_audio_in_video`` is a batch-wide Transformers flag. Build
-            # positions per sample so a video without an audio track does not
-            # consume the following sample's video grid as text.
+            # ``use_audio_in_video`` is a batch-wide Transformers flag. Build positions per sample so a video without an audio track does not consume the following sample's video grid as text.
             sample_video_grids = conditions.video_grid_thw or [None] * batch_size
             sample_seconds = conditions.video_second_per_grid or [None] * batch_size
             sample_features = conditions.input_features or [None] * batch_size
@@ -507,7 +497,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             if use_audio:
                 forward_kwargs["input_features"] = ivf
                 forward_kwargs["feature_attention_mask"] = fam
-        per_token = transformer(**forward_kwargs)  # [B, T_max] FP32
+        per_token = transformer(**forward_kwargs)
 
         if T_max == 0:
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
