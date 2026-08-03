@@ -251,6 +251,7 @@ class AsyncBatchRolloutEngine:
             raise RuntimeError(f"sync_weights with {len(self._pool)} generations in flight; quiesce() first")
         weight_sync.sync()
         self._weight_version += 1
+        logger.info("sync_weights: pushed train weights; weight_version -> %d", self._weight_version)
         return self._weight_version
 
     @property
@@ -374,6 +375,7 @@ class AsyncAgenticRolloutEngine:
             raise RuntimeError("sync_weights with a drive active; finalize or quiesce() first")
         weight_sync.sync()
         self._weight_version += 1
+        logger.info("sync_weights: pushed train weights; weight_version -> %d", self._weight_version)
         return self._weight_version
 
     def submit(self, tasks: List["Sample"]) -> None:
