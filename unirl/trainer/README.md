@@ -51,6 +51,13 @@ stay swappable by `_target_`.
   concatenate those turn Parts for training. (ReFL — which differentiates
   directly through decoded media and uses no rollout Samples or advantages —
   lives outside core as `experimental/refl`.)
+- **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
+  preserves phase-based rollout sleep (the default); `false` keeps an external
+  engine's weights resident across rollout/reward/train. Train-state policies are
+  independent: `enable_fsdp_offload` lets an external rollout borrow train memory
+  during generation, while `offload_train_during_reward` lets a reward sharing the
+  train slab borrow it during scoring. A reward on a separate `reward_fraction`
+  slab never triggers train offload.
 
 The current trainer surface is:
 

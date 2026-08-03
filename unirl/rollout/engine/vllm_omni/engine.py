@@ -155,12 +155,20 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self._backend.wake_task()
+        self._is_offloaded = False  # physical state changed before LoRA restore
         try:
             self._weight_sync.restore_lora_after_wake()
         except Exception:
-            self._is_offloaded = True
+            # Roll back the physically awakened engine. If rollback itself
+            # fails, leave the flag false so the caller's cleanup sleep retries.
+            try:
+                self._backend.sleep_task()
+            except Exception:
+                logger.exception("vLLM-Omni rollback sleep failed after LoRA restore error")
+            else:
+                self._is_offloaded = True
+                self._weight_sync.mark_weights_released()
             raise
-        self._is_offloaded = False
 
     @property
     def is_offloaded(self) -> bool:
