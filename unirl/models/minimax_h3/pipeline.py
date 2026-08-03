@@ -161,7 +161,9 @@ class MiniMaxH3Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=list(params.sde_indices) if params.sde_indices is not None else None,
-            denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
+            # sample_ids live on the PART, not the Sample -- `Sample` has
+            # root_group_ids()/split() but no sample_ids of its own.
+            denoise_seed_keys=[str(sample_id) for sample_id in gen.sample_ids],
             denoise_base_seed=int(params.seed) if params.seed is not None else 0,
         )
 
