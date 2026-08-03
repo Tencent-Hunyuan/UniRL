@@ -122,8 +122,27 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
+        # Length-based reward shaping for AR generations that hit max_new_tokens
+        # (sglang finish == "length"). A non-terminating trace whose text happens to
+        # contain a matching answer (e.g. a mid-reasoning \boxed{}) can teach the
+        # model to ramble up to the token cap — a real failure mode at long
+        # max_new_tokens. `truncated_reward` (see __init__) picks the policy:
+        #   "zero" — force reward 0 on truncated traces (anti-ramble).
+        #   "keep" — leave the raw score (= verl dapo, overlong disabled). No-op here.
+        #   "soft" — verl DAPO graded overlong penalty (never a hard zero).
+        # Only applies when the SCORED frontier is itself an AR generation, where
+        # its segment lengths are 1:1 with the rewards.
+        # Skipped for fixed-length AR stages: an image-token generation emits one
+        # token per grid cell, so seg_length == max_new_tokens on every sample and
+        # the "never terminated" signal this shaping keys on does not exist. Left
+        # in, it zeroed every PickScore reward on the Janus-Pro T2I path.
         sp = frontier.sampling_params
-        if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:
+        if (
+            self.truncated_reward != "keep"
+            and isinstance(sp, ARSamplingParams)
+            and not sp.emits_fixed_length
+            and frontier.segment is not None
+        ):
             seg_lengths = getattr(frontier.segment, "lengths", None)
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
                 seg_lengths = seg_lengths.to(rewards.device).float()

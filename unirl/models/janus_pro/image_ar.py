@@ -36,6 +36,16 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     height: Optional[int] = None
     patch_size: int = 16
 
+    @property
+    def emits_fixed_length(self) -> bool:
+        """One token per grid cell — ``max_new_tokens`` is the image size, not a cap.
+
+        ``_resolve_image_grid`` already rejects any value that is not exactly
+        ``(width / patch_size) * (height / patch_size)``, so every sequence is
+        this long and reaching it never indicates truncation.
+        """
+        return True
+
 
 def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int, int]:
     width = getattr(params, "width", None)

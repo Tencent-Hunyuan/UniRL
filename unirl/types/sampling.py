@@ -116,3 +116,16 @@ class ARSamplingParams(BaseSamplingParams):
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
+
+    @property
+    def emits_fixed_length(self) -> bool:
+        """Whether ``max_new_tokens`` is an exact count rather than a cap.
+
+        Text generation stops at a stop token, so reaching ``max_new_tokens``
+        means the trace never terminated — which is what the reward service's
+        anti-ramble shaping keys on. AR *image* generation emits one token per
+        grid cell, so its length always equals ``max_new_tokens`` and that
+        signal is meaningless. Subclasses whose length is fixed by construction
+        override this to ``True``.
+        """
+        return False
