@@ -73,15 +73,6 @@ backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
   block_class_names: ["MiniMaxH3TransformerBlock"]
   trainable_attr: transformer
-  # LOAD-BEARING. With root_wrap false the fp32-pinned leftovers (proj_in,
-  # audio_proj_in, time_embedder, proj_out, audio_proj_out, rope) sit outside
-  # every fully_shard group, so MixedPrecisionPolicy never all-gathers a bf16
-  # compute copy of them and they keep the precision the checkpoint stores.
-  # Under LoRA they are frozen, so the stray-trainable-param guard passes.
-  # Flipping this to true silently runs the timestep MLP in bf16 — and since
-  # H3 conditions on t = 1 - sigma, bf16 near 1.0 has ~0.008 spacing, i.e.
-  # ~40% relative error on sigma at the low-noise end.
-  root_wrap: false
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
@@ -91,6 +82,16 @@ backend:
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
+    # LOAD-BEARING. With root_wrap false the fp32-pinned leftovers (proj_in,
+    # audio_proj_in, time_embedder, proj_out, audio_proj_out, rope) sit outside
+    # every fully_shard group, so MixedPrecisionPolicy never all-gathers a bf16
+    # compute copy of them and they keep the precision the checkpoint stores.
+    # Under LoRA they are frozen, so the stray-trainable-param guard passes.
+    # Flipping this to true silently runs the timestep MLP in bf16 — and since
+    # H3 conditions on t = 1 - sigma, bf16 near 1.0 has ~0.008 spacing, i.e.
+    # ~40% relative error on sigma at the low-noise end.
+    # NOTE: this is an FSDPConfig field, NOT an FSDPBackend one.
+    root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-4
