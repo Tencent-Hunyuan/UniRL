@@ -209,7 +209,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
 
         sde_sorted = sorted(sde_indices) if sde_indices is not None else list(range(num_steps))
-        needed = set(compute_trajectory_positions(sde_sorted))
+        needed = set(compute_trajectory_positions(sde_sorted, num_steps))
         step_generators = make_denoise_step_generators(
             keys=denoise_seed_keys, base_seed=denoise_base_seed, device=device
         )

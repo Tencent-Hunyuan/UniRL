@@ -14,7 +14,11 @@ from unirl.types.sample import Sample
 
 from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
-from .config import MINIMAX_H3_PATCH_SIZE, MiniMaxH3PipelineConfig
+from .config import (
+    MINIMAX_H3_AUDIO_LATENT_CHANNELS,
+    MINIMAX_H3_PATCH_SIZE,
+    MiniMaxH3PipelineConfig,
+)
 from .diffusion import MiniMaxH3DiffusionStage
 from .packing import MiniMaxH3Geometry
 from .text_embed import MiniMaxH3TextEmbedStage
@@ -23,7 +27,7 @@ from .vae import (
     MiniMaxH3AudioDecodeStage,
     MiniMaxH3VideoDecodeStage,
 )
-from .vendor import MINIMAX_H3_AUDIO_CHANNELS, patchify_video_latents
+from .vendor import patchify_video_latents
 
 
 class MiniMaxH3Pipeline(Pipeline):
@@ -100,8 +104,13 @@ class MiniMaxH3Pipeline(Pipeline):
 
     @staticmethod
     def audio_latent_shape(geometry: MiniMaxH3Geometry) -> Tuple[int, ...]:
-        """Per-sample audio x_T shape: one row block per stereo channel."""
-        return (geometry.num_audio_rows, MINIMAX_H3_AUDIO_CHANNELS)
+        """Per-sample audio x_T shape ``(rows, latent_channels)``.
+
+        ``num_audio_rows`` already folds in the STEREO count (audio occupies two
+        channel-major row blocks); the trailing dim is the audio VAE's latent
+        width, which is what ``audio_proj_in`` consumes.
+        """
+        return (geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS)
 
     def generate(self, sample: Sample) -> Sample:
         gen = sample.parts[-1]
@@ -135,8 +144,14 @@ class MiniMaxH3Pipeline(Pipeline):
             device=self.bundle.device, salt="audio", latent_shape=self.audio_latent_shape(geometry)
         )
 
-        initial_latents = patchify_video_latents(video_noise, MINIMAX_H3_PATCH_SIZE)
-        initial_audio_latents = audio_noise.reshape(1, geometry.num_audio_rows, -1)
+        # `patchify_video_latents` returns 2-D `(batch*rows, C)` -- the reference
+        # pipeline is strictly batch-1 so it folds the batch away. The
+        # transformer indexes rows on dim 1, so restore the batch axis.
+        batch = int(video_noise.shape[0])
+        initial_latents = patchify_video_latents(video_noise, MINIMAX_H3_PATCH_SIZE).reshape(
+            batch, geometry.num_video_rows, geometry.video_token_dim
+        )
+        initial_audio_latents = audio_noise.reshape(batch, geometry.num_audio_rows, -1)
 
         segment = self.diffusion.generate(
             conditions,

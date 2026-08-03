@@ -8,7 +8,7 @@ import torch
 
 from unirl.types.primitives import Audio, Audios, Video, Videos
 
-from .config import MINIMAX_H3_PATCH_SIZE
+from .config import MINIMAX_H3_LATENT_CHANNELS, MINIMAX_H3_PATCH_SIZE
 from .packing import MiniMaxH3Geometry
 from .vendor import (
     MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
@@ -45,6 +45,7 @@ class MiniMaxH3VideoDecodeStage:
             num_latent_frames=geometry.num_latent_frames,
             latent_height=geometry.latent_height,
             latent_width=geometry.latent_width,
+            channels=MINIMAX_H3_LATENT_CHANNELS,
             patch_size=MINIMAX_H3_PATCH_SIZE,
         )
         mean = torch.tensor(self.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)

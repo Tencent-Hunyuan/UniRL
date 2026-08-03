@@ -29,6 +29,12 @@ MINIMAX_H3_SPATIAL_COMPRESSION = 16
 MINIMAX_H3_TEMPORAL_COMPRESSION = 4
 MINIMAX_H3_LATENT_CHANNELS = 24
 MINIMAX_H3_PATCH_SIZE = (1, 2, 2)
+# Audio VAE latent width -- the feature dim of ONE packed audio row, and the
+# transformer's ``audio_in_channels``. Distinct from
+# ``vendor.MINIMAX_H3_AUDIO_CHANNELS`` (= 2), which counts the STEREO channels
+# that make audio occupy two channel-major row blocks. Conflating the two makes
+# the audio x_T 2 wide instead of 32 and mis-shapes ``audio_proj_in``.
+MINIMAX_H3_AUDIO_LATENT_CHANNELS = 32
 
 
 @dataclass
@@ -108,6 +114,7 @@ class MiniMaxH3PipelineConfig:
 
 
 __all__ = [
+    "MINIMAX_H3_AUDIO_LATENT_CHANNELS",
     "MINIMAX_H3_LATENT_CHANNELS",
     "MINIMAX_H3_PATCH_SIZE",
     "MINIMAX_H3_SPATIAL_COMPRESSION",
