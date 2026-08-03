@@ -209,10 +209,8 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
 
         sde_sorted = sorted(sde_indices) if sde_indices is not None else list(range(num_steps))
+        sde_set = set(sde_sorted)
         needed = set(compute_trajectory_positions(sde_sorted, num_steps))
-        step_generators = make_denoise_step_generators(
-            keys=denoise_seed_keys, base_seed=denoise_base_seed, device=device
-        )
 
         stored_pairs: List[Tuple[int, torch.Tensor]] = []
         stored_audio: List[torch.Tensor] = []
@@ -224,7 +222,21 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         audio_in_policy = self.audio_joint_sde
         with self._autocast():
             for step_idx in range(num_steps):
-                step_eta = float(params.eta) if step_idx in set(sde_sorted) else 0.0
+                step_eta = float(params.eta) if step_idx in sde_set else 0.0
+                # Per-STEP generators: the seed tuple is (base_seed, step_index,
+                # sample_id), so this must be rebuilt inside the loop. Hoisting
+                # it out would make each step draw from a running stream instead
+                # of its own seed, and rollout/replay would stop agreeing across
+                # engines. Mirrors ltx2.
+                step_generators = (
+                    make_denoise_step_generators(
+                        base_seed=int(denoise_base_seed),
+                        step_index=step_idx,
+                        sample_ids=[str(key) for key in denoise_seed_keys],
+                    )
+                    if step_eta > 0.0 and denoise_seed_keys is not None
+                    else None
+                )
                 video_pred, audio_pred = self.step.predict_noise(
                     conditions,
                     video_sample=x,
