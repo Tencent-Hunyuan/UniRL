@@ -71,7 +71,6 @@ class QwenImagePipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Batched [S*B] replay forward (see BatchedStepReplayMixin); requires old_logp_source='replay'.
     batch_replay_steps: bool = False
 
     shift: float = 3.0

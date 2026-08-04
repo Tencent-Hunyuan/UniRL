@@ -298,19 +298,11 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
 
 
 def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
-    """Reject batched-step replay paired with a rollout-sourced π_old anchor.
+    """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor.
 
-    ``batch_replay_steps`` stacks the ``S`` replay steps on the batch dim, and
-    that ``[S*B]`` forward is not bit-identical to the ``[B]`` forward the
-    rollout ran (see :mod:`unirl.models.types.batched_replay`). The ratio is
-    exact only when the anchor and the train pass take the *same* batched path,
-    which is what ``old_logp_source='replay'`` does; with the default
-    ``'rollout'`` anchor the two sides disagree and the clip term silently
-    misfires, so fail fast instead.
-
-    Every diffusion algorithm that drives ``stage.replay`` against a π_old
-    anchor must call this — today ``FlowGRPO`` (and its ``BagelFlowUniGRPO``
-    subclass) and ``FlowDPPO``.
+    Call from every diffusion algorithm that drives ``stage.replay`` against an
+    anchor — today ``FlowGRPO`` (with its ``BagelFlowUniGRPO`` subclass) and
+    ``FlowDPPO``. Rationale: :mod:`unirl.models.types.batched_replay`.
     """
     if not getattr(stage, "batch_replay_steps", False):
         return
