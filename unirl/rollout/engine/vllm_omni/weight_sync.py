@@ -190,13 +190,18 @@ class WeightSync:
 
         sleep(level=1) preserves base weights but LoRA adapters may be
         discarded; re-sending after wake ensures rollout uses the adapted
-        model. Fail-fast on failure: clears the activation flag and raises so
-        the training loop crashes instead of shipping silent base-model
-        rollouts (the caller — the engine's ``wake_up`` — rolls the engine back
-        to offloaded, or latches its ``_wake_failed`` guard when even the
-        rollback fails, so ``generate`` refuses either way).
+        model. The gate is the CACHE, not ``_lora_loaded``: the cache is the
+        durable "an adapter should be active" intent, while ``_lora_loaded``
+        is only the "currently pushed" state that a failed re-push clears —
+        gating on the flag would make the retry after such a failure return
+        early "successfully" without re-pushing, and generate would silently
+        run base weights. Fail-fast on failure: clears the activation flag
+        and raises so the training loop crashes instead of shipping silent
+        base-model rollouts (the caller — the engine's ``wake_up`` — rolls the
+        engine back to offloaded, or latches its ``_wake_failed`` guard when
+        even the rollback fails, so ``generate`` refuses either way).
         """
-        if not (self._lora_loaded and self._last_lora_tensors is not None):
+        if self._last_lora_tensors is None:
             self._weights_released = False
             return
         logger.info(
