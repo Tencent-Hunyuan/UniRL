@@ -123,6 +123,19 @@ class AllSDEScheduler(TimestepScheduler):
         chosen = rng.choice(pool, size=self.num_sde_steps, replace=False)
         return set(int(i) for i in chosen)
 
+    def sde_candidate_pool(self) -> List[int]:
+        """Return every denoising step eligible to carry an SDE transition.
+
+        The candidate set is the fraction range ``[_effective_start,
+        _effective_end)`` — the same pool :meth:`get_sde_indices` samples from —
+        and is independent of ``num_sde_steps`` (how many are DRAWN per rollout).
+        FlashGRPO's per-sample path draws one step PER PROMPT from this pool so a
+        single optimizer step averages the policy gradient over a spread of
+        sigmas, instead of every sample sharing the one step ``get_sde_indices``
+        returns (the zero-diversity collapse this fixes).
+        """
+        return list(range(self._effective_start, self._effective_end))
+
 
 class WindowScheduler(TimestepScheduler):
     """Stateless sliding-window index scheduler."""

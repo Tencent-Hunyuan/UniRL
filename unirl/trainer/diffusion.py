@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
@@ -16,6 +17,7 @@ from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.prompts import RolloutInputs
 from unirl.types.rollout_req import RolloutReq
+from unirl.types.rollout_resp import RolloutResp
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
@@ -104,6 +106,11 @@ class DiffusionTrainer(BaseTrainer):
         # needs the EMA dual-adapter swap around rollout. Stays False for GRPO
         # so its hot path is untouched.
         self._uses_ema = False
+        # Set in _build_train_side: True only for FlashGRPO, whose per-sample
+        # SDE-index path draws one step per prompt and merges the grouped generate
+        # calls (see _build_flash_generate_jobs). False for every shared-schedule
+        # algorithm → their rollout path stays byte-identical (single generate job).
+        self._flash_per_sample_sde = False
 
         # Driver-side data iterator (not a Remote). The raw cfg is kept so
         # eval_rewards suites can clone it with their own prompt paths.
@@ -268,6 +275,11 @@ class DiffusionTrainer(BaseTrainer):
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
+        # FlashGRPO fans a rollout into one generate per SDE-step group so an
+        # optimizer step averages over a spread of sigmas; see train()/train_step().
+        self._flash_per_sample_sde = getattr(algo_cls, "requires_per_sample_sde_index", False)
+        if self._flash_per_sample_sde:
+            self._check_flash_rectification_pool(algorithm_cfg)
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
@@ -355,7 +367,12 @@ class DiffusionTrainer(BaseTrainer):
         return [int(x) for x in shape]
 
     def _build_req(
-        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
+        self,
+        inputs: RolloutInputs,
+        rollout_id: int,
+        *,
+        base_sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+        sde_index_override: Optional[int] = None,
     ) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
 
@@ -370,12 +387,20 @@ class DiffusionTrainer(BaseTrainer):
 
         ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
         passes its own deterministic params); ``None`` uses ``self.sampling_params``.
+
+        ``sde_index_override`` pins the SDE step for this request to one
+        caller-chosen index (FlashGRPO's per-sample path draws one step per prompt
+        group; see :meth:`_build_flash_generate_jobs`) instead of resolving the
+        shared, ``rollout_id``-keyed schedule.
         """
         base = base_sampling if base_sampling is not None else self.sampling_params
         samples_per_prompt = total_samples_per_prompt(base)
         inputs = inputs.expand(samples_per_prompt)
         diffusion = base.get("diffusion")
-        sde_indices = diffusion.resolve_sde_indices(rollout_id)
+        if sde_index_override is not None:
+            sde_indices = [int(sde_index_override)]
+        else:
+            sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diffusion, sde_indices=sde_indices, scheduler=None)
         sampling_params = {**base, "diffusion": diffusion}
         # Driver-authoritative x_T, shipped as a deterministic RECIPE. The driver
@@ -439,15 +464,150 @@ class DiffusionTrainer(BaseTrainer):
             init_noise_latent_shape=init_noise_latent_shape,
         )
 
+    def _flash_candidate_pool(self) -> List[int]:
+        """Return the SDE-step candidate pool for FlashGRPO's per-sample path.
+
+        Sourced from the diffusion sampling params' scheduler — the single source
+        of truth for which denoising steps may carry an SDE transition. Requires a
+        scheduler exposing ``sde_candidate_pool`` (i.e. an
+        :class:`~unirl.utils.scheduler_utils.AllSDEScheduler`); a static
+        ``sde_indices`` or a scheduler without that accessor cannot express the
+        per-step candidate set, so this raises loudly rather than silently
+        collapse every prompt onto one step.
+        """
+        diffusion = self.sampling_params.get("diffusion")
+        scheduler = getattr(diffusion, "scheduler", None) if diffusion is not None else None
+        pool_fn = getattr(scheduler, "sde_candidate_pool", None)
+        if pool_fn is None:
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path requires sampling_params['diffusion'] to carry a "
+                "scheduler exposing sde_candidate_pool() (e.g. AllSDEScheduler); got "
+                f"scheduler={type(scheduler).__name__ if scheduler is not None else None}. "
+                "Configure a scheduler (not a static sde_indices) for FlashGRPO."
+            )
+        pool = [int(i) for i in pool_fn()]
+        if not pool:
+            raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
+        # Uniform-K guard. The rollout stores each trajectory's SDE pair {i, i+1}
+        # plus the terminal clean latent at position T=num_inference_steps. A step
+        # i < T-1 stores 3 latents {i, i+1, T}; the LAST step i == T-1 stores only
+        # {T-1, T} (i+1 coincides with the terminal). Groups that drew different-K
+        # steps cannot be merged (RolloutResp.concat torch.cat's the stored latents),
+        # so fail loudly at build instead of a cryptic cat mismatch mid-training.
+        num_inference_steps = int(diffusion.num_inference_steps)
+        last_candidate = max(pool)
+        if last_candidate >= num_inference_steps - 1:
+            raise ValueError(
+                f"FlashGRPO per-sample SDE candidate pool reaches step {last_candidate}, but the last "
+                f"denoising step (num_inference_steps-1 = {num_inference_steps - 1}) stores only 2 "
+                "trajectory latents while earlier steps store 3, so mixed-K rollout groups cannot be "
+                "concatenated. Narrow the scheduler timestep_fraction so its end maps below the final step."
+            )
+        return pool
+
+    def _check_flash_rectification_pool(self, algorithm_cfg) -> None:
+        """Fail fast if FlashGRPO's rectification pool diverges from the SDE candidate pool.
+
+        The per-sample temporal-gradient rectification normalizes each sample's
+        coefficient by the MEAN coefficient over ``rectification_indices`` (an
+        algorithm-config field), while each sample draws its single SDE step from
+        the scheduler's ``sde_candidate_pool`` (a sampling-config field). The two
+        live in separate config blocks; if they disagree the loss is SILENTLY
+        mis-scaled (≈ an unintended learning-rate change), so require them equal at
+        build time rather than let the mismatch ride through training unnoticed.
+
+        Args:
+            algorithm_cfg: The algorithm Hydra config; ``rectification_indices`` is
+                read from it (the pre-instantiation source, since ``self.algorithm``
+                is a remote handle whose attributes are not directly readable here).
+
+        Raises:
+            ValueError: If ``rectification_indices`` is unset or not equal (as a
+                sorted set) to the scheduler's candidate pool.
+        """
+        pool = self._flash_candidate_pool()
+        rectification_indices = algorithm_cfg.get("rectification_indices", None)
+        if rectification_indices is None:
+            raise ValueError(
+                "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
+                f"candidate pool {sorted(pool)} (the temporal-rectification normalizer averages "
+                "coefficients over these steps); got None."
+            )
+        rectification_sorted = sorted(int(i) for i in rectification_indices)
+        if rectification_sorted != sorted(pool):
+            raise ValueError(
+                f"FlashGRPO rectification_indices {rectification_sorted} must equal the SDE candidate "
+                f"pool {sorted(pool)}: each sample draws its step from the pool but is normalized over "
+                "rectification_indices, so a mismatch silently mis-scales the loss. Set "
+                "algorithm.rectification_indices to the candidate pool."
+            )
+
+    def _build_flash_generate_jobs(self, inputs: RolloutInputs, rollout_id: int) -> List[Tuple[int, RolloutReq]]:
+        """Assign each prompt one i.i.d. SDE step, then build one req per step group.
+
+        FlashGRPO records a single stochastic SDE transition per trajectory. If
+        every sample took it at the SAME step (the shared ``resolve_sde_indices``
+        path), one optimizer step would see one sigma and the policy gradient would
+        vanish. Here each of the ``batch_size`` prompts independently draws one step
+        from the scheduler's candidate pool (fresh per rollout, seeded on
+        ``rollout_id`` for resume-determinism); its sibling samples inherit it.
+        Prompts that drew the SAME step are generated together with
+        ``sde_index_override=step``, so grouping issues at most ``len(pool)``
+        generate calls instead of one per prompt (diffusion samples are
+        batch-independent — only the shared step drives the trajectory).
+
+        Returns ``(step, req)`` pairs in ascending-step order. Concatenating their
+        tracks keeps each prompt's siblings consecutive (group-by-parent
+        contiguous), which :meth:`RolloutTrack.compute_advantages` relies on.
+        """
+        pool = self._flash_candidate_pool()
+        n_prompts = len(inputs.sample_ids)
+        rng = np.random.default_rng(rollout_id)
+        chosen_steps = [int(s) for s in rng.choice(pool, size=n_prompts, replace=True)]
+
+        positions_by_step: Dict[int, List[int]] = {}
+        for position, step in enumerate(chosen_steps):
+            positions_by_step.setdefault(step, []).append(position)
+
+        jobs: List[Tuple[int, RolloutReq]] = []
+        for step in sorted(positions_by_step):
+            group_positions = torch.tensor(positions_by_step[step], dtype=torch.long)
+            group_inputs = inputs.select(group_positions)
+            jobs.append((step, self._build_req(group_inputs, rollout_id, sde_index_override=step)))
+        return jobs
+
+    def _stamp_sde_index_per_sample(self, resp: RolloutResp, sde_index: int) -> None:
+        """Stamp ``segment.sde_index_per_sample = sde_index`` on each track of ``resp``.
+
+        Every sample in this group took its single SDE step at ``sde_index``. The
+        stamp is a ``CONCAT`` field, so it survives :meth:`RolloutResp.concat` into
+        the merged training track — which is what WAN replay and the FlashGRPO loss
+        read for each sample's own step, instead of the now non-authoritative shared
+        ``sde_indices``.
+        """
+        for track in resp.tracks.values():
+            if track.segment is None:
+                continue
+            n = track.batch_size
+            track.segment.sde_index_per_sample = torch.full((n,), int(sde_index), dtype=torch.long)
+
     def train_step(
         self,
-        req: RolloutReq,
+        generate_jobs: List[Tuple[Optional[int], RolloutReq]],
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[TrainStepResult, float]:
         """One ``rollout → reward → advantage → optimizer step`` pass.
+
+        ``generate_jobs`` is a list of ``(sde_index, req)`` pairs run within ONE
+        wake / offload / EMA window and then merged into a single request/response.
+        The shared-schedule path passes exactly one job with ``sde_index=None`` (so
+        behaviour is unchanged). FlashGRPO's per-sample path passes one job per
+        SDE-step group (see :meth:`_build_flash_generate_jobs`); each group's
+        response is stamped with its ``sde_index`` before the merge so every sample
+        carries its own step.
 
         ``training_progress`` in ``[0, 1]`` drives clip-range / LR schedules
         inside the algorithm. The reference trainer is stateless — the
@@ -491,12 +651,25 @@ class DiffusionTrainer(BaseTrainer):
         _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
         if _inproc_ema_swap:
             self.backend.apply_eval_ema()
-        resp = self.rollout.generate(req)
+        resps: List[RolloutResp] = []
+        for sde_index, job_req in generate_jobs:
+            group_resp = self.rollout.generate(job_req)
+            if sde_index is not None:
+                self._stamp_sde_index_per_sample(group_resp, sde_index)
+            resps.append(group_resp)
         if _inproc_ema_swap:
             self.backend.restore_from_eval()
         self.rollout.sleep()
         if _do_fsdp_offload:
             self.backend.onload()
+
+        # Merge the per-SDE-step generate groups into one request/response so reward
+        # scoring, advantages, and the optimizer step operate on the full rollout.
+        # Non-flash path: a single job → these are identity (reqs[0] is the original
+        # req, resps[0] the original resp), so behaviour is byte-identical.
+        reqs = [job_req for _, job_req in generate_jobs]
+        req = reqs[0] if len(reqs) == 1 else RolloutReq.concat(reqs)
+        resp = resps[0] if len(resps) == 1 else RolloutResp.concat(resps)
 
         for name, track in list(resp.tracks.items()):
             if track.segment is not None:
@@ -522,6 +695,16 @@ class DiffusionTrainer(BaseTrainer):
 
         self._drop_decoded(req, resp, rollout_id=rollout_id)
         (track,) = resp.tracks.values()
+        # FlashGRPO: samples arrive grouped by SDE step (the merge above concatenates
+        # per-step groups). Shuffle before the DP scatter + micro-batch split so each
+        # of the ``num_updates_per_batch`` optimizer steps sees a spread of sigmas
+        # instead of one contiguous step group — matching upstream's
+        # randperm-before-reshape. Seeded on rollout_id for resume-determinism. Gated:
+        # the shared-schedule path is byte-identical.
+        if self._flash_per_sample_sde:
+            shuffle_gen = torch.Generator()
+            shuffle_gen.manual_seed(int(rollout_id))
+            track = track.select(torch.randperm(track.batch_size, generator=shuffle_gen))
         result = self.stack.train_track(track, training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(rollout_id, result, resp, step_time_s=time.perf_counter() - t0)
         return result, mean_reward
@@ -650,7 +833,13 @@ class DiffusionTrainer(BaseTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
+                # FlashGRPO fans the rollout into one generate per SDE-step group so a
+                # single optimizer step averages over a spread of sigmas; every other
+                # algorithm builds one request (single job, sde_index=None).
+                if self._flash_per_sample_sde:
+                    generate_jobs = self._build_flash_generate_jobs(inputs, rollout_id)
+                else:
+                    generate_jobs = [(None, self._build_req(inputs, rollout_id))]
                 # Sync before generate; skip step 0 (nothing trained yet). On
                 # resume, force the first sync — the engine booted with fresh
                 # weights and needs the restored adapter before generate.
@@ -658,7 +847,7 @@ class DiffusionTrainer(BaseTrainer):
                     resumed and rollout_id == start_rollout
                 )
                 result, mean_reward = self.train_step(
-                    req,
+                    generate_jobs,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,

@@ -52,7 +52,8 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
     clip_range: float = 1e-3
     clip_schedule: str = "constant"
     beta: float = 0.0
-    old_logp_source: str = "replay"
+    old_logp_source: str = "rollout"
+    adv_clip_max: float = 5.0
     params: Any = dc_field(default=None)
     rectification_indices: Optional[List[int]] = None
 
@@ -67,6 +68,16 @@ class FlashGRPO(FlowGRPO):
     rectification formula is applied per step and normalized over those steps.
     """
 
+    # The v2 DiffusionTrainer gates its per-sample SDE-index orchestration on this
+    # flag: draw ONE i.i.d. SDE step per prompt (grouping prompts into <=|pool|
+    # generate calls), stamp ``segment.sde_index_per_sample``, then merge the
+    # groups into one training track. Without it every sample in a rollout shares
+    # the single step ``resolve_sde_indices`` draws, so an optimizer step sees one
+    # sigma and the policy gradient vanishes (the FlashGRPO collapse this fixes).
+    # FlowGRPO and every other shared-schedule algorithm leave it False (the base
+    # class has no such attribute → ``getattr(..., False)`` default).
+    requires_per_sample_sde_index = True
+
     def __init__(
         self,
         *,
@@ -77,7 +88,8 @@ class FlashGRPO(FlowGRPO):
         clip_range: float = 1e-3,
         clip_schedule: str = "constant",
         beta: float = 0.0,
-        old_logp_source: str = "replay",
+        old_logp_source: str = "rollout",
+        adv_clip_max: float = 5.0,
         rectification_indices: Optional[Sequence[int]] = None,
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
@@ -95,6 +107,13 @@ class FlashGRPO(FlowGRPO):
             conditions_cls=conditions_cls,
         )
         self.rectification_indices = None if rectification_indices is None else [int(i) for i in rectification_indices]
+        # Upstream clamps advantages to +-adv_clip_max before the ratio (train
+        # script:1056, default 5 in config/base.py:91). Without it a batch whose
+        # reward spread collapses drives |adv| arbitrarily high through the
+        # global-std denominator, and one gradient spike undoes training.
+        if not float(adv_clip_max) > 0.0:
+            raise ValueError(f"FlashGRPO: adv_clip_max must be > 0; got {adv_clip_max!r}.")
+        self.adv_clip_max = float(adv_clip_max)
 
     def compute_loss_and_backward(
         self,
@@ -119,13 +138,23 @@ class FlashGRPO(FlowGRPO):
         new_logp = replay_result.log_probs
         new_means = replay_result.prev_sample_means
 
-        old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
-            dtype=new_logp.dtype,
-            device=new_logp.device,
-        )
+        # FlashGRPO's per-sample path: each sample took exactly one stochastic
+        # step (S == 1) at its OWN index (segment.sde_index_per_sample), so the
+        # shared sde_indices / gather_sde_field / searchsorted lookup does not
+        # apply — old_logp is just the single stored column.
+        per_sample = segment.sde_index_per_sample is not None
+        if per_sample:
+            old_logp = segment.sde_logp[:, :1].to(dtype=new_logp.dtype, device=new_logp.device)
+        else:
+            old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
 
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
-        adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+        adv_raw = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device)
+        # Upstream: torch.clamp(sample["advantages"][:, 0], -adv_clip_max, +adv_clip_max).
+        adv_clipped = adv_raw.clamp(-self.adv_clip_max, self.adv_clip_max)
+        adv_b = adv_clipped.reshape(-1, 1).expand_as(new_logp)
 
         loss_per_elem, ratio_metrics = _grpo_clip_loss(
             new_logp=new_logp,
@@ -134,10 +163,11 @@ class FlashGRPO(FlowGRPO):
             clip_range=clip_range,
         )
 
-        tgr = self._rectification_weights(segment=segment, target_steps=target_steps, device=new_logp.device).to(
-            dtype=loss_per_elem.dtype,
-            device=loss_per_elem.device,
-        )
+        if per_sample:
+            tgr = self._rectification_weights_per_sample(segment=segment, device=new_logp.device)
+        else:
+            tgr = self._rectification_weights(segment=segment, target_steps=target_steps, device=new_logp.device)
+        tgr = tgr.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
         loss_per_elem = loss_per_elem * tgr
         policy_loss = loss_per_elem.mean()
         loss = policy_loss
@@ -148,10 +178,21 @@ class FlashGRPO(FlowGRPO):
             "flash_tgr_mean": float(tgr.detach().mean().item()),
             "flash_tgr_min": float(tgr.detach().min().item()),
             "flash_tgr_max": float(tgr.detach().max().item()),
+            # Fraction of samples whose advantage hit +-adv_clip_max. A run that
+            # starts regressing while this climbs is being driven by the reward
+            # outliers the clamp exists to bound.
+            "adv_clip_fraction": float((adv_raw.abs() > self.adv_clip_max).float().mean().item()),
+            "adv_abs_max": float(adv_raw.abs().max().item()),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
 
         if self.beta > 0.0:
+            if per_sample:
+                raise NotImplementedError(
+                    "FlashGRPO: reference-KL (beta>0) is not supported on the per-sample "
+                    "SDE-index path; the WAN2.1 recipe runs beta=0. Set beta=0, or route "
+                    "through the shared sde_indices path for KL."
+                )
             if new_means is None:
                 raise RuntimeError(
                     "FlashGRPO: beta>0 requires stage.replay() to return prev_sample_means, "
@@ -212,6 +253,37 @@ class FlashGRPO(FlowGRPO):
         norm = self._rectification_coefficients(sigmas=sigmas, steps=list(norm_steps), device=device)
         weights = weights / norm.detach().mean().clamp_min(torch.finfo(torch.float32).eps)
         return weights.reshape(1, -1)
+
+    def _rectification_weights_per_sample(
+        self,
+        *,
+        segment: LatentSegment,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return per-sample Flash-GRPO rectification weights ``[N, 1]``.
+
+        The S==1 flash path: each sample took its single stochastic step at
+        ``segment.sde_index_per_sample[n]``, so its coefficient is computed at
+        that own index and normalized by the mean coefficient over the shared
+        candidate pool (``rectification_indices``). The pool is REQUIRED here:
+        without it each sample would normalize by its own single coefficient and
+        collapse to ~1 — exactly the zero-diversity failure this path fixes.
+        """
+        if segment.sigmas is None:
+            raise ValueError("FlashGRPO requires segment.sigmas to compute temporal rectification weights.")
+        if self.rectification_indices is None:
+            raise ValueError(
+                "FlashGRPO per-sample rectification requires rectification_indices (the shared "
+                "candidate timestep pool) to normalize against; got None."
+            )
+        if segment.sde_index_per_sample is None:
+            raise ValueError("FlashGRPO per-sample rectification requires segment.sde_index_per_sample; got None.")
+        sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
+        per_sample_steps = [int(i) for i in segment.sde_index_per_sample.tolist()]
+        weights = self._rectification_coefficients(sigmas=sigmas, steps=per_sample_steps, device=device)
+        norm = self._rectification_coefficients(sigmas=sigmas, steps=list(self.rectification_indices), device=device)
+        weights = weights / norm.detach().mean().clamp_min(torch.finfo(torch.float32).eps)
+        return weights.reshape(-1, 1)
 
     def _rectification_coefficients(
         self,

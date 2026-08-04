@@ -13,6 +13,16 @@ log-prob; non-SDE steps simply aren't represented. This mirrors a compact
 index-map pattern — replay code reads ``sde_logp[:, s]`` and uses
 ``sde_indices[s]`` for the step lookup.
 
+``sde_indices`` is batch-SHARED: every sample in a segment took its SDE
+transition(s) at the SAME step(s). FlashGRPO breaks that assumption — each
+sample takes exactly ONE stochastic step (``S == 1``) but different samples
+take it at different steps so one optimizer step averages the gradient over a
+spread of sigmas. The optional per-sample ``sde_index_per_sample`` ``[N_segs]``
+field carries that variation; when it is set, ``sde_logp`` is ``[N_segs, 1]``
+and replay reads each sample's own step from it rather than from the shared
+``sde_indices``. It defaults to ``None`` so the shared-schedule algorithms are
+unaffected.
+
 ``sde_logp`` may be populated either at rollout time by a native log-prob
 source (the rollout engines best-effort emit it — SGLang, vllm_omni) or by
 the trainer via :meth:`StageAlgorithm.prepare_segment`. Which one is the
@@ -64,6 +74,19 @@ class LatentSegment(Segment):
     sde_logp: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sde_means: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sde_indices: Optional[torch.Tensor] = shared_field(default=None)
+    # Per-sample SDE step index ``[N_segs]`` — the SINGLE stochastic step each
+    # sample took. ``None`` for the shared-schedule algorithms (FlowGRPO /
+    # FlowDPPO / bagel), which read the batch-shared ``sde_indices`` above. Set
+    # only by FlashGRPO, where each sample has exactly one SDE transition
+    # (``S == 1``) but DIFFERENT samples take it at DIFFERENT steps (siblings
+    # share): the shared ``sde_indices`` cannot express that per-sample variation.
+    # ``FieldKind.CONCAT`` so it stacks along dim 0 when per-index group-tracks
+    # are merged into one training track. When set, ``sde_logp`` is ``[N_segs, 1]``
+    # and replay reads this field for each sample's own ``sigma`` instead of the
+    # shared ``sde_indices`` / ``gather_sde_field`` path. On a merged flash track
+    # the shared ``sde_indices`` / ``indices`` are no longer per-sample meaningful
+    # (they hold one representative group's values); this field is authoritative.
+    sde_index_per_sample: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     # Optional auxiliary per-step latent trajectory stored at the SAME sparse

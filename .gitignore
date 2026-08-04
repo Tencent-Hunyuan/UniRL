@@ -104,3 +104,10 @@ benchmarks/image/dpg_bench/data/
 benchmarks/text/aime/data/aime2025.jsonl
 benchmarks/text/gpqa/data/
 benchmarks_results/
+
+# Cloned reference repo (not part of this project)
+/Flash-GRPO/
+
+# Training run outputs and local debugging scratch
+checkpoints/
+.diag/
