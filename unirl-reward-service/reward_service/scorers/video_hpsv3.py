@@ -152,9 +152,10 @@ class VideoHPSv3Scorer(BaseScorer):
         """Load HPSv3 and configure frame sampling / aggregation.
 
         Args:
-            weights_path: Directory containing ``HPSv3.safetensors`` (or the
-                file itself); ``None`` uses the hpsv3 package's default HF
-                download path. Forwarded to :class:`HPSv3Scorer`.
+            weights_path: Directory containing ``HPSv3.safetensors``, the file
+                itself, or a Hugging Face repo id; ``None`` uses the hpsv3
+                package's default HF download. Forwarded to
+                :class:`HPSv3Scorer`.
             config_path: Optional HPSv3 config YAML override. Forwarded to
                 :class:`HPSv3Scorer`.
             device: Target device (``"cuda"`` / ``"cpu"``).

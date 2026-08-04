@@ -7,11 +7,16 @@
 # calls an HTTP service that scores decoded frames with HPSv3 and averages the
 # top 30%. This keeps the 7B reward backbone off the training GPUs.
 #
-# NOTE: the service ships frame_stride: 8, so only every 8th frame is scored
-# (11 of 81 frames, top-30% = 3 frames). Set frame_stride: 1 in
-# configs/videohpsv3_service.yaml for exact upstream Flash-GRPO semantics
-# (81 frames, top-30% = 24) at ~8x the reward cost — and re-check that config's
-# score_timeout_s, which at stride 1 is the binding constraint.
+# NOTE: configs/videohpsv3_service.yaml runs frame_stride: 1 — exact upstream
+# Flash-GRPO semantics (all 81 frames scored, top-30% = 24 frames averaged).
+# Do not raise it: at stride 8 only 11 frames are scored and top-30% keeps just
+# 3, so the policy can maximize reward by making 3 frames pretty and letting the
+# other 78 rot. A 22h stride-8 run collapsed exactly that way (reward peaked
+# around rollout 30 then went negative through rollout 74).
+# Stride 1 is close to free — the reward call is ~0.8% of step time (measured
+# 8.2s of a 1029s step at stride 8), so stride 1 costs ~60s, i.e. 17.2 -> 18.0
+# min/step (+4.6%), and leaves ~30x headroom under that config's
+# score_timeout_s. Generation, not reward, is what bounds this recipe (~75%).
 #
 # 2-node deployment:
 #   Node 1 (reward):
@@ -35,10 +40,29 @@
 #   --config-name diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3 --cfg job --resolve
 
 num_devices: 8
-batch_size: 8                 # prompts_per_rollout (small for the sglang video smoke)
+# prompts_per_rollout. 24 matches upstream Flash-GRPO's gradient SNR exactly:
+# config/dgx.py:wan2_1_flash_1node has num_batches_per_epoch=24 with
+# total_train_batch_size = train.batch_size(1) * num_processes(8) *
+# gradient_accumulation_steps(12) = 96 samples per optimizer step. Here
+# 24 prompts * samples_per_prompt(8) = 192 per rollout, and
+# stack.num_updates_per_batch(2) splits that into 2 disjoint updates of 96.
+# This was 8 for the sglang video smoke (32 samples/step, 1/3 of upstream);
+# the resulting gradient was ~70% noise (drift straightness 0.578 measured
+# over checkpoints 10-60) and the policy random-walked into solid-color
+# frames by rollout ~50. Generation is ~75% of step time and scales linearly,
+# so expect ~3x the wall clock per rollout.
+batch_size: 24
 adv_use_global_std: true
 num_rollouts: 1000
 weight_sync_interval: 1
+
+# Checkpointing. A prior 22h run finished with zero saved weights because
+# save_interval defaults to 0 (unirl/train_diffusion.py) — when its reward
+# collapsed there was nothing to roll back to. save_mode: auto keeps LoRA-only
+# keys while use_lora is true, so each checkpoint is small.
+save_interval: 10
+save_dir: ${oc.env:SAVE_DIR,checkpoints/wan21_t2v_flashgrpo_sglang_videohpsv3}
+save_mode: auto
 
 model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
@@ -183,8 +207,12 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/pickscore/train.txt
-      eval_data_path: datasets/pickscore/test.txt
+      # Upstream Flash-GRPO's own T2V prompt set (dataset/video/*.txt), whose
+      # prompts carry motion semantics. datasets/pickscore/*.txt is a still-image
+      # aesthetic set — it overlaps this one by 2 lines — so it gave the video
+      # policy no reason to move.
+      data_path: datasets/video/train.txt
+      eval_data_path: datasets/video/test.txt
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}
@@ -226,6 +254,8 @@ logging:
   run_name: ${oc.env:WANDB_RUN_NAME,wan21_t2v_flashgrpo_sglang_videohpsv3}
   entity: ${oc.env:WANDB_ENTITY,null}
   tags: ["wan21", "t2v", "flashgrpo", "grpo", "video", "videohpsv3", "sglang", "v2"]
-  log_media: false
+  # Rollout videos are never written to disk (the engine runs save_output=False),
+  # so wandb previews are the only way to see what the policy is producing.
+  log_media: true
   media_max_items: 8
   media_log_interval: 1
