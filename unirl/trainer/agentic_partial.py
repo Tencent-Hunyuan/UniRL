@@ -16,7 +16,7 @@ barrier is *how the rollout completes*:
 Motivation (LIN-531 ALFWorld comparison): the fully-async trainer *lost* on ALFWorld because
 disaggregation halves the generation GPUs; colocate+partial keeps all GPUs for generation while
 still cutting the straggler tail — the slime "over-sample + abort + recycle" / verl `bypass_mode`
-pattern. The driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine`
+pattern. The driver-side :class:`~unirl.rollout.manager.AgenticManager`
 (submit/poll/finalize_if_drained/quiesce + group assembly and versioned buffering) is shared with
 ``AsyncAgenticTrainer``; only the colocate wake/sync/sleep choreography is new.
 
@@ -35,7 +35,7 @@ import time
 from collections import Counter
 from typing import Dict, List, Literal, Optional
 
-from unirl.rollout.engine.asynchronous import AsyncAgenticRolloutEngine, root_of
+from unirl.rollout.manager import AgenticManager, root_of
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.agentic_env import _EnvRewardSource
 from unirl.types.sample import Part, Sample
@@ -204,7 +204,7 @@ class AgenticPartialTrainer(AgenticTrainer):
             },
         )
 
-        self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
+        self._engine = AgenticManager(self.rollout, group_size=self._n, start_gen_id=start_rollout)
         self._carried = []
 
         try:

@@ -63,13 +63,13 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
-- **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
+- **Driver-side async engines** (`manager/`, the driver-side half next
   to `engine/synchronous.py`'s worker-side sync contracts). Both engines expose the
   same consumer verbs the async trainers program against: `poll` / `drain_freshest` /
-  `pop_evicted` / `quiesce` + engine-owned `weight_version`. `AsyncBatchRolloutEngine`
+  `pop_evicted` / `quiesce` + engine-owned `weight_version`. `BatchManager`
   (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps
   versions at launch, used by `AsyncARTrainer`/`AsyncDiffusionTrainer`) and
-  `AsyncAgenticRolloutEngine` (trajectory granularity over the agentic rank-0
+  `AgenticManager` (trajectory granularity over the agentic rank-0
   coordinator; normalizes the `[0]` unwraps, assembles n-sibling GRPO groups,
   stamps versions at completion, used by the partial/async agentic trainers).
 
@@ -93,10 +93,10 @@ implements its weight-receive method and a matching `sync:` handler in
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
 - **Quiesce before weight sync / eval / checkpoint on the batch async path** —
-  `AsyncBatchRolloutEngine.quiesce()` drains every in-flight generation; a
+  `BatchManager.quiesce()` drains every in-flight generation; a
   weight + KV update corrupts one mid-flight. The agentic quiesce is a
   turn-boundary `abort` + final poll, folded into
-  `AsyncAgenticRolloutEngine.quiesce()`; its `sync_weights()` rejects a live
+  `AgenticManager.quiesce()`; its `sync_weights()` rejects a live
   drive, then pairs the weight push with the version bump and logs the sync.
   Reap-vs-launch ordering is trainer
   statement order (diffusion polls before topping up; see its `_next_step`).

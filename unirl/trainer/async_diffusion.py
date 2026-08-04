@@ -9,7 +9,7 @@ plumbing (``_build_request_sample`` / ``_drop_decoded`` / ``evaluate`` /
 checkpoint / FlowGRPO ``stack.train_track``).
 
 The async loop runs over the shared
-:class:`~unirl.rollout.engine.asynchronous.AsyncBatchRolloutEngine` (the same engine
+:class:`~unirl.rollout.manager.BatchManager` (the same engine
 ``AsyncARTrainer`` drives) — one single-threaded driver loop over non-blocking
 Ray dispatch, no producer thread and no locks. This trainer supplies only the
 diffusion hooks:
@@ -50,7 +50,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
+from unirl.rollout.manager import BatchManager, launch_ceiling
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
@@ -167,7 +167,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             },
         )
 
-        self._async_engine = AsyncBatchRolloutEngine(
+        self._async_engine = BatchManager(
             self.rollout,
             complete=self._score_completed,
             start_gen_id=start_rollout,

@@ -12,7 +12,7 @@ the in-flight requests batching together) and ``env.step`` (the env is re-entran
 (how many to over-sample, staleness, when to sync). The coordinator exposes a
 **submit / poll / finalize / abort** interface over a **background** drain the trainer reaps and
 interrupts — consumed driver-side through
-:class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine` (rank-0 unwrap + group assembly +
+:class:`~unirl.rollout.manager.AgenticManager` (rank-0 unwrap + group assembly +
 versioned buffering):
 
 - ``submit(request)`` — enqueue a pool (fresh prompts and/or carried partials) and fire the drain

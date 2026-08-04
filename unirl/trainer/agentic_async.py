@@ -10,7 +10,7 @@ multi-turn generation with training.
 Mechanism vs policy (LIN-531): the **engine** exposes a ``submit`` / ``poll`` /
 ``finalize_if_drained`` / ``abort`` interface over a background drain (see
 :class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine`), consumed
-through the driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticRolloutEngine`
+through the driver-side :class:`~unirl.rollout.manager.AgenticManager`
 (group assembly + versioned buffering); this **trainer** owns the *policy* —
 
 * **Producer** — keep the rollout slab saturated: ``submit`` a pool of fresh prompt
@@ -51,7 +51,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.rollout.engine.asynchronous import AsyncAgenticRolloutEngine, root_of
+from unirl.rollout.manager import AgenticManager, root_of
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -353,7 +353,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
             },
         )
 
-        self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
+        self._engine = AgenticManager(self.rollout, group_size=self._n, start_gen_id=start_rollout)
 
         if start_rollout < num_rollouts and start_rollout and self.weight_sync is not None:
             self._engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine

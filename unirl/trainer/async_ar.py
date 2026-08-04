@@ -19,7 +19,7 @@ slime's thread+asyncio). The async behavior is set by **two numeric knobs**:
   regime). ``>0`` = **off-policy continuous buffer**: generations may run ahead
   across syncs, bounded by eviction; the rollout-anchored DRPO ratio absorbs it.
 
-Generation runs through :class:`~unirl.rollout.engine.asynchronous.AsyncBatchRolloutEngine`
+Generation runs through :class:`~unirl.rollout.manager.BatchManager`
 (non-blocking Ray futures over the rollout Handle) on the single driver thread —
 no producer thread, no locks; the trainer's ``_next_step`` loop owns the policy
 (launch ceiling, launch-then-reap order). Draining all in-flight generations
@@ -45,7 +45,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
+from unirl.rollout.manager import BatchManager, launch_ceiling
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -308,7 +308,7 @@ class AsyncARTrainer(ARTrainer):
             },
         )
 
-        self._async_engine = AsyncBatchRolloutEngine(
+        self._async_engine = BatchManager(
             self.rollout,
             complete=self._score_completed,
             start_gen_id=start_rollout,

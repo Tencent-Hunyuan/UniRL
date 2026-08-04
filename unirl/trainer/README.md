@@ -68,8 +68,8 @@ The current trainer surface is:
 | `AsyncAgenticTrainer` / `AsyncAgenticEnvTrainer` | buffered complete trajectory groups → concatenated turn `Part` | Disaggregated train/rollout slabs, resident agentic drive, weight-version staleness control, and the same explicit `carry`/`drop` tail policy. |
 
 The async variants program against the driver-side async engines in
-`unirl/rollout/engine/asynchronous.py`: `AsyncBatchRolloutEngine` (AR/diffusion — non-blocking
-batched generations, launch-time version stamps) and `AsyncAgenticRolloutEngine`
+`unirl/rollout/manager/`: `BatchManager` (AR/diffusion — non-blocking
+batched generations, launch-time version stamps) and `AgenticManager`
 (partial/async agentic — trajectory drives, group assembly, completion-time stamps).
 The trainers keep the policy: launch ceilings, reap-vs-launch order, quiesce points,
 and tail carry/drop.
