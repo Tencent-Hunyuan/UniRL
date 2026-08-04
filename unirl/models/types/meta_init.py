@@ -69,10 +69,6 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
         if owner is None or not hasattr(owner, buf_name):
             continue
         live = getattr(owner, buf_name)
-        # After FSDP2 (fully_shard), non-persistent buffers can be DTensors; a plain
-        # ``live.copy_(cpu_tensor)`` onto a DTensor silently fails to write, leaving
-        # the ``to_empty`` garbage (e.g. RoPE ``inv_freq==0`` -> position-blind model
-        # -> rollout/replay logprob mismatch). Copy into the LOCAL shard.
         tgt = live.to_local() if hasattr(live, "to_local") else live
         src = value.to(device=tgt.device, dtype=tgt.dtype)
         if tuple(tgt.shape) != tuple(src.shape):
@@ -127,8 +123,6 @@ def recover_rope_inv_freq(model: nn.Module) -> int:
         rope_type = rope_type or "default"
 
         if rope_type == "default":
-            # Preserve the empirically verified Qwen3 default path used by the
-            # rollout engine; do not reinterpret a default config as scaled RoPE.
             theta = getattr(cfg, "rope_theta", None)
             if theta is None and isinstance(rope_config, dict):
                 theta = rope_config.get("rope_theta")

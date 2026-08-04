@@ -53,7 +53,6 @@ _WORD_TO_DIGIT = {
     "ten": "10",
 }
 
-# Non-counting GenEval2 atoms expect "Yes" (matches remote reward-service scorer).
 _YES_SURFACE_FORMS = ("Yes", "yes", " Yes", " yes")
 
 
@@ -189,7 +188,6 @@ class GenEval2RewardScorer(LocalRewardBackend):
             )
 
         probs = torch.nn.functional.softmax(outputs.scores[0], dim=-1)
-        # Sum probabilities for all valid answer token IDs
         return sum(probs[0, tid].item() for tid in answer_token_ids)
 
     def _answer_token_ids(self, question: str, expected: str) -> List[int]:

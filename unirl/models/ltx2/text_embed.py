@@ -56,7 +56,6 @@ class LTX2TextEmbedStage:
             "audio_text": TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
         }
 
-        # Negative prompts for CFG
         if negative_texts is not None:
             neg_hidden_states, neg_mask = self._encode_prompts(negative_texts.texts)
             neg_video, neg_audio, neg_conn_mask = self._apply_connectors(neg_hidden_states, neg_mask)
@@ -67,7 +66,6 @@ class LTX2TextEmbedStage:
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize and return Gemma3's stacked all-layer hidden states."""
-        # Gemma expects LEFT padding for chat-style prompts (diffusers sets this).
         if getattr(self.tokenizer, "pad_token", None) is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
@@ -133,10 +131,6 @@ class LTX2TextEmbedStage:
         padding_side="left")`` returns a 3-tuple
         ``(video_text_embedding, audio_text_embedding, binary_attn_mask)``.
         """
-        # diffusers >=0.38 accepts stacked 4-D Gemma states and performs the
-        # masked normalization itself. Version 0.37 expects the already
-        # normalized/flattened 3-D tensor and an additive mask. Support both
-        # without normalizing twice on the newer path.
         import inspect
 
         params = inspect.signature(self.connectors.forward).parameters

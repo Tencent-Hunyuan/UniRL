@@ -55,9 +55,6 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     ar = gen_part.sampling_params
     control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
-    # Fan-out is the LAST-fork branch (children per *frontier parent*), not the
-    # root-relative count: in a multi-turn Sample the frontier's parent is a later
-    # turn (parts[-2]), not parts[0]. They coincide for a single-stage request.
     parent_part = sample.parts[-2] if len(sample.parts) >= 2 else input_part
     n_parent = len(parent_part.sample_ids)
     n = (len(gen_part.sample_ids) // n_parent) if n_parent else 1

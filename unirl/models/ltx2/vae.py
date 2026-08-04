@@ -35,28 +35,17 @@ class LTX2VAEDecodeStage:
         Returns:
             ``Videos`` (varlen-packed) with per-frame values in ``[0, 1]``.
         """
-        # Decode in fp32: LTX2's VAE decoder (like most) is numerically
-        # unstable in bf16. Mirror WAN21VAEDecodeStage.
         vae = self.vae
         latents_f32 = latents.to(torch.float32)
 
-        # The LTX2 VAE is timestep-conditioned: its decoder multiplies a
-        # required ``temb`` by a scale factor, so passing ``None`` crashes
-        # (None * Parameter). diffusers' pipeline feeds decode_timestep=0.0
-        # (and decode_noise_scale defaults to it → the pre-decode noise
-        # injection is a no-op), so a zeros timestep reproduces inference.
         timestep = None
         if bool(getattr(vae.config, "timestep_conditioning", False)):
             timestep = torch.zeros(latents_f32.shape[0], device=latents_f32.device, dtype=latents_f32.dtype)
 
         decoded = vae.to(torch.float32).decode(latents_f32, timestep, return_dict=False)[0]
 
-        # Decoder emits [B, C, T, H, W] in [-1, 1]; normalize to [0, 1].
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0).to(self.dtype)
 
-        # Pack into the varlen ``Videos`` primitive: ``Video.frames`` is
-        # [T, C, H, W], so permute each sample (C, T, H, W) → (T, C, H, W)
-        # and let ``Videos.from_list`` concat along T (computing cu_seqlens).
         videos = [Video(frames=decoded[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(decoded.shape[0]))]
         return Videos.from_list(videos)
 
@@ -84,7 +73,6 @@ class LTX2VAEEncodeStage:
             Latents (B, C_lat, T_lat, H_lat, W_lat).
         """
         if frames.dim() == 4:
-            # Single frame → add temporal dim
             frames = frames.unsqueeze(2)
         frames = frames.to(dtype=self.vae.dtype)
         latents = self.vae.encode(frames).latent_dist.sample()
@@ -138,23 +126,16 @@ class LTX2AudioDecodeStage:
         Returns:
             Waveform tensor from the vocoder.
         """
-        # M = latent mel bins = mel_bins // mel_compression_ratio.
         mel_bins = int(getattr(self.audio_vae.config, "mel_bins", 64))
         mel_compression = int(getattr(self.audio_vae, "mel_compression_ratio", 4))
         latent_mel_bins = mel_bins // mel_compression
 
-        # 1. Denormalize FIRST (on the packed latent), then unpack — order
-        #    differs from video (which unpacks first).
         aud = self._denormalize_audio_latents(
             audio_latents.float(), self.audio_vae.latents_mean, self.audio_vae.latents_std
         )
-        # 2. Unpack: [B, L, C*M] -> [B, C, L, M]
         aud = self._unpack_audio_latents(aud, audio_latent_length, num_mel_bins=latent_mel_bins)
-        # 3. Audio VAE decode -> mel spectrogram (fp32: BigVGAN vocoder uses
-        #    snake activation + Kaiser sinc filters that overflow in bf16).
         aud = aud.to(torch.float32)
         mel = self.audio_vae.to(torch.float32).decode(aud, return_dict=False)[0]
-        # 4. Vocoder -> waveform (fp32 for numerical stability)
         waveform = self.vocoder.to(torch.float32)(mel)
         return waveform
 

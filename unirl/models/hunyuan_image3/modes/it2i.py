@@ -130,28 +130,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         "per-sample cond_vit lists are not transport-safe above 2.",
     )
     schedule = params.sigmas.to(pipeline.bundle.device)
-    # Single CFG derivation feeding the chat template, ``_encode_cond_image``,
-    # and the vit_kwargs duplication below — they must agree on the batch axis.
     cfg = float(params.guidance_scale) > 1.0
 
-    # 1. ViT cond features. Returns joint_image_info (forwarded to chat
-    #    template), cond_vit_images, vit_kwargs.
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # 2. VAE encode + ViT cond, built at cfg_factor=1 (ONE copy per sample). The
-    #    cfg uncond branch keeps the SAME source image, so cfg doubling of these
-    #    payloads is a pure block duplication (_encode_cond_image / vit_kwargs do
-    #    ``.repeat`` / ``list*cfg``); the diffusion stage re-applies it when it
-    #    expands CFG. Keeping them B-batched (not doubled) means they survive the
-    #    B-sample track transport that a 2B batch would not.
     cond_vae_images, cond_timestep, cond_vit_images = _encode_cond_images_per_sample(
         pipeline.bundle.transformer,
         vit["joint_image_info"],
         condition_vae_generators,
     )
-    vit_kwargs = vit["vit_kwargs"]  # B-batched (cfg doubling deferred to the stage)
+    vit_kwargs = vit["vit_kwargs"]  # CFG duplication is deferred to the stage.
 
-    # 4. Build the unified-MM tensors with cond-image markers spliced in.
     bot_task = str((sample.parts[0].control or {}).get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
@@ -162,12 +151,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
-    # 4. Split the cfg-doubled fused into cond (-> fused) + uncond (-> fused_uncond),
-    #    both B-batched (one row per sample). The uncond branch genuinely differs from
-    #    cond (its prompt tokens are replaced by <cfg> tokens), so it must be carried
-    #    explicitly; storing it as its own B-aligned field lets it survive the
-    #    B-sample track transport, and the stage re-stacks [cond; uncond] for a GUIDED
-    #    replay (ratio=1 at cfg>1). cfg=False -> single branch, fused_uncond=None.
+    # Store cond and uncond branches separately so transport preserves both.
     fused_full = mm["fused"]
     expected_fused_rows = frontier.batch_size * (2 if cfg else 1)
     actual_fused_rows = int(fused_full.input_ids.shape[0])
@@ -185,10 +169,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         fused_cond = fused_full
         fused_uncond = None
 
-    # 5. Pack into the typed conditions container. The chat-template
-    #    path drives the fused sequence via input_ids; cond-image data
-    #    flows through the typed ImageLatentCondition / ImageEmbedCondition
-    #    primitives.
     cond_vae = ImageLatentCondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
         embeds=cond_vit_images,

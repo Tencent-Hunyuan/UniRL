@@ -27,7 +27,5 @@ def patch_safe_unpickler() -> None:
     prefixes = getattr(SafeUnpickler, "ALLOWED_MODULE_PREFIXES", None)
     if prefixes is None:
         return
-    # ``ALLOWED_MODULE_PREFIXES`` is a class-level set; mutating it covers every
-    # instance. Matches sglang's own ``(module + ".").startswith(prefix)`` check.
     if "unirl." not in prefixes:
         prefixes.add("unirl.")

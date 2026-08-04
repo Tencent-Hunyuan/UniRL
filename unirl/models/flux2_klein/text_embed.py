@@ -42,7 +42,6 @@ from .bundle import Flux2KleinBundle
 
 logger = logging.getLogger(__name__)
 
-# Architecture constants
 POOLED_DIM = 768
 DEFAULT_KLEIN_EXTRACTION_LAYERS: Tuple[int, ...] = (9, 18, 27)
 
@@ -67,8 +66,6 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             embeds=embeds,
             pooled=pooled,
         )
-
-    # ---- helpers -----------------------------------------------------------
 
     def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
@@ -119,7 +116,7 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 use_cache=False,
             )
 
-        hidden_states = outputs.hidden_states  # tuple of [B, T, 5120]
+        hidden_states = outputs.hidden_states
         extracted = []
         for layer_idx in self.extraction_layers:
             if layer_idx < len(hidden_states):

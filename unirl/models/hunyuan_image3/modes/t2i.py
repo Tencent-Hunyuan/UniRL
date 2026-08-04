@@ -53,9 +53,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     bot_task: str = str((sample.parts[0].control or {}).get("bot_task", "image"))
 
-    # Build the upstream multimodal input tensors. CFG-batched [cond, uncond]
-    # when guidance > 1; else single batch axis. ``mm`` is
-    # ``{"fused": HunyuanImage3FusedMultimodalCondition, "tokenizer_output": Any}``.
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=float(params.guidance_scale) > 1.0,

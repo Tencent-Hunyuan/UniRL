@@ -1,7 +1,7 @@
-"""Environment — the world side of an agent-loop turn (LIN-492).
+"""Environment — the world side of an agentic rollout turn (LIN-492).
 
-See ``unirl/rollout/loop/README.md``. A structural ``Protocol`` seam only; concrete
-environments (tool / critic) are designed separately. The loop treats it as optional.
+See ``unirl/rollout/env/README.md``. A structural ``Protocol`` seam consumed by
+rollout harnesses; concrete environments (tool / critic) are designed separately.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from unirl.types.sample import Primitive, Sample
 
 
 class Environment(Protocol):
-    """The world side of a turn. Optional for the loop; concrete environments are separate."""
+    """The world side of a harness turn; concrete environments are separate."""
 
     def reset(self, request: Sample) -> Sample:
         """Optional per-episode setup; return the (possibly augmented) request Sample."""
@@ -30,11 +30,11 @@ class Environment(Protocol):
         ...
 
     def close(self, sample: Sample) -> None:
-        """Optional guaranteed teardown (LIN-533), called from the engine's ``finally`` on every
-        path — success, crash, and abort. The engine invokes it via ``getattr(env, "close", None)``,
+        """Optional guaranteed teardown (LIN-533), called from the harness's ``finally`` on every
+        path — success, crash, and abort. The harness invokes it via ``getattr(env, "close", None)``,
         so an env holding no per-trajectory resource need not implement it (default: no-op). Stateful
         envs use it to release handles exactly once — tool sessions
-        (:meth:`~unirl.rollout.loop.tool_environment.ToolEnvironment.close`) or ALFWorld episodes/
+        (:meth:`~unirl.rollout.env.tool_environment.ToolEnvironment.close`) or ALFWorld episodes/
         pooled templates. Must be idempotent and **must not raise**.
         """
         ...

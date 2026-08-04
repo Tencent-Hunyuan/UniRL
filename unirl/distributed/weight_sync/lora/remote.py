@@ -56,12 +56,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._copy = bool(copy)
-        # Rollout engines' (role_name, [worker_handles]) pairs, cached on rank 0 by
-        # the driver's set_rollout_targets() (plain Ray handles, NOT a HandleRef).
         self._targets: List[tuple] = []
-        # Rank-0 hold of (lora_tensors, peft_config) between extract() and push() —
-        # lets a memory-constrained trainer (HI3) gather while engines are asleep,
-        # offload the base, wake the engines, then push.
         self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)

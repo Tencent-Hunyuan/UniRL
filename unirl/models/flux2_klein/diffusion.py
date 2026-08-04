@@ -153,12 +153,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         txt_ids = prepare_text_ids(prompt_embeds).to(device=device)
         img_ids = prepare_latent_ids(sample).to(device=device)
 
-        # Image-edit conditioning: append the source-image condition tokens to
-        # the noise token sequence (and their RoPE ids to img_ids), mirroring
-        # diffusers' Flux2KleinPipeline reference path
-        # (latent_model_input = cat([latents, image_latents], dim=1)). The
-        # transformer attends jointly; we slice the prediction back to the
-        # noise tokens afterwards. Pure T2I leaves these None → no-op.
         cond_tokens = conditions.image_latent
         if cond_tokens is not None:
             cond_tokens = cond_tokens.to(device=device, dtype=dtype)
@@ -181,7 +175,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
-        # Drop the condition-token predictions; keep only the noise tokens.
         noise_pred_packed = noise_pred_packed[:, :noise_seq_len]
 
         if guidance_scale > 1.0:
@@ -206,8 +199,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         latent_h = int(sample.shape[-2])
         latent_w = int(sample.shape[-1])
         return unpack_latents(noise_pred_packed, latent_h, latent_w)
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -315,10 +306,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         "Flux2SingleTransformerBlock",
     )
 
-    # FLUX.2-klein VAE spatial downsample (8×) and patchify factor (2×)
-    # → effective patchified downsample 16×. The bundle's
-    # ``transformer.config.in_channels`` is the patchified channel count
-    # (128 = 32 × 4); we use it to derive ``latent_channels`` (32).
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
     DEFAULT_PATCHIFY_FACTOR: ClassVar[int] = 2
 
@@ -350,10 +337,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
             latent_channels = int(in_channels)
         self.latent_channels = int(latent_channels)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def _patchified_shape(self, height: int, width: int) -> Tuple[int, int, int]:
         """Compute the patchified ``(C, H_pat, W_pat)`` for ``(height, width)`` pixels."""
@@ -440,9 +423,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         )
         sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
 
-        # Klein's transformer keeps `.eval()` mode during sampling
-        # (matches legacy Flux2Sampler.sample). Caller is responsible
-        # for restoring `.train()` after rollout finishes.
         self.model.transformer.eval()
 
         for i in range(T):
@@ -472,7 +452,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)  # [B, K, C, H_pat, W_pat]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
         sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
@@ -486,10 +466,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -541,7 +517,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             else nullcontext()
         )
 
-        # Klein replay uses ``.eval()`` to match the legacy sampler.
         prior_training = self.model.transformer.training
         self.model.transformer.eval()
         try:
@@ -614,10 +589,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             image_latent_ids=_rep(conditions.image_latent_ids),
         )
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
-
     def predict_noise_at_step(
         self,
         conditions: Flux2KleinConditions,
@@ -638,10 +609,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             conditions,
             guidance_scale=float(params.guidance_scale),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the module the diffusion forward operates on.

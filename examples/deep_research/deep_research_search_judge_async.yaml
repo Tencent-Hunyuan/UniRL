@@ -150,12 +150,12 @@ rollout:
         cuda_graph_max_bs: 16
         enable_lora: false
     env:
-      _target_: unirl.rollout.loop.tool_environment.ToolEnvironment
+      _target_: unirl.rollout.env.tool_environment.ToolEnvironment
       max_turns: 8 # keep == config.max_turns
       tools:
-        - _target_: unirl.rollout.loop.tools.search.SearchTool
+        - _target_: unirl.rollout.env.tools.search.SearchTool
           top_k: 10
-        - _target_: unirl.rollout.loop.tools.visit.VisitTool
+        - _target_: unirl.rollout.env.tools.visit.VisitTool
           endpoint: ${oc.env:SUMMARY_URL,""}
           model: ${oc.env:SUMMARY_MODEL,""}
     episode_sampling:

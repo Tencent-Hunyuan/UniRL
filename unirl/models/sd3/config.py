@@ -30,45 +30,21 @@ class SD3PipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on
-    # SD3DiffusionParams) because these are operator/runtime knobs,
-    # not per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
-    # Collapse the S replay forwards into one batched [S*B] forward; see
-    # unirl.models.types.batched_replay.BatchedStepReplayMixin. Requires
-    # old_logp_source='replay', and costs ~S x the replay activation memory.
+    # Batched [S*B] replay forward (see BatchedStepReplayMixin); requires old_logp_source='replay'.
     batch_replay_steps: bool = False
 
-    # Diffusion schedule policy. ``shift`` is the FlowMatch time-shift used
-    # by ``sde.runtime.get_sigma_schedule`` (static branch); defaults to
-    # 3.0 to match legacy.
     shift: float = 3.0
 
-    # Trainer-side policy wraps the bare DiT, while vLLM-Omni loads it under
-    # the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
-    # ------------------------------------------------------------------
-    # Optional LoRA hints for rollout-side engines (sglang in particular).
-    #
-    # Trainer-side LoRA lives in ``cfg.training.policies`` (LoRAPolicy →
-    # PEFT injection on the FSDP-wrapped module). The SGLang rollout server
-    # still needs to know at construction time whether to boot in LoRA mode
-    # and which target modules to wrap — those flags travel through this
-    # model_config.  ``None`` / ``False`` are the default (no LoRA).
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
 
-    # VeOmniBackend lifecycle: build the transformer on the meta device
-    # (architecture only, no weight allocation). VeOmni's parallelize
-    # asserts meta init, materializes storage via ``to_empty``, and the
-    # backend loads real weights from ``<pretrained>/transformer`` after
-    # sharding. FSDPBackend recipes leave this False (eager load).
     meta_init_transformer: bool = False
 
     def __post_init__(self) -> None:

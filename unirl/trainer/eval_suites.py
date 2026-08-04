@@ -57,10 +57,10 @@ logger = logging.getLogger(__name__)
 class EvalRewardSuite:
     """One extra eval reward: a sibling reward remote + (optionally) its own eval set."""
 
-    name: str  # wandb key: eval/<name>
-    reward: Any  # reward remote, placed next to the training reward
-    data_source: Optional[Any] = None  # None → scores the default eval pass
-    num_prompts: Optional[int] = None  # own-pass size; None → eval_num_prompts
+    name: str
+    reward: Any
+    data_source: Optional[Any] = None
+    num_prompts: Optional[int] = None
 
 
 def build_eval_suites(
@@ -102,9 +102,6 @@ def build_eval_suites(
             )
         suite_source = None
         if eval_path:
-            # Own prompt set: clone the trainer's data-source cfg with both paths
-            # pointed at the suite file (a suite source only ever serves eval
-            # batches; data_path merely backs the class's load-time existence check).
             ds_cfg = OmegaConf.create(OmegaConf.to_container(data_source_cfg, resolve=True))
             ds_cfg.args.run.data_path = str(eval_path)
             ds_cfg.args.run.eval_data_path = str(eval_path)

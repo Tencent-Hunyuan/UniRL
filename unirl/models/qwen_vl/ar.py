@@ -19,10 +19,6 @@ from .conditions import QwenVLARConditions
 
 logger = logging.getLogger(__name__)
 
-# Qwen2.5-VL has NO flex_attention support (its mask path predates flex), so the
-# only reachable sparse-block kernel here is FlashAttention (flash_attention_2/3/4,
-# whichever flash-attn package is installed). flex is intentionally omitted — listing
-# it would let the gate pass on a backend the model cannot actually run.
 _SPARSE_PACKED_ATTN = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
@@ -90,14 +86,6 @@ class QwenVLARStep(ARStep):
             return token_id, log_prob
 
         scaled = logits.float() / self.temperature
-        # Behavior log-prob under the temperature-scaled distribution, matching
-        # QwenVLARStage.replay's log_softmax(logits / T). MUST be computed from
-        # `scaled` BEFORE the top-k/top-p masking below: replay re-applies the
-        # temperature but NOT the truncation, so old_logp == replay new_logp on
-        # the on-policy update -> ratio == 1 -> surrogate loss ~ 0. The prior
-        # code stored the untempered log_softmax(logits), which only matched
-        # replay at T == 1; at T < 1 it made ratio != 1 and trained on a
-        # spurious ratio (e.g. T=0.7 drove reward 0.61 -> 0.27 in ~15 rollouts).
         log_probs_full = F.log_softmax(scaled, dim=-1)
 
         if self.top_k > 0 and self.top_k < scaled.shape[-1]:
@@ -168,11 +156,6 @@ def _vision_rope_positions(
     return position_ids
 
 
-# Attention backends with a sparse packed kernel (skip cross-sequence blocks) →
-# packed replay always wins. Qwen2.5-VL has NO flex support, so packed replay needs
-# a FlashAttention backend (flash_attention_2/3/4, whichever flash-attn package is
-# installed; the repo pins flash-attn-4 → 'flash_attention_4'). On any other backend
-# (sdpa/eager) the gate falls back to the dense padded path (see packed_replay).
 class QwenVLARStage(ARStage[QwenVLARConditions]):
     def __init__(self, *, model: QwenVLBundle) -> None:
         self.model = model
@@ -198,19 +181,10 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        # QwenVLChatTemplateStage right-pads prompts to the in-batch max. The
-        # decode loop reads ``logits[:, -1, :]`` and appends each new token at the
-        # end, which is only correct when the last column is a row's last *real*
-        # token — i.e. for an equal-length batch. Re-pad to LEFT so mixed-length
-        # batches decode correctly too (no-op when already equal length, e.g. the
-        # same-prompt-group recipe). The image placeholders shift with the real
-        # prompt; ``get_rope_index`` still locates them by token id + the
-        # left-padded ``attention_mask``.
         pad_id = self.model.tokenizer.pad_token_id or 0
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
-        # Reset stale rope_deltas from any prior forward/generate call
         transformer.model.rope_deltas = None
 
         stop_ids = self._resolve_stop_ids(params, sampling_params)
@@ -221,7 +195,6 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         )
         max_new = int(sampling_params.max_new_tokens)
 
-        # pixel_values / image_grid_thw: per-sample lists → merged tensors
         pv = _merge_pv(conditions.pixel_values)
         igt = _merge_igt(conditions.image_grid_thw)
 
@@ -278,10 +251,6 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
                 per_token_logps[b].append(float(log_prob[b].item()))
                 if tid in stop_ids:
                     finished[b] = True
-            # Synchronize finished status across all FSDP ranks.
-            # If any rank still has unfinished samples, all ranks must
-            # continue running forward passes (FSDP AllGather requires
-            # every rank to participate).
             if all(finished):
                 _local_done = torch.tensor([1], device=device)
             else:
@@ -330,19 +299,11 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError("QwenVLARStage.replay: segment requires tokens with cu_seqlens")
 
-        # conditions.prompt (ids/mask) and pixel_values/image_grid_thw come back
-        # from the SGLang rollout engine on CPU, while the trainable transformer
-        # lives on this worker's CUDA device. Anchor on the model's device and
-        # move the rollout-side tensors onto it so the embedding/forward index
-        # ops don't hit a cpu-vs-cuda mismatch.
         device = next(self.model.transformer.parameters()).device
         prompt_ids = conditions.prompt.input_ids.to(device)
         prompt_mask = conditions.prompt.attention_mask.to(device)
         batch_size = int(prompt_ids.shape[0])
 
-        # pixel_values / image_grid_thw: per-sample lists → merged tensors
-        # The lists are already correctly sliced by Batched (CONCAT),
-        # so each entry corresponds to the matching prompt row.
         pv = _merge_pv(conditions.pixel_values)
         igt = _merge_igt(conditions.image_grid_thw)
         if pv is not None:
@@ -350,17 +311,12 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if igt is not None:
             igt = igt.to(device)
 
-        # Strip right-padding introduced by TextTokenCondition.concat across
-        # rollout workers.  During rollout each worker pads to its own batch
-        # max; when tracks are concatenated for replay the global max adds
-        # extra pad tokens that shift the logit extraction window and corrupt
-        # position_ids for pad positions (text_pos=1 via masked_fill).
-        real_lens = prompt_mask.sum(dim=1).long()  # [batch_size]
+        real_lens = prompt_mask.sum(dim=1).long()
         max_real_len = int(real_lens.max().item())
         prompt_ids = prompt_ids[:, :max_real_len]
         prompt_mask = prompt_mask[:, :max_real_len]
 
-        # Reset stale rope_deltas — critical for correct M-RoPE position IDs
+        # Reset stale rope_deltas before computing M-RoPE positions.
         self.model.transformer.model.rope_deltas = None
 
         lengths = [int(n) for n in segment.lengths.tolist()]
@@ -394,21 +350,15 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if igt is not None:
             forward_kwargs["image_grid_thw"] = igt
 
-        # Compute correct 4D position_ids for M-RoPE.
-        # Rollout uses prepare_inputs_for_generation which produces [4, bs, seq]:
-        #   row 0 = text positions (for causal mask), rows 1-3 = M-RoPE (temporal, height, width).
-        # Direct forward with position_ids=None only produces [3, bs, seq] (no text_position_ids),
-        # causing incorrect causal mask for multimodal inputs.
-        # Fix: call get_rope_index ourselves and prepend text_positions.
         vision_pos = _vision_rope_positions(
             self.model.transformer,
             full_ids,
             image_grid_thw=igt,
             attention_mask=full_mask,
-        )  # [3, bs, seq]
+        )
         text_pos = full_mask.long().cumsum(-1) - 1
         text_pos.masked_fill_(full_mask == 0, 1)
-        forward_kwargs["position_ids"] = torch.cat([text_pos[None], vision_pos], dim=0)  # [4, bs, seq]
+        forward_kwargs["position_ids"] = torch.cat([text_pos[None], vision_pos], dim=0)
 
         out = self.model.transformer(**forward_kwargs)
         logits = out.logits
@@ -416,26 +366,16 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         if T_max == 0:
             return torch.zeros(0, dtype=torch.float32, device=device)
 
-        # Per-sample logit extraction using real prompt lengths.
-        # With right-padding, the logit at position (real_len_b - 1) correctly
-        # predicts the first generated token (same context & position encoding
-        # as rollout).  Subsequent generated-token logits are at contiguous
-        # positions starting from max_real_len.  Positions real_len_b ..
-        # max_real_len-1 are per-sample pad tokens with incorrect position
-        # encoding, so their logits must be skipped.
+        # Extract logits at each sample's true prompt length.
         flat: List[torch.Tensor] = []
         for b in range(batch_size):
             n = lengths[b]
             if n == 0:
                 continue
             real_len_b = int(real_lens[b].item())
-            # First generated token: logit from last real prompt token
-            first_logit = logits[b, real_len_b - 1 : real_len_b, :]  # [1, V]
-            # Subsequent generated tokens: logits from generated-token positions
+            first_logit = logits[b, real_len_b - 1 : real_len_b, :]
             rest_logits = logits[b, max_real_len : max_real_len + n - 1, :] if n > 1 else logits[b, :0, :]
-            pred_logits_b = torch.cat([first_logit, rest_logits], dim=0)  # [n, V]
-            # GRPO injects the rollout sampling temperature so replay's
-            # log-softmax matches the sampling distribution (logits / T).
+            pred_logits_b = torch.cat([first_logit, rest_logits], dim=0)
             log_probs_full = F.log_softmax(pred_logits_b.float() / float(temperature), dim=-1)
             per_token = log_probs_full.gather(-1, response_tokens[b, :n].unsqueeze(-1)).squeeze(-1)
             flat.append(per_token)
@@ -486,10 +426,10 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
 
         flat_resp = segment.tokens.to(device=device, dtype=torch.long)
         lengths = [int(n) for n in segment.lengths.tolist()]
-        igt_list = conditions.image_grid_thw  # per-sample list (a sample may have 0/≥1 images)
-        self.model.transformer.model.rope_deltas = None  # avoid stale M-RoPE cache
+        igt_list = conditions.image_grid_thw
+        self.model.transformer.model.rope_deltas = None
 
-        real_prompt_lens = prompt_mask.long().sum(dim=-1)  # [B] (right-padded layout)
+        real_prompt_lens = prompt_mask.long().sum(dim=-1)
 
         cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
         streams: List[torch.Tensor] = []
@@ -499,24 +439,18 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         for b in range(batch_size):
             n_p = int(real_prompt_lens[b].item())
             n_r = lengths[b]
-            # The predict-index math below (offset + n_p - 1) assumes each stream has
-            # >=1 real prompt token; n_p == 0 would gather the PRIOR stream's last
-            # hidden state (silent cross-sequence logp corruption), so fail loud.
             assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
             seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
             streams.append(seq)
-            # Per-stream 4-D M-RoPE position [text; t; h; w]; text row restarts at
-            # 0 per stream so transformers builds the packed block-causal mask
-            # from it (sdpa). Per-stream get_rope_index == dense per-row (bit-exact).
             one = seq.unsqueeze(0)
             grid = igt_list[b] if (igt_list is not None and igt_list[b] is not None) else None
             if grid is not None:
                 grid = grid.to(device)
             vision_pos = _vision_rope_positions(
                 self.model.transformer, one, image_grid_thw=grid, attention_mask=torch.ones_like(one)
-            )  # [3, 1, n]
-            text_pos = torch.arange(seq.numel(), device=device).unsqueeze(0)  # [1, n]
-            pos_parts.append(torch.cat([text_pos, vision_pos[:, 0, :]], dim=0))  # [4, n]
+            )
+            text_pos = torch.arange(seq.numel(), device=device).unsqueeze(0)
+            pos_parts.append(torch.cat([text_pos, vision_pos[:, 0, :]], dim=0))
             if n_r > 0:
                 pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
             offset += int(seq.numel())
@@ -529,14 +463,10 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
 
         forward_kwargs: Dict[str, Any] = {
             "input_ids": packed_ids,
-            "attention_mask": None,  # packed block-causal mask inferred from restarting text positions
+            "attention_mask": None,
             "position_ids": packed_pos,
             "use_cache": False,
             "return_dict": True,
-            # Run the lm_head ONLY at the predict positions (transformers logits_to_keep
-            # accepts an index tensor) so we never materialize the full [1, L, vocab]
-            # logits — the packed analogue of Qwen3's chunked head. The returned logits
-            # come back in predict_index order, which equals flat_resp (segment) order.
             "logits_to_keep": predict_index,
         }
         if pv is not None:
@@ -545,10 +475,10 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             forward_kwargs["image_grid_thw"] = igt
 
         out = self.model.transformer(**forward_kwargs)
-        pred_logits = out.logits[0].float()  # [T_total, V] — logits at the predict positions
+        pred_logits = out.logits[0].float()
         T = float(temperature) if float(temperature) > 0.0 else 1.0
         log_probs = F.log_softmax(pred_logits / T, dim=-1)
-        per_token = log_probs.gather(-1, flat_resp.unsqueeze(-1)).squeeze(-1)  # [T_total]
+        per_token = log_probs.gather(-1, flat_resp.unsqueeze(-1)).squeeze(-1)
         return per_token.to(dtype=torch.float32)
 
     def _resolve_stop_ids(

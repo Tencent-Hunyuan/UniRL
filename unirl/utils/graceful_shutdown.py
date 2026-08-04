@@ -36,9 +36,6 @@ from typing import Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-#: Long enough for an engine shutdown that is merely slow (NCCL teardown and
-#: CUDA context destruction across a TP group take tens of seconds), short
-#: enough that a wedged driver does not sit on the GPUs indefinitely.
 _HARD_EXIT_GRACE_SECONDS = 120.0
 
 _SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
@@ -50,9 +47,6 @@ def _parent_of(pid: int) -> Optional[int]:
             stat = handle.read()
     except OSError:
         return None
-    # The comm field is parenthesised and may itself contain spaces and
-    # parens, so ppid has to be located from the last ')' rather than by
-    # splitting the whole line.
     try:
         return int(stat[stat.rindex(b")") + 2 :].split()[1])
     except (ValueError, IndexError):
@@ -198,8 +192,6 @@ class GracefulShutdown:
     def __enter__(self) -> "GracefulShutdown":
         self.claim_signals()
         self._reclaim_after_ray_init()
-        # Covers paths that bypass the with-block, e.g. a library calling
-        # sys.exit() from a callback.
         atexit.register(self.run_teardown)
         return self
 
@@ -219,21 +211,13 @@ class GracefulShutdown:
         for sig in _SIGNALS:
             try:
                 previous = signal.getsignal(sig)
-                # ``==`` not ``is``: attribute access rebuilds the bound method
-                # each time, so identity never holds even when it is ours.
                 if previous == self._on_signal:
                     continue
                 if previous is signal.SIG_IGN:
-                    # Inherited "ignore" is a deliberate instruction from
-                    # whoever launched us — nohup sets exactly this for SIGHUP
-                    # so the run survives a terminal hangup. Claiming it would
-                    # turn a disconnect into a shutdown.
                     continue
                 signal.signal(sig, self._on_signal)
             except (ValueError, OSError):
                 continue
-            # Keep the disposition from before anyone else got involved, so
-            # restoring on a clean exit does not leave a foreign handler behind.
             self._previous.setdefault(sig, previous)
             logger.info("Claimed %s for graceful shutdown (was %r)", signal.Signals(sig).name, previous)
 
@@ -271,9 +255,6 @@ class GracefulShutdown:
             except (ValueError, OSError, TypeError):
                 pass
         if self._exit_code is not None:
-            # We were signalled. Teardown is done and there is nothing left to
-            # flush, so skip interpreter shutdown: Ray's own atexit hooks can
-            # block for minutes waiting on actors that are already gone.
             os._exit(self._exit_code)
         return False
 
@@ -281,7 +262,6 @@ class GracefulShutdown:
         self._signal_count += 1
         name = signal.Signals(signum).name
         if self._signal_count > 1:
-            # The operator asked twice. Stop being polite.
             os._exit(128 + signum)
         self._exit_code = 128 + signum
         logger.warning(

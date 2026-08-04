@@ -25,8 +25,6 @@ class ValueHead(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """Map ``[..., H]`` hidden states to FP32 scalar values ``[...]``."""
-        # FSDP mixed precision may expose gathered parameters in its compute
-        # dtype even when the sharded masters are FP32.
         weight = self.proj.weight.float()
         bias = self.proj.bias.float() if self.proj.bias is not None else None
         return F.linear(hidden.float(), weight, bias).squeeze(-1)

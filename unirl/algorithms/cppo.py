@@ -59,10 +59,6 @@ from .base import (
 )
 from .grpo import GRPO
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class CPPOConfig(BaseAlgorithmConfig):
@@ -96,25 +92,13 @@ class CPPOConfig(BaseAlgorithmConfig):
 
     stage_attr: str = "ar"
     conditions_cls: str = ""
-    # Paper Sec. 4 / Table 3: delta = clip_ratio (0.15 dense, 0.20 for 30B-A3B).
     cppo_delta: float = 0.2
-    # Position-weight floor (paper default 0.8) and dynamic prefix-budget floor
-    # (paper Eq. 22 default 0.02).
     cppo_w_min: float = 0.8
     cppo_delta_b: float = 0.02
     loss_agg_mode: str = "token-mean"
     horizon: int = 8192
     sampling_temperature: Optional[float] = None
-    # "rollout" (default) keeps the rollout engine's emitted logprobs as mu for
-    # ALL num_updates_per_batch steps (verl bypass-mode parity, = the behavior
-    # policy CPPO anchors on); "replay" freezes a train-side pi_old at pre-update
-    # weights in prepare_segment instead.
     old_logp_source: str = "rollout"
-
-
-# ---------------------------------------------------------------------------
-# Loss helper — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 def _cppo_mask(
@@ -149,15 +133,9 @@ def _cppo_mask(
     Returns:
         ``keep`` mask ``[total_tokens]`` (float 0/1), detached.
     """
-    # The mask is a no-grad gate, so compute the divergence/prefix arithmetic in
-    # fp32 regardless of the logprob dtype: torch.quantile rejects bf16/fp16, and
-    # a bf16 cumsum over a long response (up to max_new_tokens) loses the prefix
-    # sum to rounding. The recipe pins logprob_precision=fp32, but this keeps CPPO
-    # correct under a bf16-logprob config too (where DRPO has no cumsum/quantile).
     prob = torch.exp(new_logp.float())
     old_prob = torch.exp(old_logp.float())
     D_all = (prob - old_prob).abs()  # Binary-TV divergence D_t
-    # Eq. 10 first clause: always keep updates that move pi back toward mu.
     toward_mu = (advantages * (ratio - 1.0)) <= 0.0
 
     keep_parts: List[torch.Tensor] = []
@@ -170,30 +148,21 @@ def _cppo_mask(
             keep_parts.append(D_t.new_zeros(0, dtype=torch.bool))
             continue
 
-        # Decreasing position weight w_t in [w_min, 1] over this sequence's own
-        # length T (paper Eq. 9); t is 1-based, so w_1 = 1 and w_T = w_min. Use the
-        # paper's (t - 1) numerator so a single-token response (T == 1) keeps its
-        # lone first token at w_1 = 1; for T >= 2 this equals w_min + (1-w_min)(T-t)/(T-1).
         pos = torch.arange(1, T + 1, device=D_t.device, dtype=D_t.dtype)
         w_t = 1.0 - (1.0 - w_min) * (pos - 1) / max(T - 1, 1)
         Z_t = w_t * D_t
 
-        # Prefix sums with a one-token right shift so the decision at t uses only
-        # the preceding prefix (S_{t-1}, W_{t-1}); S_0 = W_0 = 0 (Appendix D).
         S_prev = torch.cat([Z_t.new_zeros(1), torch.cumsum(Z_t, dim=0)[:-1]])
         W_prev = torch.cat([w_t.new_zeros(1), torch.cumsum(w_t, dim=0)[:-1]])
 
-        # Per-sequence dynamic prefix budget (Eq. 22):
-        #   delta_b^seq = clamp(P90(D_{1:T}), delta_b, 2 * delta_b).
         p90 = torch.quantile(D_t, q=0.9)
         delta_b_seq = p90.clamp(min=delta_b, max=2.0 * delta_b)
 
-        # Effective threshold c_t = min(delta, delta + delta_b^seq * W_{t-1} - S_{t-1}) (Eq. 8).
         c_t = torch.minimum(
             torch.full_like(Z_t, delta),
             delta + delta_b_seq * W_prev - S_prev,
         )
-        feasible = Z_t <= c_t  # budget feasibility
+        feasible = Z_t <= c_t
         keep_parts.append(toward_t | feasible)
 
     keep = torch.cat(keep_parts) if keep_parts else toward_mu
@@ -234,10 +203,9 @@ def _cppo_loss(
         ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
     """
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
-    ratio = torch.exp(log_diff)  # r_t = pi/mu (differentiable through new_logp)
+    ratio = torch.exp(log_diff)
     adv = advantages.detach()
 
-    # Trust-region gate (Eq. 10): no grad, it only decides which tokens train.
     with torch.no_grad():
         keep = _cppo_mask(
             new_logp=new_logp.detach(),
@@ -254,17 +222,10 @@ def _cppo_loss(
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
-        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),  # k3 estimator
-        # Fraction of tokens rejected by the CPPO budget mask (paper Fig. 7
-        # budget-mask share; analogous to DPPO/verl pg_clipfrac).
+        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),
         "masked_fraction": (1.0 - keep).mean().detach(),
     }
     return pg_losses, metrics
-
-
-# ---------------------------------------------------------------------------
-# Algorithm class — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 class CPPO(StageAlgorithm):
@@ -293,12 +254,6 @@ class CPPO(StageAlgorithm):
         conditions_cls: Stage-typed conditions container.
     """
 
-    # old_logp (the ratio denominator and the Binary-TV mu) is the rollout
-    # (SGLang) log-prob, frozen on the segment and unchanged across mini-batch
-    # updates — so reusing it across num_updates_per_batch>1 is the deliberate
-    # rollout-anchored trust region (verl bypass_mode=True parity), matching
-    # GRPO / DRPO. The ratio then also absorbs the rollout-vs-train engine gap on
-    # later mini-batches (accepted for parity).
     supports_multi_update = True
 
     def __init__(
@@ -331,22 +286,12 @@ class CPPO(StageAlgorithm):
             raise ValueError(f"CPPO: cppo_delta_b must be >= 0; got {self.cppo_delta_b}")
         self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
-        # replay rescales logits by this temperature so its log-softmax matches
-        # the rollout sampling distribution (log_softmax(logits / T)); MUST equal
-        # sampling.temperature. Mirrors GRPO / DRPO. Falls back to the
-        # ARSamplingParams default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
         self.conditions_cls = conditions_cls
-        # pi_old / mu source. "rollout" = the rollout engine's emitted
-        # segment.log_probs, kept as the anchor for ALL num_updates_per_batch
-        # steps (= the behavior policy CPPO's trust region anchors on; verl
-        # bypass-mode parity). "replay" = prepare_segment recomputes a frozen
-        # train-side pi_old at pre-update weights. Both anchors are frozen for the
-        # whole rollout batch, so multi-update is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"CPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -374,8 +319,6 @@ class CPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision so the anchor stays as close
-        # as possible to new_logp's fp32 replay (mirrors DRPO / FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(
@@ -393,15 +336,9 @@ class CPPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens]
-        # old_logp = the frozen pi_old / mu anchor (segment.log_probs). "rollout"
-        # (default) keeps the rollout engine's logp; "replay" means
-        # prepare_segment already overwrote it with a frozen train-side replay.
+        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
-        # Expand per-sample advantages to per-token.
         adv_per_token = GRPO._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
         )
@@ -417,15 +354,11 @@ class CPPO(StageAlgorithm):
             delta_b=self.cppo_delta_b,
         )
 
-        # Apply loss_mask if present (token-level masking for padding/eos).
         if segment.loss_mask is not None:
             mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
             loss_per_elem = loss_per_elem * mask
 
         if self.loss_agg_mode == "seq-mean-token-sum-norm" and segment.lengths is not None:
-            # Reference seq-mean-token-sum-norm: per-sequence token-SUM / horizon,
-            # then mean over the micro-batch's sequences. The stack's
-            # loss_scale=1/num_micros then averages across micro-batches.
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
         else:

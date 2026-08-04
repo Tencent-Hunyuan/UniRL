@@ -83,10 +83,6 @@ class TensorSpan(Generic[T]):
     def __len__(self) -> int:
         return self.stop - self.start
 
-    # ── delegated metadata: shape (sliced) / dtype / device — read by nccl_recv
-    #    and repr. Handle-specific identity (store_key/source_id/object_ref) is
-    #    reached via ``span.handle`` in the worker-local backends, not off the span.
-
     @property
     def shape(self) -> tuple:
         handle_shape = tuple(self.handle.shape)
@@ -256,11 +252,9 @@ class TensorRef(Batch):
         )
 
     def slice(self, start, end) -> "TensorRef":
-        # CONCAT path: Batch.slice → _slice_value → value.slice(start, end).
         return self.select_ranges([(int(start), int(end))])
 
     def __getitem__(self, key) -> "TensorRef":
-        # PACKED path: _slice_packed_data does ``value[cu[start]:cu[end]]``.
         if isinstance(key, slice):
             if key.step not in (None, 1):
                 raise NotImplementedError("TensorRef supports only contiguous (step=1) slicing")
@@ -320,11 +314,6 @@ class TensorRef(Batch):
         return self.batch_size
 
 
-# ---------------------------------------------------------------------------
-# Driver-side hydration
-# ---------------------------------------------------------------------------
-
-
 def hydrate(value: Any) -> Any:
     """Driver-side hydrate of a ``TensorRef`` proxy back to a real ``torch.Tensor``.
 
@@ -343,14 +332,7 @@ def hydrate(value: Any) -> Any:
         return value
     if not value.spans:
         return None
-    # materialize(None) = per-span local() fetch + cat_rows (each span slices its
-    # handle; ragged 2D parts follow the documented right-pad contract).
     return value.materialize(backend=None)
-
-
-# ---------------------------------------------------------------------------
-# Type-based tree walker
-# ---------------------------------------------------------------------------
 
 
 def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:

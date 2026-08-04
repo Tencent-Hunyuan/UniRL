@@ -30,17 +30,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# YAML trees that hold recipes / stage configs with ``_target_`` entries.
 SCAN_DIRS = ["examples", "experimental", "CPPO", "DRPO", "FlowDPPO", "unirl"]
-# Vendored / sub-project trees kept byte-pristine (mirror .pre-commit-config exclude).
 SKIP_PARTS = {".git", "vendor"}
-# The only packages ``_TARGET_RE`` accepts, so the only ones worth indexing; the
-# regex alternation is derived from this tuple so the two cannot drift apart.
 PACKAGES = ("unirl", "experimental")
 
 _TARGET_RE = re.compile(r"""^\s*_target_:\s*['"]?((?:%s)\.[A-Za-z0-9_.]+)['"]?\s*$""" % "|".join(PACKAGES))
 
-# Deep enough to hide network-filesystem round trips behind each other.
 _READ_THREADS = 32
 
 
@@ -52,7 +47,6 @@ def _scan() -> tuple[dict[str, Path], list[Path]]:
     for d in SCAN_DIRS:
         for dirpath, _dirnames, filenames in os.walk(ROOT / d):
             parts = Path(dirpath).relative_to(ROOT).parts
-            # Only an importable directory chain can be named by a dotted ``_target_``.
             importable = parts[0] in PACKAGES and all(p.isidentifier() for p in parts)
             skipped = bool(SKIP_PARTS & set(parts))
             for name in filenames:
@@ -60,16 +54,12 @@ def _scan() -> tuple[dict[str, Path], list[Path]]:
                 if importable and name.endswith(".py"):
                     stem = name[:-3]
                     if stem == "__init__":
-                        # Both ``pkg`` and the explicit ``pkg.__init__`` spelling reach it.
                         packages[".".join(parts)] = path
                         packages[".".join((*parts, stem))] = path
                     elif stem.isidentifier():
                         modules[".".join((*parts, stem))] = path
                 elif not skipped and fnmatch.fnmatch(name, "*.y*ml"):
                     recipes.append(path)
-    # A module file shadows a package of the same name, keeping the probe order this
-    # check has always used (``pkg/sub.py`` before ``pkg/sub/__init__.py``); note that
-    # Python's own import machinery resolves the other way round.
     return {**packages, **modules}, sorted(recipes)
 
 
@@ -126,7 +116,6 @@ def main() -> int:
                 targets.append((path, lineno, m.group(1)))
 
     module_split = {dotted: _split_module(dotted, modules) for _, _, dotted in targets}
-    # Only the modules a recipe actually names are worth reading and parsing.
     needed = sorted({hit[0] for hit in module_split.values() if hit is not None})
     top_level = {path: _top_level_names(source, path) for path, source in zip(needed, _read_all(needed))}
 
@@ -138,8 +127,6 @@ def main() -> int:
         if names is None or hit[1] not in names:
             failures.append(f"{path.relative_to(ROOT)}:{lineno}: unresolved _target_ '{dotted}'")
         if dotted.startswith("experimental."):
-            # Tier direction: only experimental's own recipes may wire experimental code,
-            # and only within their own package (mirrors check_experimental_boundaries).
             rel = path.relative_to(ROOT)
             if rel.parts[0] != "experimental":
                 tier.append(

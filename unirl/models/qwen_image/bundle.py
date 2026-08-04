@@ -78,13 +78,6 @@ class QwenImageBundle(Bundle):
 
         import fcntl
 
-        # Node-local load serialization: 8 colocated ranks each hold ~20 GiB
-        # anon RSS while materializing the 20B transformer (safetensors ->
-        # bf16 staging). The simultaneous burst blows the pod's k8s memcg
-        # limit (~439 GiB incl. page cache) and the kernel OOM-kills
-        # raylet/python (LIN-382 qwen probes b/d: "Memory cgroup out of
-        # memory", anon-rss ~20-23 GiB per kill). Single-file the heavy
-        # window; DIFFRL_MODEL_LOAD_SERIALIZE=0 opts out (single-rank runs).
         serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
@@ -93,8 +86,6 @@ class QwenImageBundle(Bundle):
             return cls._from_config_locked(config)
         finally:
             if lock_file is not None:
-                # Return this rank's staging anon to the kernel before the
-                # next rank starts its load, so the serialized peak holds.
                 import gc
 
                 gc.collect()
@@ -123,12 +114,6 @@ class QwenImageBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Meta-init (VeOmni load_sharded path): params on meta, weights load
-            # post-parallelize. Qwen-Image's QwenEmbedRope holds its complex rope
-            # tables (pos_freqs / neg_freqs) as plain __dict__ tensors, so to_empty
-            # never materializes them; build_meta_init_transformer keeps them real
-            # on CPU and captures them into meta_init_state for load_trainable_weights
-            # to restore after the sharded load.
             transformer_config = QwenImageTransformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: QwenImageTransformer2DModel.from_config(transformer_config), dtype=dtype
@@ -147,7 +132,6 @@ class QwenImageBundle(Bundle):
             )
             vae.requires_grad_(False)
 
-        # Skipped when load_text_encoder=False (separate-engine; see config).
         text_encoder = None
         if config.load_text_encoder:
             text_encoder = (
@@ -174,11 +158,7 @@ class QwenImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            # Consumed by VeOmniBackend's post-parallelize weight load.
-            # Kept as the raw join — the backend validates local-dir-ness
-            # at load time (HF repo IDs need a local download first).
             bundle._transformer_weights_path = os.path.join(path, "transformer")
-            # Ray-robust restore carrier for init-computed non-persistent state.
             bundle._meta_init_state = meta_init_state
         return bundle
 

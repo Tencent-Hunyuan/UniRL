@@ -65,11 +65,6 @@ def _sp() -> _SP:
     )
 
 
-# ---------------------------------------------------------------------------
-# Mechanism 1: Ulysses all-to-all around dispatch_attention_fn (newer models)
-# ---------------------------------------------------------------------------
-
-
 def _reject_attn_mask(args: Any, kwargs: Any) -> None:
     """diffusion SP v1 has no masked path; refuse if diffusers built an attn mask."""
     if kwargs.get("attn_mask", args[0] if args else None) is not None:
@@ -90,16 +85,10 @@ def _make_ulysses_dispatch(orig_dispatch: Callable) -> Callable:
     @functools.wraps(orig_dispatch)
     def ulysses_dispatch(query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs: Any):
         ps = get_parallel_state()
-        # Intervene only for SP self-attention. Disabled -> passthrough. Cross-attention
-        # (e.g. Wan text branch: sliced image Q vs full text K/V => unequal seq lengths)
-        # attends locally per rank and also passes through -- the image Q is already
-        # sliced to local by the boundary hook, so it must NOT be all-to-all'd.
         if not ps.ulysses_enabled or query.shape[1] != key.shape[1]:
             return orig_dispatch(query, key, value, *args, **kwargs)
-        _reject_attn_mask(args, kwargs)  # v1: no masked path under Ulysses
+        _reject_attn_mask(args, kwargs)
 
-        # Self-attention joint all-to-all: each rank gathers the full sequence and keeps
-        # its slice of heads, attends over the full (order-invariant) set, then inverts.
         g = ps.sp_group
         query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=g)
         key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=g)
@@ -128,11 +117,6 @@ def _patch_attention_dispatch(model: nn.Module) -> bool:
         module.dispatch_attention_fn = _make_ulysses_dispatch(module.dispatch_attention_fn)
         logger.info("diffusion SP: patched %s.dispatch_attention_fn with Ulysses all-to-all", module.__name__)
     return True
-
-
-# ---------------------------------------------------------------------------
-# Mechanism 2: SP attention processor (older models, e.g. SD3 JointAttnProcessor2_0)
-# ---------------------------------------------------------------------------
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: tuple[Tensor, Tensor]) -> Tensor:
@@ -174,10 +158,10 @@ class SPAttentionProcessor:
         sp = _sp()
         self._gather_seq, self._gather_heads = sp.gather_seq_scatter_heads, sp.gather_heads_scatter_seq
 
-    def _a2a_sh(self, x):  # scatter heads, gather seq
+    def _a2a_sh(self, x):
         return self._gather_seq(x, seq_dim=1, head_dim=2, group=self.sp_group)
 
-    def _a2a_hs(self, x):  # scatter seq, gather heads
+    def _a2a_hs(self, x):
         return self._gather_heads(x, head_dim=2, seq_dim=1, group=self.sp_group)
 
     def __call__(
@@ -312,15 +296,6 @@ def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
     return count
 
 
-# ---------------------------------------------------------------------------
-# Per-model boundary hooks: slice streams + RoPE in, gather hidden out.
-# Three models use the BLOCK-level pattern (slice at blocks[0], gather at norm_out)
-# via _install_boundary_hooks; flux2 uses a MODEL-level pattern (slice both streams at
-# model input, gather image at model output) because its dual->single + text-strip
-# layout has no single block boundary -- kept inline in _wrap_flux2.
-# ---------------------------------------------------------------------------
-
-
 def _assert_seq_divisible(length: int, sp_size: int, what: str) -> None:
     """Fail fast if a to-be-sharded stream length is not a multiple of ``sp_size``.
 
@@ -354,8 +329,6 @@ def _install_boundary_hooks(
         sp.slice_input_tensor,
         sp.gather_outputs,
     )
-    # block0_pre records the pre-slice image length; norm_out_pre reads it to drop SP
-    # divisibility padding after the gather.
     state: Dict[str, int] = {}
     import torch.distributed as dist
 
@@ -437,13 +410,9 @@ def apply_diffusion_sequence_parallelism(model: nn.Module, sp_size: int) -> None
     """Attention SP (dispatch-patch or processor-injection, auto-detected) + boundary hooks."""
     sp_group = _sp().get_parallel_state().sp_group
 
-    if not _patch_attention_dispatch(model):  # newer models
-        inject_sp_processors(model, sp_group)  # older models (SD3)
+    if not _patch_attention_dispatch(model):
+        inject_sp_processors(model, sp_group)
 
-    # Walk the MRO, not just type(model).__name__: after veomni_parallelize the
-    # instance's class is a dynamic FSDP2 subclass (e.g. FSDPSD3Transformer2DModel)
-    # whose base is the real transformer class, so the bare-name registry would
-    # miss. The MRO still contains the original (e.g. SD3Transformer2DModel).
     cls = type(model).__name__
     wrapper = next((FORWARD_WRAPPERS[k.__name__] for k in type(model).__mro__ if k.__name__ in FORWARD_WRAPPERS), None)
     if wrapper is None:

@@ -38,7 +38,7 @@ class TensorMetadata(TypedDict):
     offset: int
 
 
-# copy from https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
+# From https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
 def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
     """Rebuild a CUDA tensor from an IPC handle, optionally rewriting the device id.
 
@@ -49,8 +49,6 @@ def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) ->
     func, args = handle
     list_args = list(args)
     if device_id is not None:
-        # the key is to change device id to the current device id
-        # in case two processes have different CUDA_VISIBLE_DEVICES
         list_args[6] = device_id
     buffer = func(*list_args)
     return buffer
@@ -101,9 +99,6 @@ class BucketedWeightSender:
         bucket_size_mb: int = 2048,
         use_shm: bool = False,
     ) -> None:
-        # 2048 MB so the largest single tensor in HI3 (``lm_head.weight``,
-        # ~1 GiB at bf16) fits in one bucket. The upstream default of 512 MB
-        # would trip the per-tensor assertion below for that param.
         self.zmq_handle = zmq_handle
         self.bucket_size_mb = int(bucket_size_mb)
         self.bucket_size = self.bucket_size_mb << 20
@@ -127,9 +122,6 @@ class BucketedWeightSender:
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             async for name, weight in _ensure_async_iterator(weights):
-                # model parameters are in fp32 full precision; preserve their
-                # dtype rather than force-casting (some — e.g. moe gates — must
-                # stay fp32). Receiver will cast on demand if it wants.
                 if offset + weight.nbytes > self.bucket_size:
                     torch.cuda.synchronize()
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
@@ -137,7 +129,7 @@ class BucketedWeightSender:
                     bucket_meta = {}
                     offset = 0
 
-                # TODO: slice embedding-layer weight into chunks
+                # TODO: Chunk embedding weights before transfer.
                 assert offset + weight.nbytes <= self.bucket_size, (
                     f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket. "
                     f"Please increase bucket_size_mb (currently {self.bucket_size_mb} MB)."
@@ -299,8 +291,6 @@ class BucketedWeightReceiver:
         if self.socket is not None:
             self.socket.close()
             self.socket = None
-        # Synchronize before releasing the buffer to ensure all async ops
-        # referencing it (e.g. clone, .to()) have completed.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         del self.buffer

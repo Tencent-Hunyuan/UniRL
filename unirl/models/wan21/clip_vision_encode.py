@@ -73,10 +73,6 @@ class WAN21CLIPVisionEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
         with torch.no_grad():
             out = self.bundle.vision_encoder(processed, output_hidden_states=True)
 
-        # Penultimate hidden state — matches diffusers WAN I2V upstream
-        # (``pipeline_wan_i2v.py::encode_image``); using ``last_hidden_state``
-        # would shift the embedding distribution the transformer was
-        # trained against.
         embeds = out.hidden_states[-2]
         attn_mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=embeds.device)
         return ImageEmbedCondition(embeds=embeds, attn_mask=attn_mask)

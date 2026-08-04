@@ -34,7 +34,6 @@ def switch_adapter(model: nn.Module, adapter_name: str):
         finally:
             model.set_adapter(original_adapter)
     elif hasattr(model, "module") and hasattr(model.module, "set_adapter"):
-        # FSDP-wrapped model
         original_adapter = getattr(model.module, "active_adapter", "default")
         try:
             model.module.set_adapter(adapter_name)
@@ -42,5 +41,4 @@ def switch_adapter(model: nn.Module, adapter_name: str):
         finally:
             model.module.set_adapter(original_adapter)
     else:
-        # No adapter support, just yield (no-op)
         yield

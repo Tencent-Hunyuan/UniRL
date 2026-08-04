@@ -120,8 +120,6 @@ class BagelDiffusionConditions(Condition):
 
     @property
     def batch_size(self) -> int:
-        # Opaque-context path counts gen_contexts; deferred-prompt path (vllm_omni)
-        # has empty context lists, so fall back to the prompt count.
         return len(self.gen_contexts) or len(self.prompts)
 
     def has_contexts(self) -> bool:

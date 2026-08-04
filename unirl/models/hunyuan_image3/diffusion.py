@@ -98,12 +98,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
 
         transformer = model.transformer
 
-        # CFG batching is driven by the captured ``fused`` shape, NOT by
-        # ``guidance_scale``. vllm-omni's HI3 pipeline captures
-        # ``prepare_inputs_for_generation``'s ``input_ids`` at a single-prefill
-        # boundary — the capture is always shape ``[B, L]`` (cond-only),
-        # regardless of whether the engine internally implements CFG via two
-        # separate forwards or one cfg-batched forward.
         n_fused = int(fused.input_ids.shape[0])
         n_sample = int(sample.shape[0])
         if n_fused == n_sample:
@@ -118,18 +112,14 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 f"fused.input_ids batch ({n_fused}) is neither equal to nor "
                 f"2x of sample batch ({n_sample}). Unexpected capture shape."
             )
-        # timestep: scalar or [B] -> [N] float, matching sample_2's batch axis.
         t_scalar = sigma * 1000.0
         if t_scalar.numel() == 1:
-            # Accept both a true scalar and the legacy scalar-like ``[1]``
-            # form. The latter used to broadcast through ``Tensor.expand`` and
-            # remains a valid caller shape for batched forward processes.
+            # Accept scalar-like [1] sigmas for backward compatibility.
             t_expand = t_scalar.reshape(()).expand(sample_2.shape[0])
         elif t_scalar.numel() == sample_2.shape[0]:
             t_expand = t_scalar.reshape(sample_2.shape[0])
         elif cfg and t_scalar.numel() == n_sample:
-            # Conditions/sample use blockwise CFG layout [cond B; uncond B].
-            # Preserve the same ordering for a batched [B] sigma.
+            # Preserve blockwise [cond; uncond] CFG ordering.
             t_expand = torch.cat([t_scalar.reshape(n_sample), t_scalar.reshape(n_sample)])
         else:
             raise ValueError(
@@ -138,7 +128,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                 f"sample batch={n_sample}, model batch={int(sample_2.shape[0])}."
             )
 
-        # Decide which path we're on — stateless vs KV-cached.
         use_cache: bool = state is not None
         is_first: bool = state is None or step_index == 0
 
@@ -171,19 +160,9 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             cond_timestep = conditions.cond_timestep
             cond_vae_image_mask = fused.cond_vae_image_mask
             cond_vit_image_mask = fused.cond_vit_image_mask
-            # Cond-image analog of ``timesteps_index`` below: native passes
-            # ``output.cond_timestep_scatter_index`` (modeling:2842) so
-            # ``instantiate_continuous_tokens`` injects the cond <timestep>
-            # token's continuous embedding (t~=0 = clean source). None silently
-            # SKIPS the injection (modeling:2201 gates on the index, and
-            # ``_check_inputs`` — which demands it alongside cond_vae_images —
-            # is bypassed below), leaving the plain vocab embedding at that slot.
+            # Pass the cond-image timestep index or the continuous token is skipped.
             cond_timesteps_index = fused.cond_timestep_scatter_index
-            # it2i source-image conditioning comes off _encode_cond_image on CPU
-            # (or the VAE/ViT device), but the gen_image forward's timestep-embedder
-            # / token-instantiate Linears live on ``sample.device``. Move the cond
-            # payloads there (tensors, or per-sample lists of tensors) so the
-            # F.linear/addmm don't hit a cpu-vs-cuda mismatch. No-op for t2i (all None).
+            # Move condition payloads to the latent device before projection.
             _dev = sample.device
 
             def _to_dev(x: Any) -> Any:
@@ -205,75 +184,33 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         else:
             cond_vae_images = None
             cond_timestep = None
-            cond_timesteps_index = None  # decode steps: the cond block lives in the KV cache
+            cond_timesteps_index = None  # Decode steps reuse the cached condition block.
             cond_vae_image_mask = None
             cond_vit_images = None
             cond_vit_image_mask = None
             vit_kwargs = None
 
-        # Build model_inputs directly instead of calling
-        # transformer.prepare_inputs_for_generation(). Under FSDP2 the
-        # method dispatch can strip **kwargs. Building the dict here is
-        # equivalent and robust to FSDP wrapping.
         input_ids_in = fused.input_ids
-        # On decode steps (is_first=False) the checkpoint's _update shrinks
-        # position_ids to the changed slice (timestep + image tokens); gather
-        # input_ids AND gen_image_mask to that slice so they match the forward's
-        # hidden length (else masked_select sees full-L mask vs slice-L hidden).
         image_mask_in = fused.gen_image_mask
         if input_ids_in is not None and position_ids_in is not None:
             if input_ids_in.shape[1] != position_ids_in.shape[1]:
                 input_ids_in = torch.gather(input_ids_in, dim=1, index=position_ids_in)
                 if image_mask_in is not None:
                     image_mask_in = torch.gather(image_mask_in, dim=1, index=position_ids_in)
-        # [ROPE-FIX] config.rope_type=="2d" needs a 2-D RoPE for EVERY image
-        # section (gen + it2i's cond_vae + cond_vit). For the MULTI-section it2i
-        # layout the native builder (build_batch_rope_image_info) derives these
-        # from the real sections/all_image_slices, with overlap/interleave
-        # position bookkeeping that CANNOT be faithfully reverse-engineered from
-        # token masks (a mask-only rebuild mis-positions tokens AND overflows
-        # build_2d_rope's arange(last_pos, seq_len) under train-mode's tight
-        # seqlen); the single-gen-image t2i case IS mask-recoverable — see the
-        # else branch below. But for trainside sampling+replay the
-        # rollout ALREADY computed the correct native (cos, sin) and stashed it in
-        # ``fused.rope_cache`` (text_embed._fused_common). So: seed the model's
-        # CachedRoPE with that native cache and pass rope_image_info=None →
-        # CachedRoPE hits the cache (seq_len matches + rope_image_info is None) and
-        # returns our seeded rope, bypassing build_2d_rope entirely. Bit-exact vs
-        # rollout → ratio≈1. On decode steps CachedRoPE gathers the full-L cache by
-        # position_ids, so the same seed serves is_first and decode. ``rope_cache``
-        # is a CONCAT field, so under DP_SCATTER each rank already holds ONLY its
-        # own rows — no replica-0 cross-feed.
+        # Seed CachedRoPE from rollout state to preserve sampling/replay parity.
         if fused.rope_cache is not None:
-            # CachedRoPE keys off the outer wrapper's bare ``training`` flag.
-            # Set only that flag: Module.train() would recursively put the
-            # frozen VAE/ViT into training mode. Backends independently manage
-            # the inner trainable decoder's mode.
+            # Set only the wrapper flag; recursive train() would affect frozen encoders.
             transformer.training = True
             _cr = transformer.cached_rope
-            # rope_cache is a stacked [B, 2, L, D] tensor (idx 0=cos, 1=sin).
             _rope = fused.rope_cache
             _cr.cos_cache = _rope[:, 0].to(device=input_ids_in.device)
             _cr.sin_cache = _rope[:, 1].to(device=input_ids_in.device)
-            # Cache-hit key: match the seqlen the forward computes. In train mode
-            # forward uses ``input_ids.size(1)`` (== input_ids_in here); set it so
-            # __call__ takes the hit branch and skips build_2d_rope.
+            # Match input length so CachedRoPE bypasses rebuilding.
             _cr.seq_len = int(input_ids_in.shape[1])
             _cr.rope_image_info = None
-            rope_image_info_val: Optional[List[List[Any]]] = None  # → CachedRoPE hit path (no rebuild)
+            rope_image_info_val: Optional[List[List[Any]]] = None
         else:
-            # No carried rope — the two-engine vllm-omni path. The ENGINE builds
-            # its rope with vllm-omni's own build_2d_rope n_elem convention
-            # ([.., 64] tables vs this forward's [.., 128] apply_rotary_pos_emb),
-            # so an engine capture must not be seeded here (adapters/hi3.py
-            # deliberately doesn't ship it). Rebuild the 2-D rope info from
-            # gen_image_mask + the latent shape instead — single-gen-image (t2i)
-            # scope, exactly the reconstruction this path was validated with
-            # (image ratio 0.95 → 0.996 when introduced):
-            #   - slice: the contiguous image-token run from gen_image_mask.
-            #   - (token_h, token_w): patchify uses uniform square patches, so
-            #     the token grid preserves the LATENT aspect ratio and
-            #     token_h * token_w == n; solve token_w = round(sqrt(n*W/H)).
+            # Rebuild 2-D RoPE from masks when engine rollouts cannot share rope tables.
             _B = int(fused.input_ids.shape[0])
             rope_image_info_val = [[] for _ in range(_B)]
             if fused.gen_image_mask is not None:
@@ -293,11 +230,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                     _th = _n // _tw if _tw > 0 else 0
                     if _tw > 0 and _th * _tw == _n:
                         rope_image_info_val[_b] = [(slice(_start, _start + _n), (_th, _tw))]
-        # Forward-scatter index for the timestep continuous embedding: on is_first
-        # the model scatters into the full sequence; on decode steps it scatters
-        # into the [timestep, image] slice where the timestep is the first token
-        # (index 0). The full-sequence gen_timestep_scatter_index overflows the
-        # slice for long cond-image sequences (it2i) -> scatter index OOB.
+        # Decode uses a local timestep index; full-sequence indices can overflow.
         timesteps_index_in = scatter_idx_in if is_first else torch.zeros_like(scatter_idx_in)
         model_inputs = {
             "input_ids": input_ids_in,
@@ -309,10 +242,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             "images": sample_2,
             "image_mask": image_mask_in,
             "timesteps": t_expand,
-            # native sets timesteps_index = gen_timestep_scatter_index
-            # (modeling:2836) so instantiate_continuous_tokens injects the
-            # timestep token's continuous embedding (required for gen_image;
-            # passing None silently skips it and corrupts the noise_pred).
             "timesteps_index": timesteps_index_in,
             "gen_timestep_scatter_index": scatter_idx_in,
             "cond_vae_images": cond_vae_images,
@@ -323,32 +252,19 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             "cond_vit_image_mask": cond_vit_image_mask,
             "cond_vit_image_kwargs": vit_kwargs,
         }
-        # Bypass _check_inputs: we build model_inputs by hand (not via
-        # prepare_inputs_for_generation), so the upstream first_step+gen_image
-        # assertions don't all line up with this hand-built dict. timesteps_index
-        # IS provided (scatter_idx_in above) so instantiate_continuous_tokens runs.
         _orig_check = getattr(transformer, "_check_inputs", None)
         transformer._check_inputs = lambda *a, **kw: None
 
-        # Ensure runtime attributes that forward() reads off ``self`` are set.
-        # UNCONDITIONAL reset — GRPO sets num_image_tokens=0 on the same
-        # transformer instance. If DiffGRPO runs after GRPO, the 0 persists
-        # → rope OOB / NaN.
         transformer.post_token_len = None
         n_img = int(fused.gen_image_mask.sum(dim=-1).max().item()) if fused.gen_image_mask is not None else 0
         transformer.num_image_tokens = n_img
-        # ragged_final_layer at decode steps slices hidden_states[:, num_special_tokens:]
-        # to drop the leading timestep/special tokens before the image region; on
-        # is_first it uses image_mask instead (None is correct there).
         transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
         output = transformer(**model_inputs, first_step=is_first)
 
-        # Restore _check_inputs
         if _orig_check is not None:
             transformer._check_inputs = _orig_check
 
-        # Update state for the next step.
         if state is not None:
             self._update_state(transformer, output, conditions, state, is_first=is_first)
 
@@ -391,8 +307,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             return None
         max_cache_len = int(fused.input_ids.shape[1])
         batch_size = int(fused.input_ids.shape[0])
-        # bf16 default matches upstream pipeline; safe regardless of
-        # autocast since the cache stores K/V at the model's compute dtype.
         return cache_cls(
             config=transformer.config,
             batch_size=batch_size,
@@ -433,20 +347,10 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         rope tables (length L) and crash with a tensor-size mismatch in
         ``apply_rotary_pos_emb``.
         """
-        # Build the input model_kwargs that the helper expects. On step 0
-        # it sees the conditions (full L) plus ``tokenizer_output`` to
-        # trigger the gather. On subsequent steps it sees the state
-        # (slice L') and omits tokenizer_output.
         fused = conditions.fused
-        assert fused is not None  # asserted by predict_noise before reaching here
-        # upstream _update_model_kwargs_for_generation reads model_kwargs[
-        # "rope_image_info"] unconditionally (modeling_hunyuan_image_3.py:2944)
-        # and just propagates it forward; predict_noise rebuilds it fresh each
-        # step (line ~197) so the value carried here is never consumed — it only
-        # needs to be PRESENT to avoid a KeyError. 1D rope => empty per-sample.
+        assert fused is not None
         _rope_info = [[] for _ in range(int(fused.input_ids.shape[0]))]
-        # rope_cache is a stacked [B, 2, L, D] tensor; the model's custom_pos_emb
-        # contract is a (cos, sin) pair. Unbind here (None-safe).
+        # Unbind stacked RoPE at the model boundary.
         _cpe = None if fused.rope_cache is None else (fused.rope_cache[:, 0], fused.rope_cache[:, 1])
         if is_first:
             mk: Dict[str, Any] = {
@@ -480,8 +384,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             state.attention_mask = updated["attention_mask"]
         if updated.get("gen_timestep_scatter_index") is not None:
             state.gen_timestep_scatter_index = updated["gen_timestep_scatter_index"]
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -598,10 +500,7 @@ def _conditions_device_and_batch(
             "HunyuanImage3DiffusionStage: conditions.fused.input_ids is None; cannot infer device / batch."
         )
     n = int(fused.input_ids.shape[0])
-    # When ``fused_uncond`` is set the fused is stored cond-only (B rows, one per
-    # sample); the CFG doubling is re-applied by the stage (``_expand_cfg_for_forward``)
-    # so the batch IS ``n``. Otherwise the fused may be cfg-doubled in place (2B), so
-    # divide by the CFG factor to recover the per-sample count.
+    # Derive logical batch size before restacking CFG branches.
     if conditions.fused_uncond is not None:
         return fused.input_ids.device, n
     cfg = 2 if guidance_scale > 1.0 else 1
@@ -631,8 +530,7 @@ def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> Hun
         return conditions
 
     def _dup2(x: Any) -> Any:
-        # Block-duplicate a per-sample payload to [x; x] — matches upstream's
-        # cfg doubling (``tensor.repeat(cfg,...)`` / ``list * cfg``).
+        # Repeat per-sample payloads as [cond; uncond].
         if x is None:
             return None
         if isinstance(x, torch.Tensor):
@@ -703,10 +601,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         self.latent_channels = latent_channels
         self.diffuse_kv_cache = bool(diffuse_kv_cache)
 
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-
     def diffuse(
         self,
         conditions: HunyuanImage3DiffusionConditions,
@@ -734,8 +628,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         from unirl.sde.noise import generate_latents
 
         device, batch_size = _conditions_device_and_batch(conditions, guidance_scale=float(params.guidance_scale))
-        # Re-stack the guided [cond; uncond] batch AFTER deriving the per-sample
-        # batch_size (which sizes x_T) so predict_noise samples the guided velocity.
+        # Restack CFG branches after sizing initial noise.
         conditions = _expand_cfg_for_forward(conditions)
         T = int(params.num_inference_steps)
         if int(schedule.shape[0]) != T + 1:
@@ -743,14 +636,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        # HI3 snaps any requested H×W to the nearest preset at base_size² area
-        # (image_base_size=1024 → ~1MP) — the text-embed stage's
-        # build_gen_image_info does this, so the <img> placeholder span it
-        # splices is sized from the SNAPPED token grid. Size the latent from that
-        # SAME snapped grid, else a non-preset request (e.g. 512²) yields a
-        # latent (raw H//vae_scale) shorter than the placeholder span → the
-        # image-token scatter mismatches (index N vs src M). At a preset size
-        # (e.g. 1024²) get_target_size is a no-op, so this is identical to before.
         ip = getattr(self.model.transformer, "image_processor", None)
         info = None
         if ip is not None:
@@ -759,9 +644,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             elif hasattr(ip, "build_gen_image_info"):
                 info = ip.build_gen_image_info(f"{int(params.height)}x{int(params.width)}")
         if info is not None:
-            # token_{height,width} are computed from the snapped image dims; the
-            # DiT treats each latent spatial position as one image token, so the
-            # latent grid == the placeholder grid.
             latent_h, latent_w = int(info.token_height), int(info.token_width)
             snapped_hw = (latent_h * int(self.vae_scale_factor), latent_w * int(self.vae_scale_factor))
             if snapped_hw != (int(params.height), int(params.width)):
@@ -778,13 +660,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             latent_h = int(params.height) // int(self.vae_scale_factor)
             latent_w = int(params.width) // int(self.vae_scale_factor)
         per_sample_shape = (int(self.latent_channels), latent_h, latent_w)
-        # latents: [B, C, H, W]. Driver-authoritative x_T via the shared
-        # ``NoiseRecipe`` — the SAME ``for_batch(...).resolve(...)`` path the
-        # vLLM worker (RLHunyuanImage3Pipeline) takes, so trainside and rollout
-        # regenerate a BYTE-IDENTICAL x_T from the recipe (gids + seed) on
-        # CPU-fp32. The shape is AR-known only here, so it's filled via
-        # ``for_batch``. Falls back to engine-drawn noise when no recipe gids
-        # were shipped (e.g. DISABLE_DRIVER_XT).
         latents = None
         if params.noise_group_ids:
             latents = (
@@ -825,19 +700,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         )
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
-        # Per-rollout KV-cache state. Step 0 fills it; steps 1..T-1
-        # consume + update. Replay() does NOT use this — each replay step
-        # starts from a stored intermediate latent so prior-step cache is
-        # meaningless.
-        # The KV-cached decode path (state != None) makes SAMPLING take a
-        # different forward (short cached-decode, is_first=False) than REPLAY's
-        # full-prefill recompute. Under old_logp_source=rollout (native) that
-        # sampling-vs-replay bf16 gap surfaces as ratio≈0.997 instead of ~1e-5. Set
-        # diffuse_kv_cache=false (HunyuanImage3PipelineConfig) to disable the cache
-        # so sampling ALSO does a full prefill every step (state=None =>
-        # predict_noise is_first=True always), bit-matching replay's path → native
-        # ratio→~1e-5. Default keeps the cache (faster sampling; harmless under
-        # old_logp_source=replay where ratio=1 by construction regardless).
+        # Disable KV caching when rollout log-probs must match full-prefill replay.
         state = HunyuanImage3DiffusionState() if self.diffuse_kv_cache else None
 
         for i in range(T):
@@ -881,12 +744,9 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
-        # latents_stacked: [B, K, C, H, W]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
-        # sde_logp: [B, S]
         sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
-        # sde_indices_tensor: [S] long
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
@@ -898,10 +758,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -928,9 +784,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         if segment.sigmas is None:
             raise ValueError("HunyuanImage3DiffusionStage.replay: segment.sigmas missing")
 
-        # Re-stack the guided [cond; uncond] batch so replay recomputes the SAME
-        # CFG-combined velocity the rollout sampled (predict_noise cfg=True) -> the
-        # native (old_logp_source=rollout) ratio is 1 at cfg>1. No-op at cfg=1.
+        # Restack CFG branches so replay matches guided rollout.
         conditions = _expand_cfg_for_forward(conditions)
 
         sde_set = set(int(i) for i in segment.sde_indices.tolist())
@@ -960,7 +814,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             for step_idx in target:
                 sigma = sigmas[step_idx].to(dtype=torch.float32)
                 sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                # sample, prev_sample: [B, C, H, W]
                 sample = segment.latents_at(step_idx)
                 prev_sample = segment.latents_at(step_idx + 1)
                 _, log_prob, prev_mean = self.step.step_with_logp(
@@ -987,16 +840,9 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                 if prev_mean is not None:
                     prev_sample_means.append(prev_mean)
 
-        # log_probs: [B, len(target)] float, in logprob_precision
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        # prev_sample_means: [B, len(target), *latent_shape] in trajectory dtype.
-        # None if the strategy didn't produce them at any step.
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
 
     def predict_noise_at_step(
         self,
@@ -1012,8 +858,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         cache is only meaningful inside an SDE trajectory, which DiffusionNFT-style
         forward-process algorithms don't traverse.
         """
-        # Re-stack the guided [cond; uncond] batch exactly as diffuse()/replay()
-        # do, so guidance behavior matches them (no-op when fused_uncond is None).
+        # Restack CFG branches to match diffuse() and replay().
         conditions = _expand_cfg_for_forward(conditions)
         return self.step.predict_noise(
             self.model,
@@ -1022,10 +867,6 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             conditions,
             guidance_scale=float(params.guidance_scale),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the module the diffusion forward operates on.

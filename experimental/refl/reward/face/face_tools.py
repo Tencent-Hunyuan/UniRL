@@ -289,7 +289,6 @@ class ArcFace:
         self.torch_model = convert(model)
         self.torch_model.eval()
         self.torch_model.to(self.device)
-        # Frozen weights — gradient flows through inputs only.
         self.torch_model.requires_grad_(False)
         self.taskname = "recognition"
         self.input_size = (112, 112)

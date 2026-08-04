@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Tuple
 from unirl.types.primitives import Images
 from unirl.types.sample import Sample
 
-# One sample's chat conversation: an ordered list of role-tagged messages.
 Conversation = List[Dict[str, Any]]
 
 
@@ -46,7 +45,7 @@ def unique_group_indices(group_ids: List[str]) -> Tuple[List[int], int]:
     for i, gid in enumerate(group_ids):
         if gid not in sizes:
             sizes[gid] = 0
-            rep_indices.append(i)  # first occurrence == group-order representative
+            rep_indices.append(i)
         sizes[gid] += 1
 
     k_values = set(sizes.values())
@@ -117,7 +116,6 @@ def build_vision_conversations(
     rep, k = unique_group_indices(sample.parts[-1].group_ids)
     roles = [t.role for t in turns]
     is_image = [isinstance(t.content, Images) for t in turns]
-    # Convert each image turn's PILs once (not per representative row).
     cols = [t.content.to_pils() if im else t.content.texts for t, im in zip(turns, is_image)]
     role_groups = _group_consecutive_roles(roles)
     prefix = _system_prefix(system_instruction, roles)

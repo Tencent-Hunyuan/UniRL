@@ -59,23 +59,11 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Upstream ``__init__`` constructs ``self.scheduler`` at
-        # ``pipeline_sd3.py:191``; stash it as the config donor for the SDE
-        # swap. We never swap back — our scheduler is installed for the
-        # lifetime of this pipeline instance.
         self._upstream_scheduler: FlowMatchEulerDiscreteScheduler = self.scheduler
-        # Conditioning-tap state: armed (reset) every request, filled by the
-        # tap's first call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._t5_workaround_installed: bool = False
-        # Per-request x_T hand-off: armed every request, consumed once by the
-        # ``prepare_latents`` override. ``None`` = upstream RNG fires.
         self._pending_initial_noise: Optional[torch.Tensor] = None
-
-    # ------------------------------------------------------------------ #
-    # install — once per pipeline lifetime, idempotent
-    # ------------------------------------------------------------------ #
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (the from_config
@@ -180,10 +168,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         self._get_t5_prompt_embeds = patched_get_t5_prompt_embeds  # type: ignore[assignment]
         self._t5_workaround_installed = True
 
-    # ------------------------------------------------------------------ #
-    # arm — every request (stale-leak guards)
-    # ------------------------------------------------------------------ #
-
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
@@ -198,9 +182,7 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         """Fresh capture buffer so the tap records THIS request's first encode."""
         self._captured_conditioning = None
 
-    # ------------------------------------------------------------------ #
     # run-phase interception — upstream-called name, cannot be renamed
-    # ------------------------------------------------------------------ #
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
         """Initial-noise injection point: bypass upstream RNG when the driver
@@ -217,10 +199,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
             self._pending_initial_noise = None
         return super().prepare_latents(*args, **kwargs)
 
-    # ------------------------------------------------------------------ #
-    # harvest — export onto the wire
-    # ------------------------------------------------------------------ #
-
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             drain_trajectory_into(out, self.scheduler)
@@ -228,10 +206,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
             stamp_custom_output(out, "text_capture", self._captured_conditioning)
-
-    # ------------------------------------------------------------------ #
-    # the protocol
-    # ------------------------------------------------------------------ #
 
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
@@ -242,9 +216,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         self._arm_initial_noise(req)
         self._arm_conditioning_tap()
 
-        # Delegate the entire denoise pipeline (prompt encoding, latent prep,
-        # timestep build, diffusion loop, VAE decode) to upstream; the
-        # installed tap/injector fire inside.
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)

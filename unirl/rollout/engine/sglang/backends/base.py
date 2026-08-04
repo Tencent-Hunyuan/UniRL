@@ -107,14 +107,9 @@ class RawResult(Protocol):
     construction, and both empty when the request didn't ask for logprobs.
     """
 
-    #: The raw generated text (``<think>`` tags intact — stripping is a
-    #: driver-side concern, applied by the adapter at decode time).
     text: str
-    #: Generated token ids, always length-aligned with ``logprobs``.
     token_ids: List[int]
-    #: Per-token log-probs; both lists empty when ``return_logprob`` was off.
     logprobs: List[float]
-    #: Normalized finish reason (SRT returns a dict or a bare string).
     finish_reason: str
 
 
@@ -122,21 +117,15 @@ class RawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
-    # generation — synchronous and safe for CONCURRENT callers: the agentic
-    # drain calls it from one thread per trajectory, and the impl must keep the
-    # in-flight requests batching together on the runtime (never serialize them).
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
-    # best-effort controls
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None: ...
     def pause(self) -> None: ...
     def resume(self) -> None: ...
-    # memory / lifecycle / health
     def flush_cache(self) -> None: ...
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None: ...
     def resume_memory(self, *, tags: Optional[Sequence[str]] = None) -> None: ...
     def shutdown(self) -> None: ...
     def ping(self) -> bool: ...
-    # weight-sync verbs (serialization stays inside the impl)
     def update_from_tensor(
         self,
         *,
@@ -171,8 +160,6 @@ class Backend(Protocol):
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None: ...
-
-    # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
 
 
 __all__ = ["Backend", "RawResult"]

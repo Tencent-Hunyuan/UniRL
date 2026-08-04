@@ -127,10 +127,6 @@ class SGLangBackend:
         self._rt = runtime
         self._server_args = server_args
 
-    # ------------------------------------------------------------------ #
-    # Boot — the only place from_pretrained / the import live
-    # ------------------------------------------------------------------ #
-
     @classmethod
     def boot(
         cls,
@@ -161,10 +157,6 @@ class SGLangBackend:
         )
         return cls(generator, rt, server_args)
 
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
-
     def generate(self, sampling_kwargs: Dict[str, Any]) -> List[RawResult]:
         raw = self._gen.generate(sampling_params_kwargs=sampling_kwargs)
         if raw is None:
@@ -179,9 +171,6 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        # SGLang populates arch_config.vae_scale_factor lazily in
-        # vae_config.post_init(); our standalone call here (init_same_noise path)
-        # can run before that hook fired — populate it idempotently.
         vae_cfg = getattr(pcfg, "vae_config", None)
         arch = getattr(vae_cfg, "arch_config", None)
         if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):
@@ -191,15 +180,7 @@ class SGLangBackend:
         full_shape = pcfg.prepare_latent_shape(batch_stub, batch_size, num_frames)
         return tuple(full_shape[1:])
 
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
-
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
-        # Stock upstream DiffGenerator has no memory-occupation methods (the fork
-        # added them); route through the scheduler client to the handlers that
-        # ``patch_scheduler`` installs, keyed on the ``_patches`` req types
-        # (mirrors the v1 engine's ``_call_memory_api``).
         self._forward(
             self._rt["ReleaseMemoryOccupationReqInput"](
                 tags=list(tags),
@@ -230,10 +211,6 @@ class SGLangBackend:
         except Exception as exc:  # noqa: BLE001
             logger.warning("SGLang health_check ping failed: %s", exc)
             return False
-
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs (io_struct types stay here; no RL types cross)
-    # ------------------------------------------------------------------ #
 
     def update_from_tensor(
         self,
@@ -332,10 +309,6 @@ class SGLangBackend:
         if not (isinstance(output, dict) and output):
             raise RuntimeError(f"SGLang checksum query returned invalid payload: {output!r}")
         return output
-
-    # ------------------------------------------------------------------ #
-    # Scheduler request plumbing
-    # ------------------------------------------------------------------ #
 
     def _forward(self, request: Any, *, op: str) -> Any:
         response = self._rt["sync_scheduler_client"].forward(request)

@@ -3,7 +3,7 @@
 
 Drives :class:`unirl.trainer.agentic_env.AgenticEnvTrainer` over the
 :class:`~unirl.rollout.engine.agentic.engine.AgenticRolloutEngine` with an interactive
-:class:`~unirl.rollout.loop.environment.Environment`. Sibling of ``train_agentic.py``;
+:class:`~unirl.rollout.env.protocol.Environment`. Sibling of ``train_agentic.py``;
 the reward is the environment's own per-trajectory return — task-success or a shaped
 signal, attached to each trajectory by the engine — so no reward backend is scored and
 the recipe's ``reward`` block is built but unused.
@@ -14,7 +14,7 @@ Launch (single node; rank 0 owns the driver + the agentic coordinator):
   python -m unirl.train_agentic_env --config-name=alfworld/alfworld_grpo num_devices=8
 
 This entrypoint serves every env-reward agentic recipe; ALFWorld
-(:class:`~unirl.rollout.loop.alfworld_env.AlfworldEnv`, ``examples/alfworld/``) is the
+(:class:`~unirl.rollout.env.alfworld.AlfworldEnv`, ``examples/alfworld/``) is the
 reference environment.
 """
 
@@ -35,7 +35,7 @@ def main(cfg: DictConfig) -> None:
         pipeline_cfg=cfg.pipeline,
         backend_cfg=cfg.backend,
         rollout_cfg=cfg.rollout,
-        reward_cfg=cfg.reward,  # built but unused (reward is env-sourced)
+        reward_cfg=cfg.reward,
         algorithm_cfg=cfg.algorithm,
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,

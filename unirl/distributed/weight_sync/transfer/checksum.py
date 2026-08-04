@@ -47,10 +47,6 @@ def fingerprint_tensor(t: torch.Tensor) -> str:
     h = hashlib.sha256()
     h.update(str(data.dtype).encode())
     h.update(str(tuple(data.shape)).encode())
-    # ``view(torch.uint8)`` requires contiguous storage (already done
-    # above) and a dtype with itemsize-aligned numel — true for every
-    # torch dtype we hash here. ``flatten()`` is a no-op view; numpy
-    # ``.tobytes()`` does the actual byte materialisation.
     h.update(data.view(torch.uint8).flatten().numpy().tobytes())
     return h.hexdigest()[:16]
 

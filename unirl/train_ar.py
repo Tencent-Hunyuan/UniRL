@@ -28,9 +28,6 @@ def main(cfg: DictConfig) -> None:
     trainer = None
 
     def teardown() -> None:
-        # Still None if ARTrainer.__init__ raised — an engine that booted before
-        # the failure has no handle to reach here, so it cleans up after itself
-        # inside VLLMOmniBackend.boot rather than relying on this path.
         if trainer is not None:
             trainer.shutdown()
 
@@ -61,9 +58,6 @@ def main(cfg: DictConfig) -> None:
             rollout_anchor_device=cfg.get("rollout_anchor_device", None),
             enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
         )
-        # Backstop for the ray.init hook: if Ray was auto-initialised off the
-        # main thread, that hook could not install handlers and this is the
-        # first point where we are back in the main thread with Ray up.
         guard.claim_signals()
         trainer.train(
             num_rollouts=cfg.get("num_rollouts", 100),

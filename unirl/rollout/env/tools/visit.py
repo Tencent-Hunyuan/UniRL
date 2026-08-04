@@ -1,6 +1,6 @@
 """VisitTool — read webpage(s) and summarize toward a goal (LIN-519, hardened).
 
-A concrete :class:`~unirl.rollout.loop.tools.tool.Tool` for the deep-research
+A concrete :class:`~unirl.rollout.env.tools.base.Tool` for the deep-research
 agent: fetch a URL's content with the Jina reader (needs ``$JINA_API_KEYS``) and
 summarize the parts relevant to a stated goal with an OpenAI-compatible LLM
 (hosted out-of-band; ``$SUMMARY_URL`` / ``$SUMMARY_MODEL`` or the constructor
@@ -24,10 +24,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from unirl.rollout.loop.tools.tool import Tool
+from unirl.rollout.env.tools.base import Tool
 
 _JINA_READ = "https://r.jina.ai/"
-# Structured extractor (mirrors AReaL's EXTRACTOR_PROMPT): evidence + summary.
 _EXTRACT_PROMPT = (
     "Process the following webpage content and extract the information relevant "
     "to the goal.\n\n"
@@ -146,7 +145,7 @@ class VisitTool(Tool):
         endpoint = os.environ.get("SUMMARY_URL", self._endpoint)
         model = os.environ.get("SUMMARY_MODEL", self._model)
         if not endpoint:
-            return content  # no summarizer configured — return raw (truncated) content
+            return content
         headers = {"Content-Type": "application/json"}
         key = os.environ.get("SUMMARY_API_KEY", "")
         if key:
@@ -168,7 +167,7 @@ class VisitTool(Tool):
                     if evidence or summary:
                         return f"Evidence:\n{evidence}\n\nSummary:\n{summary}"
                 if raw:
-                    return raw  # not JSON, but the model's text is still a usable summary
+                    return raw
             except Exception:  # noqa: BLE001 — retry, then fall back to raw content
                 pass
             time.sleep(0.5)

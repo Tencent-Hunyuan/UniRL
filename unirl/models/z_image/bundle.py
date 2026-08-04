@@ -100,9 +100,6 @@ class ZImageBundle(Bundle):
             vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        # AutoModel (not a hardcoded Qwen3Model) mirrors the official Z-Image
-        # loader: it instantiates the base encoder named in the checkpoint's
-        # text_encoder/config.json, so a future text-encoder swap just works.
         text_encoder = (
             AutoModel.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
             .to(device)

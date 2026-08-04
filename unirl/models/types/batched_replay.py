@@ -3,8 +3,11 @@
 The ``S`` replay steps of a stored trajectory are stacked step-major on the
 batch dim (``[S*B, ...]``), so one batched step call replaces the serial
 per-step loop: ONE transformer forward — i.e. one FSDP all-gather of the
-sharded transformer — instead of ``S``. Concrete stages supply the per-model
-pieces via :meth:`BatchedStepReplayMixin._tile_conditions` and
+sharded transformer — instead of ``S``. It trades memory for that: the stack
+costs roughly ``S``× the replay activation footprint, so recipes running
+without activation checkpointing can OOM where the serial loop fit. Concrete
+stages supply the per-model pieces via
+:meth:`BatchedStepReplayMixin._tile_conditions` and
 :meth:`BatchedStepReplayMixin._batched_step_kwargs`.
 
 Callers gate this path on all three of: the stage's ``batch_replay_steps``

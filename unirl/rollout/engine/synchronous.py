@@ -11,7 +11,6 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
 
-# Single-turn engines return one Sample; the agentic engine returns a trajectory list.
 RolloutOutput = Union[Sample, List[Sample]]
 
 
@@ -25,8 +24,6 @@ class BaseEngineConfig(ABC):
 
 class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC."""
-
-    # Lifecycle
 
     @abstractmethod
     def shutdown(self) -> None:
@@ -64,13 +61,9 @@ class BaseRolloutEngine(Remote, ABC):
             "cached_gb": torch.cuda.memory_reserved() / 1e9,
         }
 
-    # Generation
-
     @abstractmethod
     def generate(self, sample: Sample) -> RolloutOutput:
         """Synchronously run rollout generation; each concrete contract owns its dispatch mode."""
-
-    # Control plane — reached via raw Worker.call, so calls interleave with an in-flight generate.
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
@@ -83,8 +76,6 @@ class BaseRolloutEngine(Remote, ABC):
     def resume(self) -> None:
         """Resume generation after :meth:`pause`. Default no-op."""
 
-    # Weight sync — bucketed CUDA-IPC
-
     def update_weights_from_ipc(
         self,
         *,
@@ -95,8 +86,6 @@ class BaseRolloutEngine(Remote, ABC):
     ) -> None:
         """Receive a state dict over a per-rank ZMQ + CUDA-IPC channel."""
         raise NotImplementedError
-
-    # Weight sync — NCCL broadcast
 
     def init_weights_update_group(
         self,
@@ -135,8 +124,6 @@ class BaseRolloutEngine(Remote, ABC):
         """Tear down a previously-initialized NCCL update group."""
         raise NotImplementedError
 
-    # Weight sync — LoRA tensor bag
-
     def set_lora_from_tensors(
         self,
         adapter_name: str,
@@ -146,8 +133,6 @@ class BaseRolloutEngine(Remote, ABC):
     ) -> None:
         """Load a LoRA adapter directly from in-memory tensors."""
         raise NotImplementedError
-
-    # Weight sync — SGLang-shape one-bag tensor payload
 
     def update_weights_from_tensor(
         self,
@@ -166,7 +151,6 @@ class BaseRolloutEngine(Remote, ABC):
 class SyncRolloutEngine(BaseRolloutEngine, ABC):
     """Engines that fill and return one ``Sample``; ``generate`` may be called concurrently (agentic drain)."""
 
-    # Policy weight version of the current weights; bumped on each weight sync.
     _weight_version: int = 0
 
     @abstractmethod

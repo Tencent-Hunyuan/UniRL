@@ -31,8 +31,6 @@ import os
 import random
 from typing import Any, Dict, List
 
-# The recipes score with MCExactMatchSpec(require_answer_phrase=True), so append the expected
-# format instead of relying on the model to infer it from the answer choices.
 ANSWER_INSTRUCTION = (
     "Watch the video and listen to its audio, then answer the multiple-choice question.\n"
     "Reason step by step, then end your reply with the exact phrase: The answer is [X]"

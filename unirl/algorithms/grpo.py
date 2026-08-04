@@ -60,11 +60,6 @@ class GRPO(StageAlgorithm):
             :class:`ARSamplingParams` default when no engine is configured.
     """
 
-    # old_logp is the rollout (SGLang) log-prob, which is frozen on the segment
-    # and does NOT change across mini-batch updates — so reusing it across
-    # num_updates_per_batch>1 is the deliberate rollout-anchored PPO ratio
-    # (verl bypass_mode=True parity), matching DRPO. The ratio then absorbs the
-    # rollout-vs-train engine gap on later mini-batches (accepted for parity).
     supports_multi_update = True
 
     def __init__(
@@ -114,12 +109,7 @@ class GRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens]
-        # old_logp = the rollout log-prob, frozen on the segment — the deliberate
-        # rollout-anchored ratio across num_updates_per_batch steps (see the
-        # supports_multi_update class comment; verl bypass_mode=True parity).
+        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
         adv_per_token = self._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
@@ -139,12 +129,6 @@ class GRPO(StageAlgorithm):
             clip_range_high=clip_high,
         )
 
-        # Loss aggregation (match DRPO / verl loss_agg_mode):
-        #  - "seq-mean-token-sum-norm" (Dr.GRPO/DAPO): per-seq token-SUM / horizon,
-        #    then mean over sequences (length-UNbiased).
-        #  - "seq-mean-token-mean" (ORIGINAL GRPO): per-seq token-MEAN, then mean
-        #    over sequences (length-normalized, the standard-GRPO length bias).
-        #  - "token-mean" (default): flat mean over all tokens.
         if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean") and segment.lengths is not None:
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             if self.loss_agg_mode == "seq-mean-token-sum-norm":

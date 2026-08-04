@@ -93,7 +93,7 @@ before applying the same reward, advantage, and train-stack contracts.
 - `types/README.md`: the `Sample` / `Part` contract and migration from the retired request/response API.
 - `config/README.md`: flat-recipe config — `require`/precision validators, `_target_` instantiation, cross-component contracts.
 - `rollout/README.md`: rollout modes, engines, and the `Sample` / `Part` generation flow.
-- `rollout/loop/README.md`: agent-loop environments, tools, trajectories, and partial-resume behavior.
+- `rollout/env/README.md`: agentic environments, tools, trajectories, and partial-resume behavior.
 - `train/readme.md`: train stack, FSDP backend, injection, EMA shadow.
 - `algorithms/README.md`: per-track loss algorithms.
 - `reward/README.md`: reward backends and custom scorers.

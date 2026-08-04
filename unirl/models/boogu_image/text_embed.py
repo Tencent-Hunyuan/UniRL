@@ -39,9 +39,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import BooguImageBundle
 
-# Fixed system prompts — exact strings from the reference pipeline
-# (pipeline_boogu.py:231-232). SYSTEM_PROMPT_DROP is what empty/whitespace
-# instructions (the CFG negative "") are routed to.
 SYSTEM_PROMPT_T2I = (
     "You are a helpful assistant that generates high-quality images based on "
     "user instructions. The instructions are as follows."
@@ -76,8 +73,6 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             pooled=None,
         )
 
-    # ---- helpers -----------------------------------------------------------
-
     @staticmethod
     def _messages(prompt: str) -> List[dict]:
         """Build the reference chat-message list for one T2I prompt.
@@ -102,8 +97,6 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         dtype = next(bundle.text_encoder.parameters()).dtype
 
         message_lists = [self._messages(prompt) for prompt in prompts]
-        # Exact reference kwargs (pipeline_boogu.py:1299-1308 with the
-        # __call__ defaults max_sequence_length=1280, truncation off).
         vlm_inputs = bundle.processor.apply_chat_template(
             message_lists,
             padding="longest",
@@ -122,8 +115,6 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             )
-        # instruction_feature_configs: 1 layer, mean-reduce == identity →
-        # the last hidden layer, full right-padded sequence, no repacking.
         hidden_states = encoder_out.last_hidden_state
 
         return hidden_states.to(device=device, dtype=dtype), attention_mask

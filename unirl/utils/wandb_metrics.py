@@ -116,10 +116,6 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
         return metrics
 
     gen_parts = [p for p in parts if getattr(p, "is_gen", False)]
-    # num_samples = the generated-sample count (frontier gen Part), restoring the
-    # pre-migration resp.batch_size. sample.batch_size is the root prompt count P,
-    # which under-reports by the fan-out factor (N for AR/diffusion, N*M for the
-    # PE/unified image stage).
     metrics["num_samples"] = (
         float(int(gen_parts[-1].batch_size)) if gen_parts else float(int(getattr(sample, "batch_size", 0)))
     )
@@ -133,8 +129,6 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
             metrics.update(_tensor_stats(f"{prefix}reward", rewards_f))
             zero_cnt, group_cnt = _zero_std_group_counts_from_ids(
                 rewards_f,
-                # Buckets are sibling groups (immediate parent), regardless of the
-                # lineage layer the advantages were normalized at.
                 getattr(part, "group_ids", None),
             )
             if group_cnt > 0:
@@ -147,10 +141,6 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
             adv_f = advantages.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}advantage", adv_f))
 
-        # Response-length stats from the packed varlen segment (AR parts):
-        # `segment.lengths[i]` = generated tokens for sample i. `trunc_ratio` is
-        # the fraction that hit the generation budget (= truncated, usually no
-        # final answer -> reward 0) — mirrors verl's response_length/{mean,clip_ratio}.
         segment = getattr(part, "segment", None)
         lengths = getattr(segment, "lengths", None) if segment is not None else None
         if torch.is_tensor(lengths) and lengths.numel() > 0:
