@@ -35,18 +35,13 @@ class WorkerLocalTransport(TensorTransport):
     of this; ``isinstance(t, WorkerLocalTransport)`` is the locality discriminator.
     """
 
-    # Capability methods the controller may invoke via the Worker's transport_op relay.
     REMOTE_OPS: ClassVar[frozenset] = frozenset({"incref", "decref", "tensor_op", "get_cpu", "nccl_send", "nccl_recv"})
-
-    # ---- lifecycle (ref-counting) ----
 
     def incref(self, key: Any) -> None:
         """Increment the ref count. No-op by default."""
 
     def decref(self, key: Any) -> None:
         """Decrement the ref count; free at zero. No-op by default."""
-
-    # ---- locality + cross-worker transfer ----
 
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         """Initialize the cross-worker transfer group."""
@@ -153,8 +148,6 @@ class WorkerLocalTransport(TensorTransport):
             )
             for (s_args, s_kwargs), dst in zip(shards, dsts)
         ]
-
-    # ---- remote compute (controller-triggered) ----
 
     def tensor_op(self, handle: Any, op: str, *op_args) -> Any:
         """Round-trip resolve → op → put. Backends with on-worker compute override."""

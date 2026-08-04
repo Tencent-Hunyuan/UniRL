@@ -48,7 +48,6 @@ class VideoAdapter(ImageAdapter):
     and the decoded media is packed as ``Videos`` rather than dropped.
     """
 
-    #: Modality stamp for the latent segment.
     segment_factory = staticmethod(make_video_segment)
 
     def build_segment(
@@ -93,8 +92,6 @@ class VideoAdapter(ImageAdapter):
 class MochiAdapter(ImageAdapter):
     """Mochi — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
 
-    # Legacy image-path video family: drop 4-D decoded samples (incl. single-frame)
-    # rather than squeezing them into images.
     squeeze_single_frame_4d = False
 
 
@@ -258,12 +255,6 @@ class Ltx2T2VAdapter(VideoAdapter):
         text = out.get("text")
         negative_text = out.get("negative_text")
 
-        # SGLang's LTX connector replaces padded positions with learned
-        # registers and gives the DiT an all-valid post-connector mask (the
-        # native LTX-2.3 path passes no mask at all). ``patch_conditions`` emits
-        # the pre-connector tokenizer mask for generic families, so carrying it
-        # into replay would incorrectly mask those registers. ``None`` is
-        # equivalent to SGLang's all-valid mask and matches both LTX variants.
         if text is not None:
             text = TextEmbedCondition(embeds=text.embeds, pooled=text.pooled)
             out["text"] = text
@@ -303,10 +294,6 @@ class Ltx2T2VAdapter(VideoAdapter):
             raise ValueError(
                 f"ltx2: expected a packed trajectory [B, T+1, ...]; got rank {traj.ndim}, shape {tuple(traj.shape)}."
             )
-        # LTX-2 co-denoises an AUDIO latent the video DiT cross-attends to; collect
-        # the parallel audio trajectory and stamp it as ``segment.aux_latents`` so the
-        # trainside ``LTX2DiffusionStage.replay`` replays the same per-step audio
-        # (else it raises "aux_latents (audio trajectory) missing").
         aux_traj = utils.collect_aux_trajectory_latents(results)
         return utils.build_latent_segment(
             traj,

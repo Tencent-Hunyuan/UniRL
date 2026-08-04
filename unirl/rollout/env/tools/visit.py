@@ -27,7 +27,6 @@ import requests
 from unirl.rollout.env.tools.base import Tool
 
 _JINA_READ = "https://r.jina.ai/"
-# Structured extractor (mirrors AReaL's EXTRACTOR_PROMPT): evidence + summary.
 _EXTRACT_PROMPT = (
     "Process the following webpage content and extract the information relevant "
     "to the goal.\n\n"
@@ -146,7 +145,7 @@ class VisitTool(Tool):
         endpoint = os.environ.get("SUMMARY_URL", self._endpoint)
         model = os.environ.get("SUMMARY_MODEL", self._model)
         if not endpoint:
-            return content  # no summarizer configured — return raw (truncated) content
+            return content
         headers = {"Content-Type": "application/json"}
         key = os.environ.get("SUMMARY_API_KEY", "")
         if key:
@@ -168,7 +167,7 @@ class VisitTool(Tool):
                     if evidence or summary:
                         return f"Evidence:\n{evidence}\n\nSummary:\n{summary}"
                 if raw:
-                    return raw  # not JSON, but the model's text is still a usable summary
+                    return raw
             except Exception:  # noqa: BLE001 — retry, then fall back to raw content
                 pass
             time.sleep(0.5)

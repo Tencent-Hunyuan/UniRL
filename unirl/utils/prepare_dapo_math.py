@@ -27,18 +27,17 @@ import argparse
 import json
 import os
 
-# Boxed-answer instruction (matches the math_boxed reward, which extracts \boxed{}).
 BOXED_SUFFIX = "\n\nLet's think step by step and output the final answer within \\boxed{}."
 
 
 def _extract_prompt(row: dict, append_boxed: bool) -> str:
     """Pull the user-facing prompt text from a raw row (schema-tolerant)."""
     p = row.get("prompt")
-    if isinstance(p, list) and p:  # verl chat format: [{"role","content"}, ...]
+    if isinstance(p, list) and p:
         text = (p[-1] or {}).get("content", "") if isinstance(p[-1], dict) else str(p[-1])
     elif isinstance(p, str):
         text = p
-    else:  # plain math datasets (AIME_2024 capitalizes its columns)
+    else:
         text = row.get("question") or row.get("problem") or row.get("Problem") or ""
     text = (text or "").strip()
     if append_boxed and "\\boxed" not in text:
@@ -91,11 +90,7 @@ def _convert(
     try:
         ds = load_dataset(hf_id, split=split)
     except Exception as e:
-        # Shard-inconsistent side columns (e.g. DPAO_filter's extra_info is
-        # {index: string} in one shard and struct<index,split> in another) make
-        # schema unification fail. Retry reading only the columns we use — the
-        # column set is source-specific (verl-style sources carry
-        # prompt/reward_model; the AIME sets don't), so callers opt in.
+        # Read only required columns when shard schemas cannot unify.
         if retry_columns is None:
             raise
         print(f"  full-schema load failed ({type(e).__name__}); retrying with pruned columns")
@@ -155,7 +150,7 @@ def main() -> None:
         args.dapo_split,
         os.path.join(args.out_dir, "train.jsonl"),
         args.append_boxed_template,
-        retry_columns=["prompt", "reward_model"],  # verl schema; pruning drops the conflicting extra_info
+        retry_columns=["prompt", "reward_model"],
         deduplicate=not args.keep_duplicates,
     )
 

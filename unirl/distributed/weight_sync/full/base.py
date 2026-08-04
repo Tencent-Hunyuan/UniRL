@@ -107,8 +107,6 @@ class FullWeightSync(Remote):
         wire_dtype: Any = None,
     ) -> None:
         super().__init__()
-        # Deferred: unirl.utils.dtypes imports torch at module scope, and this
-        # module must stay driver-importable without torch.
         from unirl.utils.dtypes import parse_torch_dtype
 
         self._backend = backend
@@ -145,10 +143,6 @@ class FullWeightSync(Remote):
                     "FullWeightSync: EP + LoRA requires lora_merged=True. "
                     "Use LocalLoraWeightSync/RemoteLoraWeightSync for adapter-only sync."
                 )
-        # Which PEFT adapter's weights to push. ``None`` defers to the backend's
-        # single source of truth (``rollout_adapter_name``): the EMA shadow
-        # ("old") for DiffusionNFT, else "default". See class docstring; a
-        # non-default adapter must be merged in, so fail closed.
         self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
         if self._adapter_name != "default" and not self._lora_merged:
             raise ValueError(
@@ -156,10 +150,6 @@ class FullWeightSync(Remote):
                 f"lora_merged=True (a non-default adapter must be folded into the "
                 f"pushed base weights; got lora_merged=False)."
             )
-        # The pushed adapter is invisible in the recipe when it defaults from the
-        # backend (DiffusionNFT resolves to the EMA shadow "old"), so log it once:
-        # a SEPARATE rollout engine sampling under "old" is the intended faithful
-        # path, not a misconfiguration.
         if self._adapter_name != "default":
             logger.info(
                 "%s: rollout engine will be synced from adapter %r (%s).",
@@ -167,19 +157,10 @@ class FullWeightSync(Remote):
                 self._adapter_name,
                 "explicit adapter_name" if adapter_name is not None else "backend.rollout_adapter_name",
             )
-        # Ordered, first-match-wins name rewrites (glob -> replacement, or None to
-        # drop); see _validate_name_remap / _apply_name_remap for the contract.
         self._name_remap = _validate_name_remap(name_remap)
-        # Routes the update to one child of a ComposedRolloutEngine; empty for
-        # a single-model engine. Forwarded by each transport's ``sync()``.
         self._track_prefix = str(track_prefix or "")
-        # Wire dtype for the weight walk (None = ship as-is); see class docstring.
         self._wire_dtype = parse_torch_dtype(wire_dtype, field_name="wire_dtype", allow_none=True)
         self.weight_version = 0
-
-    # ------------------------------------------------------------------
-    # Transport-agnostic weight walk
-    # ------------------------------------------------------------------
 
     def _iter_full_tensors(self) -> Iterator[Tuple[str, "object"]]:
         """Yield ``(name, full_tensor)`` one at a time (lazy → bounded memory).
@@ -214,9 +195,6 @@ class FullWeightSync(Remote):
         from unirl.utils.peft_merge import merged_state_dict, raw_state_dict
 
         remap = self._name_remap
-        # Expert-parallel models always need the EP-aware walk: even when LoRA
-        # is merged, the frozen fused experts still carry only this rank's
-        # [E/ep] block and must be gathered + converted to HF per-expert names.
         if getattr(self._backend.model, "_extra_parallel_param_groups", None) is not None:
             yield from self._iter_full_tensors_ep()
             return
@@ -284,10 +262,6 @@ class FullWeightSync(Remote):
                 dtype=self._wire_dtype,
             )
 
-        # Both source walks normalize PEFT names (strip ``base_model.model.`` and
-        # ``.base_layer.``). The merged walk also folds attention/shared-module
-        # LoRA deltas while leaving frozen fused experts as their local [E/ep]
-        # base blocks, which are gathered below.
         for name, full in state_walk:
             expert_kind = fused_expert_kind(name)
             if expert_kind is not None and ep_size > 1:

@@ -18,13 +18,7 @@ from .face_tools import Face, FaceAnalysis
 
 logger = logging.getLogger(__name__)
 
-# Reference-embedding LRU bound (see FaceRewardScorer._ref_cache).
 _REF_CACHE_MAX = 64
-
-
-# ---------------------------------------------------------------------------
-# Reference-video loader (imageio + resize-to-cover + center_crop)
-# ---------------------------------------------------------------------------
 
 
 def _load_ref_video_frames(
@@ -47,7 +41,6 @@ def _load_ref_video_frames(
     reader = imageio.get_reader(video_path)
     total = int(reader.count_frames())  # type: ignore[attr-defined]
 
-    # time_division_factor=4, remainder=1
     nf = min(max_frames, total)
     while nf > 1 and nf % 4 != 1:
         nf -= 1
@@ -71,18 +64,12 @@ def _load_ref_video_frames(
             interpolation=TF.InterpolationMode.BILINEAR,
         )
         frame = TF.center_crop(frame, (target_h, target_w))
-        t = TF.to_tensor(frame)  # (C, H, W) [0, 1]
-        frame = TF.to_pil_image(t)  # round-trip PIL to match training-time preprocessing
+        t = TF.to_tensor(frame)
+        frame = TF.to_pil_image(t)
         frames.append(TF.to_tensor(frame) * 2.0 - 1.0)
     reader.close()
 
-    # (T, C, H, W) -> (C, T, H, W)
     return torch.stack(frames).permute(1, 0, 2, 3).contiguous()
-
-
-# ---------------------------------------------------------------------------
-# Reward scorer
-# ---------------------------------------------------------------------------
 
 
 class FaceRewardScorer(LocalRewardBackend):
@@ -110,16 +97,10 @@ class FaceRewardScorer(LocalRewardBackend):
         self._ref_max_frames = int(self.model_kwargs.get("ref_max_frames", 81))
         self._ref_max_pixels = int(self.model_kwargs.get("ref_max_pixels", 480 * 480))
         self._differentiable = bool(self.model_kwargs.get("differentiable", True))
-        # Bounded LRU: reference embeddings are small, but a many-identity
-        # dataset must not grow GPU residency without bound.
         self._ref_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         raise NotImplementedError("FaceRewardScorer is REFL-only; use compute_rewards_differentiable().")
-
-    # ------------------------------------------------------------------
-    # Per-video face embedding (recipe-local REFL implementation)
-    # ------------------------------------------------------------------
 
     def _extract_face_embeddings(
         self,
@@ -177,13 +158,9 @@ class FaceRewardScorer(LocalRewardBackend):
                 embeddings.append(zero_emb)
                 mask.append(0)
 
-        emb_stack = torch.stack(embeddings).unsqueeze(0)  # (1, T, 512)
-        mask_tensor = torch.tensor(mask, device=self.device).unsqueeze(0).float()  # (1, T)
+        emb_stack = torch.stack(embeddings).unsqueeze(0)
+        mask_tensor = torch.tensor(mask, device=self.device).unsqueeze(0).float()
         return emb_stack, mask_tensor
-
-    # ------------------------------------------------------------------
-    # Reference-video caching
-    # ------------------------------------------------------------------
 
     def _get_ref_embeddings(self, ref_video_path: str) -> tuple[torch.Tensor, torch.Tensor]:
         cached = self._ref_cache.get(ref_video_path)
@@ -197,16 +174,11 @@ class FaceRewardScorer(LocalRewardBackend):
                 max_pixels=self._ref_max_pixels,
             ).to(self.device)
             ref_emb, ref_mask = self._extract_face_embeddings(video, with_grad=False)
-        # Detach (defence-in-depth) before caching.
         cached = (ref_emb.detach(), ref_mask.detach())
         self._ref_cache[ref_video_path] = cached
         while len(self._ref_cache) > _REF_CACHE_MAX:
             self._ref_cache.popitem(last=False)
         return cached
-
-    # ------------------------------------------------------------------
-    # Differentiable REFL reward entry point
-    # ------------------------------------------------------------------
 
     def compute_rewards_differentiable(
         self,
@@ -251,10 +223,6 @@ class FaceRewardScorer(LocalRewardBackend):
             rewards.append(score)
 
         return torch.stack(rewards).float()
-
-    # ------------------------------------------------------------------
-    # Lifecycle hooks
-    # ------------------------------------------------------------------
 
     def offload(self) -> None:
         self._ref_cache.clear()

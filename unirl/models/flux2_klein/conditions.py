@@ -37,13 +37,6 @@ class Flux2KleinConditions(Batch):
 
     text: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
-    # Image-edit / reference conditioning: the source image, VAE-encoded and
-    # packed into transformer tokens ``[B, N, 128]``, with its 4-axis RoPE
-    # position ids ``[B, N, 4]`` (time-offset from the noise latents so the
-    # transformer can tell condition tokens apart). Both ``None`` for pure T2I.
-    # ``Flux2KleinDiffusionStep.predict_noise`` concatenates these onto the
-    # noise token sequence (and truncates the prediction back to noise length),
-    # mirroring diffusers' ``Flux2KleinPipeline`` reference-image path.
     image_latent: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     image_latent_ids: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 

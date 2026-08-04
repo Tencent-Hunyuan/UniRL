@@ -46,10 +46,6 @@ from .base import (
 )
 from .grpo import GRPO
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class DRPOConfig(BaseAlgorithmConfig):
@@ -74,24 +70,12 @@ class DRPOConfig(BaseAlgorithmConfig):
 
     stage_attr: str = "ar"
     conditions_cls: str = ""
-    # Paper §4: "For SPO and DRPO, we set the regularization threshold to 12.5."
     drpo_epsilon: float = 12.5
-    # True = mu-weighted Binary-TV penalty with token-adaptive eps_t = eps/mu
-    # (= verl spo_adaptive_eps); False = plain fixed-eps SPO (= verl spo).
     penalty_mu_weighted: bool = True
     loss_agg_mode: str = "token-mean"
     horizon: int = 8192
     sampling_temperature: Optional[float] = None
-    # "rollout" (default) anchors the ratio on the rollout engine's emitted
-    # logprobs for ALL num_updates_per_batch steps (verl bypass-mode parity);
-    # "replay" freezes a train-side π_old in prepare_segment at pre-update
-    # weights instead (mb1 ratio≈1, isolates policy drift from the engine gap).
     old_logp_source: str = "rollout"
-
-
-# ---------------------------------------------------------------------------
-# Loss helper — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 def _drpo_loss(
@@ -129,19 +113,13 @@ def _drpo_loss(
         ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
     """
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
-    ratio = torch.exp(log_diff)  # r_t = π/μ (differentiable through new_logp)
+    ratio = torch.exp(log_diff)
     adv = advantages.detach()
-    old_prob = torch.exp(old_logp).detach()  # μ = rollout-policy token probability
+    old_prob = torch.exp(old_logp).detach()
 
-    # SPO advantage-weighted quadratic (§2.3 Eq 5). mu_weighted=True applies the
-    # Binary-TV token-adaptive trust region ε_t = ε / μ (§3, = verl
-    # spo_adaptive_eps); False is plain SPO with a fixed ε (= verl `spo`,
-    # reference run_qwen3_4b.sh LOSS_MODE=spo, clip_ratio=12.5).
-    # r_t stays differentiable in both.
     ratio_delta = ratio - 1.0
     if mu_weighted:
         penalty_weight = old_prob
-        # Token-adaptive trust-region boundary r* = 1 ± ε_t (§3) — diagnostics only.
         adaptive_eps = torch.where(old_prob > 0.0, epsilon / old_prob, torch.full_like(old_prob, float("inf")))
     else:
         penalty_weight = torch.ones_like(old_prob)
@@ -151,17 +129,12 @@ def _drpo_loss(
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
-        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),  # k3 estimator
+        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),
         "drpo_penalty_mean": quadratic_penalty.mean().detach(),
         "clipfrac_upper": (ratio > (1.0 + adaptive_eps)).float().mean().detach(),
         "clipfrac_lower": (ratio < (1.0 - adaptive_eps)).float().mean().detach(),
     }
     return pg_losses, metrics
-
-
-# ---------------------------------------------------------------------------
-# Algorithm class — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 class DRPO(StageAlgorithm):
@@ -203,38 +176,19 @@ class DRPO(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         super().__init__()
-        # v2-only: the trainer injects the shared ``pipeline``
-        # (remote_hydra(algorithm_cfg, pipeline=...)) and we resolve the stage
-        # from it. There is no v1 ``stage=`` path — DRPO is v2-only.
         if pipeline is None:
             raise ValueError("DRPO: `pipeline` must be provided (the v2 trainer injects it)")
         self.stage = getattr(pipeline, stage_attr)
         self.drpo_epsilon = float(drpo_epsilon)
-        # True: Binary-TV token-adaptive eps_t = eps/mu (verl spo_adaptive_eps).
-        # False: plain SPO, fixed-eps quadratic (verl `spo`).
         self.penalty_mu_weighted = bool(penalty_mu_weighted)
         self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
-        # replay rescales logits by this temperature so its log-softmax matches
-        # the rollout sampling distribution (log_softmax(logits / T)); MUST equal
-        # sampling.temperature. Mirrors GRPO. Falls back to the ARSamplingParams
-        # default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
         self.conditions_cls = conditions_cls
-        # π_old (the PPO ratio denominator) source. "rollout" = the rollout
-        # engine's emitted segment.log_probs, kept as the anchor for ALL
-        # num_updates_per_batch steps — exact parity with the released verl
-        # SPO-DPPO runs (rollout_correction.bypass_mode=True: old_log_probs :=
-        # rollout logprobs across their 4 mini-batch steps). Trade-off: the
-        # ratio then also absorbs the rollout-vs-train engine gap, not just
-        # policy drift. "replay" = prepare_segment recomputes a frozen
-        # train-side π_old at pre-update weights (mb1 ratio≈1, pure drift).
-        # Both anchors are frozen for the whole rollout batch, so multi-update
-        # is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"DRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -272,9 +226,6 @@ class DRPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision — do NOT downcast to whatever
-        # dtype the engine emitted, so the anchor stays as close as possible to
-        # new_logp's fp32 replay (mirrors FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(
@@ -292,17 +243,9 @@ class DRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens]
-        # old_logp = the frozen π_old anchor (segment.log_probs). old_logp_source
-        # ='rollout' (default) keeps the rollout engine's logp; 'replay' means
-        # prepare_segment already overwrote it with a frozen train-side replay
-        # at pre-update weights. Either way the anchor is frozen, so the ratio
-        # stays anchored across all num_updates_per_batch optimizer steps.
+        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
-        # Expand per-sample advantages to per-token
         adv_per_token = GRPO._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
         )
@@ -315,15 +258,11 @@ class DRPO(StageAlgorithm):
             mu_weighted=self.penalty_mu_weighted,
         )
 
-        # Apply loss_mask if present (token-level masking for padding/eos)
         if segment.loss_mask is not None:
             mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
             loss_per_elem = loss_per_elem * mask
 
         if self.loss_agg_mode == "seq-mean-token-sum-norm" and segment.lengths is not None:
-            # Reference seq-mean-token-sum-norm: per-sequence token-SUM / horizon, then
-            # mean over the micro-batch's sequences. The stack's loss_scale=1/num_micros
-            # then averages across micro-batches, giving the overall mean-over-sequences.
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
         else:

@@ -108,9 +108,6 @@ class HunyuanVideoPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideoVAEDecodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine can
-        # build the FlowMatchSchedulePolicy at startup. Static shift only
-        # (HunyuanVideo-1.0 doesn't use dynamic mu).
         self.shift = shift
 
     @classmethod
@@ -168,10 +165,6 @@ class HunyuanVideoPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            # Pass through the config-side override so the stage uses the
-            # same channel count the driver assumed in ``latent_shape``.
-            # When ``None``, the stage's existing VAE/transformer
-            # inference takes over.
             latent_channels=config.latent_channels,
         )
         vae_decode = HunyuanVideoVAEDecodeStage(bundle)
@@ -236,15 +229,11 @@ class HunyuanVideoPipeline(Pipeline):
         hv_conds = self.build_conditions(texts)
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (on the gen part's segment) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(hv_conds, schedule=schedule, params=params, initial_latents=initial_latents)
         videos = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
         filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=hv_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

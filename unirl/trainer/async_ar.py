@@ -99,7 +99,6 @@ class AsyncARTrainer(ARTrainer):
         eval_batch_size: int = 8,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
-        # ---- async knobs ----
         train_fraction: float = 0.5,
         max_inflight: int = 1,
         buffer_max_staleness: Optional[int] = None,
@@ -110,12 +109,8 @@ class AsyncARTrainer(ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
-        # Call BaseTrainer.__init__ directly: ARTrainer.__init__ opens the
-        # colocate ``placement(fraction=1.0)`` block, which is exactly what we
-        # must NOT run. (ARTrainer itself just calls BaseTrainer.__init__ here.)
         BaseTrainer.__init__(self, cfg=cfg, logging_cfg=logging_cfg)
 
-        # ---- scalar/config fields (mirrors ar.py:62-88) ----
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
@@ -139,35 +134,21 @@ class AsyncARTrainer(ARTrainer):
                 "separate slab; the trainside direct-sampling engine needs the pipeline "
                 "as a local sibling and cannot live cross-slab."
             )
-        # Inherited ``ARTrainer.evaluate`` reads this but only ``ARTrainer.__init__``
-        # sets it, which we skip above. The disaggregated layout is always the SPMD
-        # rollout path — the anchored branch is colocate-only — so None is the
-        # correct value, and it keeps ``evaluate`` on its ``nullcontext``/non-anchored path.
         self._rollout_anchor_device = None
 
-        # ---- async state ----
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
         self._buffer_max_staleness = buffer_max_staleness
-        # DP size of the TRAIN slab — the divisor for balance_shards (the parent
-        # uses self.num_devices because colocate training spans the whole pool;
-        # here training only spans the train slab).
         self._train_devices = int(round(self.num_devices * self._train_fraction))
         if self._train_devices <= 0 or self._train_devices >= self.num_devices:
             raise ValueError(
                 f"train_fraction={train_fraction} yields {self._train_devices} train "
                 f"devices of {self.num_devices}; must leave a non-empty rollout slab."
             )
-        # DP_SCATTER divisibility: per-rollout sample count must split evenly over
-        # BOTH slabs (training over the train slab, generation over the rollout
-        # slab). Fail early with a clear message rather than mid-run in dispatch.
+        # Require rollout batches to divide evenly across train and rollout slabs.
         self._rollout_devices = self.num_devices - self._train_devices
-        # DP_SCATTER divisibility differs per slab in the Sample model:
-        #   * training shards the gen Part (P*N samples) over the train slab;
-        #   * generation shards the REQUEST Sample by its root (P prompts =
-        #     Sample.batch_size; each prompt-tree stays whole) over the rollout slab.
-        prompts = int(self.batch_size)  # P
-        total = prompts * total_samples_per_prompt(self.sampling_params)  # P*N
+        prompts = int(self.batch_size)
+        total = prompts * total_samples_per_prompt(self.sampling_params)
         if total % self._train_devices != 0:
             raise ValueError(
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
@@ -184,9 +165,6 @@ class AsyncARTrainer(ARTrainer):
                 "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
             )
 
-        # ---- two disjoint top-level slabs (diffusion.py:115-129 template) ----
-        # The train scope must FULLY EXIT before the rollout scope opens, else a
-        # nested placement would carve a sub-slab instead of a disjoint slab.
         with placement(self.pool, fraction=self._train_fraction, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
@@ -195,46 +173,17 @@ class AsyncARTrainer(ARTrainer):
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             if sync_cfg is not None:
-                # NCCL handler: rollout is cross-slab and wired via the handshake
-                # below — it takes only ``backend`` (no rollout sibling).
                 self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-        # Rollout slab = the rest (fraction is relative to the WHOLE pool).
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
             self.rollout = remote(**rollout_parsed)
 
         if self.weight_sync is not None:
             self._connect_separate(sync_cfg)
 
-    def evaluate(self, rollout_id: int, *, sync_weights: bool = False) -> float:
-        """Resident-policy eval: the async default flips to ``sync_weights=False``.
-
-        Eval is read-only — weight deployment is governed solely by
-        ``weight_sync_interval`` (pushes go through ``engine.sync_weights``).
-        The scored policy is the one already on the rollout slab, 1..interval
-        optimizer steps old (exactly 1 at ``weight_sync_interval=1``); its
-        ledger version is logged as ``eval/weight_version``.
-        """
-        acc = super().evaluate(rollout_id, sync_weights=sync_weights)
-        engine = getattr(self, "_async_engine", None)
-        if engine is not None:  # absent only for a standalone eval outside train()
-            self.wandb_logger.log_eval(rollout_id + 1, {"weight_version": engine.weight_version})
-        return acc
-
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
-        """Prepare the resident separate-slab engine without colocate handoffs.
-
-        An explicit weight push stays on the ledger and is only possible inside
-        ``train()``, where the async engine exists.
-        """
+        """Sync a resident separate-slab engine without colocate handoffs."""
         if sync_weights and self.weight_sync is not None:
-            engine = getattr(self, "_async_engine", None)
-            if engine is None:
-                raise RuntimeError(
-                    "AsyncARTrainer: weight push outside train() — the async engine owns the "
-                    "version ledger and exists only inside train(); use evaluate(sync_weights=False) "
-                    "for a standalone resident-policy eval."
-                )
-            engine.sync_weights(self.weight_sync)
+            self.weight_sync.sync()
         return False
 
     def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
@@ -270,10 +219,6 @@ class AsyncARTrainer(ARTrainer):
             pp_size=pp_size,
         )
 
-    # ------------------------------------------------------------------
-    # Generic async-runtime hooks
-    # ------------------------------------------------------------------
-
     def _build_async_sample(self, gen_id: int) -> Sample:
         """Consume one data batch and build the request Sample for ``gen_id``."""
         return self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
@@ -299,10 +244,6 @@ class AsyncARTrainer(ARTrainer):
         """
         self._async_engine.quiesce()
 
-    # ------------------------------------------------------------------
-    # Train tail (mirrors ar.py:152-182, minus wake/sleep) — reward parity
-    # ------------------------------------------------------------------
-
     def _advantage_and_train(
         self,
         sample: Sample,
@@ -327,7 +268,7 @@ class AsyncARTrainer(ARTrainer):
         sample = sample.with_parts([*sample.parts[:-1], part])
         train_part = part
         if self.balance_shards:
-            train_part = part.balance_shards(self._train_devices)  # over the TRAIN slab DP size
+            train_part = part.balance_shards(self._train_devices)
         result = self.stack.train_track(train_part, training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(
             rollout_id,
@@ -336,14 +277,8 @@ class AsyncARTrainer(ARTrainer):
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
         )
-        # train_step is bypassed, so BaseTrainer's per-step reset hook never
-        # fires; reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
         return result, mean_reward
-
-    # ------------------------------------------------------------------
-    # Train loop
-    # ------------------------------------------------------------------
 
     def train(
         self,
@@ -356,16 +291,11 @@ class AsyncARTrainer(ARTrainer):
         save_mode: str = "full",
     ) -> None:
         interval = max(1, weight_sync_interval)
-        # Staleness budget: how many weight-syncs a generation may cross before it
-        # is evicted. 0 (default) = on-policy (no generation crosses a sync).
         stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
         M = self._max_inflight
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Single-threaded: exactly one get_samples(batch_size) per launch and
-        # launches are 1:1 with rollout_id, so replaying start_rollout times
-        # restores the exact stream position (deterministic resume).
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
@@ -378,7 +308,6 @@ class AsyncARTrainer(ARTrainer):
             },
         )
 
-        # gen_id is seeded by start_rollout so launches stay 1:1 with rollout_id.
         self._async_engine = AsyncBatchRolloutEngine(
             self.rollout,
             complete=self._score_completed,
@@ -386,16 +315,14 @@ class AsyncARTrainer(ARTrainer):
         )
 
         if resumed and self.weight_sync is not None:
-            self._async_engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine
+            self.weight_sync.sync()
         if self.eval_interval > 0:
-            self.evaluate(rollout_id=-1)  # baseline; resident-policy eval, engine quiescent
+            self.evaluate(rollout_id=-1)
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
                 picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
-                # Reassemble the drained per-prompt group Samples into one batched
-                # Sample [input(P), gen(P*N)] — the inverse of Sample.split.
                 sample = Sample.concat(picked)
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
@@ -405,19 +332,18 @@ class AsyncARTrainer(ARTrainer):
 
                 step = rollout_id + 1
                 if self.eval_interval > 0 and step % self.eval_interval == 0:
-                    self._drain_all()  # eval shares the engine
-                    self.evaluate(rollout_id=rollout_id)  # resident-policy eval; ledger stays exact
+                    self._drain_all()
+                    self.evaluate(rollout_id=rollout_id)
                 if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()  # consistent engine + deterministic resume
+                    self._drain_all()
                     self.maybe_save_checkpoint(
                         rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                     )
                 if step % interval == 0 and self.weight_sync is not None:
-                    self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
-                    self._async_engine.sync_weights(self.weight_sync)
+                    self._drain_all()
+                    self.weight_sync.sync()
+                    self._async_engine.bump_weight_version()
         finally:
-            # Match BaseTrainer._finish_wandb: cleanup failures must not mask
-            # the exception that caused teardown.
             active_exception = sys.exc_info()[0] is not None
             try:
                 self._drain_all()
@@ -452,7 +378,7 @@ class AsyncARTrainer(ARTrainer):
                 engine.submit(self._build_async_sample(engine.next_gen_id))
             engine.poll()
             picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
-            engine.pop_evicted()  # over-stale groups are discarded on the batch path
+            engine.pop_evicted()
             if picked is not None:
                 return picked
             if engine.inflight:

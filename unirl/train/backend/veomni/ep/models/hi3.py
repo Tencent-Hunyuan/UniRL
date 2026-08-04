@@ -37,11 +37,8 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
-# Per-expert weight key: <prefix>.experts.{idx}.{gate_and_up_proj|down_proj}.weight
 _EXPERT_RE = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<idx>\d+)\.(?P<proj>gate_and_up_proj|down_proj)\.weight$")
 
-# FQN globs relative to the module VeOmniBackend wraps (the bare decoder,
-# transformer.model) -> ``layers.*`` (NOT ``model.layers.*``).
 _EP_PLAN = {
     "layers.*.mlp.experts.gate_and_up_proj": 0,
     "layers.*.mlp.experts.down_proj": 0,
@@ -82,7 +79,7 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
                 f"fuse_expert_state_dict: non-contiguous experts for {prefix}.{proj}: "
                 f"got {indices[:8]}{'...' if len(indices) > 8 else ''}"
             )
-        stacked = torch.stack([per_idx[j] for j in indices], dim=0)  # [E, *wshape]
+        stacked = torch.stack([per_idx[j] for j in indices], dim=0)
         if proj == "gate_and_up_proj":
             stacked = _swap_gate_up_halves(stacked).contiguous()
         out[f"{prefix}.{proj}"] = stacked
@@ -141,8 +138,6 @@ class FusedHunyuanMoE(nn.Module):
         shared = self.shared_mlp(hidden_states) if self.shared_mlp is not None else None
         topk_weights, topk_idx = self.gate(hidden_states, topk_impl="easy")
         topk_weights = topk_weights.to(hidden_states.dtype)
-        # The EP-sharded expert params are DTensors (each rank's local experts).
-        # The Triton grouped-GEMM kernel needs raw local tensors, not DTensors.
         gate_up = self.experts.gate_and_up_proj
         down = self.experts.down_proj
         if isinstance(gate_up, DTensor):
@@ -187,7 +182,7 @@ def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
         mlp = getattr(layer, "mlp", None)
         if type(mlp).__name__ != "HunyuanMoE":
             continue
-        w = mlp.experts[0].gate_and_up_proj.weight  # [2I, H]
+        w = mlp.experts[0].gate_and_up_proj.weight
         two_i, hidden = w.shape
         layer.mlp = FusedHunyuanMoE(
             gate=mlp.gate,

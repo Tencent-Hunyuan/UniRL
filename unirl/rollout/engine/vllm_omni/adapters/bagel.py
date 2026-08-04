@@ -162,24 +162,18 @@ class BagelInputAdapter(DitInputAdapter):
         diff_kwargs: Dict[str, Any] = dict(
             height=int(diff_params.height),
             width=int(diff_params.width),
-            # +1: BAGEL builds linspace(1, 0, num_timesteps) and loops T = num_timesteps-1.
             num_inference_steps=T + 1,
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            # Packable: one packed generate_image. Else: one image per request.
             num_outputs_per_prompt=num_outputs_per_prompt,
         )
         seed = getattr(diff_params, "seed", None)
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
 
-        # σ contract self-check: the engine-pinned Part schedule for T steps must
-        # have T+1 points. We don't SEND sigmas (BAGEL ignores them), but assert the
-        # engine resolved the schedule for the same T the worker will loop.
         _ = sigmas_list_from_diffusion(diff_params, T)
 
-        # BAGEL CFG knobs — ALWAYS explicit (upstream defaults them to CFG-ON).
         extra_args: Dict[str, Any] = {
             "cfg_text_scale": float(getattr(diff_params, "cfg_text_scale", 1.0)),
             "cfg_img_scale": float(getattr(diff_params, "cfg_img_scale", 1.0)),
@@ -190,17 +184,8 @@ class BagelInputAdapter(DitInputAdapter):
         sde_indices = getattr(diff_params, "sde_indices", None)
         if sde_indices is not None:
             extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
-        # σ_max for the SDE std_dev_t clamp. The trainside BagelDiffusionStage uses
-        # ``schedule[1]`` (the second σ point) as sigma_max — the value that
-        # replaces σ==1 in ``sqrt(σ/(1-σ))`` on the FIRST step (σ_0 == 1.0, which
-        # would divide by zero). The worker MUST use the SAME value or the first
-        # SDE step's std_dev_t / log-prob diverges and the GRPO ratio drifts off 1
-        # (observed ratio ≈ 0.8 with the hardcoded 0.99 default). The Part schedule is the
-        # engine-pinned T+1-point schedule, identical to the trainside schedule.
         if diff_params.sigmas is not None and int(diff_params.sigmas.shape[0]) > 1:
             extra_args["sigma_max"] = float(diff_params.sigmas[1].item())
-        # Tell the worker scheduler the trajectory storage dtype so its SDE
-        # log-prob round-trip matches the trainside trajectory_precision.
         traj_prec = getattr(diff_params, "trajectory_precision", None)
         if traj_prec is not None:
             extra_args["trajectory_precision"] = str(traj_prec)
@@ -265,7 +250,6 @@ class BagelT2iAdapter(ModelAdapter):
 
     stage_yaml = "bagel_t2i_rl.yaml"
     omni_mode = "text-to-image"
-    # The BAGEL single-stage DiT worker owns its tokenizer; the driver loads none.
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

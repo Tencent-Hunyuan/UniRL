@@ -58,7 +58,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── Module-level counter for unique role_name generation ─────────────────────
 _role_name_counter: Dict[str, int] = {}
 
 
@@ -96,9 +95,6 @@ def reset_role_name_counter() -> None:
 
 
 def _cfg_get(cfg: Any, key: str, default: int) -> int:
-    # parse_hydra_cfg runs OmegaConf.to_container, so nested _target_ blocks
-    # arrive here as PLAIN DICTS, not instantiated configs. Read dict keys and
-    # object attrs alike.
     if isinstance(cfg, dict):
         val = cfg.get(key, default)
     else:
@@ -155,8 +151,6 @@ def _parallel_shape_from_init_kwargs(
             pp = max(pp, _cfg_get(cfg, "pp_size", 1))
             ep = max(ep, _cfg_get(cfg, "ep_size", 1))
 
-    # Inherit from sibling handles. This preserves the existing SP behavior and
-    # lets colocated weight-sync roles adopt their rollout sibling's TP layout.
     for value in init_kwargs.values():
         if isinstance(value, HandleRef):
             sp = max(sp, int(getattr(value, "sp_size", 1) or 1))
@@ -385,9 +379,8 @@ class Handle:
         self.role_name = role_name or _make_role_name(role_cls)
         self.slot_id = slot_id
 
-        # GPU allocation
         if device_ids is not None:
-            self.device_ids = list(device_ids)  # support range, tuple, etc.
+            self.device_ids = list(device_ids)
         elif n_gpus is not None:
             self.device_ids = pool.allocate(n_gpus)
         else:
@@ -396,11 +389,8 @@ class Handle:
         self.world_size = len(self.device_ids)
         self.workers = pool.get_workers(self.device_ids, slot=slot_id)
 
-        # worker_ids for this group (used in _ensure_local)
         self.worker_ids = [f"dw{d}" if slot_id == 0 else f"dw{d}_s{slot_id}" for d in self.device_ids]
 
-        # Reserve a port on rank 0's node for this group's sub-PG.
-        # Held by socket until initialize() releases it.
         self._group_port = ray.get(self.workers[0]._reserve_port.remote())
         self._group_master_addr = ray.get(self.workers[0].get_node_ip.remote())
 
@@ -411,10 +401,6 @@ class Handle:
             "GROUP_NAME": self.role_name,
         }
 
-        # Register role on each Worker with dist_env. Sequence parallelism
-        # (Ulysses) keeps the historical contiguous (dp, sp) layout. SGLang
-        # rollout TP/PP uses a (dp, pp, tp) layout with TP fastest; colocated
-        # weight sync inherits that layout from its rollout HandleRef.
         sp_size, tp_size, pp_size, ep_size = _parallel_shape_from_init_kwargs(init_kwargs, self.world_size, role_cls)
         self.rank_infos = _build_rank_infos(
             self.world_size,
@@ -433,18 +419,9 @@ class Handle:
             self.rank_infos[0].pp_size,
             self.rank_infos[0].ep_size,
         )
-        # Layout hints are consumed by Handle; per-rank rollout layout values
-        # are injected below for constructors that must branch before
-        # Remote.setup() installs rank_info. Only SGLangRolloutEngine accepts
-        # these kwargs — weight sync / reward / algorithm roles do not, so gate
-        # the injection on the role class to avoid TypeError on sibling roles
-        # that share the rollout Handle's layout via HandleRef.
         is_tp_engine = _is_sglang_rollout_role(role_cls)
         tp_visible_device_map: Dict[int, List[str]] = {}
         if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
-            # Query the live Workers rather than deriving CUDA ordinals from
-            # cluster-global DevicePool ids. Ray may use numeric, GPU UUID, or
-            # MIG UUID tokens, and ids repeat across nodes.
             node_ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
             cuda_visible_devices = ray.get([worker.get_cuda_visible_devices.remote() for worker in self.workers])
             tp_visible_device_map = _build_tp_visible_device_map(
@@ -453,9 +430,6 @@ class Handle:
                 cuda_visible_devices=cuda_visible_devices,
             )
         base_init_kwargs = dict(init_kwargs or {})
-        # These layout hints were consumed by _parallel_shape_from_init_kwargs
-        # above; strip them so they don't leak into role_cls.__init__ as
-        # unexpected kwargs (weight sync / reward roles don't accept them).
         for key in ("sp_size", "tp_size", "pp_size", "ep_size"):
             base_init_kwargs.pop(key, None)
 
@@ -491,12 +465,9 @@ class Handle:
             ]
         )
 
-        # Bind @distributed methods as handle functions
         self._method_configs: Dict[str, tuple] = {}
         self._bind_methods(role_cls)
 
-        # Counter for unique call_id generation within enable_grad contexts.
-        # Single-threaded training loop assumption: no concurrent handle calls.
         self._grad_call_counter = count()
 
     @property
@@ -537,24 +508,17 @@ class Handle:
         returns every worker (identical to ``self.workers``)."""
         return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
 
-    # ── User-facing initialize ──
-
     def initialize(self, *args, **kwargs) -> None:
         """Call role.initialize(*args, **kwargs) on all workers.
 
         Releases the reserved port first so init_process_group can bind it,
         then reads back (possibly modified) rank_infos.
         """
-        # Release port so init_process_group can use it
         ray.get(self.workers[0]._release_port.remote(self._group_port))
 
-        # Forward to all workers via generic call
         ray.get([w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers])
 
-        # Read back rank_infos (user may have modified them in initialize)
         self.rank_infos = ray.get([w.get_rank_info.remote(self.role_name) for w in self.workers])
-
-    # ── Method binding ──
 
     def _bind_methods(self, role_cls) -> None:
         """Scan role_cls for @distributed methods and create handle functions.
@@ -607,15 +571,9 @@ class Handle:
         """
 
         def handle_fn(*args, **kwargs):
-            # Optional per-call bound on the result gather. Reserved kwarg, popped
-            # before dispatch so it never reaches the worker method; None (the
-            # default) leaves ray.get unbounded. The exception-teardown flush passes
-            # it so a worker wedged in an NCCL collective can't hang the driver's
-            # ray.get forever (raises ray.exceptions.GetTimeoutError on expiry).
             ray_get_timeout = kwargs.pop("_ray_get_timeout", None)
             ctx = current_grad_context()
 
-            # ── enable_grad: validate backward support, record input TensorMetas ──
             call_id = None
             input_metas = []
             bwd_dispatch_mode = None
@@ -659,8 +617,6 @@ class Handle:
         handle_fn.__doc__ = f"SPMD handle: {method_name} (dispatch={dispatch_fn.__name__})"
         return handle_fn
 
-    # ── Shared call phases ──
-
     def _launch_call(
         self,
         method_name: str,
@@ -679,8 +635,6 @@ class Handle:
         ``handle_fn`` and the non-blocking :meth:`launch_nowait`.
         """
         batch_size = infer_batch_size(args, kwargs)
-        # Only DP_SCATTER/DP_SCATTER_HEAD split the per-sample batch by dp_size, so only
-        # they require divisibility; BROADCAST/SCATTER must not be rejected (main #202).
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
             and batch_size is not None
@@ -689,14 +643,9 @@ class Handle:
             raise ValueError(f"batch_size={batch_size} not divisible by dp_size={self.dp_size}")
 
         shards = dispatch_fn(self, args, kwargs, batch_size)
-        # Locality + cross-worker transfer is the transport's policy: its
-        # localize makes every ref resolvable on its dst worker (GLOBAL =
-        # identity; worker-local = NCCL/IPC routing). It needs controller
-        # topology + per-shard dst identity, passed directly.
         transport_cls = self.pool.transport_cls
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
         shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
-        # grad_mode/call_id passed as dedicated args, not mixed into kwargs
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
         return refs, worker_local
 
@@ -714,15 +663,8 @@ class Handle:
         ``handle_fn`` and :meth:`PendingHandleCall.result`.
         """
         results = ray.get(refs, timeout=ray_get_timeout)
-        # Rebind before collect: results[i] comes from workers[i],
-        # so worker attribution is unambiguous at this point. For worker-local
-        # this registers the decref GC finalizer; GLOBAL lifecycle is
-        # queue-managed, so skip rebind/GC there.
         results = [self._rebind_tree(r, self.workers[i], worker_local=worker_local) for i, r in enumerate(results)]
-        # Collect: merge primary rank results
         return collect_fn(self, results)
-
-    # ── Non-blocking launch ──
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
         """Launch a @distributed method without blocking: the launch phase of
@@ -752,8 +694,6 @@ class Handle:
         )
         return PendingHandleCall(self, method_name, refs, worker_local)
 
-    # ── Execute strategies ──
-
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""
         return [
@@ -766,8 +706,6 @@ class Handle:
         return [
             self.workers[0].call.remote(self.role_name, method_name, shards[0][0], shards[0][1], grad_mode, call_id)
         ]
-
-    # ── TensorHandle rebinding ──
 
     def _rebind_tree(self, obj, worker_handle, *, worker_local: bool = True):
         """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorRef.

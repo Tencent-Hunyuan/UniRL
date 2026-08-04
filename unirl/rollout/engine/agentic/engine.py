@@ -73,10 +73,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
 
     _component_name = "agentic"
 
-    # ------------------------------------------------------------------
-    # Construction (mirrors ComposedRolloutEngine: build the inner engine + env)
-    # ------------------------------------------------------------------
-
     def __init__(
         self,
         config: AgenticRolloutEngineConfig,
@@ -94,14 +90,8 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self.rank = rank
 
         deps = dict(device=device, rank=rank, model_config=model_config)
-        # Each worker builds its OWN local inner engine + environment.
         self._env = config.env  # an Environment (built per worker via its _target_); must be re-entrant
         require(self._env is not None, "AgenticRolloutEngine requires an env (config.env)")
-        # Single source of truth for tool schemas (LIN-519): advertise the env's
-        # tools to the model through the inner engine's chat template, so a recipe
-        # never restates the schema JSON (which could silently drift from the env's
-        # actual tools). Mutates the inner CONFIG before it is built; an explicit
-        # ``inner.chat_template_kwargs.tools`` in the recipe still wins.
         self._maybe_inject_tool_schemas(config.inner, self._env)
         inner = config.inner.make_engine(strategy=strategy, **deps)
         if not isinstance(inner, SyncRolloutEngine):
@@ -120,42 +110,26 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._n = total_samples_per_prompt(self._sp)  # GRPO group size
         self._max_turns = int(config.max_turns)
         self._partial_rollout = bool(getattr(config, "partial_rollout", False))
-        # Guard: the env's own turn bound (set independently in the recipe under
-        # ``env.max_turns``) must agree with the engine's ``config.max_turns``, else
-        # the drain loop and the env disagree on when a trajectory is done.
         _env_mt = getattr(self._env, "max_turns", None)
         require(
             _env_mt is None or int(_env_mt) == self._max_turns,
             f"env.max_turns ({_env_mt}) must equal config.max_turns ({self._max_turns}); "
             "they are set independently in the recipe and must agree.",
         )
-        # Per-worker trajectory cap = the drain pool size (distinct from the inner
-        # backend's per-request semaphore — two independent bounds). A trajectory
-        # holds its thread across its whole life, incl. tool-wait between turns —
-        # so siblings keep the GPU busy while one waits on a slow tool.
         self._concurrency = int(config.per_worker_concurrency)
 
-        # Task-internal control flow is the harness's (worker-side plugin);
-        # this runtime keeps queueing/concurrency/buffers/abort. Step 1 of the
-        # harness migration constructs the one existing harness here from the
-        # same config fields; config-selected harnesses come later.
         self._harness: RolloutHarness = ToolAgentHarness(env=self._env, sampling=self._sp, max_turns=self._max_turns)
         self._harness_ctx = HarnessContext(
             engines={"policy": self._inner.generate},
             suspend=lambda: self._stopping,
         )
 
-        # Coordinator state (populated on rank 0 only, by set_workers).
         self._workers: List[Any] = []
         self._role: str = ""
         self._queue: Deque[Sample] = deque()
         self._qlock = threading.Lock()
-        self._drain_refs: List[Any] = []  # rank-0: outstanding run_drain ObjectRefs (joined by abort/generate)
+        self._drain_refs: List[Any] = []  # Rank-0 outstanding drain calls.
 
-        # Worker-side partial-rollout buffers (LIN-531). The drain's done-callback
-        # routes each finished trajectory into ``_completed`` (terminal) or
-        # ``_checkpointed`` (turn-boundary-interrupted); ``_buf_lock`` guards them
-        # because the loop thread appends while a control-RPC thread reads.
         self._completed: List[Sample] = []
         self._checkpointed: List[Sample] = []
         self._buf_lock = threading.Lock()
@@ -173,10 +147,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         ctk = dict(inner_cfg.chat_template_kwargs or {})
         ctk.setdefault("tools", get_schemas())
         inner_cfg.chat_template_kwargs = ctk
-
-    # ------------------------------------------------------------------
-    # Coordinator (rank 0) — the NCCLWeightSync pattern
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_workers(self, actor_handles: List[Any], role_name: str) -> None:
@@ -209,7 +179,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     def _fire_drain(self) -> None:
         """Fire one ``run_drain`` per worker **non-blocking**; keep the refs so
         ``abort``/``generate`` can join them once the drives quiesce/finish."""
-        coordinator = self._workers[0]  # rank 0's own Worker actor handle (workers pull from it)
+        coordinator = self._workers[0]
         self._drain_refs = [
             w.call.remote(self._role, "run_drain", (coordinator, self._role), {}) for w in self._workers
         ]
@@ -269,8 +239,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         try:
             ray.get(refs)  # join and surface a failed worker drain before polling its buffers
         finally:
-            # All refs are ready, so this drive is terminal even when one worker
-            # reports a failure. Do not make later callers re-observe stale refs.
             self._drain_refs = []
         return self._fan("drain_completed")
 
@@ -295,11 +263,11 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             return []
         ray.get([w.call.remote(self._role, "set_stopping", (), {}) for w in self._workers])
         if self._drain_refs:
-            ray.get(self._drain_refs)  # wait for every drive to quiesce (in-flight checkpointed)
+            ray.get(self._drain_refs)
             self._drain_refs = []
         carried = self._fan("collect_carried")
         with self._qlock:
-            carried.extend(self._queue)  # not-yet-started tasks carry too
+            carried.extend(self._queue)
             self._queue = deque()
         return carried
 
@@ -316,7 +284,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._reset_all()
         self._enqueue_tasks(self._split_request(sample))
         self._fire_drain()
-        ray.get(self._drain_refs)  # drives finish naturally (queue drained, no abort)
+        ray.get(self._drain_refs)
         self._drain_refs = []
         return self._fan("drain_completed")
 
@@ -330,10 +298,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         del worker_rank
         with self._qlock:
             return self._queue.popleft() if self._queue else None
-
-    # ------------------------------------------------------------------
-    # Per-worker execution — the drain thread pool
-    # ------------------------------------------------------------------
 
     def run_drain(self, coordinator: Any, role_name: str) -> None:
         """Drive this worker's drain for the whole drive (background).
@@ -388,9 +352,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         """
         try:
             outcome = self._harness.run(task, self._harness_ctx)
-            # Exhaustive over the outcome contract: a plugin returning an unknown
-            # status (or a malformed outcome object) must not slip into training
-            # as "completed" — it falls through to the except and is NaN-marked.
             if outcome.status == "completed":
                 return self._attach_env_reward(outcome.sample, outcome.env_reward), True
             if outcome.status == "suspended":
@@ -426,13 +387,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         ref = coordinator.call.remote(role_name, "next_task", (self.rank or 0,), {})
         return ray.get(ref)
 
-    # ------------------------------------------------------------------
-    # Per-worker partial-rollout control methods (un-decorated, raw Worker.call).
-    # They ride the threaded Worker (worker_max_concurrency>1) alongside the
-    # running drain: the drain threads append to the buffers; these read/clear
-    # them on a control thread — hence _buf_lock.
-    # ------------------------------------------------------------------
-
     def drain_completed(self) -> List[Sample]:
         """Return + clear the trajectories completed since the last call (for ``poll``)."""
         with self._buf_lock:
@@ -455,10 +409,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         with self._buf_lock:
             self._completed = []
             self._checkpointed = []
-
-    # ------------------------------------------------------------------
-    # Lifecycle — delegated to the inner engine
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
@@ -491,11 +441,6 @@ class AgenticRolloutEngine(BaseRolloutEngine):
 
     def resume(self) -> None:
         self._inner.resume()
-
-    # ------------------------------------------------------------------
-    # Weight sync — delegated to the inner engine (single inner, no prefix routing).
-    # Reached via raw Worker.call by the weight-sync driver (e.g. NCCLWeightSync).
-    # ------------------------------------------------------------------
 
     def init_weights_update_group(self, **kwargs: Any) -> None:
         self._inner.init_weights_update_group(**kwargs)

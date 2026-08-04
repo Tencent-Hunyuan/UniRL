@@ -80,7 +80,6 @@ class BagelARStep(ARStep):
             raise ValueError(f"BagelARStep.step: expected logits shape [B, vocab], got {tuple(logits.shape)}")
 
         if self.temperature <= 0.0:
-            # Greedy: argmax under the full (untempered) softmax.
             log_probs_full = F.log_softmax(logits.float(), dim=-1)
             token_id = log_probs_full.argmax(dim=-1)
             log_prob = log_probs_full.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
@@ -88,9 +87,6 @@ class BagelARStep(ARStep):
 
         scaled = logits.float() / self.temperature
 
-        # Behavior log-prob under the temperature-scaled distribution, BEFORE
-        # top-k/top-p truncation, so old_logp == replay new_logp at the same
-        # weights (rl_ops.score_response computes log_softmax(logits / T)).
         log_probs_full = F.log_softmax(scaled, dim=-1)
 
         if self.top_k > 0 and self.top_k < scaled.shape[-1]:
@@ -132,23 +128,11 @@ class BagelARStage(ARStage[BagelARConditions]):
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="BagelARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="BagelARStage.logprob_precision")
-        # Replay scorer for the GRPO ratio's new_logp:
-        #   "train"     — one grad forward_train per sample (nested mask: image full +
-        #                 text causal); the und path INCLUDING the image is trained.
-        #                 Exact attention, but a different kernel than the rollout's
-        #                 forward_inference, so the on-policy ratio is ~1±1e-2.
-        #   "inference" — image prefilled no_grad (frozen) + one grad forward_inference
-        #                 over [prompt+response]; same kernel as rollout (ratio ~1),
-        #                 FSDP-safe, but the image understanding is not trained.
         self.replay_mode = str(replay_mode).strip().lower()
         require(
             self.replay_mode in ("train", "inference"),
             f"BagelARStage: replay_mode must be 'train' or 'inference'; got {replay_mode!r}.",
         )
-        # A checkpoint trained with freeze_und detaches the und hidden states in
-        # forward_train — a signal the und path was never meant to train. The
-        # inference-path replay is unaffected mechanically, but fail loudly.
-        # (Chain guarded so fake bundles without the full config tree construct.)
         llm_cfg = getattr(getattr(getattr(model, "model", None), "config", None), "llm_config", None)
         require(
             not getattr(llm_cfg, "freeze_und", False),
@@ -159,10 +143,6 @@ class BagelARStage(ARStage[BagelARConditions]):
         """The MoT transformer (``bundle.transformer``) — same root the diffusion
         stage exposes, so LoRA/FSDP injection is visible to both stages."""
         return self.model.transformer
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
@@ -196,12 +176,8 @@ class BagelARStage(ARStage[BagelARConditions]):
             ids.extend(int(t) for t in params.stop_token_ids)
         if sampling_params.stop_token_id is not None:
             ids.append(int(sampling_params.stop_token_id))
-        ids.append(int(self.model.new_token_ids["eos_token_id"]))  # <|im_end|>, as in the vendored gen_text
+        ids.append(int(self.model.new_token_ids["eos_token_id"]))
         return list(dict.fromkeys(ids))
-
-    # ------------------------------------------------------------------
-    # Rollout
-    # ------------------------------------------------------------------
 
     def autoregress(
         self,
@@ -246,10 +222,6 @@ class BagelARStage(ARStage[BagelARConditions]):
             tokens=[torch.tensor(t, dtype=torch.long, device=device) for t in generated],
             log_probs=[torch.tensor(lp, dtype=torch.float32, device=device) for lp in logps],
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _split_image_and_prompt_ids(splits: List[Dict[str, Any]]) -> Tuple[Optional[Any], List[int]]:
@@ -344,7 +316,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         bagel = self.model.model
         new_token_ids = self.model.new_token_ids
         temp = float(temperature) if float(temperature) > 0.0 else 1.0
-        bagel.language_model.train()  # navit forward_train dispatch; persists through backward
+        bagel.language_model.train()
         parts: List[torch.Tensor] = []
         with self._autocast_ctx(device):
             for i, splits in enumerate(conditions.prompt_splits):
@@ -364,7 +336,7 @@ class BagelARStage(ARStage[BagelARConditions]):
                     response_input=response_input,
                     device=device,
                 )
-                logits = rl_ops.und_replay_logits(bagel, packed)  # [n, V]
+                logits = rl_ops.und_replay_logits(bagel, packed)
                 logp_full = torch.log_softmax(logits.float() / temp, dim=-1)
                 parts.append(logp_full.gather(-1, response.unsqueeze(-1)).squeeze(-1))
         return parts
@@ -384,7 +356,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         ``forward_inference`` over ``[prompt+response]``. Kernel-matched to rollout
         (ratio ~1), FSDP-safe (single grad forward), image not trained."""
         bagel = self.model.model
-        bagel.language_model.eval()  # navit forward_inference dispatch
+        bagel.language_model.eval()
         rl_ops.require_inference_dispatch(bagel)
         parts: List[torch.Tensor] = []
         with self._autocast_ctx(device):

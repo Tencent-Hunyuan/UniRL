@@ -85,9 +85,6 @@ def write_adapter_config(
         config.base_model_name_or_path = str(base)
         config.save_pretrained(output)
     except Exception:
-        # Keep export usable in minimal/offline tool environments where PEFT is
-        # unavailable or its config API changes; the written fields are the PEFT
-        # LoRA essentials needed by common loaders.
         import json
 
         with open(os.path.join(output, "adapter_config.json"), "w") as f:

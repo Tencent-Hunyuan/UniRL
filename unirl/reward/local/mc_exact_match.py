@@ -28,13 +28,11 @@ def _normalize_answer(answer: str) -> str:
                  "1"/"2"/"3"/"4" → "A"/"B"/"C"/"D"
     """
     a = answer.strip().upper()
-    # Numeric → letter
     if len(a) == 1 and a in "1234":
         return chr(ord("A") + ord(a) - ord("1"))
-    # Already a letter
     if len(a) == 1 and a in "ABCD":
         return a
-    return a  # fallback
+    return a
 
 
 def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
@@ -45,7 +43,6 @@ def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
     phrase_matches = _ANSWER_PATTERN.findall(text)
     if require_phrase:
         return phrase_matches[-1].upper() if phrase_matches else ""
-    # Handle numeric answers: "1"→"A", "2"→"B", "3"→"C", "4"→"D"
     if len(text) == 1 and text in "1234":
         return chr(ord("A") + ord(text) - ord("1"))
     if len(text) == 1 and text.upper() in "ABCD":
@@ -62,7 +59,6 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
     """Return the extracted letter and its format-quality weight."""
     text = text.strip()
 
-    # Prefer the last prompt-mandated answer tag.
     tag_matches = _ANSWER_TAG.findall(text)
     if tag_matches:
         return tag_matches[-1].upper(), 1.0

@@ -13,7 +13,6 @@ Importing this package populates the adapter registry (the ``adapters`` import
 fires the ``@register_adapter`` side-effects).
 """
 
-# Import adapters first so the registry is populated before config validation.
 from unirl.rollout.engine.sglang_diffusion import adapters  # noqa: F401
 from unirl.rollout.engine.sglang_diffusion.config import (
     SGLangDiffusionEngineConfig,

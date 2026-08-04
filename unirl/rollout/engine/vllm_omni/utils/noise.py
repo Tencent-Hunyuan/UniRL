@@ -46,8 +46,6 @@ def pack_initial_noise_extra_args(
                 f"{caller}: initial_latents.shape[0]={int(initial_latents.shape[0])} "
                 f"!= diffusion sample count {n_samples} after sharding."
             )
-        # Tensor stays on whatever device the caller left it (typically CPU);
-        # the worker pipeline does the device move inside ``prepare_latents``.
         extra_args["initial_noise_batch"] = initial_latents
     elif diff_params.init_noise_latent_shape:
         share = bool(getattr(diff_params, "init_same_noise", False))

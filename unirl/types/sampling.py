@@ -103,8 +103,6 @@ class DiffusionSamplingParams(BaseSamplingParams):
     Flows unchanged from YAML config → rollout pipeline → model pipeline.
     """
 
-    # --- common (all diffusion models) ---
-    # samples_per_prompt is inherited from BaseSamplingParams.
     num_inference_steps: int = 50
     guidance_scale: float = 7.5
     height: int = 256
@@ -113,34 +111,22 @@ class DiffusionSamplingParams(BaseSamplingParams):
     seed: Optional[int] = 42
     init_same_noise: bool = False
     noise_group_ids: Optional[List[str]] = None
-    # x_T noise recipe: the per-sample latent shape each engine regenerates a
-    # byte-identical initial noise into (pairs with init_same_noise + seed).
     init_noise_latent_shape: Optional[List[int]] = None
-    # Driver-x_T opt-out (debug escape hatch). When True the trainer is NOT
-    # authoring x_T: the engine adapter skips the init_noise_group_ids recipe and
-    # each engine falls back to its own RNG. Per-request so the unified DiT path
-    # honors it just like DiffusionTrainer's DISABLE_DRIVER_XT env.
+    # Debug opt-out: let each rollout engine generate its own initial noise.
     disable_driver_xt: bool = False
-    # Resolved σ schedule for this rollout, pinned by the rollout-engine adapter
-    # before generation (single source of truth). The engine echoes it back on
-    # ``LatentSegment.sigmas`` and ``sigma_verify`` asserts the two match.
     sigmas: Optional[torch.Tensor] = None
 
-    # --- SDE ---
     eta: float = 1.0
-    sde_strategy: Any = None  # StepStrategy
-    scheduler: Any = None  # TimestepScheduler
+    sde_strategy: Any = None
+    scheduler: Any = None
     sde_indices: Optional[List[int]] = None
 
-    # --- engine knobs ---
     sampler_kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    # --- precision ---
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # --- model-specific (optional, unused fields ignored) ---
     max_sequence_length: Optional[int] = None
     taylor_cache_interval: Optional[int] = None
     taylor_cache_order: Optional[int] = None
@@ -148,7 +134,6 @@ class DiffusionSamplingParams(BaseSamplingParams):
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
 
-    # --- backward compat (removed once all consumers migrate) ---
     num_samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:
@@ -189,11 +174,8 @@ class DiffusionSamplingParams(BaseSamplingParams):
 class ARSamplingParams(BaseSamplingParams):
     """AR (autoregressive) sampling parameters for LLM-based PE generation."""
 
-    # samples_per_prompt is inherited from BaseSamplingParams.
     temperature: float = 0.7
     max_new_tokens: int = 512
     top_p: float = 0.9
-    # Canonical AR convention: 0 disables top-k filtering; adapters map it to
-    # each engine's sentinel (for example, SGLang -1).
     top_k: int = 0
     stop_token_id: int | None = None

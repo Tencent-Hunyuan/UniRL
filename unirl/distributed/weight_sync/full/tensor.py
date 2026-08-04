@@ -53,7 +53,7 @@ class TensorWeightSync(FullWeightSync):
             track_prefix=track_prefix,
             wire_dtype=wire_dtype,
         )
-        self._rollout = rollout  # local engine sibling (single-model, or a ComposedRolloutEngine)
+        self._rollout = rollout
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -76,14 +76,6 @@ class TensorWeightSync(FullWeightSync):
         tp_size = int(ri.tp_size) if ri is not None else 1
         is_tp_zero = ri is None or ri.tp_rank == 0
 
-        # Use SGLang's own reductions when the rollout engine is SGLang-based
-        # so pickles reference ``sglang.srt.utils.patch_torch._rebuild_cuda_tensor_modified``
-        # — the server-side ``SafeUnpickler`` allows ``sglang.srt.utils.`` but NOT
-        # ``unirl.``, so the vendored copy in ``sgl_compat`` only works for
-        # vLLM-Omni (where the receiver is a vLLM worker, not SGLang's
-        # SafeUnpickler). When both sglang and vllm are installed, detect the
-        # engine kind from the rollout sibling so vLLM-Omni doesn't accidentally
-        # use SGLang's reductions.
         rollout_mod = type(self._rollout).__module__
         use_sglang = "sglang" in rollout_mod and "vllm" not in rollout_mod
         if use_sglang:
@@ -109,14 +101,8 @@ class TensorWeightSync(FullWeightSync):
         dist_ready = self._dist_ready()
 
         for bucket, is_last in self._iter_buckets():
-            # Group by dtype, one FlattenedTensorBucket per dtype (matches the
-            # receiver's flattened_bucket load_format). Non-tp-zero SGLang TP
-            # ranks must also serialize their LOCAL CUDA IPC handles; tp_rank=0
-            # forwards those small serialized handles to the hosted SRT server.
             by_dtype: dict = {}
             for name, tensor in bucket:
-                # Tensors arrive already at the wire dtype: ``wire_dtype`` (sync
-                # config) is applied once in the base-class walk, shard-side.
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
             del name, tensor
 
@@ -124,10 +110,6 @@ class TensorWeightSync(FullWeightSync):
             sglang_tp_fanout = use_sglang and fanout > 1
             participates_in_sglang_tp = sglang_tp_fanout and dist_ready
 
-            # Non-tp-zero ranks still drive the generator (lockstep all-gather).
-            # For SGLang TP they additionally serialize a local-device payload
-            # and participate in the handle gather; otherwise their rollout is a
-            # no-op shell and there is nothing to push.
             if not is_tp_zero and not participates_in_sglang_tp:
                 del by_dtype, bucket
                 if torch.cuda.is_available():
@@ -183,24 +165,15 @@ class TensorWeightSync(FullWeightSync):
                     except BaseException as exc:  # keep peer ranks from hanging
                         update_error = f"{type(exc).__name__}: {exc}"
 
-                # SGLang TP payloads exported by non-tp-zero ranks must stay
-                # alive until tp_rank=0's blocking HTTP/native update returns.
-                # This status gather is both a barrier and error propagation.
                 if participates_in_sglang_tp:
                     self._raise_if_sglang_tp_update_failed(update_error, rank_info=ri)
                 elif update_error is not None:
                     raise RuntimeError(f"TensorWeightSync: rollout update failed: {update_error}")
                 del payload_keepalive
 
-            # Release the all-gathered full tensors + IPC payloads for this bucket
-            # before gathering the next — else the full model (~13GB) accumulates
-            # in the caching allocator and OOMs the colocated server.
+            # Release each gathered bucket before loading the next to avoid OOMs.
             del groups, by_dtype, bucket
             if torch.cuda.is_available():
-                # CUDA IPC exports enter the allocator's limbo after the
-                # receiver closes them. empty_cache() alone cannot reclaim
-                # those segments; ipc_collect() completes the refcount
-                # handshake on the rank that created the exports.
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
         self.weight_version += 1

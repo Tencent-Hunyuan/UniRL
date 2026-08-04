@@ -99,13 +99,11 @@ class ReflActorRole(Remote):
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
-        # Default PG over the actor role's workers (env:// from Remote.setup's
-        # dist_env); FSDP2 fully_shard wraps over it. Phase-0-validated order.
         if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
         try:
-            self._model_config.device = self.device  # runtime device injection
+            self._model_config.device = self.device
         except Exception:
             pass
 
@@ -125,9 +123,6 @@ class ReflActorRole(Remote):
                 f"use a experimental.refl.models pipeline."
             )
 
-        # FSDP-wrap pipeline.bundle.transformer in place + LoRA + optimizer.
-        # The pipeline's stages reference the same bundle, so sampling runs
-        # through the wrapped trainable transformer.
         self.backend = FSDPBackend(
             bundle=self.pipeline.bundle,
             block_class_names=self._block_class_names,
@@ -145,10 +140,6 @@ class ReflActorRole(Remote):
             self.reward_weight,
             self.kl_weight,
         )
-
-    # ------------------------------------------------------------------
-    # Grad chain (run under the driver's enable_grad() context)
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate_samples(
@@ -168,9 +159,6 @@ class ReflActorRole(Remote):
         self.backend.model.train()
         self.backend.zero_grad()
 
-        # Single KL knob: the actor owns kl_weight (loss-side), the sampling
-        # config owns only sampling-shape knobs (mid/final window). A stale
-        # sampler_kwargs.kl_weight is an error, not a silent override.
         sampler_kwargs = dict(params.sampler_kwargs or {})
         if "kl_weight" in sampler_kwargs:
             raise ValueError(
@@ -179,10 +167,6 @@ class ReflActorRole(Remote):
             )
         sampler_kwargs["kl_weight"] = self.kl_weight
 
-        # Fixed init noise across rollouts and ranks — the contributor's
-        # verified DRaFT regime (params.seed used verbatim by the stage).
-        # Varying noise per rollout is a training-semantics change; do not
-        # introduce it here without its own evidence.
         params = dataclasses.replace(params, sampler_kwargs=sampler_kwargs)
 
         conditions = self.pipeline.build_refl_conditions(texts, images=images, params=params)
@@ -222,10 +206,6 @@ class ReflActorRole(Remote):
             kl_loss=[float(kl_term.detach().item())],
             reward_mean=[float(reward.detach().float().mean().item())],
         )
-
-    # ------------------------------------------------------------------
-    # Optimizer / checkpoint (delegate to the composed FSDPBackend)
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.ALL)
     def step(self, *, max_grad_norm: float) -> Dict[str, float]:

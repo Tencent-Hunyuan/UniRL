@@ -53,8 +53,6 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import WAN21Bundle
 from .conditions import WAN21Conditions
 
-# WAN training-time timestep scale: sigma ∈ [0, 1] → timestep ∈ [0, 1000].
-# Matches ``WAN21ModelBundle.TIMESTEP_SCALE`` in ``models/wan21.py``.
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
 
@@ -97,14 +95,9 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         elif int(timestep.shape[0]) != batch_size:
             timestep = timestep.expand(batch_size)
 
-        # WAN's transformer wants encoder_hidden_states in its own dtype;
-        # latents are cast to match for the forward.
         embeds_dtype = prompt_embeds.dtype
         sample_cast = sample.to(dtype=embeds_dtype)
 
-        # I2V channel concat: when an image-condition latent is present,
-        # prepend it on the channel axis (16 noise + 20 mask+image →
-        # 36 transformer ``in_channels``). Identical across cond/uncond.
         image_latent = conditions.image_latent
         if image_latent is not None and image_latent.latents is not None:
             sample_cat = torch.cat(
@@ -114,11 +107,6 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         else:
             sample_cat = sample_cast
 
-        # I2V CLIP-vision: when patch embeddings are present, forward
-        # them as ``encoder_hidden_states_image``. Only emitted when the
-        # WAN 2.1 transformer declares ``image_dim > 0`` (T2V never sets
-        # this slot, so the kwarg is conditional to avoid leaking an
-        # unknown kwarg to a T2V transformer signature).
         image_embed = conditions.image_embed
         image_embeds = image_embed.embeds if image_embed is not None and image_embed.embeds is not None else None
         extra: Dict[str, Any] = {}
@@ -155,8 +143,6 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             return_dict=False,
             **extra,
         )[0]
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -281,12 +267,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
 
-    # WAN VAE spatial/temporal downsampling factors. These are fixed for
-    # the AutoencoderKLWan architecture (8× spatial, 4× temporal) and not
-    # configurable per-request, so they live on the stage.
     _SPATIAL_DOWNSAMPLE: ClassVar[int] = 8
     _TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
-    # Latent channel count fallback when ``vae.config.z_dim`` is absent.
     _DEFAULT_LATENT_CHANNELS: ClassVar[int] = 16
 
     def __init__(
@@ -309,10 +291,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
         self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
 
-    # ------------------------------------------------------------------
-    # Shape helpers
-    # ------------------------------------------------------------------
-
     def _latent_shape(self, *, num_frames: int, height: int, width: int) -> Tuple[int, int, int, int]:
         """Return ``(C, T_lat, H_lat, W_lat)``.
 
@@ -331,10 +309,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         latent_h = int(height) // self.vae_scale_factor
         latent_w = int(width) // self.vae_scale_factor
         return (self.latent_channels, latent_t, latent_h, latent_w)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def diffuse(
         self,
@@ -395,11 +369,9 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
                 base_seed=int(params.seed),
             )
 
-        # SDE indices: which steps record log probs.
         sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
         sde_sorted: List[int] = sorted(sde_set)
 
-        # Stored positions: SDE pairs ∪ {T} so VAE decode always has the clean latent.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
 
@@ -441,23 +413,14 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
             if log_prob is not None:
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # Pack into LatentSegment. WAN latents are 5D
-        # [B, C, T_lat, H_lat, W_lat] so stacked is [B, K, C, T_lat, H_lat, W_lat].
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
-        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None  # [B, S]
+        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp ``modality=VIDEO`` via the factory helper. Plain
-        # ``LatentSegment(...)`` would leave the ClassVar default
-        # ``Modality.IMAGE`` in place, which is wrong for WAN T2V — any
-        # downstream generic segment routing that branches on
-        # ``segment.modality`` would mistake video latents for image
-        # latents and (e.g.) try the image-only ``as_condition`` /
-        # decode paths.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,
@@ -465,10 +428,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -552,10 +511,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
-
     def predict_noise_at_step(
         self,
         conditions: WAN21Conditions,
@@ -575,10 +530,6 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
             conditions,
             guidance_scale=float(params.guidance_scale),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the module the diffusion forward operates on.

@@ -54,12 +54,7 @@ class MediaPreview(Batch):
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
-    # Per-sample audio waveforms (mono [L] float32 CPU tensors) for muxing into
-    # the mp4 upload. Parallel to ``videos`` — same length. ``None``/empty for
-    # non-audio tracks.
     audios: List[Any] = concat_field(default_factory=list)
-    # Source sample rate of the waveforms in ``audios``. Batch-shared (one rate
-    # per preview). None when audios is empty.
     audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
@@ -171,11 +166,6 @@ def build_media_preview_for_part(
         return None
     limit = max(1, int(max_items))
 
-    # ``decoded`` reaches the driver dehydrated (its tensor leaf is a
-    # ``TensorRef`` proxy partitioned by DP shard). Slice to the smallest
-    # ref-boundary prefix covering ``limit`` samples, then hydrate only that
-    # shard so we pull one shard instead of the full decoded batch. Both steps
-    # are no-ops when the leaf is already a real tensor (e.g. unit tests).
     from unirl.distributed.tensor import hydrate, map_tree
 
     prefix = _ref_aligned_prefix_len(decoded, limit)
@@ -198,13 +188,8 @@ def build_media_preview_for_part(
         pixels = decoded.pixels
         if pixels is None:
             return None
-        # it2i carries the per-sample source image (the chained image input Part);
-        # pair it beside the output when it covers the (possibly shard-prefixed) batch.
         input_pixels = None
         if isinstance(input_image, Images) and input_image.pixels is not None:
-            # The source image reaches the driver through the same dehydrated
-            # transport path as decoded output. Hydrate it before shape checks
-            # and indexing; a TensorRef is metadata, not a tensor.
             input_image = map_tree(input_image, hydrate)
             input_pixels = input_image.pixels
         show_edit_pairs = input_pixels is not None and int(input_pixels.shape[0]) >= int(pixels.shape[0])
@@ -232,7 +217,6 @@ def build_media_preview_for_part(
     if not selected_indices:
         return None
 
-    # T2AV: extract per-sample audio waveforms for muxing into the mp4 upload.
     audios_out: List[Any] = []
     audio_sr: Optional[int] = None
     decoded_audio = part.primitives.get("audio")
@@ -247,7 +231,6 @@ def build_media_preview_for_part(
             else:
                 audios_out.append(None)
         audio_sr = part.primitive_metadata.get("audio", {}).get("sample_rate")
-        # Drop audio if none of the selected samples have it
         if all(a is None for a in audios_out):
             audios_out = []
             audio_sr = None

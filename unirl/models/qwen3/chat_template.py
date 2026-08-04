@@ -45,9 +45,6 @@ class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # MUST agree with the rollout engine's chat template
-        # (rollout.config.chat_template_kwargs.enable_thinking) or train/rollout
-        # prompts diverge and the importance ratio breaks.
         self.enable_thinking = bool(enable_thinking)
 
     def embed(self, value: Qwen3ChatInput) -> Qwen3ARConditions:
@@ -99,17 +96,11 @@ class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
                 return_dict=False,
                 truncation=False,
             )
-            # transformers v5 flipped apply_chat_template's `return_dict` default
-            # from False to True: it now returns a BatchEncoding, and integer-
-            # indexing a fast-tokenizer BatchEncoding yields a tokenizers.Encoding
-            # (no `.to`), not a tensor. Pin return_dict=False so we keep the bare
-            # input_ids [1, L] tensor identically across v4/v5; squeeze leading dim.
             ids = ids[0]
             if ids.shape[0] > self.max_prompt_length:
                 ids = ids[-self.max_prompt_length :]
             per_sample_ids.append(ids.to(device=device, dtype=torch.long))
 
-        # Right-pad to the in-batch max so the AR loop can use a single tensor.
         max_len = max(int(t.shape[0]) for t in per_sample_ids)
         pad_id = tokenizer.pad_token_id
         if pad_id is None:

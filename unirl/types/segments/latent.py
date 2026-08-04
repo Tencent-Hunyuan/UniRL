@@ -59,8 +59,6 @@ class LatentSegment(Segment):
     modality: Modality = shared_field(default=Modality.IMAGE)
 
     latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Start-of-denoising latent (x_T or encoded init image), per-sample, set on the
-    # gen-shell before generation (img2img / driver-materialized x_T). CONCAT.
     initial_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     sigmas: Optional[torch.Tensor] = shared_field(default=None)
     indices: Optional[torch.Tensor] = shared_field(default=None)
@@ -69,12 +67,6 @@ class LatentSegment(Segment):
     sde_indices: Optional[torch.Tensor] = shared_field(default=None)
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Optional auxiliary per-step latent trajectory stored at the SAME sparse
-    # ``indices`` as ``latents`` (shape ``[B, K, ...]``). First consumer: LTX-2,
-    # which co-denoises an AUDIO latent stream alongside the video one — the
-    # video transformer forward depends on the current audio state (audio→video
-    # cross-attention), so replay must reproduce the audio at each step. Default
-    # ``None`` → every other model is unaffected.
     aux_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 
     def as_condition(self) -> Optional[Condition]:

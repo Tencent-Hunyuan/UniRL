@@ -46,10 +46,6 @@ def _as_tensor(x):
     raise TypeError(f"Cannot extract tensor from visual output of type {type(x).__name__}")
 
 
-# ============================================================================
-# VideoAlign prompt templates (from DanceGRPO prompt_template.py)
-# ============================================================================
-
 _DETAILED_PROMPT_WITH_SPECIAL_TOKEN = "\nYou are tasked with evaluating a generated video based on three distinct criteria: Visual Quality, Motion Quality, and Text Alignment. Please provide a rating from 0 to 10 for each of the three categories, with 0 being the worst and 10 being the best. Each evaluation should be independent of the others.\n\n**Visual Quality:**  \nEvaluate the overall visual quality of the video, with a focus on static factors. The following sub-dimensions should be considered:\n- **Reasonableness:** The video should not contain any significant biological or logical errors, such as abnormal body structures or nonsensical environmental setups.\n- **Clarity:** Evaluate the sharpness and visibility of the video. The image should be clear and easy to interpret, with no blurring or indistinct areas.\n- **Detail Richness:** Consider the level of detail in textures, materials, lighting, and other visual elements (e.g., hair, clothing, shadows).\n- **Aesthetic and Creativity:** Assess the artistic aspects of the video, including the color scheme, composition, atmosphere, depth of field, and the overall creative appeal. The scene should convey a sense of harmony and balance.\n- **Safety:** The video should not contain harmful or inappropriate content, such as political, violent, or adult material. If such content is present, the image quality and satisfaction score should be the lowest possible. \n\nPlease provide the ratings of Visual Quality: <|VQ_reward|>\nEND\n\n**Motion Quality:**  \nAssess the dynamic aspects of the video, with a focus on dynamic factors. Consider the following sub-dimensions:\n- **Stability:** Evaluate the continuity and stability between frames. There should be no sudden, unnatural jumps, and the video should maintain stable attributes (e.g., no fluctuating colors, textures, or missing body parts).\n- **Naturalness:** The movement should align with physical laws and be realistic. For example, clothing should flow naturally with motion, and facial expressions should change appropriately (e.g., blinking, mouth movements).\n- **Aesthetic Quality:** The movement should be smooth and fluid. The transitions between different motions or camera angles should be seamless, and the overall dynamic feel should be visually pleasing.\n- **Fusion:** Ensure that elements in motion (e.g., edges of the subject, hair, clothing) blend naturally with the background, without obvious artifacts or the feeling of cut-and-paste effects.\n- **Clarity of Motion:** The video should be clear and smooth in motion. Pay attention to any areas where the video might have blurry or unsteady sections that hinder visual continuity.\n- **Amplitude:** If the video is largely static or has little movement, assign a low score for motion quality.\n\nPlease provide the ratings of Motion Quality: <|MQ_reward|>\nEND\n\n**Text Alignment:**  \nAssess how well the video matches the textual prompt across the following sub-dimensions:\n- **Subject Relevance** Evaluate how accurately the subject(s) in the video (e.g., person, animal, object) align with the textual description. The subject should match the description in terms of number, appearance, and behavior.\n- **Motion Relevance:** Evaluate if the dynamic actions (e.g., gestures, posture, facial expressions like talking or blinking) align with the described prompt. The motion should match the prompt in terms of type, scale, and direction.\n- **Environment Relevance:** Assess whether the background and scene fit the prompt. This includes checking if real-world locations or scenes are accurately represented, though some stylistic adaptation is acceptable.  \n- **Style Relevance:** If the prompt specifies a particular artistic or stylistic style, evaluate how well the video adheres to this style.\n- **Camera Movement Relevance:** Check if the camera movements (e.g., following the subject, focus shifts) are consistent with the expected behavior from the prompt.\n\nTextual prompt - {text_prompt}\nPlease provide the ratings of Text Alignment: <|TA_reward|>\nEND\n"
 
 _DIMENSION_DESCRIPTIONS = {
@@ -88,10 +84,6 @@ def _build_prompt(prompt: str, dimension, template_type: str) -> str:
         "{text_prompt}", prompt
     )
 
-
-# ============================================================================
-# Video reading utilities (from DanceGRPO vision_process.py)
-# ============================================================================
 
 IMAGE_FACTOR = 28
 FRAME_FACTOR = 2
@@ -138,14 +130,13 @@ def _resize_video_to_view(
     """
     from torchvision.transforms.v2 import functional as F
 
-    _, total_frames, h, w = video.shape  # C, T, H, W
+    _, total_frames, h, w = video.shape
     n_frames, grid_t = view_grid
     if n_frames * grid_t < total_frames:
         video = video[:, : n_frames * grid_t]
     idx = torch.arange(total_frames).view(-1, grid_t)[:, 0]
     keep_frames = video[:, idx]
 
-    # Calculate resize sizes
     current_size = min(h, w)
     scale = target_size / current_size
     new_h = round(h * scale / factor) * factor
@@ -165,21 +156,13 @@ def _reshape_by_grid(video: torch.Tensor, view_grid: Tuple[int, int]) -> torch.T
     if n_frames * grid_t < total_frames:
         video = video[:, : n_frames * grid_t]
     elif n_frames * grid_t > total_frames:
-        # pad with zeros if we need more frames
         pad = n_frames * grid_t - total_frames
         video = torch.cat([video, torch.zeros(3, pad, h, w, dtype=video.dtype, device=video.device)], dim=1)
 
-    # Pick frames at column 0 of each temporal row
     idx = torch.arange(n_frames * grid_t).view(-1, grid_t)[:, 0]
     video = video[:, idx]
 
-    # Reassemble into grid
     return video.permute(1, 2, 3, 0).reshape(n_frames, h, w * grid_t, 3).permute(0, 3, 1, 2)
-
-
-# ============================================================================
-# Qwen2-VL helper utilities (from DanceGRPO qwen_utils.py)
-# ============================================================================
 
 
 def _get_rope_index_modified(
@@ -220,7 +203,6 @@ def _build_vl_inputs(
     """Build model-ready inputs through the Qwen2-VL processor chain."""
     text = processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True)
 
-    # Handle processor return from qwen_vl_utils.process_vision_info
     if video_inputs is not None:
         video_grid_thw, second_per_grid_ts = zip(
             *(processor.video_processor.preprocess(video_inputs, return_tensors="pt"))
@@ -241,7 +223,6 @@ def _build_vl_inputs(
         videos_kwargs={"do_rescale": True},
     ).to(device)
 
-    # Compute 3D RoPE position ids
     if video_grid_thw is not None:
         inputs["video_grid_thw"] = video_grid_thw.to(device)
         attention_mask = inputs.get("attention_mask")
@@ -255,15 +236,9 @@ def _build_vl_inputs(
             image_grid_thw=None,
             video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
-            # rope_deltas=rope_deltas,
         )
 
     return inputs
-
-
-# ============================================================================
-# VideoAlign model definition (from DanceGRPO videoalign_model.py)
-# ============================================================================
 
 
 class _MLP(nn.Module):
@@ -280,7 +255,6 @@ class _MLP(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, out_dim),
         )
-        # Store the key name for logging purposes
         self.key = "mlp_head"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -330,10 +304,8 @@ class _VideoAlignModel(nn.Module):
             output_hidden_states=True,
         )
 
-        # Extract last hidden state using model-specific layout
         last_hidden_state = _get_last_hidden_state(outputs, self.model)
 
-        # Pool over visual token positions
         pooled = _pool_visual_tokens(
             last_hidden_state=last_hidden_state,
             attention_mask=attention_mask,
@@ -374,19 +346,12 @@ def _pool_visual_tokens(
     used as special reward tokens instead of mean pooling.
     """
     if use_special_tokens:
-        # Special-token mode: last 3 positions carry VQ / MQ / TA
-        pooled = last_hidden_state[:, -3:, :]  # (B, 3, D)
+        pooled = last_hidden_state[:, -3:, :]
     else:
-        # Mean-pool over visual positions (where attention_mask != 0)
         mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
         pooled = (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        pooled = pooled.unsqueeze(1)  # (B, 1, D)
+        pooled = pooled.unsqueeze(1)
     return pooled
-
-
-# ============================================================================
-# Checkpoint loading (inlined from DanceGRPO training code)
-# ============================================================================
 
 
 def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> None:
@@ -403,7 +368,6 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
         for fpath in sorted(glob.glob(os.path.join(checkpoint_dir, pattern))):
             state_dicts.append(load_file(fpath))
 
-    # Merge all safetensor files into a single state dict
     full_state = {}
     for sd in state_dicts:
         full_state.update(sd)
@@ -411,11 +375,9 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
     model_state = inference_obj.model.state_dict()
     filtered_state = full_state.copy()
 
-    # Detect and remap keys for Qwen2-VL's nested architecture
     flat_model_keys = list(model_state.keys())
     flat_filtered_keys = list(filtered_state.keys())
 
-    # Remap ``model.layers`` → ``model.language_model.layers`` (transformers >= 4.49)
     if any("model.language_model" in k for k in flat_model_keys):
         keys_to_remap = [k for k in flat_filtered_keys if k.startswith("model.layers.")]
         for old_key in keys_to_remap:
@@ -423,7 +385,6 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
             if new_key in flat_model_keys:
                 filtered_state[new_key] = filtered_state.pop(old_key)
 
-    # Remap ``visual`` → ``model.visual`` (transformers >= 4.49)
     if any("model.visual" in k for k in flat_model_keys):
         keys_to_remap = [k for k in flat_filtered_keys if k.startswith("visual.")]
         for old_key in keys_to_remap:
@@ -431,7 +392,6 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
             if new_key in flat_model_keys:
                 filtered_state[new_key] = filtered_state.pop(old_key)
 
-    # Log match stats for debugging checkpoint compatibility
     matched = sum(1 for k in filtered_state if k in model_state)
     skipped = len(filtered_state) - matched
     if skipped:
@@ -440,11 +400,6 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
     inference_obj.model.load_state_dict(filtered_state, strict=False)
     inference_obj.model.to(device=device, dtype=dtype)
     inference_obj.model.eval()
-
-
-# ============================================================================
-# Top-level VideoAlign inference class
-# ============================================================================
 
 
 class _VideoAlignInference:
@@ -461,7 +416,6 @@ class _VideoAlignInference:
         self.processor = None
         self._inference_cfg: Optional[dict] = None
 
-        # Data config defaults (overridden by model_config.json)
         self._fps: float = 2.0
         self._num_frames: Optional[int] = None
         self._max_pixels: int = 200704
@@ -475,7 +429,6 @@ class _VideoAlignInference:
         """Load model, config, processor, and checkpoint weights."""
         from transformers import AutoConfig, AutoModelForTextToVideo, AutoProcessor
 
-        # ---- Load model config to determine architecture flags ----
         config_path = os.path.join(checkpoint_dir, "model_config.json")
         with open(config_path) as f:
             cfg = json.load(f)
@@ -484,7 +437,6 @@ class _VideoAlignInference:
         model_cfg = cfg["model_config"]
         self._inference_cfg = cfg.get("inference_config")
 
-        # Data config
         self._fps = data_cfg.get("fps", 2.0)
         self._num_frames = data_cfg.get("num_frames")
         self._max_pixels = data_cfg.get("max_frame_pixels", 200704)
@@ -492,9 +444,6 @@ class _VideoAlignInference:
         self._prompt_template_type = data_cfg.get("prompt_template_type", "detailed_special")
         self._sample_type = data_cfg.get("sample_type", "uniform")
 
-        # Processor. The base Qwen2-VL-2B model location: prefer an explicit
-        # env override (so launches from any cwd work), else a sibling of the
-        # checkpoint dir, else the original DanceGRPO-relative default.
         qwen_path = os.environ.get("VIDEOALIGN_QWEN_CKPT", "")
         if not qwen_path:
             _sibling = os.path.join(os.path.dirname(checkpoint_dir.rstrip("/")), "Qwen2-VL-2B-Instruct")
@@ -512,11 +461,9 @@ class _VideoAlignInference:
                 ]
                 print(f"[VideoAlign] Added {num_added} special reward tokens; ids={special_token_ids}", flush=True)
 
-        # ---- Build base Qwen2-VL model ----
         qwen_config = AutoConfig.from_pretrained(qwen_path)
         qwen_model = AutoModelForTextToVideo.from_config(qwen_config)
 
-        # Honour the checkpoint's special-token choice
         has_special = model_cfg.get("use_special_tokens", False)
         in_dim = qwen_config.hidden_size
         if special_token_ids is not None:
@@ -547,7 +494,6 @@ class _VideoAlignInference:
         num_frames = self._num_frames if num_frames is None else num_frames
         max_pixels = self._max_pixels if max_pixels is None else max_pixels
 
-        # Build chat messages in Qwen2-VL format
         chat_data = []
         for prompt in prompts:
             vid_info: Dict[str, Any] = {
@@ -563,10 +509,8 @@ class _VideoAlignInference:
             text = _build_prompt(prompt, self._eval_dim, self._prompt_template_type)
             chat_data.append([{"role": "user", "content": [vid_info, {"type": "text", "text": text}]}])
 
-        # Process vision
         _, video_inputs = _process_vision_info(chat_data)
 
-        # Tokenize
         batch = self.processor(
             text=self.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True),
             images=None,
@@ -576,7 +520,6 @@ class _VideoAlignInference:
             videos_kwargs={"do_rescale": True},
         )
 
-        # Move to device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         with torch.no_grad():
@@ -588,11 +531,6 @@ class _VideoAlignInference:
                 rewards[i] = self._norm(rewards[i])
             rewards[i]["Overall"] = rewards[i]["VQ"] + rewards[i]["MQ"] + rewards[i]["TA"]
         return rewards
-
-
-# ============================================================================
-# DiffusionRL Reward Scorer Interface
-# ============================================================================
 
 
 class VideoAlignRewardScorer(LocalRewardBackend):
@@ -615,7 +553,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         self._ta_coef = float(getattr(config, "ta_coef", 1.0))
 
     def _load_model(self) -> None:
-        # Ensure decord is used (torchvision.io.read_video removed in newer versions)
         os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
         checkpoint_path = self.model_kwargs.get("checkpoint_path") or os.environ.get("VIDEOALIGN_CKPT")
         if not checkpoint_path:
@@ -666,7 +603,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         if self._inferencer is None:
             raise RuntimeError("VideoAlign model not loaded; call onload() first.")
 
-        # Ensure model is on GPU
         if self.model is not None and next(self.model.parameters()).device.type != "cuda":
             self.model.to(self.device)
 
@@ -711,24 +647,14 @@ def _export_tensor_video(video: torch.Tensor, path: str) -> None:
     if video.dim() != 4:
         raise ValueError(f"Expected 4D video tensor, got shape={tuple(video.shape)}")
 
-    # Normalize to [T, C, H, W]. ``RewardRequest.videos`` hands us [C, T, H, W]
-    # (channel-first), while a raw ``Video.frames`` is already [T, C, H, W].
-    # Disambiguate by the channel axis: the C dimension is the one of size 3.
     c0, t0 = video.shape[0], video.shape[1]
     if c0 == 3 and t0 != 3:
-        # [C, T, H, W] -> [T, C, H, W]
         video = video.permute(1, 0, 2, 3)
 
-    # Convert [T, C, H, W] → [T, H, W, C]
     video = video.permute(0, 2, 3, 1)
     video = video[..., :3].clamp(0.0, 1.0)
     frames = (video * 255).round().to(torch.uint8).numpy()
     export_to_video(list(frames), path, fps=24)
-
-
-# ============================================================================
-# Config registration
-# ============================================================================
 
 
 @dataclass

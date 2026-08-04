@@ -54,7 +54,7 @@ def _last_boxed(text: str) -> Optional[str]:
             depth -= 1
             if depth == 0:
                 return text[open_brace + 1 : j]
-    return None  # unbalanced → truncated
+    return None
 
 
 def _extract_prediction(text: str) -> str:
@@ -83,7 +83,6 @@ def _normalize_latex(s: str) -> str:
     for tok in ("\\left", "\\right", "\\,", "\\!", "\\;", "\\ ", "\\quad", "\\qquad"):
         s = s.replace(tok, "")
     s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
-    # \frac{a}{b} -> (a)/(b)  (one level; nested fracs are rare in final answers)
     for _ in range(3):
         s = re.sub(r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"((\1)/(\2))", s)
     s = s.replace("\\cdot", "*").replace("\\times", "*")
@@ -108,11 +107,11 @@ def _values_equal(pred: str, gt: str) -> bool:
         return False
     from fractions import Fraction
 
-    try:  # exact: integers, decimals, "a/b"
+    try:
         return Fraction(np) == Fraction(ng)
     except (ValueError, ZeroDivisionError):
         pass
-    try:  # symbolic: normalized forms like "((3)/(2))" or a bare "2**3"
+    try:
         import sympy
 
         return bool(sympy.simplify(sympy.sympify(np) - sympy.sympify(ng)) == 0)

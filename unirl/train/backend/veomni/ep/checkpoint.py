@@ -84,8 +84,6 @@ def load_ep_model_state_dict(
             ep_rank=_ep_rank(ps),
         )
 
-    # Every rank loaded the single checkpoint file and now carries its own
-    # [E/ep,...] expert block. Broadcasting rank 0 here would recreate the bug.
     load_model_state_dict(
         model,
         local_state,
@@ -145,7 +143,6 @@ def load_ep_optimizer_state_dict(
     for name, param in ep_named_parameters(model):
         source_entry = source_entries.get(name)
         if source_entry is None:
-            # Adam has no entry before its first step; that is a valid empty state.
             continue
         local_entry = dict(source_entry)
         for state_name, value in source_entry.items():

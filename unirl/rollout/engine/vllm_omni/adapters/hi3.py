@@ -79,11 +79,6 @@ def _trailing_gen_parts(sample: Sample, *params_types: type, caller: str) -> Tup
     return trailing
 
 
-# --------------------------------------------------------------------------- #
-# Chat-template prompt construction
-# --------------------------------------------------------------------------- #
-
-
 def _build_prompt_entries(
     texts: Texts,
     *,
@@ -114,11 +109,6 @@ def _build_prompt_entries(
         decorate(entry, i)
         prompts.append(entry)
     return prompts
-
-
-# --------------------------------------------------------------------------- #
-# Replay-condition extractors
-# --------------------------------------------------------------------------- #
 
 
 def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) -> Dict[str, Any]:
@@ -196,9 +186,6 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
         "gen_image_mask": torch.cat([c["gen_image_mask"] for c in padded_captures], dim=0),
         "gen_timestep_scatter_index": torch.cat([c["gen_timestep_scatter_index"] for c in padded_captures], dim=0),
     }
-    # ``from_dict`` skips optional fields when absent; cond_* fields stay
-    # ``None`` for t2i (out of scope for the it2i extension) and rope_cache is
-    # never shipped on this path (engine-internal layout — see docstring).
     return {"fused": HunyuanImage3FusedMultimodalCondition.from_dict(fused_dict)}
 
 
@@ -236,11 +223,6 @@ def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str,
             input_ids[b, : len(r)] = torch.tensor(r, dtype=torch.long)
             prompt_lengths[b] = len(r)
     return {"fused": HunyuanImage3FusedMultimodalCondition(input_ids=input_ids, prompt_lengths=prompt_lengths)}
-
-
-# --------------------------------------------------------------------------- #
-# Input sub-adapters
-# --------------------------------------------------------------------------- #
 
 
 class Hi3InputAdapter:
@@ -384,9 +366,7 @@ class Hi3InputAdapter:
                 f"{self.modality}: x_T recipe key count {len(recipe_keys)} != prompt count {len(prompts)}."
             )
 
-        # vLLM-Omni executes every prompt as a B=1 DiT request while one
-        # StageSampling object is otherwise shared across all prompts. Slice the
-        # generation Part so each request receives only its own x_T key.
+        # Slice the generation part so each B=1 request gets its own noise key.
         calls: List[GenerateCall] = []
         for index, prompt in enumerate(prompts):
             one = diff_part.slice(index, index + 1)
@@ -404,8 +384,6 @@ class Hi3InputAdapter:
     def _decorate(self, entry: Dict[str, Any], i: int, *, pil_images: List[Any], diff_params: Any) -> None:
         """The per-entry extras, derived from the constructor flags."""
         if self.image_input:
-            # Upstream HI3 reads h/w off the prompt dict for the
-            # image-conditioned paths — the PIL dims, not the request's.
             pil = pil_images[i]
             entry["multi_modal_data"] = {"image": pil}
             entry["height"] = pil.height
@@ -438,8 +416,6 @@ class Hi3InputAdapter:
 
         extra_args = sde_extra_args(diff_params)
 
-        # HI3's DiT latent shape is AR-dynamic (only known in-worker after
-        # stage 0), so the driver cannot ship a materialized x_T tensor.
         seg = gen_part.segment
         if getattr(seg, "initial_latents", None) is not None:
             raise NotImplementedError(
@@ -449,11 +425,7 @@ class Hi3InputAdapter:
                 f"gen Part's lineage instead."
             )
 
-        # Driver-authoritative x_T RECIPE: per-image gids derived from the gen
-        # Part's lineage (OD-2; group id when siblings share x_T, else the
-        # per-sample id) + seed; NO shape — the pipeline's prepare_latents hook
-        # fills the AR-resolved shape and regenerates the byte-identical x_T via
-        # NoiseRecipe.for_batch.
+        # Ship noise IDs and seed; the pipeline fills shape before regeneration.
         explicit_keys = list(gen_part.init_noise_group_ids or [])
         share = bool(getattr(diff_params, "init_same_noise", False))
         keys = explicit_keys or (gen_part.group_ids if share else list(gen_part.sample_ids))
@@ -496,9 +468,6 @@ class Hi3DitRecaptionInputAdapter:
 
     def __init__(self, modality: str, *, sys_type: str = "en_unified") -> None:
         self.modality = modality
-        #: System-prompt preset for ``use_system_prompt`` — the only piece of
-        #: the HI3 chat-template row this DiT-only stage consumes (no task:
-        #: the recaption text is injected via ``extra['ar_generated_text']``).
         self.sys_type = sys_type
 
     def build(self, sample: Sample) -> List[GenerateCall]:
@@ -506,8 +475,8 @@ class Hi3DitRecaptionInputAdapter:
             raise ValueError(f"modality={self.modality!r} does not accept an image input Part")
 
         turns = sample.text_conditioning()
-        texts = turns[0].content  # the prompts (root turn)
-        cot = turns[1].content  # the chained recaptions, 1:1 with prompts by lineage
+        texts = turns[0].content
+        cot = turns[1].content
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
         sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
@@ -516,17 +485,9 @@ class Hi3DitRecaptionInputAdapter:
         height = int(base_kwargs["height"])
         width = int(base_kwargs["width"])
 
-        # Base extra_args: sparse SDE indices + the WHOLE batch's x_T recipe gids
-        # derived from the gen Part's lineage (OD-2; + the regen base seed —
-        # distinct from the per-image SAMPLING seed below; per-image x_T variety
-        # comes from the gid). NO init_noise_latent_shape — HI3's DiT latent shape
-        # is AR-dynamic and resolved in the worker.
         base_extra = sde_extra_args(diff_params)
         share = bool(getattr(diff_params, "init_same_noise", False))
         recipe_gids = gen_part.group_ids if share else list(gen_part.sample_ids)
-        # Driver-x_T opt-out: when disable_driver_xt is set the trainer is not
-        # authoring x_T, so skip the recipe and let the engine use its own RNG
-        # (the per-sample gid slice below is gated on this key being present).
         if recipe_gids and not bool(getattr(diff_params, "disable_driver_xt", False)):
             base_extra["init_noise_group_ids"] = [str(g) for g in recipe_gids]
             base_extra["init_noise_seed"] = (
@@ -545,8 +506,6 @@ class Hi3DitRecaptionInputAdapter:
             kwargs = dict(base_kwargs)
             kwargs["seed"] = seed_from_sample_id(sample_id)
             extra_args = dict(base_extra)
-            # Each single-prompt generate runs with batch_size=1 in the worker,
-            # so ship ONLY this sample's x_T recipe gid.
             gid = recipe_gids[idx] if idx < len(recipe_gids) else None
             if gid is not None and extra_args.get("init_noise_group_ids"):
                 extra_args["init_noise_group_ids"] = [str(gid)]
@@ -556,16 +515,10 @@ class Hi3DitRecaptionInputAdapter:
                 GenerateCall(
                     prompts=[prompt],
                     sampling=[StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=kwargs)],
-                    # Single-prompt call: its flat output list IS the group.
                     group_by_request_id=False,
                 )
             )
         return calls
-
-
-# --------------------------------------------------------------------------- #
-# Output sub-adapters
-# --------------------------------------------------------------------------- #
 
 
 class Hi3TextOutputAdapter:
@@ -599,8 +552,6 @@ class Hi3TextOutputAdapter:
         segment = self.build_segment(sample, per_request)
         decoded = self.build_decoded(sample, per_request)
         conditions = self.build_conditions(sample, per_request)
-        # Preserve the old no-token behavior: all hooks run, but without an AR
-        # segment there is no completed generation Part to write back.
         if segment is None:
             return sample
         frontier = sample.frontier_gen_part(ARSamplingParams)
@@ -635,13 +586,8 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
 
     def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
-        # The base writes the Stage-1 trajectory, image, and DiT fused capture
-        # only to the diffusion Part.
         filled = super().build(sample, per_request)
 
-        # Stage 0 is a separate generated Part with a different replay contract:
-        # prompt token ids + prompt_lengths, not the DiT's fused image sequence.
-        # Fill it independently so diffusion conditions can never leak onto AR.
         ar_segment = build_ar_segment(per_request)
         if ar_segment is None:
             return filled
@@ -678,11 +624,6 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         return hi3_fused_conditions(diff_outputs, modality=self.modality)
-
-
-# --------------------------------------------------------------------------- #
-# Modality binders
-# --------------------------------------------------------------------------- #
 
 
 @register_adapter("hi3_t2i")
@@ -763,8 +704,6 @@ class Hi3I2tAdapter(ModelAdapter):
 
     stage_yaml = "hunyuan_image3_i2t.yaml"
     stage_yaml_source = "upstream"
-    #: AR-only requests carry ``ARSamplingParams`` with no diffusion sub-block
-    #: — they have no diffusion Part for ``ensure_sample_sigmas`` to pin.
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -843,8 +782,6 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
-    #: HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the
-    #: byte-copy transport (a zero-copy handle crashes ranks 2..N).
     lora_copy_transport = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
@@ -872,11 +809,8 @@ class Hi3DitRecaptionAdapter(ModelAdapter):
 
     stage_yaml = "hunyuan_image3_dit_recaption_rl.yaml"
     omni_mode = "text-to-image"
-    # v1 loads a driver tokenizer for dit_recaption even though this builder
-    # never tokenizes — kept for parity (health semantics, warm cache).
     clear_cuda_visible = True
-    #: HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the
-    #: byte-copy transport.
+    # HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the byte-copy transport.
     lora_copy_transport = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

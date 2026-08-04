@@ -11,9 +11,8 @@ loops live in the trainers):
 - :class:`VersionedBuffer` — payload-agnostic freshness/staleness buffer.
 - :class:`InflightPool` — non-blocking pool of distributed ``generate`` calls.
 
-Engines, sharing one consumer surface (``poll`` / ``drain_freshest`` /
-``pop_evicted`` / ``quiesce`` + engine-owned ``weight_version``, advanced
-only by ``sync_weights`` — every weight push goes through the ledger):
+Engines share one consumer surface (``poll`` / ``drain_freshest`` /
+``pop_evicted`` / ``quiesce`` + engine-owned ``weight_version``):
 
 - :class:`AsyncBatchRolloutEngine` — batch granularity over a single-turn
   engine slab; one ``submit`` is one non-blocking distributed ``generate``.
@@ -53,11 +52,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-
-# ---------------------------------------------------------------------------
-# Mechanisms
-# ---------------------------------------------------------------------------
 
 
 class VersionedBuffer(Generic[T]):
@@ -112,7 +106,6 @@ class VersionedBuffer(Generic[T]):
         return evicted
 
 
-#: Reap-time completion hook: ``(gen_id, weight_version, completed_payload)``.
 Complete = Callable[[int, int, Any], None]
 
 
@@ -120,7 +113,7 @@ Complete = Callable[[int, int, Any], None]
 class _InflightJob:
     gen_id: int
     weight_version: int
-    pending: Any  # PendingHandleCall
+    pending: Any
 
 
 class InflightPool:
@@ -207,11 +200,6 @@ class InflightPool:
             self._jobs[0].pending.wait()
 
 
-# ---------------------------------------------------------------------------
-# Batch engine
-# ---------------------------------------------------------------------------
-
-
 class AsyncBatchRolloutEngine:
     """Batch-granular async engine over a ``SyncRolloutEngine`` slab Handle; buffers ``Sample`` groups.
 
@@ -240,18 +228,8 @@ class AsyncBatchRolloutEngine:
     def weight_version(self) -> int:
         return self._weight_version
 
-    def sync_weights(self, weight_sync: Any) -> int:
-        """Push train weights via *weight_sync* and advance the version ledger.
-
-        The only sanctioned weight-push path — pairing the push with the bump
-        is what keeps the ledger truthful. Raises if any generation is in
-        flight (a weight + KV update corrupts it); drain via ``quiesce`` first.
-        """
-        if len(self._pool):
-            raise RuntimeError(f"sync_weights with {len(self._pool)} generations in flight; quiesce() first")
-        weight_sync.sync()
+    def bump_weight_version(self) -> int:
         self._weight_version += 1
-        logger.info("sync_weights: pushed train weights; weight_version -> %d", self._weight_version)
         return self._weight_version
 
     @property
@@ -288,11 +266,6 @@ class AsyncBatchRolloutEngine:
         groups = self._complete(gen_id, completed)  # fallible (scoring) before any buffer put
         for group in groups:
             self._buffer.put(group, weight_version=weight_version, gen_id=gen_id)
-
-
-# ---------------------------------------------------------------------------
-# Agentic engine (driver-side facade over the rank-0 coordinator)
-# ---------------------------------------------------------------------------
 
 
 def root_of(traj: "Sample") -> str:
@@ -392,8 +365,7 @@ class AsyncAgenticRolloutEngine:
                 "finalize_if_drained() to report it done or quiesce() first (a second "
                 "drain would double-pull the coordinator queue)."
             )
-        # Fail closed: the coordinator may start a drive before its call reports
-        # an error, so only finalize_if_drained() or quiesce() may re-arm submit.
+        # Set before RPC so ambiguous submit failures remain guarded.
         self._drive_live = True
         self._rollout.submit(tasks)
 

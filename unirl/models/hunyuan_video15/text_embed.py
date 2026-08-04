@@ -37,12 +37,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import HunyuanVideo15Bundle
 
-# --------------------------------------------------------------------------
-# Chat-template constants. The system prompt is the upstream default; the
-# crop-start length matches it exactly (108 tokens). Changing either
-# requires also retraining the transformer.
-# --------------------------------------------------------------------------
-
 PROMPT_TEMPLATE_SYSTEM_MESSAGE = (
     "You are a helpful assistant. Describe the video by detailing the following aspects: "
     "1. The main content and theme of the video. "
@@ -52,7 +46,6 @@ PROMPT_TEMPLATE_SYSTEM_MESSAGE = (
     "5. camera angles, movements, and transitions used in the video."
 )
 
-# Regex that captures quoted glyph text (ASCII " " and curly " ").
 _GLYPH_PATTERN = re.compile(r"\"(.*?)\"|“(.*?)”")
 
 
@@ -65,7 +58,6 @@ def _extract_glyph_texts(prompt: str) -> Optional[str]:
     """
     matches = _GLYPH_PATTERN.findall(prompt)
     result = [m[0] or m[1] for m in matches]
-    # Dedup while preserving order when there are multiple snippets.
     result = list(dict.fromkeys(result)) if len(result) > 1 else result
     if not result:
         return None
@@ -108,10 +100,6 @@ class HunyuanVideo15TextEmbedStage:
         self.mllm_skip_layers = int(mllm_skip_layers)
         self.byt5_max_length = int(byt5_max_length)
 
-    # ------------------------------------------------------------------
-    # MLLM stream (Qwen2.5-VL)
-    # ------------------------------------------------------------------
-
     def embed_mllm(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the Qwen2.5-VL MLLM into a TextEmbedCondition."""
         embeds, mask = self._encode_mllm(list(p.texts))
@@ -145,20 +133,13 @@ class HunyuanVideo15TextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        # Use the (skip_layers + 1)-th-from-last hidden state, NOT the
-        # final hidden state — matches the upstream pipeline.
         prompt_embeds = outputs.hidden_states[-(self.mllm_skip_layers + 1)]
 
-        # Strip the chat-template prefix tokens.
         if crop_start > 0:
             prompt_embeds = prompt_embeds[:, crop_start:]
             attention_mask = attention_mask[:, crop_start:]
 
         return prompt_embeds.to(dtype=dtype), attention_mask
-
-    # ------------------------------------------------------------------
-    # Glyph stream (ByT5)
-    # ------------------------------------------------------------------
 
     def embed_glyph(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the ByT5 glyph encoder into a TextEmbedCondition."""
@@ -180,8 +161,6 @@ class HunyuanVideo15TextEmbedStage:
         for raw in prompts:
             glyph = _extract_glyph_texts(raw or "")
             if glyph is None:
-                # No glyph snippets — emit a zero placeholder so the
-                # batch concat below stays uniform.
                 emb = torch.zeros(1, max_length, d_model, device=device, dtype=enc_dtype)
                 mask = torch.zeros(1, max_length, device=device, dtype=torch.int64)
             else:

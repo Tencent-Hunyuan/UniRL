@@ -40,7 +40,7 @@ class TQTensorHandle:
       fetch.
     """
 
-    meta: Any  # upstream SampleMeta/BatchMeta, restricted to this one field
+    meta: Any  # Upstream SampleMeta or BatchMeta.
     field: str  # the field name the tensor occupies in its put's TensorDict
     orig_shape: Optional[Tuple[int, ...]] = None  # shape to restore on fetch (None for non-tensors)
 
@@ -147,8 +147,6 @@ class TQTransport(TensorTransport):
         return _run_async_in_temp_loop(_put)
 
     def _resolve_handles(self, handles: List[TQTensorHandle]) -> List[torch.Tensor]:
-        # One async _fetch (column-unioned per put-group) returns the full base
-        # tensors aligned to *handles*; the base's get/get_batch slice the spans.
         return _run_async_in_temp_loop(self._fetch, handles)
 
     def is_ref(self, value: Any) -> bool:
@@ -159,11 +157,6 @@ class TQTransport(TensorTransport):
             return {}
 
         async def _put_batch() -> Dict[str, TensorRef]:
-            # Group keys by leading-dim batch size: a TensorDict requires one
-            # uniform batch_size, so a mixed-dim object (e.g. a rollout's 96-row
-            # per-sample tensors alongside an 11-step trajectory) must split into
-            # one async_put per distinct leading dim. Same-dim tensors stay in one
-            # TensorDict, preserving the column-union single round-trip.
             def _bs(t: Any) -> int:
                 if isinstance(t, torch.Tensor):
                     return int(t.shape[0]) if t.dim() > 0 else 1

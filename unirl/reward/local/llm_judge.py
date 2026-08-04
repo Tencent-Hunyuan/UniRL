@@ -42,12 +42,7 @@ _DEFAULT_JUDGE_PROMPT = (
     "'incorrect'."
 )
 
-# Verdict patterns, checked NEGATIVE-first: "incorrect" contains the substring
-# "correct", and a verbose judge may write "not correct" / "wrong" — the old
-# ``"correct" in content and "incorrect" not in content`` test misreads both
-# ("not correct" -> scored 1.0). The prompt asks for a single word, so
-# double-negatives ("not incorrect") are out of scope; ambiguous replies score
-# 0.0 (under-reward on uncertainty, matching the judge-failure convention).
+# Check negative verdicts first because "incorrect" contains "correct".
 _INCORRECT_RE = re.compile(r"\b(?:incorrect|not\s+correct|isn'?t\s+correct|wrong|not\s+equivalent)\b")
 _CORRECT_RE = re.compile(r"\b(?:correct|equivalent|yes)\b")
 
@@ -71,12 +66,11 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
     input_kind = "text"
 
     def __init__(self, *, config: "LLMJudgeSpec", base_device: str) -> None:
-        del base_device  # HTTP backend — no local model / device
+        del base_device
         self._spec = config
-        super().__init__()  # sets self.model_name/batch_size/timeout; then calls _load_model
+        super().__init__()
 
     def _load_model(self) -> None:
-        # Nothing to load; resolve the endpoint (env override wins for secrets).
         self.model = "llm_judge"
         self._endpoint = os.environ.get("JUDGE_URL", self._spec.endpoint)
         self._judge_model = os.environ.get("JUDGE_MODEL", self._spec.model)
@@ -134,7 +128,7 @@ class LLMJudgeSpec(BaseRewardComponentSpec):
     are overridable at load time by ``$JUDGE_URL`` / ``$JUDGE_MODEL`` /
     ``$JUDGE_API_KEY`` (keep secrets out of the recipe)."""
 
-    endpoint: str = ""  # OpenAI-compatible /v1/chat/completions URL
+    endpoint: str = ""
     model: str = ""
     api_key: str = ""
     timeout: float = 60.0

@@ -27,9 +27,7 @@ from unirl.types.sample import Primitive, Sample, _part_with_field
 
 logger = logging.getLogger(__name__)
 
-# ``<tool_call>{...}</tool_call>`` — the Hermes/Qwen convention (matches relax/slime/areal).
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-# Opener for a tool call whose ``</tool_call>`` was trimmed by a ``stop`` string mid-generation.
 _TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*(\{)", re.DOTALL)
 
 
@@ -120,8 +118,6 @@ class ToolEnvironment:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name!r}")
             self._tools[tool.name] = tool
-        # Tools that hold per-trajectory session state (LIN-533); the stateless path skips all
-        # session plumbing whenever this list is empty (zero regression for calculator/search).
         self._stateful_tools: List[StatefulTool] = [t for t in self._tools.values() if isinstance(t, StatefulTool)]
         self.max_turns = max_turns
 
@@ -154,8 +150,6 @@ class ToolEnvironment:
             sessions[tool.name] = sid
         control = dict(root.control or {})
         control["tool_sessions"] = sessions
-        # ``_part_with_field`` swaps only ``control`` — preserving the encoded prompt
-        # (``primitives``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
         return Sample.request(_part_with_field(root, "control", control))
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
@@ -191,9 +185,6 @@ class ToolEnvironment:
         if (not any_call) or (turn >= self.max_turns):
             return None, True, info
 
-        # Row-aligned observation: the tool result for rows that called a tool; "" placeholder for
-        # rows that already produced a final answer while siblings continue (the n>1 heterogeneous
-        # case — a known follow-up that belongs to the loop/Sample layer, not the environment).
         observation = Texts(texts=[r if r is not None else "" for r in results])
         return observation, False, info
 

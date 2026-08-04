@@ -90,9 +90,6 @@ class QwenImageInputAdapter(DitInputAdapter):
         sampling = super().build_sampling(sample)
         diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         kwargs = sampling[0].kwargs
-        # Qwen's CFG knob: set it ALWAYS so upstream's ``or 4.0`` default
-        # never fires (at <= 1.0 ``do_true_cfg`` stays False regardless of
-        # the prompt-side gate — belt and suspenders).
         kwargs["true_cfg_scale"] = float(diff_params.guidance_scale)
         if "max_sequence_length" not in kwargs:
             max_seq_len = getattr(self.model_config, "max_sequence_length", None)
@@ -190,8 +187,6 @@ class QwenImageT2iAdapter(ModelAdapter):
 
     stage_yaml = "qwen_image_t2i_rl.yaml"
     omni_mode = "text-to-image"
-    # The Qwen2.5-VL tokenizer lives in the tokenizer/ subfolder; the worker
-    # loads it and the single-stage path never calls build_prompt_tokens.
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

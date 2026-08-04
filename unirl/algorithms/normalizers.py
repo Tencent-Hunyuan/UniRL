@@ -84,11 +84,6 @@ def normalize_global(
     return advantages
 
 
-# ------------------------------------------------------------------
-# Group-index helpers
-# ------------------------------------------------------------------
-
-
 def _normalize_group_id(group_id: Any) -> Optional[str]:
     if group_id is None:
         return None

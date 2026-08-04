@@ -36,15 +36,6 @@ class Qwen3PipelineConfig:
     trust_remote_code: bool = True
 
     model_precision: Any = "bf16"
-    # HF attention backend for the TRAIN-side model, set on from_pretrained — so it
-    # is the model's GLOBAL backend and governs EVERY forward: replay teacher-forcing
-    # AND the HF autoregress() decode loop (the *_sglang recipes roll out in SGLang,
-    # so only replay is exercised there; flex targets full-sequence forwards and may
-    # recompile per step under HF incremental decode).
-    # 'flex_attention' makes the packed varlen replay fast: transformers builds a
-    # BlockMask from the restarting position_ids and the flex kernel skips the
-    # fully-masked cross-sequence blocks (sdpa falls back to the math kernel on
-    # packed masks — ~3x slower and memory-bound). None = HF default (sdpa).
     attn_implementation: Optional[str] = None
     device: Any = None
 
@@ -55,26 +46,16 @@ class Qwen3PipelineConfig:
 
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Meta-init the transformer (build on the meta device; the backend loads
-    # weights after sharding from the checkpoint root) instead of eager
-    # ``from_pretrained``. Avoids the per-rank full-model GPU spike. Consumed by
-    # FSDPBackend / VeOmniBackend via the stashed ``_transformer_weights_path``.
     meta_init_transformer: bool = False
 
-    # ``merged_dense`` is the only LoRA-materialization path that survives
-    # the SGLang LLM LoRA-pool deadlock under composed (PE) rollouts, so it
-    # is the default for Qwen3.
     lora_materialization: str = "merged_dense"
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Attach a scalar critic to the causal LM for PPO / GAE training.
     use_value_head: bool = False
 
     system_instruction: Optional[str] = None
-    # Chat-template thinking switch; MUST agree with the rollout engine's
-    # chat_template_kwargs.enable_thinking or train/rollout prompts diverge.
     enable_thinking: bool = False
     max_prompt_length: int = 4096
 

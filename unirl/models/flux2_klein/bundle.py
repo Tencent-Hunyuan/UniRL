@@ -192,18 +192,9 @@ class Flux2KleinBundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        # --- Transformer (9B) ---
         meta_init_state = None
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
-            # no per-rank weight allocation; the backend materializes + loads
-            # from the stashed dir after sharding. build_meta_init_transformer
-            # keeps init-computed non-persistent buffers real and captures them
-            # into meta_init_state (stashed on the bundle below). The guidance-
-            # embedder quirk (see module docstring) is handled separately by a
-            # deferred zero-init of the checkpoint-absent params, since to_empty
-            # leaves them as garbage (not meta) — _materialize_meta_tensors
-            # wouldn't catch them.
+            # Zero-init checkpoint-absent guidance parameters after meta materialization.
             transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Flux2Transformer2DModel.from_config(transformer_config), dtype=dtype
@@ -226,13 +217,11 @@ class Flux2KleinBundle(Bundle):
                 )
             transformer = transformer.to(device)
 
-        # --- VAE (frozen, eval) ---
         vae = None
         if config.load_vae:
             vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        # --- Qwen3 text encoder (frozen, eval) ---
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
         if getattr(tokenizer, "pad_token", None) is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -244,7 +233,6 @@ class Flux2KleinBundle(Bundle):
         )
         text_encoder.requires_grad_(False)
 
-        # --- Scheduler (FlowMatchEulerDiscreteScheduler with empirical mu) ---
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
         bundle = cls(
@@ -258,9 +246,7 @@ class Flux2KleinBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            # Consumed by the backend's post-shard weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
-            # Ray-robust restore carrier for init-computed non-persistent state.
             bundle._meta_init_state = meta_init_state
         return bundle
 

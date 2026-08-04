@@ -76,10 +76,6 @@ class NCCLWeightSync(FullWeightSync):
         self._rollout_targets: List[Any] = []  # rollout Worker actor handles (rank 0 only)
         self._rollout_role: Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # One-time setup (driver-called)
-    # ------------------------------------------------------------------
-
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def pick_master(self) -> Tuple[str, int]:
         """Rank 0 returns its ``(node_ip, free_port)`` for the rendezvous."""
@@ -128,9 +124,6 @@ class NCCLWeightSync(FullWeightSync):
         if self._rollout_role is None:
             raise RuntimeError("NCCLWeightSync.connect: call set_rollout_targets() first")
 
-        # PP>1 needs a per-stage rank_offset map (each PP stage holds a disjoint
-        # slice of the model). Fail closed until that lands; the tp/dp path is
-        # the supported one today.
         if pp_size > 1:
             raise NotImplementedError(
                 "NCCLWeightSync.connect: rollout pp_size>1 is not implemented "
@@ -164,10 +157,6 @@ class NCCLWeightSync(FullWeightSync):
             group_name=self._group_name,
         )
         ray.get(refs)
-
-    # ------------------------------------------------------------------
-    # Per-step sync
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:

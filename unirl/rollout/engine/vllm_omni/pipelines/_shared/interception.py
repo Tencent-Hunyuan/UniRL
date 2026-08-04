@@ -143,7 +143,7 @@ def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
         noise_group_ids=[str(g) for g in recipe_gids[start:end]],
         base_seed=int(extra.get("init_noise_seed", 0)),
         latent_shape=tuple(extra["init_noise_latent_shape"]),
-    ).resolve()  # [num_outputs_per_prompt, ...] — matches the tensor slice shape
+    ).resolve()
 
 
 def inject_latents(

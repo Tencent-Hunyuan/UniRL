@@ -62,7 +62,7 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError(
                 f"ZImageVAEDecodeStage.decode: expected latents shape [N, K, C, H, W], got {tuple(s.latents.shape)}"
             )
-        clean = s.latents[:, -1]  # [B, C, H, W]
+        clean = s.latents[:, -1]
 
         scaling_factor = self.bundle.vae.config.scaling_factor
         shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)

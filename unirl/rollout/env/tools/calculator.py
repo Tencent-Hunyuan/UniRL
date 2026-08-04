@@ -14,8 +14,6 @@ from typing import Any, Dict
 
 from unirl.rollout.env.tools.base import Tool
 
-# Binary / unary operators the calculator allows. Anything else (names, calls, attributes,
-# comparisons, subscripts, ...) is rejected by ``_eval`` below.
 _BINOPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -89,7 +87,6 @@ class CalculatorTool(Tool):
         except SyntaxError as exc:
             raise ValueError(f"could not parse expression {expression!r}: {exc.msg}") from None
         result = _eval(tree)
-        # Render integral results without a trailing ``.0`` (what a human/model expects).
         if isinstance(result, float) and result.is_integer():
             result = int(result)
         return str(result)

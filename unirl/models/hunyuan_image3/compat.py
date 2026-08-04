@@ -32,7 +32,6 @@ from typing import Any
 
 def apply_hi3_transformers5_compat() -> None:
     """Idempotently install the transformers-5.x compat shims. Safe to call repeatedly."""
-    # A — StaticLayer.lazy_initialization(key_states[, value_states])
     try:
         from transformers.cache_utils import StaticLayer
 
@@ -49,9 +48,6 @@ def apply_hi3_transformers5_compat() -> None:
     except Exception:  # noqa: BLE001 — best-effort; a transformers without StaticLayer doesn't need it
         pass
 
-    # B — Siglip2 image processor: default return_tensors="pt". Patch BOTH the
-    # Fast and non-Fast classes: the "Fast" suffix is deprecated in transformers
-    # 5.x and from_dict may yield a non-Fast instance.
     try:
         from transformers.models.siglip2 import image_processing_siglip2 as _sig
 
@@ -95,7 +91,6 @@ def repair_hi3_tokenizer_backend(tokenizer: Any, pretrained_path: Any) -> bool:
 
     backend = getattr(tokenizer, "_tokenizer", None)
     if backend is None or getattr(backend, "pre_tokenizer", None) is not None:
-        # Not a fast tokenizer, or already has the ByteLevel pre-tokenizer.
         return False
     tok_json = os.path.join(str(pretrained_path), "tokenizer.json")
     if not os.path.exists(tok_json):

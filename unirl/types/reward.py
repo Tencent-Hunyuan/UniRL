@@ -48,10 +48,6 @@ class RewardRequest:
     group_ids: Optional[List[str]] = None
     reward_types: List[RewardType] = field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
     return_components: bool = False
-    # Source sample rate (Hz) of any waveforms in ``generated["audio"]``. Set by
-    # the reward service when a Part carries a parallel audio stream (LTX-2.3
-    # T2AV). ``None`` for non-audio requests. Audio reward scorers (CLAP /
-    # ImageBind) read it to resample to their model's expected rate.
     audio_sample_rate: Optional[int] = None
 
     @property

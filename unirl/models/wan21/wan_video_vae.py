@@ -16,9 +16,6 @@ from torch.nn.modules.utils import _triple
 CACHE_T = 2
 
 
-# ── Memory-efficient Conv layers ──
-
-
 class Conv3dActGradOnlyFunction(torch.autograd.Function):
     """Conv3d that only computes input gradient, not weight gradient.
 
@@ -136,9 +133,6 @@ class CausalConv3dActGradOnly(CausalConv3d):
         return Conv3dActGradOnlyFunction.apply(
             x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups
         )
-
-
-# ── Building blocks ──
 
 
 def check_is_instance(model, module_class):
@@ -342,9 +336,6 @@ class AttentionBlock(nn.Module):
         return x + identity
 
 
-# ── Encoder / Decoder ──
-
-
 class Encoder3d(nn.Module):
     def __init__(
         self,
@@ -517,9 +508,6 @@ def count_conv3d(model):
     return sum(1 for m in model.modules() if isinstance(m, CausalConv3d))
 
 
-# ── VideoVAE_ (core model) ──
-
-
 class VideoVAE_(nn.Module):
     def __init__(
         self,
@@ -609,9 +597,6 @@ class VideoVAE_(nn.Module):
         self._enc_conv_num = count_conv3d(self.encoder)
         self._enc_conv_idx = [0]
         self._enc_feat_map = [None] * self._enc_conv_num
-
-
-# ── WanVideoVAE (top-level wrapper) ──
 
 
 def _replace_conv_with_act_grad_only(model):
@@ -767,10 +752,6 @@ class WanVideoVAE(nn.Module):
         self.upsampling_factor = 8
         self.z_dim = z_dim
 
-        # diffusers-compatible config for WanPipeline.__init__ compatibility.
-        # WanPipeline reads vae.config.scale_factor_temporal/spatial in __init__.
-        # ``scaling_factor`` is exposed only as a legacy fallback — the real
-        # un-normalization always uses ``latents_mean`` / ``latents_std``.
         self.config = _SimpleConfig(
             scale_factor_temporal=4,
             scale_factor_spatial=8,
@@ -780,7 +761,6 @@ class WanVideoVAE(nn.Module):
             scaling_factor=1.0,
         )
 
-        # Build model with standard conv, then optionally replace with act-grad-only
         self.model = (
             VideoVAE_(
                 z_dim=z_dim,
@@ -793,8 +773,6 @@ class WanVideoVAE(nn.Module):
         if use_act_grad_only_conv:
             _replace_conv_with_act_grad_only(self.model)
 
-    # ── Properties / dtype shim ──
-
     @property
     def dtype(self) -> torch.dtype:
         """Parameter dtype, matching the diffusers ``vae.dtype`` convention.
@@ -804,8 +782,6 @@ class WanVideoVAE(nn.Module):
         stays in sync if the module is later ``.to(dtype=...)``-cast.
         """
         return next(self.parameters()).dtype
-
-    # ── Encode / Decode ──
 
     def single_encode(self, video, device):
         video = video.to(device)
@@ -835,7 +811,6 @@ class WanVideoVAE(nn.Module):
            normalized latent. The VAE is non-stochastic in this port
            , so ``mode()`` and ``sample()`` agree.
         """
-        # Diffusers-compatible path: single 5D tensor, infer device.
         if device is None and isinstance(videos, torch.Tensor) and videos.dim() == 5:
             target_device = videos.device
             latents = self._encode_batched(videos, target_device, tiled, tile_size, tile_stride)
@@ -879,8 +854,6 @@ class WanVideoVAE(nn.Module):
         else:
             video = self.single_decode(hidden_states, device)
         return video
-
-    # ── Tiled operations ──
 
     def build_1d_mask(self, length, left_bound, right_bound, border_width):
         x = torch.ones((length,))
@@ -984,16 +957,13 @@ class WanVideoVAE(nn.Module):
         for h, h_, w, w_ in rank_tasks:
             batch = hidden_states[:, :, :, h:h_, w:w_].to(device)
             batch = self.model.decode(batch, self.scale).to(device)
-            # Pad to uniform tile size for all_gather
             padding = (0, tile_img_w - batch.shape[-1], 0, tile_img_h - batch.shape[-2])
             if padding != (0, 0, 0, 0):
                 batch = F.pad(batch, padding)
             all_decoded.append(batch)
 
-        # Stack and all_gather across SP ranks
-        local_stack = torch.stack(all_decoded, dim=0)  # (num_local_tasks, B, C, T, H, W)
+        local_stack = torch.stack(all_decoded, dim=0)
         gathered = [torch.empty_like(local_stack) for _ in range(world_size)]
-        # Pad to max local tasks across ranks
         max_tasks = max(
             (task_end - task_start)
             for s, e in [_get_task_range(len(tasks), world_size, r) for r in range(world_size)]
@@ -1013,7 +983,6 @@ class WanVideoVAE(nn.Module):
         dist.all_gather(gathered, local_stack.contiguous(), group=sp_group)
         all_decoded_global = torch.cat(gathered, dim=0)
 
-        # Reassemble tiles (using global task order)
         for i, (h, h_, w, w_) in enumerate(tasks):
             if i >= all_decoded_global.shape[0]:
                 break
@@ -1080,8 +1049,6 @@ class WanVideoVAE(nn.Module):
 
         return values / weight
 
-    # ── HF Diffusers weight loading ──
-
     @classmethod
     def load_from_diffusers(cls, pretrained_path, **kwargs):
         """Load WanVideoVAE from HuggingFace diffusers format.
@@ -1109,9 +1076,6 @@ class WanVideoVAE(nn.Module):
         return vae
 
 
-# ── State dict converter ──
-
-
 def convert_diffusers_state_dict(hf_sd: dict) -> OrderedDict:
     """Convert HuggingFace AutoencoderKLWan state dict to WanVideoVAE format.
 
@@ -1121,9 +1085,6 @@ def convert_diffusers_state_dict(hf_sd: dict) -> OrderedDict:
     """
     new_sd = OrderedDict()
 
-    # ResidualBlock internal mapping
-    # HF: norm1.gamma, conv1.{w,b}, norm2.gamma, conv2.{w,b}, conv_shortcut.{w,b}
-    # ROLL: residual.{0.gamma, 2.{w,b}, 3.gamma, 6.{w,b}}, shortcut.{w,b}
     resblock_map = {
         "norm1.gamma": "residual.0.gamma",
         "conv1.weight": "residual.2.weight",
@@ -1135,10 +1096,6 @@ def convert_diffusers_state_dict(hf_sd: dict) -> OrderedDict:
         "conv_shortcut.bias": "shortcut.bias",
     }
 
-    # AttentionBlock internal mapping (keys match directly)
-    # HF: norm.gamma, to_qkv.{w,b}, proj.{w,b}
-    # ROLL: norm.gamma, to_qkv.{w,b}, proj.{w,b}
-
     for hf_key, tensor in hf_sd.items():
         roll_key = _convert_single_key(hf_key, resblock_map)
         new_sd[roll_key] = tensor
@@ -1149,17 +1106,14 @@ def convert_diffusers_state_dict(hf_sd: dict) -> OrderedDict:
 def _convert_single_key(hf_key: str, resblock_map: dict) -> str:
     """Convert a single HF key to ROLL key."""
 
-    # quant_conv / post_quant_conv
     if hf_key.startswith("quant_conv."):
         return "model.conv1." + hf_key[len("quant_conv.") :]
     if hf_key.startswith("post_quant_conv."):
         return "model.conv2." + hf_key[len("post_quant_conv.") :]
 
-    # Encoder
     if hf_key.startswith("encoder."):
         return "model.encoder." + _convert_encoder_key(hf_key[len("encoder.") :], resblock_map)
 
-    # Decoder
     if hf_key.startswith("decoder."):
         return "model.decoder." + _convert_decoder_key(hf_key[len("decoder.") :], resblock_map)
 
@@ -1167,19 +1121,15 @@ def _convert_single_key(hf_key: str, resblock_map: dict) -> str:
 
 
 def _convert_encoder_key(key: str, rb_map: dict) -> str:
-    # conv_in → conv1
     if key.startswith("conv_in."):
         return "conv1." + key[len("conv_in.") :]
 
-    # norm_out → head.0
     if key.startswith("norm_out."):
         return "head.0." + key[len("norm_out.") :]
 
-    # conv_out → head.2
     if key.startswith("conv_out."):
         return "head.2." + key[len("conv_out.") :]
 
-    # down_blocks.{i}.{suffix}
     if key.startswith("down_blocks."):
         rest = key[len("down_blocks.") :]
         dot = rest.index(".")
@@ -1187,7 +1137,6 @@ def _convert_encoder_key(key: str, rb_map: dict) -> str:
         suffix = rest[dot + 1 :]
         return "downsamples." + block_idx + "." + _convert_resblock_suffix(suffix, rb_map)
 
-    # mid_block: HF [attn, res0, res1] → ROLL [res0(middle.0), attn(middle.1), res1(middle.2)]
     if key.startswith("mid_block."):
         rest = key[len("mid_block.") :]
         if rest.startswith("resnets.0."):
@@ -1204,19 +1153,15 @@ def _convert_encoder_key(key: str, rb_map: dict) -> str:
 
 
 def _convert_decoder_key(key: str, rb_map: dict) -> str:
-    # conv_in → conv1
     if key.startswith("conv_in."):
         return "conv1." + key[len("conv_in.") :]
 
-    # norm_out → head.0
     if key.startswith("norm_out."):
         return "head.0." + key[len("norm_out.") :]
 
-    # conv_out → head.2
     if key.startswith("conv_out."):
         return "head.2." + key[len("conv_out.") :]
 
-    # mid_block: same reorder as encoder
     if key.startswith("mid_block."):
         rest = key[len("mid_block.") :]
         if rest.startswith("resnets.0."):
@@ -1229,8 +1174,6 @@ def _convert_decoder_key(key: str, rb_map: dict) -> str:
             suffix = rest[len("resnets.1.") :]
             return "middle.2." + _convert_resblock_suffix(suffix, rb_map)
 
-    # up_blocks.{block_i}.resnets.{res_j}.{suffix} → upsamples.{flat_idx}.{suffix}
-    # up_blocks.{block_i}.upsamplers.0.{suffix} → upsamples.{flat_idx}.{suffix}
     if key.startswith("up_blocks."):
         return _convert_upblock_key(key[len("up_blocks.") :], rb_map)
 
@@ -1259,9 +1202,7 @@ def _convert_upblock_key(key: str, rb_map: dict) -> str:
     block_idx = int(key[:dot])
     rest = key[dot + 1 :]
 
-    # Base offset: each block contributes 4 items (3 resnets + 1 upsampler)
-    # except the last block which has 3 items (3 resnets, no upsampler)
-    base = block_idx * 4  # works for blocks 0,1,2; block 3 won't have upsampler
+    base = block_idx * 4
 
     if rest.startswith("resnets."):
         rest2 = rest[len("resnets.") :]
@@ -1284,5 +1225,4 @@ def _convert_resblock_suffix(suffix: str, rb_map: dict) -> str:
     for hf_pattern, roll_pattern in rb_map.items():
         if suffix == hf_pattern or suffix.startswith(hf_pattern):
             return suffix.replace(hf_pattern, roll_pattern, 1)
-    # Pass through (e.g. resample.*, time_conv.*)
     return suffix

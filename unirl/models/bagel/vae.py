@@ -95,12 +95,7 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
     def __init__(self, bundle: "BagelBundle", *, decode_batch_size: int = 4) -> None:
         self.bundle = bundle
-        # Chunk the VAE decode along the batch axis. With a unified rollout the
-        # pipeline fans ONE prompt out to G samples internally, so this stage can
-        # receive all G latents at once (e.g. G=24 @ 1024²). The fp32 decoder's
-        # upsample conv2d peaks at ~1GB/image, so decoding 24 at once OOMs a
-        # 7B-resident card; 4/chunk bounds the peak. Pure no_grad inference,
-        # per-image independent → numerically identical.
+        # Decode VAE batches in chunks to bound fp32 convolution memory.
         self.decode_batch_size = max(1, int(decode_batch_size))
 
     def decode(
@@ -129,7 +124,7 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError(
                 f"BagelVAEDecodeStage.decode: expected packed latents [N, K, seq, C], got {tuple(s.latents.shape)}"
             )
-        clean = s.latents[:, -1]  # [N, seq, p²·z]
+        clean = s.latents[:, -1]
         n, seq, _ = clean.shape
 
         p = int(self.bundle.latent_patch_size)
@@ -153,8 +148,6 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             bs = self.decode_batch_size
             if n <= bs:
                 return vae_fp32.decode(spatial)
-            # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
-            # (per-image independent; cat keeps the [N, 3, H, W] order).
             return torch.cat([vae_fp32.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
 
         with nullcontext() if grad else torch.no_grad():
@@ -164,20 +157,8 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
                 decoded = _decode(clean)
-        # Framework convention (qwen_image / sd3 / flux2_klein): the VAE stays fp32
-        # after the first decode — the .to(float32) above is a one-time lazy upcast,
-        # a no-op on later calls. The shared encode path is dtype-safe regardless:
-        # pipeline.py casts encode inputs/outputs at the vendor boundary, so the
-        # downstream bf16 vae2llm is unaffected. (This also removes the old restore's
-        # leak, where an activation_checkpoint backward recompute re-cast the VAE to
-        # fp32 after the restore had run.)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
-        # Move to CPU before returning: decoded pixels are only ever consumed as
-        # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow
-        # algorithm uses latents, not decoded images. Keeping them on GPU makes the
-        # reward-step ray.get() gather deserialize onto the driver's cuda:0 (stacked
-        # on the rank-0 worker) → OOM at 32-GPU scale where the gathered batch is 4×
-        # the 8-GPU smoke.
+        # Return decoded pixels on CPU to avoid driver-side GPU gathers.
         return Images(pixels=pixels.cpu())
 
 

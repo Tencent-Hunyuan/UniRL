@@ -53,37 +53,24 @@ class ToolAgentHarness:
         sample = request
         env_reward: Optional[float] = None
         try:
-            sample = self.env.reset(request)  # [input(1)], root id = prompt id
+            sample = self.env.reset(request)
             turns_done = len(sample.gen_parts())
             for _ in range(self.max_turns - turns_done):
-                if context.suspend_requested():  # partial rollout: checkpoint at the turn boundary
+                if context.suspend_requested():
                     return HarnessOutcome(sample, "suspended", env_reward)
-                sample = context.generate(self.ENGINE, sample.fork(1, sampling_params=self.sampling))  # +[gen(1)]
-                observation, done, info = self.env.step(sample)  # blocking tool boundary, own thread
-                # Env-sourced reward (LIN-519): interactive envs (ALFWorld, …) return a
-                # per-trajectory return in ``info["reward"]`` (last value = the episode
-                # return); tool-only envs (calculator/search) omit it — a no-op here.
+                sample = context.generate(self.ENGINE, sample.fork(1, sampling_params=self.sampling))
+                observation, done, info = self.env.step(sample)
                 if isinstance(info, dict) and info.get("reward") is not None:
                     env_reward = float(info["reward"])
                 if done:
                     return HarnessOutcome(sample, "completed", env_reward)
                 if observation is not None:
-                    sample = sample.observe(observation)  # +[obs(1)]
-            return HarnessOutcome(sample, "completed", env_reward)  # max_turns reached = terminal
+                    sample = sample.observe(observation)
+            return HarnessOutcome(sample, "completed", env_reward)
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
-            # Task-level fault (backend outage, tool timeout, context overflow):
-            # return the partial trace as ``failed`` — the runtime marks it so a
-            # fault never enters advantage math as a legitimate low-scoring
-            # sibling. Any partial ``env_reward`` is deliberately dropped: a
-            # reward collected before the fault does not describe a complete
-            # trajectory.
             logger.warning("ToolAgentHarness: trajectory failed: %s", exc, exc_info=True)
             return HarnessOutcome(sample, "failed")
         finally:
-            # Guaranteed teardown (LIN-533): end any open tool sessions / episodes
-            # for this trajectory — on success, crash, AND suspension. Duck-typed
-            # like ``tool_schemas`` so envs without ``close`` are unaffected, and
-            # wrapped so a teardown error can never re-raise.
             close = getattr(self.env, "close", None)
             if close is not None:
                 try:
