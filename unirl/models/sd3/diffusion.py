@@ -520,7 +520,6 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
             if cond is None:
                 return None
-            # Preserve the unused mask for condition consistency.
             return TextEmbedCondition(
                 embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
             )

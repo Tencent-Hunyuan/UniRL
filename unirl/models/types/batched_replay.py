@@ -1,35 +1,32 @@
 """Shared batched replay for stateless diffusion SDE stages.
 
-Replay steps are stacked step-major on the batch dimension so one batched
-step call replaces the serial loop. Concrete stages tile their conditions
-and supply any model-specific step arguments.
+The ``S`` replay steps of a stored trajectory are stacked step-major on the
+batch dim (``[S*B, ...]``), so one batched step call replaces the serial
+per-step loop: ONE transformer forward — i.e. one FSDP all-gather of the
+sharded transformer — instead of ``S``. Concrete stages supply the per-model
+pieces via :meth:`BatchedStepReplayMixin._tile_conditions` and
+:meth:`BatchedStepReplayMixin._batched_step_kwargs`.
+
+Callers gate this path on all three of: the stage's ``batch_replay_steps``
+flag, ``S > 1``, and a stateless :class:`~unirl.sde.kernels.SDEStrategy`
+(Flow / Dance / CPS, which ignore ``step_index``). Anything else takes the
+serial loop; the stateful ``DPM2Strategy`` is an ODE strategy and so can
+never enter here.
 
 Requires ``old_logp_source='replay'``
 -------------------------------------
 A ``[S*B]`` forward is numerically equivalent to the ``[B]`` forward the
-rollout ran, but **not** bit-identical: the batch shape changes GEMM tiling and
-reduction order, so per-sample log-probs move at the rounding level. The PPO
-ratio is only exact when the π_old anchor and the train pass take the *same*
-batched path, i.e. under ``old_logp_source='replay'``. Pairing this with the
-default ``'rollout'`` anchor is rejected at algorithm construction
+rollout ran, but **not** bit-identical: the batch shape changes GEMM tiling
+and reduction order, so per-sample log-probs move at the rounding level —
+and by more on models whose forward restructures with the batch (z_image's
+per-sample lists, flux2_klein's rebuilt RoPE ids) than on sd3 / qwen_image.
+
+The PPO ratio therefore stays exact only when the π_old anchor and the train
+pass take the *same* batched path at the *same* micro-geometry — which is
+what ``old_logp_source='replay'`` gives, since ``TrainStack.prepare_segment``
+replays the anchor per micro-slice. Pairing the flag with the default
+``'rollout'`` anchor is rejected at algorithm construction
 (``_require_replay_anchor_for_batched_replay``).
-
-Measured max per-sample log-prob gap versus the serial path (H20, bf16, B=2,
-S=3), worst strategy per model — compare against the recipe's ``clip_range``:
-
-===========  ====================  ====================
-model        Flow                  Dance / CFG
-===========  ====================  ====================
-sd3          2e-7                  3e-8
-qwen_image   2e-7                  1e-6 (CFG)
-flux2_klein  1e-5                  9e-4 (Dance+CFG)
-z_image      1e-4                  6e-3 (Flow+CFG)
-===========  ====================  ====================
-
-sd3 / qwen_image sit far below any usable ``clip_range``. z_image and
-flux2_klein do not: their list-based / RoPE-rebuilding forwards restructure
-more when the batch grows, so at ``clip_range=1e-4`` the residual is visible as
-extra clipping even with a replay anchor.
 """
 
 from __future__ import annotations
@@ -47,12 +44,18 @@ if TYPE_CHECKING:
 class BatchedStepReplayMixin:
     """Model-agnostic batched replay implementation.
 
-    Hosts provide ``model``, ``step``, ``strategy``, precision dtypes, and
-    :meth:`_tile_conditions`.
+    The host stage must provide ``model``, ``step``, ``strategy``,
+    ``logprob_dtype``, ``trajectory_dtype``, and :meth:`_tile_conditions`.
     """
 
     def _tile_conditions(self, conditions: Any, repeats: int) -> Any:
-        """Tile conditions for ``repeats`` step-major blocks."""
+        """Repeat EVERY conditioning field ``repeats``× along the batch dim.
+
+        Each block of ``B`` rows reuses the same per-sample conditioning,
+        since all ``S`` steps replay the SAME ``B`` trajectories at different
+        timesteps. A field left untiled here is silently dropped from the
+        batched forward, so cover the whole conditions container.
+        """
         raise NotImplementedError(f"{type(self).__name__} must implement _tile_conditions for batched replay")
 
     def _batched_step_kwargs(self, segment: "LatentSegment", params: Any) -> Dict[str, Any]:
@@ -71,6 +74,10 @@ class BatchedStepReplayMixin:
         device: torch.device,
     ) -> ReplayResult:
         """Replay ``target`` steps in one step-major batch.
+
+        Returns log-probs as ``[B, S]`` with slot ``s`` aligned to
+        ``target[s]``, matching what the serial loop stacks — so callers can
+        swap paths without touching ``segment.sde_logp`` ordering.
 
         Callers restrict this path to stateless SDE strategies, so
         ``target[0]`` can be used as the shared ``step_index``.

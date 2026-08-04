@@ -36,9 +36,9 @@ class SD3PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
-    # See SD3DiffusionStage.batch_replay_steps and BatchedStepReplayMixin; exposed
-    # here so non-trainside recipes can opt in via SD3Pipeline.from_config.
-    # Requires old_logp_source='replay'.
+    # Collapse the S replay forwards into one batched [S*B] forward; see
+    # unirl.models.types.batched_replay.BatchedStepReplayMixin. Requires
+    # old_logp_source='replay', and costs ~S x the replay activation memory.
     batch_replay_steps: bool = False
 
     # Diffusion schedule policy. ``shift`` is the FlowMatch time-shift used

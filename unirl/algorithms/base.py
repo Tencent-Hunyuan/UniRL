@@ -315,14 +315,17 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
 def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
     """Reject batched-step replay paired with a rollout-sourced π_old anchor.
 
-    ``batch_replay_steps`` stacks the ``S`` replay steps on the batch dim, and a
-    ``[S*B]`` forward is not bit-identical to the ``[B]`` forward the rollout ran
-    — measured per-sample log-prob gaps reach ~6e-3 on Z-Image and ~9e-4 on
-    FLUX.2-klein, i.e. well outside a typical ``clip_range`` (1e-4). The ratio is
-    only exact when the anchor and the train pass take the *same* batched path,
-    which is what ``old_logp_source='replay'`` does. With the default
+    ``batch_replay_steps`` stacks the ``S`` replay steps on the batch dim, and
+    that ``[S*B]`` forward is not bit-identical to the ``[B]`` forward the
+    rollout ran (see :mod:`unirl.models.types.batched_replay`). The ratio is
+    exact only when the anchor and the train pass take the *same* batched path,
+    which is what ``old_logp_source='replay'`` does; with the default
     ``'rollout'`` anchor the two sides disagree and the clip term silently
     misfires, so fail fast instead.
+
+    Every diffusion algorithm that drives ``stage.replay`` against a π_old
+    anchor must call this — today ``FlowGRPO`` (and its ``BagelFlowUniGRPO``
+    subclass) and ``FlowDPPO``.
     """
     if not getattr(stage, "batch_replay_steps", False):
         return
