@@ -1955,4 +1955,241 @@ bash examples/run_experiment_single_node.sh \
 - 不要去"修" `[T,C,H,W]` 和 `(C,T,H,W)` 的差异——`types/reward.py:73-77` 的 permute 已经桥接了（§19.9.4）。
 - 不要改原来那两个 flashgrpo recipe 来接 remote reward——用户明确要求新增文件（§19.9.1 第 3 条）。
 
-*§19.10 是当前 Resume 入口。再有新 session 请覆盖本节。*
+*§19.10 已被 §19.13 覆盖（保留作历史记录）。特别注意：本节第 2 条建议的 `frame_stride: 8` 先跑通、以及"降到 1 成本 ~8 倍"的说法，已被 §19.12 的实测推翻——以 §19.13 为准。*
+
+### 19.11 HPSv3 backbone 上 FlashAttention（fa 调查 + FA2 pin）（2026-07-27）
+
+**背景问题**：用户问「配置中默认用 fa 还是 sdpa」，然后要求给 reward 端装 fa2。
+
+**调查结论（两侧默认都是 SDPA）**：
+- **训练侧（WAN21）**：recipe 不设 `attn_implementation`；`bundle.py:129` 用 diffusers `WanTransformer3DModel.from_pretrained`，默认 processor 是 `WanAttnProcessor` → `dispatch_attention_fn` → active backend 默认 `DIFFUSERS_ATTN_BACKEND=os.getenv(...,"native")`（`diffusers/utils/constants.py:46`），`native` = `torch.nn.functional.scaled_dot_product_attention`。unirl 无任何 `set_active_backend` / `attention_backend()` / env 覆盖，故停在 SDPA。注意 torch SDPA 在 H20+bf16 下内部通常已 dispatch 到 flash kernel，不是慢的 math 路径。train base venv 里 *有* `flash_attn_4-4.0.0b15`（FA4 beta），但 diffusers 默认没启用它。想显式走 diffusers flash backend：`export DIFFUSERS_ATTN_BACKEND=flash` 或 `with attention_backend("flash"):`，无需改代码。
+- **奖励侧（HPSv3 / Qwen2-VL-7B）**：`hpsv3_scorer` → `HPSv3RewardInferencer`（`inference.py:30`）→ `create_model_and_processor`（`hpsv3/train.py`）。该函数 `try: import flash_attn`，命中且 `disable_flash_attn2=False`（dataclass 默认 + `HPSv3_7B.yaml` 都是 False）时才传 `attn_implementation="flash_attention_2"`，否则 sdpa。**决定因素 = `flash_attn`(FA2) 包能否 import**。Ray actor 的 runtime_env venv（`include-system-site-packages=false`，纯净）只装 `envs/hpsv3.txt`，其中原本没有 flash_attn，故实测落到 SDPA。
+
+**reward actor venv 实测环境**（wheel 必须精确对齐）：py3.12 · torch **2.12.1+cu130** · CUDA 13.0 · cxx11abi=True · sm_90 (Hopper)。
+
+**为什么是 FA2 而不是 FA3**：HPSv3 gate 在 `import flash_attn`（FA2 模块名）且**写死** `"flash_attention_2"`。FA3 的导入名是 `flash_attn_interface`，且 transformers 的 FA2 路径不调 FA3 kernel —— 装 FA3 会被完全忽略，除非改 HPSv3 源码（违反本仓「不 patch 绕环境」硬规矩）。故选 FA2。
+
+**改动（文件）**：`envs/hpsv3.txt` 末尾 pin 预编译 FA2 wheel（PyPI 版会从源码编译、需 nvcc、易失败）：
+```
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.17/flash_attn-2.8.3%2Bcu130torch2.12-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
+```
+wheel 源 = `mjun0812/flash-attention-prebuild-wheels`。已验证 URL 可达（302→CDN→200，~231 MB）。`workers/group.py:_build_runtime_env` 按行读入、跳过 `#` 注释,裸 URL 作为一个 pip package 传给 Ray runtime_env pip，语法有效;预编译 wheel 无源码构建，不需要 `# pip-options: --no-build-isolation`。
+
+**测试**：纯 env pin、无代码逻辑 → 命中 §4.5.2 免测清单，不补单测。
+
+**未完成 / 待验证**：pin 只在**下次 hpsv3 缓存 venv 重建 + reward service 重启**时生效。当前有一条 8 卡训练正用着 reward service，重启会打断它的 reward backend，属破坏性操作，**未擅自执行**，等用户决定。生效后应确认 actor 日志不再打 "Flash Attention is not installed. Falling to SDPA." 并且显存/吞吐符合预期。hpsv3 与 videohpsv3 两个 scorer 共用本文件，改动后两者仍一致、仍共享同一缓存 venv。
+
+**绝对不要做的事（本次新增）**：
+- 不要给 HPSv3 reward 端装 FA3 指望它生效——HPSv3 gate 在 `import flash_attn`(FA2) 且写死 `flash_attention_2`，FA3 导入名不同会被忽略（§19.11）。
+- 不要用 PyPI 的裸 `flash-attn`——会从源码编译。必须 pin 与 venv 精确对齐的预编译 wheel（cp312 / torch2.12 / cu130）。换 torch/CUDA/py 版本后这条 wheel URL 需重挑。
+
+*Resume 时：fa 相关事实以 §19.11 为准，其余仍看 §19.10。*
+
+### 19.12 reward 崩塌诊断 + 三项修复重启（2026-07-28）
+
+**背景**：`frame_stride: 8` 那条 8 卡训练跑了 22 小时（74 rollouts），reward 先升后崩——rollout 1-44 为正、29-38 见顶（+4.15/+4.39/+4.86），50-74 转负、最低 -7.6794。用户问「为什么我们的reward一直在下降」。
+
+**诊断结论：真实的 over-optimization / reward hacking，不是基础设施故障。** 证据：
+- step 时间 **1054.1s ± 1.18s**（n=73，min 1051 / max 1059）——零方差。日志里 grep 不到 timeout / NaN / OOM / traceback / actor-died。
+- 读码排除了两个常见 bug：`algorithms/base.py:151-193` `_grpo_clip_loss` 的 PPO 符号正确（`unclipped = -adv*ratio`，`maximum(unclipped, clipped)`）；`types/rollout_resp.py:280-345` 的优势归一化 `(reward - group_mean)/(group_std + eps)` 正确。**组内中心化意味着 reward 的绝对水平本身不可能产生向下梯度——所以是策略真的退化了**。
+- rollout 50 是 trust-region 突破点：整个 run 唯一一次 `loss=0.0005`、`gn=0.0145`（正常值的 100 倍）、`clip=0.38`（唯一一次 clip 激活；`clip_range: 1e-3` 窄到 `ratio=1.0000` 平时根本触不到）。
+- `gn≈0.0001` 看着无害是错觉：**Adam 的步长 ≈ `lr·g/√v ≈ lr`，与梯度大小无关**。74 rollouts × `num_updates_per_batch: 2` = 148 步，LoRA `alpha 128 / rank 64` = 2× 放大 → 约 3e-2 等效漂移。`max_grad_norm: 1.0` 全程未生效（gn 比它低 4 个数量级）。
+
+**三个根因（用户批准按此重启）**：
+1. **看不见**：rollout 视频从不落盘（engine `save_output=False`，`_patches/patch_sampling_io.py` 那个 `output_file_path` 只是确定性文件名 hash），`log_media: false` → 盲飞 22 小时。
+2. **奖励可被薅**：`video_hpsv3.py:65` `top_ratio_mean` 做 `keep = max(1, int(len(scores)*top_ratio))`。stride 8 下 81 帧只采 11 帧，`int(11*0.3)` = **只保留 3 帧**——策略可以把 3 帧做漂亮、放任另外 78 帧烂掉。stride 1 时池子是 81 选 24。
+3. **prompt 分布不匹配**：`datasets/pickscore/train.txt` 是静态图美学集（25432 行、均长 113 字符、58% 逗号堆 tag），与上游 T2V 运动 prompt 集（19700 行、均长 76 字符）**只有 2 行重叠**。给视频策略的信号里没有"要动"这件事。
+
+**实测性能分解（从 wandb offline 二进制里 regex 捞出 `perf/*`）**：generate **775.7s（75.4%）**、reward **8.2s（0.8%）**、train 240.3s（23.4%）、weight_sync 0.5s、step 1029.1s。**这条 run 是 generate-bound，不是 reward-bound。**
+
+**因此推翻了 §19.9.5 第 3 条与 recipe 头部原有的"stride 1 成本 ×8、`score_timeout_s` 变成瓶颈"警告**：stride 1 的 reward ≈ 8.2 × 81/11 ≈ **60s**，step 1029→1081s，即 17.2→**18.0 分钟（+4.6%）**，`score_timeout_s: 1800` 仍有 **~30 倍余量**。stride 1 基本免费，没有理由不开。
+
+**另一个致命发现：22 小时零 checkpoint。** `save_interval` 在三个 flashgrpo recipe 里全都缺失 → `train_diffusion.py:70` 默认 `0` → `trainer/base.py:348` `if save_interval <= 0: return`。**commit da2b5dd "Enable checkpointing for FlashGRPO SGLang" 只翻了 `activation_checkpointing: false→true` 和 `use_torch_compile: false→true`——那是激活重算，不是存权重。** 所以崩塌后无处可回滚，22 小时权重永久丢弃。
+
+**文件改动清单**：
+- 修改 `configs/videohpsv3_service.yaml`：`frame_stride: 8 → 1`（含注释改写为实测成本 + 说明为何不该调高）；`weights_path` 从占位符 `/path/to/RewardModel/HPSv3` 填成真实路径 `/group/40173/zionyfeng/models/RewardModel/HPSv3`。
+- 修改 `examples/diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3.yaml`（训练侧，UniRL repo 根下）：
+  - 头部注释：删掉"stride 1 = ~8x 成本 / timeout 是瓶颈"的错误警告，改成实测数据 + 记录 stride-8 崩塌事故。
+  - `data_path` / `eval_data_path` → `datasets/video/{train,test}.txt`。
+  - `log_media: false → true`。
+  - 新增 `save_interval: 10` / `save_dir` / `save_mode: auto`（照 `qwen_image_edit_plus_flowgrpo_sglang.yaml:56-58` 的仓库惯例）。
+- 新增（**untracked、不提交**）`datasets/video/{train,test}.txt`：19700 / 300 行，从本地 `Flash-GRPO/dataset/video/`（`.gitignore:109` 已忽略该目录）拷贝，无需下载。
+
+**测试状态**：本次全是 YAML 值 + 注释改动与数据文件拷贝，无 Python 逻辑变更 → 命中 §4.5.2 免测清单。改用配置层验证：
+- `python -m unirl.train_diffusion --config-name ... --cfg job --resolve` 通过，确认 `save_interval: 10` / `save_dir` / `save_mode: auto` / `datasets/video/*` / `log_media: true` 全部 resolve 正确。
+- `load_config('configs/videohpsv3_service.yaml')` 通过，确认 `frame_stride: 1` + 真实 `weights_path`。
+- 链路已验证可用（读码）：media 走 `trainer/diffusion.py:523` `_drop_decoded` →（`trainer/base.py:277-284`）在释放 `decoded` 前 `build_media_preview_for_track` → `wandb_logger.py:689` `wandb.Video(..., format="mp4")`；checkpoint 走 `train_diffusion.py:70` → `trainer/base.py:330-365` `maybe_save_checkpoint`。
+
+**重启实况（2026-07-28）**：停旧训练 PID 876635（22h 权重丢弃，已事先告知用户）+ 旧 reward service PID 534894 → 8 卡显存归零 → reward service 重启（新 PID 2456101，日志 `logs/reward_videohpsv3_stride1.log`），FA2 wheel 触发缓存 venv 重建，**~4.5 分钟**后 8 个 actor 全 ready、每卡 16.4GB、`/health` 全 `videohpsv3:ready` → 训练重启（PID 2477362，日志 `logs/train_videohpsv3_stride1.log`，`WANDB_RUN_NAME=wan21_t2v_flashgrpo_videohpsv3_stride1`），确认加载 19700 条上游 prompt。
+
+**§19.11 待验证项已结清：FA2 生效。** 新 reward service 日志里 "Flash Attention is not installed. Falling to SDPA." 出现 **0 次**（旧 run 有），HPSv3 backbone 现在走 flash_attention_2。
+
+**踩到的坑**：
+- 我自己先前给的"stride 1 成本 ×8、要复核 timeout"是错的——没量 `perf/reward_time_s` 就按帧数线性外推，而 reward 只占 step 的 0.8%。**性能建议必须先量 profile 再给。**
+- wandb offline `.wandb` 用官方 `DataStore` + `Record` protobuf 解析返回 0 steps（12 条 history record 却解不出），只能 regex 扫二进制捞 `perf/*` 键旁的数值。下次要 offline 指标别指望官方 API。
+- `weights_path` 占位符是上个 session 在 service 已运行时写回去的，于是"重启 service"这个动作被埋了个哑雷——运行中的进程内存里是好路径，磁盘配置是坏路径。**改运行中服务的配置时，要么同时改对，要么在 Resume 入口标红。**
+
+### 19.13 Resume 入口（覆盖 §19.10；已被 §19.15 覆盖，保留作历史记录）
+
+**当前状态**（2026-07-28）：
+- 位置：`UniRL` worktree `feature/flashgrpo-unirl` → `unirl-reward-service/`。
+- `videohpsv3` scorer 已实现、已测（50 passed）、ruff clean。
+- **两条进程在跑**：reward service PID 2456101（`frame_stride: 1`，8 replicas，FA2 已生效）+ 训练 PID 2477362（上游 video prompts，`log_media: true`，`save_interval: 10`）。
+- **reward service 已单独开 PR**：fork PR #5（`feat/reward-service-videohpsv3` → `NancyFyong/UniRL:main`），在独立 worktree `../pr-reward-service` 里从 `origin/main` 建的，不影响本 worktree 的在跑文件。按用户要求两轮收窄后的最终形态：**9 文件 +417/-48，4 个 commit**（`dd47735` 加 repo id 支持 → `b98cc46` scorer 本体 + config → `b1015d4` envs 依赖 pin，顺序保证 bisect 时 config 依赖的代码先落地；末尾 `63928ca` 是 review 的注释精简），CI 三项全绿，PR body 已重写对齐。
+  - **脱敏/收窄清单**：① `weights_path` 不填本机路径，改成 HF repo id `MizzenAI/HPSv3`——为此在 `hpsv3_scorer.py` 加了 `_resolve_checkpoint_path`（目录 / 文件 / repo id 三种都吃，非本地值走 `hf_hub_download`，失败统一报 `FileNotFoundError` 并把两种解释都写进消息），照 `hpsv2_scorer.py:118` 的同名 staticmethod 抄的形状。**旧记录里"不能填 HF repo id"已作废**——那是我们自己 `hpsv3_scorer.py` 的透传限制，不是上游的，现已修掉。② `132adac` 带进来的 4 处 `PID 1691465` 改成"训练进程"。③ 本节 §19.12-19.13 整段不进 PR。④ `tests/` 不进 PR（50 个用例只在本 worktree，PR body 的 Test Plan 明说了这点，并声明 PR 里的 scorer 源码与跑测试的版本 `diff` 一致）。⑤ markdown 只交 `docs/ARCHITECTURE.md`，`CHANGELOG.md` / `README.md` / `docs/DEVELOPMENT_LOG.md` / `docs/RESUME_PROMPT.md` 都不交。
+  - recipe 也不在 PR 里——它 `_target_: unirl.algorithms.flashgrpo.FlashGRPO`，`main` 上没这个模块，会被 `recipe _target_ paths resolve` 钩子拦下，只能随 FlashGRPO 的 PR 一起走。
+  - **第一轮 review 已处理**（`63928ca`，追加 commit 而非 force-push，避免动到 reviewer 那份 pending draft review 的行锚点）。四条意见全是"注释太多"：① `envs/hpsv3.txt` 的 FA2 整块注释删掉、只留 wheel URL；② trl / tensorboard 注释各压到一行；③④ 两个 config 的注释精简（`videohpsv3_service.yaml` 55→41 行，`service.example.yaml` 的 videohpsv3 段 20→8 行，对齐上面 `hpsv2` 条目的密度）。纯注释改动，改完两个 config 重新过 `load_config` 取值一字未变。
+  - **reviewer 问"真的需要 trl 吗"——需要，是 import 期依赖**：`hpsv3/__init__.py` → `inference.py:9` → `hpsv3/train.py:21 from trl import get_kbit_device_map, get_quantization_config`，且 `train.py:8` 还连带 import `qwen2vl_trainer`（`:56 from trl import RewardTrainer`、`:10 from torch.utils.tensorboard import SummaryWriter`）。所以只要 `import hpsv3` 就必须有 trl + tensorboard，推理侧一行都没碰它们。实跑组合 `trl 0.21.0 / tensorboard 2.21.0 / transformers 4.57.6`。上游若把 `create_model_and_processor` 从 `train.py` 拆出去，这两个依赖才能删。
+  - **FA2 注释删掉的代价**：那行 wheel URL 是全文件最脆的一处（`cp312/torch2.12/cu130`、Hopper sm_90 硬绑定，且"装不装这个包本身就是 FA2/SDPA 的开关"），删注释后这段理由只存在于 PR 正文的 Compatibility/Risk 段和 PR 评论里。已在评论里说明并提出可以加回一行，等 reviewer 定。
+- **上游 draft PR 已开**：[Tencent-Hunyuan/UniRL#270](https://github.com/Tencent-Hunyuan/UniRL/pull/270)，`NancyFyong:feat/videohpsv3-reward-scorer` → `Tencent-Hunyuan/UniRL:main`，draft 状态，**9 文件 +417/-48，3 个 commit**（`807fb4b` repo id → `0313154` scorer + config → `89cb6a2` envs pin），5 项 CI 全绿（含 `Validate PR body sections` / `Validate PR title` / `lint` / 开源扫描）。
+  - **必须另起 worktree `../upstream-videohpsv3` 从 `upstream/main`（5d034c3）建分支**：fork 的 `origin/main` 已经岔开（比 upstream 多 37 个 commit、落后 69 个），直接拿 PR #5 的分支跨 fork 提会带进 41 个 commit。已验证那 37 个 fork-only commit 一个都没碰 `unirl-reward-service/`，所以 cherry-pick 干净；rebuild 后用 `git diff <cherry-pick 结果> HEAD` 为空证明树逐字节一致。
+  - 与 PR #5 的差别：① review 的注释精简（`63928ca`）在这里是**折进父 commit** 的（上游没见过精简前的版本，不需要保留那段历史）；② commit message 全部重写成上游读者视角（repo id 的 `HFValidationError` 理由、frame_stride 的 reward-hacking 论证、trl/tensorboard 的 import 链、"装不装 flash_attn 本身就是 FA2 开关"）。
+  - **不带测试**（用户决定）：上游 `unirl-reward-service` 根本没有 test tree（`git ls-tree -r upstream/main -- unirl-reward-service/tests` = 0），CI 也不跑 pytest。PR body 的 Test Plan 老实写了"50 个用例存在但不在 diff 里，是拷进这棵树跑过 50 passed 后删掉的，需要就推上来"。
+  - 提交前跑过模板建议的 `SKIP=no-commit-to-branch pre-commit run --from-ref upstream/main --to-ref HEAD`（→ `recipe _target_ paths resolve … Passed`，其余 hook 因 nested project 被 exclude）、`ruff check` 5 个改动文件全 clean、两个 config 过 `load_config`，以及对 `/group/40173` / `zionyfeng` / `uv_venv` / `PID` / `29.163` / `ANTHROPIC` / `_TOKEN` 的泄漏扫描（clean）。
+  - 重复劳动检查：30 个 open 上游 PR 里没有一个碰 videohpsv3 或 `unirl-reward-service` 的 video reward；recipe 仍跟着 FlashGRPO 的上游 PR #244 走。
+- 本 worktree 的改动仍**未 commit**，且**刻意保持未 commit**：`configs/videohpsv3_service.yaml` 的真实 `weights_path`（本机 16.5GB 权重，避免每次重启重新下载；新的 `_resolve_checkpoint_path` 对这个本地目录行为不变）、`docs/DEVELOPMENT_LOG.md` §19.11-19.13，以及训练侧 recipe。`tests/scorers/test_hpsv3_scorer.py`（5 个 `_resolve_checkpoint_path` 用例）同样只在本 worktree。`envs/hpsv3.txt` 的内容已随 PR #5 提交。`datasets/video/*.txt` 是数据文件，**不要提交**。
+
+**启动链（当前实际用的单机共卡形状，8 卡全用）**：
+```
+# reward（自己的 Ray 集群：port 6380 + 独立 temp-dir，与训练的 6379 分开）
+cd unirl-reward-service
+RAY_ADDRESS=127.0.0.1:6380 /group/40173/zionyfeng/uv_venv/reward-venv/bin/python \
+  -m reward_service --config configs/videohpsv3_service.yaml
+# 等 ~4.5 分钟，curl --noproxy '*' localhost:8080/health 全 ready 再起训练
+
+# 训练
+RAY_ADDRESS=127.0.0.1:6379 REPORT_TO_WANDB=true WANDB_MODE=offline \
+WANDB_PROJECT=unirl-flashgrpo WANDB_RUN_NAME=wan21_t2v_flashgrpo_videohpsv3_stride1 \
+REWARD_SERVICE_URL=http://localhost:8080 \
+/group/40173/zionyfeng/uv_venv/venv/bin/python -m unirl.train_diffusion \
+  --config-name=diffusion/wan21/wan21_t2v_flashgrpo_sglang_videohpsv3 num_devices=8
+```
+注意这里 8 个 reward actor 与训练**故意共卡**（97GB H20 上 ~16.4GB reward + ~48GB 训练），所以 `num_devices=8` 不需要 §19.10 里那套 `num_devices=7 ++devices_per_node=7`。
+
+**下次进来先做的事**（按优先级）：
+1. **看 wandb 里的 `rollout/generated_videos`**——这是本次重启的首要目的。确认策略退化形态（是否塌成静帧/糊图），以及新 prompt 集下画面是否真的有运动。
+2. **盯 reward 曲线是否还是先升后崩**。若仍崩，下一手不是继续调 reward，而是收紧优化强度：`learning_rate: 1.0e-4` 偏大（148 步 Adam 已能漂移），或降 `num_updates_per_batch: 2 → 1`。**注意 `max_grad_norm: 1.0` 在这个 run 里等于没有**（gn 比它低 4 个数量级），别指望它兜底。
+3. ~~确认 `checkpoints/wan21_t2v_flashgrpo_sglang_videohpsv3/checkpoint-10/` 在第 10 个 rollout 后真的落盘了~~ **已验证（2026-07-28 18:43）**：目录存在，`checkpoint.pt` 283 MB + `trainer_state.json`（`{"wandb_run_id": "8davz9cd", "optimizer_step": 20}`——10 个 rollout × `num_updates_per_batch: 2`，对得上）。`save_interval: 10` 链路确认可用，不再是只读码验证。wandb run id 记在这里，offline 目录对得上号。
+4. 复核 stride 1 的实测 `perf/reward_time_s`——预测 ~60s。若远超预测，说明 FA2 或 8-replica 分摊的假设有问题。
+5. 决定 `wan21_t2v_flashgrpo.yaml` 要不要配 `_videohpsv3` 兄弟文件（§19.9.8 未决）。
+6. `use_torch_compile: true` 的来源仍未定论。
+7. 提交组织：用户说好了再提交，**不要擅自 commit**。
+8. **两个 PR 的待办都在等 reviewer**：fork #5 有两条挂着的问题（`envs/hpsv3.txt` 要不要加回一行 FA2 说明；要不要给上游开 issue 把 `create_model_and_processor` 从 `hpsv3/train.py` 拆出来，拆了才能删 trl + tensorboard）；上游 #270 是 draft，等 FlashGRPO 的 #244 落地后再决定转 ready。别在没人回复的情况下自己改 PR 形态。
+
+**绝对不要做的事**（§19.7 / §19.10 / §19.11 全部继续有效，本次新增）：
+- **不要把 `frame_stride` 调回 8**——它不是"上游的便宜版"，是把 top-30% 池子从 24 帧砍到 3 帧的另一个估计量，且已实测导致 reward 崩塌（§19.12）。stride 1 只贵 4.6% step 时间。
+- **不要靠帧数线性外推来估 reward 成本**——先看 `perf/reward_time_s` 占 step 的比例。这条 run 是 generate-bound（75%），reward 只占 0.8%（§19.12）。
+- **不要看 `gn≈0.0001` 就以为优化很温和**——Adam 步长与梯度大小无关，`max_grad_norm` 在这个量级下形同不存在（§19.12）。
+- **不要在没有 `save_interval` 的情况下开长跑**——三个 flashgrpo recipe 默认全都不存权重，`da2b5dd` 那个 commit 名字骗人（它改的是 activation checkpointing）。
+- 不要用 `datasets/pickscore/*.txt` 训视频——静图美学集，与上游 T2V prompt 集只有 2 行重叠（§19.12）。
+- 不要 `git add` `datasets/video/*.txt` 或 `Flash-GRPO/`（后者已被 `.gitignore:109` 忽略）。
+- 不要指望 wandb offline `.wandb` 能用官方 `DataStore`/protobuf API 解出 history（实测 0 steps），要 regex 扫二进制（§19.12）。
+- **不要在本 worktree 里改 PR 的内容**——现在有三个 worktree：`feature-flashgrpo`（在跑的 run，配置带本机路径）、`pr-reward-service`（fork PR #5，基于 `origin/main`）、`upstream-videohpsv3`（上游 PR #270，基于 `upstream/main`）。后两个刻意保留。改 PR 前先 `git -C <worktree> status --short --branch` 确认位置——`cd` 在 Bash 块之间不保留，用 `git -C` 更稳。
+- **不要把 fork 分支直接跨 fork 提上游**——`origin/main` 已岔开 37/69 个 commit，会把无关 commit 全带进去（§19.13）。
+
+*§19.13 已被 §19.15 覆盖，保留作历史记录。*
+
+### 19.14 合并上游 11 个 commit + 修上游 `video.py`（2026-07-28）
+
+用户原话：**"把上游的最新commit给merge进来，保证上游和我们的分支的兼容和正确性"**，随后 **"把这个修复并且提bug修复 pr"**。
+
+#### 19.14.1 先量分叉，再定合并对象
+
+四个分支各自对 `upstream/main`（`5d034c3`，2026-07-28）的距离量过一遍，**不要凭印象**：
+
+| 分支 | 落后 | 领先 |
+| --- | --- | --- |
+| `feature/flashgrpo-unirl`（本次目标） | **11** | 13 |
+| `origin/main` | 69 | 37 |
+| `feat/reward-service-videohpsv3` | 69 | 41 |
+| `feat/videohpsv3-reward-scorer` | 0 | 3 |
+
+关键点：`feature/flashgrpo-unirl` 是从 **upstream** 拉出来的（merge-base `fce4f4b`），不是从 fork 的 `main`，所以只落后 11 个 commit 而不是 69 个。
+
+#### 19.14.2 在独立 worktree 里合，不动在跑的 run
+
+新建 `../merge-upstream`（分支 `feature/flashgrpo-upstream-merge`，从 `132adac` 建）。理由：302 个文件在运行中的 Ray/SGLang worker 底下变动会造成版本 skew——worker 重启时加载新代码，与已在跑的 driver 不一致。`git merge --no-edit upstream/main` → **零文本冲突**，302 files / +24603 / -6135，merge commit `8711ffd`。
+
+（`git merge-tree --write-tree` 预演走不通：本机 git 2.29.2 没有新式 merge-tree，exit 129。真建 worktree 反而更稳。）
+
+#### 19.14.3 上游这轮的破坏性重构
+
+- `unirl/types/rollout_req.py`(-196) + `rollout_resp.py`(-733) + `prompts.py` **删除**，换成 `types/sample.py`(+883) + `sample_id.py`(+62)。`RolloutReq`/`RolloutResp`/`RolloutTrack` 三件套退役，改成 `Sample`/`Part`。
+- `Sample` 只有 `parts` 和 `reward_compute_s` 两个字段；**σ schedule 不在 Sample 上**，要走 `sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas`。
+- `NoiseRecipe.from_rollout_req` → `from_sample`；`unirl.sde.ensure_req_sigmas` → `ensure_sample_sigmas`。
+- `StageAlgorithm` 新增两个类级 flag：`requires_advantages`（基类 True）、`loss_weighting`（`'sample'`/`'token'`）；`compute_loss_and_backward(advantages=...)` 放宽到 `Optional[torch.Tensor]`。
+- `a4bc183 test: remove tests directory (#267)`——**上游整个 tests 目录没了**，所以合并后的验证只能靠 import、hydra compose、ruff 和 `recipe _target_ paths resolve` 钩子，没有上游测试可跑。
+
+#### 19.14.4 兼容性验证（全过）
+
+| 检查 | 结果 |
+| --- | --- |
+| 566 文件 AST 扫 stale import | clean |
+| `sglang_diffusion.adapters` import + registry | 11 个 family 全解析，`wan21`/`ltx2` 都对 |
+| `FlashSDEStrategy` | 存活，`canonical_name="flash"`，仍在 `__all__` |
+| `patch_dance` | 存活，与上游新增的 `patch_ltx2_rollout_sde` 不冲突（后者只 patch LTX2 专有目标，且在 `hijack.py` 的 `_safe_apply` 里排在 `patch_dance` 之后）|
+| hydra compose × 3 个 flashgrpo recipe | 全 OK，`algorithm=unirl.algorithms.flashgrpo.FlashGRPO` |
+| `scripts/check_recipe_targets.py` | 2267 个 `_target_` 全解析 |
+| `ruff check` / `ruff format --check` | clean |
+| trainer 调用点 ↔ `FlashGRPO.compute_loss_and_backward` | 两处调用点（`train/unified_model_stack.py:205`、`train/stack/base.py:256`）传的 5 个 kwarg 全满足 |
+| 新 flag 继承 | `requires_advantages=True`、`loss_weighting='sample'` 正确继承；`supports_multi_update=True` 保住（我们 `num_updates_per_batch: 2` 依赖它）；`anchor_fields=('sde_logp',)` 不变；无未实现抽象方法 |
+| recipe schema drift | **无**——上游这 11 个 commit 只碰了一个 WAN recipe，且那个 hunk 是 FastVideo 专属的纯注释 |
+
+两个**假线索**，记下来免得下次误判：
+- `unirl/config/validation.py` 里的 `validate_*` 函数是给**扁平的 LLM recipe schema** 用的（`training`/`run`/`placement` 顶层键），diffusion recipe 是另一套 schema（`model_config`/`strategy`/`bundle`/...）。`unirl/` 里没有任何地方调它们，原调用点在被删的 tests 里。**拿它们校验 diffusion recipe 会全红，那是 harness 的错不是代码的错。**
+- `unirl.patch.dance` 这个路径不存在，真实路径是 `unirl/rollout/engine/sglang_diffusion/_patches/patch_dance.py`。
+
+#### 19.14.5 唯一的真 bug 在上游，不在合并
+
+`unirl/rollout/engine/sglang_diffusion/adapters/video.py` 在**纯净的 `upstream/main`** 上就是坏的：`5d034c3`(#233) 加了 `Ltx2T2VAdapter`，而同区间的 `89115c9`(#214) 删了 `rollout_req.py`，这个文件只被移植了一半。三处残留：
+
+| 行（upstream 原文） | 残留 | 后果 |
+| --- | --- | --- |
+| 36 | `from unirl.types.rollout_req import RolloutReq` | `ModuleNotFoundError`，模块级即炸 |
+| 234 | `NoiseRecipe.from_rollout_req(req)` | `AttributeError` |
+| 315 | `expected_sigmas=req.sigmas` | `AttributeError`，`Sample` 无此字段 |
+
+`adapters/__init__.py:25` 是**无 try/except 保护的普通 import**，一次把 `Wan21T2VAdapter`/`Wan22T2VAdapter`/`HunyuanVideoAdapter`/`MochiAdapter` 和 LTX2 从同一模块拉进来，所以 **`upstream/main` 上任何 sglang_diffusion rollout 都起不来**，WAN 连带阵亡，不只是 LTX2。实证方式：把修复 `git stash` 掉让工作树退回 pristine upstream 代码，再 import，拿到真 traceback（不是推断）。上游没接住是因为 #267 把测试删了，而这条路径只在 import 时炸。
+
+修法是 4 处编辑（+5/-6，全在 `Ltx2T2VAdapter` 内，`Wan21T2VAdapter` 本身干净），照抄上游**自己已经移植好**的 `image.py:315` 和同文件父类 `VideoAdapter.build_segment`：删死 import、`req: RolloutReq` → `sample: Sample`（两处）、`from_rollout_req` → `from_sample`、`req.sigmas` → `sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas`（`DiffusionSamplingParams` 原本就在 38 行导入过）。**同一个文件里父类是新 API、子类是旧 API**，这本身就证明是漏改。
+
+#### 19.14.6 上游 bug 修复 PR #272
+
+[Tencent-Hunyuan/UniRL#272](https://github.com/Tencent-Hunyuan/UniRL/pull/272)，`NancyFyong:fix/sglang-diffusion-video-adapter-sample-api` → `Tencent-Hunyuan/UniRL:main`，**非 draft**（`main` 上 import 就挂，属 P0），1 文件 +5/-6，单 commit `9e23b27`，4 项 CI 全绿（`Validate PR title` / `Validate PR body sections` / `lint` / `Sync PR status label`）。
+
+- 第四个 worktree `../fix-video-adapter`，分支从 `upstream/main` 建——**不能拿 `merge-upstream` 那条分支提**，它带着 302 文件的合并。做法是 `git diff` 出补丁跨 worktree apply，`git apply --check` 先确认能干净落到 pristine upstream 上。
+- PR body 老实写了两个"没跑"：`pytest`（#267 删了测试目录，`main` 上没有可跑的 suite）、LTX-2 rollout smoke（没有 LTX-2 权重和 AV 节点；那两个 `AttributeError` 只有真跑 LTX-2 才到得了，靠 API 对照 + 与 `image.py` 的 parity 验证，请有 #233 环境的人验 `ltx2_t2v_sglang_loramerge.yaml`）。
+- 查重：60 个 open PR 里没有一个碰 `adapters/video.py`，open issue 里也没人报这个 import 失败。
+- 同一个 commit 已 cherry-pick 到 `feature/flashgrpo-upstream-merge`（`edd1ecf`），所以我们的合并分支不依赖上游先合。
+
+### 19.15 Resume 入口（覆盖 §19.13，以本节为准）
+
+**当前状态**（2026-07-28）：
+- §19.13 里关于 reward service / videohpsv3 / 两个 PR（fork #5、上游 #270）/ 在跑进程 / 启动链 的描述**全部继续有效**，本节只增量覆盖合并相关的部分。
+- **五个 worktree**，改任何东西前先 `git -C <worktree> status --short --branch` 确认位置（`cd` 在 Bash 块之间不保留，用 `git -C`）：
+
+| worktree | 分支 | 用途 |
+| --- | --- | --- |
+| `feature-flashgrpo` | `feature/flashgrpo-unirl` | **在跑的 run**，配置带本机路径，7 个文件刻意未 commit |
+| `pr-reward-service` | `feat/reward-service-videohpsv3` | fork PR #5，基于 `origin/main` |
+| `upstream-videohpsv3` | `feat/videohpsv3-reward-scorer` | 上游 PR #270（draft），基于 `upstream/main` |
+| `merge-upstream` | `feature/flashgrpo-upstream-merge` | 上游合并 + video.py 修复，**等训练跑完再落** |
+| `fix-video-adapter` | `fix/sglang-diffusion-video-adapter-sample-api` | 上游 PR #272，基于 `upstream/main` |
+
+- **合并已完成但刻意未落 `feature/flashgrpo-unirl`**（用户决定：等训练跑完再落）。`merge-upstream` 上是 `8711ffd`（merge）+ `edd1ecf`（video.py 修复），工作树干净，验证证据见 §19.14.4。
+
+**下次进来先做的事**（按优先级）：
+1. §19.13 的第 1、2、4、5、6 条仍然有效（看 `rollout/generated_videos`、盯 reward 曲线、复核 `perf/reward_time_s`、`wan21_t2v_flashgrpo.yaml` 要不要配兄弟文件、`use_torch_compile` 来源）。
+2. **训练跑完后把合并落到 `feature/flashgrpo-unirl`**：在 live worktree 里 merge `feature/flashgrpo-upstream-merge`。落之前先确认 7 个未提交文件还在（merge 不会动它们，但 302 文件的变动值得先 `git stash list` / `status` 存证）。落完重跑 §19.14.4 那张表里的 import + compose + `check_recipe_targets` 三项。
+3. **盯 PR #272**：若 reviewer 指出 `expected_sigmas` 该从别处取（PR body 的 Compatibility 段主动点了这个风险），按他们的说法改，并同步改 `merge-upstream` 上的 `edd1ecf`。
+4. §19.13 第 8 条不变：fork #5 的两条问题 + 上游 #270 转 ready 都在等 reviewer，别自己改 PR 形态。
+5. 提交组织：用户说好了再提交，**不要擅自 commit**（合并分支上的两个 commit 是用户明确要求的）。
+
+**绝对不要做的事**（§19.7 / §19.10 / §19.11 / §19.13 全部继续有效，本次新增）：
+- **不要在 live worktree 里做上游合并**——302 个文件在运行中的 Ray/SGLang worker 底下变动 = 版本 skew。开独立 worktree（§19.14.2）。
+- **不要用 `unirl/config/validation.py` 的 `validate_*` 校验 diffusion recipe**——那是 LLM 的扁平 schema，全红是 harness 的错（§19.14.4）。
+- **不要假设"零冲突"就等于"能跑"**——本次唯一的真 bug 正是零冲突合并之后才暴露的，而且根源在上游而非合并（§19.14.5）。逐个验证重叠点，别信 merge 的沉默。
+- **不要拿 `merge-upstream` 分支给上游提 PR**——它带着 302 文件的合并。给上游的修复必须从 `upstream/main` 另起分支（§19.14.6）。
+- **不要指望 `git merge-tree --write-tree` 预演**——本机 git 2.29.2 不支持，exit 129。
+
+*§19.15 是当前 Resume 入口。再有新 session 请覆盖本节。*
