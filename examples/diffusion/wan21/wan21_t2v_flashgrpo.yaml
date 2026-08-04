@@ -105,7 +105,11 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-3
   clip_schedule: constant
-  old_logp_source: replay
+  # Upstream anchors the ratio on the log-prob stored during rollout
+  # (train script:1060, sample["log_probs"]), not on a train-side replay.
+  old_logp_source: rollout
+  # Upstream config/base.py:91 (adv_clip_max = 5), applied at train script:1056.
+  adv_clip_max: 5.0
   # Normalize the single sampled step by the same candidate pool upstream
   # uses: one of the first 10 steps in a 20-step trajectory.
   rectification_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -118,6 +122,12 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
+  # 2 == upstream's optimizer steps per rollout. config/dgx.py:96,101 set
+  # num_batches_per_epoch=24 and gradient_accumulation_steps=24//2=12, and the
+  # train loop reshapes the rollout into 24 micro-batches (train script:1004),
+  # so 24/12 = 2 steps. num_inner_epochs=1 (dgx.py:102) is one *pass* over the
+  # data, not one step. UniRL partitions into disjoint updates with a single
+  # frozen pi_old anchor, which is the same geometry.
   num_updates_per_batch: 2
 
 data_source:
