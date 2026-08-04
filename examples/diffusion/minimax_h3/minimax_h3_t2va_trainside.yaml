@@ -203,7 +203,23 @@ sampling:
   height: 768
   width: 768
   num_frames: 124
-  eta: 0.7
+  # MEASURED. Not the usual flow-GRPO 0.7 — that value destroys this checkpoint.
+  # H3 is GUIDANCE-DISTILLED, so its sampling trajectory is sharp and it was
+  # never trained to recover from states knocked off it. Swept at 768x768/124f,
+  # 10 steps, judged on decoded frames:
+  #     eta 0.00  clean (ODE reference)
+  #     eta 0.05  indistinguishable from ODE
+  #     eta 0.10  clean, fine detail intact          <- chosen
+  #     eta 0.20  visible softening + road artifacts (marginal)
+  #     eta 0.30  colour speckle, smeared edges      (damaging)
+  #     eta 0.70  unrecognisable noise               (what shipped first)
+  # At 0.7 the rollout produced blue/white blobs, so every reward was scored on
+  # garbage and the reward curve was flat by construction.
+  # TENSION TO WATCH: eta is also the ONLY exploration source, and its
+  # log-prob variance shrinks with it. If gradients stay ~1e-4 at 0.1, the fix
+  # is NOT to raise eta back up — it is more samples per prompt, or accepting
+  # that a distilled checkpoint has little room for SDE-based RL.
+  eta: 0.1
   # MEASURED CONSTRAINT, not a preference. replay() builds ONE autograd graph
   # across every replayed step, and at ~22k packed rows each step retains
   # ~12 GB of activation-checkpoint boundaries (50 layers x 21982 x 5376 bf16).
