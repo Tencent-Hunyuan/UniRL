@@ -321,6 +321,8 @@ class HunyuanImage3Bundle(Bundle):
             set_model_state_dict,
         )
 
+        from unirl.train.backend.sharded_state import _canonical_param_name
+
         aux_set = tuple(with_aux)
         for name in aux_set:
             if name not in {"vae", "vit"}:
@@ -371,7 +373,12 @@ class HunyuanImage3Bundle(Bundle):
                 sd = fuse_expert_state_dict(sd)
 
             # Remap LoRA base_layer keys before loading to avoid skipped parameters.
-            expected_names = {name for name, _ in self.transformer.named_parameters(remove_duplicate=False)}
+            # Canonical names: ``set_model_state_dict`` below matches against
+            # ``state_dict()`` keys, which never carry the AC-wrapper segment
+            # that ``named_parameters()`` exposes.
+            expected_names = {
+                _canonical_param_name(name) for name, _ in self.transformer.named_parameters(remove_duplicate=False)
+            }
             rename_map = {}
             for name in expected_names:
                 if not name.endswith((".base_layer.weight", ".base_layer.bias")):
