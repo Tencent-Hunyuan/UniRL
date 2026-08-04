@@ -110,8 +110,6 @@ class BooguImagePipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BooguImageVAEDecodeStage(bundle)
-        # Retained so the hosting engine can read it when constructing the
-        # FlowMatchSchedulePolicy at startup (static shift, e^{1.15}).
         self.shift = shift
 
     @classmethod
@@ -122,7 +120,7 @@ class BooguImagePipeline(Pipeline):
         (``latent_h = 2 * (H // 16)``)."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
-        vae_scale_factor = 8  # FLUX.1 AutoencoderKL with 4 block_out_channels
+        vae_scale_factor = 8
         latent_h = 2 * (height // (vae_scale_factor * 2))
         latent_w = 2 * (width // (vae_scale_factor * 2))
         return (16, latent_h, latent_w)
@@ -242,15 +240,11 @@ class BooguImagePipeline(Pipeline):
         conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(conds, schedule=schedule, params=params, initial_latents=initial_latents)
         images = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
         filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

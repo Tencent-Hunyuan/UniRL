@@ -42,50 +42,23 @@ class Flux2KleinPipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on
-    # Flux2KleinDiffusionParams) because these are operator/runtime
-    # knobs, not per-request shape. Defaults match the legacy
-    # Flux2Sampler.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Static-shift fallback for FlowMatchSchedulePolicy when the
-    # pretrained path is not a real local directory (HF repo ID,
-    # tests). In practice Klein's checkpoint enables empirical-mu
-    # shifting and this value is ignored — kept aligned with the
-    # diffusers Klein default to avoid surprising any ad-hoc consumer.
     shift: float = 1.0
 
-    # Trainer-side policy wraps the bare DiT, while vLLM-Omni / SGLang
-    # load it under the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Meta-init the transformer (build on the meta device; the backend loads
-    # weights after sharding) instead of eager ``from_pretrained``. Avoids the
-    # per-rank full-model GPU spike. Consumed by FSDPBackend / VeOmniBackend via
-    # the stashed ``_transformer_weights_path``. The Klein guidance-embedder
-    # quirk is handled by a deferred zero-init of checkpoint-absent params.
     meta_init_transformer: bool = False
 
-    # FLUX.2-klein Qwen3 text encoder budget (tokens including chat
-    # template). The legacy bundle defaults to 512.
     max_sequence_length: int = 512
 
-    # Hidden-state extraction layers for the Qwen3 text encoder. Klein
-    # concatenates layers (9, 18, 27) into the transformer's
-    # ``joint_attention_dim`` (3 * 5120 = 15360 for Qwen3-9B). Mirror
-    # ``main_flux_bundle/unirl/models/flux2.py`` Klein detection.
     qwen3_extraction_layers: Tuple[int, ...] = (9, 18, 27)
 
-    # LoRA hints for rollout-side engines (e.g. ``sglang_new``).
-    # Mirrors SD3PipelineConfig / QwenImagePipelineConfig; the
-    # trainer-side LoRA injection lives in ``cfg.training.policies``
-    # via LoRAPolicy.
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
-    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
 
     def __post_init__(self) -> None:

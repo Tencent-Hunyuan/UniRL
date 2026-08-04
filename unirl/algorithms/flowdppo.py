@@ -49,11 +49,6 @@ class FlowDPPOConfig(BaseAlgorithmConfig):
     params: Any = dc_field(default=None)
 
 
-# ---------------------------------------------------------------------------
-# Loss helpers
-# ---------------------------------------------------------------------------
-
-
 def _flowdppo_kl_adv_loss(
     *,
     new_logp: torch.Tensor,
@@ -91,19 +86,12 @@ def _flowdppo_kl_adv_loss(
     adv = advantages.detach()
     unclipped_loss = -adv * ratio
 
-    # Compute per-sample KL between new and old policy means
-    kl_per_elem = _gaussian_kl_div(new_means, old_means, sigma_t)  # [B, S', C, H, W]
-    kl_per_sample = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
+    kl_per_elem = _gaussian_kl_div(new_means, old_means, sigma_t)
+    kl_per_sample = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
 
     # KL mask: keep samples where KL < threshold (low divergence → safe to update)
     kl_mask = kl_per_sample < kl_mask_threshold
 
-    # Advantage-aware masking: among high-KL samples, remove those whose
-    # update direction conflicts with the advantage signal.
-    # - pos_rm: KL high AND ratio > 1 (increasing prob) AND adv > 0
-    #   → policy is already moving in reward direction but too aggressively
-    # - neg_rm: KL high AND ratio < 1 (decreasing prob) AND adv < 0
-    #   → policy is already moving away from bad actions but too aggressively
     pos_rm_mask = (~kl_mask) & (ratio > 1.0) & (adv > 0)
     neg_rm_mask = (~kl_mask) & (ratio < 1.0) & (adv < 0)
     rm_mask = pos_rm_mask | neg_rm_mask
@@ -113,17 +101,10 @@ def _flowdppo_kl_adv_loss(
     zero = torch.zeros((), dtype=unclipped_loss.dtype, device=unclipped_loss.device)
     loss_per_elem = torch.where(keep_adv_mask, unclipped_loss, zero)
 
-    # Metrics for logging
     if ratio.numel() > 1:
         ratio_std = ratio.std()
     else:
         ratio_std = torch.zeros((), dtype=ratio.dtype, device=ratio.device)
-    # Mask breakdown:
-    # - kl_mask_fraction: fraction of elements where KL >= threshold (high divergence)
-    # - pos_rm_fraction: fraction masked by positive-direction conflict
-    # - neg_rm_fraction: fraction masked by negative-direction conflict
-    # - masked_fraction: total fraction of elements zeroed out (the key metric)
-    # - unmasked_fraction: fraction of elements that contribute to gradient
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_std": ratio_std.detach(),
@@ -139,11 +120,6 @@ def _flowdppo_kl_adv_loss(
         "unmasked_fraction": keep_adv_mask.float().mean().detach(),
     }
     return loss_per_elem, metrics
-
-
-# ---------------------------------------------------------------------------
-# Algorithm class
-# ---------------------------------------------------------------------------
 
 
 class FlowDPPO(StageAlgorithm):
@@ -194,17 +170,11 @@ class FlowDPPO(StageAlgorithm):
         conditions_cls: Stage-typed conditions container.
     """
 
-    # prepare_segment freezes segment.sde_logp + sde_means once, so the ratio
-    # and KL anchor stay fixed across every num_updates_per_batch optimizer step.
     supports_multi_update = True
-    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2
-    # trainer must inject the FSDP backend (the trainable model lives on it).
     requires_backend = True
     anchor_fields = ("sde_logp", "sde_means")
 
     def recomputes_anchor(self) -> bool:
-        # FlowDPPO always replays sde_means for the KL term (regardless of
-        # old_logp_source), so the anchor always needs train-time geometry.
         return True
 
     def __init__(
@@ -221,8 +191,6 @@ class FlowDPPO(StageAlgorithm):
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
-        # v1 (track_builder) passes `stage`; v2 (DiffusionTrainer) passes the
-        # `pipeline` sibling and the stage is resolved off it (mirrors FlowGRPO).
         if stage is None and pipeline is not None:
             stage = getattr(pipeline, stage_attr)
         if stage is None:
@@ -277,10 +245,8 @@ class FlowDPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
-        # Log-prob anchor: replay overwrites; rollout keeps the engine's emission.
         if self.old_logp_source == "replay":
             segment.sde_logp = result.log_probs.detach().cpu()
-        # Always populate old means (core of FlowDPPO)
         if result.prev_sample_means is None:
             raise RuntimeError(
                 "FlowDPPO.prepare_segment: stage.replay() returned "
@@ -309,8 +275,8 @@ class FlowDPPO(StageAlgorithm):
             params=self.params,
             step_indices=target_steps,
         )
-        new_logp = replay_result.log_probs  # [B, S']
-        new_means = replay_result.prev_sample_means  # [B, S', C, H, W]
+        new_logp = replay_result.log_probs
+        new_means = replay_result.prev_sample_means
 
         if new_means is None:
             raise RuntimeError(
@@ -325,7 +291,6 @@ class FlowDPPO(StageAlgorithm):
             dtype=new_means.dtype, device=new_means.device
         )
 
-        # Compute sigma_t for KL normalization
         sigma_t = self._compute_sigma_t(segment, target_steps, device=new_logp.device)
 
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
@@ -348,8 +313,6 @@ class FlowDPPO(StageAlgorithm):
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
 
-        # Optional reference-policy KL penalty (Flow-DPPO eq.17): pull pi_theta toward
-        # pi_ref (LoRA-disabled base model). Distinct from the KL-to-old masking above.
         if self.beta > 0.0:
             ref_means = _reference_replay_means(
                 self.stage,
@@ -359,9 +322,6 @@ class FlowDPPO(StageAlgorithm):
                 params=self.params,
                 target_steps=target_steps,
             ).to(dtype=new_means.dtype, device=new_means.device)
-            # The beta term is the true Gaussian KL (eq.17): always normalize by the SDE
-            # transition std, independent of add_kl_coefficient (which only governs the
-            # KL-ADV masking gate above), so it matches FlowGRPO's beta term.
             kl_sigma_t = _transition_sigma(
                 self.stage,
                 segment=segment,
@@ -383,8 +343,6 @@ class FlowDPPO(StageAlgorithm):
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
         )
-
-    # -- helpers --------------------------------------------------------
 
     def _resolve_target_steps(self, segment: "LatentSegment") -> List[int]:
         """All SDE-recorded step indices on the segment."""

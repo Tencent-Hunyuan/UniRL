@@ -126,7 +126,6 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             raise ValueError(f"ARSupervisedTrackBuilder: max_response_length must be >= 1; got {max_response_length!r}")
         self.max_response_length = max_response_length
         self.append_eos = append_eos
-        # VLM chat stages take (texts, images); text-only ones take (texts).
         self._embed_takes_images = "images" in inspect.signature(self._chat_stage.embed).parameters
         self._warned_truncation = False
 
@@ -151,10 +150,6 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                 "records — token accounting is broken."
             )
         return part
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
 
     def _embed_prompts(self, records: Sequence[Record]) -> Any:
         agent_flags = ["messages" in r for r in records]
@@ -231,8 +226,6 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             if needs_eos:
                 ids = list(ids) + [eos_id]
             tokens.append(torch.tensor(ids, dtype=torch.long, device=device))
-            # _eval_pad rows ride the forward but carry zero loss weight — the
-            # trainer pads eval batches to the DP width with duplicates.
             fill = 0.0 if is_pad else 1.0
             masks.append(torch.full((len(ids),), fill, dtype=torch.float32, device=device))
         if truncated and not self._warned_truncation:
@@ -341,10 +334,6 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             segment=segment,
             metadata=[dict(record.get("metadata") or {}) for record in records],
         )
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
 
     def _load_target_pixels(self, records: Sequence[Record]) -> torch.Tensor:
         """Load + resize target images → ``[B, 3, H, W]`` fp32 in ``[0, 1]``."""

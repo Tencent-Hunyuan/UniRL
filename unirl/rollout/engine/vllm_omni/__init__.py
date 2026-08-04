@@ -8,7 +8,7 @@ component, typed self-reserved ports, and the worker-side role packages
 (``worker/`` / ``pipelines/`` / ``patches/``). Recipes select it by pointing
 their rollout ``_target_`` lines here.
 
-Imports are lazy: engine modules pull ``rollout.engine.base`` whose import
+Imports are lazy: engine modules pull ``rollout.engine.synchronous`` whose import
 chain is still initializing when reached from ``base → types → distributed``.
 """
 

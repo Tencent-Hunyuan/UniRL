@@ -79,14 +79,6 @@ _SETLORA_SENTINEL = "_unirl_lora_tensors_param"
 _LAYER_SENTINEL = "_unirl_lora_online_layer"
 _APPLY_SENTINEL = "_unirl_adapter_alpha_expand"
 
-# Reserved key for an adapter-level LoRA alpha, stored alongside the per-layer
-# weight keys in ``lora_adapters[nickname]``. Real entries are per-layer names
-# (``<layer>.lora_A`` / ``.lora_B`` / ``.alpha``); the double-underscore prefix
-# cannot collide with any transformer layer name. It holds one alpha for the
-# whole adapter; the ``_apply_lora_to_layers`` wrapper (below) expands it into
-# the per-layer ``<layer>.alpha`` keys upstream already reads, using the exact
-# layer names upstream iterates — so no per-layer name alignment is needed and
-# rename-based param mappings can't strand it.
 _ADAPTER_ALPHA_KEY = "__adapter_alpha__"
 
 
@@ -98,19 +90,11 @@ def patch_lora_tensors() -> None:
     LoRAPipeline = lp.LoRAPipeline
     logger = lp.logger
 
-    # --- (a) Register "online" as a valid merge mode --------------------------
-    # Upstream LORA_MERGE_MODES = ("auto","merge","dynamic"). UniRL ships
-    # lora_merge_mode="online" (rollout/engine/sglang/config.py), which upstream's
-    # _resolve_lora_merge_mode would reject. Extend the constant *in both modules*
-    # that reference it (server_args defines it; lora_pipeline imported it by
-    # value at import time, so rebind that binding too).
     if "online" not in sa.LORA_MERGE_MODES:
         sa.LORA_MERGE_MODES = tuple(sa.LORA_MERGE_MODES) + ("online",)
     if "online" not in lp.LORA_MERGE_MODES:
         lp.LORA_MERGE_MODES = tuple(lp.LORA_MERGE_MODES) + ("online",)
 
-    # Make _should_merge_lora_for_layers treat "online" as no-merge (compute LoRA
-    # on the fly in forward). AROUND-wrap so all other modes keep upstream policy.
     if not getattr(LoRAPipeline._should_merge_lora_for_layers, _MODES_SENTINEL, False):
         _orig_should_merge = LoRAPipeline._should_merge_lora_for_layers
 
@@ -122,29 +106,20 @@ def patch_lora_tensors() -> None:
         _should_merge_lora_for_layers._unirl_online_merge_mode = True  # type: ignore[attr-defined]
         LoRAPipeline._should_merge_lora_for_layers = _should_merge_lora_for_layers
 
-    # --- (b) AROUND-wrap __init__: set merge-mode attrs + online prewrap -------
     if not getattr(LoRAPipeline.__init__, _INIT_SENTINEL, False):
         _orig_init = LoRAPipeline.__init__
 
         def __init__(self, *args, **kwargs):
             _orig_init(self, *args, **kwargs)
-            # Fork additions: expose the configured merge mode on the instance.
             self.lora_merge_mode = self.server_args.lora_merge_mode
             self.auto_merge = self.lora_merge_mode == "merge"
-            # RL workflow: when online and no startup lora_path, upstream __init__
-            # did NOT wrap any layers. Wrap them now so weight-sync targets exist
-            # before the first adapter arrives. (When lora_path is set, upstream
-            # __init__ already called convert_to_lora_layers + set_lora.)
             if self.lora_path is None and self.lora_merge_mode == "online":
                 self.convert_to_lora_layers()
 
         __init__._unirl_lora_online_init = True  # type: ignore[attr-defined]
         LoRAPipeline.__init__ = __init__
 
-    # --- (c)+(e) setattr fork-new pipeline methods (verbatim) -----------------
     if not getattr(LoRAPipeline, _METHODS_SENTINEL, False):
-        # Bind upstream module-globals the verbatim bodies reference, so the
-        # nested fns resolve them through THIS scope (LEGB) identically.
         import hashlib
         from collections import defaultdict
         from collections.abc import Hashable
@@ -188,23 +163,15 @@ def patch_lora_tensors() -> None:
             to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
             for name, weight in lora_state_dict.items():
                 name = name.replace("diffusion_model.", "")
-                # LoRA scale is delivered adapter-wide via ``adapter_alpha`` (below),
-                # not as per-layer ``<layer>.alpha`` wire keys. Drop any stray alpha
-                # key so it is not mis-handled as a weight by the mapping/merge path.
                 if name.endswith(".alpha"):
                     continue
                 name = name.replace(".weight", "")
-                # misc-format -> HF-format
                 name, _, _ = lora_param_names_mapping_fn(name)
-                # HF-format (LoRA) -> SGLang-dit-format
                 target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
-                # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
-                # see param mapping in HunyuanVideoArchConfig
                 if merge_index is not None:
                     to_merge_params[target_name][merge_index] = weight
                     if len(to_merge_params[target_name]) == num_params_to_merge:
                         sorted_tensors = [to_merge_params[target_name][i] for i in range(num_params_to_merge)]
-                        # Use stack instead of cat because it needs to be compatible with TP.
                         weight = torch.stack(sorted_tensors, dim=0)
                         del to_merge_params[target_name]
                     else:
@@ -216,9 +183,6 @@ def patch_lora_tensors() -> None:
                     )
                 self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
             if adapter_alpha is not None:
-                # One alpha for the whole adapter; the _apply_lora_to_layers wrapper
-                # expands it into the per-layer "<layer>.alpha" keys upstream reads
-                # (scale = alpha / rank).
                 self.lora_adapters[lora_nickname][_ADAPTER_ALPHA_KEY] = torch.tensor(float(adapter_alpha))
             if lora_path is not None:
                 self.loaded_adapter_paths[lora_nickname] = lora_path
@@ -251,7 +215,6 @@ def patch_lora_tensors() -> None:
             if not self.lora_initialized:
                 return
 
-            # Map module names to their LoRA layer dicts
             module_to_lora_layers = {
                 "transformer": self.lora_layers,
                 "transformer_2": self.lora_layers_transformer_2,
@@ -263,11 +226,8 @@ def patch_lora_tensors() -> None:
                 if not lora_layers_dict:
                     continue
                 if not self.cur_adapter_name.get(module_name):
-                    continue  # No LoRA active for this module
+                    continue
 
-                # Weight sync already replaced base_layer.weight with new raw base.
-                # Just update the snapshot and mark as unmerged so forward uses
-                # online LoRA computation.
                 lora_a_hash = None
                 for name, layer in lora_layers_dict.items():
                     layer.merged = False
@@ -291,7 +251,6 @@ def patch_lora_tensors() -> None:
         LoRAPipeline.handle_weight_sync = handle_weight_sync
         setattr(LoRAPipeline, _METHODS_SENTINEL, True)
 
-    # --- (d) AROUND-wrap set_lora to accept lora_tensors= ---------------------
     if not getattr(LoRAPipeline.set_lora, _SETLORA_SENTINEL, False):
         _orig_set_lora = LoRAPipeline.set_lora
 
@@ -319,29 +278,17 @@ def patch_lora_tensors() -> None:
             ``_apply_lora_to_layers``. ``None`` leaves the scale at alpha == rank.
             """
             if lora_tensors is not None:
-                # set_lora always pre-wraps layers when uninitialized, but the
-                # registration path below needs self.modules["transformer"] param
-                # mappings only; conversion is handled by upstream set_lora. Mirror
-                # upstream's normalization to learn the rank for this call.
                 rank = self._distributed_rank()
-                # Single-nickname contract for the from-tensors path (the fork's
-                # SetLoraFromTensorsReq carries a single nickname).
                 nickname = lora_nickname[0] if isinstance(lora_nickname, list) else lora_nickname
                 if not self.lora_initialized:
                     with self._temporarily_disable_offload(target="all", use_module_names_only=True):
                         self.convert_to_lora_layers()
-                # Always reload from tensors — LoRA weights change after each
-                # training step and must be refreshed on every sync.
                 self.load_lora_adapter_from_tensors(lora_tensors, nickname, rank, adapter_alpha=lora_alpha)
-                # Invalidate cached config so _check_lora_config_matches does not
-                # short-circuit re-application of the (changed) adapter.
                 tgt_list = target if isinstance(target, list) else [target]
                 for tgt in tgt_list:
                     target_modules, _ = self._get_target_lora_layers(tgt)
                     for module_name, _layers in target_modules:
                         self.cur_adapter_config.pop(module_name, None)
-                # Delegate to upstream with lora_path=None (adapter is now present
-                # in self.lora_adapters, so upstream's path-None guard won't raise).
                 return _orig_set_lora(
                     self,
                     lora_nickname,
@@ -365,9 +312,6 @@ def patch_lora_tensors() -> None:
         set_lora._unirl_lora_tensors_param = True  # type: ignore[attr-defined]
         LoRAPipeline.set_lora = set_lora
 
-        # Small helper so the wrapper does not duplicate the dist-rank logic
-        # upstream uses inline (`dist.get_rank()`); kept defensive for the
-        # not-yet-initialized-process-group case in unit tests.
         if not hasattr(LoRAPipeline, "_distributed_rank"):
             import torch.distributed as dist
 
@@ -376,14 +320,6 @@ def patch_lora_tensors() -> None:
 
             LoRAPipeline._distributed_rank = _distributed_rank
 
-    # --- (e) AROUND-wrap _apply_lora_to_layers: expand adapter-level alpha -----
-    # Upstream reads a per-layer "<layer>.alpha" key (scale = alpha/rank) keyed by
-    # the layer name it iterates. We store ONE adapter-level alpha under
-    # _ADAPTER_ALPHA_KEY (see _register_lora_state_dict); expand it here into the
-    # per-layer keys upstream expects, using the SAME layer names upstream will
-    # iterate — so alignment is exact and rename-based mappings can't strand it.
-    # A real per-layer "<layer>.alpha" (if ever present) is left untouched and
-    # still wins. Then delegate to upstream unchanged (args/signature passthrough).
     if not getattr(LoRAPipeline._apply_lora_to_layers, _APPLY_SENTINEL, False):
         _orig_apply = LoRAPipeline._apply_lora_to_layers
 
@@ -394,8 +330,6 @@ def patch_lora_tensors() -> None:
                     continue
                 adapter_alpha = adapter[_ADAPTER_ALPHA_KEY]
                 for name in lora_layers:
-                    # Only for layers this adapter actually carries weights for,
-                    # and don't clobber a real per-layer alpha if one exists.
                     if name + ".lora_A" in adapter and name + ".alpha" not in adapter:
                         adapter[name + ".alpha"] = adapter_alpha
             return _orig_apply(self, lora_layers, lora_nicknames, *args, **kwargs)
@@ -403,7 +337,6 @@ def patch_lora_tensors() -> None:
         _apply_lora_to_layers._unirl_adapter_alpha_expand = True  # type: ignore[attr-defined]
         LoRAPipeline._apply_lora_to_layers = _apply_lora_to_layers
 
-    # --- (f) layers/lora/linear.py: snapshot refresh + forward REPLACE --------
     _patch_lora_linear()
 
 
@@ -432,9 +365,6 @@ def _patch_lora_linear() -> None:
         BaseLayerWithLoRA.update_base_weight_snapshot = update_base_weight_snapshot
         setattr(BaseLayerWithLoRA, _LAYER_SENTINEL, True)
 
-    # REPLACE LinearWithLoRA.forward. Re-vendors UPSTREAM's body (keeping its
-    # lora_dtype / dtype-cast, which did not exist at the fork point) with the
-    # fork's two changes applied: no @torch.compile, no delta.reshape.
     if not getattr(LinearWithLoRA.forward, _LAYER_SENTINEL, False):
 
         def forward(self, x: "torch.Tensor") -> "torch.Tensor":
@@ -455,7 +385,6 @@ def _patch_lora_linear() -> None:
                         self.lora_alpha / self.lora_rank  # type: ignore
                     )  # type: ignore
                 delta = delta * self.strength
-                # nn.Linear preserves input dimensions — no reshape needed.
                 out = self.base_layer(x)
                 return out + delta.to(dtype=out.dtype)
             else:

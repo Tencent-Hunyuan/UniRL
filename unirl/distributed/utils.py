@@ -14,11 +14,6 @@ import torch
 
 from unirl.distributed.tensor.batch import Batch
 
-# ── CUDA IPC compatibility ──
-
-# cudaMalloc-backed IPC handles always have a 66-byte device handle (CUDA_IPC_HANDLE_SIZE=64
-# + 2 bytes padding).  Expandable-segments (VMM) allocations produce shorter handles
-# because they use pidfd_getfd for cross-process sharing instead of the legacy IPC path.
 _CUDA_IPC_HANDLE_BYTES = 66
 
 
@@ -34,9 +29,6 @@ def cuda_ipc_needs_clone(storage: torch.UntypedStorage) -> tuple:
     """
     handle = storage._share_cuda_()
     return handle, len(handle[1]) != _CUDA_IPC_HANDLE_BYTES
-
-
-# ── Broadcast wrapper ──
 
 
 class Broadcast:
@@ -60,9 +52,6 @@ class Broadcast:
 
     def __repr__(self) -> str:
         return f"Broadcast({self.value!r})"
-
-
-# ── Generic tree traversal ──
 
 
 def collect_leaves(x, leaf_type: Type) -> list:
@@ -93,9 +82,6 @@ def collect_leaves(x, leaf_type: Type) -> list:
         for v in x:
             result.extend(collect_leaves(v, leaf_type))
     return result
-
-
-# ── Network helpers ──
 
 
 def get_open_port() -> int:

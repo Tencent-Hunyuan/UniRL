@@ -34,10 +34,6 @@ from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
 
-#: SGLang ``finish_reason`` → terminal :class:`SegmentStatus` (LIN-531). The agentic
-#: rollout engine reads this per-candidate status to tell a *terminal* turn
-#: (COMPLETED / TRUNCATED / ABORTED) apart from an unfinished one; unknown reasons
-#: (or a partial carrying none) fall back to PENDING.
 _FINISH_TO_STATUS = {
     "stop": SegmentStatus.COMPLETED,
     "length": SegmentStatus.TRUNCATED,
@@ -51,6 +47,16 @@ class TextLMAdapter(ModelAdapter):
 
     def validate(self) -> None:
         super().validate()
+        forbidden_tokens = list(getattr(self.cfg, "response_forbidden_tokens", None) or [])
+        self._response_forbidden_token_ids: Tuple[int, ...] = ()
+        if forbidden_tokens:
+            vocab = self._tokenizer.get_vocab()
+            unknown = [token for token in forbidden_tokens if token not in vocab]
+            require(
+                not unknown,
+                f"{type(self).__name__}: response_forbidden_tokens are absent from the tokenizer vocabulary: {unknown}",
+            )
+            self._response_forbidden_token_ids = tuple(dict.fromkeys(int(vocab[token]) for token in forbidden_tokens))
         if not self._has_chat_template():
             logger.info(
                 "%s: tokenizer has no chat template — raw-text completion rollouts",
@@ -59,10 +65,6 @@ class TextLMAdapter(ModelAdapter):
 
     def _has_chat_template(self) -> bool:
         return hasattr(self._tokenizer, "apply_chat_template") and bool(getattr(self._tokenizer, "chat_template", None))
-
-    # ------------------------------------------------------------------ #
-    # build_inputs — request ``Sample`` → per-prompt /generate payloads
-    # ------------------------------------------------------------------ #
 
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
         use_template = self._has_chat_template()
@@ -76,9 +78,6 @@ class TextLMAdapter(ModelAdapter):
         prompt_token_ids: List[List[int]] = []
 
         if use_template:
-            # Render the whole trajectory (role-tagged turns), de-expanded to the
-            # unique conversations the backend fans out ``n`` per. Degenerates to a
-            # single user turn on single-turn requests (byte-identical to before).
             conversations, k = build_text_conversations(sample, sampling.system_instruction)
             require(
                 k == sampling.n,
@@ -93,9 +92,6 @@ class TextLMAdapter(ModelAdapter):
                 prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
-            # Raw-text completion mode — no chat template, so no roles/turns: encode
-            # the raw prompt so the replay's prompt condition still carries the ids
-            # the server tokenized.
             for prompt in self.extract_prompts(sample):
                 payload = self.base_payload(sampling)
                 payload["text"] = prompt
@@ -119,10 +115,15 @@ class TextLMAdapter(ModelAdapter):
 
     def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
+        block = dict(sampling.block)
+        if self._response_forbidden_token_ids:
+            logit_bias = dict(block.get("logit_bias") or {})
+            for token_id in self._response_forbidden_token_ids:
+                logit_bias[str(token_id)] = -1.0e9
+            block["logit_bias"] = logit_bias
         return {
-            "sampling_params": dict(sampling.block),
+            "sampling_params": block,
             "return_logprob": sampling.return_logprob,
-            "logprob_start_len": 0,
         }
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
@@ -134,11 +135,6 @@ class TextLMAdapter(ModelAdapter):
         (bad ``chat_template_kwargs``, jinja error) is a config bug — silently
         switching the run's prompt format would corrupt training.
         """
-        # tokenize=True + return_dict=False yields a bare List[int]. transformers
-        # >=5 defaults return_dict=True, handing back a BatchEncoding that then
-        # leaks into the JSON /generate payload ("Object of type BatchEncoding is
-        # not JSON serializable"). Force the list form and normalize any
-        # tensor/batch dim a template kwarg might introduce.
         template_kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
             "tokenize": True,
@@ -153,10 +149,6 @@ class TextLMAdapter(ModelAdapter):
         if ids and isinstance(ids[0], (list, tuple)):  # leading batch dim of 1
             ids = ids[0]
         return [int(t) for t in ids]
-
-    # ------------------------------------------------------------------ #
-    # build_response — the template: one fan-out stage per ``Part`` field
-    # ------------------------------------------------------------------ #
 
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
         """Fill the frontier gen ``Part`` from the seam's per-candidate results.
@@ -187,9 +179,6 @@ class TextLMAdapter(ModelAdapter):
             conditions=self.build_conditions(sample, prepared, raw),
             status=self.build_status(raw),
         )
-        # Preserve every input Part: multi-input multimodal chains image / cot_text
-        # input Parts before the gen shell, so the filled gen Part's parent id must
-        # stay in the returned chain (text-only: parts[:-1] == [head], unchanged).
         return Sample(parts=[*sample.parts[:-1], filled])
 
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:

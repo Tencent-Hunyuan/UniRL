@@ -175,8 +175,6 @@ def _patch_sigma_alignment() -> None:
     def forward(self, batch, server_args):
         pinned = getattr(batch, "sigmas", None)
         if getattr(batch, "rollout", False) and pinned is not None and len(pinned) > 0:
-            # Preserve upstream side effects (notably ``ltx2_phase=stage1``),
-            # then restore the driver-authoritative schedule it overwrites.
             result = orig(self, batch, server_args)
             result.sigmas = pinned
             return result
@@ -304,10 +302,6 @@ def _patch_sde_logprob_bridge() -> None:
             if sched is not None:
                 sched._unirl_rollout_batch = batch
                 sched._unirl_rollout_generator = gen
-            # Trajectory capture is handled by the BASE DenoisingStage.forward loop
-            # (LTX2AVDenoisingStage.forward delegates to super().forward()), gated on
-            # return_trajectory_latents. Do NOT append it here too — double-recording
-            # corrupts the stacked tensor.
             try:
                 return orig_stage_step(self, ctx, step, batch, server_args)
             finally:

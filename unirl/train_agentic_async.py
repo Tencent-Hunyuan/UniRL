@@ -42,8 +42,6 @@ def main(cfg: DictConfig) -> None:
     trainer = AsyncAgenticTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,
-        # Must equal the engine's episode_sampling.samples_per_prompt (the GRPO group
-        # size n); the recipe keeps sampling.samples_per_prompt == episode_sampling.
         samples_per_prompt=cfg.sampling.samples_per_prompt,
         bundle_cfg=cfg.bundle,
         pipeline_cfg=cfg.pipeline,

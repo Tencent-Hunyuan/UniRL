@@ -58,10 +58,6 @@ from .base import (
 )
 from .grpo import GRPO
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 
 @dataclass
 class DPPOConfig(BaseAlgorithmConfig):
@@ -90,23 +86,11 @@ class DPPOConfig(BaseAlgorithmConfig):
 
     stage_attr: str = "ar"
     conditions_cls: str = ""
-    # Paper §4 / CPPO Table 3: delta = clip_ratio (0.15 for dense models). Uniform
-    # across tokens — DPPO's defining simplification vs CPPO's position-weighted,
-    # cumulative-prefix threshold.
     dppo_delta: float = 0.15
     loss_agg_mode: str = "token-mean"
     horizon: int = 8192
     sampling_temperature: Optional[float] = None
-    # "rollout" (default) keeps the rollout engine's emitted logprobs as mu for
-    # ALL num_updates_per_batch steps (verl bypass-mode parity, = the behavior
-    # policy DPPO anchors on); "replay" freezes a train-side pi_old at pre-update
-    # weights in prepare_segment instead.
     old_logp_source: str = "rollout"
-
-
-# ---------------------------------------------------------------------------
-# Loss helper — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 def _dppo_mask(
@@ -135,17 +119,10 @@ def _dppo_mask(
     Returns:
         ``keep`` mask ``[total_tokens]`` (float 0/1), detached.
     """
-    # Compute the divergence in fp32 regardless of the logprob dtype: a bf16
-    # subtraction of two near-equal probabilities loses the small shift to
-    # rounding. The recipe pins logprob_precision=fp32, but this keeps DPPO
-    # correct under a bf16-logprob config too.
     prob = torch.exp(new_logp.float())
     old_prob = torch.exp(old_logp.float())
     D_t = (prob - old_prob).abs()  # Binary-TV divergence D_t
 
-    # Keep rule (= CPPO Eq. 10 with c_t collapsed to the constant delta):
-    #  1. always keep updates that move pi back toward mu, and
-    #  2. keep diverging updates only while D_t stays within the threshold.
     toward_mu = (advantages * (ratio - 1.0)) <= 0.0
     feasible = D_t <= delta
     keep = toward_mu | feasible
@@ -180,10 +157,9 @@ def _dppo_loss(
         ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
     """
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
-    ratio = torch.exp(log_diff)  # r_t = pi/mu (differentiable through new_logp)
+    ratio = torch.exp(log_diff)
     adv = advantages.detach()
 
-    # Trust-region gate (paper §3): no grad, it only decides which tokens train.
     with torch.no_grad():
         keep = _dppo_mask(
             new_logp=new_logp.detach(),
@@ -197,17 +173,10 @@ def _dppo_loss(
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
-        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),  # k3 estimator
-        # Fraction of tokens zeroed by the Binary-TV mask (analogous to
-        # DPPO/verl pg_clipfrac; the CPPO sibling's masked_fraction).
+        "approx_kl": ((ratio - 1.0) - log_diff).mean().detach(),
         "masked_fraction": (1.0 - keep).mean().detach(),
     }
     return pg_losses, metrics
-
-
-# ---------------------------------------------------------------------------
-# Algorithm class — AR (token-level)
-# ---------------------------------------------------------------------------
 
 
 class DPPO(StageAlgorithm):
@@ -238,12 +207,6 @@ class DPPO(StageAlgorithm):
         conditions_cls: Stage-typed conditions container.
     """
 
-    # old_logp (the ratio denominator and the Binary-TV mu) is the rollout
-    # (SGLang) log-prob, frozen on the segment and unchanged across mini-batch
-    # updates — so reusing it across num_updates_per_batch>1 is the deliberate
-    # rollout-anchored trust region (verl bypass_mode=True parity), matching
-    # GRPO / DRPO / CPPO. The ratio then also absorbs the rollout-vs-train engine
-    # gap on later mini-batches (accepted for parity).
     supports_multi_update = True
 
     def __init__(
@@ -270,22 +233,12 @@ class DPPO(StageAlgorithm):
             raise ValueError(f"DPPO: dppo_delta must be > 0; got {self.dppo_delta}")
         self.loss_agg_mode = str(loss_agg_mode)
         self.horizon = int(horizon)
-        # replay rescales logits by this temperature so its log-softmax matches
-        # the rollout sampling distribution (log_softmax(logits / T)); MUST equal
-        # sampling.temperature. Mirrors GRPO / DRPO / CPPO. Falls back to the
-        # ARSamplingParams default when unset.
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
         self.conditions_cls = conditions_cls
-        # pi_old / mu source. "rollout" = the rollout engine's emitted
-        # segment.log_probs, kept as the anchor for ALL num_updates_per_batch
-        # steps (= the behavior policy DPPO's trust region anchors on; verl
-        # bypass-mode parity). "replay" = prepare_segment recomputes a frozen
-        # train-side pi_old at pre-update weights. Both anchors are frozen for the
-        # whole rollout batch, so multi-update is supported in either mode.
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"DPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -313,8 +266,6 @@ class DPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        # Keep the replay's native (fp32) precision so the anchor stays as close
-        # as possible to new_logp's fp32 replay (mirrors CPPO / DRPO / FlowGRPO).
         segment.log_probs = frozen.detach().cpu()
 
     def compute_loss_and_backward(
@@ -332,15 +283,9 @@ class DPPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens]
-        # old_logp = the frozen pi_old / mu anchor (segment.log_probs). "rollout"
-        # (default) keeps the rollout engine's logp; "replay" means
-        # prepare_segment already overwrote it with a frozen train-side replay.
+        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
-        # Expand per-sample advantages to per-token.
         adv_per_token = GRPO._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
         )
@@ -352,15 +297,11 @@ class DPPO(StageAlgorithm):
             delta=self.dppo_delta,
         )
 
-        # Apply loss_mask if present (token-level masking for padding/eos).
         if segment.loss_mask is not None:
             mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
             loss_per_elem = loss_per_elem * mask
 
         if self.loss_agg_mode == "seq-mean-token-sum-norm" and segment.lengths is not None:
-            # Reference seq-mean-token-sum-norm: per-sequence token-SUM / horizon,
-            # then mean over the micro-batch's sequences. The stack's
-            # loss_scale=1/num_micros then averages across micro-batches.
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
         else:

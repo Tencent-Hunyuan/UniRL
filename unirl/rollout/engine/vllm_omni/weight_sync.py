@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes
 the backend and the LoRA transport choice explicitly and owns ALL sync/LoRA
 state (``_lora_loaded`` / ``_weights_released`` / ``_last_lora_*``). Method
-names mirror the frozen ``base.py`` surface minus ``track_prefix`` (the
+names mirror the frozen ``synchronous.py`` surface minus ``track_prefix`` (the
 engine's forwards absorb that), so a grep for a trainer-side entry point lands
 here. The transports declared are exactly what vllm-omni supports: bucketed
 CUDA-IPC, NCCL (init/transfer/destroy), the SGLang-shape tensor bag, and the
@@ -43,16 +43,9 @@ class WeightSync:
     ) -> None:
         self._backend = backend
         self._uses_lora = bool(uses_lora)
-        # HI3 two-engine stages are TP>1: the wake-time re-push must use the
-        # byte-copy transport (the zero-copy handle's one-shot fd pops after
-        # the first consumer, crashing ranks 2..N).
         self._lora_copy_transport = bool(lora_copy_transport)
-        #: An adapter has been pushed and should be active on generate.
         self._lora_loaded = False
-        #: The runtime released its memory since the last push (sleep) — the
-        #: worker-side adapter pool may be gone until the wake-time re-push.
         self._weights_released = False
-        # Cached adapter state for the wake-time re-push.
         self._last_lora_name: Optional[str] = None
         self._last_lora_tensors: Optional[Dict[str, Any]] = None
         self._last_peft_config: Optional[dict] = None
@@ -66,10 +59,6 @@ class WeightSync:
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed."""
         return self._uses_lora and (self._weights_released or not self._lora_loaded)
-
-    # ------------------------------------------------------------------ #
-    # Bucketed CUDA-IPC
-    # ------------------------------------------------------------------ #
 
     def update_weights_from_ipc(
         self,
@@ -85,18 +74,9 @@ class WeightSync:
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
-        # Phase-2 LoRA sync (peft_config + base_sync_done) has registered the
-        # adapter on every worker — flip the activation flag so the next
-        # generate attaches a lora_request (without it, vllm-omni's per-request
-        # ``set_active_adapter(None)`` deactivates the adapter we just synced
-        # and rollout silently runs base weights).
         if peft_config and base_sync_done:
             self._lora_loaded = True
             self._weights_released = False
-
-    # ------------------------------------------------------------------ #
-    # NCCL broadcast: init group → transfer bucket → destroy group
-    # ------------------------------------------------------------------ #
 
     def init_weights_update_group(
         self,
@@ -139,10 +119,6 @@ class WeightSync:
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))
 
-    # ------------------------------------------------------------------ #
-    # SGLang-shape one-bag tensor payload
-    # ------------------------------------------------------------------ #
-
     def update_weights_from_tensor(
         self,
         *,
@@ -157,10 +133,6 @@ class WeightSync:
             load_format=load_format,
             flush_cache=bool(flush_cache),
         )
-
-    # ------------------------------------------------------------------ #
-    # LoRA tensor bag — two transports; both cache for the wake re-push
-    # ------------------------------------------------------------------ #
 
     def set_lora_from_tensors(
         self,
@@ -199,19 +171,11 @@ class WeightSync:
             self._last_lora_tensors = lora_tensors
         self._last_peft_config = dict(peft_config or {})
 
-    # ------------------------------------------------------------------ #
-    # Post-load value-correctness read-back
-    # ------------------------------------------------------------------ #
-
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
         return self._backend.param_checksums(names=list(names))
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
         return self._backend.lora_checksums(adapter_id=int(adapter_id), names=names)
-
-    # ------------------------------------------------------------------ #
-    # Weights-released event + the wake-time restore
-    # ------------------------------------------------------------------ #
 
     def mark_weights_released(self) -> None:
         """The engine released the runtime memory — the worker-side LoRA pool

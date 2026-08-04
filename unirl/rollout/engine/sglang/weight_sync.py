@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes
 the backend explicitly and owns all sync/LoRA state (``_lora_version`` /
 ``_lora_loaded`` / ``_active_adapter``). Method names mirror the frozen
-``base.py`` surface minus ``track_prefix`` (the engine's forwards absorb that,
+``synchronous.py`` surface minus ``track_prefix`` (the engine's forwards absorb that,
 along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
 trainer-side entry point lands here.
 
@@ -46,10 +46,6 @@ class WeightSync:
         self._lora_loaded = False
         self._lora_version = 0
 
-    # ------------------------------------------------------------------ #
-    # Tensor-bag (SGLang one-bag payload per TP rank)
-    # ------------------------------------------------------------------ #
-
     def update_weights_from_tensor(
         self,
         *,
@@ -64,10 +60,6 @@ class WeightSync:
             load_format=load_format,
             flush_cache=flush_cache,
         )
-
-    # ------------------------------------------------------------------ #
-    # NCCL broadcast: init group → transfer bucket → destroy group
-    # ------------------------------------------------------------------ #
 
     def init_weights_update_group(
         self,
@@ -99,7 +91,6 @@ class WeightSync:
     ) -> None:
         if not names:
             raise ValueError("names must be non-empty for distributed update")
-        # sglang expects bare dtype strings like "bfloat16", not "torch.bfloat16".
         clean_dtypes = [d.replace("torch.", "") if isinstance(d, str) else d for d in dtypes]
         self._backend.update_from_distributed(
             names=list(names),
@@ -111,10 +102,6 @@ class WeightSync:
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))
-
-    # ------------------------------------------------------------------ #
-    # LoRA tensor bag — versioned-nickname rotation
-    # ------------------------------------------------------------------ #
 
     def set_lora_from_tensors(
         self,
@@ -154,10 +141,6 @@ class WeightSync:
     def _next_lora_nickname(self, adapter_name: str) -> str:
         self._lora_version += 1
         return f"{adapter_name}_v{self._lora_version}"
-
-    # ------------------------------------------------------------------ #
-    # Weights-released event + active-adapter / dirty state
-    # ------------------------------------------------------------------ #
 
     def mark_weights_released(self) -> None:
         """The engine released the runtime weights — the loaded LoRA pool is gone."""

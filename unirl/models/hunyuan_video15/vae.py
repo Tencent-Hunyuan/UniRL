@@ -87,12 +87,8 @@ class HunyuanVideo15VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
             else:
                 decoded = _decode(clean)
 
-        # Decoded layout: [B, C, T_dec, H_dec, W_dec] in [-1, 1].
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
 
-        # Pack into the varlen ``Videos`` primitive: ``Video.frames`` is
-        # ``[T, C, H, W]`` so we permute each sample from (C, T, H, W) to
-        # (T, C, H, W) and let ``Videos.from_list`` concat along T.
         videos = [Video(frames=decoded[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(decoded.shape[0]))]
         return Videos.from_list(videos)
 

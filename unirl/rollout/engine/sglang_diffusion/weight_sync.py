@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes the
 backend and the LoRA spec explicitly and owns all sync/LoRA state
 (``_lora_loaded`` / ``_active_adapter``). Method names mirror
-the frozen ``base.py`` surface minus ``track_prefix`` (the engine's forwards absorb
+the frozen ``synchronous.py`` surface minus ``track_prefix`` (the engine's forwards absorb
 that, along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
 trainer-side entry point lands here.
 
@@ -43,17 +43,11 @@ class WeightSync:
         uses_lora: bool,
     ) -> None:
         self._backend = backend
-        # Pipeline prefix embedded in canonical LoRA wire keys, e.g. "transformer."
-        # for SD3/WAN or "model." for HunyuanImage3 — stripped before SGLang sees them.
         self._pipeline_prefix = pipeline_prefix
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
         self._active_adapter: Optional[str] = None
         self._lora_loaded = False
-
-    # ------------------------------------------------------------------ #
-    # Tensor-bag (SGLang one-bag payload per TP rank)
-    # ------------------------------------------------------------------ #
 
     def update_weights_from_tensor(
         self,
@@ -71,10 +65,6 @@ class WeightSync:
             load_format=load_format,
             flush_cache=flush_cache,
         )
-
-    # ------------------------------------------------------------------ #
-    # NCCL broadcast: init group → transfer bucket → destroy group
-    # ------------------------------------------------------------------ #
 
     def init_weights_update_group(
         self,
@@ -119,10 +109,6 @@ class WeightSync:
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))
 
-    # ------------------------------------------------------------------ #
-    # LoRA tensor bag — wire-key adaptation
-    # ------------------------------------------------------------------ #
-
     def set_lora_from_tensors(
         self,
         adapter_name: str,
@@ -140,20 +126,11 @@ class WeightSync:
         ``lora_adapters`` registry never evicts other nicknames, so each sync
         would strand one GPU-resident adapter copy (~34 MB/sync measured).
         """
-        # Canonical wire keys are "<pipeline_prefix><module>.lora_A.weight"; SGLang's
-        # lora_layers dict is keyed from inside the transformer, so strip the prefix.
-        # We do NOT inject per-layer ".alpha" keys anymore (no peft_config here): the
-        # LoRA scale is delivered adapter-wide via ``lora_alpha`` below, which needs
-        # no per-layer name alignment and so is robust to param renaming.
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
         )
         nickname = adapter_name
-        # Adapter-level LoRA alpha (one value for the whole adapter). The engine
-        # stores it once and uses it as the scale source (alpha / rank) for every
-        # layer via _apply_lora_to_layers. Harmless on an older fork whose set_lora
-        # ignores the kwarg (the backend then forwards lora_alpha=None).
         adapter_alpha = None
         if peft_config is not None:
             adapter_alpha = peft_config.get("lora_alpha")
@@ -182,17 +159,9 @@ class WeightSync:
             len(layer_names),
         )
 
-    # ------------------------------------------------------------------ #
-    # Checksum query (vllm-omni-shape return)
-    # ------------------------------------------------------------------ #
-
     def loaded_param_checksums(self, *, names: List[str]) -> Dict[int, List[Dict[str, str]]]:
         output = self._backend.weights_checksum(module_names=list(names))
         return {0: [{str(k): str(v) for k, v in output.items()}]}
-
-    # ------------------------------------------------------------------ #
-    # Weights-released event + dirty state
-    # ------------------------------------------------------------------ #
 
     def mark_weights_released(self) -> None:
         """The engine released the runtime weights — the loaded LoRA pool is gone."""

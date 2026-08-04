@@ -64,10 +64,6 @@ def veomni_parallelize(
     compute_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
     dtype_name = canonical_torch_dtype_name(compute_dtype, field_name="training.fsdp.param_dtype")
 
-    # Master-weight dtype: cast on meta (dtype-only, no data) so to_empty
-    # materializes storage in this dtype; MixedPrecisionPolicy(param_dtype) then
-    # casts the compute copy to bf16. master_dtype=None -> master follows
-    # param_dtype (all-bf16). Mirrors fsdp_wrap's master/compute split.
     master_t = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype else compute_dtype
     )
@@ -116,14 +112,7 @@ def veomni_parallelize(
         for layer in block_instances:
             layer.forward = torch.compile(layer.forward)
 
-    # Expert-parallel bookkeeping: VeOmni sets ``model._extra_parallel_param_groups``
-    # inside *its* optimizer builder (veomni/optim/optimizer.py), which UniRL does
-    # not use (we build our own optimizer). The EP-aware grad clip
-    # (veomni.distributed.fsdp2.clip_grad_norm) dispatches on this attribute — so
-    # without it, an EP-sharded model falls back to the non-EP clip and crashes
-    # trying to stack grads across the ep_fsdp (size world/ep) and dp_shard (size
-    # world) meshes. Replicate VeOmni's classification here so UniRL's clip is
-    # EP-correct. No-op when EP is disabled.
+    # Populate VeOmni EP parameter groups or EP-aware gradient clipping crashes.
     _attach_extra_parallel_param_groups(model)
 
     if _current_rank() == 0:
@@ -192,9 +181,6 @@ def _enumerate_block_instances(
     if not class_names:
         return ()
     names = set(class_names)
-    # ``parallelize_model_fsdp2`` (run before this) ``fully_shard``s each block,
-    # which renames its class to ``FSDP<OriginalName>``; strip that prefix before
-    # matching (a no-op when absent) so AC actually finds the post-shard blocks.
     return tuple(m for _, m in model.named_modules() if type(m).__name__.removeprefix("FSDP") in names)
 
 

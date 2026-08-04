@@ -155,8 +155,6 @@ class Qwen3MoeBundle(Bundle):
             device=device,
             pretrained_path=pretrained_model_ckpt_path,
         )
-        # Meta-init Pattern B: backend loads stacked safetensors from this dir
-        # after EP sharding.
         bundle._transformer_weights_path = pretrained_model_ckpt_path
         return bundle
 

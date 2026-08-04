@@ -36,13 +36,12 @@ class TextSegment(Segment):
 
     tokens: Optional[torch.Tensor] = packed_field(default=None)
     log_probs: Optional[torch.Tensor] = packed_field(default=None)
-    # Immutable engine emission. ``log_probs`` may be replaced by a train-side
-    # replay anchor before PPO/GSPO updates.
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
     loss_mask: Optional[torch.Tensor] = packed_field(default=None)
-    # Original engine emission retained when an algorithm replaces ``log_probs``
-    # with a train-side replay anchor.
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
+    values: Optional[torch.Tensor] = packed_field(default=None)
+    returns: Optional[torch.Tensor] = packed_field(default=None)
+    token_advantages: Optional[torch.Tensor] = packed_field(default=None)
 
     def as_condition_with(self, encoder: Callable[..., Any]) -> Condition:
         """Re-embed packed tokens via the supplied encoder into a TextEmbedCondition.

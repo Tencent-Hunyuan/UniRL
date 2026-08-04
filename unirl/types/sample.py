@@ -31,29 +31,23 @@ from unirl.distributed.tensor.batch import (
     shared_field,
 )
 from unirl.distributed.tensor.ref import hydrate
+from unirl.types.advantages import compute_gae_advantages as _compute_gae
+from unirl.types.advantages import scatter_terminal_rewards
 from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos, primitive_modality_key
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
-from unirl.types.segments import Segment
+from unirl.types.segments import Segment, TextSegment
 from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
-# A Part's content in raw/primitive form (text / image / …) — the counterpart of
-# the encoded ``segment``: given content on an input Part, decoded output on a
-# generation Part. A generation may expose more than one jointly-produced
-# modality (LTX-2 text-to-audio-video is the first such case), so raw content is
-# keyed by modality on the Part.
 Primitive = Union[Texts, Images, Videos, Audios]
 PrimitiveMap = Dict[str, Primitive]
 PrimitiveMetadata = Dict[str, Dict[str, Any]]
 PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio")
 
-# The conversation roles a turn can carry when a trajectory is rendered for an
-# LLM/VLM consumer (see :meth:`Sample.turns` and the ``*_conditioning`` renderers).
-# ``system`` / ``tool`` are not derivable — set ``Part.role`` explicitly for them.
 TURN_ROLES = ("system", "user", "assistant", "tool")
 
 
@@ -89,14 +83,7 @@ class Part(Batch):
 
     segment: Optional[Segment] = field(kind=FieldKind.CONCAT, default=None)
     primitives: PrimitiveMap = field(kind=FieldKind.CONCAT, default_factory=dict)
-    # Shared metadata for decoded primitive modalities. Keep this separate from
-    # ``metadata`` below: that field is per-example dataset/reward metadata,
-    # whereas e.g. an audio sample rate is one output-format property shared by
-    # every row in the Part.
     primitive_metadata: PrimitiveMetadata = shared_field(default_factory=dict)
-    # Encoded conditioning produced for this part, kept for trainer-side replay —
-    # the carrier for what the old ``RolloutTrack.conditions`` held. Per-sample
-    # (CONCAT); defaults to ``{}`` so an unpopulated part is an empty dict, not None.
     conditions: Dict[str, Condition] = field(kind=FieldKind.CONCAT, default_factory=dict)
     media_preview: Optional[MediaPreview] = concat_field(default=None)
 
@@ -106,25 +93,10 @@ class Part(Batch):
     status: Optional[torch.Tensor] = concat_field(default=None)
 
     metadata: List[Dict[str, Any]] = concat_field(default_factory=list)
-    # Request-side routing / override metadata (task / bot_task / chat / ar);
-    # renamed from the old ``RolloutReq.stage_config``. Shared across a part's samples.
     control: Dict[str, Any] = shared_field(default_factory=dict)
-    # The sampling params this part was generated under (provenance; set at fork).
     sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
-    # Conversation role for trajectory → LLM/VLM rendering (one of ``TURN_ROLES``).
-    # Per-part (shared across the part's fan-out samples). ``None`` ⇒ derived by
-    # :meth:`resolved_role` (gen part → ``"assistant"``, input → ``"user"``).
     role: Optional[str] = shared_field(default=None)
-    # The policy weight version this part was generated under (provenance for
-    # off-policy / streaming accounting; stamped by the rollout engine after
-    # ``fill``). One fork = one version, so it is shared across a part's samples;
-    # ``None`` means "not stamped / not applicable" (e.g. train-side sampling).
     weight_version: Optional[int] = shared_field(default=None)
-    # Optional explicit per-sample initial-noise keys. Normal training derives
-    # these from lineage (sample/group ids); deterministic evaluation overrides
-    # them with prompt-content keys so the same prompt/sample slot keeps the same
-    # x_T across steps and checkpoints. CONCAT is load-bearing: DP
-    # select/split must slice the keys with their samples.
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -376,7 +348,6 @@ class Part(Batch):
         if n == 0:
             return self
 
-        # rewards may arrive as a TensorRef proxy from the reward workers; hydrate.
         rewards_local = hydrate(self.rewards)
 
         if scope == "global":
@@ -418,6 +389,87 @@ class Part(Batch):
             adv = reshaped - mean
         return _part_with_field(self, "advantages", adv.flatten())
 
+    def compute_gae_advantages(
+        self,
+        *,
+        gamma: float = 1.0,
+        gae_lambda: float = 0.95,
+    ) -> "Part":
+        """Attach packed token advantages and returns for an AR PPO update.
+
+        ``loss_mask`` controls which tokens later contribute to the policy and
+        value losses. It deliberately does not control the GAE recursion:
+        masked actions are still states in the same trajectory, so terminal
+        reward must propagate across them.
+        """
+        if self.rewards is None:
+            raise ValueError("Part.compute_gae_advantages: part has no rewards")
+        if not isinstance(self.segment, TextSegment):
+            raise ValueError("Part.compute_gae_advantages: requires a TextSegment")
+        segment = self.segment
+        if segment.values is None:
+            raise ValueError("Part.compute_gae_advantages: segment.values is None")
+        if segment.cu_seqlens is None or segment.lengths is None:
+            raise ValueError(
+                "Part.compute_gae_advantages: segment requires framework-managed "
+                "cu_seqlens (construct via TextSegment.pack)"
+            )
+
+        values = hydrate(segment.values).to(torch.float32)
+        cu_seqlens = segment.cu_seqlens.to(device=values.device)
+        total_tokens = int(cu_seqlens[-1].item())
+        if values.ndim != 1 or int(values.numel()) != total_tokens:
+            raise ValueError(
+                "Part.compute_gae_advantages: values must be a packed 1D tensor "
+                f"with {total_tokens} elements, got shape {tuple(values.shape)}"
+            )
+
+        rewards = hydrate(self.rewards).to(device=values.device, dtype=torch.float32)
+        token_rewards = scatter_terminal_rewards(rewards, cu_seqlens=cu_seqlens)
+        token_advantages = values.new_zeros(values.shape)
+        token_returns = values.new_zeros(values.shape)
+        cu = [int(offset) for offset in cu_seqlens.tolist()]
+        for start, end in zip(cu, cu[1:]):
+            if end <= start:
+                continue
+            advantages, returns = _compute_gae(
+                token_rewards[start:end],
+                values[start:end],
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+            )
+            token_advantages[start:end] = advantages
+            token_returns[start:end] = returns
+
+        segment_fields = {f.name: getattr(segment, f.name) for f in dc_fields(segment)}
+        segment_fields["token_advantages"] = token_advantages
+        segment_fields["returns"] = token_returns
+        updated_segment = segment._rebuild(segment_fields)
+
+        loss_mask = None
+        if segment.loss_mask is not None:
+            loss_mask = hydrate(segment.loss_mask).to(device=values.device, dtype=torch.bool)
+            if loss_mask.shape != values.shape:
+                raise ValueError(
+                    "Part.compute_gae_advantages: loss_mask shape "
+                    f"{tuple(loss_mask.shape)} != values shape {tuple(values.shape)}"
+                )
+        sample_advantages: List[torch.Tensor] = []
+        for start, end in zip(cu, cu[1:]):
+            if end <= start:
+                sample_advantages.append(values.new_zeros(()))
+                continue
+            selected = token_advantages[start:end]
+            if loss_mask is not None:
+                selected = selected[loss_mask[start:end]]
+            sample_advantages.append(selected.mean() if selected.numel() else values.new_zeros(()))
+        mean_advantages = (
+            torch.stack(sample_advantages) if sample_advantages else values.new_zeros((0,), dtype=torch.float32)
+        )
+
+        updated = _part_with_field(self, "segment", updated_segment)
+        return _part_with_field(updated, "advantages", mean_advantages)
+
 
 def _part_with_field(part: Part, field_name: str, value: Any) -> Part:
     """Copy of ``part`` with one field replaced."""
@@ -439,9 +491,8 @@ class Sample(Batch):
     def __post_init__(self) -> None:
         for i, p in enumerate(self.parts):
             if len(p.sample_ids) == 0:
-                continue  # empty part: no lineage to validate
+                continue
             if p.is_root:
-                # Only the head (index 0) may be a root — position is lineage.
                 if i != 0:
                     raise ValueError(
                         f"Sample.parts[{i}] is a root (ids carry no lineage segment) but is not the head; "
@@ -508,7 +559,6 @@ class Sample(Batch):
         if not root_gids:
             return [self]
 
-        # One pass per part: bucket sample indices by root id (the first id segment).
         per_part_buckets: List[Dict[str, List[int]]] = []
         for part in self.parts:
             buckets: Dict[str, List[int]] = {}
@@ -701,7 +751,7 @@ class Sample(Batch):
     def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
         """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
 
-        The world-response half of an agentic turn (``unirl/rollout/loop/README.md``): the
+        The world-response half of an agentic turn (``unirl/rollout/env/README.md``): the
         observation rides as a chained input Part — one child per frontier sample, ids
         extended by ``/0`` — carrying no ``sampling_params``. So it is excluded from
         :meth:`gen_parts` (never trained) and surfaced to the next turn by
@@ -731,7 +781,7 @@ class Sample(Batch):
             if i + 1 >= len(new_parts):
                 continue
             child = new_parts[i + 1]
-            if child.is_root:  # successor isn't a child of this part
+            if child.is_root:
                 continue
             if child.rewards is None:
                 raise ValueError(
@@ -787,10 +837,6 @@ class Sample(Batch):
                 raise ValueError(
                     f"Sample.turns: ancestor id {e.args[0]!r} not found in part {anc}; lineage chain is malformed."
                 ) from None
-            # The ancestor walk runs newest -> oldest and the final reverse below
-            # restores chronological order. Append a multi-primitive Part in
-            # reverse canonical modality order so its modalities remain canonical
-            # after that final reversal.
             for key in reversed(PRIMITIVE_MODALITY_ORDER):
                 primitive = part.primitives.get(key)
                 if primitive is None:
@@ -801,7 +847,7 @@ class Sample(Batch):
                 break
             active_ids = [parent_id(aid) for aid in active_ids]
             anc -= 1
-        out.reverse()  # chronological: root → frontier-parent
+        out.reverse()
         return out
 
     def conditioning(self) -> List[Primitive]:

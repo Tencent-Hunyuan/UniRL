@@ -62,9 +62,6 @@ def _resolve_one(value: str) -> str:
     pref = str(value or "").strip().lower()
     if pref in {"cpu", "cuda", "auto"}:
         return pref
-    # Explicit CUDA ordinal (e.g. "cuda:0" / "cuda:1"): reject loudly rather than
-    # silently dropping to CPU. Local rewards have no safe GPU-pinning path; point
-    # the user at the remote backend.
     if pref.startswith("cuda:"):
         raise ValueError(f"Reward Spec device={value!r}: {_REMOTE_HINT}")
     logger.warning(

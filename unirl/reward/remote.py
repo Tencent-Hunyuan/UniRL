@@ -40,11 +40,6 @@ from unirl.types.reward import RewardRequest, RewardResponse
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _pil_from_tensor(tensor: torch.Tensor) -> Image.Image:
     """Convert a CHW float or uint8 tensor to a PIL RGB image.
 
@@ -99,12 +94,11 @@ def _encode_video_b64(
     if v.dim() != 4:
         raise ValueError(f"Expected 4D (C, T, H, W) video tensor, got shape {tuple(v.shape)}.")
 
-    # Channel-first to list of PIL frames
     if v.is_floating_point():
         v = v.clamp(0.0, 1.0)
     frames = []
     for t in range(v.shape[1]):
-        frame = v[:, t, :, :]  # (C, H, W)
+        frame = v[:, t, :, :]
         if frame.is_floating_point():
             frame = (frame * 255).byte()
         frame_np = frame.permute(1, 2, 0).numpy()
@@ -125,11 +119,6 @@ def _encode_video_b64(
             pass
 
     return base64.b64encode(video_bytes).decode("ascii")
-
-
-# ---------------------------------------------------------------------------
-# RemoteRewardBackend
-# ---------------------------------------------------------------------------
 
 
 class RemoteRewardBackend(RewardBackend):
@@ -153,7 +142,7 @@ class RemoteRewardBackend(RewardBackend):
     _AGGREGATION_METHODS = {"weighted_sum", "mean", "min", "max"}
 
     def __init__(self, *, config: "RemoteRewardSpec", base_device: str) -> None:
-        del base_device  # HTTP backend, no device dependency
+        del base_device
         super().__init__(
             model_name="reward_service",
             batch_size=config.batch_size,
@@ -170,20 +159,12 @@ class RemoteRewardBackend(RewardBackend):
         self.raise_on_failure = config.raise_on_failure
         self.aggregation_method = config.aggregation_method
         self.video_fps = config.video_fps
-        # Instance attr overrides the RewardBackend.input_kind class default;
-        # RewardService reads it via preferred_input_kind to route image vs video.
         self.input_kind = config.input_kind
 
         self._remote_rewards_validated = False
 
-        # Disable proxy env vars — reward services are typically on an internal
-        # network where corporate HTTP proxies (squid etc.) would return 503.
         self._session = http_requests.Session()
         self._session.trust_env = False
-
-    # ------------------------------------------------------------------
-    # Public interface (RewardBackend)
-    # ------------------------------------------------------------------
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Convert a UniRL request, call the remote service, and
@@ -286,10 +267,6 @@ class RemoteRewardBackend(RewardBackend):
         """Close the HTTP session."""
         self._session.close()
 
-    # ------------------------------------------------------------------
-    # Request conversion: UniRL → RewardService wire format
-    # ------------------------------------------------------------------
-
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
         """Convert a UniRL ``RewardRequest`` into the RewardService
         ``ScoreRequest`` JSON payload.
@@ -312,7 +289,6 @@ class RemoteRewardBackend(RewardBackend):
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
 
-        # Check for condition images in primitives (source images for editing)
         condition_images = self._get_condition_images(request)
 
         for idx in range(len(images)):
@@ -327,7 +303,6 @@ class RemoteRewardBackend(RewardBackend):
                 sample_metadata = metadata_list[idx]
 
             if condition_images is not None and idx < len(condition_images):
-                # Two-turn history: condition (source) image + generated (edited) image
                 condition_b64 = _encode_image_b64(
                     condition_images[idx],
                     image_format=self.image_format,
@@ -338,7 +313,6 @@ class RemoteRewardBackend(RewardBackend):
                     {"text": prompt, "image_b64": image_b64},
                 ]
             else:
-                # Single-turn history: generated image only (T2I)
                 history = [{"text": prompt, "image_b64": image_b64}]
 
             wire_requests.append(
@@ -359,14 +333,9 @@ class RemoteRewardBackend(RewardBackend):
         prim_image = request.primitives.get("image")
         if prim_image is None:
             return None
-        # Images batch has .pixels [B, C, H, W]
         from unirl.utils.media import tensor_frame_to_pil
 
         return [tensor_frame_to_pil(img) for img in prim_image.pixels.unbind(0)]
-
-    # ------------------------------------------------------------------
-    # Video reward support
-    # ------------------------------------------------------------------
 
     def _compute_video_rewards(self, request: RewardRequest, start: float) -> RewardResponse:
         """Send video tensors to the remote service and parse the response."""
@@ -420,10 +389,6 @@ class RemoteRewardBackend(RewardBackend):
 
         return {"requests": wire_requests}
 
-    # ------------------------------------------------------------------
-    # HTTP call with retries
-    # ------------------------------------------------------------------
-
     def _post_score(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """POST to ``/score`` with retry logic.
 
@@ -459,10 +424,6 @@ class RemoteRewardBackend(RewardBackend):
 
         raise RuntimeError(f"RemoteRewardBackend: failed after {self.max_retries} retries calling {url}") from last_exc
 
-    # ------------------------------------------------------------------
-    # Response conversion: RewardService wire format → UniRL
-    # ------------------------------------------------------------------
-
     def _parse_score_response(
         self,
         raw: Dict[str, Any],
@@ -484,7 +445,6 @@ class RemoteRewardBackend(RewardBackend):
         results: List[Dict[str, Dict[str, float]]] = raw.get("results", [])
         errors_list: List[Dict[str, str]] = raw.get("errors", [])
 
-        # Pad if server returned fewer entries than expected.
         while len(results) < batch_size:
             results.append({})
         while len(errors_list) < batch_size:
@@ -503,26 +463,12 @@ class RemoteRewardBackend(RewardBackend):
             weights: List[float] = []
             error_parts: List[str] = []
 
-            # Validation contract: every reward this sample asked for must come
-            # back. Today every sample asks for the same self.required_rewards
-            # (set at executor construction). When per-sample required_rewards
-            # arrives for multi-turn rollouts (the wire format already supports
-            # it via wire_requests[i]["required_rewards"]), replace the loop
-            # source with `request.required_rewards[i]` — the failure semantics
-            # ("asked-for not returned") stay identical.
             for reward_name in self.required_rewards:
                 if reward_name in sample_result:
                     sub_metrics = sample_result[reward_name]
-                    # Any non-finite sub-metric fails the whole reward for this
-                    # sample (a partially-broken output is suspect), even an axis
-                    # the reduction below would not select.
                     non_finite = self._first_non_finite(sub_metrics)
                     if non_finite is not None:
-                        # NaN/inf/null marks an unusable score: the scorer hit a
-                        # per-item failure (e.g. OCR could not read the image), or a
-                        # NaN serialized to JSON null on the wire. Flag the sample as
-                        # failed instead of feeding a non-finite value into advantage
-                        # normalization, where it would poison the whole group.
+                        # Reject non-finite scores before they poison group normalization.
                         metric_name, bad_value = non_finite
                         component_rewards[reward_name].append(0.0)
                         error_parts.append(
@@ -538,7 +484,6 @@ class RemoteRewardBackend(RewardBackend):
                     if reward_name in sample_errors_dict:
                         error_parts.append(f"{reward_name}: {sample_errors_dict[reward_name]}")
                     else:
-                        # Asked-for reward absent without explanation: server bug, not legitimate omission.
                         error_parts.append(f"{reward_name}: missing from server response without error")
 
             if scores:
@@ -576,7 +521,6 @@ class RemoteRewardBackend(RewardBackend):
             return sum(scores) / len(scores)
         if self.aggregation_method == "min":
             return min(scores)
-        # "max"
         return max(scores)
 
     @staticmethod
@@ -590,8 +534,6 @@ class RemoteRewardBackend(RewardBackend):
         computation.
         """
         for name, value in sub_metrics.items():
-            # bool is an int subclass, so reject it explicitly before the numeric
-            # check — a True/False reward is junk, not a 1.0/0.0 score.
             if (
                 value is None
                 or isinstance(value, bool)
@@ -617,7 +559,6 @@ class RemoteRewardBackend(RewardBackend):
             return float(values[0])
         if self.sub_metric_reduce == "mean":
             return float(sum(values) / len(values))
-        # "max"
         return float(max(values))
 
 
@@ -633,10 +574,6 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
     required_rewards: Tuple[str, ...] = ()
     reward_weights: Optional[Dict[str, float]] = None
     batch_size: int = 8
-    # Per-attempt HTTP read timeout. Keep it above the RewardService server's
-    # per-reward score_timeout_s (ServerCfg default 120s) so a server-side reward
-    # timeout comes back as a structured errors[i][reward] instead of the client
-    # timing out first and re-POSTing the whole batch (burning the retry budget).
     timeout: float = 300.0
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -645,10 +582,6 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
     image_format: str = "JPEG"
     image_quality: int = 95
     video_fps: int = 8
-    # "image" (default) or "video": selects which decoded-media key
-    # RewardService.score_and_attach populates, hence whether compute_rewards
-    # builds an image or a video payload. A video reward (e.g. videoalign) is
-    # configured as its own component with input_kind: video.
     input_kind: str = "image"
     raise_on_failure: bool = True
 

@@ -111,18 +111,13 @@ def load_model_from_checkpoint(
     lora_ckpt = os.path.join(checkpoint_path, "adapter_model.safetensors")
     non_lora_ckpt = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
 
-    # Upstream checkpoints use the old Qwen2VL layout (LM at
-    # base_model.model.model.*, vision at base_model.model.visual.*);
-    # transformers 5.6 nests them under model.language_model / model.visual.
-    # Applied to every loaded dict — LoRA keys embed module paths too — and
-    # idempotent for already-new-layout keys.
     def _remap_qwen_layout(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         new_state_dict: Dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("base_model.model.model.language_model.") or key.startswith(
                 "base_model.model.model.visual."
             ):
-                new_state_dict[key] = value  # already the new layout
+                new_state_dict[key] = value
             elif key.startswith("base_model.model.model"):
                 new_state_dict["base_model.model.model.language_model" + key[len("base_model.model.model") :]] = value
             elif key.startswith("base_model.model.visual"):
@@ -135,7 +130,6 @@ def load_model_from_checkpoint(
         model_state_dict = torch.load(full_ckpt, map_location="cpu", weights_only=True)
         model.load_state_dict(_remap_qwen_layout(model_state_dict))
     else:
-        # LoRA branch — merge LoRA adapter + non-LoRA tensors.
         if not os.path.exists(lora_ckpt) or not os.path.exists(non_lora_ckpt):
             raise FileNotFoundError(
                 f"Neither {full_ckpt!r} nor the LoRA pair "

@@ -13,10 +13,25 @@ Pairs with ``examples/unified_model/hi3_vllmomni.yaml``::
 
 from __future__ import annotations
 
+import warnings
+
 import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.unified_model import UnifiedModelTrainer
+
+
+def _resolve_task_config(cfg: DictConfig):
+    if "stage_config" not in cfg:
+        return cfg.get("task_config")
+    if "task_config" in cfg:
+        raise ValueError("Specify only task_config; do not set deprecated stage_config alongside it")
+    warnings.warn(
+        "`stage_config` is deprecated; rename the recipe key to `task_config`",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return cfg.get("stage_config")
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="unified_model/hi3_vllmomni")
@@ -36,6 +51,7 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
+        task_config=_resolve_task_config(cfg),
         sync_cfg=cfg.get("sync"),
         dump_dir=cfg.get("dump_dir"),
         logging_cfg=cfg.get("logging"),

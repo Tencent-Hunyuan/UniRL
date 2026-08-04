@@ -110,13 +110,9 @@ class QwenVLPipeline(Pipeline):
                 f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
 
-        # Full role-tagged trajectory (text + chained image turns), frontier-aligned —
-        # vision_conditioning() fails loud on a no-image or extra-modality request.
         turns, _images = sample.vision_conditioning()
         conds = self._conditions_for(turns, sample.parts[0].control)
 
-        # Normalize the gen shell's ARSamplingParams through QwenVLARParams (parity
-        # with the prior req-sourced path: stop_token_id reset, types coerced).
         params = QwenVLARParams(
             max_tokens=ar.max_new_tokens,
             temperature=ar.temperature,
@@ -134,9 +130,6 @@ class QwenVLPipeline(Pipeline):
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay: Part.conditions is the train stack's source (GRPO re-types them via
-        # conditions_cls.from_dict in compute_loss_and_backward).
         filled = frontier.fill(segment=segment, primitives={"text": decoded}, conditions=conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

@@ -46,9 +46,7 @@ def _iter_source(source: Optional[str], hf_name: str, split: str) -> Iterator[Di
         return
     from datasets import load_dataset  # lazy: only needed when downloading
 
-    # streaming=True yields raw rows and skips the arrow schema cast that fails when
-    # building the full DatasetDict (the sibling ASearcherLRM35k split has an
-    # inconsistent schema), and avoids downloading the whole set up front.
+    # Stream raw rows to bypass inconsistent Hugging Face schemas.
     for row in load_dataset(hf_name, split=split, streaming=True):
         yield dict(row)
 
@@ -58,9 +56,6 @@ def main() -> None:
     ap.add_argument("--out-dir", default="data/asearcher")
     ap.add_argument("--source", default=None, help="local jsonl (else download from HF)")
     ap.add_argument("--hf-name", default="inclusionAI/ASearcher-train-data")
-    # ASearcherBase35k loads cleanly; ASearcherLRM35k (AReaL's exact split) has an
-    # inconsistent HF schema (extra id/idx cols, scalar answer) that `datasets`
-    # can't auto-cast — download its raw jsonl and pass it via --source to use it.
     ap.add_argument("--split", default="ASearcherBase35k")
     ap.add_argument("--limit", type=int, default=0, help="cap kept rows (0 = all)")
     args = ap.parse_args()

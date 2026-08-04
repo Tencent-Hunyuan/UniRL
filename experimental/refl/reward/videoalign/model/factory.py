@@ -76,14 +76,12 @@ def create_model_and_processor(
         ``(model, processor, peft_config)`` — same tuple shape as the
         upstream helper. ``peft_config`` is ``None`` when LoRA is disabled.
     """
-    # Resolve the torch dtype string to a real dtype.
     torch_dtype = (
         model_config.torch_dtype
         if model_config.torch_dtype in ["auto", None]
         else getattr(torch, model_config.torch_dtype)
     )
 
-    # Build processor + (optional) special tokens.
     processor = AutoProcessor.from_pretrained(
         model_config.model_name_or_path,
         padding_side="right",
@@ -96,8 +94,6 @@ def create_model_and_processor(
         processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
-    # Build the reward model. Quantisation is intentionally not supported
-    # here — the reward path expects full-precision (or bf16/fp16) weights.
     model = Qwen2VLRewardModelBT.from_pretrained(
         model_config.model_name_or_path,
         output_dim=model_config.output_dim,
@@ -108,8 +104,6 @@ def create_model_and_processor(
         cache_dir=cache_dir,
         revision=getattr(model_config, "model_revision", "main"),
     )
-    # transformers 5.x forwards unknown from_pretrained kwargs to the model
-    # ctor (4.x absorbed config fields like use_cache) — set it on the config.
     model.config.use_cache = bool(training_args.gradient_checkpointing)
 
     if model_config.use_special_tokens:
@@ -120,17 +114,12 @@ def create_model_and_processor(
     if training_args.fp16:
         model.to(torch.float16)
 
-    # Optional LoRA wrapping — required to *load* a LoRA-split checkpoint.
     if peft_lora_config.lora_enable:
-        # peft is an optional dep for the non-LoRA inference path; import
-        # lazily so users who only ever load full-state-dict ckpts don't
-        # need it installed.
         from peft import LoraConfig, get_peft_model
 
         namespan_exclude = list(peft_lora_config.lora_namespan_exclude or [])
         if isinstance(peft_lora_config.lora_namespan_exclude, str):
             namespan_exclude = [peft_lora_config.lora_namespan_exclude]
-        # Mirror upstream: when vision_lora is off, exclude the visual tower.
         if not peft_lora_config.vision_lora and "visual" not in namespan_exclude:
             namespan_exclude.append("visual")
 

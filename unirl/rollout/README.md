@@ -35,7 +35,7 @@ wrong objective.
 
 ## How it works
 
-- **One synchronous generation interface.** `BaseRolloutEngine` (`engine/base.py`)
+- **One synchronous generation interface.** `BaseRolloutEngine` (`engine/synchronous.py`)
   is a `Remote` whose concrete engines implement synchronous `generate(sample)`;
   each keeps its native batching/runtime path. Single-turn engines return one
   `Sample` and dispatch `generate` with `DP_SCATTER`; the agentic coordinator
@@ -63,10 +63,19 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
+- **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
+  to `engine/synchronous.py`'s worker-side sync contracts). Both engines expose the
+  same consumer verbs the async trainers program against: `poll` / `drain_freshest` /
+  `pop_evicted` / `quiesce` + engine-owned `weight_version`. `AsyncBatchRolloutEngine`
+  (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps
+  versions at launch, used by `AsyncARTrainer`/`AsyncDiffusionTrainer`) and
+  `AsyncAgenticRolloutEngine` (trajectory granularity over the agentic rank-0
+  coordinator; normalizes the `[0]` unwraps, assembles n-sibling GRPO groups,
+  stamps versions at completion, used by the partial/async agentic trainers).
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
-`engine/<name>/engine.py` (subclass `BaseSingleTurnRolloutEngine`, implement
+`engine/<name>/engine.py` (subclass `SyncRolloutEngine`, implement
 synchronous generation over the whole-`Sample` contract — thread-safe for
 concurrent callers if it should serve as an agentic inner, else serialized
 internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
@@ -83,6 +92,12 @@ implements its weight-receive method and a matching `sync:` handler in
   intentional exception: `BROADCAST + RANK_ZERO` returns its trajectory list.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
+- **Quiesce before weight sync / eval / checkpoint on the batch async path** —
+  `AsyncBatchRolloutEngine.quiesce()` drains every in-flight generation; a
+  weight + KV update corrupts one mid-flight. The agentic quiesce is a
+  turn-boundary `abort` + final poll, folded into
+  `AsyncAgenticRolloutEngine.quiesce()`. Reap-vs-launch ordering is trainer
+  statement order (diffusion polls before topping up; see its `_next_step`).
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

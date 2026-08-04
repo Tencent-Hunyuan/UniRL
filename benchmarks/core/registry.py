@@ -24,16 +24,16 @@ class BenchmarkSpec:
     """Protocol card for one benchmark. ``data`` is repo-root-relative."""
 
     name: str
-    modality: str  # "t2i": runner renders images | "text": runner queries an OpenAI-compatible endpoint
+    modality: str
     data: str
-    prompt_field: Optional[str] = None  # jsonl/csv/tsv column with the prompt; None for txt (one per line)
+    prompt_field: Optional[str] = None
     samples_per_prompt: int = 4
-    rewards: Tuple[str, ...] = ()  # reward-service scorer names; () = scored externally (see the README)
-    send_metadata: bool = False  # t2i jsonl specs: ship each record as RewardRequest.metadata (geneval*)
+    rewards: Tuple[str, ...] = ()
+    send_metadata: bool = False
     grader: Optional[str] = None  # text benchmarks: "math_verify" | "mc_letter"
-    gen: Dict = field(default_factory=dict)  # generation defaults; CLI flags override
-    t2i_linspace_sigmas: bool = False  # t2i: use explicit sigmas=linspace(1,1/steps,steps) flow-match grid
-    t2i_prompt_seed: bool = False  # t2i: seed each image per prompt content (reproducible), CPU generator
+    gen: Dict = field(default_factory=dict)
+    t2i_linspace_sigmas: bool = False  # Use an explicit flow-match sigma grid.
+    t2i_prompt_seed: bool = False
     notes: str = ""
 
     def data_path(self) -> Path:
@@ -57,7 +57,7 @@ def load_prompts(spec: BenchmarkSpec) -> List[str]:
         with open(path, newline="") as f:
             reader = csv.DictReader(f, delimiter="\t" if path.suffix == ".tsv" else ",")
             prompts = [row[spec.prompt_field] for row in reader]
-    else:  # txt: one prompt per line
+    else:
         prompts = [line for line in path.read_text().splitlines() if line.strip()]
     return list(dict.fromkeys(prompts))
 
@@ -89,11 +89,8 @@ _ALL = (
         data="datasets/geneval2/synthetic/test.jsonl",
         prompt_field="prompt",
         rewards=("geneval2",),
-        send_metadata=True,  # ships each record's vqa_list, so the scorer needs no dataset_path config
-        samples_per_prompt=1,  # reproduction protocol: 1 image/prompt
-        # DPPO GenEval2 reproduction regime. Key params: 512px, 40 steps, cfg 1.0,
-        # max_sequence_length 256 (SD3 default; passing 512 halves the score), + the linspace
-        # flow-match sigma grid (t2i_linspace_sigmas). See benchmarks/image/geneval2/README.md.
+        send_metadata=True,
+        samples_per_prompt=1,
         gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512, "max_sequence_length": 256},
         t2i_linspace_sigmas=True,
         t2i_prompt_seed=True,
@@ -105,7 +102,7 @@ _ALL = (
         data="benchmarks/image/geneval/data/evaluation_metadata.jsonl",
         prompt_field="prompt",
         rewards=("geneval",),
-        send_metadata=True,  # ships tag/include/exclude, which the geneval scorer hard-requires
+        send_metadata=True,
         notes="Official GenEval (Mask2Former + CLIP); enable the 'geneval' scorer in the reward service (off by default).",
     ),
     BenchmarkSpec(

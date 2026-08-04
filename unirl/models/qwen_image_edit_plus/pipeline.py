@@ -159,8 +159,6 @@ class QwenImageEditPlusPipeline(Pipeline):
             text_embed = QwenImageEditPlusTextEmbedStage(
                 bundle,
                 max_sequence_length=config.max_sequence_length,
-                # Honor a text-encoder override so the processor tracks the
-                # tokenizer/text encoder, not just the main checkpoint.
                 processor_path=config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path,
             )
         step = QwenImageEditPlusDiffusionStep()
@@ -209,13 +207,8 @@ class QwenImageEditPlusPipeline(Pipeline):
                 "QwenImageEditPlusPipeline.build_conditions: no text_embed stage "
                 "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
-        # CFG empty negative: single-space " " (mirrors base Qwen-Image —
-        # the chat-template prefix strip makes "" unsafe).
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[" "] * len(texts.texts))
-        # Both CFG branches share the source image when multimodal prompt
-        # conditioning is enabled. Disabling it preserves the Edit-Plus
-        # template/drop-64 path while passing no image to the text encoder.
         embed_images = images if self.use_condition_image_prompt else None
         text_cond = self.text_embed.embed(texts, embed_images)
         negative_text_cond = self.text_embed.embed(negatives, embed_images) if negatives is not None else None

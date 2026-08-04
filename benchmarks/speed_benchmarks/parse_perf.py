@@ -18,8 +18,6 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
-# Hydra job_logging default: "[%(asctime)s][%(name)s][%(levelname)s] - rollout N/M  reward=..."
-# unirl.utils.configure_logger: "%(asctime)s - %(name)s - %(levelname)s - rollout N/M  reward=..."
 _STEP_LINE = re.compile(r"^\[?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\]?.* - rollout (\d+)/\d+\s+reward=")
 
 

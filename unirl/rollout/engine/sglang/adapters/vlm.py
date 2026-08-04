@@ -44,10 +44,6 @@ class VLMAdapter(TextLMAdapter):
             f"{type(self).__name__} requires an AutoProcessor (the engine loads one when config.image_token is set)",
         )
 
-    # ------------------------------------------------------------------ #
-    # build_inputs — processor path (overrides the chat-template path)
-    # ------------------------------------------------------------------ #
-
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
         conversations, images_list, k = build_vision_conversations(sample, sampling.system_instruction)
         require(
@@ -64,10 +60,6 @@ class VLMAdapter(TextLMAdapter):
             mm = self.encode_mm(messages, images)
             mm_encs.append(mm)
             payload = self.base_payload(sampling)
-            # Send the chat-templated TEXT (single placeholder) + image_data so
-            # SRT's processor expands the placeholder and the model actually
-            # attends the image. (Sending the pre-expanded input_ids +
-            # image_data makes SRT return HTTP 500.)
             payload["text"] = mm.text
             payload["image_data"] = pil_to_base64(mm.image)
             wire.append(payload)
@@ -99,7 +91,23 @@ class VLMAdapter(TextLMAdapter):
             f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
             f"got {len(images)} (multi-image conversations are unsupported).",
         )
-        text = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        template_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        processor_messages = [
+            {
+                **message,
+                "content": (
+                    [{"type": "text", "text": message["content"]}]
+                    if isinstance(message.get("content"), str)
+                    else message.get("content")
+                ),
+            }
+            for message in messages
+        ]
+        text = self._processor.apply_chat_template(processor_messages, **template_kwargs)
         enc = self._processor(text=[text], images=images, return_tensors="pt")
         return MMEncoding(
             image=images[0],
@@ -108,10 +116,6 @@ class VLMAdapter(TextLMAdapter):
             pixel_values=enc["pixel_values"],
             image_grid_thw=enc["image_grid_thw"],
         )
-
-    # ------------------------------------------------------------------ #
-    # build_conditions — prompt condition + the multimodal replay conditions
-    # ------------------------------------------------------------------ #
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base.

@@ -39,30 +39,76 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from unirl.rollout.engine.sglang.backends.base import (
+    _filter_server_args_or_raise,
+    _normalize_cuda_visible_devices,
+)
+
 logger = logging.getLogger(__name__)
 
-#: Sentinel for :meth:`HTTPBackend._post`'s ``timeout``: apply the per-path
-#: tier (600s weight ops / 120s rest). Pass ``None`` explicitly to block
-#: indefinitely (the ``/generate`` decode path).
 _TIERED_TIMEOUT: Any = object()
 
 
-# ---------------------------------------------------------------------------
-# Process / health helpers (SRT subprocess lifecycle + health polling)
-# ---------------------------------------------------------------------------
+def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
+    """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``.
+
+    The parent may observe a boot failure before the spawned child has executed
+    :func:`os.setsid`.  In that race the child still belongs to the Ray
+    worker/trainer's process group, so signaling that inherited group would
+    terminate the launcher too.  A session leader owns a group whose id equals
+    its pid; only that group is safe to fan out to.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        pgid = pid
+    except PermissionError:
+        pgid = None
+
+    try:
+        if pgid == pid:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def kill_process_tree(pid: int) -> None:
-    """Send SIGTERM to ``pid`` and its descendants."""
+    """Send SIGTERM to ``pid`` and descendants in its owned process group."""
+    _signal_process_tree(pid, signal.SIGTERM)
+
+
+def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: float = 10.0) -> None:
+    """Best-effort bounded teardown for a started SRT server process tree."""
+    pid = getattr(process, "pid", None)
+    if pid is None:
+        return
+
+    kill_process_tree(int(pid))
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        process.join(timeout=float(timeout_s))
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+
+    try:
+        alive = process.is_alive()
+    except Exception:
+        logger.exception("Failed to inspect SGLang SRT server process pid=%s after SIGTERM", pid)
+        return
+    if not alive:
+        return
+
+    logger.warning("SGLang SRT server process pid=%s ignored SIGTERM; sending SIGKILL", pid)
+    _signal_process_tree(int(pid), signal.SIGKILL)
+    try:
+        process.join(timeout=1.0)
+    except Exception:
+        logger.exception("Failed to join SGLang SRT server process pid=%s after SIGKILL", pid)
+        return
+    if process.is_alive():
+        logger.error("SGLang SRT server process pid=%s is still alive after SIGKILL", pid)
 
 
 def wait_server_healthy(
@@ -86,11 +132,6 @@ def wait_server_healthy(
             raise RuntimeError("SGLang SRT server process terminated unexpectedly.")
         time.sleep(poll_interval_s)
     raise TimeoutError(f"SGLang SRT server at {base_url} did not become healthy within {timeout_s}s")
-
-
-# ---------------------------------------------------------------------------
-# Lazy runtime import — the only place sglang is named (once per process)
-# ---------------------------------------------------------------------------
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
@@ -127,6 +168,18 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     }
 
 
+def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> Any:
+    """HTTP server target with child-local launch environment overrides."""
+    os.setsid()
+
+    if env_overrides:
+        os.environ.update(env_overrides)
+
+    from sglang.srt.entrypoints.http_server import launch_server
+
+    return launch_server(server_args)
+
+
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
     """The wire view of an io_struct request: its fields minus the ``None``s.
 
@@ -135,11 +188,6 @@ def asdict_drop_none(req: Any) -> Dict[str, Any]:
     reach the server).
     """
     return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
-
-
-# ---------------------------------------------------------------------------
-# Wire deserialization — pure, module-level (CPU-testable without sglang)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -200,11 +248,6 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# The backend
-# ---------------------------------------------------------------------------
-
-
 class HTTPBackend:
     """The HTTP ``Backend`` impl over a spawned SGLang SRT server."""
 
@@ -220,15 +263,8 @@ class HTTPBackend:
         self._base_url = base_url
         self._concurrency = int(concurrency)
         self._rt = runtime
-        # One shared semaphore bounding concurrent in-flight /generate POSTs
-        # across ALL caller threads (agentic trajectory threads + the batch
-        # path's own fan-out pool share this single bound).
         self._sem = threading.Semaphore(int(concurrency))
         self._logged_first_response = False
-
-    # ------------------------------------------------------------------ #
-    # Boot — the only place the sglang import / spawn / env quarantine live
-    # ------------------------------------------------------------------ #
 
     @classmethod
     def boot(
@@ -238,26 +274,26 @@ class HTTPBackend:
         advertise_host: str,
         concurrency: int,
         health_timeout_s: float = 300.0,
+        cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "HTTPBackend":
         """Filter intent against ServerArgs, spawn the SRT server, await health.
 
         ``server_intent`` is the config-spelled ServerArgs intent (reserved
         ports already overlaid as ``port`` / ``nccl_port`` — real ServerArgs
         fields, so no port env manipulation happens anywhere). We filter it to
-        the real ServerArgs fields here (the only place that knows them —
-        non-ServerArgs escape-hatch keys drop harmlessly), then spawn.
+        the real ServerArgs fields here (the only place that knows them).
+        Non-ServerArgs escape-hatch keys drop harmlessly; explicitly requested
+        UniRL correctness flags fail closed if the installed runtime lacks them.
         """
         rt = _import_sglang_runtime()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
+        server_kwargs = _filter_server_args_or_raise(
+            server_intent,
+            allowed=allowed,
+            backend_name="HTTP",
+        )
 
-        # --- Env quarantine: everything the SRT subprocess needs, set at the
-        # spawn boundary (the spec's documented last resort) — never in the
-        # engine ctor. Each line carries the predecessor's rationale.
-
-        # CUDA-IPC tensor sync requires the non-expandable allocator on older
-        # kernels (<5.10) that lack pidfd_getfd; matches PE rollout_actor.py.
         try:
             import torch
 
@@ -265,17 +301,9 @@ class HTTPBackend:
         except Exception:
             pass
 
-        # NCCL transport defaults — required for cross-process NCCL groups
-        # used by weight sync to establish P2P/CUMEM channels. sglang's
-        # _set_envs_and_config() defaults these to "0" when enable_symm_mem
-        # is False, breaking broadcast with "Cuda failure 'invalid argument'".
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 
-        # SGLang's warmup self-check issues requests.get(...) against
-        # http://{host}:{port}/model_info which honors HTTP(S)_PROXY env vars
-        # and routes loopback through Squid (returns 503, kills SRT). Whitelist
-        # the bind + advertise + loopback hosts.
         _extra_no_proxy = f"0.0.0.0,127.0.0.1,localhost,{advertise_host}"
         _cur_no_proxy = os.environ.get("no_proxy", "") or os.environ.get("NO_PROXY", "")
         os.environ["no_proxy"] = f"{_cur_no_proxy},{_extra_no_proxy}" if _cur_no_proxy else _extra_no_proxy
@@ -289,23 +317,34 @@ class HTTPBackend:
             server_kwargs.get("nccl_port"),
         )
 
-        # ``set_start_method`` is process-global; PE-tested, Ray-compatible.
-        # Forcing matches the predecessor so torch CUDA init in the child
-        # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         server_args = rt["ServerArgs"](**server_kwargs)
-        process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
+
+        tp_size = int(server_kwargs.get("tp_size", 1))
+        visible_devices = _normalize_cuda_visible_devices(
+            cuda_visible_devices,
+            tp_size=tp_size,
+        )
+        env_overrides: Dict[str, str] = {}
+        if visible_devices is not None:
+            server_args.base_gpu_id = 0
+            env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+        process = multiprocessing.Process(
+            target=_launch_server_with_env,
+            args=(server_args, env_overrides),
+        )
         process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
-        wait_server_healthy(
-            base_url,
-            timeout_s=float(health_timeout_s),
-            is_alive_fn=lambda: process.is_alive(),
-        )
-        # Bind-mapping gate (GPU smoke): the settled ServerArgs must echo the
-        # reserved ports verbatim — a runtime upgrade that silently re-settles
-        # them shows up here.
+        try:
+            wait_server_healthy(
+                base_url,
+                timeout_s=float(health_timeout_s),
+                is_alive_fn=lambda: process.is_alive(),
+            )
+        except BaseException:
+            _terminate_server_process(process)
+            raise
         logger.info(
             "SGLang SRT server healthy at %s (settled ServerArgs: port=%s nccl_port=%s host=%s)",
             base_url,
@@ -314,10 +353,6 @@ class HTTPBackend:
             getattr(server_args, "host", None),
         )
         return cls(process, base_url, concurrency=concurrency, runtime=rt)
-
-    # ------------------------------------------------------------------ #
-    # Generation — blocking POSTs; concurrency = caller threads + semaphore
-    # ------------------------------------------------------------------ #
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major.
@@ -380,11 +415,7 @@ class HTTPBackend:
                     raise RuntimeError(f"SGLang SRT POST {url} failed after {max_retries} retries: {exc}") from exc
                 logger.debug("SGLang SRT POST %s attempt %d/%d failed: %s", url, attempt + 1, max_retries, exc)
                 time.sleep(1)
-        return {}  # unreachable
-
-    # ------------------------------------------------------------------ #
-    # Abort / pause — best-effort sync POSTs (bounded 10s, swallow + warn).
-    # ------------------------------------------------------------------ #
+        return {}
 
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"rid": rid} if rid is not None else {"abort_all": bool(abort_all)}
@@ -407,10 +438,6 @@ class HTTPBackend:
         except Exception as exc:
             logger.warning("sglang HTTPBackend: %s failed (best-effort): %s", path, exc)
 
-    # ------------------------------------------------------------------ #
-    # Sync HTTP core (all endpoints)
-    # ------------------------------------------------------------------ #
-
     def _post(self, path: str, payload: Dict[str, Any], *, timeout: Any = _TIERED_TIMEOUT) -> Any:
         """Synchronous POST JSON to the SRT server.
 
@@ -419,10 +446,7 @@ class HTTPBackend:
         """
         url = f"{self._base_url}{path}"
         if timeout is _TIERED_TIMEOUT:
-            # Weight-update + LoRA hot-reload endpoints can stall server-side
-            # (NCCL init / broadcast, or SGLang's LoRA-pool unload+reload which
-            # takes ~2 min from the 2nd sync on — LIN-287). Give them the long
-            # timeout so a legitimately-slow-but-succeeding op isn't killed at 120s.
+            # Use the long timeout for weight updates and LoRA reloads.
             timeout = 600 if ("weights" in path or "update" in path or "lora" in path) else 120
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -458,10 +482,6 @@ class HTTPBackend:
     def _require_alive(self, operation: str) -> None:
         if self._server_process is None or not self._server_process.is_alive():
             raise RuntimeError(f"Cannot {operation}: SRT server is not alive.")
-
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
 
     def flush_cache(self) -> None:
         """Flush the sglang scheduler cache; retry until 200.
@@ -513,15 +533,11 @@ class HTTPBackend:
 
     def shutdown(self) -> None:
         """Kill the SRT server (idempotent via the None-swap)."""
-        if self._server_process is not None:
-            logger.info("Shutting down SGLang SRT server (pid=%s)", self._server_process.pid)
-            kill_process_tree(self._server_process.pid)
-            self._server_process.join(timeout=10)
-            self._server_process = None
-
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs — HTTP POSTs to the SRT post-training endpoints
-    # ------------------------------------------------------------------ #
+        process = self._server_process
+        self._server_process = None
+        if process is not None:
+            logger.info("Shutting down SGLang SRT server (pid=%s)", process.pid)
+            _terminate_server_process(process)
 
     def update_from_tensor(
         self,

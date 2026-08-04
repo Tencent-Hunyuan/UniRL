@@ -38,9 +38,6 @@ from .config import LTX2_SPATIAL_COMPRESSION, LTX2_TEMPORAL_COMPRESSION
 
 _LTX2_TIMESTEP_SCALE: float = 1000.0
 
-# diffusers 0.37.x LTX2VideoTransformer3DModel.forward rejects sigma/audio_sigma/
-# isolate_modalities (LTX-2.3-only kwargs) -> TypeError. Drop any kwarg the bound
-# forward() doesn't declare (pass through if it declares **kwargs). Cached per class.
 _FORWARD_PARAMS_CACHE: dict = {}
 
 
@@ -59,23 +56,9 @@ def _filter_forward_kwargs(transformer, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
-# LTX-2 is a UNIFIED audiovisual transformer: ``forward`` always runs both the
-# video and audio branches AND, by design, injects an audio→video cross-attn
-# residual into the video stream at every layer (``hidden_states += a2v_gate *
-# a2v_attn``). diffusers' default T2V path co-denoises a real audio latent
-# stream with ``isolate_modalities=False`` — so to match the training/inference
-# distribution we MUST do the same: maintain an audio latent alongside video,
-# feed it each step, and keep that residual. (The earlier "1-frame zero audio +
-# isolate_modalities=True" shortcut deleted the residual at all 48 layers →
-# residual blur even after the schedule fix.) The audio branch runs ODE (no RL
-# gradient); only video carries the SDE log-prob.
+# Co-denoise audio because LTX-2 feeds audio cross-attention into every video layer.
 _LTX2_FRAME_RATE: float = 24.0
 
-# Audio-latent geometry fallbacks (used when no audio_vae is loaded, i.e.
-# enable_audio=False). Mirror diffusers ``Flux2KleinPipeline``/LTX2Pipeline
-# defaults: 16kHz / hop 160 / temporal-compress 4 → 25 audio-latent frames per
-# second; 8 latent channels, 64 mel bins, mel-compress 4 → packed feature dim
-# 8 * (64/4) = 128 == transformer.config.audio_in_channels.
 _LTX2_AUDIO_SAMPLING_RATE: int = 16000
 _LTX2_AUDIO_HOP_LENGTH: int = 160
 _LTX2_AUDIO_TEMPORAL_COMPRESSION: int = 4
@@ -171,8 +154,6 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
         transformer = model.transformer
         timestep = (sigma * _LTX2_TIMESTEP_SCALE).to(sample.device)
 
-        # Text conditioning (video + audio share the connector's text embeds;
-        # the audio branch has its own projection inside the transformer).
         text_cond = conditions.text
         encoder_hidden_states = text_cond.embeds
         encoder_attention_mask = text_cond.attn_mask
@@ -201,11 +182,9 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
                 return_dict=False,
             )
             out = transformer(**_filter_forward_kwargs(transformer, _fwd))
-            # forward returns (video_out, audio_out).
             return out[0], out[1]
 
         if guidance_scale > 1.0 and conditions.negative_text is not None:
-            # CFG: batch [uncond, cond] for both modalities.
             neg = conditions.negative_text
             neg_audio = conditions.negative_audio_text if conditions.negative_audio_text is not None else neg
 
@@ -268,11 +247,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        # Joint audio+video SDE policy. Only meaningful when the bundle actually
-        # has audio (LTX-2.3 T2AV); for T2V the audio stream is a synthetic
-        # placeholder that is never decoded/rewarded, so it must stay out of the
-        # policy regardless of the flag. ``_audio_in_policy`` is the resolved
-        # gate used throughout generate()/replay().
         self.audio_joint_sde = bool(audio_joint_sde)
         self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
 
@@ -338,23 +312,13 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         sigmas = sigmas.to(device)
         self.strategy.init_schedule(sigmas)
 
-        # SDE step set: which steps record log-probs (default: all).
         sde_set: Set[int] = set(int(i) for i in sde_indices) if sde_indices else set(range(num_steps))
         sde_sorted: List[int] = sorted(sde_set)
 
-        # Sparse trajectory storage: SDE transition endpoints (k, k+1) plus the
-        # final step T so VAE decode always has the clean latent. Stored as a
-        # (position, latent) list → packed into LatentSegment.{latents,indices},
-        # which ``latents_at`` / ``replay`` index by step. Mirrors WAN21. The
-        # audio trajectory is stored in parallel (aux_latents) so replay can
-        # reproduce the per-step audio that the video forward cross-attends to.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, num_steps))
         needed.add(num_steps)
 
         x = initial_latents.to(dtype=self.trajectory_dtype)
-        # Audio x_T (B, audio_t, 128): driver-authoritative noise from the
-        # pipeline (same recipe as video → reproducible, off the global RNG
-        # stream); bare randn only when a caller doesn't supply one.
         if initial_audio_latents is not None:
             a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -403,8 +367,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     audio_num_frames=audio_t,
                 )
 
-                # Video: SDE (RL) step. strategy.denoise →
-                # (prev_sample, log_prob, prev_sample_mean); log_prob None on ODE.
                 x_next, log_prob, _ = self.strategy.denoise(
                     noise_pred=video_pred,
                     sample=x,
@@ -417,12 +379,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 )
                 x = x_next.to(dtype=self.trajectory_dtype)
 
-                # Audio step. Joint mode (LTX-2.3 + audio_joint_sde): share the
-                # video ``eta`` so audio is a stochastic SDE twin, capture its
-                # log-prob, and merge into a single joint-policy log-prob. Legacy
-                # mode: ODE (eta=0), no RL gradient — audio is only the state the
-                # video branch cross-attends to. The strategy is stateless
-                # (step_index passed in), so the same instance serves both steps.
                 audio_eta = step_eta if self._audio_in_policy else 0.0
                 a_next, audio_log_prob, _ = self.strategy.denoise(
                     noise_pred=audio_pred,
@@ -518,20 +474,8 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
             for step_idx in target:
                 sigma = sigmas[step_idx].to(dtype=torch.float32)
                 sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                # Feed the model/strategy the SAME dtype generate() used
-                # (trajectory_dtype, the dtype the rollout latents were actually
-                # stored in). Upcasting to autocast_dtype here would make the
-                # replay model input differ from rollout (fp16 vs bf16 residual
-                # stream) → step-0 importance ratio != 1 and a biased FlowGRPO
-                # gradient. Matches WAN21 (which never re-casts at the replay
-                # call site). autocast still runs the matmuls in autocast_dtype.
                 sample = segment.latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
                 prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
-                # Reuse the audio state stored at this step from the rollout, so
-                # the video prediction matches what generate() produced (the
-                # video forward cross-attends to audio). In joint mode the audio
-                # pred is also stepped for its own log-prob; in legacy mode it is
-                # discarded.
                 audio_sample = segment.aux_latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
 
                 video_pred, audio_pred = self.step_kernel.predict_noise(
@@ -563,11 +507,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                         f"(deterministic mode); replay requires a stochastic SDE strategy."
                     )
 
-                # Joint mode: replay the audio transition too (same eta) and merge
-                # its log-prob/mean into the joint policy, mirroring generate(). The
-                # combined log-prob keeps the ratio consistent with rollout; the
-                # concatenated means feed FlowDPPO's Gaussian KL (video-only models
-                # leave _audio_in_policy False → unchanged).
                 if self._audio_in_policy:
                     audio_prev = segment.aux_latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
                     _, audio_log_prob, audio_prev_mean = self.strategy.denoise(
@@ -592,10 +531,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                         n_audio=audio_sample[0].numel(),
                     )
                     if prev_mean is not None and audio_prev_mean is not None:
-                        # Concat on the sequence dim (both packed latents are
-                        # C=128). KL reduces over all non-batch dims and sigma_t
-                        # broadcasts, so the joint mean is the well-defined mean of
-                        # the concatenated [video|audio] SDE Gaussian.
                         prev_mean = torch.cat([prev_mean, audio_prev_mean], dim=1)
 
                 log_probs.append(log_prob)

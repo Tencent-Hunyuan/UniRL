@@ -80,8 +80,6 @@ class SFTTrainer(BaseTrainer):
                 "this trainer's outer-step accounting."
             )
 
-        # Driver-side data iterator (not a Remote) — records stay light dicts;
-        # tokenization / media loading run worker-side in the track builder.
         self.data_source = instantiate(data_source_cfg)
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -97,23 +95,12 @@ class SFTTrainer(BaseTrainer):
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
         logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
 
-    # ------------------------------------------------------------------
-    # One optimizer step
-    # ------------------------------------------------------------------
-
     def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
         """records → worker-side track build → stack train. No rollout legs."""
         part = self.track_builder.build(records)
         if part.batch_size != len(records):
-            # AReaL's single-controller once broadcast SFT batches instead of
-            # scattering them — 8× duplicated tokens with a correct-LOOKING loss.
-            # Token conservation is cheap to assert; assert it.
             raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
         return self.stack.train_track(part, training_progress=training_progress)
-
-    # ------------------------------------------------------------------
-    # Validation loss (full set, exact)
-    # ------------------------------------------------------------------
 
     def evaluate(self, step: int) -> float:
         """Weighted eval loss over the full validation set; logs ``eval/loss``."""
@@ -157,10 +144,6 @@ class SFTTrainer(BaseTrainer):
             records.append(pad)
         return records
 
-    # ------------------------------------------------------------------
-    # Data-cursor sidecar (exact mid-epoch resume)
-    # ------------------------------------------------------------------
-
     def _save_data_state(self, step: int, num_steps: int, *, save_interval: int, save_dir: Optional[str]) -> None:
         """Write the dataset cursor beside the checkpoint this step produced
         (same cadence/path arithmetic as :meth:`BaseTrainer.maybe_save_checkpoint`)."""
@@ -192,15 +175,9 @@ class SFTTrainer(BaseTrainer):
                 self.data_source.load_state_dict(json.load(fh))
             logger.info("Restored dataset cursor from %s (epoch=%.3f)", path, self.data_source.epoch)
             return
-        # Sidecar-less checkpoint: replay the stream to the resume point (exact
-        # for a fixed seed — the shuffle is seed+epoch generated).
         logger.warning("No %s beside the checkpoint; fast-forwarding %d batches.", _DATA_STATE_FILENAME, start_step)
         for _ in range(start_step):
             self.data_source.get_samples(self.batch_size)
-
-    # ------------------------------------------------------------------
-    # Loop
-    # ------------------------------------------------------------------
 
     def train(
         self,
@@ -223,7 +200,7 @@ class SFTTrainer(BaseTrainer):
         self._init_wandb(num_rollouts=num_steps)
         try:
             if self.eval_interval > 0:
-                self.evaluate(step=-1)  # baseline eval-loss at step 0
+                self.evaluate(step=-1)
             for step in range(start_step, num_steps):
                 t0 = time.perf_counter()
                 training_progress = step / max(1, num_steps - 1)

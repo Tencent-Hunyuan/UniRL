@@ -158,8 +158,6 @@ def patch_qwen3_omni_audio_video_mrope(thinker_cls: type[Any]) -> None:
                 or int(tokens[audio_end_idx + 1]) != vision_end
             ):
                 continue
-            # vLLM 0.20 duplicates the vision-start position for audio-start.
-            # Leave newer runtimes that already fixed the layout untouched.
             if not torch.equal(positions[:, start], positions[:, start - 1]):
                 continue
             blocks.append((start, audio_end_idx))
@@ -171,12 +169,9 @@ def patch_qwen3_omni_audio_video_mrope(thinker_cls: type[Any]) -> None:
         cumulative_shift = 0
         for audio_start_idx, audio_end_idx in blocks:
             corrected[:, cursor:audio_start_idx] = positions[:, cursor:audio_start_idx] + cumulative_shift
-            # HF assigns audio-start, every interleaved feature, and audio-end
-            # one position after vLLM while preserving each token's 3D axes.
             corrected[:, audio_start_idx : audio_end_idx + 1] = (
                 positions[:, audio_start_idx : audio_end_idx + 1] + cumulative_shift + 1
             )
-            # The final vision-end delimiter is one further position along.
             corrected[:, audio_end_idx + 1] = positions[:, audio_end_idx + 1] + cumulative_shift + 2
             cursor = audio_end_idx + 2
             cumulative_shift += 2

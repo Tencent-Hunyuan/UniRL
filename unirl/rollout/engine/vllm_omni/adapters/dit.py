@@ -102,10 +102,6 @@ class DitInputAdapter:
     def __init__(self, modality: str) -> None:
         self.modality = modality
 
-    # ------------------------------------------------------------------ #
-    # Family hooks — one per GenerateCall payload field
-    # ------------------------------------------------------------------ #
-
     def build_prompts(self, sample: Sample) -> List[Any]:
         """The per-prompt dicts: the ``{"prompt", "negative_prompt"}`` shape."""
         # text-only consumer: text_conditioning() fails loud if an image turn is present.
@@ -136,10 +132,6 @@ class DitInputAdapter:
 
         return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]
 
-    # ------------------------------------------------------------------ #
-    # Skeleton
-    # ------------------------------------------------------------------ #
-
     def build(self, sample: Sample) -> List[GenerateCall]:
         return [GenerateCall(prompts=self.build_prompts(sample), sampling=self.build_sampling(sample))]
 
@@ -157,16 +149,11 @@ class DitOutputAdapter:
     ``super()``.
     """
 
-    #: Wire ``final_output_type`` to collect. Video families override it.
     final_output_type = "image"
 
     def __init__(self, modality: str, *, stage_id: int = 0) -> None:
         self.modality = modality
         self.stage_id = stage_id
-
-    # ------------------------------------------------------------------ #
-    # Family hooks — one per target Part field
-    # ------------------------------------------------------------------ #
 
     def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         """The diffusion trajectory segment, asserting the worker's σ echo."""
@@ -190,10 +177,6 @@ class DitOutputAdapter:
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """The family's replay conditions."""
         raise NotImplementedError(f"{type(self).__name__} must implement build_conditions()")
-
-    # ------------------------------------------------------------------ #
-    # Skeleton
-    # ------------------------------------------------------------------ #
 
     def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         if not per_request or not any(per_request):

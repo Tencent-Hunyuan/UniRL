@@ -149,11 +149,6 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
             lm.train()
 
 
-# ---------------------------------------------------------------------------
-# AR (text-out) adapters
-# ---------------------------------------------------------------------------
-
-
 def require_inference_dispatch(model: Any) -> None:
     """Raise unless the MoT is in eval() mode (the navit forward-dispatch contract).
 
@@ -291,8 +286,6 @@ def decode_text(
     past = ctx["past_key_values"]
     stop_set = set(int(t) for t in stop_ids)
 
-    # Hoisted index pools — per-step values are views (kv indexes grow by one
-    # contiguous slot per token, so arange slices cover every step).
     max_new = int(max_new_tokens)
     all_indexes = torch.arange(kv_len + max_new, dtype=torch.long, device=device)
     all_positions = torch.arange(pos, pos + max_new, dtype=torch.long, device=device)
@@ -301,14 +294,6 @@ def decode_text(
     curr = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
     tokens: List[int] = []
     logps: List[float] = []
-    # Always run a FIXED ``max_new`` forwards (no early EOS break). Under an
-    # FSDP-sharded MoT each forward triggers an all-gather collective; a
-    # data-dependent forward count per rank (early break at a sample's own EOS)
-    # desyncs the collective and deadlocks. A fixed loop makes every sample issue
-    # an identical number of all-gathers — the same lockstep the Qwen-VL AR stage
-    # uses. Recording stops at the first stop token, so the returned list is
-    # unchanged (up to and including the stop token); forwards past it advance the
-    # KV cache unrecorded.
     done = False
     for j in range(max_new):
         emb = lm.model.embed_tokens(curr)
@@ -325,7 +310,7 @@ def decode_text(
             mode="und",
         )
         past = out.past_key_values
-        logits = lm.lm_head(out.packed_query_sequence)  # [1, vocab]
+        logits = lm.lm_head(out.packed_query_sequence)
         token_id, log_prob = sample_fn(logits)
         tid = int(token_id.item())
         if not done:
@@ -372,7 +357,7 @@ def score_response(
 
     response_ids = response_ids.to(device=device, dtype=torch.long)
     start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
-    query_ids = torch.cat([start, response_ids[:-1]], dim=0)  # [n]
+    query_ids = torch.cat([start, response_ids[:-1]], dim=0)
 
     emb = lm.model.embed_tokens(query_ids)
     out = lm.forward_inference(
@@ -387,7 +372,7 @@ def score_response(
         is_causal=True,
         mode="und",
     )
-    hidden = out.packed_query_sequence  # [n, H]
+    hidden = out.packed_query_sequence
 
     temp = float(temperature) if float(temperature) > 0.0 else 1.0
 
@@ -428,7 +413,7 @@ def score_response_with_prompt(
     (no grad across two forwards). The last ``n`` query rows predict ``response[j]``;
     full-softmax ``log_softmax(lm_head(h)/T)`` gathered on the response tokens.
     """
-    require_inference_dispatch(model)  # inference-mode replay stays in eval()
+    require_inference_dispatch(model)
     disable_inference_cache(model)
     lm = model.language_model
     kv_len, pos = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
@@ -439,7 +424,7 @@ def score_response_with_prompt(
     response_ids = response_ids.to(device=device, dtype=torch.long)
     prompt = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).reshape(-1)
     start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
-    query_ids = torch.cat([prompt, start, response_ids[:-1]], dim=0)  # [P + n]
+    query_ids = torch.cat([prompt, start, response_ids[:-1]], dim=0)
     m = int(query_ids.numel())
 
     emb = lm.model.embed_tokens(query_ids)
@@ -455,7 +440,7 @@ def score_response_with_prompt(
         is_causal=True,
         mode="und",
     )
-    hidden = out.packed_query_sequence[-n:]  # the n response-predicting rows
+    hidden = out.packed_query_sequence[-n:]
 
     temp = float(temperature) if float(temperature) > 0.0 else 1.0
 

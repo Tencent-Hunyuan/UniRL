@@ -52,7 +52,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
         )
 
-    # Build HunyuanImage3ARParams from typed sampling params + model-specific control.
     model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
@@ -75,27 +74,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
 
-    # vit: {"joint_image_info": [[JointImageInfo]]*B, "cond_vit_images":
-    #       list[Tensor [S_b, D]]*B, "vit_kwargs": {"spatial_shapes",
-    #       "attention_mask"}}
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    # HI3-Instruct represents a cond image as a DUAL VAE + ViT block (the
-    # chat template splices VAE <img> slots + a cond <timestep> alongside the
-    # ViT <img> slots). ``_encode_cond_image`` VAE-encodes the cond image and
-    # returns the per-sample VAE latents + timestep + the (re-shaped) ViT
-    # features the unified-MM forward scatters — same call it2i uses.
-    # ``cfg_factor=1``: the AR/comprehension forward has no CFG batching.
-    # Without the VAE half, the 4096 VAE <img> slots stay bare <img>
-    # embeddings → the model sees garbage and can't comprehend the image.
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=1
     )
 
-    # ``cond_vae_images`` is the raw VAE-input image (float). The AR forward runs
-    # the bf16 VAE encoder WITHOUT autocast (the diffusion path wraps its forward
-    # in torch.autocast; the autoregress loop does not), so a float input hits
-    # bf16 conv weights → dtype mismatch. Cast float tensors to the model dtype.
     def _cast_floats(x: Any) -> Any:
         if isinstance(x, torch.Tensor):
             return x.to(dtype=pipeline.bundle.dtype) if x.is_floating_point() else x
@@ -105,10 +89,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     cond_vae_images = _cast_floats(cond_vae_images)
 
-    # Chat template path: pass batch_cond_image_info so the wrapper splices in
-    # the cond-image markers; the resulting cond_vae_image_mask /
-    # cond_vit_image_mask / cond_timestep_scatter_index (now on ``fused``) pin
-    # which ``input_ids`` positions hold the VAE / ViT / timestep scatter targets.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
         bot_task=tok_bot_task,

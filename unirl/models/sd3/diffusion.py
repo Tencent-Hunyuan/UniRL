@@ -69,19 +69,12 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         text = conditions.text
         if text.embeds is None:
             raise ValueError("SD3DiffusionStep.predict_noise: conditions.text.embeds is None")
-        # Pin every model input to the transformer's device. Dedicated-engine
-        # (vLLM-Omni) replay hands sample/conditions back on CPU; the trainside
-        # engine already has them on GPU (these ``.to`` calls are then no-ops).
         dev = model.device
         sample = sample.to(dev)
         sigma = sigma.to(dev)
         prompt_embeds = text.embeds.to(dev)
         pooled_prompt_embeds = text.pooled.to(dev) if text.pooled is not None else None
 
-        # Cast latent/embeds to the transformer's param dtype before the bf16
-        # pos_embed conv — autocast doesn't reliably catch the first conv input
-        # under FSDP2 wrap (the DiffusionNFT forward-process path hits this; GRPO/FlowDPPO
-        # replay feeds already-bf16 latents). Idempotent when dtype matches.
         try:
             model_dtype = next(model.transformer.parameters()).dtype
         except StopIteration:
@@ -131,8 +124,6 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
             pooled_projections=pooled_prompt_embeds,
             return_dict=False,
         )[0]
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -280,16 +271,7 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         self.latent_channels = latent_channels
-        # Batched-step replay: stack all S SDE steps into one [S*B] transformer
-        # forward (+ vectorized SDE transition), cutting per-replay forwards /
-        # FSDP all-gathers from S to 1. Stateless SDE strategies only
-        # (Flow/Dance/CPS). Under old_logp_source='replay' the anchor and train
-        # forward share this path, so the on-policy ratio stays exactly 1.
         self.batch_replay_steps = batch_replay_steps
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def diffuse(
         self,
@@ -350,11 +332,9 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
                 base_seed=int(params.seed),
             )
 
-        # SDE indices: which steps record log probs.
         sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
         sde_sorted: List[int] = sorted(sde_set)
 
-        # Stored positions: SDE pairs ∪ {T} so VAE decode always has the clean latent.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
 
@@ -396,11 +376,10 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
             if log_prob is not None:
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # Pack into LatentSegment.
         positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)  # [B, K, C, H, W]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
-        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None  # [B, S]
+        sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
@@ -412,10 +391,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -455,10 +430,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
                 f"SD3DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
             )
 
-        # Dedicated-engine (vLLM-Omni) rollouts hand the trajectory back on
-        # CPU; pin replay to the model's (CUDA) device so the forward and the
-        # autocast context match the transformer weights. Trainside segments
-        # are already on this device.
         device = torch.device(self.model.device)
         sigmas = segment.sigmas.to(device)
         sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
@@ -469,8 +440,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
             else nullcontext()
         )
 
-        # Fast path (see batch_replay_steps in __init__): stateless SDE
-        # strategies only (step_index unused by .step), and only when S > 1.
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
                 return self._replay_batched_steps(
@@ -547,11 +516,9 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         guarded stateless SDE strategies ignore it.
         """
         S = len(target)
-        # Step-major stack: rows [k*B:(k+1)*B] are all B samples at step target[k].
         sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
         prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
         B = sample_all.shape[0] // S
-        # Per-sample sigma vectors aligned with the step-major stack.
         sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
         sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
         tiled = self._tile_conditions(conditions, S)
@@ -574,7 +541,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
                 "SD3DiffusionStage._replay_batched_steps: strategy returned None log-prob "
                 "(deterministic mode); batched replay requires a stochastic SDE strategy."
             )
-        # [S*B] -> [S, B] -> [B, S] so slot s aligns with segment.sde_logp ordering.
         log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
         means_t = None
         if prev_mean_all is not None:
@@ -595,17 +561,11 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
             if cond is None:
                 return None
-            # Tile attn_mask too for metadata parity (SD3 predict_noise ignores
-            # it today, but keep the condition self-consistent under batching).
             return TextEmbedCondition(
                 embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
             )
 
         return SD3Conditions(text=_tile(conditions.text), negative_text=_tile(conditions.negative_text))
-
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
 
     def predict_noise_at_step(
         self,
@@ -628,10 +588,6 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
             conditions,
             guidance_scale=float(params.guidance_scale),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the module the diffusion forward operates on.

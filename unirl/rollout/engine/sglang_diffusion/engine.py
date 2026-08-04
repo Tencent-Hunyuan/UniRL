@@ -4,7 +4,7 @@ A thin core over the backend seam: it names no concrete model (the adapter, pick
 from the registry by ``config.model_family``, owns the ``Sample`` → ``Sample``
 conversion) and no concrete backend (the seam owns the runtime). Weight sync is a
 :class:`WeightSync` component constructed over the seam; the offload lifecycle (a
-single flag) lives directly on the engine. The frozen ``base.py`` surface is
+single flag) lives directly on the engine. The frozen ``synchronous.py`` surface is
 implemented as thin forwards here — they must be real class attributes anyway
 (``Worker.call`` dispatches by name; ``@distributed`` binds the most-derived
 attribute) — which also absorbs the surface quirks (``track_prefix``) so the
@@ -12,7 +12,7 @@ component keeps clean signatures.
 
 One-shot construction: after ``__init__`` returns, the generator is spawned and the
 engine is usable. ``generate`` / ``sleep`` / ``wake_up`` re-apply ``@distributed``
-(the decorator is not inherited — see ``base.py``).
+(the decorator is not inherited — see ``synchronous.py``).
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -33,6 +32,7 @@ from unirl.rollout.engine.sglang_diffusion.config import (
     SGLangDiffusionPorts,
 )
 from unirl.rollout.engine.sglang_diffusion.weight_sync import WeightSync
+from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.sde.noise import generate_latents
 from unirl.sde.runtime import ensure_sample_sigmas
 from unirl.types.noise_recipe import NoiseRecipe
@@ -42,13 +42,11 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
 
-#: Memory tags released on sleep / restored on wake.
 _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
-#: Tags backed up to CPU rather than dropped.
 _CPU_BACKUP_TAGS = ("vae", "text_encoder")
 
 
-class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
+class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
     """Rollout engine backed by ``sglang.multimodal_gen.DiffGenerator`` (v2 layout)."""
 
     _component_name = "sglang_diffusion"
@@ -79,7 +77,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
 
-        # Adapter (the only read of a model knob) — owns the conversion + schedule.
         self.adapter = get_adapter(config.model_family)(config, model_config, strategy=strategy)
         pipeline_prefix, target_modules = self.adapter.lora_spec()
 
@@ -93,12 +90,9 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             config.populate_conditions,
         )
 
-        # Ports — engine-reserved on this node at the last moment before the spawn.
-        # Tests inject a fixed set; remote mode uses cfg host/port/scheduler_port.
         if config.local_mode and ports is None:
             ports = SGLangDiffusionPorts.reserve()
 
-        # Backend (the seam) — booted from the config-spelled intent (ports overlaid).
         intent = config.server_intent(
             model_config=model_config,
             ports=ports,
@@ -109,7 +103,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             local_mode=bool(config.local_mode),
         )
 
-        # Weight sync — owns all sync/LoRA state, over the live seam.
         self._weight_sync = WeightSync(
             self._backend,
             pipeline_prefix=pipeline_prefix,
@@ -117,20 +110,13 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             uses_lora=bool(model_config.use_lora),
         )
 
-        # σ schedule policy comes from the adapter (absorbs the generic-vs-factory branch).
         self.schedule_policy = self.adapter.schedule_policy()
 
-        # The DiffGenerator backend is synchronous and its scheduler client is not
-        # request-concurrent-safe; the lock serializes concurrent generate callers.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
         self._shutdown_complete = False
-
-    # ------------------------------------------------------------------ #
-    # Generation — sync entrypoint, serialized internally
-    # ------------------------------------------------------------------ #
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -150,8 +136,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             int(gen.batch_size) > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        # σ SSOT: pin once onto the gen part's (shared) sampling_params, so every
-        # forward-batch chunk sees the same schedule.
         self._ensure_sample_sigmas(sample)
 
         fbs = self.cfg.forward_batch_size
@@ -159,8 +143,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
-        # Slice the gen frontier into chunks; ``replace_frontier`` keeps the input
-        # part(s) whole (mirrors trainside; preserves any chained inputs).
         gen_chunks: List[Part] = []
         for start in range(0, bs, fbs):
             end = min(start + fbs, bs)
@@ -226,20 +208,13 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             base_seed=int(diffusion.seed),
         )
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle — the offload flag lives here; decorators re-applied (base.py footgun)
-    # ------------------------------------------------------------------ #
-
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        # Idempotent, symmetric with ``wake_up``: a second ``sleep()`` while already
-        # offloaded would issue ``release_memory_occupation`` to the scheduler twice.
+        # Skip duplicate sleep calls because memory release is not idempotent.
         if self._is_offloaded:
             return
         self._backend.release_memory(tags=_OFFLOAD_TAGS, cpu_backup_tags=_CPU_BACKUP_TAGS)
         self._is_offloaded = True
-        # The released tags include the transformer weights → the loaded LoRA pool
-        # is gone; the next weight sync must re-push.
         self._weight_sync.mark_weights_released()
         logger.info("sglang_diffusion engine slept (release_memory_occupation).")
 
@@ -255,8 +230,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
         return self._is_offloaded
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
-        # Diffusion release/resume is all-or-nothing on one tag set, so onloading
-        # weights == waking.
         del track_prefix
         self.wake_up()
 
@@ -272,12 +245,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True
-
-    # ------------------------------------------------------------------ #
-    # Weight sync — frozen base.py surface; thin forwards to the component.
-    # Un-decorated: reached per worker via the raw ``Worker.call`` RPC, not
-    # through ``@distributed``. ``track_prefix`` is absorbed here.
-    # ------------------------------------------------------------------ #
 
     def update_weights_from_tensor(
         self,
@@ -295,7 +262,7 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1  # weights changed → bump the version stamped onto gens
+        self._weight_version += 1
 
     def init_weights_update_group(
         self,
@@ -338,7 +305,7 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1  # weights changed → bump the version stamped onto gens
+        self._weight_version += 1
 
     def destroy_weights_update_group(
         self,
@@ -365,9 +332,6 @@ class SGLangDiffusionRolloutEngine(BaseSingleTurnRolloutEngine):
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed before generate."""
         return self._weight_sync.lora_dirty
-
-    # ``update_weights_from_ipc`` is deliberately NOT defined — the base raises
-    # NotImplementedError (SGLang has no bucketed-IPC receiver).
 
 
 __all__ = ["SGLangDiffusionRolloutEngine"]

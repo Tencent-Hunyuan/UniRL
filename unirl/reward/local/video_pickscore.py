@@ -34,10 +34,6 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
     canonical_model_name = "videopickscore"
     input_kind = "video"
 
-    # ------------------------------------------------------------------
-    # Frame extraction
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _extract_first_frame(video: torch.Tensor) -> "Image.Image":
         """Extract the first frame of a channel-first video tensor.
@@ -87,10 +83,6 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
             frame = frame.clamp(0.0, 1.0)
 
         return tensor_frame_to_pil(frame)
-
-    # ------------------------------------------------------------------
-    # Override: extract first frame then delegate to PickScore scoring
-    # ------------------------------------------------------------------
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         if request.is_video:

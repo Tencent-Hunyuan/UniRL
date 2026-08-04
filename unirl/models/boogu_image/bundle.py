@@ -119,10 +119,6 @@ class BooguImageBundle(Bundle):
 
         import fcntl
 
-        # Node-local load serialization (qwen_image precedent): 8 colocated
-        # ranks each stage ~20 GiB (10.29B DiT) + ~17 GiB (Qwen3-VL-8B)
-        # while materializing; the simultaneous burst can blow the pod memcg.
-        # DIFFRL_MODEL_LOAD_SERIALIZE=0 opts out (single-rank runs).
         serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
@@ -158,13 +154,6 @@ class BooguImageBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Architecture only, on the meta device; the backend materializes
-            # per-rank shards after wrapping and loads weights from the
-            # stashed path. Boogu's vendored tree has zero registered buffers
-            # and zero init-computed plain-tensor attrs (rope freqs_cis is a
-            # per-call input), so the captured init state must come out EMPTY;
-            # if it ever grows after a re-vendor, that is the signal a quirk
-            # restore became load-bearing.
             transformer_config = BooguImageTransformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: BooguImageTransformer2DModel.from_config(transformer_config), dtype=dtype
@@ -190,15 +179,9 @@ class BooguImageBundle(Bundle):
             vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        # Separate-engine recipes can skip the frozen encoder copy on actors
-        # that never embed text (qwen_image precedent).
         text_encoder = None
         processor = None
         if config.load_text_encoder:
-            # ``mllm/`` may ship the full CausalLM wrapper (reused upstream as
-            # a prompt rewriter). Conditioning uses hidden states only, so
-            # keep the inner ``Qwen3VLModel`` and free the wrapper/lm_head
-            # (mirrors pipeline_boogu.py:194-198).
             wrapper = Qwen3VLForConditionalGeneration.from_pretrained(
                 text_encoder_path, subfolder="mllm", torch_dtype=te_dtype
             )
@@ -219,7 +202,6 @@ class BooguImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            # Consumed by the backends' post-wrap sharded weight load.
             bundle._transformer_weights_path = os.path.join(path, "transformer")
             bundle._meta_init_state = meta_init_state
         return bundle

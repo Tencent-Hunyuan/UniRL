@@ -17,29 +17,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from unirl.rollout.engine.base import BaseEngineConfig
+from unirl.rollout.engine.synchronous import BaseEngineConfig
 
 
 @dataclass
 class ComposedRolloutEngineConfig(BaseEngineConfig):
     """Two-stage prompt-enhancement (PE) composed rollout engine."""
 
-    ar: Any  # BaseEngineConfig (kept Any: built from its own _target_)
-    diffusion: Any  # BaseEngineConfig (kept Any: built from its own _target_)
+    ar: Any
+    diffusion: Any
 
     sleep_diffusion_on_start: bool = True
 
-    # System instruction injected into the AR child's ``task_config`` so
-    # the LLM rewrites the user's prompt (PE = prompt enhancement). ``None``
-    # forwards the bare user prompt to AR.
     pe_instruction: Optional[str] = None
 
-    # If set (e.g. ``"Revised Prompt:"``), only the suffix after the LAST
-    # occurrence of the marker is forwarded to diffusion; off-format
-    # outputs fall back to the original user prompt.
     pe_marker: Optional[str] = None
 
-    # Optional char cap applied AFTER marker extraction.
     pe_max_chars: Optional[int] = None
 
 

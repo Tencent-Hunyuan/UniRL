@@ -32,13 +32,10 @@ from dataclasses import dataclass
 
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 
-# LTX-2 scheduler_config.json defaults (diffusers ``.get`` fallbacks).
 _LTX2_BASE_SHIFT = 0.95
 _LTX2_MAX_SHIFT = 2.05
 _LTX2_BASE_IMAGE_SEQ_LEN = 1024
 _LTX2_MAX_IMAGE_SEQ_LEN = 4096
-# LTX-2 stretches the σ grid so its terminal value is 0.1 (scheduler_config
-# ``shift_terminal``); the diffusers scheduler applies this in set_timesteps.
 _LTX2_SHIFT_TERMINAL = 0.1
 
 
@@ -53,8 +50,6 @@ class LTX2SchedulePolicy(FlowMatchSchedulePolicy):
     """
 
     def compute_mu(self, image_seq_len: int, num_inference_steps: int) -> float:
-        # image_seq_len is intentionally ignored: diffusers pins it to
-        # max_image_seq_len, so the linear interpolation degenerates to max_shift.
         return float(self.max_shift)
 
 

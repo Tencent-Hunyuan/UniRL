@@ -1,7 +1,6 @@
 """REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop).
 
-The video sibling of :class:`unirl.trainer.refl.RewardBackpropTrainer`: two
-roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
+Two roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
 grad BPTT sampling + optimizer) and a frozen differentiable video reward
 (:class:`unirl.reward.service.RewardService`), colocated on the same worker
 slab so decoded video never leaves the GPU. Each step runs, under the
@@ -66,7 +65,7 @@ class REFLTrainer(BaseTrainer):
 
     def __init__(self, *, cfg: DictConfig) -> None:
         super().__init__(cfg=cfg, logging_cfg=cfg.get("logging"))
-        self.cfg = cfg  # train() reads run-length/checkpoint defaults from it
+        self.cfg = cfg
         self.batch_size = int(cfg.batch_size)
         self.max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
         self.data_source = instantiate(cfg.data_source)
@@ -81,15 +80,10 @@ class REFLTrainer(BaseTrainer):
             )
         self.sampling_params = params
 
-        # Reward shares the actor's workers: decoded video stays on-GPU for
-        # scoring. (Cross-slab reward placement — DiffusionTrainer's
-        # reward_fraction — is deliberately not supported here; add it only
-        # when a recipe actually cannot colocate.)
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.actor = remote_hydra(cfg.actor)
             self.reward = remote_hydra(cfg.reward)
         self.actor.initialize()
-        # BaseTrainer.maybe_save/load_checkpoint operate on ``self.backend``.
         self.backend = self.actor
 
         adp, rdp = self.actor.dp_size, self.reward.dp_size
@@ -148,7 +142,7 @@ class REFLTrainer(BaseTrainer):
         save_mode = str(save_mode if save_mode is not None else cfg.get("save_mode", "adapter"))
 
         start = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        for _ in range(start):  # fast-forward the data stream on resume
+        for _ in range(start):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:

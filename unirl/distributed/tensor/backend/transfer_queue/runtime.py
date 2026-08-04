@@ -90,8 +90,6 @@ class TransferQueueRuntime:
         self.backend: "Backend | None" = None
         self.controller: "ActorHandle | None" = None
 
-    # -- process-singleton plumbing ---------------------------------------
-
     @classmethod
     def current(cls) -> "TransferQueueRuntime | None":
         """Return the runtime bound to this process, or ``None`` if unbound."""
@@ -109,8 +107,6 @@ class TransferQueueRuntime:
         """Unbind the process runtime (test/teardown helper)."""
         cls._current = None
 
-    # -- driver-side ------------------------------------------------------
-
     def init(self, cfg: DictConfig) -> "tuple[dict, dict] | None":
         """Spawn controller + backend-side actors; return ``(controller, actor)`` handoffs.
 
@@ -122,9 +118,6 @@ class TransferQueueRuntime:
 
         from transfer_queue import TransferQueueController, process_zmq_server_info
 
-        # The `transfer_queue:` block is a standard Hydra _target_ config (the
-        # backend and its nested zero_copy both carry `_target_`), so instantiate
-        # it directly.
         self.backend = instantiate(tq_cfg)
         self.controller = TransferQueueController.remote()
         controller_info = process_zmq_server_info(self.controller)
@@ -141,17 +134,12 @@ class TransferQueueRuntime:
         ray.get(refs)
 
     def reset_actors_zero_copy_buffer_free(self, actors: list) -> None:
-        # Zero-copy buffer free-list reset is Mooncake-specific; skip it for
-        # other backends (e.g. the simple in-Ray storage backend has no such
-        # buffers, so the upstream reset call is meaningless there).
         if self.backend is None or self.backend.manager_type != "MooncakeStorageManager":
             return
         import ray
 
         refs = [actor.reset_zero_copy_buffer_free.remote() for actor in actors]
         ray.get(refs)
-
-    # -- per-process (driver and actor) -----------------------------------
 
     def create_client(
         self,
@@ -164,17 +152,10 @@ class TransferQueueRuntime:
         from transfer_queue import AsyncTransferQueueClient, TransferQueueClient
 
         if handoff.get("manager_type") == "MooncakeStorageManager":
-            # Mooncake binds to LOCAL_IP; otherwise it picks a random interface.
             local_ip = os.getenv("LOCAL_IP", _get_local_ip())
             os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             handoff["local_hostname"] = local_ip
 
-            # Per-process GPU↔HCA affinity. With this env flag set and a
-            # comma-list device_name, Mooncake's setup() picks the PIX-distance
-            # HCA from the active CUDA context. Without it, every client binds
-            # to the first listed bond regardless of GPU placement, causing
-            # `-800` on wrong-NUMA ranks once CUDA initializes.
-            # See LIN-186/docs/mooncake_-800_diagnosis.md (probe G6).
             os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
             if not handoff.get("device_name"):
                 from unirl.distributed.tensor.backend.transfer_queue.topology import list_rdma_bonds

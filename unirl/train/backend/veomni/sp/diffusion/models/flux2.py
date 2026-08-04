@@ -9,13 +9,6 @@ logger = logging.getLogger(__name__)
 
 @register("Flux2Transformer2DModel")
 def _wrap_flux2(model, sp_group):
-    # flux2 uses the MODEL-level boundary (vs block-level for the others): dual->single
-    # blocks + text-strip (hidden[:, num_txt_tokens:]). Because num_txt_tokens ==
-    # encoder_hidden_states.shape[1] and img_ids/txt_ids are forward ARGS (not derived
-    # from the sliced tensors), we slice both streams at the MODEL input (the strip then
-    # removes the LOCAL text, leaving image-local) and gather the image-only output at the
-    # MODEL exit. pos_embed is called per stream (img_ids, txt_ids); slice each (cos, sin)
-    # on dim 0 so the in-forward cat is the joint sliced RoPE.
     sp = _sp()
     get_parallel_state, slice_input_tensor, gather_outputs = (
         sp.get_parallel_state,

@@ -31,8 +31,8 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
-from unirl.rollout.engine.base import BaseSingleTurnRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
+from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -50,14 +50,10 @@ def _cleanup_constructed_child(name: str, child: Any) -> None:
         logger.warning("Child %r cleanup after construction failure raised: %s", name, exc)
 
 
-class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
+class ComposedRolloutEngine(SyncRolloutEngine):
     """Two-child rollout engine for prompt-enhancement (PE) serial flow."""
 
     _component_name = "composed"
-
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
 
     def __init__(
         self,
@@ -83,8 +79,8 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         ar = config.ar.make_engine(strategy=None, **deps)
         try:
             require(
-                isinstance(ar, BaseSingleTurnRolloutEngine),
-                f"ComposedRolloutEngine ar child must be a BaseSingleTurnRolloutEngine; got {type(ar).__name__}",
+                isinstance(ar, SyncRolloutEngine),
+                f"ComposedRolloutEngine ar child must be a SyncRolloutEngine; got {type(ar).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("ar", ar)
@@ -97,9 +93,8 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             raise
         try:
             require(
-                isinstance(diffusion, BaseSingleTurnRolloutEngine),
-                "ComposedRolloutEngine diffusion child must be a BaseSingleTurnRolloutEngine; "
-                f"got {type(diffusion).__name__}",
+                isinstance(diffusion, SyncRolloutEngine),
+                f"ComposedRolloutEngine diffusion child must be a SyncRolloutEngine; got {type(diffusion).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("diffusion", diffusion)
@@ -109,14 +104,11 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         self._ar = ar
         self._diffusion = diffusion
 
-        self._child_by_name: Dict[str, BaseSingleTurnRolloutEngine] = {
+        self._child_by_name: Dict[str, SyncRolloutEngine] = {
             "ar": self._ar,
             "diffusion": self._diffusion,
         }
 
-        # The whole AR→diffusion transition is one serialized operation because
-        # the children share wake/sleep state. Composed owns no weights and
-        # propagates each child's stamp rather than stamping its own version.
         self._weight_version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
@@ -129,10 +121,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             _cleanup_constructed_child("diffusion", diffusion)
             _cleanup_constructed_child("ar", ar)
             raise
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
@@ -179,10 +167,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             out["cached_gb"] += float(m.get("cached_gb", 0.0))
         return out
 
-    # ------------------------------------------------------------------
-    # Generation — PE serial flow
-    # ------------------------------------------------------------------
-
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Run the whole PE serial flow for one DP shard synchronously."""
@@ -224,14 +208,9 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
         require(M >= 1, f"ComposedRolloutEngine.generate: diffusion branch M={M} must be >= 1")
 
-        # ── Stage 1: AR child ────────────────────────────────────────
         self._ar.wake_up()
         self._diffusion.sleep()
 
-        # AR child request: the prompts + the AR shell. The input Part's
-        # ``control`` carries the AR routing (forward parent's "chat" + "ar"
-        # subsets, inject pe_instruction on both — ``sglang`` reads "ar" while
-        # ``Qwen3Pipeline`` reads "chat").
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
             primitives={"text": text_primitive},
@@ -244,8 +223,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             f"ComposedRolloutEngine: AR child returned {len(ar_part.sample_ids)} samples; expected {P}*{N}={P * N}",
         )
 
-        # PE extraction: clean the AR text the diffusion child conditions on
-        # (rewritten onto the AR Part's text primitive so logging sees it too).
         pe_texts = ar_part.primitives.get("text")
         require(
             isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
@@ -255,17 +232,10 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         pe_texts = self._extract_pe(pe_texts, text_primitive, N)
         ar_part = ar_part.fill(primitives={"text": pe_texts})
 
-        # ── Stage 1 → Stage 2 transition ────────────────────────────
         self._ar.sleep()
         self._diffusion.wake_up()
 
-        # ── Stage 2: diffusion child ─────────────────────────────────
-        # The PE ids ("p0/0") are non-root, so they cannot be a child Sample's
-        # root input. Re-root the PE prompts onto fresh ids, fork the diffusion
-        # shell off them (preserving the shell's sampling params + x_T segment),
-        # generate, then map the per-sample outputs back onto our
-        # lineage-correct diffusion_shell — row order matches (both
-        # group-by-parent, branch=M, same parent order).
+        # Re-root diffusion prompts because composed PE IDs are not valid child roots.
         pe_input = Part.input(
             sample_ids=[f"pe{k}" for k in range(P * N)],
             primitives={"text": pe_texts},
@@ -282,8 +252,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
             f"samples; expected {P}*{N}*{M}={P * N * M}",
         )
-        # Carry the diffusion child's weight version onto the frontier part — composed
-        # owns no weights, so it propagates the child's stamp rather than its own 0.
         diffusion_part = diffusion_shell.fill(
             segment=diff_child.segment,
             primitives=dict(diff_child.primitives),
@@ -294,10 +262,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
         )
 
         return Sample(parts=[input_part, ar_part, diffusion_part])
-
-    # ------------------------------------------------------------------
-    # Control plane — forwarded to both children (best-effort).
-    # ------------------------------------------------------------------
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation on both children. Partials surface via the
@@ -315,10 +279,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
     def resume(self) -> None:
         for child in self._child_by_name.values():
             child.resume()
-
-    # ------------------------------------------------------------------
-    # Generation helpers
-    # ------------------------------------------------------------------
 
     def _unpack_request(self, sample: Sample) -> tuple:
         """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request.
@@ -379,10 +339,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
             )
         return Texts(texts=cleaned_texts)
 
-    # ------------------------------------------------------------------
-    # Prefix demux helper
-    # ------------------------------------------------------------------
-
     def _demux_by_prefix(
         self,
         keys: Dict[str, Any],
@@ -396,7 +352,7 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
                 result[child_name] = subset
         return result
 
-    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseSingleTurnRolloutEngine]:
+    def _children_for_track_prefix(self, track_prefix: str) -> List[SyncRolloutEngine]:
         """Resolve the tensor-payload track routing hint to child engines."""
         if not track_prefix:
             return list(self._child_by_name.values())
@@ -407,10 +363,6 @@ class ComposedRolloutEngine(BaseSingleTurnRolloutEngine):
                 f"expected one of {sorted(self._child_by_name)}."
             )
         return [child]
-
-    # ------------------------------------------------------------------
-    # Weight sync — prefix-based demux
-    # ------------------------------------------------------------------
 
     def update_weights_from_ipc(
         self,

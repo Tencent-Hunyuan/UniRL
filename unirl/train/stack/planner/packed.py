@@ -53,9 +53,6 @@ logger = logging.getLogger(__name__)
 Cost = Callable[[List["Sample"]], int]
 
 
-# --------------------------------------------------------------------------- #
-# Sample value object + cost functions (cost = token-slots the forward allocates)
-# --------------------------------------------------------------------------- #
 class Sample(NamedTuple):
     """A sequence's packing sizes; build via :func:`_sample` (clamps resp>=1, prompt>=0)."""
 
@@ -74,18 +71,13 @@ def _sample(idx: int, *, prompt: int, resp: int) -> Sample:
 
 
 def dense(micro: List[Sample]) -> int:
-    # rectangle [n, maxP + maxR]: prompt and response blocks pad apart
     return (max(s.prompt for s in micro) + max(s.resp for s in micro)) * len(micro)
 
 
 def varlen_sum(micro: List[Sample]) -> int:
-    # flat [Σ tokens], no padding (verl accounting; staged for perf/02)
     return sum(s.total for s in micro)
 
 
-# --------------------------------------------------------------------------- #
-# Placement kernels — pure, CPU-only, unit-testable (no torch.distributed)
-# --------------------------------------------------------------------------- #
 def first_fit_decreasing(samples: List[Sample], *, cost: Cost, budget: int) -> List[List[Sample]]:
     """Pack samples into micros under ``budget`` (longest-first; an oversize sample gets its own micro)."""
     if int(budget) < 1:
@@ -112,9 +104,6 @@ def balance_into_k(samples: List[Sample], *, cost: Cost, k: int) -> List[List[Sa
     return micros
 
 
-# --------------------------------------------------------------------------- #
-# Track extraction + the distributed parity boundary
-# --------------------------------------------------------------------------- #
 def _prompt_lengths(part: Part, total: int) -> Optional[List[int]]:
     """Per-sample prompt token counts from ``conditions['prompt'].attention_mask`` (None if absent)."""
     conditions = getattr(part, "conditions", None)
@@ -153,9 +142,6 @@ def _sync_micro_count(local_count: int) -> int:
     return int(t.item())
 
 
-# --------------------------------------------------------------------------- #
-# Arrange: pack each update -> parity -> emit (perm, plan)
-# --------------------------------------------------------------------------- #
 def _log_packing_efficiency(micros: List[List[Sample]], *, cost: Cost, budget: int) -> None:
     """Log packing efficiency = real tokens / materialized slots across all micros."""
     real = sum(s.total for micro in micros for s in micro)
@@ -202,9 +188,6 @@ def _arrange_packed(
     return perm, plan
 
 
-# --------------------------------------------------------------------------- #
-# The strategy injected into TrainStack
-# --------------------------------------------------------------------------- #
 class TokenBudgetPlanner:
     """Token-budget packed micro-batches (verl ``ppo_max_token_len_per_gpu``).
 
@@ -236,8 +219,6 @@ class TokenBudgetPlanner:
         perm, plan = _arrange_packed(
             samples, num_updates=num_updates, token_budget=self.token_budget, cost_model=self.cost_model
         )
-        # One up-front gather reorders the whole track (segment / conditions / advantages
-        # stay sample-aligned) so the packed micros are contiguous.
         return part.select(perm), plan
 
     def validate(self, algorithm: StageAlgorithm) -> None:

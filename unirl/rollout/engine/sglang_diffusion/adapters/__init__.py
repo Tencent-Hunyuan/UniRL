@@ -15,8 +15,6 @@ from unirl.rollout.engine.sglang_diffusion.adapters.flux import (
     FluxAdapter,
 )
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
-
-# Concrete adapters — imported for their registration side-effects.
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image_edit_plus import (
     QwenImageEditPlusAdapter,

@@ -36,7 +36,6 @@ class Qwen3OmniChatTemplateStage:
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # Cross-worker CONCAT requires a common sequence length when enabled.
         self.pad_to_max_length = bool(pad_to_max_length)
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
@@ -189,8 +188,7 @@ class Qwen3OmniChatTemplateStage:
                 inputs = processor(**processor_kwargs)
             else:
                 template_kwargs.update(mm_kwargs)
-                # These define the replay-condition wire shape and cannot be
-                # overridden by recipe-level chat kwargs.
+                # These define the replay-condition wire shape and cannot be overridden by recipe-level chat kwargs.
                 template_kwargs.update(
                     add_generation_prompt=True,
                     tokenize=True,
@@ -235,7 +233,6 @@ class Qwen3OmniChatTemplateStage:
             mask = inp["attention_mask"].squeeze(0)
             attention_mask[i, :L] = mask[:L].to(device)
 
-        # Keep media as per-sample CONCAT lists.
         pixel_values_videos: List[Optional[torch.Tensor]] = []
         video_grid_thw: List[Optional[torch.Tensor]] = []
         video_second_per_grid: List[Optional[torch.Tensor]] = []

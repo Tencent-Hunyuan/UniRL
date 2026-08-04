@@ -41,7 +41,7 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     frontier = sample.parts[-1]
     primitives: Dict[str, Primitive] = {}
     for prim in sample.conditioning():
-        primitives[primitive_modality_key(prim)] = prim  # nearest ancestor wins (last)
+        primitives[primitive_modality_key(prim)] = prim
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(
@@ -78,14 +78,6 @@ class RewardService(Remote):
     ) -> None:
         super().__init__()
         self.backend = backend
-        # How to score AR generations that hit max_new_tokens (sglang finish=="length"):
-        #   "zero" — force reward 0 on truncated traces (anti-ramble; the default).
-        #   "keep" — keep the raw score on the partial text (= verl dapo reward manager
-        #            with overlong_buffer.enable=False: no zeroing, no penalty).
-        #   "soft" — verl DAPO overlong reward shaping (overlong_buffer.enable=True): a
-        #            graded NEGATIVE penalty over the last `overlong_buffer_len` tokens
-        #            before max_new_tokens — never a hard zero. Mirrors
-        #            verl.workers.reward_manager.dapo: reward += min(-exceed/buf*factor, 0).
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
@@ -172,16 +164,6 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
-        # Length-based reward shaping for AR generations that hit max_new_tokens
-        # (sglang finish == "length"). A non-terminating trace whose text happens to
-        # contain a matching answer (e.g. a mid-reasoning \boxed{}) can teach the
-        # model to ramble up to the token cap — a real failure mode at long
-        # max_new_tokens. `truncated_reward` (see __init__) picks the policy:
-        #   "zero" — force reward 0 on truncated traces (anti-ramble).
-        #   "keep" — leave the raw score (= verl dapo, overlong disabled). No-op here.
-        #   "soft" — verl DAPO graded overlong penalty (never a hard zero).
-        # Only applies when the SCORED frontier is itself an AR generation, where
-        # its segment lengths are 1:1 with the rewards.
         sp = frontier.sampling_params
         if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:
             seg_lengths = getattr(frontier.segment, "lengths", None)
@@ -191,8 +173,7 @@ class RewardService(Remote):
                 if self.truncated_reward == "zero":
                     truncated = seg_lengths >= max_len
                     rewards = torch.where(truncated, torch.zeros_like(rewards), rewards)
-                else:  # "soft": verl overlong shaping — graded negative penalty over the
-                    # last overlong_buffer_len tokens before max_len, clamped to <= 0.
+                else:
                     buf = float(self.overlong_buffer_len)
                     exceed = seg_lengths - (max_len - buf)
                     penalty = torch.clamp(-exceed / buf * self.overlong_penalty_factor, max=0.0)

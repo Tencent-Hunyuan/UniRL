@@ -34,9 +34,7 @@ from unirl.types.conditions import (
 class HunyuanVideoConditions(Batch):
     """Typed conditions container for HunyuanVideo-1.0 diffusion."""
 
-    # LLaMA encoder: 3D [B, seq, 4096] + attn_mask [B, seq].
     text_llama: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, transport=True, default=None)
-    # CLIP pooled: embeds [B, 768] (attn_mask not used by transformer).
     pooled_clip: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, transport=True, default=None)
 
     @classmethod

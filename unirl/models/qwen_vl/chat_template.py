@@ -28,11 +28,6 @@ class QwenVLChatTemplateStage:
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # When True, pad every prompt to a fixed `max_prompt_length` instead of
-        # the per-batch dynamic max. Required by the v2 DP trainer: shards from
-        # different rollout workers are concatenated (dim 0) at merge time, so
-        # input_ids/attention_mask must share one sequence length across shards.
-        # Default False preserves the v1 dynamic-pad behavior.
         self.pad_to_max_length = bool(pad_to_max_length)
 
     def embed(
@@ -123,10 +118,6 @@ class QwenVLChatTemplateStage:
             mask = inp["attention_mask"].squeeze(0)
             attention_mask[i, :L] = mask[:L].to(device)
 
-        # Per-sample lists for pixel_values and image_grid_thw.
-        # Each list has batch_size elements (one per sample, possibly None).
-        # Using per-sample lists with FieldKind.CONCAT ensures correct
-        # concatenation when multiple rollout workers' conditions are merged.
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:

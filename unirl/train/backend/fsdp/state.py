@@ -107,11 +107,6 @@ def fsdp_onload(model: nn.Module, device: torch.device) -> None:
     logger.debug("fsdp_onload: onloaded params/grads to %s", device)
 
 
-# ------------------------------------------------------------------
-# Internal helpers
-# ------------------------------------------------------------------
-
-
 def _global_clip_for_sharded_grads(
     params: List[Parameter],
     max_grad_norm: float,

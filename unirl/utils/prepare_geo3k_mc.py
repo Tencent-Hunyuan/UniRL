@@ -62,7 +62,6 @@ def _answer_letter(row: dict, choices: list) -> str | None:
         gt = row.get(key)
         if gt is not None and str(gt).strip()[:1].upper() in _LETTERS[: len(choices)]:
             return str(gt).strip()[:1].upper()
-    # fall back: match the answer value against the choices
     ans = row.get("answer")
     if ans is not None and choices:
         ans = str(ans).strip()

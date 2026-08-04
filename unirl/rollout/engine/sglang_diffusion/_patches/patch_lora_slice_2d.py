@@ -39,8 +39,6 @@ def _patch_merged_column(ll) -> None:
     if getattr(cls.slice_lora_b_weights, _SENTINEL, False):
         return
 
-    # Resolve get_tp_rank symbol via the module that defines it; ll already
-    # imports it at module load time (used by the existing slicer above).
     get_tp_rank = ll.get_tp_rank
 
     def slice_lora_b_weights(self, B):

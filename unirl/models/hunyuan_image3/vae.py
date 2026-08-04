@@ -55,19 +55,27 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             raise ValueError(
                 f"HunyuanImage3VAEDecodeStage.decode: expected latents shape [N, K, ...], got {tuple(s.latents.shape)}"
             )
-        clean = s.latents[:, -1]  # [B, C, H, W]
+        clean = s.latents[:, -1]
 
-        # Scaling factor lookup mirrors the SD3 pattern; HunyuanImage3's
-        # 3D-VAE config exposes the same attribute.
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor  # [B, C, H, W]
             latents_f32 = latents_f32.unsqueeze(2)  # [B, C, 1, H, W]
-            decoded = self.bundle.vae.to(torch.float32).decode(latents_f32).sample
-            # decoded: [B, 3, T_out, H_out, W_out]; T_out is 1 for still images.
+            # Force per-rank decode; the distributed path returns data only on rank 0.
+            import torch.distributed as _dist
+
+            _orig_is_init = _dist.is_initialized
+            _dist.is_initialized = lambda: False
+            try:
+                out = self.bundle.vae.to(torch.float32).decode(latents_f32)
+            finally:
+                _dist.is_initialized = _orig_is_init
+            # Accept both DecoderOutput and bare-tensor decode results.
+            decoded = out.sample if hasattr(out, "sample") else out
+            # Decoded shape: [B, 3, T, H, W].
             if decoded.dim() == 5:
-                decoded = decoded.squeeze(2)  # [B, 3, H_out, W_out]
+                decoded = decoded.squeeze(2)
             return decoded
 
         with nullcontext() if grad else torch.no_grad():
@@ -106,12 +114,10 @@ class HunyuanImage3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
             raise ValueError("HunyuanImage3VAEEncodeStage.encode: pixels is None")
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
         with torch.no_grad():
-            # p.pixels: [B, 3, H, W] in [0, 1] → [B, 3, 1, H, W] in [-1, 1]
             x = (p.pixels.to(dtype=torch.float32) * 2.0 - 1.0).unsqueeze(2)
             latents = self.bundle.vae.to(torch.float32).encode(x).latent_dist.sample()
-            # latents: [B, C_lat, T_lat=1, H_lat, W_lat]
             if latents.dim() == 5:
-                latents = latents.squeeze(2)  # [B, C_lat, H_lat, W_lat]
+                latents = latents.squeeze(2)
             latents = latents * scaling_factor
         return ImageLatentCondition(latents=latents)
 

@@ -9,6 +9,8 @@ extra key.
 ``server_intent`` (the successor of the hand-maintained ServerArgs allowlist)
 spells this config + the reserved ports as the SGLang ServerArgs intent dict;
 the backend filters it against the real ServerArgs fields and spawns.
+Explicit first-class correctness flags are marked as required so the backend
+fails closed when the installed SGLang ``ServerArgs`` cannot accept them.
 """
 
 from __future__ import annotations
@@ -16,15 +18,25 @@ from __future__ import annotations
 import random
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
-from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
+from unirl.rollout.engine.synchronous import BaseEngineConfig
 
 _SGLANG_GRPC_PORT_OFFSET = 30000
 _SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET
 _SGLANG_SAFE_SERVER_PORT_MIN = 1024
+_REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+_LOAD_BEARING_SERVER_ARGS = frozenset(
+    {
+        "ep_size",
+        "enable_expert_parallel",
+        "enable_memory_saver",
+        "enable_weights_cpu_backup",
+        "skip_server_warmup",
+    }
+)
 
 
 def _bind_tcp_port(port: int) -> socket.socket:
@@ -108,65 +120,40 @@ class SGLangEngineConfig(BaseEngineConfig):
 
         return SGLangRolloutEngine(config=self, **deps)
 
-    # --- Model ---
     pretrained_model_ckpt_path: str = ""
 
-    # --- Adapter selection (registry key; None = derived from image_token) ---
     model_family: Optional[str] = None
 
-    # --- Parallelism & GPU ---
     tp_size: Optional[int] = None
+    pp_size: Optional[int] = None
+    ep_size: Optional[int] = None
+    dp_size: Optional[int] = None
+    enable_expert_parallel: Optional[bool] = None
 
-    # --- SGLang network ---
-    # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
-    # cross-node connections). ``port`` is kept for config-shape parity with
-    # the predecessor; the engine self-reserves its ports — inject a typed
-    # ``SGLangPorts`` (tests) instead of pinning this field.
     host: Optional[str] = None
     port: Optional[int] = None
 
-    # --- Backend transport selection ---
-    # "http" (default): SRT server subprocess + HTTP client. "native":
-    # in-process sglang.Engine (no HTTP hop; the schedulers are still
-    # subprocesses).
     backend: str = "http"
 
-    # --- Concurrency / async ---
     concurrency: int = 8
 
-    # --- Sample expansion contract ---
-    # VLMTrainer pre-expands the request by samples_per_prompt (P prompts → P*N
-    # entries, one per GRPO sibling), so the engine must emit exactly ONE
-    # completion per entry (n=1) — matching the trainside pipeline, else samples
-    # double-count (P*N entries × N each). Standalone callers (e.g. the smoke
-    # driver) pass unexpanded prompts and want the engine to fan out
-    # n=samples_per_prompt itself; they leave this False.
+    enable_memory_saver: Optional[bool] = None
+    enable_weights_cpu_backup: Optional[bool] = None
+    skip_server_warmup: Optional[bool] = None
+
     samples_pre_expanded: bool = False
 
-    # --- VLM multimodal ---
-    # Image token placeholder injected into the chat template at image
-    # positions.  Model-specific: e.g. "<|vision_start|><|image_pad|><|vision_end|>"
-    # for Qwen2.5-VL.  None (default) = text-only mode.
     image_token: Optional[str] = None
 
-    # --- LLM sampling (forwarded to SGLang /generate sampling_params) ---
     max_new_tokens: int = 512
     temperature: float = 0.7
     top_p: float = 0.9
     top_k: int = 0
+    response_forbidden_tokens: Optional[List[str]] = None
 
-    # --- Chat template ---
-    # System message prepended to every prompt (e.g. "/no_think" to suppress
-    # Qwen3's thinking mode), used as the fallback when a per-request stage
-    # config doesn't carry one. Must match the trainside pipeline's
-    # system_instruction so generation and replay see the same prompt.
     system_instruction: Optional[str] = None
-    # Extra kwargs forwarded to tokenizer.apply_chat_template (e.g.
-    # {enable_thinking: false} for Qwen3 — without it the model emits a long
-    # <think> block that overruns max_new_tokens before reaching the answer).
     chat_template_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
 
-    # --- Escape hatch for advanced ServerArgs / engine knobs ---
     engine_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -179,6 +166,42 @@ class SGLangEngineConfig(BaseEngineConfig):
         require(
             self.tp_size is None or self.tp_size >= 1,
             f"SGLangEngineConfig.tp_size must be >= 1 when set; got {self.tp_size!r}",
+        )
+        require(
+            self.pp_size is None or self.pp_size >= 1,
+            f"SGLangEngineConfig.pp_size must be >= 1 when set; got {self.pp_size!r}",
+        )
+        require(
+            self.pp_size is None or self.pp_size == 1,
+            "SGLangEngineConfig.pp_size>1 is not supported yet: UniRL Handle "
+            "would spawn one engine per pp_rank while SGLang Engine also spawns "
+            "its own PP scheduler subprocesses, double-booking the GPUs. Set "
+            "pp_size=1 (or leave it unset) for now; per-stage rank_offset "
+            "routing and single-engine PP fan-out are future work "
+            f"(got pp_size={self.pp_size!r}).",
+        )
+        require(
+            self.ep_size is None or self.ep_size >= 1,
+            f"SGLangEngineConfig.ep_size must be >= 1 when set; got {self.ep_size!r}",
+        )
+        effective_tp = self.tp_size if self.tp_size is not None else 1
+        require(
+            self.ep_size is None or (self.ep_size <= effective_tp and effective_tp % self.ep_size == 0),
+            "SGLangEngineConfig.ep_size must divide tp_size: SGLang derives "
+            "moe_tp_size = tp_size // ep_size, so ep_size must be a divisor of "
+            f"tp_size (got ep_size={self.ep_size!r}, tp_size={self.tp_size!r}).",
+        )
+        require(
+            self.dp_size is None or self.dp_size >= 1,
+            f"SGLangEngineConfig.dp_size must be >= 1 when set; got {self.dp_size!r}",
+        )
+        require(
+            self.dp_size is None or self.dp_size == 1,
+            "SGLangEngineConfig.dp_size>1 is not supported yet: UniRL Handle "
+            "derives data parallelism from world_size // (tp*pp) and does not "
+            "account for SGLang server-level DP replicas, which would "
+            "double-book GPUs. Set dp_size=1 (or leave it unset) "
+            f"(got dp_size={self.dp_size!r}).",
         )
         require(
             self.concurrency >= 1,
@@ -203,9 +226,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.backend must be 'http' or 'native'; got {self.backend!r}",
         )
 
-        # Adapter selection: derive from the predecessor's VLM switch when not
-        # explicit, then validate against the live registry (importing it
-        # registers the families).
         if self.model_family is None:
             self.model_family = "vlm" if self.image_token is not None else "text"
         self.model_family = str(self.model_family).strip().lower()
@@ -217,48 +237,66 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
         )
 
-    # ------------------------------------------------------------------
-    # SGLang ServerArgs intent (successor of the hand-maintained allowlist)
-    # ------------------------------------------------------------------
-
     def server_intent(
         self,
         *,
         ports: SGLangPorts,
         extra: Optional[Dict[str, Any]] = None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Spell this config (+ the reserved ports) as ServerArgs intent.
 
         Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns (non-ServerArgs escape-hatch keys drop harmlessly there).
+        spawns. Non-ServerArgs escape-hatch keys still drop harmlessly there,
+        but explicitly requested first-class correctness flags are recorded so
+        the backend can fail closed if the installed runtime cannot accept them.
         Precedence (low → high): ``engine_kwargs`` escape-hatch < typed cfg
-        fields < adapter ``extra`` < the reserved ports. The trailing
-        ``setdefault``s supply the predecessor's defaults (bind-all host so the
-        server accepts cross-node connections; mem_fraction 0.88) without
-        shadowing an escape-hatch override.
+        fields < adapter ``extra`` < runtime overrides < the reserved ports. The
+        trailing ``setdefault``s supply the predecessor's defaults (bind-all
+        host so the server accepts cross-node connections; mem_fraction 0.88)
+        without shadowing an escape-hatch override.
         """
         intent: Dict[str, Any] = {}
 
-        # Layer 1: escape-hatch (lowest priority).
         intent.update(self.engine_kwargs or {})
 
-        # Layer 2: typed cfg fields.
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
             intent["tp_size"] = int(self.tp_size)
+        if self.pp_size is not None:
+            intent["pp_size"] = int(self.pp_size)
+        if self.ep_size is not None:
+            intent["ep_size"] = int(self.ep_size)
+        if self.dp_size is not None:
+            intent["dp_size"] = int(self.dp_size)
+        if self.enable_expert_parallel is not None:
+            intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
+        if self.enable_memory_saver is not None:
+            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+        if self.enable_weights_cpu_backup is not None:
+            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+        if self.skip_server_warmup is not None:
+            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
         if self.host is not None:
             intent["host"] = str(self.host)
 
-        # Layer 3: adapter model-specific extras (override hook).
         if extra:
             intent.update(extra)
 
-        # Layer 4: the reserved ports (highest) — real ServerArgs fields.
+        if runtime_overrides:
+            intent.update(runtime_overrides)
+
+        required_server_args = sorted(set(intent) & _LOAD_BEARING_SERVER_ARGS)
+        if required_server_args:
+            intent[_REQUIRED_SERVER_ARGS_METADATA_KEY] = required_server_args
+
         intent["port"] = ports.server_port
         intent["nccl_port"] = ports.nccl_port
 
         intent.setdefault("host", "0.0.0.0")
         intent.setdefault("tp_size", 1)
+        intent.setdefault("pp_size", 1)
+        intent.setdefault("ep_size", 1)
         intent.setdefault("mem_fraction_static", 0.88)
 
         return intent
