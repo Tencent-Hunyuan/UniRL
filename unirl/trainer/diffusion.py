@@ -272,6 +272,13 @@ class DiffusionTrainer(BaseTrainer):
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
+        if self._uses_ema and self._offload_train_during_reward:
+            raise ValueError(
+                "offload_train_during_reward is not supported with EMA/DiffusionNFT algorithms "
+                f"({algo_cls.__name__} sets requires_ema_rollout): the reward-phase offload has "
+                "not been validated against backend.ema state. Disable one of the two instead of "
+                "having the trainer silently ignore the requested policy."
+            )
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
@@ -409,7 +416,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _offload_for_reward_phase(self) -> bool:
         """Whether a colocated reward may temporarily borrow the train cards."""
-        return self._offload_train_during_reward and not self._reward_is_separate and not self._uses_ema
+        return self._offload_train_during_reward and not self._reward_is_separate
 
     @contextmanager
     def _reward_phase(self) -> Iterator[None]:

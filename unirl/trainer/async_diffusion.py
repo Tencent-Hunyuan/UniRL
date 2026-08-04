@@ -80,6 +80,14 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             )
         super().__init__(**diffusion_kwargs)
 
+        if self._offload_train_during_reward:
+            raise ValueError(
+                "AsyncDiffusionTrainer does not support offload_train_during_reward: async scoring "
+                "runs at reap time outside _reward_phase(), so the option would be silently ignored "
+                "and a reward sharing the train slab could still OOM. Remove the option or use the "
+                "synchronous trainer."
+            )
+
         if self.weight_sync is None:
             raise ValueError(
                 "AsyncDiffusionTrainer requires a cross-slab weight sync; add a `sync:` block to the recipe."

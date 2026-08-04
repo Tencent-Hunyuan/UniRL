@@ -57,7 +57,10 @@ stay swappable by `_target_`.
   independent: `enable_fsdp_offload` lets an external rollout borrow train memory
   during generation, while `offload_train_during_reward` lets a reward sharing the
   train slab borrow it during scoring. A reward on a separate `reward_fraction`
-  slab never triggers train offload.
+  slab never triggers train offload. `offload_train_during_reward` is rejected at
+  startup with EMA/DiffusionNFT algorithms (unvalidated against `backend.ema`
+  state) and with `AsyncDiffusionTrainer` (async scoring runs outside
+  `_reward_phase()`), rather than being silently ignored.
 
 The current trainer surface is:
 
