@@ -168,6 +168,8 @@ class UnifiedModelTrainStack(Remote):
         micro_slices: List[Tuple[int, int]],
         *,
         training_progress: float,
+        microbatch_offset: int,
+        total_microbatches: int,
     ) -> tuple[TrainStepResult, bool]:
         """Backward one algorithm's Part over the given absolute ``micro_slices``
         (no zero_grad / no optimizer step).
@@ -193,7 +195,8 @@ class UnifiedModelTrainStack(Remote):
         has_backward = False
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
-        for start, end in micro_slices:
+        for i, (start, end) in enumerate(micro_slices):
+            self.fsdp_backend.set_grad_sync(microbatch_offset + i == total_microbatches - 1)
             micro_track = part if single_micro else part.slice(start, end)
             loss_scale = (end - start) / float(update_total)
             result = algorithm.compute_loss_and_backward(
@@ -231,11 +234,22 @@ class UnifiedModelTrainStack(Remote):
         slices → shared optimizer_step → stamp grad_norm / lr onto each stage result.
         """
         self.fsdp_backend.zero_grad()
+        total_microbatches = len(ar_slices) + len(image_slices)
         ar_result, ar_backward = self._backward_part(
-            self.ar_algorithm, ar_part, ar_slices, training_progress=training_progress
+            self.ar_algorithm,
+            ar_part,
+            ar_slices,
+            training_progress=training_progress,
+            microbatch_offset=0,
+            total_microbatches=total_microbatches,
         )
         image_result, image_backward = self._backward_part(
-            self.image_algorithm, image_part, image_slices, training_progress=training_progress
+            self.image_algorithm,
+            image_part,
+            image_slices,
+            training_progress=training_progress,
+            microbatch_offset=len(ar_slices),
+            total_microbatches=total_microbatches,
         )
         results: Dict[str, TrainStepResult] = {"ar": ar_result, "image": image_result}
         any_backward = ar_backward or image_backward
