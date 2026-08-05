@@ -407,7 +407,7 @@ class ARTrainer(BaseTrainer):
         request = prepare_input_sample(
             inputs,
             rollout_id,
-            allowed_primitives={"text", "image", "video"},
+            allowed_primitives={"text", "image", "video", "media"},
             caller="ARTrainer._build_request_sample",
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))

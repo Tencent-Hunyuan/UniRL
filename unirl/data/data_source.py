@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 import torch
 from torch.utils.data import DataLoader
 
+from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts, Videos
 from unirl.types.sample import Part, PrimitiveMap, Sample
 
@@ -164,39 +165,46 @@ def _validate_homogeneous_videos(videos: List[Any]) -> None:
 
 _SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {
     ("image", "condition"),
+    ("image", "prompt"),
     ("video", "condition"),
     ("audio", "prompt"),
     ("video", "prompt"),
 }
 
-_PROMPT_MEDIA_METADATA_KEY = "_media_refs"
+
+def _dataset_metadata(items: List[Dict[str, Any]], *, context: str) -> List[Optional[Dict[str, Any]]]:
+    """Keep dataset/reward metadata separate from typed model inputs."""
+    values: List[Optional[Dict[str, Any]]] = []
+    for row, item in enumerate(items):
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict) and "_media_refs" in metadata:
+            raise ValueError(
+                f"{context}: metadata['_media_refs'] is no longer a model-input channel "
+                f"(row {row}); use the dataset media/media_refs field."
+            )
+        values.append(metadata)
+    return values
 
 
-def _prompt_media_metadata(
+def _prompt_media_primitive(
     media_refs: List[Any],
-    metadata: List[Optional[Dict[str, Any]]],
     *,
     context: str,
-) -> List[Dict[str, Any]]:
-    """Attach lightweight prompt-media refs to root metadata, row by row.
+) -> Optional[MediaRefs]:
+    """Build a batch-aligned sparse prompt-media primitive.
 
-    Prompt media is intentionally not materialized as a primitive Part: a Part
-    is rectangular, while an Omni batch may mix text/audio/video rows.
-    The Qwen3-Omni actor resolves these refs after rollout fan-out via
-    ``Sample.root_metadata`` and loads the actual media locally.
+    The outer row list remains rectangular while each row may carry a different
+    image/video/audio combination (or no prompt media at all).
     """
-    if len(media_refs) != len(metadata):
-        raise ValueError(f"{context}: media_refs count {len(media_refs)} != metadata count {len(metadata)}.")
-
-    rows: List[Dict[str, Any]] = []
-    for row, (refs, raw_metadata) in enumerate(zip(media_refs, metadata)):
-        row_metadata = dict(raw_metadata or {})
+    rows: List[List[MediaRef]] = []
+    any_prompt_media = False
+    for row, refs in enumerate(media_refs):
         selected = [ref for ref in (refs or []) if getattr(ref, "role", None) == "prompt"]
-        by_modality: Dict[str, Any] = {}
-        serialized: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        typed: List[MediaRef] = []
         for ref in selected:
             modality = str(getattr(ref, "modality", "")).lower()
-            if modality in by_modality:
+            if modality in seen:
                 raise ValueError(
                     f"{context}: prompt {row} has more than one ({modality}, prompt) MediaRef; "
                     "Qwen3-Omni currently supports at most one input per media modality."
@@ -206,16 +214,11 @@ def _prompt_media_metadata(
                 raise ValueError(f"{context}: prompt {row} has an empty {modality} media URI.")
             if not uri.startswith(("http://", "https://", "s3://", "gs://")) and not os.path.exists(uri):
                 raise FileNotFoundError(f"{context}: prompt {row} {modality} media not found: {uri}")
-            by_modality[modality] = ref
-            serialized.append({"modality": modality, "role": "prompt", "uri": uri})
-        if serialized:
-            if _PROMPT_MEDIA_METADATA_KEY in row_metadata:
-                raise ValueError(
-                    f"{context}: metadata key {_PROMPT_MEDIA_METADATA_KEY!r} is reserved for normalized prompt media."
-                )
-            row_metadata[_PROMPT_MEDIA_METADATA_KEY] = serialized
-        rows.append(row_metadata)
-    return rows
+            seen.add(modality)
+            typed.append(MediaRef(modality=modality, role="prompt", uri=uri))
+        rows.append(typed)
+        any_prompt_media = any_prompt_media or bool(typed)
+    return MediaRefs.from_rows(rows) if any_prompt_media else None
 
 
 def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> None:
@@ -223,7 +226,8 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
 
     The ``media_refs`` channel carries a ``MediaRef(uri, modality, role)``
     URI list. The driver consumes condition media into chained primitive
-    Parts and preserves prompt audio/video refs as sparse root metadata;
+    Parts and preserves sparse prompt image/audio/video refs in a typed
+    ``MediaRefs`` input Part;
     all other (modality, role) combinations are not yet typed and
     would be silently dropped (degrading I2V/V2V/text-conditioned jobs
     into a misconfigured run).
@@ -271,14 +275,14 @@ def _input_sample(
     text = primitives.get("text")
     if not isinstance(text, Texts):
         raise TypeError(f"Data-source input requires a Texts root, got {type(text).__name__}.")
-    unsupported = set(primitives) - {"text", "image", "video"}
+    unsupported = set(primitives) - {"text", "image", "video", "media"}
     if unsupported:
         raise ValueError(f"Data-source input has unsupported primitive keys: {sorted(unsupported)}")
 
     root = Part.input(sample_ids, primitives={"text": text}, metadata=metadata)
     parts = [root]
     parent = root
-    for key in ("image", "video"):
+    for key in ("image", "video", "media"):
         primitive = primitives.get(key)
         if primitive is None:
             continue
@@ -435,12 +439,11 @@ class MultimodalRLDataSource:
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)
             primitives["video"] = Videos.from_list([video for video in condition_videos if video is not None])
+        prompt_media = _prompt_media_primitive(media_refs, context="MultimodalRLDataSource._collate_text")
+        if prompt_media is not None:
+            primitives["media"] = prompt_media
 
-        metadata_list = _prompt_media_metadata(
-            media_refs,
-            [item.get("metadata") for item in batch],
-            context="MultimodalRLDataSource._collate_text",
-        )
+        metadata_list = _dataset_metadata(batch, context="MultimodalRLDataSource._collate_text")
 
         return _input_sample(primitives, sample_ids=sample_ids, metadata=metadata_list)
 
@@ -472,11 +475,14 @@ class MultimodalRLDataSource:
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)
             primitives["video"] = Videos.from_list([video for video in condition_videos if video is not None])
+        prompt_media = _prompt_media_primitive(
+            media_refs, context="MultimodalRLDataSource._prompt_examples_to_batch"
+        )
+        if prompt_media is not None:
+            primitives["media"] = prompt_media
 
-        metadata_list = _prompt_media_metadata(
-            media_refs,
-            [item.get("metadata") for item in prompt_examples],
-            context="MultimodalRLDataSource._prompt_examples_to_batch",
+        metadata_list = _dataset_metadata(
+            prompt_examples, context="MultimodalRLDataSource._prompt_examples_to_batch"
         )
 
         return _input_sample(primitives, sample_ids=sample_ids, metadata=metadata_list)

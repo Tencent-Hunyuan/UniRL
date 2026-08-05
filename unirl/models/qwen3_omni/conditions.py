@@ -14,6 +14,8 @@ class Qwen3OmniARConditions(Batch):
     """AR inputs; per-sample media fields must remain ``FieldKind.CONCAT``."""
 
     prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
+    pixel_values: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
+    image_grid_thw: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     pixel_values_videos: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     video_grid_thw: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     video_second_per_grid: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
@@ -31,6 +33,8 @@ class Qwen3OmniARConditions(Batch):
             )
         return cls(
             prompt=prompt,
+            pixel_values=d.get("pixel_values"),
+            image_grid_thw=d.get("image_grid_thw"),
             pixel_values_videos=d.get("pixel_values_videos"),
             video_grid_thw=d.get("video_grid_thw"),
             video_second_per_grid=d.get("video_second_per_grid"),
@@ -43,6 +47,10 @@ class Qwen3OmniARConditions(Batch):
         if self.prompt is None:
             raise ValueError("Qwen3OmniARConditions.to_dict: prompt field is None")
         out: Dict[str, Any] = {"prompt": self.prompt}
+        if self.pixel_values is not None:
+            out["pixel_values"] = self.pixel_values
+        if self.image_grid_thw is not None:
+            out["image_grid_thw"] = self.image_grid_thw
         if self.pixel_values_videos is not None:
             out["pixel_values_videos"] = self.pixel_values_videos
         if self.video_grid_thw is not None:

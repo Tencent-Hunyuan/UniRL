@@ -105,7 +105,6 @@ class Qwen3OmniPipeline(Pipeline):
         self,
         turns: List[Turn],
         control: Optional[Dict[str, Any]] = None,
-        prompt_media_refs: Optional[List[List[Any]]] = None,
     ) -> Qwen3OmniARConditions:
         """Render the trajectory using config plus root-Part chat overrides."""
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
@@ -135,7 +134,6 @@ class Qwen3OmniPipeline(Pipeline):
         conversations = build_omni_messages(
             turns,
             system_instruction,
-            prompt_media_refs=prompt_media_refs,
         )
         return chat_stage.embed_messages(conversations)
 
@@ -146,9 +144,7 @@ class Qwen3OmniPipeline(Pipeline):
         assert isinstance(ar, ARSamplingParams)
 
         turns = sample.turns()
-        metadata = sample.root_metadata()
-        prompt_media_refs = [list((row or {}).get("_media_refs") or []) for row in metadata]
-        conds = self._conditions_for(turns, sample.parts[0].control, prompt_media_refs)
+        conds = self._conditions_for(turns, sample.parts[0].control)
 
         params = Qwen3OmniARParams(
             max_tokens=ar.max_new_tokens,

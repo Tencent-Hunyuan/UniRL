@@ -54,6 +54,7 @@ import PIL.Image
 import torch
 
 from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field
+from unirl.types.media import MediaRefs
 
 # ---------------------------------------------------------------------------
 # Per-sample primitives
@@ -330,14 +331,14 @@ def _cumsum(values: List[int]) -> List[int]:
 # The batched single-modality primitive union — a Part's raw content (text /
 # image / video / audio). Mirrors ``sample.Primitive`` without importing the
 # Sample module and creating a cycle.
-PrimitiveValue = Union[Texts, Images, Videos, Audios]
+PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs]
 
 
-def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
+def primitive_modality_key(prim: Texts | Images | Videos | Audios | MediaRefs) -> str:
     """Map a batched primitive to its modality slot key.
 
     ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
-    ``Audios -> "audio"`` — the keying convention shared by
+    ``Audios -> "audio"``, ``MediaRefs -> "media"`` — the keying convention shared by
     ``RewardRequest.primitives`` / ``generated`` and the slots
     :meth:`Sample.conditioning` surfaces. Inverse of a backend's
     ``preferred_input_kind``.
@@ -350,6 +351,8 @@ def primitive_modality_key(prim: Texts | Images | Videos | Audios) -> str:
         return "video"
     if isinstance(prim, Audios):
         return "audio"
+    if isinstance(prim, MediaRefs):
+        return "media"
     raise TypeError(f"primitive_modality_key: unknown primitive type {type(prim).__name__!r}")
 
 
@@ -359,6 +362,7 @@ __all__ = [
     "Embedding",
     "Image",
     "Images",
+    "MediaRefs",
     "Text",
     "TextAndImage",
     "TextAndVideo",

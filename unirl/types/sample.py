@@ -35,6 +35,7 @@ from unirl.types.advantages import compute_gae_advantages as _compute_gae
 from unirl.types.advantages import scatter_terminal_rewards
 from unirl.types.conditions import Condition
 from unirl.types.media_preview import MediaPreview
+from unirl.types.media import MediaRefs
 from unirl.types.primitives import Audios, Images, Texts, Videos, primitive_modality_key
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
@@ -48,10 +49,10 @@ logger = logging.getLogger(__name__)
 # generation Part. A generation may expose more than one jointly-produced
 # modality (LTX-2 text-to-audio-video is the first such case), so raw content is
 # keyed by modality on the Part.
-Primitive = Union[Texts, Images, Videos, Audios]
+Primitive = Union[Texts, Images, Videos, Audios, MediaRefs]
 PrimitiveMap = Dict[str, Primitive]
 PrimitiveMetadata = Dict[str, Dict[str, Any]]
-PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio")
+PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio", "media")
 
 # The conversation roles a turn can carry when a trajectory is rendered for an
 # LLM/VLM consumer (see :meth:`Sample.turns` and the ``*_conditioning`` renderers).
