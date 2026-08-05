@@ -115,12 +115,10 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             guidance_value = guidance_scale if distilled_guidance_scale is None else float(distilled_guidance_scale)
             guidance = torch.tensor([guidance_value], device=device, dtype=torch.float32).expand(batch_size)
 
-        true_lens = prompt_embeds_mask.sum(dim=1).to(torch.long)
-        max_true = int(true_lens.max().item())
+        max_true = int(prompt_embeds_mask.sum(dim=1).max().item())
         if prompt_embeds.shape[1] > max_true:
             prompt_embeds = prompt_embeds[:, :max_true]
             prompt_embeds_mask = prompt_embeds_mask[:, :max_true]
-        txt_seq_lens = true_lens.tolist()
 
         noise_pred_packed = model.transformer(
             hidden_states=packed,
@@ -129,7 +127,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             encoder_hidden_states_mask=prompt_embeds_mask,
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
-            txt_seq_lens=txt_seq_lens,
             return_dict=False,
         )[0]
 
@@ -144,12 +141,10 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                     raise ValueError(
                         "QwenImageEditPlusDiffusionStep.predict_noise: conditions.negative_text.attn_mask is None"
                     )
-                neg_true = negative_prompt_embeds_mask.sum(dim=1).to(torch.long)
-                neg_max = int(neg_true.max().item())
+                neg_max = int(negative_prompt_embeds_mask.sum(dim=1).max().item())
                 if negative_prompt_embeds.shape[1] > neg_max:
                     negative_prompt_embeds = negative_prompt_embeds[:, :neg_max]
                     negative_prompt_embeds_mask = negative_prompt_embeds_mask[:, :neg_max]
-                negative_txt_seq_lens = neg_true.tolist()
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,
@@ -157,7 +152,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                     encoder_hidden_states_mask=negative_prompt_embeds_mask,
                     encoder_hidden_states=negative_prompt_embeds,
                     img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
                     return_dict=False,
                 )[0]
                 negative_noise_pred_packed = negative_noise_pred_packed[:, :noise_seq_len]
