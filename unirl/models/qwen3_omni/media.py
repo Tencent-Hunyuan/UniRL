@@ -64,8 +64,8 @@ def load_image_rgb(path: str) -> PIL.Image.Image:
             source = BytesIO(response.read())
     elif path.startswith(("s3://", "gs://")):
         raise NotImplementedError(
-            f"Qwen3-Omni image URI scheme is not supported directly: {path!r}; "
-            "download it to shared storage or use HTTP(S)."
+            f"Qwen3-Omni image URI scheme is not supported: {path!r}; "
+            "materialize to a local path or HTTP(S) URL first."
         )
     with PIL.Image.open(source) as image:
         return image.convert("RGB")

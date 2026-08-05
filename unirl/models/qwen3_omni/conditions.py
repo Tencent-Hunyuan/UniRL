@@ -8,6 +8,23 @@ from typing import Any, Dict, List, Optional
 from unirl.distributed.tensor.batch import Batch, FieldKind, field
 from unirl.types.conditions import TextTokenCondition
 
+_PAIR_FIELDS = (
+    ("pixel_values", "image_grid_thw"),
+    ("pixel_values_videos", "video_grid_thw"),
+    ("input_features", "feature_attention_mask"),
+)
+
+_LIST_FIELDS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_values_videos",
+    "video_grid_thw",
+    "video_second_per_grid",
+    "input_features",
+    "feature_attention_mask",
+    "use_audio_in_video",
+)
+
 
 @dataclass
 class Qwen3OmniARConditions(Batch):
@@ -22,6 +39,35 @@ class Qwen3OmniARConditions(Batch):
     input_features: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     feature_attention_mask: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)
     use_audio_in_video: Optional[List[bool]] = field(kind=FieldKind.CONCAT, default=None)
+
+    def __post_init__(self) -> None:
+        lengths: Dict[str, int] = {}
+        if self.prompt is not None and getattr(self.prompt, "input_ids", None) is not None:
+            lengths["prompt"] = int(self.prompt.input_ids.shape[0])
+        for name in _LIST_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, list):
+                raise TypeError(
+                    f"Qwen3OmniARConditions.{name} must be a list or None, got {type(value).__name__}."
+                )
+            lengths[name] = len(value)
+        if lengths:
+            batch_size = next(iter(lengths.values()))
+            mismatched = {name: size for name, size in lengths.items() if size != batch_size}
+            if mismatched:
+                raise ValueError(
+                    "Qwen3OmniARConditions per-sample media lists must share one batch size; "
+                    f"got {lengths}."
+                )
+        for left, right in _PAIR_FIELDS:
+            left_value = getattr(self, left)
+            right_value = getattr(self, right)
+            if (left_value is None) != (right_value is None):
+                raise ValueError(
+                    f"Qwen3OmniARConditions.{left} and .{right} must both be set or both be None."
+                )
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Qwen3OmniARConditions":

@@ -297,6 +297,12 @@ def _merge_audio(
     """Pad and concatenate per-sample Whisper features and masks."""
     if input_features is None or feature_attention_mask is None:
         return None, None
+    if len(input_features) != len(feature_attention_mask):
+        raise ValueError(
+            "Qwen3-Omni audio feature/mask lists must share one batch size: "
+            f"input_features={len(input_features)}, "
+            f"feature_attention_mask={len(feature_attention_mask)}."
+        )
     pairs = [(f, m) for f, m in zip(input_features, feature_attention_mask) if f is not None and m is not None]
     if not pairs:
         return None, None

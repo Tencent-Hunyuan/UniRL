@@ -194,28 +194,26 @@ def _prompt_media_primitive(
     """Build a batch-aligned sparse prompt-media primitive.
 
     The outer row list remains rectangular while each row may carry a different
-    image/video/audio combination (or no prompt media at all).
+    image/video/audio combination (or no prompt media at all). Schema and URI
+    normalization live here; model-specific cardinality (e.g. Qwen3-Omni's one
+    input per modality) is enforced by the Omni adapter, not the data layer.
+    Local-path existence is checked when the actor opens the media.
     """
     rows: List[List[MediaRef]] = []
     any_prompt_media = False
     for row, refs in enumerate(media_refs):
         selected = [ref for ref in (refs or []) if getattr(ref, "role", None) == "prompt"]
-        seen: Set[str] = set()
         typed: List[MediaRef] = []
         for ref in selected:
-            modality = str(getattr(ref, "modality", "")).lower()
-            if modality in seen:
-                raise ValueError(
-                    f"{context}: prompt {row} has more than one ({modality}, prompt) MediaRef; "
-                    "Qwen3-Omni currently supports at most one input per media modality."
-                )
-            uri = str(getattr(ref, "uri", ""))
-            if not uri:
-                raise ValueError(f"{context}: prompt {row} has an empty {modality} media URI.")
-            if not uri.startswith(("http://", "https://", "s3://", "gs://")) and not os.path.exists(uri):
-                raise FileNotFoundError(f"{context}: prompt {row} {modality} media not found: {uri}")
-            seen.add(modality)
-            typed.append(MediaRef(modality=modality, role="prompt", uri=uri))
+            if isinstance(ref, MediaRef):
+                typed.append(ref)
+                continue
+            modality = getattr(ref, "modality", None)
+            uri = getattr(ref, "uri", None)
+            try:
+                typed.append(MediaRef(modality=modality, role="prompt", uri=uri))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{context}: prompt {row} invalid media ref: {exc}") from exc
         rows.append(typed)
         any_prompt_media = any_prompt_media or bool(typed)
     return MediaRefs.from_rows(rows) if any_prompt_media else None

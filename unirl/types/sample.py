@@ -898,6 +898,26 @@ class Sample(Batch):
         (replay: call on ``parts[:i+1]``)."""
         return [t.content for t in self.turns()]
 
+    def prompt_media_refs(self) -> Optional[MediaRefs]:
+        """Return typed URI prompt-media refs from the root input Part, if any.
+
+        ``(image|audio|video, prompt)`` inputs live under
+        ``Part.primitives["media"]`` as :class:`MediaRefs`. Decoded condition
+        ``primitives["image"]`` / ``primitives["video"]`` used by diffusion and
+        edit paths are intentionally not returned here.
+        """
+        if not self.parts:
+            return None
+        media = self.parts[0].primitives.get("media")
+        if media is None:
+            return None
+        if not isinstance(media, MediaRefs):
+            raise TypeError(
+                f"Sample.prompt_media_refs: expected MediaRefs under primitives['media'], "
+                f"got {type(media).__name__}."
+            )
+        return media
+
     def conditioning_at(self, index: int) -> List[Primitive]:
         """:meth:`conditioning` for generating ``parts[index]`` rather than the frontier.
 
