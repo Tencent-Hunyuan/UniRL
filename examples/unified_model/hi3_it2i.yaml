@@ -199,6 +199,10 @@ data_source:
   args:
     run:
       # Editing instruction + SOURCE image (role: condition).
+      # NOTE: source images should share ONE resolution/aspect — cond_vit's
+      # ``spatial_shapes`` is a SHARED field, so a dp>1 track merge keeps
+      # replica-0's per-sample list; heterogeneous ViT grids would silently
+      # cross-feed at replay (the per-sample-tensors follow-up removes this).
       data_path: ${oc.env:EDIT_DATA_PATH,datasets/image_edit/train.jsonl}
       eval_data_path: ${oc.env:EDIT_EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
       seed: 42
@@ -207,7 +211,9 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  samples_per_prompt: 2          # GRPO group size.
+  samples_per_prompt: 2          # GRPO group size. Pinned at 2: samples_per_prompt>2 trips a
+                                 # cond_vit list-merge (spatial_shapes/attn_mask are Python lists)
+                                 # in the DP merge — see the PR's "future work" note.
   num_inference_steps: 8
   guidance_scale: 1.0            # TRAIN cfg=1 (matches bundle.config.guidance_scale)
   height: 1024
