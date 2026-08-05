@@ -57,27 +57,12 @@ def _resolve_build_batch_2d_rope():
 def _batched_template_over_full_batch(tkw: Any) -> Iterator[None]:
     """Make the upstream batched chat template tokenize every sample, not just the first.
 
-    ``apply_chat_template`` always delegates to ``apply_general_template`` with
-    ``batchify=True``, which in turn calls ``batch_gen_infer`` with a literal
-    ``prompt_list=[[]]`` against one ``infer_fn_kwargs_list`` entry per sample.
-    ``batch_gen_infer`` pairs the two with ``zip``, so the single-element
-    ``prompt_list`` cuts the loop to one iteration and samples 1..B-1 never reach
-    the tokenizer. Nothing raises; at B=1 the lengths agree and the bug is
-    invisible. That the two lists are meant to be parallel is the function's own
-    contract — its default is ``infer_fn_kwargs_list = [{} for _ in prompt_list]``.
-
-    Replicating ``prompt_list`` to match restores the pairing. Every entry is
-    ``[]`` and is spread as ``infer_fn(*prompt, **infer_fn_kwargs)``, i.e. zero
-    positional arguments, so each sample's content still comes only from its own
-    kwargs entry — including the CFG uncond branch, which reuses the same
-    ``*prompt``.
-
-    Iterating over samples here instead would mean re-implementing everything
-    ``batch_gen_infer`` does around the per-sample call: CFG uncond replication,
-    collection by output position, and the closing pad/stack.
-
-    The override is per instance and restored on exit; it assumes the tokenizer
-    instance is not in concurrent use.
+    ``apply_chat_template`` delegates with ``batchify=True``, which calls
+    ``batch_gen_infer(prompt_list=[[]], infer_fn_kwargs_list=[...one per sample])``;
+    ``zip`` cuts the loop to one iteration, so samples 1..B-1 never reach the
+    tokenizer. Replicating ``prompt_list`` restores the pairing — every entry is
+    ``[]`` and spreads as zero positional args, so each sample's content still
+    comes only from its own kwargs entry. Per-instance, restored in ``finally``.
     """
     original = tkw.batch_gen_infer
     had_instance_attr = "batch_gen_infer" in vars(tkw)
@@ -101,7 +86,7 @@ def _batched_template_over_full_batch(tkw: Any) -> Iterator[None]:
             and isinstance(per_sample_kwargs, list)
             and len(per_sample_kwargs) > 1
         ):
-            kwargs["prompt_list"] = prompt_list * len(per_sample_kwargs)
+            kwargs["prompt_list"] = [list(prompt_list[0]) for _ in per_sample_kwargs]
         return original(*args, **kwargs)
 
     tkw.batch_gen_infer = _over_full_batch
