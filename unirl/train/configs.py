@@ -49,6 +49,7 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
+    # Shard degree: full = the whole world, hybrid = one node (replicate across nodes), no_shard = nobody (DDP — every rank keeps the full model).
     fsdp_mode: str = "full"
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False

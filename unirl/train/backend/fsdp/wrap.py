@@ -157,7 +157,7 @@ def fsdp_wrap(
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
-            "HSDP" if mesh is not None else "FSDP2",
+            fsdp_mode,
             cpu_offload,
             mixed_precision,
             reshard_after_forward,
@@ -200,8 +200,19 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
+# Parameter shard degree: full = world default, hybrid = 8 ranks, no_shard = 1 rank (DDP).
+_SHARD_DEGREE: Dict[str, Optional[int]] = {"full": None, "hybrid": 8, "no_shard": 1}
+
+
 def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
-    if str(fsdp_mode).strip().lower() != "hybrid":
+    mode = str(fsdp_mode).strip().lower()
+    require(
+        mode in _SHARD_DEGREE,
+        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {sorted(_SHARD_DEGREE)}; "
+        "an unrecognized mode would silently fall back to full sharding.",
+    )
+    shard_size = _SHARD_DEGREE[mode]
+    if shard_size is None:
         return None
 
     import torch.distributed as dist
@@ -210,7 +221,8 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
         return None
 
     world_size = dist.get_world_size()
-    shard_size = 8
+    # A world that the shard degree cannot split (including single-rank
+    # ``no_shard``) already matches the default 1D mesh.
     if world_size <= shard_size or world_size % shard_size != 0:
         return None
 
@@ -222,7 +234,7 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
         (replicate_size, shard_size),
         mesh_dim_names=("dp_replicate", "dp_shard"),
     )
-    logger.info("fsdp_wrap: HSDP mesh dp_replicate=%d x dp_shard=%d", replicate_size, shard_size)
+    logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", mode, replicate_size, shard_size)
     return mesh
 
 
