@@ -49,25 +49,20 @@ class Qwen3OmniARConditions(Batch):
             if value is None:
                 continue
             if not isinstance(value, list):
-                raise TypeError(
-                    f"Qwen3OmniARConditions.{name} must be a list or None, got {type(value).__name__}."
-                )
+                raise TypeError(f"Qwen3OmniARConditions.{name} must be a list or None, got {type(value).__name__}.")
             lengths[name] = len(value)
         if lengths:
             batch_size = next(iter(lengths.values()))
             mismatched = {name: size for name, size in lengths.items() if size != batch_size}
             if mismatched:
                 raise ValueError(
-                    "Qwen3OmniARConditions per-sample media lists must share one batch size; "
-                    f"got {lengths}."
+                    f"Qwen3OmniARConditions per-sample media lists must share one batch size; got {lengths}."
                 )
         for left, right in _PAIR_FIELDS:
             left_value = getattr(self, left)
             right_value = getattr(self, right)
             if (left_value is None) != (right_value is None):
-                raise ValueError(
-                    f"Qwen3OmniARConditions.{left} and .{right} must both be set or both be None."
-                )
+                raise ValueError(f"Qwen3OmniARConditions.{left} and .{right} must both be set or both be None.")
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Qwen3OmniARConditions":

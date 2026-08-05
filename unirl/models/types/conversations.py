@@ -37,9 +37,7 @@ def _uri_videos_to_media_refs(videos: Videos, *, context: str) -> MediaRefs:
             "use URI-backed MediaRefs (or deprecated Videos.from_uris)."
         )
     if videos.frames is not None:
-        raise ValueError(
-            f"{context}: Videos cannot carry both frames and uris for Qwen3-Omni prompts."
-        )
+        raise ValueError(f"{context}: Videos cannot carry both frames and uris for Qwen3-Omni prompts.")
     rows: List[List[MediaRef]] = []
     for uri in videos.uris:
         if uri is None or (isinstance(uri, str) and not uri.strip()):
@@ -281,9 +279,7 @@ def build_omni_messages(
                             )
                         modality = ref.modality
                         if modality not in {"image", "audio", "video"}:
-                            raise ValueError(
-                                f"build_omni_messages: unsupported prompt media modality {modality!r}."
-                            )
+                            raise ValueError(f"build_omni_messages: unsupported prompt media modality {modality!r}.")
                         if modality in seen_modalities:
                             raise ValueError(
                                 f"build_omni_messages: row {row} has more than one {modality} prompt input."

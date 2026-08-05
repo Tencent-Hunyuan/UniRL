@@ -59,9 +59,7 @@ class MediaRef:
                 f"MediaRef modality must be one of {sorted(SUPPORTED_MEDIA_MODALITIES)}, got {modality!r}."
             )
         if role not in SUPPORTED_MEDIA_ROLES:
-            raise ValueError(
-                f"MediaRef role must be one of {sorted(SUPPORTED_MEDIA_ROLES)}, got {role!r}."
-            )
+            raise ValueError(f"MediaRef role must be one of {sorted(SUPPORTED_MEDIA_ROLES)}, got {role!r}.")
         uri = normalize_media_uri(self.uri, context="MediaRef")
         object.__setattr__(self, "modality", modality)
         object.__setattr__(self, "role", role)
@@ -88,9 +86,7 @@ class MediaRefs(Batch):
             values = list(refs)
             invalid = [type(ref).__name__ for ref in values if not isinstance(ref, MediaRef)]
             if invalid:
-                raise TypeError(
-                    f"MediaRefs.rows[{row}] contains non-MediaRef values: {invalid}."
-                )
+                raise TypeError(f"MediaRefs.rows[{row}] contains non-MediaRef values: {invalid}.")
             normalized.append(values)
         self.rows = normalized
 

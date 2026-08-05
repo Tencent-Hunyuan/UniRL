@@ -34,8 +34,8 @@ from unirl.distributed.tensor.ref import hydrate
 from unirl.types.advantages import compute_gae_advantages as _compute_gae
 from unirl.types.advantages import scatter_terminal_rewards
 from unirl.types.conditions import Condition
-from unirl.types.media_preview import MediaPreview
 from unirl.types.media import MediaRefs
+from unirl.types.media_preview import MediaPreview
 from unirl.types.primitives import Audios, Images, Texts, Videos, primitive_modality_key
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
@@ -874,8 +874,7 @@ class Sample(Batch):
             return None
         if not isinstance(media, MediaRefs):
             raise TypeError(
-                f"Sample.prompt_media_refs: expected MediaRefs under primitives['media'], "
-                f"got {type(media).__name__}."
+                f"Sample.prompt_media_refs: expected MediaRefs under primitives['media'], got {type(media).__name__}."
             )
         return media
 

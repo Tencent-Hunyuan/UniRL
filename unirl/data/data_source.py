@@ -464,15 +464,11 @@ class MultimodalRLDataSource:
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)
             primitives["video"] = Videos.from_list([video for video in condition_videos if video is not None])
-        prompt_media = _prompt_media_primitive(
-            media_refs, context="MultimodalRLDataSource._prompt_examples_to_batch"
-        )
+        prompt_media = _prompt_media_primitive(media_refs, context="MultimodalRLDataSource._prompt_examples_to_batch")
         if prompt_media is not None:
             primitives["media"] = prompt_media
 
-        metadata_list = _dataset_metadata(
-            prompt_examples, context="MultimodalRLDataSource._prompt_examples_to_batch"
-        )
+        metadata_list = _dataset_metadata(prompt_examples, context="MultimodalRLDataSource._prompt_examples_to_batch")
 
         return _input_sample(primitives, sample_ids=sample_ids, metadata=metadata_list)
 

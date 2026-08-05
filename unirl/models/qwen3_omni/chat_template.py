@@ -128,9 +128,7 @@ class Qwen3OmniChatTemplateStage:
             use_audio_in_video=self.use_audio_in_video,
         )
         processor_kwargs = (
-            self._multimodal_processor_kwargs(video_fps=media.effective_fps)
-            if media.video_frames is not None
-            else {}
+            self._multimodal_processor_kwargs(video_fps=media.effective_fps) if media.video_frames is not None else {}
         )
         has_media = media.image is not None or media.video_frames is not None or media.audio_waveform is not None
         return (

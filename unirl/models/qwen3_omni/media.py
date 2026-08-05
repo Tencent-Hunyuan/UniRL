@@ -64,8 +64,7 @@ def load_image_rgb(path: str) -> PIL.Image.Image:
             source = BytesIO(response.read())
     elif path.startswith(("s3://", "gs://")):
         raise NotImplementedError(
-            f"Qwen3-Omni image URI scheme is not supported: {path!r}; "
-            "materialize to a local path or HTTP(S) URL first."
+            f"Qwen3-Omni image URI scheme is not supported: {path!r}; materialize to a local path or HTTP(S) URL first."
         )
     with PIL.Image.open(source) as image:
         return image.convert("RGB")
@@ -99,8 +98,7 @@ def prepare_omni_media(
     audio_sample_rate: Optional[int] = None
     audio_in_video = False
     has_standalone_audio = any(
-        isinstance(message.get("content"), list)
-        and any(block.get("type") == "audio" for block in message["content"])
+        isinstance(message.get("content"), list) and any(block.get("type") == "audio" for block in message["content"])
         for message in messages
     )
 
