@@ -118,12 +118,14 @@ def _global_clip_for_sharded_grads(
     CPU DTensor collectives missing under cpu_offload. Every grad here is a
     sharded DTensor: the root wrap claims all leftover params, and
     ``fsdp_wrap`` fails fast on trainable params outside every group when
-    ``root_wrap`` is disabled — so per-shard square sums SUM-reduce to the
-    exact global norm with no replicated double counting.
+    ``root_wrap`` is disabled. Reduce only over the DTensor shard dimension;
+    reducing over replicated mesh dimensions would count the same gradient
+    multiple times under HSDP / ``no_shard``.
     """
     import torch.distributed as dist
 
     grads: list[Tensor] = []
+    shard_group = None
     local_sq_sum = 0.0
     for param in params:
         grad = getattr(param, "grad", None)
@@ -131,6 +133,17 @@ def _global_clip_for_sharded_grads(
             continue
         local_grad = grad
         if hasattr(local_grad, "to_local") and callable(getattr(local_grad, "to_local")):
+            if shard_group is None:
+                mesh = getattr(local_grad, "device_mesh", None)
+                placements = getattr(local_grad, "placements", ())
+                shard_dims = [i for i, placement in enumerate(placements) if placement.is_shard()]
+                if mesh is not None and shard_dims:
+                    if len(shard_dims) != 1:
+                        raise RuntimeError(
+                            "clip_grad_norm fallback supports exactly one DTensor shard dimension; "
+                            f"got placements={placements!r}"
+                        )
+                    shard_group = mesh.get_group(shard_dims[0])
             local_grad = local_grad.to_local()
         if not isinstance(local_grad, Tensor):
             continue
@@ -146,7 +159,8 @@ def _global_clip_for_sharded_grads(
 
     total_sq = torch.tensor(local_sq_sum, device=reduce_device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(total_sq, op=dist.ReduceOp.SUM)
+        if shard_group is None or dist.get_world_size(group=shard_group) > 1:
+            dist.all_reduce(total_sq, op=dist.ReduceOp.SUM, group=shard_group)
     global_norm = float(torch.sqrt(total_sq).item())
     clip_coef = float(max_grad_norm) / (global_norm + 1e-6)
     if clip_coef < 1.0:

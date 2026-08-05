@@ -200,13 +200,7 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
-# Shard degree per fsdp_mode: how many ranks one parameter is split across.
-# ``None`` means the whole world, which is ``fully_shard``'s own default 1D mesh
-# (no explicit mesh needed).  ``no_shard`` is the degenerate end of the same
-# axis: a shard group of 1 leaves every rank holding the full parameter, so the
-# all-gather has no peer to gather from and only the replicate-dim all-reduce
-# syncs gradients (DDP semantics).  Parameters stay ``DTensor`` in every mode, so the
-# loss mesh, weight sync, checkpoint and grad-clip paths are unaffected.
+# Parameter shard degree: full = world default, hybrid = 8 ranks, no_shard = 1 rank (DDP).
 _SHARD_DEGREE: Dict[str, Optional[int]] = {"full": None, "hybrid": 8, "no_shard": 1}
 
 
