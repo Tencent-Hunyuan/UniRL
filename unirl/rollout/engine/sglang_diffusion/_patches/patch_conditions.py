@@ -79,32 +79,6 @@ from dataclasses import field
 
 logger = logging.getLogger(__name__)
 
-# Condition fields carried from the worker result. All default to None and are
-# typed ``list[torch.Tensor] | None`` (one entry per text encoder) on
-# OutputBatch; ``Any``-typed on GenerationResult to match its existing style.
-#
-# ``image_latent`` (Edit-Plus only) is a single packed
-# ``[B, S_img, C*4]`` tensor — NOT a per-encoder list. It is wrapped as a
-# one-element list ``[tensor]`` at copy time so it flows through the existing
-# list-based merge/slice path unchanged (one "encoder", one tensor). Only
-# Edit-Plus sets ``batch.image_latent`` (via upstream's
-# ``ImageVAEEncodingStage``); T2I models leave it ``None``, so this field is
-# a no-op for every non-Edit-Plus adapter.
-#
-# ``image_latent_sizes`` (Edit-Plus only) carries the per-request
-# ``vae_image_sizes`` (a ``list[tuple[int, int]]`` of pixel (W, H) pairs from
-# upstream's ``preprocess_vae_image``). The adapter needs these to unpack
-# ``image_latent`` from packed ``[S_img, C*4]`` to spatial ``[C, H_img, W_img]``
-# (S_img alone is ambiguous — multiple H×W grids give the same token count).
-# Wrapped as ``[value]`` to fit the list-based merge/slice path.
-#
-# ``condition_image_latent_ids`` (9th field, FLUX.2-Klein ti2i only) carries the
-# 4-axis RoPE ids ``[B, N, 4]`` upstream's ``prepare_condition_image_latent_ids``
-# sets alongside ``image_latent``. FLUX.2 replay needs both the condition tokens
-# and their ids, and the grid factorization can't be recovered from N alone (see
-# the Flux2KleinAdapter.build_condition note), so the ids are captured rather than
-# recomputed. Single ``[B, N, 4]`` tensor, wrapped as ``[tensor]`` like
-# ``image_latent``; ``None`` for every non-Klein-ti2i adapter.
 _COND_FIELDS = (
     "prompt_embeds",
     "audio_prompt_embeds",
@@ -119,21 +93,6 @@ _COND_FIELDS = (
     "condition_image_latent_ids",
 )
 
-# result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
-# Positives gate on return_prompt_embeds; negatives on return_negative_prompt_embeds.
-#
-# NOTE (LIN-365): the emitted ``encoder_attention_mask`` carries the model's
-# EMBEDS-ALIGNED mask (``prompt_embeds_mask`` — the very mask the server's DiT
-# attends under, built by the text-encoding stage over the post-prefix-strip
-# embeds), NOT the raw ``prompt_attention_mask`` (which for prefix-stripped models
-# like Qwen-Image is longer than the embeds). The response translator mounts it
-# only when its fused length matches the fused embeds
-# (``utils.tracks.fuse_text_conditions``): Qwen-Image's single-encoder mask matches
-# and flows through to replay; SD3's per-encoder mask fuses to 410 vs the merged
-# 333-token embeds, so it is dropped there (SD3's ``predict_noise`` ignores the
-# mask anyway — see the historic ~68x LoRA-gradient dilution that motivated this
-# guard). This source-of-truth transmit + shape guard replaces both the old global
-# mask-drop and the adapter-side all-ones backfill.
 _POS_MAP = {
     "prompt_embeds": "prompt_embeds",
     "audio_prompt_embeds": "audio_prompt_embeds",
@@ -147,12 +106,6 @@ _NEG_MAP = {
     "negative_attention_mask": "negative_prompt_embeds_mask",
 }
 
-# Dest fields whose per-encoder tensor may arrive un-batched ``[seq, hidden]``.
-# Single-encoder token-level models (Z-Image / Qwen3) emit a bare ``[seq, hidden]``
-# caption when a chunk encodes a single prompt (``zimage_postprocess_text`` returns
-# ``hidden_states[0][mask]`` for batch-size 1). Only these dests get a batch dim
-# added at ingestion; pooled (``[B, hidden]``) and masks (``[B, seq]``) are already
-# batched and must be sliced/merged as-is.
 _TOKEN_EMBED_DESTS = frozenset(
     {
         "prompt_embeds",
@@ -162,7 +115,6 @@ _TOKEN_EMBED_DESTS = frozenset(
     }
 )
 
-# Sentinels.
 _OUTPUT_BATCH_FIELDS_SENTINEL = "_unirl_conditions_output_batch_fields"
 _GEN_RESULT_FIELDS_SENTINEL = "_unirl_conditions_gen_result_fields"
 _REQ_TO_OB_SENTINEL = "_unirl_conditions_req_to_ob"
@@ -184,17 +136,6 @@ def patch_conditions() -> None:
         DecodingStage,
     )
 
-    # (1) Field injection on the two dataclasses that carry the conditions.
-    #
-    # Both are registered in ``__dataclass_fields__`` (so they round-trip through
-    # ``fields`` / ``replace`` / ``asdict`` / pickle) AND have their generated
-    # ``__init__`` wrapped to strip-then-reapply the injected keys -- because once a field
-    # lives in ``__dataclass_fields__``, ``dataclasses.replace`` passes EVERY field
-    # as a kwarg to ``__init__``, and the frozen generated ``__init__`` would reject
-    # the post-hoc ones. GenerationResult is additionally built directly with these
-    # kwargs (``GenerationResult(**common, ...)`` in DiffGenerator.generate, fed by
-    # our _result_common wrap). Same strip-then-reapply pattern patch_sampling_io
-    # uses for SamplingParams.
     _inject_dataclass_fields(
         sb_mod.OutputBatch,
         _OUTPUT_BATCH_FIELDS_SENTINEL,
@@ -206,24 +147,13 @@ def patch_conditions() -> None:
         type_str="Any",
     )
 
-    # (2a) Monolithic path: copy embeds batch(Req) -> OutputBatch at the terminal
-    #      decoding stage (where the OutputBatch is actually built).
     _wrap_decoding_stage(DecodingStage)
 
-    # (2b) Disagg/raw-Req path: copy embeds Req -> OutputBatch in the per-Req
-    #      conversion (this seam never fires on the monolithic decoding path).
     _wrap_req_to_output_batch(gw_mod.GPUWorker)
 
-    # (3) Carry embeds through the grouped (nopp>1) merge.
     _wrap_merge_expanded_output_batches(gw_mod.GPUWorker)
 
-    # (4) Copy/slice embeds OutputBatch -> GenerationResult per output index.
     _wrap_result_common(dg_mod.DiffGenerator)
-
-
-# ------------------------------------------------------------------ #
-# (1) Dataclass field injection (OutputBatch / GenerationResult)
-# ------------------------------------------------------------------ #
 
 
 def _make_dataclass_field(name: str, default, type_str: str):
@@ -267,8 +197,6 @@ def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
     for name in _COND_FIELDS:
         if name not in own_fields:
             own_fields[name] = _make_dataclass_field(name, None, type_str)
-        # Class-level default so getattr(obj, name) works even when our write
-        # sites did not set it (flags off).
         if name not in cls.__dict__:
             setattr(cls, name, None)
 
@@ -285,11 +213,6 @@ def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
         cls.__init__ = __init__
 
     setattr(cls, sentinel, True)
-
-
-# ------------------------------------------------------------------ #
-# (2) Req -> OutputBatch copy in _req_to_output_batch
-# ------------------------------------------------------------------ #
 
 
 def _wrap_req_to_output_batch(GPUWorker) -> None:
@@ -330,10 +253,6 @@ def _copy_conditions(src, output_batch) -> None:
         _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
         _copy_mapped_conditions(src, output_batch, _NEG_MAP)
-    # Edit-Plus image_latent: a single packed [B, S_img, C*4] tensor set by
-    # upstream's ImageVAEEncodingStage. Not gated on a SamplingParams flag —
-    # presence on the batch IS the gate (only Edit-Plus sets it; T2I leaves
-    # it None). Wrapped as [tensor] to fit the list-based merge/slice path.
     image_latent = getattr(src, "image_latent", None)
     if image_latent is not None:
         import torch
@@ -342,16 +261,9 @@ def _copy_conditions(src, output_batch) -> None:
             output_batch.image_latent = [image_latent.detach().cpu()]
         elif isinstance(image_latent, (list, tuple)):
             output_batch.image_latent = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
-    # Edit-Plus vae_image_sizes: list[tuple[int, int]] of pixel (W, H) pairs
-    # from upstream's preprocess_vae_image. The adapter needs these to unpack
-    # image_latent to spatial form. Wrapped as [value] for the merge/slice path.
     vae_image_sizes = getattr(src, "vae_image_sizes", None)
     if vae_image_sizes is not None:
         output_batch.image_latent_sizes = [vae_image_sizes]
-    # FLUX.2-Klein ti2i condition_image_latent_ids: a single [B, N, 4] RoPE-id
-    # tensor set by upstream's prepare_condition_image_latent_ids alongside
-    # image_latent. Same presence-is-the-gate + [tensor]-wrap contract as
-    # image_latent; None for every non-Klein-ti2i adapter.
     condition_image_latent_ids = getattr(src, "condition_image_latent_ids", None)
     if condition_image_latent_ids is not None:
         import torch
@@ -414,10 +326,6 @@ def _coalesce_duplicate_single_sample_encodes(value):
         return value
     if any(tuple(t.shape) != first_shape for t in value[1:]):
         return value
-    # Value check: only coalesce when the same-shape entries are actually
-    # byte-identical (the shared-list duplicate signature). Same-shape-but-
-    # differing tensors are a genuine multi-encoder whose outputs must NOT be
-    # collapsed — hardens the shape-only heuristic per the examples/ README note.
     if not all(torch.equal(first, t) for t in value[1:]):
         return value
     return [first]
@@ -476,11 +384,6 @@ def _to_cpu_embed_list(value):
     return value
 
 
-# ------------------------------------------------------------------ #
-# (3) Grouped-merge carry (nopp>1 path)
-# ------------------------------------------------------------------ #
-
-
 def _wrap_merge_expanded_output_batches(GPUWorker) -> None:
     """AROUND-wrap the grouped-output merge to carry conditions dim-0 concatenated.
 
@@ -537,17 +440,10 @@ def _merge_conditions(merged, output_batches) -> None:
             if any(t is None for t in tensors):
                 merged_list.append(None)
             elif name == "image_latent_sizes":
-                # Non-tensor (list[tuple[int,int]]); all outputs in a group
-                # share the same source image, so take the first.
                 merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
-
-
-# ------------------------------------------------------------------ #
-# (4) OutputBatch -> GenerationResult copy/slice in _result_common
-# ------------------------------------------------------------------ #
 
 
 def _wrap_result_common(DiffGenerator) -> None:
@@ -576,13 +472,6 @@ def _wrap_result_common(DiffGenerator) -> None:
         for name in _COND_FIELDS:
             val = getattr(output_batch, name, None)
             if name == "image_latent_sizes":
-                # image_latent_sizes is list[tuple[int,int]] per encoder (NOT
-                # per-output — all outputs in a group share one source image).
-                # _merge_conditions already took tensors[0] across batches, so
-                # the merged value has exactly one entry per encoder. Slicing
-                # by output_index would index past it (e.g. [(1024,1024)][3:4]
-                # = []) → "got 0 source images" in _collect_image_latents.
-                # Pass through unchanged.
                 common[name] = val
             else:
                 common[name] = _slice_embed_list(val, idx)

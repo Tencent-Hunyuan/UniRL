@@ -30,16 +30,13 @@ if TYPE_CHECKING:
     from unirl.distributed.group.handle import Handle
 
 
-# Per-worker dispatch payload: (positional args, keyword args).
 Shard: TypeAlias = Tuple[Tuple[Any, ...], Dict[str, Any]]
 
-# Signature contract for entries in DISPATCH_MODE_REGISTRY["dispatch_fn"].
 DispatchFn: TypeAlias = Callable[
     ["Handle", Tuple[Any, ...], Dict[str, Any], Optional[int]],
     List[Shard],
 ]
 
-# Signature contract for entries in DISPATCH_MODE_REGISTRY["collect_fn"].
 CollectFn: TypeAlias = Callable[["Handle", List[Any]], Any]
 
 
@@ -55,16 +52,13 @@ def _unwrap_broadcast(args: tuple, kwargs: dict):
     return clean_args, clean_kwargs
 
 
-# ── Enums ──
-
-
 class Dispatch(Enum):
     """How to distribute input to workers."""
 
     BROADCAST = auto()  # Same data to every worker
     SCATTER = auto()  # Split N ways across world (one shard per worker)
-    DP_SCATTER = auto()  # Chunk by dp_size; all ranks in DP group get the same shard; collect merge
-    DP_SCATTER_HEAD = auto()  # Chunk by dp_size; only DP head gets shard, others empty; collect merge
+    DP_SCATTER = auto()  # One shard per DP group; all ranks receive it.
+    DP_SCATTER_HEAD = auto()  # One shard per DP group; only its head receives it.
 
 
 class Execute(Enum):
@@ -72,9 +66,6 @@ class Execute(Enum):
 
     ALL = auto()  # All workers execute
     RANK_ZERO = auto()  # Only rank 0 executes
-
-
-# ── Dispatch functions (wg, args, kwargs, batch_size) → List[(args_i, kwargs_i)] ──
 
 
 def _dispatch_broadcast(
@@ -131,18 +122,15 @@ def _dispatch_dp_scatter(
         args, kwargs = _unwrap_broadcast(args, kwargs)
         return [(args, kwargs)] * wg.world_size
 
-    # Split into dp_size shards
     split_args = tuple(pytree_chunk(v, dp_size, batch_size) for v in args)
     split_kwargs = {k: pytree_chunk(v, dp_size, batch_size) for k, v in kwargs.items()}
 
-    # Build per-dp-rank shards
     dp_shards = []
     for dp_rank in range(dp_size):
         shard_args = tuple(split_args[j][dp_rank] for j in range(len(args)))
         shard_kwargs = {k: split_kwargs[k][dp_rank] for k in kwargs}
         dp_shards.append((shard_args, shard_kwargs))
 
-    # Map each worker to its DP shard
     return [dp_shards[wg.rank_infos[i].dp_rank] for i in range(wg.world_size)]
 
 
@@ -163,7 +151,6 @@ def _dispatch_dp_scatter_head(
         args, kwargs = _unwrap_broadcast(args, kwargs)
         return [(args, kwargs) if _is_dp_head(wg.rank_infos[i]) else ((), {}) for i in range(wg.world_size)]
 
-    # Split into dp_size shards
     split_args = tuple(pytree_chunk(v, dp_size, batch_size) for v in args)
     split_kwargs = {k: pytree_chunk(v, dp_size, batch_size) for k, v in kwargs.items()}
 
@@ -180,9 +167,6 @@ def _dispatch_dp_scatter_head(
 
 def _is_dp_head(ri) -> bool:
     return ri.tp_rank == 0 and ri.pp_rank == 0 and ri.sp_rank == 0
-
-
-# ── Collect functions (wg, results) → collected ──
 
 
 def _collect_passthrough(wg, results: List) -> List:
@@ -212,17 +196,12 @@ def _collect_dp_merge(wg, results: List) -> Any:
     return pytree_cat(dp_results)
 
 
-# ── Registry: Dispatch mode → paired (dispatch_fn, collect_fn) ──
-
 DISPATCH_MODE_REGISTRY: Dict[Dispatch, Dict[str, Callable]] = {
     Dispatch.BROADCAST: {"dispatch_fn": _dispatch_broadcast, "collect_fn": _collect_passthrough},
     Dispatch.SCATTER: {"dispatch_fn": _dispatch_scatter, "collect_fn": _collect_passthrough},
     Dispatch.DP_SCATTER: {"dispatch_fn": _dispatch_dp_scatter, "collect_fn": _collect_dp_merge},
     Dispatch.DP_SCATTER_HEAD: {"dispatch_fn": _dispatch_dp_scatter_head, "collect_fn": _collect_dp_merge},
 }
-
-
-# ── Backward dispatch mode resolution ────────────────────────────────────────
 
 
 def resolve_backward_dispatch_mode(
@@ -258,12 +237,8 @@ def resolve_backward_dispatch_mode(
             f"Do not call this method inside enable_grad()."
         )
 
-    # DP_SCATTER_HEAD → DP_SCATTER (all ranks must participate in backward)
-    # DP_SCATTER      → DP_SCATTER (unchanged)
     return Dispatch.DP_SCATTER
 
-
-# ── @distributed decorator ──
 
 DISTRIBUTED_CONFIG_ATTR = "_distributed_config"
 
@@ -306,6 +281,5 @@ def distributed(
         return wrapper
 
     if _func is not None:
-        # Called as @distributed without parentheses
         return decorator(_func)
     return decorator

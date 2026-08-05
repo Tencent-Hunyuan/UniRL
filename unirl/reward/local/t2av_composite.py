@@ -45,7 +45,6 @@ class T2AVCompositeScorer(RewardBackend):
             inner_cls = resolve_builtin_reward_scorer_class(name)
             inner_spec_cls = resolve_builtin_reward_spec_class(name)
             inner_spec = inner_spec_cls()
-            # Propagate batch_size/device to inner specs that accept them.
             import dataclasses
 
             overrides = {f: getattr(config, f) for f in ("device", "batch_size") if hasattr(inner_spec, f)}

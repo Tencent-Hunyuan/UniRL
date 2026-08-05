@@ -71,11 +71,6 @@ class FSDPBackend(BaseFSDP2Backend):
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # FSDP compute dtype (MixedPrecisionPolicy.param_dtype) = the wire dtype for
-        # weight sync. With master_dtype=fp32 the trainable LoRA params live in fp32
-        # (the reward-collapse fix), but the rollout engine's vLLM punica kernel
-        # hard-asserts bf16/fp16 — so LoRA extraction casts to this dtype at the
-        # all-gather (also halves sync bandwidth). Read via the ``weight_sync_dtype`` property.
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
         )
@@ -98,10 +93,6 @@ class FSDPBackend(BaseFSDP2Backend):
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
         )
 
-        # Real weights: meta-init bundles stash a safetensors dir (load_sharded
-        # to_empty-materializes the still-meta module then broadcasts); Pattern-A
-        # bundles (hi3) materialize themselves; eager bundles already hold real
-        # weights (fsdp_wrap sharded them in place), so eager_ok=True is a no-op.
         load_trainable_weights(
             model,
             bundle,
@@ -134,14 +125,7 @@ class FSDPBackend(BaseFSDP2Backend):
         """
         return self._weight_sync_dtype
 
-    # ------------------------------------------------------------------
-    # Engine hooks (torch-native FSDP2)
-    # ------------------------------------------------------------------
-
     def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:
-        # Every trainable grad is a sharded DTensor that FSDP reduce-scatters:
-        # the root wrap claims the leftover params, and fsdp_wrap fails fast on
-        # trainable params outside every group when root_wrap is disabled.
         return clip_grad_norm(list(trainable_params(self.model)), max_grad_norm)
 
     def _gather_optimizer_state(self) -> StateDict:

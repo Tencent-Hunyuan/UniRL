@@ -21,8 +21,8 @@ through the driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgenticR
   ``buffer_max_staleness``), reward + GRPO advantage + one optimizer step (reusing
   :class:`AgenticTrainer`'s helpers), then **quiesce + sync**: ``abort`` the in-flight
   tail at a turn boundary, apply the configured ``tail_policy`` (carry only when the
-  environment can resume from the ``Sample``; otherwise drop), ``weight_sync.sync()``,
-  bump the version.
+  environment can resume from the ``Sample``; otherwise drop), then
+  ``engine.sync_weights`` (one call: push + version bump).
 
 ONE single-threaded loop (the ``AsyncARTrainer`` shape): with disjoint slabs the
 rollout slab keeps generating in the background (the engine's per-worker drain) while
@@ -62,15 +62,10 @@ from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# The trainer (producer-side bookkeeping lives in AsyncAgenticRolloutEngine)
-# --------------------------------------------------------------------------- #
-
-
 class AsyncAgenticTrainer(AgenticTrainer):
     """Disaggregated fully-async agentic trainer (two slabs, resident engine, NCCL sync)."""
 
-    _POLL_INTERVAL_S = 0.02  # backoff between polls while the in-flight drive fills the buffer
+    _POLL_INTERVAL_S = 0.02
     _MAX_REFILLS = 64  # underflow guard: refills of a drained-but-short buffer before we give up
 
     def __init__(
@@ -93,56 +88,35 @@ class AsyncAgenticTrainer(AgenticTrainer):
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
         stop: Optional[List[str]] = None,
-        # ---- async knobs ----
         train_fraction: float = 0.5,
         oversample_batch_size: Optional[int] = None,
         buffer_max_staleness: Optional[int] = None,
         tail_policy: Literal["carry", "drop"] = "carry",
     ) -> None:
-        # Call BaseTrainer.__init__ directly: AgenticTrainer.__init__ → ARTrainer.__init__
-        # opens the colocate ``placement(fraction=1.0)`` block we replace with two slabs.
         BaseTrainer.__init__(self, cfg=cfg, logging_cfg=logging_cfg)
 
-        # ---- scalar/config fields (the ARTrainer/AgenticTrainer state we still need) ----
         self.batch_size = int(batch_size)
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
         self.balance_shards = False
-        self.eval_interval = 0  # AgenticTrainer.evaluate raises; agentic eval is a follow-up
+        self.eval_interval = 0
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         self.weight_sync = None
-        # Per-turn stop (AgenticTrainer.__init__): a tool-call turn ends at ``</tool_call>``.
         self._stop = list(stop) if stop else ["</tool_call>"]
 
-        # ---- async state ----
         self._train_fraction = float(train_fraction)
         self._buffer_max_staleness = buffer_max_staleness
         self._tail_policy = str(tail_policy)
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
-        # Monotonic per-DRIVE nonce. ``rollout_id`` alone does not make root ids
-        # unique: :meth:`_next_batch` refills re-submit under the SAME rollout_id, and a
-        # data source may restart its ids on every ``get_samples`` (DefaultDataSource
-        # numbers by batch position, not prompt identity). Two drives would then
-        # namespace different source rows identically, and the facade's group
-        # assembler — which buckets purely by root id — would merge siblings of
-        # unrelated prompts into one GRPO group and overwrite their ``_gt_by_root`` answers.
         self._drive_seq = 0
         self._carried_tail_trajectories = 0
         self._dropped_tail_trajectories = 0
         self._dropped_tail_roots = 0
         self._discarded_completed_trajectories = 0
-        # root id -> ground-truth answer, recorded at submit time so the reward judge
-        # never depends on the engine preserving root-Part metadata through a (possibly
-        # resumed) trajectory. Carried partials keep the root id they were submitted
-        # under, so their answer is already here.
         self._gt_by_root: Dict[str, Optional[str]] = {}
-        # GRPO group size n. Must equal the engine's ``episode_sampling.samples_per_prompt``
-        # (the assembler needs it to know when a root's siblings are all in).
         self._n = int(samples_per_prompt)
-        # How many prompt-groups to feed the rollout slab per drive (>= batch_size). A
-        # larger pool keeps the slab busy across more train steps between syncs.
         self._oversample = int(oversample_batch_size) if oversample_batch_size else self.batch_size
         if self._oversample < self.batch_size:
             raise ValueError(f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}")
@@ -155,7 +129,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
             )
         self._rollout_devices = self.num_devices - self._train_devices
 
-        # ---- two disjoint top-level slabs (AsyncARTrainer template) ----
         with placement(self.pool, fraction=self._train_fraction, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
@@ -174,7 +147,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 )
             self.rollout = remote(**rollout_parsed)
 
-        # Wire the rank-0 coordinator (AgenticTrainer.__init__ does this too).
         self.rollout.set_workers(self.rollout.workers, self.rollout.role_name)
 
         if self.weight_sync is not None:
@@ -196,10 +168,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
             num_rollout_gpus=len(self.rollout.workers),
         )
 
-    # ------------------------------------------------------------------
-    # Producer — build/submit a drive, poll completions into the buffer
-    # ------------------------------------------------------------------
-
     def _build_tasks(self, carried: List[Sample], rollout_id: int) -> List[Sample]:
         """A drive's task list: ``n`` fresh siblings per new prompt + carried partials.
 
@@ -219,7 +187,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
         root = fresh.parts[0]
         root_meta = root.metadata or [None] * len(root.sample_ids)
         for sid, md in zip(root.sample_ids, root_meta):
-            self._gt_by_root[sid] = (md or {}).get("answer")  # remember the answer for this root
+            self._gt_by_root[sid] = (md or {}).get("answer")
         tasks = [prompt for prompt in fresh.split() for _ in range(self._n)]
         tasks.extend(carried)
         return tasks
@@ -285,10 +253,8 @@ class AsyncAgenticTrainer(AgenticTrainer):
             picked = self._drain_buffer(self.batch_size, max_staleness=stale)
             if picked is not None:
                 return picked
-            # finalize_if_drained joins the drain and ingests its last completions
-            # atomically, before a new submit is allowed to reset worker buffers.
             if self._engine.finalize_if_drained() is None:
-                time.sleep(self._POLL_INTERVAL_S)  # in-flight drive still generating; back off
+                time.sleep(self._POLL_INTERVAL_S)
                 continue
             picked = self._drain_buffer(self.batch_size, max_staleness=stale)
             if picked is not None:
@@ -301,11 +267,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
                     f"(buffer={self._engine.buffered_groups()} < batch={self.batch_size}); raise "
                     f"oversample_batch_size or buffer_max_staleness."
                 )
-            self._submit_drive([], rollout_id)  # fresh refill (carried tails resubmit at sync time)
-
-    # ------------------------------------------------------------------
-    # Consumer — reward + GRPO advantage + one optimizer step over a group batch
-    # ------------------------------------------------------------------
+            self._submit_drive([], rollout_id)
 
     def _train_on_groups(
         self, groups: List[List[Sample]], *, training_progress: float, rollout_id: int, t0: float
@@ -314,10 +276,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
         groups. Reuses :class:`AgenticTrainer`'s reward/GRPO/log helpers; the train-part
         assembly mirrors :meth:`AgenticTrainer.train_step` (steps 5-6)."""
         trajs: List[Sample] = [t for group in groups for t in group]
-        # Reconstruct a request whose root Part carries every trajectory's root id +
-        # ground-truth answer (looked up in _gt_by_root, not the trajectory), so the
-        # inherited answer-grader (_rewards_and_groups reads gt from sample.parts[0])
-        # works unchanged. Built as ONE Part.input (no Part.concat of input Parts).
         roots = [tr.parts[0].sample_ids[0] for tr in trajs]
         request = Sample.request(Part.input(roots, metadata=[{"answer": self._gt_by_root.get(r)} for r in roots]))
         rewards, group_ids = self._rewards_and_groups(request, trajs, rollout_id)
@@ -332,7 +290,7 @@ class AsyncAgenticTrainer(AgenticTrainer):
             adv_i = float(advantages[i].item())
             for gp in tr.gen_parts():
                 gp = _part_with_field(gp, "advantages", torch.full((gp.batch_size,), adv_i, dtype=torch.float32))
-                gp = _part_with_field(gp, "primitives", {})  # free decoded content before train
+                gp = _part_with_field(gp, "primitives", {})
                 gp = _part_with_field(gp, "rewards", None)
                 train_parts.append(gp)
 
@@ -367,10 +325,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
         self._reset_transport_buffers()
         return result, mean_reward
 
-    # ------------------------------------------------------------------
-    # Train loop — single-threaded producer/consumer
-    # ------------------------------------------------------------------
-
     def train(
         self,
         *,
@@ -385,8 +339,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
         stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        # Single-threaded + one get_samples(oversample) per drive → replay to restore the
-        # exact stream position (deterministic resume).
         for _ in range(start_rollout):
             self.data_source.get_samples(self._oversample)
         self._init_wandb(
@@ -404,9 +356,9 @@ class AsyncAgenticTrainer(AgenticTrainer):
         self._engine = AsyncAgenticRolloutEngine(self.rollout, group_size=self._n, start_gen_id=start_rollout)
 
         if start_rollout < num_rollouts and start_rollout and self.weight_sync is not None:
-            self.weight_sync.sync()  # push restored weights into the fresh engine
+            self._engine.sync_weights(self.weight_sync)  # push restored weights into the fresh engine
         if start_rollout < num_rollouts:
-            self._submit_drive(carried=[], rollout_id=start_rollout)  # prime the first drive
+            self._submit_drive(carried=[], rollout_id=start_rollout)
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
@@ -422,8 +374,6 @@ class AsyncAgenticTrainer(AgenticTrainer):
                 need_save = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
                 need_sync = step % interval == 0 and self.weight_sync is not None
                 if need_save or need_sync:
-                    # ONE turn-boundary quiesce for both: checkpoint the in-flight tail so
-                    # the engine is decode-idle (safe to sync / save), then resume it.
                     checkpointed = self._engine.quiesce()
                     carried = self._apply_tail_policy(checkpointed, rollout_id)
                     if checkpointed:
@@ -437,14 +387,13 @@ class AsyncAgenticTrainer(AgenticTrainer):
                             save_mode=save_mode,
                         )
                     if need_sync:
-                        self.weight_sync.sync()
-                        self._engine.bump_weight_version()
+                        self._engine.sync_weights(self.weight_sync)
                     if step < num_rollouts:
-                        self._submit_drive(carried=carried, rollout_id=step)  # resume safe tails + fresh
+                        self._submit_drive(carried=carried, rollout_id=step)
         finally:
             active_error = sys.exc_info()[0] is not None
             try:
-                checkpointed = self._engine.quiesce()  # stop the resident drive; leak no drives
+                checkpointed = self._engine.quiesce()
                 self._apply_tail_policy(checkpointed, num_rollouts)
                 if checkpointed:
                     self._log_tail_metrics(num_rollouts)

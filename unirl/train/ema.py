@@ -40,11 +40,6 @@ from unirl.train.lora import (
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
-# Shadow handle
-# ------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Shadow:
     """How to access (live, shadow) parameter pairs on the model tree.
@@ -60,11 +55,6 @@ class Shadow:
     swap_out: Callable[[], None]
 
 
-# ------------------------------------------------------------------
-# Runtime updater
-# ------------------------------------------------------------------
-
-
 @dataclass
 class EMA:
     """Per-step shadow updater.  The only runtime class.
@@ -75,7 +65,7 @@ class EMA:
 
     shadow: Shadow
     decay_fn: Callable[[int], float]
-    timing: str  # "optimizer_step" | "rollout_end"
+    timing: str
     name: str = "ema"
 
     def step(self, t: int) -> None:
@@ -134,11 +124,6 @@ def make_decay_fn(cfg: EmaLoraConfig | EmaFullConfig) -> Callable[[int], float]:
     return lambda t: ema_decay
 
 
-# ------------------------------------------------------------------
-# inject_nft — returns Shadow handle
-# ------------------------------------------------------------------
-
-
 def inject_nft(
     model: nn.Module,
     *,
@@ -167,11 +152,6 @@ def inject_nft(
     inject_adapter_in_model(peft_cfg, model, adapter_name=default)
     inject_adapter_in_model(peft_cfg, model, adapter_name=shadow)
 
-    # peft's inject_adapter_in_model installs the LoRA layers but does not flip
-    # diffusers' PeftAdapterMixin `_hf_peft_config_loaded` flag, so the model-level
-    # `set_adapter` raises "No adapter loaded". Activate `default` the same
-    # per-LoraLayer way swap_out does (works for diffusers + plain modules), and
-    # mark the flag so downstream diffusers adapter ops stay consistent.
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
     _activate_keep_grad(model, default, trainable=default, frozen=shadow)
@@ -196,11 +176,6 @@ def inject_nft(
         swap_in=lambda: _activate_keep_grad(model, shadow, trainable=default, frozen=shadow),
         swap_out=lambda: _activate_keep_grad(model, default, trainable=default, frozen=shadow),
     )
-
-
-# ------------------------------------------------------------------
-# inject_mirror — returns Shadow handle
-# ------------------------------------------------------------------
 
 
 def inject_mirror(
@@ -230,11 +205,6 @@ def inject_mirror(
         swap_in=lambda: _swap_mirror(pairs),
         swap_out=lambda: _swap_mirror(pairs),
     )
-
-
-# ------------------------------------------------------------------
-# Peft helpers
-# ------------------------------------------------------------------
 
 
 def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
@@ -310,11 +280,6 @@ def _activate_keep_grad(model: nn.Module, active: str, *, trainable: str, frozen
     _set_adapter_requires_grad(model, frozen, False)
 
 
-# ------------------------------------------------------------------
-# Mirror helpers
-# ------------------------------------------------------------------
-
-
 def _copy_mirror(model: nn.Module, *, pairs: List[Tuple[nn.Module, str, str]]) -> None:
     for mod, live_attr, shadow_attr in pairs:
         getattr(mod, shadow_attr).data.copy_(getattr(mod, live_attr).data)
@@ -325,11 +290,6 @@ def _swap_mirror(pairs: List[Tuple[nn.Module, str, str]]) -> None:
         live = getattr(mod, live_attr)
         shd = getattr(mod, shadow_attr)
         live.data, shd.data = shd.data, live.data
-
-
-# ------------------------------------------------------------------
-# General helpers
-# ------------------------------------------------------------------
 
 
 def local_view(tensor: Tensor) -> Tensor:

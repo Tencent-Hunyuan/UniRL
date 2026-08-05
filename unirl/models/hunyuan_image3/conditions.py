@@ -72,14 +72,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
     out.
     """
 
-    # Override the base's ``(cos, sin)`` tuple ``rope_cache`` with a first-class
-    # per-sample STACKED ``[B, 2, L, D]`` tensor (index 0 = cos, 1 = sin). As a
-    # plain CONCAT tensor it rides the framework's transport/merge/scatter/hydrate
-    # exactly like ``input_ids`` — under DP_SCATTER each rank keeps its OWN rows
-    # (no replica-0 cross-feed) and the lazy ``TensorRef`` path never has to recurse
-    # into a Python tuple (which it cannot). Consumers unbind to ``(cos, sin)`` at
-    # the model boundary. Kept hi3-local (not on the shared base) so the generic
-    # ``FusedMultimodalCondition`` primitive is untouched.
+    # Store RoPE as a CONCAT tensor so DP transport preserves per-sample rows.
     rope_cache: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, 2, L, D]
 
     gen_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
@@ -87,11 +80,6 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
     cond_vae_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
     cond_vit_image_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, L] bool
     cond_timestep_scatter_index: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, K] long
-    # Per-sample TRUE prompt length [B] long — set only on the two-engine AR
-    # path (``response._build_ar_fused_condition``), where ``input_ids`` is
-    # right-padded across variable-length per-request prompts. ``ARStage.replay``
-    # uses it to slice each sample's real prompt (no padding corruption). A plain
-    # 1D CONCAT field (cat, not _pad_attn) so it survives Batch merges.
     prompt_lengths: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B] long
 
     @classmethod
@@ -114,8 +102,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
                 kwargs[name] = d[name]
         rope_cache = kwargs.get("rope_cache")
         if rope_cache is not None and not isinstance(rope_cache, torch.Tensor):
-            # Fail fast at the wire boundary: a legacy (cos, sin) tuple here
-            # would otherwise blow up deep inside a track merge or replay.
+            # Reject legacy RoPE tuples at the transport boundary.
             raise TypeError(
                 "HunyuanImage3FusedMultimodalCondition.from_dict: rope_cache "
                 f"must be a stacked [B, 2, L, D] tensor; got {type(rope_cache).__name__}. "
@@ -176,10 +163,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
         max_L = max(seq_lens)
 
         def _materialize(t):
-            # rope_cache / input_ids / masks are CONCAT fields, so during a
-            # DP-merge they can arrive as lazy ``TensorRef``s (no ``.ndim``, no
-            # F.pad). Hydrate to a real tensor — they are about to be ``torch.cat``'d
-            # into the merged batch anyway.
+            # Materialize lazy CONCAT fields before padding and merging.
             if t is not None and not isinstance(t, torch.Tensor) and hasattr(t, "materialize"):
                 return t.materialize()
             return t
@@ -210,15 +194,12 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
             padded[:, :, :L, :L] = mask
             return padded
 
-        # Rebuild EVERY item (not just the short ones) so already-max-L shards are
-        # materialized too — that way the base concat's per-field merge sees a
-        # single homogeneous type (all real tensors), never a Tensor/TensorRef mix.
+        # Materialize every shard so concatenation never mixes tensors and TensorRefs.
         padded_items = [
             cls(
                 input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
                 attention_mask=_pad_attn(item.attention_mask),
                 position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
-                # rope_cache is a stacked [B, 2, L, D] tensor; pad the L dim (-2).
                 rope_cache=_pad_seq(item.rope_cache, dim=-2, value=0.0),
                 gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
                 gen_timestep_scatter_index=item.gen_timestep_scatter_index,
@@ -255,26 +236,11 @@ class HunyuanImage3DiffusionConditions(Batch):
     """
 
     fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
-    # CFG uncond-branch fused, B-batched (one row per sample, aligned 1:1 with
-    # ``fused``'s cond rows). Set only for guided training (guidance_scale>1):
-    # ``modes/it2i.py`` splits the cfg-doubled fused into cond -> ``fused`` and
-    # uncond -> ``fused_uncond`` so BOTH survive the B-sample track transport
-    # (the cfg-doubled [cond; uncond] N=2B batch does NOT — the trainer counts B
-    # logical samples and would keep only the cond rows, making replay recompute
-    # UNGUIDED). The diffusion stage re-stacks [fused; fused_uncond] into the N=2B
-    # batch so predict_noise runs cfg=True for both sampling AND replay -> the
-    # guided velocity matches on both sides -> on-policy ratio=1 at cfg>1.
-    # ``None`` => unguided (cfg=1), the ratio-1-by-construction default.
+    # Store CFG's unconditional branch separately so B-sample transport preserves it.
     fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
     cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Opaque ``apply_chat_template`` output — used by the KV-cache path's
-    # first ``_update_model_kwargs_for_generation`` call to drive the
-    # gather-down from the full L sequence to the L' changed slice. Carries
-    # ``joint_image_slices`` / ``gen_image_slices`` / etc. internally; we
-    # treat it as opaque. Non-transportable; lives only for one diffuse()
-    # call. ``None`` means the kernel falls back to the stateless path.
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod

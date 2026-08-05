@@ -32,7 +32,6 @@ class FluxAdapter(ImageAdapter):
     pass
 
 
-# FLUX.2 patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
 _KLEIN_DOWNSAMPLE = 16
 
 
@@ -49,8 +48,6 @@ class Flux2KleinAdapter(ImageAdapter):
 
     def schedule_policy(self):
         return self.model_config.build_schedule_policy()
-
-    # ---- Request side: ti2i delta (no-op without an image) ---- #
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
         """T2I payload, plus the source image when the request carries one.
@@ -76,8 +73,6 @@ class Flux2KleinAdapter(ImageAdapter):
         pil_images = image_batches[0].to_pils()
         if len(pil_images) != len(prompts):
             raise ValueError(f"image count {len(pil_images)} != prompt count {len(prompts)}")
-        # One source image per group, first-seen order (mirrors the prompt collapse;
-        # ``pil_images[::k]`` would misalign interleaved group_ids).
         if k > 1:
             unique_pils = self._first_per_group(pil_images, list(gen_part.group_ids))
             if len(unique_pils) != len(unique_prompts):
@@ -92,8 +87,6 @@ class Flux2KleinAdapter(ImageAdapter):
             out["num_outputs_per_prompt"] = k
         return out
 
-    # ---- Response side ---- #
-
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Inherited text conditions, plus the ti2i source-image slots.
 
@@ -105,7 +98,7 @@ class Flux2KleinAdapter(ImageAdapter):
         cond_dict = super().build_condition(results)
         tokens = self._stack_condition_field(results, "image_latent")
         if tokens is None:
-            return cond_dict  # pure T2I
+            return cond_dict
         ids = self._stack_condition_field(results, "condition_image_latent_ids")
         require(ids is not None, "ti2i returned image_latent but no condition_image_latent_ids; replay needs both.")
         cond_dict["image_latent"] = ImageLatentCondition(latents=tokens)
@@ -151,8 +144,6 @@ class Flux2KleinAdapter(ImageAdapter):
     def _deexpand_prompts(self, prompts: List[str], group_ids: List[str]):
         """Collapse K-expanded prompts back to unique + repeat count."""
         return utils.deexpand_prompts_from_groups(prompts, list(group_ids))
-
-    # ---- Segment (inherited shape, Klein packed-token unpack) ---- #
 
     def build_segment(
         self,

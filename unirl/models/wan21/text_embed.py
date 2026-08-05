@@ -74,9 +74,6 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         max_sequence_length: int = 512,
     ) -> None:
         self.bundle = bundle
-        # Caller can override; defaults pull from the config-time setting
-        # cached on the bundle (which is in turn set by
-        # ``WAN21PipelineConfig.max_sequence_length``).
         self.max_sequence_length = int(
             max_sequence_length if max_sequence_length is not None else bundle.max_sequence_length
         )
@@ -106,12 +103,6 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             )
             embeds = encoder_out.last_hidden_state
 
-        # WAN-specific padding policy: zero out padded positions in the
-        # encoder output BEFORE the diffusion transformer sees it. This
-        # is the training-time convention from WAN's reference
-        # implementation; skipping it shifts the distribution and
-        # produces systematically different rewards from rollout (which
-        # always applies the mask).
         embeds = embeds * attention_mask.unsqueeze(-1).to(dtype=embeds.dtype)
 
         return TextEmbedCondition(

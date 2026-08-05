@@ -5,7 +5,7 @@ not a jsonl field. This emits N driver rows, one per game,
 ``{"prompt": <placeholder>, "metadata": {"game_index": i}}``, so
 ``MultimodalRLDataSource`` drives N rollouts and :meth:`AlfworldEnv.reset` maps each
 ``game_index`` to a game. The index ordering matches
-:func:`unirl.rollout.loop.alfworld_env.list_alfworld_games`, so the row and the env
+:func:`unirl.rollout.env.alfworld.list_alfworld_games`, so the row and the env
 agree on which game an index selects (and the ``n`` GRPO siblings of a prompt share the
 same game). The prompt is a non-empty placeholder only because the data source rejects
 empty-prompt rows — :meth:`AlfworldEnv.reset` discards it and uses the env observation.
@@ -19,10 +19,8 @@ import argparse
 import json
 import os
 
-from unirl.rollout.loop.alfworld_env import list_alfworld_games
+from unirl.rollout.env.alfworld import list_alfworld_games
 
-# Non-empty so the data source keeps the row; AlfworldEnv.reset() replaces it with the
-# environment's initial observation, so the text itself is never used for generation.
 _PLACEHOLDER = "Begin the ALFWorld household task."
 
 
@@ -48,10 +46,6 @@ def main() -> None:
             "No ALFWorld games found (check $ALFWORLD_DATA / --task-filter). Run `alfworld-download` first."
         )
     if args.limit and args.limit < len(games):
-        # Evenly spaced across the sorted games so a small fixed set spans task types
-        # (sorted games cluster by type). A fixed set that a rollout FULLY covers
-        # (prompts_per_rollout == #games) makes the per-rollout reward comparable across
-        # rollouts — the curve then reflects learning, not which games were drawn.
         stride = max(1, len(games) // args.limit)
         games = games[::stride][: args.limit]
 
@@ -59,8 +53,6 @@ def main() -> None:
     out_path = os.path.join(args.out_dir, f"{args.split}.jsonl")
     with open(out_path, "w", encoding="utf-8") as f:
         for i in range(len(games)):
-            # Carry the exact game FILE so the env plays precisely this row's game
-            # (index alone drifts once the list is filtered/sampled).
             row = {"prompt": f"{_PLACEHOLDER} (game {i})", "metadata": {"game_index": i, "game_file": games[i]}}
             f.write(json.dumps(row) + "\n")
     print(f"wrote {len(games)} rows -> {out_path}")

@@ -31,43 +31,24 @@ class HunyuanImage3PipelineConfig:
     pretrained_model_ckpt_path: str
     vit_ckpt_path: Optional[str] = None
     vae_dtype: Any = None
-    text_encoder_dtype: Any = None  # honored for the shared embedding lookup precision
+    text_encoder_dtype: Any = None
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy. Lives here (not on the
-    # per-stage Params) because these are operator/runtime knobs, not
-    # per-request shape.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # Diffusion schedule policy. ``shift`` is the FlowMatch time-shift used
-    # by ``sde.runtime.get_sigma_schedule`` (static branch); HunyuanImage3
-    # defaults to 3.0 too.
     shift: float = 3.0
 
-    # mRoPE axis split (text-axis, h-axis, w-axis). Matches the upstream
-    # default at vllm-omni stage_configs/hunyuan_image3_*.yaml.
     mrope_section: Tuple[int, int, int] = (0, 32, 32)
 
-    # CFG default. Upstream `it2i` config ships 2.5; t2i auto mode varies.
     guidance_scale: float = 2.5
 
-    # Trainside sampling KV-cache policy for ``diffuse()``. True (default) keeps
-    # the per-rollout KV-cached decode (fast sampling). False makes every step a
-    # full prefill, so the sampling forward bit-matches replay's — REQUIRED for
-    # the exact on-policy ratio (≈1) under ``algorithm.old_logp_source=rollout``
-    # (native). Harmless to leave True under ``old_logp_source=replay`` (ratio=1
-    # by construction). Replaces the former HI3_DIFFUSE_KV_CACHE env gate.
+    # Disable sampling KV cache when rollout log-probs must match replay.
     diffuse_kv_cache: bool = True
 
-    # Trainer-side ``trainable_module()`` returns ``self.model.transformer.model``
-    # (bare ``HunyuanImage3Model`` decoder). Its state_dict keys are
-    # ``layers.X.*`` with no outer envelope. The rollout model
-    # (``HunyuanImage3ForConditionalGeneration``) exposes the same decoder
-    # under ``self.model`` (weights at ``model.layers.X.*``). We prepend
-    # ``"model."`` so the LoRA out_name resolves correctly on the rollout side.
+    # Prefix rollout weight names because training exposes the bare decoder.
     weight_sync_param_name_prefix: str = "model."
 
     def __post_init__(self) -> None:

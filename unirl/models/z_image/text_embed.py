@@ -57,8 +57,6 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             pooled=None,
         )
 
-    # ---- helpers -----------------------------------------------------------
-
     def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
         device = bundle.device
@@ -93,10 +91,8 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 attention_mask=prompt_masks,
                 output_hidden_states=True,
             )
-        # Z-Image conditions on the second-to-last hidden layer.
         hidden_states = encoder_out.hidden_states[-2]
 
-        # Split into per-prompt variable-length slices (drop pad positions).
         split_hidden_states = [hidden_states[i][prompt_masks[i]] for i in range(len(prompts))]
         attn_mask_list = [
             torch.ones(item.size(0), dtype=torch.long, device=item.device) for item in split_hidden_states

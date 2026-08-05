@@ -132,7 +132,7 @@ class TrainStepProfiler:
         if self._stopped:
             return
         try:
-            self._prof.step()  # may trigger on_trace_ready (export) at the active->done edge
+            self._prof.step()
             self._n += 1
             if self._n >= self._total:
                 self._prof.stop()
@@ -141,7 +141,7 @@ class TrainStepProfiler:
         except Exception:
             self._stopped = True
             try:
-                self._prof.stop()  # release CUPTI hooks so later steps carry no overhead
+                self._prof.stop()
             except Exception:
                 pass
             logger.warning("TrainStepProfiler: profiling/export failed; training continues", exc_info=True)
@@ -160,10 +160,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     """
     if not profile_enabled():
         return None
-    # The caller passes a backend-specific rank that is 0 on every worker for some
-    # backends (e.g. FSDP colocate lacks `_rank`). Prefer the true global rank from
-    # the process group so UNIRL_PROFILE_RANKS actually restricts to one worker —
-    # profiling every rank makes 8 CUPTI trace-flushes contend and stall the export.
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
@@ -171,8 +167,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     if not _rank_enabled(int(rank)):
         return None
 
-    # Default = capture ONE full step (wait1 + warmup1 + active1) so a bare
-    # UNIRL_PROFILE=train already produces a small, Perfetto-loadable trace.
     wait = _int_env("UNIRL_PROFILE_WAIT", 1)
     warmup = _int_env("UNIRL_PROFILE_WARMUP", 1)
     active = _int_env("UNIRL_PROFILE_ACTIVE", 1)
@@ -181,10 +175,6 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
     os.makedirs(out_dir, exist_ok=True)
 
     activities = [torch.profiler.ProfilerActivity.CPU]
-    # CUDA (CUPTI) activity can be disabled with UNIRL_PROFILE_CUDA=0. On some
-    # torch/driver/CUPTI combos the CUDA kineto trace-finalize (stop_trace) hangs
-    # the export; a CPU-only trace still opens in Perfetto and shows the step
-    # structure + cudaLaunchKernel timeline.
     if _truthy(os.environ.get("UNIRL_PROFILE_CUDA"), default=True) and torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 
@@ -208,7 +198,7 @@ def maybe_build_train_profiler(rank: int) -> Optional[TrainStepProfiler]:
         out_dir,
     )
     try:
-        return TrainStepProfiler(prof, total_steps=total, out_dir=out_dir)  # __init__ calls prof.start()
+        return TrainStepProfiler(prof, total_steps=total, out_dir=out_dir)
     except Exception:
         logger.warning("TrainStepProfiler: profiler start failed (CUPTI init?); not profiling this run", exc_info=True)
         return None
@@ -276,7 +266,6 @@ def maybe_profile_update(owner, rank: int) -> Iterator[None]:
             prof.stop()
             raw = os.path.join(out_dir, f"update_rank{int(rank)}.pt.trace.json")
             prof.export_chrome_trace(raw)
-            # gzip in place -> opens directly in Perfetto and is small enough to download
             import gzip
             import shutil
 

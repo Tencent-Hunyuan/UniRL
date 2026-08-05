@@ -47,59 +47,25 @@ class HunyuanVideoPipelineConfig:
     model_precision: Any = "bf16"
     device: Any = None
 
-    # Stage-level precision / numerical policy.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # FlowMatchSchedulePolicy shift -- static (HunyuanVideo-1.0 does not
-    # use dynamic shifting). Default 5.0 mirrors the upstream sampler.
     shift: float = 5.0
 
-    # Trainer-side policy wraps the bare DiT, while vLLM-Omni loads it
-    # under the pipeline's ``transformer.*`` namespace.
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Meta-init the transformer (build on the meta device; the backend loads
-    # weights after sharding) instead of eager ``from_pretrained``. Avoids the
-    # per-rank full-model GPU spike. Consumed by FSDPBackend / VeOmniBackend via
-    # the stashed ``_transformer_weights_path``.
     meta_init_transformer: bool = False
 
-    # VAE latent channel count. ``None`` lets both the driver and the
-    # stage fall back to ``HunyuanVideoDiffusionStage.DEFAULT_LATENT_CHANNELS``
-    # (16) which matches the HunyuanVideo checkpoint. The stage will still
-    # cross-check against ``vae.config.latent_channels`` at construction;
-    # the explicit config-side value is the only handle the driver has
-    # before the bundle is loaded.
     latent_channels: Optional[int] = None
 
-    # Decode large frames with the VAE's spatial tiling path. The 720p
-    # recipes enable this to bound fp32 decode activation memory.
     vae_use_tiling: bool = False
 
-    # ------------------------------------------------------------------
-    # Text-encoder shape parameters
-    # ------------------------------------------------------------------
-    # LLaMA: tokenizer max_length (after the prompt template prefix is
-    # prepended). Output is cropped by ``crop_start`` tokens.
     llama_max_length: int = 256
-    # Number of prefix tokens to crop after the LLaMA encoder forward
-    # (the prompt template system header length).
     crop_start: int = 95
-    # CLIP: standard max_length for CLIPTokenizer.
     clip_max_length: int = 77
-    # LLaMA hidden layer used as the text conditioning: the embedding is taken
-    # from ``hidden_states[-(hidden_state_skip_layer + 1)]``. HunyuanVideo's
-    # canonical recipe is ``2`` -> the 3rd-from-last layer, matching the official
-    # HunyuanVideo release and diffusers' ``HunyuanVideoPipeline``
-    # (``num_hidden_layers_to_skip=2``) and the sglang rollout. (Set ``0`` for the
-    # last hidden state, e.g. to reproduce the legacy skip=0 baseline.)
     hidden_state_skip_layer: int = 2
 
-    # LoRA hints for rollout-side engines (e.g. ``sglang``). Mirrors
-    # SD3 / HV15 config; the trainer-side LoRA injection lives in
-    # ``cfg.training.policies`` via LoRAPolicy.
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 

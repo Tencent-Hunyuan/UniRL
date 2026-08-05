@@ -27,7 +27,6 @@ import random
 import re
 from typing import Dict, List, Optional
 
-# Directory containing Video-R1-260k.json and the per-source folders.
 DEFAULT_DATA_ROOT = "/path/to/Video-R1-data"
 
 _ANSWER_TAG = re.compile(r"<answer>\s*([A-Da-d])\s*</answer>")
@@ -110,7 +109,6 @@ def main() -> None:
 
     sources = {s.strip() for s in args.sources.split(",") if s.strip()} or None
 
-    # Collect, applying per-source cap.
     per_source: Dict[str, List[Dict]] = collections.defaultdict(list)
     for source, abs_path, prompt, answer, pid in _iter_rows(args.data_root, sources, args.keep_missing):
         if args.max_per_source and len(per_source[source]) >= args.max_per_source:

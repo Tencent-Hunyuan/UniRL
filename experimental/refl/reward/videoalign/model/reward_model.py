@@ -35,8 +35,6 @@ def _cfg_get(config: Any, name: str) -> Any:
     text_cfg = getattr(config, "text_config", None)
     if text_cfg is not None and hasattr(text_cfg, name):
         return getattr(text_cfg, name)
-    # Fall back to whatever the top-level had (possibly None) so callers
-    # that tolerate ``None`` (e.g. ``pad_token_id``) keep working.
     if hasattr(config, name):
         return getattr(config, name)
     raise AttributeError(f"{type(config).__name__} has no attribute {name!r} (checked top-level and .text_config).")
@@ -77,15 +75,9 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         self.reward_token = reward_token
 
         self.special_token_ids = special_token_ids
-        # When special tokens are configured, the pooling mode is forced —
-        # otherwise the trainer-set ``reward_token`` setting on disk wins.
         if self.special_token_ids is not None:
             self.reward_token = "special"
 
-    # The forward code below addresses ``self.visual``; transformers 5.6
-    # owns the vision tower at ``self.model.visual``. Read via ``_modules``
-    # to avoid recursing into ``nn.Module.__getattr__``, which would
-    # re-trigger this property with a misleading "no attribute" error.
     @property
     def visual(self):  # type: ignore[override]
         inner = self._modules.get("model", None)
@@ -97,10 +89,6 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
                 "transformers 5.6 stack; align the environment."
             )
         return visual
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -126,15 +114,6 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # Visual + text token fusion. Identical to the upstream
-        # Qwen2VLForConditionalGeneration.forward except we don't compute
-        # an LM head — only the regression head over the final hidden
-        # states.
-        #
-        # transformers 5.6: the vision tower returns BaseModelOutputWithPooling
-        # whose pooler_output holds the merged features that fill the media
-        # placeholders (what get_video_features reads). last_hidden_state is
-        # the PRE-merger states (4x tokens, vision dim) — never usable here.
         def _as_tensor(visual_out):
             t = getattr(visual_out, "pooler_output", None)
             if t is None:
@@ -179,15 +158,14 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0]  # (B, L, D)
-        logits = self.rm_head(hidden_states)  # (B, L, output_dim)
+        hidden_states = outputs[0]
+        logits = self.rm_head(hidden_states)
 
         if input_ids is not None:
             batch_size = input_ids.shape[0]
         else:
             batch_size = inputs_embeds.shape[0]
 
-        # Locate per-sample sequence length so we can pool the right token.
         try:
             pad_token_id = _cfg_get(self.config, "pad_token_id")
         except AttributeError:
@@ -198,8 +176,6 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                # Find the first pad token; previous token is the last real
-                # token. ``%`` keeps the index in range for ONNX export.
                 sequence_lengths = torch.eq(input_ids, pad_token_id).int().argmax(-1) - 1
                 sequence_lengths = sequence_lengths % input_ids.shape[-1]
                 sequence_lengths = sequence_lengths.to(logits.device)
@@ -216,10 +192,6 @@ class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
             for special_token_id in self.special_token_ids:
                 special_token_mask = special_token_mask | (input_ids == special_token_id)
             pooled_logits = logits[special_token_mask, ...]
-            # Each sample has exactly 3 special tokens (VQ/MQ/TA), each
-            # producing an ``output_dim``-row of logits. Reshape →
-            # (B, 3, output_dim); when output_dim=3 we keep the diagonal
-            # (matching the special-token training contract).
             pooled_logits = pooled_logits.view(batch_size, 3, -1)
             if self.output_dim == 3:
                 pooled_logits = pooled_logits.diagonal(dim1=1, dim2=2)

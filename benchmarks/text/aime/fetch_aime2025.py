@@ -28,12 +28,10 @@ def main() -> None:
     from huggingface_hub import HfApi, hf_hub_download
 
     repo = "yentinglin/aime_2025"
-    # The repo ships the same 30 problems both combined (data/) and split
-    # (part1/ + part2/), so records are deduped by id.
     parquets = [f for f in HfApi().list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")]
     records = {}
     for filename in sorted(parquets):
-        import pyarrow.parquet as pq  # available via the repo's datasets/pyarrow stack
+        import pyarrow.parquet as pq
 
         table = pq.read_table(hf_hub_download(repo_id=repo, filename=filename, repo_type="dataset"))
         for i, row in enumerate(table.to_pylist()):

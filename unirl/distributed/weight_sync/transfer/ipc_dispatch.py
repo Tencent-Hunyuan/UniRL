@@ -15,17 +15,10 @@ from __future__ import annotations
 
 import os
 
-# Single LoRA "slot" we hot-swap on rollout. The integer id has to match
-# between the trainer's add/remove calls and the worker's lookup. Mirrors
-# verl-omni's VLLM_LORA_INT_ID / NAME / PATH triple.
 DIFFRL_LORA_INT_ID: int = 1
 DIFFRL_LORA_NAME: str = "diffrl_lora"
-# Used as a placeholder ``lora_path`` on ``OmniTensorLoRARequest``; the
-# hijacked ``_load_adapter`` ignores it for tensor-bag requests.
 DIFFRL_LORA_PATH: str = "diffrl_lora_in_memory"
 
-# Default ZMQ-IPC root. Override per call by passing zmq_handle directly
-# or by setting DIFFRL_IPC_DIR in the env before construction.
 _DEFAULT_IPC_DIR: str = os.environ.get("DIFFRL_IPC_DIR", "/tmp")
 
 

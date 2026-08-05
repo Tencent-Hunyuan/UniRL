@@ -20,10 +20,6 @@ from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.sample import Sample
 
-# --------------------------------------------------------------------------- #
-# Registry
-# --------------------------------------------------------------------------- #
-
 _REGISTRY: Dict[str, type["ModelAdapter"]] = {}
 
 
@@ -55,11 +51,6 @@ def registered_adapters() -> Tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
-# --------------------------------------------------------------------------- #
-# ABC
-# --------------------------------------------------------------------------- #
-
-
 class ModelAdapter(ABC):
     """Thin ABC: registry key + boilerplate defaults + the two conversion seams.
 
@@ -77,7 +68,6 @@ class ModelAdapter(ABC):
         self._sde_label = self.resolve_sde_label(strategy)
         self.validate()
 
-    # ---- SDE kernel label (boilerplate; overridable) ----
     @staticmethod
     def resolve_sde_label(strategy: Any) -> Optional[str]:
         """Map the SDE strategy to SGLang's ``rollout_sde_type`` kernel label.
@@ -102,7 +92,6 @@ class ModelAdapter(ABC):
             f"after verifying the SGLang kernel is mathematically equivalent."
         )
 
-    # ---- model-specific ServerArgs extras (override hook; default none) ----
     def boot_kwargs(self) -> Dict[str, Any]:
         """Extra SGLang ServerArgs intent a model needs beyond the generic set.
 
@@ -112,7 +101,6 @@ class ModelAdapter(ABC):
         """
         return {}
 
-    # ---- schedule policy (default: generic FlowMatch) ----
     def schedule_policy(self) -> Any:
         """The σ schedule policy. Default reads ``model_config.shift`` (+ optional
         dynamic-shift hints); Klein-style models override with a factory."""
@@ -126,13 +114,11 @@ class ModelAdapter(ABC):
             dynamic_overrides=getattr(mc, "dynamic_shift_overrides", None),
         )
 
-    # ---- LoRA spec: (pipeline_prefix, target_modules) ----
     def lora_spec(self) -> Tuple[str, List[str]]:
         prefix = str(self.model_config.weight_sync_param_name_prefix or "")
         target_modules = list(self.cfg.target_modules or ("transformer",))
         return prefix, target_modules
 
-    # ---- validation (default: require shift + ckpt) ----
     def validate(self) -> None:
         mc = self.model_config
         require(
@@ -145,7 +131,6 @@ class ModelAdapter(ABC):
             f"{type(mc).__name__}. Use a registered model preset.",
         )
 
-    # ---- the two conversion seams the engine drives ----
     @abstractmethod
     def build_inputs(self, sample: Sample, *, initial_noise: Any) -> Dict[str, Any]:
         """Translate a request ``Sample`` into SGLang ``generate`` sampling kwargs."""

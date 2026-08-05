@@ -50,7 +50,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine
+from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
@@ -68,7 +68,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         buffer_max_staleness: Optional[int] = None,
         **diffusion_kwargs: Any,
     ) -> None:
-        # Async needs disjoint train/rollout slabs; force the separate layout.
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
@@ -86,13 +85,8 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                 "AsyncDiffusionTrainer requires a cross-slab weight sync; add a `sync:` block to the recipe."
             )
 
-        # ---- async state ----
         self._max_inflight = max_inflight
         self._buffer_max_staleness = buffer_max_staleness
-
-    # ------------------------------------------------------------------
-    # Generic async-runtime hooks
-    # ------------------------------------------------------------------
 
     def _build_async_sample(self, gen_id: int) -> Sample:
         """Consume one data batch and build the request Sample for ``gen_id``."""
@@ -120,11 +114,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         """
         self._async_engine.quiesce()
 
-    # ------------------------------------------------------------------
-    # Train tail (mirrors DiffusionTrainer.train_step's post-generate half:
-    # advantage → FlowGRPO stack step; reward already attached at reap time).
-    # ------------------------------------------------------------------
-
     def _advantage_and_train(
         self,
         sample: Sample,
@@ -139,8 +128,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            # Hydrate in place so the wandb reward/advantage stats reuse this fetch
-            # instead of re-pulling the TensorRef from the worker.
             part.rewards = hydrate(part.rewards)
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
@@ -149,14 +136,8 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         sample = sample.replace_frontier(part)
         result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
         self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
-        # train_step is bypassed, so BaseTrainer's per-step reset hook never fires;
-        # reclaim transport buffers here (no-op for colocate_store/gpu).
         self._reset_transport_buffers()
         return result, mean_reward
-
-    # ------------------------------------------------------------------
-    # Train loop
-    # ------------------------------------------------------------------
 
     def train(
         self,
@@ -174,9 +155,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Single-threaded: exactly one get_samples(batch_size) per launch and
-        # launches are 1:1 with gen_id, so replaying start_rollout times restores
-        # the exact stream position (deterministic resume).
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
@@ -189,7 +167,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             },
         )
 
-        # gen_id is seeded by start_rollout so launches stay 1:1 with rollout_id.
         self._async_engine = AsyncBatchRolloutEngine(
             self.rollout,
             complete=self._score_completed,
@@ -197,18 +174,14 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         )
 
         if resumed and self.weight_sync is not None:
-            self.weight_sync.sync()  # push restored weights into the fresh engine
+            self.weight_sync.sync()
         if self.eval_interval > 0:
-            # Evaluate the policy already resident on the rollout slab. Eval must
-            # neither advance the async weight version nor offload this engine.
             self.evaluate(start_rollout, sync_weights=False, sleep_after=False)
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
                 picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
-                # Reassemble the drained per-prompt group Samples into one batched
-                # Sample [input(P), gen(P*N)] — the inverse of Sample.split.
                 sample = Sample.concat(picked)
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
@@ -218,15 +191,15 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
 
                 step = rollout_id + 1
                 if self.eval_interval > 0 and step % self.eval_interval == 0:
-                    self._drain_all()  # eval shares the engine
+                    self._drain_all()
                     self.evaluate(step, sync_weights=False, sleep_after=False)
                 if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()  # consistent engine + deterministic resume
+                    self._drain_all()
                     self.maybe_save_checkpoint(
                         rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                     )
                 if step % interval == 0 and self.weight_sync is not None:
-                    self._drain_all()  # MANDATORY: weight/KV update corrupts in-flight generations
+                    self._drain_all()
                     self.weight_sync.sync()
                     self._async_engine.bump_weight_version()
         finally:
@@ -264,12 +237,12 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         """
         engine = self._async_engine
         while True:
-            ceiling = min(num_rollouts, ((rollout_id // interval) + 1 + stale) * interval)
+            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
             engine.poll()
             while engine.next_gen_id < ceiling and engine.inflight < M:
                 engine.submit(self._build_async_sample(engine.next_gen_id))
             picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
-            engine.pop_evicted()  # over-stale groups are discarded on the batch path
+            engine.pop_evicted()
             if picked is not None:
                 return picked
             if engine.inflight:

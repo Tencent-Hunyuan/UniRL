@@ -58,7 +58,6 @@ def _require_alpha(alpha: Optional[float]) -> float:
 
 
 def _fold(base: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, alpha: float) -> torch.Tensor:
-    # Merge in fp32: a bf16 base + bf16 delta rounds the update away.
     scaling = alpha / lora_a.shape[0]
     return (base.float() + (lora_b.float() @ lora_a.float()) * scaling).to(base.dtype)
 
@@ -82,7 +81,7 @@ def merge_lora_state_dict(
     folded = 0
     for key, value in state_dict.items():
         if ".lora_A." in key or ".lora_B." in key:
-            continue  # folded below, or a non-exported adapter
+            continue
         if ".base_layer." not in key:
             out[key] = value
             continue
@@ -178,20 +177,16 @@ def main() -> None:
 
         model = AutoModelForCausalLM.from_pretrained(args.base, **from_pretrained_kwargs)
 
-    if any(".base_layer." in k for k in state_dict):  # save_mode=full: self-contained
+    if any(".base_layer." in k for k in state_dict):
         merged = merge_lora_state_dict(state_dict, adapter=args.adapter, alpha=alpha)
-    elif any(".lora_A." in k for k in state_dict):  # save_mode=adapter: fold onto the base
+    elif any(".lora_A." in k for k in state_dict):
         merged = fold_adapter_into_base(model.state_dict(), state_dict, adapter=args.adapter, alpha=alpha)
-    else:  # full finetune, no LoRA
+    else:
         merged = dict(state_dict)
 
-    # DCP full saves intentionally omit frozen/meta entries. Fill those from
-    # --base while still rejecting checkpoint keys the selected model lacks.
     if checkpoint.get("_checkpoint_format") == "dcp" and checkpoint.get("save_mode", "full") == "full":
         merged = overlay_partial_state_dict(model.state_dict(), merged)
 
-    # strict: naming drift between checkpoint and base class is a hard error,
-    # not a silently half-loaded export.
     model.load_state_dict({k: v.to(dtype) if v.is_floating_point() else v for k, v in merged.items()}, strict=True)
     model.save_pretrained(args.output)
     print(f"wrote {args.output}")

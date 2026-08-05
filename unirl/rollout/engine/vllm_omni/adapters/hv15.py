@@ -131,8 +131,6 @@ class Hv15T2vAdapter(ModelAdapter):
     """HunyuanVideo-1.5 text → video (single diffusion stage, TP=1)."""
 
     stage_yaml = "hunyuan_video15_t2v_rl.yaml"
-    # HV1.5's tokenizers live in tokenizer/ + tokenizer_2/ subfolders; the
-    # worker loads them internally and the driver-side translator needs none.
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

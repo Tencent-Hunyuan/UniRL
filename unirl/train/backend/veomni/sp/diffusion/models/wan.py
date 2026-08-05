@@ -13,9 +13,6 @@ logger = logging.getLogger(__name__)
 
 @register("WanTransformer3DModel")
 def _wrap_wan(model, sp_group):
-    # Wan: image self-attn (slice image) + text cross-attn (text stays FULL; the
-    # dispatch cross-attn guard skips its all-to-all). Block call is positional.
-    # Wan rotary: (cos, sin), each (1, S_img, 1, D); slice the image seq dim (dim 1).
     _install_boundary_hooks(
         model,
         sp_group,

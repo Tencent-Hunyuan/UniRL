@@ -85,7 +85,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
     compatible because Python protocols are non-strict on extra kwargs.
     """
 
-    # Sigma → transformer timestep scale (sigma ∈ [0, 1] → t ∈ [0, 1000]).
     TIMESTEP_SCALE: ClassVar[float] = 1000.0
 
     def predict_noise(
@@ -133,15 +132,10 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         device = sample.device
         dtype = prompt_embeds.dtype
 
-        # T2V channel-dim packing: zero cond_latents (same shape as
-        # latents) + zero cond_mask (single channel). The transformer's
-        # ``in_channels`` is ``2 * latent_channels + 1`` by contract.
         sample_cast = sample.to(dtype)
         cond_latents = torch.zeros_like(sample_cast)
         cond_mask = torch.zeros(batch_size, 1, latent_t, latent_h, latent_w, device=device, dtype=dtype)
 
-        # T2V vision placeholder. The transformer cross-attends to it
-        # but the zero content is a no-op (matches upstream behavior).
         image_embeds = torch.zeros(
             batch_size,
             int(vision_num_semantic_tokens),
@@ -150,8 +144,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             dtype=dtype,
         )
 
-        # Sigma → timestep scaling. Always cast to a [B]-shape tensor on
-        # the model's compute dtype.
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size)
         elif sigma.shape[0] != batch_size:
@@ -178,8 +170,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
                     "embeds + attn_mask."
                 )
 
-            # Stack [cond, uncond] along batch dim — a single transformer
-            # forward halves wall-clock vs two separate calls.
             doubled_input = torch.cat([latent_model_input, latent_model_input], dim=0)
             doubled_timestep = torch.cat([timestep, timestep], dim=0)
             encoder_hs = torch.cat([prompt_embeds, neg_mllm.embeds.to(dtype)], dim=0)
@@ -211,8 +201,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             image_embeds=image_embeds,
             return_dict=False,
         )[0]
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -348,18 +336,7 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         "HunyuanVideo15TokenRefiner",
     )
 
-    # VAE downsample defaults from upstream; overridden at construction
-    # if the bundle's VAE exposes ``spatial_compression_ratio`` /
-    # ``temporal_compression_ratio`` attributes (it does on the canonical
-    # checkpoint). ``DEFAULT_LATENT_CHANNELS=32`` matches the diffusers
-    # ``hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`` VAE
-    # (32-channel; transformer ``in_channels=65=2*32+1``,
-    # ``out_channels=32``). ``HunyuanVideo15Pipeline.latent_shape`` reads
-    # ``model_config.latent_channels`` first (config-side override) and
-    # falls back to this default; the stage init reads VAE config first
-    # and falls back to the transformer's ``out_channels`` and then to
-    # this constant — three layers of inference, with a runtime fail-fast
-    # in ``diffuse(initial_latents=...)`` when driver and stage disagree.
+    # Fail if inferred latent geometry differs between driver and stage.
     DEFAULT_SPATIAL_DOWNSAMPLE: ClassVar[int] = 16
     DEFAULT_TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
     DEFAULT_LATENT_CHANNELS: ClassVar[int] = 32
@@ -388,8 +365,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         self.vision_num_semantic_tokens = int(vision_num_semantic_tokens)
         self.vision_states_dim = int(vision_states_dim)
 
-        # VAE geometry: prefer attributes on the VAE itself, then the VAE
-        # config, then the dataclass-level defaults.
         vae = model.vae
         if spatial_compression_ratio is None:
             spatial_compression_ratio = (
@@ -410,15 +385,10 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             cfg = getattr(vae, "config", None)
             ch = int(getattr(cfg, "latent_channels", 0)) if cfg is not None else 0
             if not ch:
-                # Fall back to transformer's reported out_channels.
                 tx_cfg = getattr(model.transformer, "config", None)
                 ch = int(getattr(tx_cfg, "out_channels", self.DEFAULT_LATENT_CHANNELS))
             latent_channels = ch
         self.latent_channels = int(latent_channels)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def _latent_shape(self, *, height: int, width: int, num_frames: int) -> Tuple[int, int, int]:
         latent_t = (int(num_frames) - 1) // self.temporal_compression_ratio + 1
@@ -536,7 +506,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             if log_prob is not None:
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # 6D stacked storage: [B, K, C, T_lat, H_lat, W_lat].
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
@@ -545,9 +514,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
 
         indices_tensor = torch.tensor(positions_collected, dtype=torch.long, device=device)
 
-        # Stamp modality=VIDEO via the factory so downstream
-        # ``segment.modality``-based routing doesn't mistake video latents
-        # for image latents.
         return make_video_segment(
             latents=latents_stacked,
             sigmas=schedule,
@@ -555,10 +521,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -646,10 +608,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
-
     def predict_noise_at_step(
         self,
         conditions: HunyuanVideo15Conditions,
@@ -673,10 +631,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             vision_num_semantic_tokens=self.vision_num_semantic_tokens,
             vision_states_dim=self.vision_states_dim,
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the FSDP wrap target — the bundle's transformer."""

@@ -49,14 +49,11 @@ class TensorStore:
         self.global_rank = global_rank
         self.global_world_size = global_world_size
 
-        # store_key → tensor (holds storage alive)
         self._store: Dict[str, Tensor] = {}
-        # store_key → ref count (number of live TensorHandles referencing this key)
         self._ref_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
         self._counter = 0
 
-        # Global ProcessGroup for cross-worker NCCL.
         self._global_pg = None
 
     def put(self, tensor: Tensor) -> ColocateTensorHandle:
@@ -128,9 +125,6 @@ class TensorStore:
             if self._ref_counts[key] <= 0:
                 del self._store[key]
                 del self._ref_counts[key]
-                # tensor goes out of scope here → Python GC → GPU memory freed
-
-    # ── Cross-worker NCCL transfer ──
 
     def setup_global_pg(self, global_rank: int, global_world_size: int) -> None:
         """Initialize the global ProcessGroup for cross-worker NCCL transfers.
@@ -153,12 +147,6 @@ class TensorStore:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
-        # ProcessGroupNCCL otherwise creates a new two-rank communicator on the
-        # first unbatched send/recv.  PE reaches that first transfer only after
-        # the colocated models fill the GPUs, leaving too little memory for
-        # NCCL communicator setup.  Eager initialization reserves the global
-        # communicator while the workers are still empty; send/recv then reuse
-        # it instead of allocating at the training-step memory peak.
         self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:

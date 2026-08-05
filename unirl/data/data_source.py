@@ -37,8 +37,6 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
     """
     if not media_refs or not any(media_refs):
         return None
-    # Local imports keep PIL / torchvision off the import path for
-    # text-only training runs that never touch this code.
     import PIL.Image
     import torchvision.transforms.functional as TF
 
@@ -58,7 +56,7 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
         if len(selected) > 1:
             raise ValueError(f"WAN I2V expects <=1 (image, condition) MediaRef per prompt, got {len(selected)}")
         pil = PIL.Image.open(selected[0].uri).convert("RGB")
-        tensor = TF.to_tensor(pil)  # [3, H, W] in [0, 1]
+        tensor = TF.to_tensor(pil)
         images_per_prompt.append(PrimImage(pixels=tensor))
         any_loaded = True
 
@@ -76,7 +74,6 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
     """
     if not media_refs or not any(media_refs):
         return None
-    # Local imports keep video IO dependencies off text/image-only runs.
     import torchvision.io
 
     from unirl.types.primitives import Video as PrimVideo
@@ -97,8 +94,6 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
 
         uri = selected[0].uri
         if str(uri).endswith((".pt", ".pth")):
-            # weights_only=True blocks arbitrary code execution from a crafted
-            # manifest pointing at an untrusted .pt (condition videos are plain tensors).
             frames = torch.load(uri, map_location="cpu", weights_only=True)
         elif str(uri).endswith((".npy", ".npz")):
             import numpy as np
@@ -321,16 +316,12 @@ class MultimodalRLDataSource:
         self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
         self.drop_last = True
 
-        # Training data and eval data are treated as separate prompt sources.
         self.train_dataset = None
         self.eval_dataset = None
         self._dataloader = None
         self._iter: Optional[Iterator] = None
         self._eval_dataset_ready = False
         self._shuffle_generator = torch.Generator()
-        # ``self.seed`` may be None (run.seed=null) — torch.Generator needs an
-        # int, so draw from OS entropy. Per-process shuffle order then becomes
-        # non-reproducible, matching the seed=null contract.
         if self.seed is None:
             _shuffle_seed = int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF
         else:
@@ -408,9 +399,9 @@ class MultimodalRLDataSource:
             self.train_dataset,
             batch_size=self.prompts_per_rollout,
             sampler=sampler,
-            shuffle=should_shuffle,  # Only shuffle if not using custom sampler
+            shuffle=should_shuffle,
             generator=self._shuffle_generator if should_shuffle else None,
-            num_workers=0,  # Keep simple for Ray
+            num_workers=0,
             collate_fn=self._collate_text,
             drop_last=True,
         )
@@ -491,7 +482,6 @@ class MultimodalRLDataSource:
         try:
             batch = next(self._iter)
         except StopIteration:
-            # Reset iterator
             self._iter = iter(self._dataloader)
             batch = next(self._iter)
 
@@ -580,7 +570,6 @@ class DefaultDataSource:
         self.args = args
         self.drop_last = False
 
-        # Default prompts for different scenarios
         self.prompts = [
             "A beautiful sunset over the ocean",
             "A cat playing with a ball of yarn",

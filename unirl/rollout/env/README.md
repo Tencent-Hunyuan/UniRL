@@ -1,14 +1,13 @@
-# Agentic rollout loop
+# Agentic environments and tools
 
-This package defines the synchronous turn loop and the environment/tool contracts used by
-agentic rollout. The distributed runtime is
+This package defines the environment/tool contracts used by agentic rollout. The turn LOOP
+itself lives in [`unirl/rollout/harness/tool_agent.py`](../harness/tool_agent.py)
+(`ToolAgentHarness` — worker-side task control flow); the distributed runtime hosting it is
 [`AgenticRolloutEngine`](../engine/agentic/engine.py); trajectory storage is described by the
 [`Sample`/`Part` types](../../types/README.md).
 
 ## Contracts
 
-- `RolloutEnginePort.generate(sample) -> Sample` fills one generation frontier. The production
-  agentic engine requires its inner engine to implement `SyncRolloutEngine`.
 - `Environment.reset(request) -> Sample` performs per-trajectory setup and may augment or replace
   the request.
 - `Environment.step(sample) -> (observation, done, info)` consumes the latest generated action.
@@ -34,9 +33,10 @@ Sample -> fork -> blocking generate -> environment.step
                                       +------> observe -> next turn
 ```
 
-`AgentLoop.run` calls `environment.reset` once, uses
-`total_samples_per_prompt(sampling_params)` for the first fork, and uses branch one for subsequent
-turns. It stops when the environment returns `done=True` or after `max_turns`.
+`ToolAgentHarness.run` calls `environment.reset` once, forks a one-sample continuation per
+turn on the `"policy"` engine, and stops when the environment returns `done=True`, after
+`max_turns`, or — at a turn boundary — when the runtime requests a cooperative suspension
+(`HarnessContext.suspend_requested`).
 
 `AgenticRolloutEngine` is the production coordinator. Rank 0 expands `P` prompts into `P * n`
 single-trajectory tasks. Each worker runs up to `per_worker_concurrency` synchronous trajectories
@@ -109,8 +109,8 @@ return through `info["reward"]`. GRPO siblings select the same game but run sepa
 - `max_turns` is the hard engine bound. When an environment also exposes `max_turns`, the production
   engine requires it to match. `ToolEnvironment` also terminates when no row calls a tool;
   `AlfworldEnv` terminates on simulator completion or `max_steps`.
-- `AgentLoop` itself is blocking and does not call `Environment.close`; callers using it directly
-  own teardown. `AgenticRolloutEngine` calls `close` from `finally` on success, failure, and abort.
+- `ToolAgentHarness.run` calls `Environment.close` from `finally` on success, failure, AND
+  suspension; a teardown error is logged, never raised.
 
 Current runnable configurations live under [`examples/deep_research`](../../../examples/deep_research)
 and [`examples/alfworld`](../../../examples/alfworld).

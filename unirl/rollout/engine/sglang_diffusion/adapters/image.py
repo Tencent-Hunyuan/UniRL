@@ -33,18 +33,9 @@ from unirl.types.segments.latent import make_image_segment
 class ImageAdapter(ModelAdapter):
     """Conversion for image-output families (SD3, FLUX, …). Default path end-to-end."""
 
-    #: Segment factory (modality). A video adapter would pass ``make_video_segment``.
     segment_factory = staticmethod(make_image_segment)
-    #: Whether image-path decoded 4-D ``[C, T=1, H, W]`` samples are squeezed to
-    #: images. Legacy image-path video families set this False (drop 4-D instead).
     squeeze_single_frame_4d: bool = True
-    #: Whether to pad (not drop) the attention mask when shorter than embeds.
-    #: Only Edit-Plus sets this (its embeds carry image-token slots). Default False.
     pad_mask_to_embeds: bool = False
-
-    # ------------------------------------------------------------------ #
-    # Request side
-    # ------------------------------------------------------------------ #
 
     def build_inputs(self, sample: Sample, *, initial_noise: Any) -> Dict[str, Any]:
         """Sealed template: validate, then merge the stage payloads in layer order.
@@ -60,7 +51,7 @@ class ImageAdapter(ModelAdapter):
         """
         input_part = sample.parts[0]
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
-        # ---- sealed validation (fail-fast gates survive any stage override) ----
+        # sealed validation (fail-fast gates survive any stage override)
         text_prim = input_part.primitives.get("text")
         if not isinstance(text_prim, Texts):
             raise TypeError(
@@ -76,8 +67,6 @@ class ImageAdapter(ModelAdapter):
             "build_inputs: the gen Part must carry diffusion sampling_params",
         )
 
-        # σ is the SSOT, pinned onto ``diffusion.sigmas`` by the engine before this
-        # runs. Never recompute here; ``build_sampling`` slices it.
         require(
             diffusion.sigmas is not None,
             "build_inputs: diffusion.sigmas must be pinned by the engine before "
@@ -91,10 +80,6 @@ class ImageAdapter(ModelAdapter):
 
         sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs or {})
 
-        # Negative-prompt CFG invariant: SGLang gates CFG on guidance_scale>1
-        # independently of return_negative_prompt_embeds — without pinning the
-        # latter, rollout conditions on the negative prompt while replay falls
-        # back to zero negative embeds (silent GRPO ratio mismatch). Fail fast.
         neg_prompt = sampler_kwargs.get("negative_prompt")
         return_neg_embeds = bool(sampler_kwargs.get("return_negative_prompt_embeds", False))
         require(
@@ -108,18 +93,9 @@ class ImageAdapter(ModelAdapter):
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
 
-        # Layer 1: caller escape-hatch (lowest priority).
         kwargs: Dict[str, Any] = dict(sampler_kwargs)
-        # Layer 2: overridable stages (override layer 1).
         kwargs.update(self.build_prompts(sample))
         kwargs.update(self.build_sampling(sample, diffusion=diffusion))
-        # Layer 3: engine pins — RL-loop invariants, not model knobs. Stock
-        # upstream has no ``init_same_noise`` field; its default draws per-output
-        # noise (== the fork's ``init_same_noise=False``), and any group-sharing
-        # pattern is already carried by ``initial_noise`` below, so the fork flag
-        # is simply dropped. ``save_output`` / ``return_file_paths_only`` default
-        # to True upstream — RL wants tensors, not files, so the pins are load-
-        # bearing.
         kwargs.update(
             {
                 "save_output": False,
@@ -129,59 +105,21 @@ class ImageAdapter(ModelAdapter):
             }
         )
 
-        # ``return_prompt_embeds`` / ``return_negative_prompt_embeds`` are the
-        # conditions-path opt-in flags re-hosted onto stock upstream by
-        # ``_patches/patch_conditions`` (+ ``patch_sampling_io`` makes them genuine
-        # ``SamplingParams`` fields). Only request them when the engine populates
-        # conditions; positives are always emitted under ``populate_conditions``,
-        # negatives only when CFG is actually active in the rollout (SGLang's CFG
-        # gate: ``guidance_scale > 1`` AND a negative prompt present) — the same
-        # invariant the ``require`` above enforces from the opposite direction.
+        # Request negative prompt embeds only when CFG is active.
         if self.cfg.populate_conditions:
             kwargs["return_prompt_embeds"] = True
             if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
-        # Per-step SDE noise key. Keyed on sample_ids (unique per sample) so each
-        # sample explores its own per-step SDE noise; the fork keyed on group_ids
-        # (same-group samples shared per-step noise). x_T is already per-sample
-        # via the initial_noise injection below, so within-group diversity does
-        # not depend on this; it is a secondary exploration knob. GATED on
-        # ``initial_noise``: the driver controls x_T and per-step seeds together
-        # (both are the per-sample group K-vectors the grouped-forward slice patch
-        # must split per output). With DISABLE_DRIVER_XT (initial_noise None) the
-        # engine draws BOTH itself — shipping per-sample ``denoise_seeds`` then
-        # leaves a K-length generator list against a batch_size=1 expanded Req
-        # ("Generator list must have the same length as batch size").
+        # Key per-step SDE noise by sample ID to preserve within-group exploration.
         if initial_noise is not None:
             kwargs["initial_noise"] = initial_noise
             if gen_part.sample_ids:
                 kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
 
-        # Layer 4: the upstream rollout machinery is ALWAYS on — the patched
-        # stack returns the per-output-sliced T+1 trajectory + σ echo ONLY via
-        # ``rollout_trajectory_data.dit_trajectory`` (gated on
-        # ``rollout_return_dit_trajectory``); the flat ``trajectory_latents``
-        # field is unsliced across outputs and lacks the x_T prepend, so it
-        # cannot back the RawResult contract.
-        #
-        # SDE vs ODE gates on ``is_forward_process`` (the single source of truth
-        # for "no SDE steps" — empty ``[]`` from num_sde_steps=0, or ``None`` when
-        # no SDE params were set). A forward process (DiffusionNFT / eval) must NOT
-        # enter the SDE branch: that would ship the SDE kernel label with the
-        # recipe's ``eta`` (0.0 for NFT), tripping the upstream kernel's
-        # ``assert noise_level > 0``. The ODE branch pins ``rollout_sde_type="ode"``
-        # + ``rollout_log_prob_no_const=True``: an ODE step's normalized log-prob is
-        # undefined, so upstream asserts the flag is set and emits a zero
-        # placeholder this path never reads (``emit_native_logprob`` is False for a
-        # forward process). Mirrors the legacy engine's ``_to_sglang_kwargs``.
+        # RawResult must use dit_trajectory; trajectory_latents omits x_T and is not output-sliced.
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
-        # ``r.trajectory_latents`` (consumed by tracks.py) is set from
-        # ``ctx.trajectory_latents``, which ``_record_trajectory`` only fills when
-        # ``return_trajectory_latents`` is True (it defaults False in rollout_api).
-        # The base DenoisingStage path apparently has it on; LTX-2's custom denoising
-        # leaves it off, so request it explicitly.
         kwargs["return_trajectory_latents"] = True
         if is_forward_process(sde_indices):
             kwargs["rollout_sde_type"] = "ode"
@@ -195,14 +133,9 @@ class ImageAdapter(ModelAdapter):
             )
             kwargs["rollout_sde_type"] = self._sde_label
             kwargs["rollout_noise_level"] = float(diffusion.eta)
-            # Upstream renamed the per-step SDE gate (fork ``rollout_sde_indices``).
             kwargs["rollout_sde_step_indices"] = sde_indices
 
         return kwargs
-
-    # ------------------------------------------------------------------ #
-    # Overridable request stages (the template merges them in layer order)
-    # ------------------------------------------------------------------ #
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
         """Prompt payload: unique prompts + repeat count, recovered by lineage.
@@ -213,7 +146,6 @@ class ImageAdapter(ModelAdapter):
         forward-batch chunks (a chunk may hold a partial group).
         """
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
-        # text-only consumer: the frontier-aligned prompt is the (single) text turn.
         prompts = list(sample.text_conditioning()[0].content.texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
         out: Dict[str, Any] = {
@@ -243,10 +175,6 @@ class ImageAdapter(ModelAdapter):
             "seed": int(diffusion.seed) if diffusion.seed is not None else 0,
         }
 
-    # ------------------------------------------------------------------ #
-    # Response side
-    # ------------------------------------------------------------------ #
-
     def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
         require(bool(raw), "build_response: SGLang returned no results")
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
@@ -259,10 +187,6 @@ class ImageAdapter(ModelAdapter):
         num_steps = int(diffusion.num_inference_steps)
         sde_indices_raw = diffusion.sde_indices
         sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
-        # Best-effort native log-prob emission: only meaningful when the algorithm
-        # requested SDE steps (a forward process — NFT / eval — has none). Whether
-        # the emitted anchor is *used* or recomputed is the training layer's call
-        # (``algorithm.old_logp_source``), not an engine flag.
         emit_native_logprob = not is_forward_process(sde_indices)
 
         segment = self.build_segment(
@@ -278,14 +202,8 @@ class ImageAdapter(ModelAdapter):
         if self.cfg.populate_conditions:
             conditions = self.build_condition(raw)
 
-        # Fill the frontier gen Part; ``with_filled_frontier`` preserves every
-        # preceding part (the prompt head and any chained inputs).
         primitives = {primitive_modality_key(decoded): decoded} if decoded is not None else {}
         return sample.with_filled_frontier(segment=segment, primitives=primitives, conditions=conditions)
-
-    # ------------------------------------------------------------------ #
-    # Overridable conversion steps (defaults delegate to utils)
-    # ------------------------------------------------------------------ #
 
     def build_segment(
         self,

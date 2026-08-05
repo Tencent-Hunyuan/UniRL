@@ -50,7 +50,7 @@ class _EnvRewardSource:
         """Read the env-sourced scalar reward the engine attached to each
         trajectory's last generated Part; group by the shared root id. No reward
         backend, no scoring Sample."""
-        del sample, rollout_id  # env reward is already on the trajectories
+        del sample, rollout_id
         values: List[float] = []
         group_ids: List[str] = []
         missing = 0
@@ -58,15 +58,8 @@ class _EnvRewardSource:
             gens = tr.gen_parts()
             reward: Optional[torch.Tensor] = gens[-1].rewards if gens else None
             if reward is not None:
-                # Already NaN when the engine marked a fault AFTER the first turn
-                # (``_run_one`` attaches NaN to the terminal Part); passes straight
-                # through to the same exclusion below.
                 values.append(float(hydrate(reward).to(torch.float32).flatten()[0].item()))
             else:
-                # Gen-less trajectory = engine-marked failure (the fault hit before the
-                # first turn). NaN, not 0.0, so _group_advantages drops it from the
-                # group's mean/std and gives it zero advantage — scoring an
-                # infrastructure fault as a genuine miss biases every sibling.
                 values.append(float("nan"))
                 missing += 1
             group_ids.append(tr.parts[0].sample_ids[0])

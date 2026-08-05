@@ -114,9 +114,6 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
         sigma = sigma.to(dev)
 
         batch_size = int(sample.shape[0])
-        # Boogu timestep input: t = 1 - sigma, in MODEL dtype (the reference
-        # predict() does t.expand(B).to(latents.dtype); timestep_scale=1000
-        # is applied inside the transformer).
         if sigma.dim() == 0 or sigma.shape[0] != batch_size:
             timestep = (1.0 - sigma).expand(batch_size)
         else:
@@ -132,8 +129,6 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
             raise ValueError("BooguImageDiffusionStep.predict_noise: conditions.text.attn_mask is None")
         mask = mask.to(dev)
 
-        # Bare-tensor return: the vendored forward defaults return_dict=False
-        # and returns [B, C, H, W] directly — no `[0]` indexing.
         out = model.transformer(
             sample,
             timestep,
@@ -143,9 +138,6 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
             ref_image_hidden_states=None,
         )
 
-        # Boogu CFG gate: 1.0 == off (unlike z_image's 0.0). Sequential
-        # negative forward — positive/negative embeds are padded to
-        # different lengths, and the reference runs branches sequentially.
         use_cfg = guidance_scale > 1.0 and conditions.negative_text is not None
         if use_cfg:
             neg = conditions.negative_text
@@ -159,8 +151,6 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
                 neg.attn_mask.to(dev),
                 ref_image_hidden_states=None,
             )
-            # Reference combine (pipeline_boogu.py:3646-3649), plain linear:
-            # model_pred + (g - 1) * (model_pred - model_pred_drop_all).
             out = out + (guidance_scale - 1.0) * (out - neg_out)
         elif guidance_scale > 1.0:
             raise ValueError(
@@ -169,10 +159,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
                 "have built ''-negatives"
             )
 
-        # t-convention velocity -> sigma-convention FlowMatch velocity.
         return -out
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -327,10 +314,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         self._freqs_cis: Optional[List[torch.Tensor]] = None
         self._freqs_cis_device: Optional[torch.device] = None
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _get_freqs_cis(self, device: torch.device) -> List[torch.Tensor]:
         """Per-device cache of the resolution-independent rotary tables."""
         if self._freqs_cis is None or self._freqs_cis_device != device:
@@ -353,10 +336,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         if float(lo) <= fraction <= float(hi):
             return float(params.guidance_scale)
         return 1.0
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def diffuse(
         self,
@@ -384,10 +363,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        # Latent grid: 2 * (H // (vae_scale_factor * 2)) — equals the
-        # reference's H // 8 after its ×16 pixel-size floor
-        # (pipeline_boogu.py:2994-2997, 863-867) and guarantees the patch-2
-        # divisibility flat_and_pad_to_seq needs.
         vsf = int(self.vae_scale_factor)
         latent_h = 2 * (int(params.height) // (vsf * 2))
         latent_w = 2 * (int(params.width) // (vsf * 2))
@@ -465,7 +440,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)  # [B, K, C, H, W]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
         sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
@@ -479,10 +454,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
             sde_logp=sde_logp,
             sde_indices=sde_indices_tensor,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -516,8 +487,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
 
         device = torch.device(self.model.device)
         sigmas = segment.sigmas.to(device)
-        # The cfg_range fraction denominator is the rollout's step count,
-        # recovered from the stored schedule (T + 1 sigmas).
         num_steps = int(sigmas.shape[0]) - 1
         sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
 
@@ -563,10 +532,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
-
     def predict_noise_at_step(
         self,
         conditions: BooguImageConditions,
@@ -590,10 +555,6 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
             guidance_scale=float(params.guidance_scale),
             freqs_cis=self._get_freqs_cis(torch.device(self.model.device)),
         )
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """Return the module the diffusion forward operates on — the

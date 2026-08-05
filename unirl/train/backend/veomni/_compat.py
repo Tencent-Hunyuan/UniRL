@@ -81,8 +81,6 @@ def _install_path_stubs() -> None:
         _stub_package("veomni", pkg_dir)
     else:
         pkg_dir = list(sys.modules["veomni"].__path__)[0]
-    # NOTE: never importlib.util.find_spec("veomni.models") — resolving a
-    # submodule spec imports the parent package for real.
     _stub_package("veomni.models", os.path.join(pkg_dir, "models"))
 
 

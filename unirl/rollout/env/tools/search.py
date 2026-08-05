@@ -1,6 +1,6 @@
 """SearchTool — batched web search via Serper or SerpApi (LIN-519, hardened).
 
-A concrete :class:`~unirl.rollout.loop.tools.tool.Tool` for the deep-research
+A concrete :class:`~unirl.rollout.env.tools.base.Tool` for the deep-research
 agent: given an array of query strings it returns the top web results per query
 as text. Two providers, selected by ``$SEARCH_PROVIDER`` (or the constructor):
 
@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from unirl.rollout.loop.tools.tool import Tool
+from unirl.rollout.env.tools.base import Tool
 
 _SERPER_URL = "https://google.serper.dev/search"
 _SERPAPI_URL = "https://serpapi.com/search"

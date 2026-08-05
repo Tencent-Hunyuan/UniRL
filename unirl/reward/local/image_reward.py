@@ -50,7 +50,6 @@ class ImageRewardScorer(LocalRewardBackend):
         all_rewards: List[float] = []
 
         for img, prompt in zip(images, prompts):
-            # Ensure PIL Image
             if isinstance(img, Image.Image):
                 pil_img = img.convert("RGB")
             else:
@@ -58,7 +57,6 @@ class ImageRewardScorer(LocalRewardBackend):
 
             with torch.no_grad():
                 score = float(self.model.score(prompt, pil_img))
-                # Normalize to ~[0, 1]: raw scores typically in [-2, +2]
                 score = (score + 2.0) / 4.0
                 all_rewards.append(score)
 

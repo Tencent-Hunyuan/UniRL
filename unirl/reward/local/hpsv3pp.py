@@ -115,8 +115,6 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
             ]
 
             with torch.no_grad():
-                # reward() infers capability from the image; iter_step is the
-                # explicit RL-iteration condition. Returns [B, 2] (mu, sigma).
                 rewards = self._hpsv3pp_inferencer.reward(
                     prompts=batch_prompts,
                     image_paths=pil_images,

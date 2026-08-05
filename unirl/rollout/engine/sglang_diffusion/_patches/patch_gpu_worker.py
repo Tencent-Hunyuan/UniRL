@@ -42,14 +42,12 @@ def patch_gpu_worker() -> None:
     """Install the fork's ``GPUWorker`` RL additions on stock upstream sglang."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
-    # -- AROUND-wrap __init__: add fork instance state + MemorySaverHandler -----
     if not getattr(GPUWorker.__init__, "_unirl_gpu_worker", False):
         _orig_init = GPUWorker.__init__
 
         def __init__(self, *args, **kwargs):
             _orig_init(self, *args, **kwargs)
 
-            # Lazy import: import-safe + avoids a hard dep at patch-install time.
             from sglang.srt.utils.torch_memory_saver_adapter import (
                 TorchMemorySaverAdapter,
             )
@@ -62,11 +60,6 @@ def patch_gpu_worker() -> None:
             self._sleep_restore_map: dict[str, str] = {}
             self._weights_update_groups: dict = {}
 
-            # Memory saver handler (zero-copy sleep/wake).
-            # NOTE: stock-upstream multimodal_gen ServerArgs lacks
-            # ``enable_memory_saver`` (only ``pin_cpu_memory`` exists), so read
-            # both defensively via getattr -- see RISKS. The fork read them as
-            # plain attributes (server_args.enable_memory_saver / .pin_cpu_memory).
             self._memory_saver = MemorySaverHandler(
                 adapter=TorchMemorySaverAdapter.create(enable=getattr(self.server_args, "enable_memory_saver", False)),
                 pipeline=self.pipeline,
@@ -78,8 +71,6 @@ def patch_gpu_worker() -> None:
         __init__._unirl_gpu_worker = True  # type: ignore[attr-defined]
         GPUWorker.__init__ = __init__
 
-    # -- setattr the net-new methods (verbatim fork bodies) --------------------
-    # Idempotency guard: all methods share one sentinel attr on the class.
     if getattr(GPUWorker, "_unirl_gpu_worker_methods", False):
         return
 
@@ -97,16 +88,8 @@ def patch_gpu_worker() -> None:
     GPUWorker._move_modules = _move_modules
     GPUWorker.release_memory_occupation = _release_memory_occupation
     GPUWorker.resume_memory_occupation = _resume_memory_occupation
-    # NOTE: get_weights_checksum is NOT set -- it exists in stock upstream.
 
     GPUWorker._unirl_gpu_worker_methods = True
-
-
-# ===========================================================================
-# Module-level patched method bodies (copied verbatim from the fork diff).
-# ``self`` is the GPUWorker instance; module globals the fork relied on are
-# imported locally inside each body (import-safe).
-# ===========================================================================
 
 
 def _is_sleeping(self) -> bool:
@@ -307,16 +290,12 @@ def _encode_prompt(self, prompts: list[str]) -> dict:
 
         result: dict = {}
 
-        # Separate 3D sequence embeds from 2D pooled embeds
         seq_embeds = [e for e in embeds_list if e.ndim >= 3]
         pooled_embeds = [e for e in embeds_list if e.ndim == 2]
 
-        # prompt_embeds: concat sequence embeds along seq dim
         if seq_embeds:
             result["prompt_embeds"] = torch.cat(seq_embeds, dim=1) if len(seq_embeds) > 1 else seq_embeds[0]
 
-        # pooled_prompt_embeds: from 2D embeds first, fallback to pooled_list
-        # (don't merge both — Flux has duplicates across the two sources)
         if not pooled_embeds:
             pooled_embeds = list(pooled_list)
         if pooled_embeds:
@@ -324,7 +303,6 @@ def _encode_prompt(self, prompts: list[str]) -> dict:
                 torch.cat(pooled_embeds, dim=-1) if len(pooled_embeds) > 1 else pooled_embeds[0]
             )
 
-        # Attention masks for sequence encoders
         seq_masks = [m for m in masks_list if m.ndim == 2]
         if seq_masks:
             result["encoder_attention_mask"] = torch.cat(seq_masks, dim=1) if len(seq_masks) > 1 else seq_masks[0]
@@ -513,8 +491,6 @@ def _move_modules(self, names: list[str], device: str) -> bool:
         logger.warning(
             f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
         )
-        # TODO (mengyang, chenyang): If exception is raised
-        # during rollback, the original exception detail is lost.
         for name in moved:
             module = modules.get(name)
             src_dev = src_device_map.get(name)
@@ -545,14 +521,10 @@ def _release_memory_occupation(self, tags: list[str] | None = None, cpu_backup_t
             "message": "pipeline not initialized",
         }
 
-    # --- memory_saver path: per-component region pause ---
     if self._memory_saver.enabled:
         result = self._memory_saver.release(tags, cpu_backup_tags)
         self._sleeping = result.get("sleeping", False)
         return result
-
-    # --- legacy path: .to("cpu") offload ---
-    # Accept any tags (or None) — legacy path moves all modules regardless.
 
     try:
         modules = get_updatable_modules(self.pipeline)
@@ -608,13 +580,10 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "message": "pipeline not initialized",
         }
 
-    # --- memory_saver path: per-component region resume ---
     if self._memory_saver.enabled:
         result = self._memory_saver.resume(tags)
         self._sleeping = result.get("sleeping", False)
         return result
-
-    # --- legacy path: .to(device) restore ---
 
     try:
         if not self._sleep_restore_map:
@@ -645,62 +614,3 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "sleeping": self._sleeping,
             "message": f"resume failed; rolled back to keep state consistent: {e}",
         }
-
-
-# ===========================================================================
-# RISKS (upstream gaps vs. the fork) -- surfaced per task requirements.
-# ===========================================================================
-#
-# 1. ServerArgs.enable_memory_saver MISSING upstream.
-#    Stock-upstream ``multimodal_gen/runtime/server_args.py`` defines
-#    ``pin_cpu_memory: bool = True`` (line 208) but NOT ``enable_memory_saver``
-#    (that field lives only in srt ServerArgs and in the fork's multimodal_gen
-#    ServerArgs). __init__ above therefore reads BOTH via getattr with the
-#    fork's defaults (enable_memory_saver=False, pin_cpu_memory=True). Net effect
-#    on the SD3/dance pilots: ``self._memory_saver.enabled`` is False, so
-#    release/resume take the legacy ``.to("cpu")`` path -- functionally fine.
-#    To enable the zero-copy memory_saver path, upstream (or a ServerArgs patch)
-#    must add ``enable_memory_saver``. Worker reads server args as
-#    ``self.server_args`` (confirmed upstream gpu_worker:118).
-#
-# 2. encode_prompt: encode_text return-arity DRIFT (RISK).
-#    The fork unpacks a 3-tuple
-#    ``embeds_list, masks_list, pooled_list = text_stage.encode_text(...)``,
-#    but stock upstream ``TextEncodingStage.encode_text(return_type="list",
-#    return_attention_mask=True)`` now returns a 5-tuple
-#    ``(embeds_list, attn_masks_list, pooled_embeds_list, embeds_masks_list,
-#    seq_lens_list)``. The verbatim fork body will raise "too many values to
-#    unpack" against upstream. Left verbatim (battle-tested) and flagged: this is
-#    the conditions/text-embed path, NOT on the SD3/dance pilots
-#    (populate_conditions=False), so it is exercised only if encode_prompt is
-#    actually called. Fix when adopting the conditions path (re-sync the unpack
-#    or pass return_type="dict").
-#
-# 3. set_lora_from_tensors: depends on a sibling LoRA patch (RISK).
-#    Stock upstream ``LoRAPipeline.set_lora`` does NOT accept ``lora_tensors=``
-#    (and lacks the ``load_lora_adapter_from_tensors`` / ``normalize_lora_state_dict``
-#    helpers the fork added). The body here calls set_lora exactly as the fork
-#    does; it only works once ``patch_lora_pipeline`` re-homes those fork
-#    additions onto upstream. Not on the SD3/dance pilot path.
-#
-# 4. WeightsUpdater.update_weights_from_named_tensors is fork-only.
-#    The class exists upstream (weights_updater.py:154) but this method does NOT.
-#    update_weights_from_tensor / update_weights_from_distributed call it as the
-#    fork does; it must be provided by sibling ``patch_weights_updater``.
-#
-# 5. Forward path (_req_to_output_batch) NOT wrapped -- conditions path DEFERRED.
-#    The fork wrapped an inline ``OutputBatch(...)`` in the forward loop to add
-#    prompt_embeds / pooled_prompt_embeds / encoder_attention_mask /
-#    negative_* and trajectory_log_probs / trajectory_noise_preds.
-#    Upstream has since refactored this into a @staticmethod
-#    ``GPUWorker._req_to_output_batch(result)`` whose OutputBatch ALREADY carries
-#    the native-logprob payload via ``rollout_trajectory_data`` (schedule_batch
-#    OutputBatch:416) and ``trajectory_latents`` -- so the trajectory/log-prob
-#    needs of the SD3/dance pilots are met without any wrap. Upstream OutputBatch
-#    has NO trajectory_log_probs / trajectory_noise_preds / pooled_prompt_embeds /
-#    encoder_attention_mask / neg_pooled_prompt_embeds / negative_attention_mask
-#    fields, and the conditions return_prompt_embeds/return_negative_prompt_embeds
-#    flags are not on the pilot path (populate_conditions=False). We therefore
-#    SKIP wrapping the forward / _req_to_output_batch. Revisit when adopting the
-#    conditions path: it needs both new OutputBatch fields and an AROUND-wrap of
-#    the static ``_req_to_output_batch`` (or its merge helpers).

@@ -56,6 +56,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+!unirl/rollout/env/
+!unirl/rollout/env/**/
+!unirl/rollout/env/**/*.py
+!unirl/rollout/env/**/*.md
 
 # Jupyter / notebooks
 .ipynb_checkpoints/

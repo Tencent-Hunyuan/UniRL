@@ -43,44 +43,27 @@ class FastVideoEngineConfig(BaseEngineConfig):
 
         return FastVideoRolloutEngine(config=self, **deps)
 
-    # --- Sampling (live interpolation back to top-level cfg.sampling) ---
     sampling: Any = dc_field(default_factory=lambda: SI("${sampling}"))
 
-    # --- Model family: selects the Sample frontier conversion (only wan2.1 for now) ---
     model_family: str = "wan2.1"
 
-    # --- Native log-prob (PR #1222 ForwardBatch.RLData path). When False the
-    #     engine returns only the trajectory and the trainer recomputes log-probs
-    #     via replay (algorithm.old_logp_source=replay). ---
     native_logprob: bool = True
 
-    # --- Engine-internal noise fallback. FastVideo currently uses one seed for
-    #     x_T and SDE noise, so True shares the whole random stream, not only x_T. ---
     init_same_noise: bool = False
 
-    # --- Parallelism & GPU (colocate first cut: 1 GPU per actor) ---
     num_gpus: int = 1
     tp_size: int = 1
     sp_size: int = 1
 
-    # --- FastVideo behaviour ---
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # --- Output concat cadence (None = collect the whole shard, concat once).
-    #     NOT a GPU batch size: _drive_fastvideo runs FastVideo one video at a
-    #     time (per-sample seeds preclude batching), so peak GPU activation is one
-    #     video regardless. This only bounds how many CPU-side outputs accumulate
-    #     before a concat + empty_cache. ---
     forward_batch_size: Optional[int] = None
 
-    # --- Weight sync target submodule(s) on the FastVideo transformer ---
     target_modules: Optional[Tuple[str, ...]] = None
 
-    # --- FastVideo repo location (added to sys.path; lazy-imported in engine) ---
     fastvideo_path: Optional[str] = None
 
-    # --- Escape hatch for rare FastVideoArgs overrides ---
     engine_kwargs: Optional[Dict[str, Any]] = dc_field(default_factory=dict)
 
     def __post_init__(self) -> None:

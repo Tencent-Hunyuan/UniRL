@@ -34,17 +34,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# ── Thread-local storage for active context ───────────────────────────────────
-
 _tls = threading.local()
 
 
 def current_grad_context() -> Optional["GradContext"]:
     """Return the active GradContext for the current thread, or None."""
     return getattr(_tls, "ctx", None)
-
-
-# ── RPCBackwardNode ────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -64,9 +59,6 @@ class RPCBackwardNode:
     output_metas: List["TensorRef"]  # forward output TensorMetas, in traversal order
 
 
-# ── GradContext ────────────────────────────────────────────────────────────────
-
-
 class GradContext:
     """Context manager that tracks forward RPCs and runs backward on exit."""
 
@@ -82,23 +74,16 @@ class GradContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # Clear ctx first — prevents _auto_backward RPCs from being re-tracked.
         _tls.ctx = None
 
         if exc_type is not None:
-            # Forward raised: clean up worker-side saved tensors, re-raise.
             _cleanup_all(self)
             return False  # don't suppress exception
 
         _run_backward(self)
 
-        # Backward complete: clear saved grad tensors on all involved workers
-        # (belt-and-suspenders after _auto_backward already pops call_id entries).
         _cleanup_all(self)
 
-        # Clear .grad on all tracked TensorMetas to free GPU memory,
-        # unless the user called tm.retain_grad() (mirrors PyTorch semantics:
-        # non-leaf .grad is freed after backward unless retain_grad() was called).
         seen: set = set()
         for node in self.nodes:
             for tm in node.input_metas + node.output_metas:
@@ -113,16 +98,11 @@ def enable_grad() -> GradContext:
     return GradContext()
 
 
-# ── _run_backward ──────────────────────────────────────────────────────────────
-
-
 def _run_backward(ctx: GradContext) -> None:
     """Traverse nodes in reverse, issue _auto_backward RPCs."""
     errors = []
 
     for node in reversed(ctx.nodes):
-        # Skip if all output_metas have no grad AND there are output_metas.
-        # (Empty output_metas = forward_backward_loss style: always run.)
         if node.output_metas and all(tm.grad is None for tm in node.output_metas):
             continue
 
@@ -154,9 +134,6 @@ def _run_auto_backward(node: RPCBackwardNode) -> None:
         for tm, grad in zip(node.input_metas, new_in_grads):
             if grad is not None:
                 tm.grad = grad
-
-
-# ── _cleanup_all ──────────────────────────────────────────────────────────────
 
 
 def _cleanup_all(ctx: GradContext) -> None:

@@ -48,12 +48,9 @@ def load_training_checkpoint(path: str) -> Dict[str, object]:
 
 
 def _torch_load(file_path: str, *, allow_unsafe_fallback: bool = True) -> Dict[str, object]:
-    # Prefer the safe unpickler; fall back for older checkpoints that carry
-    # pickled (non-tensor) objects it rejects.
     try:
         return torch.load(file_path, map_location="cpu", weights_only=True)
     except TypeError:
-        # PyTorch versions predating ``weights_only``.
         return torch.load(file_path, map_location="cpu")
     except pickle.UnpicklingError:
         if not allow_unsafe_fallback:
@@ -66,10 +63,6 @@ def _torch_load(file_path: str, *, allow_unsafe_fallback: bool = True) -> Dict[s
 
 
 def _load_dcp(path: str) -> Dict[str, object]:
-    # Single-process reassembly of the sharded save: the empty-state-dict planner
-    # reads the global tensors from every shard (no model and no process group
-    # needed). The app-level metadata.pt carries lora_config / step / save_mode
-    # beside DCP's own ``.metadata``.
     try:
         import torch.distributed.checkpoint as dcp
         from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner

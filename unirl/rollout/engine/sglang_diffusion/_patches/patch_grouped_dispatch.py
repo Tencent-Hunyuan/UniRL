@@ -43,12 +43,6 @@ def patch_grouped_dispatch() -> None:
         return
 
     def __call__(self, batch, server_args):
-        # post1's ParallelExecutor._execute_stages calls stage(batch) instead of
-        # honoring its run_grouped_requests dispatch; when batch is a grouped
-        # list of Reqs, route it through run_grouped_requests (StageDedupMixin)
-        # the way upstream >= 3142278c5 / 2fc does. Single-Req calls are
-        # untouched, and newer sglang never passes a list here, so this is a
-        # no-op there.
         if isinstance(batch, list):
             return self.run_grouped_requests(batch, server_args)
         return orig_call(self, batch, server_args)

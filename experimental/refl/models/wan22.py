@@ -19,12 +19,8 @@ from unirl.train.lora import adapters_disabled
 from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import DiffusionSamplingParams
 
-# Matches the mainline module-level constant in unirl/models/wan22/diffusion.py.
-# We do not import the private symbol so the recipe stays decoupled from the
-# mainline's private surface.
 _WAN_TIMESTEP_SCALE: float = 1000.0
 
-# Inclusive max for torch.Generator.manual_seed and torch initial_seed conventions.
 MAX_TORCH_SEED = (1 << 63) - 1
 
 
@@ -199,7 +195,6 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                 base_seed=int(params.seed),
             )
 
-        # BPTT knobs.
         sk: Dict[str, Any] = dict(getattr(params, "sampler_kwargs", {}) or {})
         mid_timestep = int(sk.get("mid_timestep", 0))
         final_timestep = int(sk.get("final_timestep", T - 1))
@@ -284,9 +279,6 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                 noise_pred = noise_pred.float()
                 kl_pred = noise_pred
 
-            # Per-step KL against the LoRA-disabled reference, on the
-            # conditional prediction of the currently active branch. When CFG
-            # is enabled, this intentionally excludes the stop-grad uncond mix.
             if kl_weight != 0.0 and grad_enabled:
                 with torch.no_grad(), autocast_ctx, adapters_disabled(dual):
                     ref_pred = step.predict_noise(
@@ -302,9 +294,6 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
                 kl_total = kl_total + kl_step
                 kl_steps += 1
 
-            # Keep the transition outside autocast and under the same BPTT
-            # window used by WAN21: grad-enabled for train steps, no-grad
-            # before ``mid_timestep``.
             transition_ctx = nullcontext() if grad_enabled else torch.no_grad()
             with transition_ctx:
                 new_latents, _, _ = step.forward(

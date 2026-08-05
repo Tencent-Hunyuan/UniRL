@@ -40,12 +40,7 @@ class NoiseRecipe:
 
     noise_group_ids: List[str] = field(default_factory=list)
     base_seed: int = 0
-    # None until the latent shape is known. Models with a request-time-known
-    # shape fill it via ``from_sample`` (the gen Part's
-    # ``init_noise_latent_shape``); dynamic-shape models fill it at the engine
-    # point where the shape resolves.
     latent_shape: Optional[Tuple[int, ...]] = None
-    # Path 1: genuine latent DATA (img2img / i2v first-frame), shipped verbatim.
     initial_latents: Optional[torch.Tensor] = None
 
     def for_batch(self, batch_size: int, *, latent_shape: Optional[Tuple[int, ...]] = None) -> "NoiseRecipe":
@@ -95,7 +90,6 @@ class NoiseRecipe:
         shape = latent_shape if latent_shape is not None else self.latent_shape
         if not (gids and shape):
             return None
-        # Local import avoids a module-level types→sde cycle.
         from unirl.sde.noise import regen_initial_noise
 
         return regen_initial_noise(
@@ -120,9 +114,6 @@ class NoiseRecipe:
         """
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
-        # Explicit per-request opt-out: neither an encoded initial-latent tensor
-        # nor a reproducible seed recipe is driver-authored in this mode. The
-        # rollout backend/pipeline must use its native RNG instead.
         if bool(getattr(diffusion, "disable_driver_xt", False)):
             return cls()
         seg = gen.segment

@@ -4,7 +4,7 @@ ALFWorld (text-only ``AlfredTWEnv``) is the field's canonical multi-turn agentic
 benchmark: a household task where the agent issues text commands (``go to shelf 1``,
 ``take mug 1``, ``clean mug 1 with sinkbasin 1`` …) and the simulator returns the next
 observation, ending with a binary task-success reward. Unlike the stateless
-:class:`~unirl.rollout.loop.tool_environment.ToolEnvironment`, each trajectory is its
+:class:`~unirl.rollout.env.tool_environment.ToolEnvironment`, each trajectory is its
 own **episode with evolving state** and the **reward comes from the simulator**.
 
 Fits the engine's ``reset(sample)->Sample`` / ``step(sample)->(obs, done, info)``
@@ -38,7 +38,6 @@ from unirl.types.sample import Part, Primitive, Sample
 
 logger = logging.getLogger(__name__)
 
-# ReAct action line: the command after the last ``Action:``.
 _ACTION_RE = re.compile(r"[Aa]ction\s*:\s*(.+)")
 
 _SYSTEM = (
@@ -152,26 +151,16 @@ class AlfworldEnv:
         self._max_steps = int(max_steps)
         self._step_penalty = float(step_penalty)
         self._max_obs_chars = int(max_obs_chars)
-        # Per-trajectory episodes keyed by the id minted in reset() (carried in the
-        # Sample's root control bag). Guarded: concurrent trajectory threads reset/
-        # step their own episodes against this shared store.
         self._episodes: Dict[str, _Episode] = {}
         self._lock = threading.Lock()
         self._counter = 0
         self._games: List[str] = []
-        # Lazy, reused AlfredTWEnv templates (construct scans all games ~5s → reuse).
         self._free: List[Any] = []
         self._environment: Any = None
         self._alfworld_cfg: Any = None
         self._ready = False
 
-    # ------------------------------------------------------------------
-    # ALFWorld backend — lazy + isolated so tests can inject a mock episode.
-    # ------------------------------------------------------------------
     def _ensure_backend(self) -> None:
-        # Double-checked lock: concurrent trajectory threads all reach here on the
-        # first rollout; only ONE may run the setup (it mutates sys.argv around
-        # load_config(), which is not thread-safe).
         if self._ready:
             return
         with self._lock:
@@ -186,14 +175,13 @@ class AlfworldEnv:
                     "AlfworldEnv needs an ALFWorld base config. Set $ALFWORLD_CONFIG (or the "
                     f"env's config_file) to a readable base_config.yaml; got {cfg_file!r}."
                 )
-            # generic.load_config() argparses sys.argv for the config path — swap argv.
             old_argv = sys.argv
             try:
                 sys.argv = ["alfworld", cfg_file]
                 cfg = generic.load_config()
             finally:
                 sys.argv = old_argv
-            cfg["env"]["type"] = "AlfredTWEnv"  # force the text-only variant
+            cfg["env"]["type"] = "AlfredTWEnv"
 
             self._alfworld_cfg = cfg
             self._environment = environment
@@ -225,9 +213,6 @@ class AlfworldEnv:
         tw = template.init_env(batch_size=1)
         return tw, template
 
-    # ------------------------------------------------------------------
-    # Engine protocol
-    # ------------------------------------------------------------------
     def reset(self, request: Sample) -> Sample:
         """Start an episode for this trajectory; return a Sample whose input is the
         ReAct instruction + the initial observation + admissible commands."""
@@ -235,9 +220,6 @@ class AlfworldEnv:
         root = request.parts[0]
         sid = str(root.sample_ids[0])
         meta = (root.metadata or [None])[0] or {}
-        # Prefer the exact game FILE from the data row (author-selected set); fall back to
-        # indexing this worker's game list. Using the file path avoids any index-alignment
-        # drift between prepare_alfworld's (filtered/sampled) list and the env's glob.
         game_file = meta.get("game_file")
         if not game_file and self._games:
             game_file = self._games[int(meta.get("game_index", 0)) % len(self._games)]
@@ -269,7 +251,7 @@ class AlfworldEnv:
         eid = self._episode_id(sample)
         with self._lock:
             ep = self._episodes.get(eid) if eid is not None else None
-        if ep is None:  # lost/expired episode — terminate this trajectory cleanly
+        if ep is None:
             return None, True, {"reward": 0.0}
 
         frontier = sample.parts[-1].primitives.get("text")
@@ -281,9 +263,6 @@ class AlfworldEnv:
             logger.warning("AlfworldEnv: env.step failed (%s: %s); ending episode.", type(exc).__name__, exc)
             with self._lock:
                 self._episodes.pop(eid, None)
-            # NaN reward = "engine bug, not a policy failure": the trainer excludes it from
-            # the GRPO group (neutral, zero advantage) so a crash doesn't penalize the
-            # trajectory's actions. Drop (don't reuse) a template whose game just errored.
             return None, True, {"reward": float("nan"), "success": 0.0, "steps": ep.steps, "error": True}
         ep.steps += 1
         ep.admissible = self._admissible(infos)
@@ -321,9 +300,6 @@ class AlfworldEnv:
         if ep is not None:
             self._release_template(ep.template)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _episode_id(sample: Sample) -> Optional[str]:
         ctrl = sample.parts[0].control or {}

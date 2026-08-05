@@ -75,10 +75,6 @@ import torch
 
 T = TypeVar("T", bound="Batch")
 
-# Metadata key under which the field kind enum is stored. The string value is
-# also the kwarg name accepted by ``field()`` below — caller writes
-# ``field(kind=FieldKind.CONCAT, ...)`` and the routing is identical to the
-# legacy ``concat_field()`` helper.
 _FIELD_KIND_KEY = "kind"
 
 
@@ -94,14 +90,7 @@ class FieldKind(Enum):
 
 _REDUCTION_KINDS = frozenset({FieldKind.MAX, FieldKind.MIN, FieldKind.SUM, FieldKind.MEAN})
 
-# Cache of dataclasses.field's accepted kwargs so the generic ``field()`` below
-# can route arbitrary keyword args between dc.field params and free-form metadata.
 _DC_FIELD_PARAMS = frozenset(_inspect.signature(_dc_field).parameters)
-
-
-# ---------------------------------------------------------------------------
-# Field constructors
-# ---------------------------------------------------------------------------
 
 
 def field(**kwargs: Any) -> Any:
@@ -195,11 +184,6 @@ def mean_field(**kwargs: Any) -> Any:
 
 def _field_kind(f: Any) -> FieldKind:
     return f.metadata.get(_FIELD_KIND_KEY, FieldKind.SHARED)
-
-
-# ---------------------------------------------------------------------------
-# Value-level helpers
-# ---------------------------------------------------------------------------
 
 
 def _infer_batch_size(value: Any) -> Optional[int]:
@@ -409,11 +393,6 @@ def _clone_value(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-# ---------------------------------------------------------------------------
-# Packed-varlen helpers (data + cu_seqlens algorithms)
-# ---------------------------------------------------------------------------
-
-
 def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
     """Merge per-shard cu_seqlens with offset shift.
 
@@ -463,10 +442,6 @@ def _concat_packed_data(values: List[Optional[torch.Tensor]]) -> Optional[torch.
     if not non_none:
         return None
     if all(isinstance(v, Batch) for v in non_none):
-        # Transport placeholders (e.g. TensorRef returned from a DP_SCATTER
-        # dispatch) carry routing handles, not real tensors — defer to their own
-        # concat, exactly like _concat_value's Batch branch. A raw torch.cat
-        # would choke on them ("expected Tensor ... but got TensorRef").
         return type(non_none[0]).concat(non_none)
     return torch.cat(non_none, dim=0)
 
@@ -507,7 +482,6 @@ def _select_packed_data(
             return value.select_ranges([])
         return value[:0].clone()
     if hasattr(value, "select_ranges"):
-        # TensorRef: token-range gather as a lazy range view (no data motion).
         return value.select_ranges([(int(cu[i].item()), int(cu[i + 1].item())) for i in indices])
     chunks = [value[int(cu[i].item()) : int(cu[i + 1].item())] for i in indices]
     return torch.cat(chunks, dim=0)
@@ -548,11 +522,6 @@ def _repeat_interleave_cu_seqlens(cu: torch.Tensor, n: int) -> torch.Tensor:
     return torch.tensor(cu_list, dtype=cu.dtype, device=cu.device)
 
 
-# ---------------------------------------------------------------------------
-# Base class
-# ---------------------------------------------------------------------------
-
-
 class Batch:
     """Mixin / base for ``@dataclass`` containers with concat/shared fields.
 
@@ -573,11 +542,6 @@ class Batch:
     properties; there is no setter and no constructor argument.
     """
 
-    # Hidden cumulative-offsets metadata for ``packed_field`` values on
-    # this instance.  Initialized to None (class-level default); populated
-    # by :meth:`pack` when packed fields are present, and propagated by
-    # ``concat`` / ``slice`` / ``select``.  Never set directly by user
-    # code — read via :attr:`cu_seqlens` / :attr:`lengths`.
     _packed_cu_seqlens: Optional[torch.Tensor] = None
 
     @property

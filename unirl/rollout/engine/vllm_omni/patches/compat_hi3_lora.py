@@ -39,8 +39,6 @@ def install() -> None:
     try:
         from vllm.model_executor import utils as vllm_mu
     except ImportError:
-        # vllm not installed in this process — nothing to patch (the import
-        # is the worker's, not the smoke test's).
         return
 
     original = getattr(vllm_mu, "get_moe_expert_mapping", None)
@@ -53,8 +51,6 @@ def install() -> None:
 
     def _patched(model, _orig=original):
         result = _orig(model)
-        # HI3 shape: ``(list_of_4tuples, dict)``. Anything else passes
-        # through untouched.
         if (
             isinstance(result, tuple)
             and len(result) == 2
@@ -68,10 +64,6 @@ def install() -> None:
     _patched._diffrl_hi3_unwrap = True  # type: ignore[attr-defined]
     vllm_mu.get_moe_expert_mapping = _patched
 
-    # Replace the cached local reference inside ``vllm/lora/utils.py``
-    # (and any other consumer module already loaded). New consumers that
-    # haven't imported the symbol yet will pick up the patched ``vllm_mu``
-    # version directly.
     try:
         from vllm.lora import utils as vllm_lora_utils
 

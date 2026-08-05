@@ -87,17 +87,12 @@ class Flux2KleinPipeline(Pipeline):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool = False,
         max_sequence_length: int = 512,
         qwen3_extraction_layers: Tuple[int, ...] = (9, 18, 27),
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        # Optional-stages constructor (mirrors SD3Pipeline / QwenImagePipeline):
-        # the trainer instantiates the pipeline via
-        # ``remote_hydra(pipeline_cfg, bundle=self.bundle)``, so the flat conf
-        # ``pipeline:`` block carries strategy / precision / text-embed knobs and
-        # the trainer injects ``bundle=``. text_embed/diffusion/vae_decode are
-        # built from the bundle here when not supplied.
         self.text_embed = (
             text_embed
             if text_embed is not None
@@ -115,18 +110,11 @@ class Flux2KleinPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else Flux2KleinVAEDecodeStage(bundle)
-        # Image-edit conditioning: encodes the source image into condition
-        # tokens. Built unconditionally (cheap); only used when a request
-        # carries primitives["image"].
         self.vae_encode = Flux2KleinVAEEncodeStage(bundle)
-        # ``shift`` is retained as an attribute for the hosting engine
-        # to read when constructing the σ policy. For Klein, the
-        # empirical-μ schedule fully replaces static shifting at
-        # runtime — the value is only a fallback when the bundle's
-        # scheduler can't be loaded.
         self.shift = shift
 
     def build_schedule_policy(self):
@@ -158,7 +146,7 @@ class Flux2KleinPipeline(Pipeline):
         """
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
-        downsample = 8 * 2  # vae_scale_factor × patchify_factor
+        downsample = 8 * 2
         if height % downsample != 0 or width % downsample != 0:
             raise ValueError(
                 f"Flux2KleinPipeline.latent_shape: height ({height}) and width "
@@ -196,6 +184,7 @@ class Flux2KleinPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = Flux2KleinVAEDecodeStage(bundle)
         return cls(
@@ -255,8 +244,6 @@ class Flux2KleinPipeline(Pipeline):
                 "in unirl.models.types.pipeline."
             )
 
-        # conditioning() surfaces [text, image?] in turn order — the image-edit
-        # source rides as a chained input Part (Part.input_child) on the request.
         conditioning = sample.conditioning()
         texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
@@ -269,17 +256,11 @@ class Flux2KleinPipeline(Pipeline):
         allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
         params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
         params = Flux2KleinDiffusionParams(**params_dict)
-        # init_same_noise shares the initial latent within each prompt group; surface
-        # the gen part's group ids to the noise sampler when the driver didn't pre-ship
-        # noise_group_ids on sampling_params (a shared_field that isn't batch-sliced).
-        # Mirrors SD3Pipeline.generate; without it generate_latents asserts on the
-        # missing noise_group_ids when init_same_noise=True.
+        # Pass group IDs to the noise sampler when init_same_noise is enabled.
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
         klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
-        # Image-edit encoding depends on the output grid, so attach it after the
-        # public text-only condition builder.
         if source_image is not None:
             if source_image.pixels is None or int(source_image.pixels.shape[0]) != len(texts.texts):
                 raise ValueError(
@@ -296,8 +277,6 @@ class Flux2KleinPipeline(Pipeline):
             klein_conds.image_latent_ids = image_ids
         schedule = sampling.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (on the gen part's segment) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
@@ -305,8 +284,6 @@ class Flux2KleinPipeline(Pipeline):
         )
         decoded = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
         filled = frontier.fill(segment=latent_seg, primitives={"image": decoded}, conditions=klein_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

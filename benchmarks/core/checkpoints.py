@@ -18,9 +18,6 @@ class ResolvedCkpt:
 
 
 def _slug(name: str) -> str:
-    # Local paths keep their last two components: UniRL checkpoints are conventionally
-    # named checkpoint-<step>, so basename alone collides across training runs — and a
-    # colliding tag would silently resume/rescore another run's outputs.
     parts = Path(name).parts if Path(name).exists() else name.rstrip("/").split("/")[-1:]
     return re.sub(r"[^A-Za-z0-9._-]+", "-", "-".join(parts[-2:]).lstrip("-/")) or "ckpt"
 

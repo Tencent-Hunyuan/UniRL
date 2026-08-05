@@ -84,13 +84,7 @@ class SD3Pipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else SD3VAEDecodeStage(bundle)
-        # Encode side of the codec (target images → clean latents). Rollout
-        # never calls it; diffusion SFT / future img2img conditioning do.
         self.vae_encode = SD3VAEEncodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine
-        # (TrainsideRolloutEngine) can read it when constructing the
-        # FlowMatchSchedulePolicy at startup. It is NOT used by
-        # ``generate`` itself.
         self.shift = shift
 
     @classmethod
@@ -181,17 +175,12 @@ class SD3Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        # init_same_noise shares the initial latent within each prompt group; surface
-        # the gen part's group ids to the noise sampler when the driver didn't pre-ship
-        # noise_group_ids on sampling_params (a shared_field that isn't batch-sliced).
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
         sd3_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
@@ -199,9 +188,6 @@ class SD3Pipeline(Pipeline):
         )
         images = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay: Part.conditions is the train stack's source in prepare_segment
-        # (matches every sibling pipeline + the SD3 sglang_diffusion adapter).
         filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=sd3_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

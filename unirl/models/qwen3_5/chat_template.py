@@ -41,11 +41,7 @@ class Qwen3_5ChatTemplateStage:
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # MUST agree with the rollout engine's chat_template_kwargs.enable_thinking
-        # or train/rollout prompts diverge and the importance ratio breaks.
         self.enable_thinking = bool(enable_thinking)
-        # When True, pad every prompt to max_prompt_length (v2 DP trainer shard
-        # concatenation requires a single shared seq len across shards).
         self.pad_to_max_length = bool(pad_to_max_length)
 
     def embed(
@@ -126,9 +122,6 @@ class Qwen3_5ChatTemplateStage:
                 for message in messages
             )
             if has_media:
-                # Qwen3.5's AutoProcessor scans every message as multimodal
-                # content. Normalize system/text strings to text blocks so the
-                # scan does not iterate over characters.
                 processor_messages = [
                     {
                         **message,
@@ -149,9 +142,6 @@ class Qwen3_5ChatTemplateStage:
                     return_tensors="pt",
                 )
 
-            # The processor's multimodal pre-scan does not accept the standard
-            # string content emitted by build_text_messages. The tokenizer does,
-            # and is also the exact path used by the SGLang text adapter.
             ids = processor.tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=add_generation_prompt,
@@ -186,12 +176,6 @@ class Qwen3_5ChatTemplateStage:
                     "Increase pipeline.max_prompt_length or shorten the prompt."
                 )
             if not has_media and prompt_len > self.max_prompt_length:
-                # Plain right-truncation would drop the trailing generation-prompt
-                # suffix ("<|im_start|>assistant\n", plus thinking tokens when
-                # enabled), leaving the model unprimed to open an assistant turn
-                # → degenerate/empty generations. Truncate the body but keep the
-                # suffix: re-tokenize without the generation prompt to measure the
-                # suffix, then splice head + suffix at max_prompt_length.
                 base = apply_template(messages, add_generation_prompt=False)
                 suffix_len = prompt_len - int(base["input_ids"].shape[-1])
                 if suffix_len < 0 or suffix_len >= self.max_prompt_length:
@@ -236,7 +220,6 @@ class Qwen3_5ChatTemplateStage:
             mask = inp["attention_mask"].squeeze(0)
             attention_mask[i, :L] = mask[:L].to(device)
 
-        # Per-sample lists for media tensors (FieldKind.CONCAT-safe).
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:

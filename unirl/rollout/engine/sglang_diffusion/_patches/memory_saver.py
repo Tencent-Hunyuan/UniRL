@@ -23,11 +23,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants (private)
-# ---------------------------------------------------------------------------
 
-# Map pipeline component names to memory_saver region tags.
 _COMPONENT_TO_REGION = {
     "transformer": "transformer",
     "transformer_2": "transformer",
@@ -42,27 +38,15 @@ _COMPONENT_TO_REGION = {
 }
 _ALL_REGION_TAGS = list(dict.fromkeys(_COMPONENT_TO_REGION.values()))
 
-# Request-scoped caches that become invalid after weight updates.
-# Keyed by (class_name, attr_name).
 _REQUEST_SCOPED_ATTRS = {
     ("GLMSelfAttention", "k_cache"),
     ("GLMSelfAttention", "v_cache"),
 }
 
 
-# ---------------------------------------------------------------------------
-# Public accessor
-# ---------------------------------------------------------------------------
-
-
 def get_region_tag(component_name: str) -> str | None:
     """Return the memory_saver region tag for a pipeline component name, or None."""
     return _COMPONENT_TO_REGION.get(component_name)
-
-
-# ---------------------------------------------------------------------------
-# Handler class
-# ---------------------------------------------------------------------------
 
 
 class MemorySaverHandler:
@@ -84,21 +68,16 @@ class MemorySaverHandler:
         self._cpu_backup_tags: set[str] = set()
         self._stashed_states: dict[str, dict] = {}
         self.dirty_modules: set[str] = set()
-        # Reusable pinned CPU buffers keyed by (tag, module_name, param_key)
         self._pinned_buffers: dict[tuple[str, str, str], torch.Tensor] = {}
 
     @property
     def enabled(self) -> bool:
         return self.adapter.enabled
 
-    # -- module lookup -------------------------------------------------------
-
     def modules_for_tag(self, tag: str) -> dict[str, torch.nn.Module]:
         """Return pipeline modules belonging to a given region tag."""
         modules = get_updatable_modules(self.pipeline)
         return {name: m for name, m in modules.items() if _COMPONENT_TO_REGION.get(name) == tag}
-
-    # -- ephemeral cache clearing --------------------------------------------
 
     def clear_ephemeral_caches(self, tags: Iterable[str]) -> None:
         """Null out request-scoped caches that are invalid after weight updates."""
@@ -110,8 +89,6 @@ class MemorySaverHandler:
                         if (cls_name, attr) in _REQUEST_SCOPED_ATTRS:
                             submod.__dict__[attr] = None
 
-    # -- pinned buffer management ---------------------------------------------
-
     def _get_or_alloc_pinned(self, tag: str, module_name: str, key: str, src: torch.Tensor) -> torch.Tensor:
         """Return a reusable pinned CPU buffer matching src's shape/dtype."""
         cache_key = (tag, module_name, key)
@@ -121,8 +98,6 @@ class MemorySaverHandler:
         buf = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
         self._pinned_buffers[cache_key] = buf
         return buf
-
-    # -- CPU stash / restore -------------------------------------------------
 
     def _clone_gpu_tensor_to_cpu(self, src: torch.Tensor, cache_key: tuple[str, str, str]) -> torch.Tensor:
         """Copy a GPU tensor to a (pinned) CPU buffer with non_blocking."""
@@ -177,8 +152,6 @@ class MemorySaverHandler:
         """
         state: dict = {"params_and_buffers": {}, "unregistered": {}}
         for name, m in self.modules_for_tag(tag).items():
-            # Use named_parameters() + named_buffers() instead of state_dict()
-            # because state_dict() excludes persistent=False buffers (e.g. CLIP position_ids)
             saved: dict[str, torch.Tensor] = {}
             for k, v in m.named_parameters():
                 saved[k] = self._clone_gpu_tensor_to_cpu(v, (tag, name, k))
@@ -186,7 +159,6 @@ class MemorySaverHandler:
                 saved[k] = self._clone_gpu_tensor_to_cpu(v, (tag, name, f"buf.{k}"))
             state["params_and_buffers"][name] = saved
 
-            # Stash unregistered GPU tensor attrs (Qwen RoPE etc.)
             for submod_name, submod in m.named_modules():
                 prefix = f"{name}.{submod_name}" if submod_name else name
                 for attr_name, attr_value in list(submod.__dict__.items()):
@@ -209,7 +181,6 @@ class MemorySaverHandler:
         non_blocking = self._pin_cpu_memory
         device = f"cuda:{self.local_rank}"
         modules = get_updatable_modules(self.pipeline)
-        # Restore params + buffers (including non-persistent)
         for name, saved_tensors in state["params_and_buffers"].items():
             m = modules.get(name)
             if m is None:
@@ -223,7 +194,6 @@ class MemorySaverHandler:
                 target = current.get(k)
                 if target is not None:
                     target.data.copy_(saved_v, non_blocking=non_blocking)
-        # Restore unregistered tensor attrs
         all_submodules: dict[str, torch.nn.Module] = {}
         for name, m in modules.items():
             for sn, sm in m.named_modules():
@@ -233,8 +203,6 @@ class MemorySaverHandler:
             submod = all_submodules.get(prefix)
             if submod is not None:
                 submod.__dict__[attr_name] = self._move_saved_to_device(saved_value, device, non_blocking=non_blocking)
-
-    # -- release / resume orchestration --------------------------------------
 
     def release(
         self,
@@ -250,21 +218,16 @@ class MemorySaverHandler:
             all_tags = tags if tags is not None else list(_ALL_REGION_TAGS)
             backup_set = set(cpu_backup_tags or [])
 
-            # 1. Clear request-scoped caches (e.g. GLM KV caches)
             self.clear_ephemeral_caches(all_tags)
             t_clear = time.monotonic()
 
-            # 2. Stash state for CPU-backup tags (frozen modules)
-            #    Uses non_blocking copies when pinned memory is enabled.
             for tag in all_tags:
                 if tag in backup_set:
                     self.stash_tag(tag)
-            # Ensure all async GPU→CPU copies complete before vunmap
             if self._pin_cpu_memory:
                 torch.cuda.synchronize()
             t_stash = time.monotonic()
 
-            # 3. Pause each tag (zero-copy since enable_cpu_backup=False)
             for tag in all_tags:
                 self.adapter.pause(tag)
             t_pause = time.monotonic()
@@ -325,17 +288,13 @@ class MemorySaverHandler:
             t_start = time.monotonic()
             tags_to_resume = set(tags) if tags is not None else set(self._paused_tags)
 
-            # 1. Resume all tags (zero-copy remap)
             for tag in tags_to_resume:
                 self.adapter.resume(tag)
             t_resume = time.monotonic()
 
-            # 2. Restore stashed state for CPU-backed tags
-            #    Uses non_blocking copies when pinned memory is enabled.
             for tag in tags_to_resume:
                 if tag in self._cpu_backup_tags:
                     self.restore_tag(tag)
-            # Ensure all async CPU→GPU copies complete before inference
             if self._pin_cpu_memory:
                 torch.cuda.synchronize()
             t_restore = time.monotonic()
@@ -349,7 +308,6 @@ class MemorySaverHandler:
 
             self._paused_tags -= tags_to_resume
             still_sleeping = len(self._paused_tags) > 0
-            # Non-backed tags remain dirty until weight sync
             return {
                 "success": True,
                 "sleeping": still_sleeping,

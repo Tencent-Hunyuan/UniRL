@@ -24,7 +24,6 @@ class OCRRewardScorer(LocalRewardBackend):
     canonical_model_name = "ocr"
 
     def __init__(self, *, config: "OCRSpec", base_device: str) -> None:
-        # base_device unused: paddleocr forces CPU init.
         del base_device
         super().__init__(lang=config.lang)
 
@@ -43,9 +42,6 @@ class OCRRewardScorer(LocalRewardBackend):
 
         import paddle
 
-        # PaddleOCR v3 removed `use_gpu=` and can aggressively reserve GPU memory
-        # during initialization. Force CPU init so colocate mode does not contend
-        # with training/SGLang allocations.
         paddle.set_device("cpu")
         self._ocr_reader = PaddleOCR(
             use_doc_orientation_classify=False,

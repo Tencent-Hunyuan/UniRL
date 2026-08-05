@@ -2,7 +2,7 @@
 
 Turns the policy's ``<tool_call>{...}</tool_call>`` into a tool execution and feeds the result
 back as the next turn's observation, ending the episode when the model stops calling tools (it
-gave a final answer) or ``max_turns`` is hit. See ``unirl/rollout/loop/README.md`` and the
+gave a final answer) or ``max_turns`` is hit. See ``unirl/rollout/env/README.md`` and the
 real-world references it mirrors (relax ``DeepeyesEnv``, slime ``Geo3kEnv``): the loop stays
 mechanical; the *decision* — parse → execute → done — lives here.
 
@@ -21,15 +21,13 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-from unirl.rollout.loop.tools.tool import StatefulTool, Tool
+from unirl.rollout.env.tools.base import StatefulTool, Tool
 from unirl.types.primitives import Texts
 from unirl.types.sample import Primitive, Sample, _part_with_field
 
 logger = logging.getLogger(__name__)
 
-# ``<tool_call>{...}</tool_call>`` — the Hermes/Qwen convention (matches relax/slime/areal).
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-# Opener for a tool call whose ``</tool_call>`` was trimmed by a ``stop`` string mid-generation.
 _TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*(\{)", re.DOTALL)
 
 
@@ -106,7 +104,7 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 class ToolEnvironment:
     """Agentic :class:`Environment`: parse tool calls, run tools, observe results, stop on a final answer.
 
-    Drives :class:`~unirl.rollout.loop.agent_loop.AgentLoop` over a frontier of one-or-more samples
+    Driven by :class:`~unirl.rollout.harness.tool_agent.ToolAgentHarness` over a frontier of one-or-more samples
     (the GRPO group / continuations). :meth:`step` parses each frontier sample's text, executes any
     tool call, and returns a row-aligned observation. The batch's ``done`` is True once **no** sample
     emits a tool call (all gave a final answer) or ``max_turns`` is reached.
@@ -120,8 +118,6 @@ class ToolEnvironment:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool name: {tool.name!r}")
             self._tools[tool.name] = tool
-        # Tools that hold per-trajectory session state (LIN-533); the stateless path skips all
-        # session plumbing whenever this list is empty (zero regression for calculator/search).
         self._stateful_tools: List[StatefulTool] = [t for t in self._tools.values() if isinstance(t, StatefulTool)]
         self.max_turns = max_turns
 
@@ -137,7 +133,7 @@ class ToolEnvironment:
         instance serves many concurrent trajectories on a worker).
 
         Stateful tools (LIN-533): mint a per-trajectory ``session_id`` (``uuid4``) for each
-        :class:`~unirl.rollout.loop.tools.tool.StatefulTool`, call ``session_start`` (cheap — the
+        :class:`~unirl.rollout.env.tools.base.StatefulTool`, call ``session_start`` (cheap — the
         handle opens lazily in :meth:`step`), and stamp the ids into the root Part's *control* bag
         under ``"tool_sessions"`` so :meth:`step`/:meth:`close` recover them position-independently
         across the fork/observe chain. ``uuid4`` avoids collisions between the ``n`` GRPO siblings
@@ -154,8 +150,6 @@ class ToolEnvironment:
             sessions[tool.name] = sid
         control = dict(root.control or {})
         control["tool_sessions"] = sessions
-        # ``_part_with_field`` swaps only ``control`` — preserving the encoded prompt
-        # (``primitives``/``segment``/``metadata``), unlike a ``Part.input`` rebuild.
         return Sample.request(_part_with_field(root, "control", control))
 
     def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
@@ -191,9 +185,6 @@ class ToolEnvironment:
         if (not any_call) or (turn >= self.max_turns):
             return None, True, info
 
-        # Row-aligned observation: the tool result for rows that called a tool; "" placeholder for
-        # rows that already produced a final answer while siblings continue (the n>1 heterogeneous
-        # case — a known follow-up that belongs to the loop/Sample layer, not the environment).
         observation = Texts(texts=[r if r is not None else "" for r in results])
         return observation, False, info
 
@@ -221,9 +212,9 @@ class ToolEnvironment:
     def close(self, sample: Sample) -> None:
         """Guaranteed teardown (LIN-533): end every open tool session for this trajectory.
 
-        The engine calls this from ``_run_one``'s ``finally`` on every path — success, crash, and
-        abort — on the trajectory's own drain thread. Swallows per-session errors so teardown can
-        never destabilize the drain (``_run_one`` must not raise). A no-op for stateless tools /
+        The harness calls this from ``ToolAgentHarness.run``'s ``finally`` on every path — success,
+        crash, and suspension — on the trajectory's own drain thread. Swallows per-session errors
+        so teardown can never destabilize the drain. A no-op for stateless tools /
         sessionless trajectories.
         """
         if not self._stateful_tools:

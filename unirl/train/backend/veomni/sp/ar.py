@@ -69,9 +69,6 @@ def apply_ar_sequence_parallelism(model: nn.Module, sp_size: int) -> None:
     sp_attn_impl = _select_sp_attn_impl()
     _install_b1_dense_attn_patch(sp_attn_impl)
 
-    # Set the SP attn impl on the model config and every sub-config that carries
-    # one (transformers resolves the attention fn per-forward via this field, so
-    # setting it on the already-built model re-dispatches).
     _set_attn_impl(model.config, sp_attn_impl)
     for m in model.modules():
         cfg = getattr(m, "config", None)
@@ -121,8 +118,6 @@ def _install_b1_dense_attn_patch(sp_attn_impl: str) -> None:
         return
 
     _PACK_KEYS = (
-        # Local-length hints to strip for B=1; the last two are alt-spellings
-        # absent from the 5.x signature, popped defensively against renames.
         "position_ids",
         "cu_seq_lens_q",
         "cu_seq_lens_k",
@@ -166,13 +161,13 @@ def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
 
     input_ids = kwargs.get("input_ids")
     inputs_embeds = kwargs.get("inputs_embeds")
-    batch = (inputs_embeds if inputs_embeds is not None else input_ids).shape[0]  # == 1
+    batch = (inputs_embeds if inputs_embeds is not None else input_ids).shape[0]
 
     real_idx = mask2d[0].nonzero(as_tuple=False).flatten()
-    real_start, real_end = int(real_idx[0].item()), int(real_idx[-1].item()) + 1  # real span [real_start, real_end)
+    real_start, real_end = int(real_idx[0].item()), int(real_idx[-1].item()) + 1
     real_len = real_end - real_start
     sp = max(1, int(getattr(ps, "ulysses_size", 1)))
-    padded_len = ((real_len + sp - 1) // sp) * sp  # round up to a multiple of sp
+    padded_len = ((real_len + sp - 1) // sp) * sp
     pad = padded_len - real_len
     ref = input_ids if input_ids is not None else inputs_embeds
     if input_ids is not None:
@@ -187,11 +182,11 @@ def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
         kwargs["inputs_embeds"] = slice_input_tensor(emb, dim=1, group=spg)
     global_pos = torch.arange(padded_len, device=ref.device).unsqueeze(0).expand(batch, padded_len).contiguous()
     kwargs["position_ids"] = slice_input_tensor(global_pos, dim=1, group=spg)
-    kwargs["attention_mask"] = None  # dense causal, pad stripped
+    kwargs["attention_mask"] = None
     kwargs.pop("cache_position", None)
     out = orig(*args, **kwargs)
     hidden = gather_outputs(out.last_hidden_state, gather_dim=1, group=spg)
-    hidden = hidden[:, :real_len, :]  # drop right-pad
+    hidden = hidden[:, :real_len, :]
     padded = hidden.new_zeros((batch, true_len, hidden.shape[-1]))
     padded[:, real_start:real_end, :] = hidden
     out.last_hidden_state = padded
@@ -201,7 +196,6 @@ def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
 def _set_attn_impl(cfg: Any, sp_attn_impl: str) -> None:
     if hasattr(cfg, "_attn_implementation"):
         cfg._attn_implementation = sp_attn_impl
-    # Some HF configs nest a text sub-config (VLMs); set there too if present.
     get_text = getattr(cfg, "get_text_config", None)
     if callable(get_text):
         try:
@@ -234,7 +228,7 @@ def _sp_plain_forward(orig, args, kwargs, true_len, position_ids, spg):
     kwargs.pop("cache_position", None)
     out = orig(*args, **kwargs)
     hidden = gather_outputs(out.last_hidden_state, gather_dim=1, group=spg)
-    if hidden.shape[1] > true_len:  # drop SP divisibility padding
+    if hidden.shape[1] > true_len:
         hidden = hidden[:, :true_len, :]
     out.last_hidden_state = hidden
     return out
@@ -268,7 +262,7 @@ def _wrap_decoder_forward(decoder: nn.Module) -> None:
 
         input_ids = kwargs.get("input_ids")
         inputs_embeds = kwargs.get("inputs_embeds")
-        position_ids = kwargs.get("position_ids")  # captured pre-mutation for the plain path
+        position_ids = kwargs.get("position_ids")
         attention_mask = kwargs.get("attention_mask")
 
         if inputs_embeds is not None:
@@ -276,13 +270,11 @@ def _wrap_decoder_forward(decoder: nn.Module) -> None:
         elif input_ids is not None:
             true_len = input_ids.shape[1]
         else:
-            return orig(*args, **kwargs)  # nothing to slice (decode-style call)
+            return orig(*args, **kwargs)
 
         batch = (inputs_embeds if inputs_embeds is not None else input_ids).shape[0]
         mask2d = attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None
 
-        # B=1 + padding -> dense-span boundary half; anything else -> plain
-        # slice/gather. See the module docstring's two-point-fix note.
         if batch == 1 and mask2d is not None and int(mask2d.sum().item()) < true_len:
             return _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg)
         return _sp_plain_forward(orig, args, kwargs, true_len, position_ids, spg)

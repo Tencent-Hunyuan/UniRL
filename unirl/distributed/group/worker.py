@@ -63,36 +63,25 @@ class Worker:
         self.world_size = world_size
         self.transport_kind = transport_kind or "colocate_store"
 
-        # GPU setup: Ray PlacementGroup sets CUDA_VISIBLE_DEVICES
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
             self.device = "cuda:0"
         else:
             self.device = "cpu"
 
-        # Snapshot recording (UNIRL_MEMSNAP=1) must start in this process; dumps
-        # fire later via Remote.get_memory_stats.
         from unirl.utils.memory_utils import init_process_snapshot_sampler
 
         init_process_snapshot_sampler(rank=nccl_rank if nccl_rank is not None else device_id)
 
         self.worker_id = f"dw{device_id}" if slot == 0 else f"dw{device_id}_s{slot}"
 
-        # Backend dependencies: tw (gpu) is injected after spawn via
-        # set_tensor_worker(); tq_handoff (transfer_queue) arrives here in the
-        # constructor from DevicePool. Both are consumed by build_transport.
         self.tw = None
         self.tq_handoff = tq_handoff
-        # Typed as the base TensorTransport (matches build_transport's return);
-        # _install_transport enforces at runtime that it is a WorkerLocalTransport.
         self.transport: Optional[TensorTransport] = None
 
         self._roles: Dict[str, Remote] = {}
         self._reserved_sockets: Dict[int, socket.socket] = {}
 
-        # colocate + transfer_queue build immediately — their deps are ready at
-        # construction (in-process store / the driver handoff). gpu defers until
-        # DevicePool injects the shared per-GPU TensorWorker via set_tensor_worker().
         if self.transport_kind in ("colocate_store", "colocate", "transfer_queue", "tq"):
             self.build_and_install_transport()
 
@@ -141,8 +130,6 @@ class Worker:
                 world_size=self.world_size,
             )
         )
-        # No return: the transport is not Ray-serializable (holds locks / actor
-        # handles); DevicePool calls this via RPC and must not receive it.
 
     def _install_transport(self, transport: TensorTransport) -> None:
         """Install the Worker's transport as the process backend.
@@ -171,8 +158,6 @@ class Worker:
         if rt is not None:
             rt.reset_zero_copy_buffer_free()
 
-    # ── Port reservation ──
-
     def _reserve_port(self) -> int:
         """Bind a socket to an ephemeral port and hold it open.
 
@@ -192,8 +177,6 @@ class Worker:
         s = self._reserved_sockets.pop(port, None)
         if s:
             s.close()
-
-    # ── Role management ──
 
     def add_remote(
         self, role_name: str, role_cls, rank_info: RankInfo, init_kwargs: dict = None, dist_env: dict = None
@@ -279,8 +262,6 @@ class Worker:
         """Read back rank_info (may have been modified by initialize)."""
         return self._roles[role_name].rank_info
 
-    # ── RPC entry point ──
-
     def call(self, role_name: str, method_name: str, args: tuple, kwargs: dict, grad_mode: bool = False, call_id=None):
         """Generic RPC entry point.
 
@@ -296,8 +277,6 @@ class Worker:
         """
         role = self._roles[role_name]
 
-        # Resolve: collect TensorRef leaves (tree order), batch-fetch, substitute.
-        # Keys are positional indices so get_batch results align with the walk.
         in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
         in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
@@ -309,8 +288,6 @@ class Worker:
         resolved_kwargs = map_tree(kwargs, resolve)
 
         if grad_mode:
-            # Cross-RPC autograd can only propagate gradients back to controller-side
-            # TensorRef inputs recorded by Handle as input_metas.
             tensors = [fetched[str(i)] for i in range(len(in_metas))]
             for t in tensors:
                 t.requires_grad_(True)
@@ -320,10 +297,8 @@ class Worker:
         result = getattr(role, method_name)(*resolved_args, **resolved_kwargs)
 
         if grad_mode:
-            # Save output tensors BEFORE pack so backward can use grad_fn.
             role._grad_outputs[call_id] = collect_leaves(result, Tensor)
 
-        # Pack: collect tensor leaves (tree order), batch-store, substitute metas.
         out_tensors = self._collect(result, Tensor)
         stored = self.transport.put_batch({str(i): t for i, t in enumerate(out_tensors)})
         out_iter = iter(stored[str(i)] for i in range(len(out_tensors)))
@@ -332,8 +307,6 @@ class Worker:
             return next(out_iter) if isinstance(o, Tensor) else o
 
         return map_tree(result, pack)
-
-    # ── Leaf collection ──
 
     def _collect(self, obj, leaf_type) -> list:
         """Collect leaves of leaf_type in the SAME order ``map_tree`` visits them.
@@ -350,8 +323,6 @@ class Worker:
 
         map_tree(obj, visit)
         return out
-
-    # ── Transport relay (the Worker is the transport's addressable proxy) ──
 
     def transport_op(self, method: str, *args, **kwargs):
         """Relay a controller-side call into this Worker's transport.
@@ -374,8 +345,6 @@ class Worker:
         world_size) that the controller does not pass.
         """
         self.transport.setup_transfer(self.nccl_rank, self.world_size)
-
-    # ── Teardown ──
 
     def teardown(self) -> None:
         """Release everything this actor owns. Idempotent, best effort.
@@ -401,8 +370,6 @@ class Worker:
 
         for port in list(getattr(self, "_reserved_sockets", {})):
             self._release_port(port)
-
-    # ── Info queries ──
 
     def get_gpu_count(self) -> int:
         return torch.cuda.device_count() if torch.cuda.is_available() else 0

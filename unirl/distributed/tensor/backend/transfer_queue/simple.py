@@ -45,8 +45,6 @@ class SimpleBackend(Backend):
         self._storage_units: Dict[int, "ActorHandle"] = {}
 
     def bootstrap(self, *, controller_info: Any) -> dict:
-        # Deferred upstream import: schema registration must work without the
-        # transfer_queue runtime lib (compose tests don't need it).
         from transfer_queue import SimpleStorageUnit, get_placement_group, process_zmq_server_info
 
         placement_group = get_placement_group(self._num_units, num_cpus_per_actor=1)
