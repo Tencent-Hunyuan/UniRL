@@ -58,6 +58,7 @@ def fsdp_wrap(
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
+    ac_wrap_order: str = "inside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
     root_wrap: bool = True,
@@ -143,6 +144,36 @@ def fsdp_wrap(
             ),
             check_fn=lambda module: id(module) in block_ids,
         )
+        # Where fully_shard lands relative to the AC wrapper is a real trade-off,
+        # not a style choice — each order fixes one failure mode and has the other:
+        #
+        # * "inside" (fully_shard on the INNER block; FSDP hooks re-run during
+        #   recompute): REQUIRED for models whose blocks run several times in one
+        #   autograd graph (BAGEL replays every diffusion step through the same
+        #   block) — after the first use's post-backward reshard, only a re-entered
+        #   pre-forward hook re-gathers params for the next recompute; without it
+        #   the recompute hits sharded DTensors (mixed Tensor/DTensor mul).
+        #   Failure mode: the gather + mp_policy cast happen inside the region on
+        #   forward but not on recompute, so dtype-branching modules diverge.
+        # * "outside" (fully_shard on the CheckpointWrapper; torchtitan order):
+        #   REQUIRED for single-use blocks with dtype-branching modules (HI3's
+        #   RMSNorm) or data-dependent dispatch (MoE routing): gather/cast stay
+        #   outside the region and both executions see identical param state.
+        #   Failure mode: breaks multi-use blocks as above.
+        if ac_wrap_order == "outside":
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+            wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
+            require(
+                len(wrapped) == len(block_instances),
+                f"fsdp_wrap: expected {len(block_instances)} checkpoint wrappers, found {len(wrapped)}",
+            )
+            block_instances = wrapped
+        else:
+            require(
+                ac_wrap_order == "inside",
+                f"fsdp_wrap: ac_wrap_order must be 'inside' or 'outside', got {ac_wrap_order!r}",
+            )
 
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)

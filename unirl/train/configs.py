@@ -52,6 +52,12 @@ class FSDPConfig:
     fsdp_mode: str = "full"
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
+    # AC/FSDP composition order: "inside" re-runs FSDP hooks during recompute
+    # (required for blocks used multiple times per graph, e.g. BAGEL's per-step
+    # replay); "outside" keeps gather/cast out of the checkpointed region
+    # (required for dtype-branching or MoE blocks, e.g. HunyuanImage3). See
+    # fsdp_wrap for the failure mode of each.
+    ac_wrap_order: str = "inside"
     use_torch_compile: bool = False
     # Defer FSDP2 gradient reduce-scatter only under ZeRO-2.
     defer_grad_sync: bool = False
