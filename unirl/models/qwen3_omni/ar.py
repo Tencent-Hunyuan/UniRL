@@ -312,14 +312,40 @@ def _merge_audio(
     return torch.cat(features, dim=0), torch.cat(masks, dim=0)
 
 
+def _validate_audio_in_video_modes(conditions: Qwen3OmniARConditions, batch_size: int) -> None:
+    """Reject video-only/audio-in-video mixing unsupported by Qwen3-Omni generation."""
+    flags = conditions.use_audio_in_video
+    video_grids = conditions.video_grid_thw
+    if flags is None or video_grids is None:
+        return
+    if len(flags) != batch_size or len(video_grids) != batch_size:
+        raise ValueError(
+            "Qwen3-Omni per-row media conditions must match the text batch size: "
+            f"batch={batch_size}, use_audio_in_video={len(flags)}, video_grid_thw={len(video_grids)}."
+        )
+
+    video_modes = {bool(flags[row]) for row, grid in enumerate(video_grids) if grid is not None}
+    if len(video_modes) > 1:
+        raise ValueError(
+            "Qwen3-Omni does not currently support mixing video-only and audio-in-video rows "
+            "in one batch. Configure the training run uniformly with use_audio_in_video=false "
+            "or use_audio_in_video=true."
+        )
+
+    # TODO(qwen3-omni): Add end-to-end support for training video-only and
+    # audio-in-video rows together. This requires a separate design and parity
+    # validation across generation, model forward, and replay.
+
+
 def _per_sample_rope(
     transformer: Any,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     conditions: Qwen3OmniARConditions,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build TMRoPE positions without applying a batch-wide audio/video flag."""
+    """Build per-row TMRoPE positions for one supported, uniform video mode."""
     batch_size = int(input_ids.shape[0])
+    _validate_audio_in_video_modes(conditions, batch_size)
     device = input_ids.device
     image_grids = conditions.image_grid_thw or [None] * batch_size
     video_grids = conditions.video_grid_thw or [None] * batch_size
