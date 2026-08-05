@@ -159,21 +159,23 @@ class ImageAdapter(ModelAdapter):
         """Sampling scalars + the σ schedule slice.
 
         ``diffusion.sigmas`` is length T+1 (terminal 0 included); SGLang's
-        ``set_timesteps`` wants the interior T. Pass the seed even when
-        ``initial_noise`` pins x_T verbatim: SGLang derives per-step SDE noise
-        deterministically (its ``_make_step_generators``, keyed on
-        ``denoise_seeds``) only when seed is not None — a None seed silently
-        falls back to global RNG.
+        ``set_timesteps`` wants the interior T. When set, pass the seed even
+        when ``initial_noise`` pins x_T verbatim: SGLang derives per-step SDE
+        noise deterministically (its ``_make_step_generators``, keyed on
+        ``denoise_seeds``). When unset, omit the seed so SGLang keeps its global
+        RNG semantics.
         """
-        return {
+        kwargs = {
             "num_inference_steps": int(diffusion.num_inference_steps),
             "guidance_scale": float(diffusion.guidance_scale),
             "height": int(diffusion.height),
             "width": int(diffusion.width),
             "num_frames": int(diffusion.num_frames),
             "sigmas": diffusion.sigmas.detach().cpu().tolist()[:-1],
-            "seed": int(diffusion.seed) if diffusion.seed is not None else 0,
         }
+        if diffusion.seed is not None:
+            kwargs["seed"] = int(diffusion.seed)
+        return kwargs
 
     def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
         require(bool(raw), "build_response: SGLang returned no results")
