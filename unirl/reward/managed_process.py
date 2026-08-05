@@ -121,6 +121,13 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 expected_scorer_version=config.scorer.version,
             )
             super().__init__(config=remote_spec, base_device=base_device)
+            # per_call means "on GPU only while scoring" — including BEFORE the
+            # first score call. The child boots resident (model loaded to CUDA),
+            # so without this initial offload it holds its full footprint through
+            # the whole first generation phase and can OOM a colocated rollout
+            # before any scoring ever happens.
+            if self.process_config.lifecycle == "per_call":
+                self.offload()
         except Exception:
             self._stop_child()
             raise
