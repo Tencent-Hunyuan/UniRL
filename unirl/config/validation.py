@@ -229,8 +229,9 @@ def validate_lora_target_modules(cfg: DictConfig) -> None:
 
         model_cls = load_function(target_dotpath)
     except (ImportError, AttributeError, KeyError, ValueError) as exc:
-        logger.debug(
-            "Could not resolve model class %r for LoRA target lookup: %s",
+        logger.warning(
+            "Could not resolve model class %r for LoRA target lookup: %s; "
+            "falling back to None (SGLang will wrap every linear layer).",
             target_dotpath,
             exc,
         )
