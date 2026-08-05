@@ -1,15 +1,8 @@
 """Envelope for returning one result per TP rank from a worker RPC.
 
-vLLM-Omni's ``collective_rpc`` executes the method on every rank, but only
-rank 0 owns a result queue — the other ranks' return values are dropped. A
-worker method that needs to report per-rank state therefore has to gather it
-itself and hand the whole set back inside rank 0's single reply.
-
-The key lives here, rather than in either side, so it cannot drift between the
-worker process that writes the envelope and the driver-side backend that reads
-it. This module deliberately imports nothing: the worker side already pulls in
-torch and vllm, while ``backends/native.py`` defers its vllm-omni import to keep
-the driver process light, so neither can import the other at module scope.
+``collective_rpc`` runs on every rank but only rank 0's reply survives, so
+per-rank state must be gathered worker-side. Imports nothing: the worker and
+driver processes cannot import each other's modules at module scope.
 """
 
 from __future__ import annotations
@@ -28,14 +21,9 @@ _MAX_TRANSPORT_NESTING = 4
 def unwrap_tp_rank_readbacks(results: Any) -> Any:
     """Strip RPC transport wrappers and return the per-TP-rank list.
 
-    Checks for the envelope *before* each unwrap step, so a reply that is
-    itself a one-element list is returned intact rather than being unwrapped
-    into its only element.
-
-    A payload with no envelope passes through unchanged rather than raising:
-    it then reaches ``_assert_loaded``, whose existing shape check reports it
-    precisely ("expected N TP rank readbacks, got ..."). Failing here instead
-    would replace that message with a less specific one.
+    Checks for the envelope before each unwrap step, so a genuine one-element
+    payload is not unwrapped past itself. A payload with no envelope passes
+    through, leaving ``_assert_loaded`` to report the shape.
     """
     value = results
     for _ in range(_MAX_TRANSPORT_NESTING):

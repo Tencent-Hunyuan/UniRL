@@ -432,25 +432,10 @@ class BucketedIPCReceiveMixin:
     def _diffrl_gather_tp_rank_results(local_result: dict) -> dict:
         """Gather this rank's checksum map into the reply rank 0 sends back.
 
-        ``collective_rpc`` runs the method on every rank but only rank 0's
-        return value survives, so a per-rank readback has to be gathered
-        worker-side. Doing it here keeps vLLM-Omni's control-plane protocol
-        untouched — the driver still receives exactly one reply, it just
-        carries every rank's entry.
-
-        This is a collective, so every rank must reach it — including a rank
-        that has nothing to report. The public entry points below are therefore
-        thin wrappers whose only statement is this call; everything that can
-        bail out early lives in a ``_local_*`` helper that returns ``{}``
-        instead of returning from the RPC. That matters most in exactly the
-        case this read-back exists to catch: when an adapter failed to register
-        on one rank, that rank still joins the gather and contributes ``{}``,
-        and ``_assert_loaded`` then names it —
-
-            [LoRA-SYNC] verify FAILED on ..., stage 1 rank 2:
-            engine returned no loaded LoRA layers.
-
-        — rather than the whole sync hanging on a collective one rank skipped.
+        Collective: every rank must reach it, including one with nothing to report.
+        The two RPC entry points are therefore body-free — anything that can return
+        early lives in a ``_local_*`` helper returning ``{}``, so a rank that bailed
+        out cannot leave its peers blocked in the gather.
         """
         per_rank: list = [local_result]
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -468,10 +453,7 @@ class BucketedIPCReceiveMixin:
         self,
         names: Optional[list] = None,
     ) -> dict:
-        """Per-TP-rank wrapper around :meth:`_diffrl_local_param_checksums`.
-
-        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
-        """
+        """Per-TP-rank wrapper — body-free, see :meth:`_diffrl_gather_tp_rank_results`."""
         return self._diffrl_gather_tp_rank_results(self._diffrl_local_param_checksums(names))
 
     def _diffrl_local_param_checksums(
@@ -521,10 +503,7 @@ class BucketedIPCReceiveMixin:
         adapter_id: int,
         names: Optional[list] = None,
     ) -> dict:
-        """Per-TP-rank wrapper around :meth:`_diffrl_local_lora_checksums`.
-
-        Body-free by design — see :meth:`_diffrl_gather_tp_rank_results`.
-        """
+        """Per-TP-rank wrapper — body-free, see :meth:`_diffrl_gather_tp_rank_results`."""
         return self._diffrl_gather_tp_rank_results(self._diffrl_local_lora_checksums(adapter_id, names))
 
     def _diffrl_local_lora_checksums(
