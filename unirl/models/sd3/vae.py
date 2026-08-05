@@ -121,8 +121,6 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
         if shift_factor is not None:
             z = z - float(shift_factor)
         z = z * scaling_factor
-        # Keep the clean latent fp32: it becomes the supervised target
-        # (``ε - x0``); a bf16 round-trip here is needless precision loss.
         return ImageLatentCondition(latents=z.to(dtype=torch.float32))
 
 

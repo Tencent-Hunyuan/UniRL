@@ -103,12 +103,10 @@ class Qwen3OmniThinkerInputAdapter:
         self.system_instruction = system_instruction
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
 
-        # Reuse the processor and tokenizer across requests.
         from transformers import AutoProcessor, AutoTokenizer
 
         self._processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
-        # Some checkpoints store the chat template separately.
         if getattr(self._tokenizer, "chat_template", None) is None:
             import json
             import os
@@ -130,9 +128,6 @@ class Qwen3OmniThinkerInputAdapter:
         ):
             processor_tokenizer.chat_template = self._tokenizer.chat_template
 
-        # Cached for replay-condition construction by the output adapter. The
-        # engine's _generate_lock encloses build -> generate -> response, so no
-        # second caller can replace this request-local batch in between.
         self._last_encodings: List[Dict[str, Any]] = []
 
     def _multimodal_processor_kwargs(self, *, video_fps: float) -> Dict[str, Any]:
@@ -238,7 +233,6 @@ class Qwen3OmniThinkerInputAdapter:
 
         if video_frames is not None:
             template_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
-        # These fields define the replay-condition wire shape.
         template_kwargs.update(
             add_generation_prompt=True,
             tokenize=True,
@@ -271,7 +265,6 @@ class Qwen3OmniThinkerInputAdapter:
         )
 
         prompts: List[Dict[str, Any]] = []
-        # The output adapter consumes this cache after generation.
         self._last_encodings = []
         for messages in conversations:
             (
@@ -286,7 +279,6 @@ class Qwen3OmniThinkerInputAdapter:
             enc["_unirl_audio_in_video"] = bool(audio_in_video)
             expanded_ids = enc["input_ids"].squeeze(0).tolist()
             if len(expanded_ids) > self.max_prompt_length:
-                # Multimodal token truncation would break feature alignment.
                 if image is not None or video_frames is not None or audio_wave is not None:
                     raise ValueError(
                         f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(expanded_ids)} tokens, "
@@ -315,8 +307,6 @@ class Qwen3OmniThinkerInputAdapter:
             if media:
                 entry["multi_modal_data"] = media
             if image is not None or video_frames is not None or audio_wave is not None:
-                # Keep this request-local: globally enabling audio-in-video
-                # breaks vLLM's video-only dummy profiling during engine boot.
                 mm_processor_kwargs: Dict[str, Any] = {"truncation": True}
                 if video_frames is not None:
                     mm_processor_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
@@ -353,9 +343,6 @@ class Qwen3OmniThinkerInputAdapter:
         if stop_token_id is not None:
             base_sampling_kwargs["stop_token_ids"] = [int(stop_token_id)]
 
-        # Keep seed unset: AsyncOmniEngine.add_request receives each prompt as an
-        # independent request, and patch_per_request_ar_seed clones the shared
-        # SamplingParams with a fresh seed for every request.
         return [
             GenerateCall(
                 prompts=prompts,
@@ -395,7 +382,6 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
         if pad_id is None:
             pad_id = self._input_adapter._tokenizer.eos_token_id or 0
 
-        # Right-pad token tensors to the batch maximum.
         raw_ids = [e["input_ids"].squeeze(0) for e in encs]
         raw_masks = [e["attention_mask"].squeeze(0) for e in encs]
         max_len = int(max(t.shape[-1] for t in raw_ids))
@@ -477,14 +463,11 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
             f"Qwen3OmniThinkerOutputAdapter: result count {len(per_request)} "
             f"!= frontier id count {len(frontier.sample_ids)}",
         )
-        # Missing stage outputs are infrastructure failures, not valid empty
-        # assistant turns. Validate before any best-effort helper runs.
         for group in per_request:
             self._stage0(group)
 
         segment = self.build_segment(sample, per_request)
         if segment is None:
-            # A present stage may legitimately finish without an emitted token.
             empty = [torch.zeros(0, dtype=torch.long) for _ in per_request]
             empty_logp = [torch.zeros(0, dtype=torch.float32) for _ in per_request]
             segment = TextSegment.pack(tokens=empty, log_probs=empty_logp)
@@ -504,8 +487,6 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
 class Qwen3OmniThinkerAdapter(ModelAdapter):
     """Qwen3-Omni Thinker — text/video → AR text (single stage, TP>1, LoRA)."""
 
-    # TODO: This anchored AR topology is temporarily migrated from unified
-    # models; replace these knobs with formal TP/DP/PP support.
     stage_yaml = "qwen3_omni_thinker_only_rl_1x4.yaml"
     stage_yaml_source = "local"
     omni_mode = None
@@ -580,8 +561,6 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
 
     def validate_request(self, sample: Sample) -> None:
         sample.frontier_gen_part(ARSamplingParams)
-        # Rendering is the single validation source for supported modalities,
-        # frontier alignment, and the one-video contract.
         conversations = build_omni_messages(sample.turns())
         require(bool(conversations), f"modality={self.modality!r} requires conditioning turns.")
 

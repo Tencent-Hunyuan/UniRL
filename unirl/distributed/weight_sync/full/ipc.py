@@ -49,8 +49,6 @@ class IPCWeightSync(FullWeightSync):
         track_prefix: str = "",
         wire_dtype: Any = None,
     ) -> None:
-        # 2048 MB default: the buffer must fit the largest single tensor in one
-        # bucket (BucketedWeightSender asserts this).
         super().__init__(
             backend=backend,
             bucket_size_mb=bucket_size_mb,
@@ -86,7 +84,6 @@ class IPCWeightSync(FullWeightSync):
 
         replica_rank = self._my_rank  # distinct per colocate engine → unique socket
 
-        # Discover stages from the engine (TP-per-stage map). SD3 → {0: 1}.
         try:
             tp_per_stage = {int(stage_id): int(tp_size) for stage_id, tp_size in self._rollout.tp_per_stage().items()}
         except (AttributeError, NotImplementedError):
@@ -104,7 +101,6 @@ class IPCWeightSync(FullWeightSync):
         recv_error: dict = {}
 
         def _spawn_receivers() -> None:
-            # Engine fans to every stage's Omni worker; each parks on its socket.
             try:
                 self._rollout.update_weights_from_ipc(
                     peft_config=None,
@@ -120,8 +116,6 @@ class IPCWeightSync(FullWeightSync):
         thread.start()
         try:
             for sid in stage_ids:
-                # TP=1 → one receiver per stage at local_rank 0. A fresh
-                # generator per stage (each stage receives the full state dict).
                 handle = zmq_handle(replica_rank=replica_rank, stage_id=int(sid), local_rank=0)
                 sender = BucketedWeightSender(
                     zmq_handle=handle,

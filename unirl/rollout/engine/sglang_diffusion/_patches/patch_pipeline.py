@@ -41,8 +41,6 @@ def patch_pipeline() -> None:
         return
 
     def forward_batch(self, batches, server_args):
-        # Grouped path (len>1) skips the residency-manager setup that `forward`
-        # does; mirror it so executor.execute_group_with_profiling has a manager.
         if len(batches) > 1:
             self.component_residency_manager = get_global_component_residency_manager(self, server_args)
             self.executor.component_residency_manager = self.component_residency_manager
@@ -51,12 +49,6 @@ def patch_pipeline() -> None:
     forward_batch._unirl_grouped_residency = True  # type: ignore[attr-defined]
     ComposedPipelineBase.forward_batch = forward_batch
 
-    # The grouped executor passes a LIST of batches to the residency hook, but
-    # ComponentResidencyManager.begin_request reads ``batch.is_warmup`` (a single
-    # Req) -> ``'list' object has no attribute 'is_warmup'``. All grouped batches
-    # share is_warmup (same request group), and before_stage/after_stage don't
-    # touch batch, so unwrap to a representative batch[0]. AROUND-wrap the base
-    # PipelineExecutor hook so all executor subclasses inherit it.
     from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
         PipelineExecutor,
     )

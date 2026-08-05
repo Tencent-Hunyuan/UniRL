@@ -61,9 +61,6 @@ def patch_set_timesteps() -> None:
         mu=None,
         timesteps=None,
     ):
-        # External (driver-pinned) sigmas are already the final schedule.
-        # Neutralize whichever schedule-mutation paths the scheduler is
-        # configured for so the driver's sigmas pass through unchanged.
         if sigmas is None:
             return orig(
                 self,
@@ -81,14 +78,8 @@ def patch_set_timesteps() -> None:
         try:
             self.set_shift(1.0)
             if stretches:
-                # Identity instance-binding shadows the class method for this
-                # call only; the driver already baked the terminal stretch in.
                 self.stretch_shift_to_terminal = lambda t: t
             if dynamic:
-                # Same identity-shadow trick for the mu-shift: correct for BOTH
-                # exponential and linear time_shift_type (mu=0.0 was the identity
-                # only for exponential and would zero the schedule under linear).
-                # The driver already baked μ into the sigmas.
                 self.time_shift = lambda mu, sigma, t: t
             return orig(
                 self,

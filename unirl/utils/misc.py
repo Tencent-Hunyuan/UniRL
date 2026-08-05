@@ -75,7 +75,6 @@ def set_seed(seed: Optional[int]) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        # For deterministic behavior (may impact performance)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     # warn_only lets non-deterministic ops fall back gracefully instead of hard-failing.
@@ -107,7 +106,6 @@ def configure_logger(
         handlers=handlers,
     )
 
-    # Reduce verbosity of some libraries
     logging.getLogger("ray").setLevel(logging.WARNING)
     logging.getLogger("torch").setLevel(logging.WARNING)
 

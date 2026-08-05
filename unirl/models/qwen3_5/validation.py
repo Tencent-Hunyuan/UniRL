@@ -95,10 +95,7 @@ def validate_qwen3_5_training_contract(
             reason=f"GDN sequence parallelism (sp_size={sp_size})",
         )
 
-    # TokenBudgetPlanner only changes CPU-side micro-batch grouping for UniRL's
-    # dense replay path; it does not enable Transformers padding_free / THD packed
-    # attention. Keep the >=5.9 guard only for true VeOmni sequence parallelism
-    # above, where Qwen3.5 GDN sequence-parallel kernels have a validated floor.
+    # Token budgeting does not enable packed attention or sequence-parallel kernels.
     micro_planner_target = _target(_get(stack_cfg, "micro_planner", {}))
     require(
         not micro_planner_target.endswith(".TokenBudgetPlanner") or sp_size == 1,

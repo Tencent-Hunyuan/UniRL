@@ -93,12 +93,6 @@ def build_optimizer(
         if backend_optimizer is not None:
             return backend_optimizer
 
-    # ``foreach=False`` disables the multi-tensor kernel path. Required whenever
-    # the param list mixes regular ``torch.Tensor`` (non-FSDP-wrapped sub-modules
-    # — e.g. SD3's embed/norm layers when only transformer blocks are
-    # ``fully_shard``-wrapped) with ``DTensor`` (FSDP-wrapped block params):
-    # ``_foreach_lerp_`` rejects the mixed bag and trips ``RuntimeError: got mixed
-    # torch.Tensor and DTensor``. Single-tensor kernels handle each independently.
     adam_kwargs = dict(
         betas=(float(config.adam_beta1), float(config.adam_beta2)),
         eps=float(config.adam_epsilon),

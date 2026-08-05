@@ -78,27 +78,23 @@ def flash_attn_varlen_func(
     q_off = 0
     k_off = 0
     for lq, lk in zip(q_lens, k_lens):
-        qi = q[q_off : q_off + lq]  # (lq, num_heads, head_dim)
-        ki = k[k_off : k_off + lk]  # (lk, num_kv_heads, head_dim)
+        qi = q[q_off : q_off + lq]
+        ki = k[k_off : k_off + lk]
         vi = v[k_off : k_off + lk]
 
-        if n_rep > 1:  # GQA: expand KV heads to match query heads (contiguous grouping)
-            ki = ki.repeat_interleave(n_rep, dim=1)  # -> (lk, num_heads, head_dim)
+        if n_rep > 1:
+            ki = ki.repeat_interleave(n_rep, dim=1)
             vi = vi.repeat_interleave(n_rep, dim=1)
 
-        # SDPA expects (batch, num_heads, seq, head_dim).
-        qh = qi.transpose(0, 1).unsqueeze(0)  # (1, num_heads, lq, head_dim)
+        qh = qi.transpose(0, 1).unsqueeze(0)
         kh = ki.transpose(0, 1).unsqueeze(0)
         vh = vi.transpose(0, 1).unsqueeze(0)
 
         attn_mask = None
         if causal:
-            # Bottom-right alignment: query i (0..lq) attends key j (0..lk) iff
-            # j <= i + (lk - lq). lq==lk -> usual lower-triangular; decode (lq=1,lk=N)
-            # -> all N keys visible. Every row keeps >=1 key (lk>=lq here), so no
-            # all-masked row / NaN. Bool mask: True = attend.
-            qi_idx = torch.arange(lq, device=q.device).unsqueeze(1)  # (lq, 1)
-            ki_idx = torch.arange(lk, device=q.device).unsqueeze(0)  # (1, lk)
+            # Use bottom-right causal masking so decode rows see all prior keys.
+            qi_idx = torch.arange(lq, device=q.device).unsqueeze(1)
+            ki_idx = torch.arange(lk, device=q.device).unsqueeze(0)
             attn_mask = ki_idx <= (qi_idx + (lk - lq))
 
         oi = scaled_dot_product_attention(
@@ -108,8 +104,8 @@ def flash_attn_varlen_func(
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             scale=softmax_scale,
-        )  # (1, num_heads, lq, head_dim)
-        out[q_off : q_off + lq] = oi.squeeze(0).transpose(0, 1)  # (lq, num_heads, head_dim)
+        )
+        out[q_off : q_off + lq] = oi.squeeze(0).transpose(0, 1)
         q_off += lq
         k_off += lk
 

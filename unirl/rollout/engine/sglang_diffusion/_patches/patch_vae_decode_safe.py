@@ -24,8 +24,6 @@ import torch
 
 
 def patch_vae_decode_safe() -> None:
-    # DIFFRL_DISABLE_CUDNN is the legacy (pre-rename) name; the fleet venv
-    # sitecustomize.py paired with PR #285 still sets it -- accept both.
     if os.environ.get("UNIRL_DISABLE_CUDNN") != "1" and os.environ.get("DIFFRL_DISABLE_CUDNN") != "1":
         return
 

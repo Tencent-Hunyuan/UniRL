@@ -53,11 +53,6 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
-# Wire mapping — pure, module-level (CPU-testable without sglang)
-# ---------------------------------------------------------------------------
-
-#: /generate payload keys that map 1:1 onto ``Engine.async_generate`` kwargs.
 _GENERATE_PASSTHROUGH = (
     "input_ids",
     "sampling_params",
@@ -85,11 +80,6 @@ def payload_to_generate_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-# ---------------------------------------------------------------------------
-# Lazy runtime import — the only place sglang is named (once per process)
-# ---------------------------------------------------------------------------
-
-
 def _import_sglang_engine() -> Dict[str, Any]:
     """Lazy import of the Engine entrypoint + the io_struct request types.
 
@@ -112,11 +102,6 @@ def _import_sglang_engine() -> Dict[str, Any]:
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
-
-
-# ---------------------------------------------------------------------------
-# LoopThread — the serve/park lifecycle over SGLang's own engine.loop
-# ---------------------------------------------------------------------------
 
 
 class LoopThread:
@@ -153,7 +138,7 @@ class LoopThread:
 
     def _ensure_serving_locked(self) -> None:
         if self._thread is not None and not self._thread.is_alive():
-            self._thread.join()  # loop died (run_forever raised); restart below
+            self._thread.join()
             self._thread = None
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop.run_forever, name=f"{self._label} loop", daemon=True)
@@ -231,11 +216,6 @@ class LoopThread:
                 finalizer()
 
 
-# ---------------------------------------------------------------------------
-# The backend
-# ---------------------------------------------------------------------------
-
-
 class NativeBackend:
     """The native ``Backend`` impl over an in-process ``sglang.Engine``."""
 
@@ -250,17 +230,8 @@ class NativeBackend:
         self._concurrency = int(concurrency)
         self._rt = runtime
         self._logged_first_response = False
-        # The backend owns the serve/park lifecycle of engine.loop, so the
-        # rollout engine never handles a raw event loop or thread.
         self._lt = LoopThread(engine.loop, label="sglang NativeBackend")
-        # One semaphore bounding concurrent in-flight requests across ALL callers
-        # (3.12 binds it to engine.loop on first use — every coroutine runs
-        # there, so the bound spans concurrent trajectory threads too).
         self._sem = asyncio.Semaphore(int(concurrency))
-
-    # ------------------------------------------------------------------ #
-    # Boot — the only place the sglang import / spawn / env quarantine live
-    # ------------------------------------------------------------------ #
 
     @classmethod
     def boot(
@@ -293,17 +264,8 @@ class NativeBackend:
                 "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
                 "use backend='http' for rollout TP/EP."
             )
-        # The Engine entrypoint defaults log_level to "error" (the HTTP
-        # server path runs at "info") — restore parity so scheduler logs and
-        # this module's post-init lines stay visible. Intent overrides win.
         engine_kwargs.setdefault("log_level", "info")
 
-        # --- Env quarantine: the HTTP impl's block minus the no_proxy
-        # whitelist (no HTTP warmup self-check to misroute). The rest is
-        # unchanged because the schedulers are still subprocesses.
-
-        # CUDA-IPC tensor sync requires the non-expandable allocator on older
-        # kernels (<5.10) that lack pidfd_getfd; matches PE rollout_actor.py.
         try:
             import torch
 
@@ -311,10 +273,6 @@ class NativeBackend:
         except Exception:
             pass
 
-        # NCCL transport defaults — required for cross-process NCCL groups
-        # used by weight sync to establish P2P/CUMEM channels. sglang's
-        # _set_envs_and_config() defaults these to "0" when enable_symm_mem
-        # is False, breaking broadcast with "Cuda failure 'invalid argument'".
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 
@@ -325,14 +283,9 @@ class NativeBackend:
             engine_kwargs.get("nccl_port"),
         )
 
-        # ``set_start_method`` is process-global; matches the HTTP impl so
-        # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        # Bind-mapping gate twin: the settled ServerArgs must echo the
-        # reserved ports verbatim — a runtime upgrade that silently re-settles
-        # them shows up here.
         settled = getattr(engine, "server_args", None)
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
@@ -340,11 +293,6 @@ class NativeBackend:
             getattr(settled, "nccl_port", None),
         )
         return cls(engine, concurrency=concurrency, runtime=rt)
-
-    # ------------------------------------------------------------------ #
-    # Generation — thread-safe concurrent submission onto engine.loop (no
-    # retry; see module docstring)
-    # ------------------------------------------------------------------ #
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[Any]:
         """Generate the payloads on engine.loop; flatten prompt-major.
@@ -404,10 +352,6 @@ class NativeBackend:
                 raise item
         return [item for sublist in nested for item in sublist]
 
-    # ------------------------------------------------------------------ #
-    # Abort / pause — best-effort controls, bounded-wait while serving.
-    # ------------------------------------------------------------------ #
-
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
         self._lt.run_control(self._aabort(abort_all=abort_all, rid=rid))
 
@@ -448,10 +392,6 @@ class NativeBackend:
         if asyncio.iscoroutine(res):
             await res
 
-    # ------------------------------------------------------------------ #
-    # Result normalization — the native twin of _check_update_response
-    # ------------------------------------------------------------------ #
-
     @staticmethod
     def _check_result(result: Any, operation: str) -> None:
         """Raise on failure; absent success means ok (HTTP-checker parity).
@@ -475,10 +415,6 @@ class NativeBackend:
     def _require_alive(self, operation: str) -> None:
         if self._engine is None:
             raise RuntimeError(f"Cannot {operation}: native sglang engine is shut down.")
-
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
 
     def flush_cache(self) -> None:
         """Flush the sglang scheduler cache; retry until it succeeds.
@@ -530,8 +466,6 @@ class NativeBackend:
             pids = self._engine.get_all_child_pids()
             for pid in pids:
                 os.kill(pid, 0)
-            # An empty pid list after a successful boot means the children
-            # are gone.
             return bool(pids)
         except Exception:
             return False
@@ -554,11 +488,6 @@ class NativeBackend:
             engine.shutdown()
 
         self._lt.close(finalizer=_shutdown)
-
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs — public Engine methods where signatures match;
-    # io_struct + tokenizer_manager for the pre-serialized payloads
-    # ------------------------------------------------------------------ #
 
     def update_from_tensor(
         self,

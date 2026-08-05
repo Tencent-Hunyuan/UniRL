@@ -34,26 +34,16 @@ class RLBagelPipeline(BagelPipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Trajectory-capturing SDE scheduler; generate_image reads it via self.scheduler.
         self._sde_scheduler = BagelFlowSDEScheduler()
         self._sde_scheduler_installed = False
         self._noise_tap_installed = False
         self._generate_image_tap_installed = False
         self._rope_fp32_patched = False
         self._rmsnorm_fp32_patched = False
-        # Per-request x_T hand-off: armed every request, consumed once by the
-        # prepare_vae_latent tap. None = upstream RNG draw fires.
         self._pending_initial_noise: Optional[torch.Tensor] = None
-        # Packed t2i group size (num_outputs_per_prompt). 1 = plain bs=1 path.
         self._pending_spp: int = 1
-        # generate_image tap stash: spp per-image latents for batched VAE decode.
         self._pending_batched_latents: Optional[list] = None
-        # Stored trajectory dtype (matches trainside trajectory_precision).
         self._trajectory_dtype: torch.dtype = torch.float32
-
-    # ------------------------------------------------------------------ #
-    # install — once per pipeline lifetime, idempotent
-    # ------------------------------------------------------------------ #
 
     def _install_sde_scheduler(self) -> None:
         """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always
@@ -88,7 +78,6 @@ class RLBagelPipeline(BagelPipeline):
             position_ids_expanded = position_ids[:, None, :].float()
             device_type = x.device.type
             device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-            # Force fp32 for the matmul + trig (autocast off), like vendored Qwen2RotaryEmbedding.
             with torch.autocast(device_type=device_type, enabled=False):
                 freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
                 emb = torch.cat((freqs, freqs), dim=-1)
@@ -96,8 +85,6 @@ class RLBagelPipeline(BagelPipeline):
                 sin = emb.sin()
             cos = cos * rotary.attention_scaling
             sin = sin * rotary.attention_scaling
-            # Return fp32 (not bf16): keeps q/k fp32 through rotary_op so the rotated
-            # q/k match trainside (the attention forward downcasts to bf16 itself).
             return cos.to(dtype=torch.float32), sin.to(dtype=torch.float32)
 
         rotary.forward = fp32_forward  # type: ignore[assignment]
@@ -123,16 +110,12 @@ class RLBagelPipeline(BagelPipeline):
             orig = module.forward
 
             def fp32_forward(x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-                # Fused add-then-norm isn't on the gen velocity path; defer to the
-                # original kernel to keep its contract.
                 if residual is not None:
                     return orig(x, residual)
                 input_dtype = x.dtype
                 h = x.to(torch.float32)
                 variance = h.pow(2).mean(-1, keepdim=True)
                 h = h * torch.rsqrt(variance + eps)
-                # Literal Qwen2RMSNorm: weight in native dtype, multiply promotes
-                # when h.to(input_dtype) is fp32 (the gen q/k path).
                 return module.weight * h.to(input_dtype)
 
             return fp32_forward
@@ -158,9 +141,6 @@ class RLBagelPipeline(BagelPipeline):
 
         def tapped(*args: Any, **kw: Any) -> Any:
             spp = pipeline_self._pending_spp
-            # Grouped t2i: replicate the single prompt's KV span ``spp``× so
-            # ``prepare_input`` builds ``spp`` packed image blocks (each attends
-            # its own copy of the shared prompt KV). Upstream calls with keywords.
             if spp > 1 and "image_sizes" in kw and len(kw["image_sizes"]) == 1:
                 kw = dict(kw)
                 kw["image_sizes"] = list(kw["image_sizes"]) * spp
@@ -175,9 +155,6 @@ class RLBagelPipeline(BagelPipeline):
                     raise RuntimeError(
                         "RLBagelPipeline noise tap: prepare_vae_latent returned no 'packed_init_noises' to override."
                     )
-                # Driver x_T is [spp, seq, C] (grouped span) or [1, seq, C]; BAGEL's
-                # packed_init_noises is unbatched [spp*seq, C] (spp==1 → [seq, C]).
-                # Flatten the leading batch dim into the packed token dim.
                 if noise.dim() == ref.dim() + 1:
                     noise = noise.reshape(-1, noise.shape[-1]) if noise.shape[0] > 1 else noise.squeeze(0)
                 if tuple(noise.shape) != tuple(ref.shape):
@@ -188,7 +165,6 @@ class RLBagelPipeline(BagelPipeline):
                         "init_noise_latent_shape (bagel_latent_shape) vs the "
                         "request's height/width."
                     )
-                # Match the worker draw's dtype/device (upstream moves to device after).
                 out["packed_init_noises"] = noise.to(dtype=ref.dtype, device=ref.device)
             return out
 
@@ -235,16 +211,11 @@ class RLBagelPipeline(BagelPipeline):
                 kwargs = pipeline._replicate_prompt_kv(kwargs, spp, merge_kv_caches)
             result = original_generate_image(*args, **kwargs)
             if spp > 1:
-                # result[0]: List[Tensor], one latent per packed image.
                 pipeline._pending_batched_latents = list(result[0])
             return result
 
         self.bagel.generate_image = generate_image_grouped  # type: ignore[assignment]
         self._generate_image_tap_installed = True
-
-    # ------------------------------------------------------------------ #
-    # arm — every request (stale-leak guards)
-    # ------------------------------------------------------------------ #
 
     def _arm_sde(self, req: OmniDiffusionRequest, image_token_sizes: Optional[list] = None) -> None:
         """This request's SDE strength + sparse step gate + σ_max + storage dtype."""
@@ -257,8 +228,6 @@ class RLBagelPipeline(BagelPipeline):
             if traj_dtype_name
             else self._trajectory_dtype
         )
-        # σ_max (trainside schedule[1]): load-bearing for the first SDE step's
-        # std_dev_t clamp — must match trainside or the ratio drifts off 1.
         sigma_max = extra.get("sigma_max")
         self._sde_scheduler.set_for_request(
             eta=eta,
@@ -272,18 +241,10 @@ class RLBagelPipeline(BagelPipeline):
         """This request's driver-authored x_T (batch slice or recipe row)."""
         self._pending_initial_noise = resolve_request_noise(req, caller="RLBagelPipeline._arm_initial_noise")
 
-    # ------------------------------------------------------------------ #
-    # harvest — export onto the wire
-    # ------------------------------------------------------------------ #
-
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         """Overwrite upstream's trajectory capture with the SDE scheduler's — sets
         latents/timesteps/log_probs + sparse sde_step_indices (the build_image_segment wire)."""
         drain_trajectory_into(out, self._sde_scheduler)
-
-    # ------------------------------------------------------------------ #
-    # the protocol
-    # ------------------------------------------------------------------ #
 
     def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
         """Packed DiT batching: pure text→image at cfg=1 only.
@@ -307,16 +268,12 @@ class RLBagelPipeline(BagelPipeline):
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
         self._install_noise_tap()
-        # fp32 RoPE + RMSNorm: bit-match the trainside forward so the rollout↔replay
-        # log-prob ratio stays ≈ 1 (see the install methods).
         self._install_rope_fp32()
         self._install_rmsnorm_fp32()
 
         spp = getattr(req.sampling_params, "num_outputs_per_prompt", 1)
         if spp > 1:
             if not self._is_batchable_t2i(req):
-                # Adapter should keep sample-level requests when packing is off;
-                # refuse the broken "num_outputs>1 on the single-image path".
                 raise RuntimeError(
                     f"RLBagelPipeline: num_outputs_per_prompt={spp} requires pure t2i "
                     f"with cfg_text_scale<=1 and cfg_img_scale<=1 present in "
@@ -329,8 +286,6 @@ class RLBagelPipeline(BagelPipeline):
         self._arm_sde(req)
         self._arm_initial_noise(req)
 
-        # Delegate the full pipeline to upstream; the noise tap fires inside and the
-        # scheduler captures the trajectory as the loop runs.
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
@@ -346,19 +301,18 @@ class RLBagelPipeline(BagelPipeline):
         ds = int(self.bagel.latent_downsample)
         per = (int(req.sampling_params.height) // ds) * (int(req.sampling_params.width) // ds)
         self._arm_sde(req, image_token_sizes=[per] * spp)
-        self._arm_initial_noise(req)  # [spp, seq, C] grouped span
+        self._arm_initial_noise(req)
         self._pending_spp = spp
         self._pending_batched_latents = None
         try:
-            out = super().forward(req, **kwargs)  # taps expand single→spp
-            self._harvest_trajectory(out)  # trajectory_latents = [spp, T+1, seq, C]
+            out = super().forward(req, **kwargs)
+            self._harvest_trajectory(out)
             lats = self._pending_batched_latents
             if not lats or len(lats) != spp:
                 raise RuntimeError(
                     f"RLBagelPipeline batched forward: generate_image tap captured "
                     f"{0 if not lats else len(lats)} latents, expected spp={spp}."
                 )
-            # Reuse upstream PIL for latents[0] — avoid a second VAE decode + D2H.
             first = None
             raw = out.output
             if isinstance(raw, dict):

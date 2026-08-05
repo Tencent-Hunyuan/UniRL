@@ -240,10 +240,6 @@ class HunyuanImage3Pipeline(Pipeline):
             f"expected one of 't2t', 'i2t', 't2i', 'it2i', 't2ti'."
         )
 
-    # ------------------------------------------------------------------
-    # Helpers shared by multiple modes.
-    # ------------------------------------------------------------------
-
     def _detokenize_text_segment(self, text_seg, *, skip_special_tokens: bool = True) -> Texts:
         """Detokenize a varlen ``TextSegment`` back into a ``Texts`` primitive.
 
@@ -272,9 +268,6 @@ class HunyuanImage3Pipeline(Pipeline):
             a = int(text_seg.cu_seqlens[k].item())
             b = int(text_seg.cu_seqlens[k + 1].item())
             ids = text_seg.tokens[a:b].tolist()
-            # clean_up_tokenization_spaces=False: the HunyuanImage3 BPE tokenizer
-            # warns that the WordPiece-oriented cleanup is destructive for BPE
-            # (inserts spaces between characters) — disable it for coherent text.
             out.append(
                 tokenizer.decode(ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
             )

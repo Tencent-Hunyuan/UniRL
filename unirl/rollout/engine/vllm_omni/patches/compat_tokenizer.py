@@ -67,7 +67,7 @@ def install() -> None:
         if method is None:
             continue
         if getattr(method, "_unirl_none_filter", False):
-            continue  # already patched
+            continue
 
         original = method
 
@@ -83,14 +83,8 @@ def install() -> None:
     _INSTALLED = True
 
 
-# Module-import side effect: fires when vllm-omni's worker subprocess
-# imports this module to resolve the ``HI3ARWorkerExtension`` qualname.
-# Idempotent via the ``_INSTALLED`` guard, so re-imports are safe.
 install()
 
-# Side-effect: install the HI3-specific MoE-LoRA compat patch needed when
-# ``enable_lora=true`` on the AR stage. Importing the module fires its
-# ``install()``; the patch is idempotent and a no-op if vllm isn't loaded.
 from unirl.rollout.engine.vllm_omni.patches import compat_hi3_lora as _hi3_lora_compat  # noqa: F401, E402
 
 

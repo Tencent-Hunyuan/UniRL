@@ -79,11 +79,10 @@ class QwenImagePipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        # No default text-embed stage without a loaded text encoder
-        # (load_text_encoder=False — separate-engine recipes' trainer side).
         if text_embed is None and bundle.text_encoder is not None:
             text_embed = QwenImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
         self.text_embed = text_embed
@@ -95,16 +94,10 @@ class QwenImagePipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else QwenImageVAEDecodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine
-        # (TrainsideRolloutEngine / VLLMOmniRolloutEngine /
-        # SGLangDiffusionRolloutEngine) can read it when constructing the
-        # FlowMatchSchedulePolicy at startup. For Qwen-Image, the
-        # checkpoint's scheduler_config.json enables dynamic shifting,
-        # so the static ``shift`` value is only used as a fallback when
-        # the pretrained path is not a local directory.
         self.shift = shift
 
     def build_schedule_policy(self):
@@ -158,7 +151,7 @@ class QwenImagePipeline(Pipeline):
         """
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
-        vae_scale_factor = 8  # AutoencoderKLQwenImage canonical
+        vae_scale_factor = 8
         latent_h = 2 * (height // (vae_scale_factor * 2))
         latent_w = 2 * (width // (vae_scale_factor * 2))
         return (16, latent_h, latent_w)
@@ -178,8 +171,6 @@ class QwenImagePipeline(Pipeline):
         from ``cfg.sampling.sde_strategy``.
         """
         bundle = QwenImageBundle.from_config(config)
-        # load_text_encoder=False (separate-engine recipes): no trainer-side TE —
-        # prompts are encoded engine-side and conditions arrive captured.
         text_embed = (
             QwenImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
             if bundle.text_encoder is not None
@@ -193,6 +184,7 @@ class QwenImagePipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = QwenImageVAEDecodeStage(bundle)
         return cls(
@@ -276,8 +268,6 @@ class QwenImagePipeline(Pipeline):
         qwen_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
@@ -285,9 +275,6 @@ class QwenImagePipeline(Pipeline):
         )
         images = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay: Part.conditions is the train stack's source (FlowGRPO re-types them
-        # via conditions_cls.from_dict in prepare_segment / compute_loss_and_backward).
         filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=qwen_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

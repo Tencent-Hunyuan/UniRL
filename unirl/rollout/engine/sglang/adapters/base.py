@@ -29,10 +29,6 @@ from unirl.rollout.engine.sglang.backends import RawResult
 from unirl.rollout.engine.sglang.utils import ResolvedSampling
 from unirl.types.sample import Sample
 
-# --------------------------------------------------------------------------- #
-# Registry
-# --------------------------------------------------------------------------- #
-
 _REGISTRY: Dict[str, type["ModelAdapter"]] = {}
 
 
@@ -62,11 +58,6 @@ def get_adapter(key: str) -> type["ModelAdapter"]:
 
 def registered_adapters() -> Tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
-
-
-# --------------------------------------------------------------------------- #
-# The build_inputs → build_response thread
-# --------------------------------------------------------------------------- #
 
 
 @dataclass
@@ -108,11 +99,6 @@ class PreparedInputs:
     mm: Optional[List[MMEncoding]] = None
 
 
-# --------------------------------------------------------------------------- #
-# ABC
-# --------------------------------------------------------------------------- #
-
-
 class ModelAdapter(ABC):
     """Thin ABC: registry key + boilerplate defaults + the two conversion seams.
 
@@ -137,7 +123,6 @@ class ModelAdapter(ABC):
         self._processor = processor
         self.validate()
 
-    # ---- model-specific ServerArgs extras (override hook; default none) ----
     def boot_kwargs(self) -> Dict[str, Any]:
         """Extra SGLang ServerArgs intent a model needs beyond the generic set.
 
@@ -147,7 +132,6 @@ class ModelAdapter(ABC):
         """
         return {}
 
-    # ---- validation ----
     def validate(self) -> None:
         require(
             bool(getattr(self.cfg, "pretrained_model_ckpt_path", "")),
@@ -158,13 +142,10 @@ class ModelAdapter(ABC):
             f"{type(self).__name__} requires a tokenizer",
         )
 
-    # ---- tokenizer-derived helpers ----
     def pad_token_id(self) -> int:
-        # External boundary: HF tokenizers are duck-typed (pad/eos optional).
         pad = getattr(self._tokenizer, "pad_token_id", None) or getattr(self._tokenizer, "eos_token_id", None)
         return int(pad) if pad is not None else 0
 
-    # ---- the two conversion seams the engine drives ----
     @abstractmethod
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
         """Translate a request ``Sample`` into per-prompt SRT ``/generate`` payloads."""

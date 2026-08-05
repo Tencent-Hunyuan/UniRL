@@ -28,8 +28,6 @@ from unirl.distributed.tensor.batch import Batch
 from unirl.distributed.tensor.ref import TensorRef
 from unirl.distributed.utils import Broadcast
 
-# ── Batch-size inference ──
-
 
 def _value_batch_size(value) -> Optional[int]:
     """First batch-axis size found in ``value``, or ``None``.
@@ -54,8 +52,6 @@ def _value_batch_size(value) -> Optional[int]:
     if isinstance(value, Broadcast):
         return None
     if isinstance(value, (torch.Tensor, np.ndarray, GPUTensorHandle, TensorRef)):
-        # ``TensorRef.shape`` is Optional and 0-dim tensors have an empty
-        # shape — both mean "no batch axis".
         shape = value.shape
         return int(shape[0]) if shape else None
     if isinstance(value, list):
@@ -152,14 +148,6 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
         return [tuple(split_elems[j][i] for j in range(len(value))) for i in range(dp_size)]
 
     elif isinstance(value, Batch):
-        # Kind-aware split, mirroring pytree_cat's Batch.concat delegation on the
-        # collect side: Batch.chunk slices each field by its kind (CONCAT/PACKED
-        # split, SHARED/reduction passed through) and recomputes cu_seqlens for
-        # packed fields. A Batch whose own batch dim differs from the dispatch dim
-        # doesn't participate in the split -> replicate it.
-        # TensorRef rides this path too (it IS a Batch): Batch.chunk -> its overridden
-        # slice/select_ranges chunks by ROW, so no TensorRef-specific branch is needed
-        # and single-span / non-uniform-span refs split into equal row shards.
         if value.batch_size != batch_size:
             return [value] * dp_size
         return value.chunk(dp_size)

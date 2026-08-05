@@ -107,8 +107,6 @@ def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int,
     data = param.data
     total = int(data.shape[0])
     size = int(tensor.shape[0])
-    # Leading shards are equal-sized; a (possibly larger) trailing shard sits at the
-    # tail. For all-equal fusions the two formulas coincide (``(n-1)*size == dim0 - size``).
     offset = total - size if shard_id == num_shards - 1 else shard_id * size
     if offset < 0 or offset + size > total:
         raise ValueError(
@@ -168,7 +166,6 @@ def _apply_fused_param_mapping(module, named_tensors):
                 break
             if isinstance(val, str):
                 if val == "":
-                    # model dropped this param — nothing to load.
                     dropped += 1
                     handled = True
                     break
@@ -178,7 +175,6 @@ def _apply_fused_param_mapping(module, named_tensors):
                     renamed += 1
                     handled = True
                     break
-                # rename produced a non-param name; keep trying other patterns.
         if not handled:
             leftover.append((name, tensor))
     if fused or renamed or dropped:
@@ -188,10 +184,6 @@ def _apply_fused_param_mapping(module, named_tensors):
             renamed,
             dropped,
         )
-    # A leftover name that is still not a real model param slipped through every
-    # mapping branch (unmatched pattern, or a rename whose target does not exist).
-    # It will silently no-op in the exact-match loader — exactly the stale-weight
-    # failure this mapping is meant to prevent — so surface it loudly instead.
     unmatched = [n for n, _ in leftover if n not in model_params]
     if unmatched:
         _log.warning(
@@ -208,17 +200,9 @@ def patch_weights_updater() -> None:
     import sglang.multimodal_gen.runtime.loader.weights_updater as wu
     from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 
-    # Upstream module-globals the verbatim bodies depend on. Bound here so the
-    # nested fns resolve them through THIS scope identically to the fork.
     logger = wu.logger
     _load_weights_into_module = wu._load_weights_into_module
 
-    # --- (1) REPLACE module-level load_weights_into_model (+ remap helper) ----
-    # Upstream's load_weights_into_model has no LoRA name-remap. The fork added a
-    # bidirectional ``.base_layer.`` remap so weight-sync names match whether or
-    # not the model wrapped a layer with a ``.base_layer.`` indirection. We
-    # REPLACE the module function (so upstream ``_load_weights_into_module``,
-    # which calls it by module global, picks it up) and install the helper.
     if not getattr(wu.load_weights_into_model, _LWIM_SENTINEL, False):
         from torch.distributed.tensor import DTensor, distribute_tensor
 
@@ -236,8 +220,6 @@ def patch_weights_updater() -> None:
                     stripped = param_name.replace(".base_layer.", ".")
                     remap[stripped] = param_name
                 else:
-                    # Only add reverse remap for plausible base_layer patterns
-                    # e.g. attn.to_q.weight → attn.to_q.base_layer.weight
                     for suffix in (".weight", ".bias"):
                         if param_name.endswith(suffix):
                             prefix = param_name[: -len(suffix)]
@@ -272,13 +254,7 @@ def patch_weights_updater() -> None:
                 else:
                     param.data.copy_(loaded_weight.to(param.dtype))
 
-            # Silent weight-drop is dangerous: a name matching no model param is
-            # skipped above (``continue``), so a sender/receiver naming or fusion
-            # mismatch (diffusers separate ``to_q/to_k/to_v`` vs SGLang's fused
-            # ``to_qkv``) leaves those weights at their loaded base value with NO
-            # error — the rollout silently never sees the trained update. Fused
-            # projections are consumed upstream by ``_apply_fused_param_mapping``;
-            # anything still unmatched here is a real mismatch, surfaced loudly.
+            # Report unmatched weight names; skipped updates leave rollout weights stale.
             if _skipped:
                 logger.warning(
                     "load_weights_into_model: matched=%d SKIPPED=%d unmatched name(s) "
@@ -292,12 +268,7 @@ def patch_weights_updater() -> None:
         load_weights_into_model._unirl_lora_name_remap = True  # type: ignore[attr-defined]
         wu._build_lora_name_remap = _build_lora_name_remap
         wu.load_weights_into_model = load_weights_into_model
-        # Note: upstream's ``_load_weights_into_module`` calls
-        # ``load_weights_into_model`` via its module global, so it picks up the
-        # replacement above; the ``_load_weights_into_module`` object itself is
-        # unchanged, so the local alias bound at the top stays valid.
 
-    # --- (2) setattr the 6 net-new WeightsUpdater methods (verbatim) ----------
     if getattr(wu.WeightsUpdater, _METHODS_SENTINEL, False):
         return
 
@@ -465,9 +436,6 @@ def patch_weights_updater() -> None:
             gc.collect()
             return
 
-        # Handle LoRA state only after ALL buckets/dtypes are done (flush_cache=True).
-        # Calling per-bucket would corrupt state: partial updates + unmerge/merge
-        # cause base weights to be reverted or LoRA to be double-applied.
         updated_names = {name for name, _ in modules_to_update}
         if flush_cache and hasattr(self.pipeline, "handle_weight_sync"):
             self.pipeline.handle_weight_sync(updated_names)
@@ -488,11 +456,6 @@ def patch_weights_updater() -> None:
             if not module_tensors:
                 continue
             try:
-                # Fused-projection models (Z-Image: to_q/k/v -> to_qkv,
-                # feed_forward.w1/w3 -> w13) need the model's param_names_mapping
-                # applied so the trainer's separate-projection tensors land in the
-                # right fused shard. Consume those here; the rest fall through to
-                # the exact-match loader below.
                 module_tensors = _apply_fused_param_mapping(module, module_tensors)
                 _load_weights_into_module(module, module_tensors)
                 updated_modules.append(module_name)

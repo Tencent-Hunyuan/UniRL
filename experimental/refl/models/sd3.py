@@ -30,7 +30,6 @@ from unirl.types.primitives import Images, Texts
 from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
 
-# Inclusive max for torch.Generator.manual_seed conventions.
 MAX_TORCH_SEED = (1 << 63) - 1
 
 

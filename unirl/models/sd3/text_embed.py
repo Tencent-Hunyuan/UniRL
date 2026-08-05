@@ -80,9 +80,6 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         bundle = self.bundle
         device = bundle.device
 
-        # CLIP 1 — collect pooled (for ``pooled_projections``) AND the
-        # penultimate hidden state (for ``encoder_hidden_states``, per the
-        # diffusers SD3 spec with clip_skip=None default).
         clip1_inputs = bundle.tokenizer(
             prompts,
             padding="max_length",
@@ -96,7 +93,6 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             pooled_1 = clip1_out.text_embeds
             clip1_hidden = clip1_out.hidden_states[-2]
 
-        # CLIP 2 — same shape contract as CLIP 1.
         clip2_inputs = bundle.tokenizer_2(
             prompts,
             padding="max_length",
@@ -112,7 +108,6 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
         pooled = torch.cat([pooled_1, pooled_2], dim=-1)
 
-        # T5
         t5_inputs = bundle.tokenizer_3(
             prompts,
             padding="max_length",
@@ -125,11 +120,6 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             t5_out = bundle.text_encoder_3(t5_ids)
             t5_embeds = t5_out.last_hidden_state
 
-        # Build ``encoder_hidden_states`` per diffusers SD3 spec:
-        #   cat([cat([clip1_h, clip2_h], dim=-1) padded to t5_dim,
-        #        t5_last_hidden_state],
-        #       dim=-2)
-        # Shape: [B, clip_seq + t5_seq, t5_dim].
         clip_merged = torch.cat([clip1_hidden, clip2_hidden], dim=-1)
         clip_merged = torch.nn.functional.pad(clip_merged, (0, t5_embeds.shape[-1] - clip_merged.shape[-1]))
         embeds = torch.cat([clip_merged, t5_embeds], dim=-2)

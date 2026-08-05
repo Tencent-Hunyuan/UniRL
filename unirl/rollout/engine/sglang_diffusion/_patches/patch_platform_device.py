@@ -49,10 +49,6 @@ def patch_platform_device() -> None:
 
         if torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
-            # Colocate: the FSDP rank may exceed this actor's visible device
-            # count (CUDA_VISIBLE_DEVICES restricts the actor to 1 GPU). Only
-            # adopt the rank as the device id when it is a valid local device;
-            # otherwise honor the caller-passed (local) device_id.
             if rank < torch.cuda.device_count():
                 device_id = rank
 

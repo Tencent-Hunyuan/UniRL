@@ -61,11 +61,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# ===========================================================================
-# Layer 1 — pure math
-# ===========================================================================
-
-
 def get_sigma_schedule(
     num_steps: int,
     shift: float = 3.0,
@@ -96,8 +91,6 @@ def get_sigma_schedule(
     growing an untested hand-rolled stretch.
     """
     if mu is None:
-        # DELETE-WHEN: diffusers #13243 fixed → drop this branch and route
-        # static through diffusers too (symmetric with the dynamic branch).
         if shift_terminal is not None:
             raise ValueError(
                 f"get_sigma_schedule: shift_terminal={shift_terminal!r} is only "
@@ -141,11 +134,6 @@ def calculate_dynamic_mu(
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
     return image_seq_len * m + b
-
-
-# ===========================================================================
-# Layer 2 — schedule policy (model-owned config + behavior, from the checkpoint)
-# ===========================================================================
 
 
 def _read_json(path: Path) -> Optional[dict]:
@@ -412,9 +400,6 @@ class FlowMatchSchedulePolicy:
         I.4). Each Pipeline's ``build_schedule_policy()`` knows its own
         dynamic-shift posture and passes the right hints.
         """
-        # Local JSON dir unreadable — either no path given, or an HF repo ID
-        # not yet on disk. Both fall back the same way: require_dynamic →
-        # build from overrides (raises if absent); otherwise static-only.
         root = Path(path) if path is not None else None
         if root is None or not root.exists():
             if require_dynamic:
@@ -429,15 +414,10 @@ class FlowMatchSchedulePolicy:
                 )
             return cls.static_only(shift)
 
-        defaults = cls()  # canonical default values
+        defaults = cls()
         sched_path = root / "scheduler" / "scheduler_config.json"
         sched = _read_json(sched_path)
         if sched is None:
-            # Dynamic-shift information lives in this JSON; silent
-            # fallback to static would mis-shift a dynamic-shift model
-            # (caught by ``verify_engine_used_sigmas`` at rollout time
-            # but worth surfacing here so the cause is obvious in
-            # logs).
             logger.warning(
                 "FlowMatchSchedulePolicy.from_pretrained: %s not found; "
                 "dynamic-shift fields default to static-only behavior. "
@@ -464,11 +444,6 @@ class FlowMatchSchedulePolicy:
         )
 
 
-# ===========================================================================
-# Layer 3 — Sample glue (pin σ onto a diffusion gen Part)
-# ===========================================================================
-
-
 def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
     """Compute and pin σ onto a Sample's diffusion generation parameters.
 
@@ -482,8 +457,6 @@ def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
     (e.g. WAN T2V at 480×832). The driver always sets all three at request
     construction; absence means a wiring bug.
     """
-    # Local import avoids making the low-level SDE math module eagerly import
-    # the complete rollout type graph.
     from unirl.types.sampling import DiffusionSamplingParams
 
     if not sample.parts or not isinstance(sample.parts[-1].sampling_params, DiffusionSamplingParams):
@@ -500,11 +473,8 @@ def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
 
 
 __all__ = [
-    # Layer 2 — the per-model schedule object (engines build it; models subclass)
     "FlowMatchSchedulePolicy",
-    # Layer 3 — Sample glue (rollout engines call this)
     "ensure_sample_sigmas",
-    # Layer 1 — stateless math primitives (used directly by tests / advanced callers)
     "get_sigma_schedule",
     "calculate_dynamic_mu",
 ]

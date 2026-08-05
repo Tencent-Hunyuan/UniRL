@@ -1,9 +1,9 @@
 """SandboxTool — a persistent Python-REPL subprocess tool (LIN-533).
 
-The first out-of-process :class:`~unirl.rollout.loop.tools.tool.StatefulTool`: each session owns a
+The first out-of-process :class:`~unirl.rollout.env.tools.base.StatefulTool`: each session owns a
 long-lived ``python`` subprocess whose global namespace **persists across turns**, so ``x = 40`` on
 one turn and ``x + 2`` on the next returns ``42`` — the cross-turn capability a stateless
-:class:`~unirl.rollout.loop.tools.tool.Tool` cannot express.
+:class:`~unirl.rollout.env.tools.base.Tool` cannot express.
 
 Lifecycle (all off the shared event loop — ``execute_session``/``session_end`` run in
 ``ToolEnvironment``'s executor):
@@ -31,13 +31,8 @@ import sys
 import threading
 from typing import Any, Dict, Optional
 
-from unirl.rollout.loop.tools.tool import StatefulTool
+from unirl.rollout.env.tools.base import StatefulTool
 
-# Runs in the child process. Protocol: read one JSON line ``{"code": ...}`` from stdin; exec it in a
-# persistent namespace with stdout+stderr captured; if the last top-level statement is an expression,
-# echo its ``repr`` (REPL-style); write one JSON line ``{"out": ...}`` back and flush; loop until
-# stdin closes. User output is captured into a StringIO (never the real pipe), so a chatty cell can't
-# deadlock the pipe — only the single framed response reaches the parent.
 _WORKER_SRC = r"""
 import ast, io, json, sys, contextlib, traceback
 
@@ -95,7 +90,6 @@ class SandboxTool(StatefulTool):
     def __init__(self, *, timeout_s: float = 10.0, max_output_chars: int = 4000) -> None:
         self._timeout_s = float(timeout_s)
         self._max_output_chars = int(max_output_chars)
-        # Session store shared across concurrent trajectories on the worker → lock-guarded.
         self._sessions: Dict[str, _Session] = {}
         self._store_lock = threading.Lock()
 
@@ -117,9 +111,6 @@ class SandboxTool(StatefulTool):
             },
         }
 
-    # ------------------------------------------------------------------
-    # StatefulTool lifecycle
-    # ------------------------------------------------------------------
     def session_start(self, session_id: str, context: Dict[str, Any]) -> None:
         """Record the session — no subprocess yet (opened lazily in :meth:`execute_session`)."""
         with self._store_lock:
@@ -131,7 +122,7 @@ class SandboxTool(StatefulTool):
             raise ValueError("python tool requires a non-empty 'code' string argument")
         with self._store_lock:
             session = self._sessions.get(session_id)
-            if session is None:  # session_start skipped (not via ToolEnvironment) — tolerate it
+            if session is None:  # Tolerate callers that skip session_start.
                 session = self._sessions.setdefault(session_id, _Session({}))
         with session.lock:
             if self._ensure_proc(session) is None:
@@ -146,9 +137,6 @@ class SandboxTool(StatefulTool):
             with session.lock:
                 self._kill(session)
 
-    # ------------------------------------------------------------------
-    # Subprocess plumbing
-    # ------------------------------------------------------------------
     def _ensure_proc(self, session: _Session) -> Optional[subprocess.Popen]:
         """Lazily spawn (or respawn a dead) worker subprocess. Caller holds ``session.lock``."""
         if session.proc is not None and session.proc.poll() is None:
@@ -201,7 +189,7 @@ class SandboxTool(StatefulTool):
         session.proc = None
         if proc is None:
             return
-        for closer in (lambda: proc.stdin.close(),):  # stop writes first
+        for closer in (lambda: proc.stdin.close(),):
             try:
                 closer()
             except Exception:  # noqa: BLE001

@@ -26,17 +26,6 @@ from multiprocessing.process import BaseProcess as _MpBaseProcess
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# Subprocess propagation -- make spawn children also run hijack
-# ============================================================
-#
-# The diffusion scheduler is launched via a spawn-context ``mp.Process``; the
-# child is a fresh interpreter that does not inherit the parent's patches.
-# Wrapping the target so it re-runs ``hijack()`` before the scheduler loop
-# guarantees the child's ``Scheduler``/``GPUWorker``/``SchedulerRLMixin`` are
-# patched before any request is served.
-
-
 class _DiffrlPatchedTarget:
     """Pickleable wrapper that installs sglang patches in a spawn child first.
 
@@ -48,22 +37,9 @@ class _DiffrlPatchedTarget:
         self._target = target
 
     def __call__(self, *args, **kwargs):
-        # SGLang scheduler subprocesses inherit train-side NCCL env vars from
-        # Ray/FSDP. Clear those single-process-incompatible knobs before the
-        # scheduler bootstraps its own NCCL group. Also pre-import the LoRA
-        # pipeline so its TOKENIZERS_PARALLELISM putenv happens before NCCL
-        # background threads can race with later environment writes.
         import os as _os
 
-        # PRECONDITION: this scrub assumes the scheduler subprocess hosts a
-        # single-process NCCL world (num_gpus=1 / tp_size=1 — the only
-        # validated colocate topology). Deployments that need these knobs
-        # inside the subprocess (engine TP>1, multi-NIC hosts pinning
-        # NCCL_SOCKET_IFNAME) can set UNIRL_SGLANG_KEEP_NCCL_ENV=1 to skip it.
         if _os.environ.get("UNIRL_SGLANG_KEEP_NCCL_ENV") not in ("1", "true"):
-            # NCCL_TOPO_FILE is the actual deadlock trigger, but only when it
-            # dangles (a /proc/self/fd/NNN path of the dead parent). A real,
-            # readable topo file is a legitimate host-level setting — keep it.
             _topo = _os.environ.get("NCCL_TOPO_FILE")
             if _topo is not None and not _os.path.exists(_topo):
                 _os.environ.pop("NCCL_TOPO_FILE", None)
@@ -78,8 +54,6 @@ class _DiffrlPatchedTarget:
             ):
                 _os.environ.pop(_k, None)
 
-        # Pre-import to run lora_pipeline's module-level putenv before NCCL
-        # background threads start.
         _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         try:
             import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
@@ -156,10 +130,6 @@ class SglangDiffusionHijack:
         # Spawn shim MUST run first so the scheduler/worker child re-installs.
         wrap_mp_process_for_children()
 
-        # Import all patch entrypoints. Each is import-safe + idempotent; a
-        # target unavailable in this interpreter is logged and skipped by
-        # _safe_apply, so partial availability (e.g. a CPU-only unit-test
-        # process importing only the rollout math) never aborts the rest.
         from unirl.rollout.engine.sglang_diffusion._patches.patch_conditions import (
             patch_conditions,
         )
@@ -220,12 +190,6 @@ class SglangDiffusionHijack:
             patch_weights_updater,
         )
 
-        # (A) Additive infra: srt is_available shim; SamplingParams/Req IO
-        #     fields; GPUWorker RL methods + sleep/wake; weight-sync;
-        #     in-memory LoRA; RL Scheduler handlers.
-        # (B) post1 bridge: grouped-stage dispatch (v0.5.12.post1 predates the
-        #     3142278c5 grouped-path fix; no-op on any sglang that has it).
-        # (C) The one REPLACE: the DanceGRPO objective upstream lacks.
         for patch in (
             patch_srt,
             patch_platform_device,

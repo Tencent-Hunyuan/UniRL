@@ -130,12 +130,6 @@ def _prepare_qwen_moe_dtensor(
 
 def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
     """Whether this model uses a supported packed Qwen MoE checkpoint layout."""
-    # VeOmni train-side EP keeps only this rank's contiguous [E/ep, ...]
-    # expert block in the model.  FullWeightSync._iter_full_tensors_ep must see
-    # the packed parameter name so it can gather those blocks across the EP
-    # group and assign global expert ids before exporting HF per-expert keys.
-    # Unpacking here would make every EP rank independently emit
-    # experts.0..E/ep-1 and bypass that gather.
     parallel_groups = getattr(model, "_extra_parallel_param_groups", None) or {}
     if parallel_groups.get("ep"):
         return False
@@ -234,8 +228,6 @@ def merged_state_dict(
             continue
         if skip_lm_head and original_name == "lm_head.weight":
             continue
-        # Merge inputs stay master-width (no ``dtype`` here): pre-casting them
-        # to the wire dtype would round the LoRA update away before the fold.
         if (
             unpack_qwen_moe
             and original_name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
@@ -253,7 +245,6 @@ def merged_state_dict(
         if "lora_A" in group and "lora_B" in group:
             lora_a = _to_full_tensor(state_dict[group["lora_A"]])
             lora_b = _to_full_tensor(state_dict[group["lora_B"]])
-            # Merge in fp32: bf16 base + bf16 delta rounds the LoRA update away.
             merged = (base.float() + (lora_b.float() @ lora_a.float()) * scaling).to(base.dtype)
             yield from _iter_rollout_tensors(
                 original_name,
@@ -400,11 +391,7 @@ def extract_lora_tensors(
             result[out_name] = _to_full_tensor(param, dtype).detach().cpu()
             break
 
-    # Defensive dtype check: vllm punica kernel hard-asserts inputs.dtype in
-    # {fp16, bf16}. Catch fp32 LoRA here in trainer (cheap) rather than
-    # crashing ~20min later in rollout. With ``dtype`` passed (the normal path)
-    # this never fires; it backstops a caller that forgot to thread the wire
-    # dtype while running master_dtype=fp32.
+    # Reject fp32 LoRA tensors before vLLM's bf16/fp16-only kernel.
     _bad_dtype = [
         (k, v.dtype) for k, v in result.items() if ".lora_" in k and v.dtype not in (torch.bfloat16, torch.float16)
     ]

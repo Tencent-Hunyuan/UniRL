@@ -107,8 +107,6 @@ class Sd3T2iAdapter(ModelAdapter):
 
     stage_yaml = "sd35_t2i_rl.yaml"
     omni_mode = "text-to-image"
-    # SD3.5 has no top-level tokenizer (only subfolder CLIP/T5 ones) and the
-    # single-stage path never calls build_prompt_tokens.
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

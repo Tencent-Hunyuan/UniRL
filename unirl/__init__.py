@@ -8,15 +8,11 @@ from typing import Dict, Tuple
 __version__ = "0.1.0"
 
 _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
-    # shared types
     "RewardRequest": ("unirl.types", "RewardRequest"),
     "RewardResponse": ("unirl.types", "RewardResponse"),
     "RewardType": ("unirl.types", "RewardType"),
-    # sde
     "get_sigma_schedule": ("unirl.sde", "get_sigma_schedule"),
-    # reward
     "RewardBackend": ("unirl.reward.base", "RewardBackend"),
-    # utils
     "load_function": ("unirl.utils", "load_function"),
     "set_seed": ("unirl.utils", "set_seed"),
     "configure_logger": ("unirl.utils", "configure_logger"),

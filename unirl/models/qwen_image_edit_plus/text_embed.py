@@ -31,10 +31,6 @@ from unirl.types.primitives import Images, Texts
 
 from .bundle import QwenImageEditPlusBundle
 
-# Edit chat template + drop index (upstream diffusers
-# ``QwenImageEditPlusPipeline``: ``prompt_template_encode`` /
-# ``prompt_template_encode_start_idx``). The system prompt differs from base
-# Qwen-Image, so the fixed prefix is 64 tokens (not 34).
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, "
     "background), then explain how the user's text instruction should alter or modify the image. Generate a new "
@@ -45,9 +41,6 @@ PROMPT_TEMPLATE_START_IDX = 64
 IMG_PROMPT_TEMPLATE = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 TOKENIZER_MAX_LENGTH = 1024
 
-# Condition-image grid fed to the text encoder (upstream ``CONDITION_IMAGE_SIZE``).
-# NOTE: this is the low-res condition size for the *text encoder*; the VAE
-# latent-concat path resizes the same source image to a separate ≈1024² grid.
 CONDITION_IMAGE_AREA = 384 * 384
 _SIZE_ALIGN = 32
 
@@ -87,8 +80,6 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
             )
         self.bundle = bundle
         self.max_sequence_length = int(max_sequence_length)
-        # Same root as text encoder / tokenizer: honor ``processor_path``
-        # (from ``text_encoder_ckpt_path``) else the main checkpoint.
         self.processor = self._load_processor(processor_path or bundle.pretrained_path)
 
     @staticmethod
@@ -127,7 +118,6 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
-        # Upstream: image list / tensor → Picture N placeholders; None → "".
         condition_pils = None
         if images is not None:
             condition_pils = self._condition_pils(images)
@@ -142,8 +132,6 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
 
         txt = [PROMPT_TEMPLATE.format(base_img_prompt + e) for e in prompts]
 
-        # Upstream always goes through the processor; when image is None it
-        # still tokenizes text and omits pixel_values / image_grid_thw.
         model_inputs = self.processor(
             text=txt,
             images=condition_pils,
@@ -168,8 +156,6 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
         hidden_states = encoder_out.hidden_states[-1]
 
         split_hidden_states = extract_masked_hidden(hidden_states, model_inputs.attention_mask)
-        # Strip the 64-token edit-template system prefix (with or without
-        # image-placeholder tokens after it).
         split_hidden_states = [item[PROMPT_TEMPLATE_START_IDX:] for item in split_hidden_states]
         attn_mask_list = [
             torch.ones(item.size(0), dtype=torch.long, device=item.device) for item in split_hidden_states
@@ -186,8 +172,6 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
             [torch.cat([item, item.new_zeros(max_seq_len - item.size(0))]) for item in attn_mask_list]
         )
 
-        # Final slice to the configured budget (image-placeholder tokens are at
-        # the front when present, so a short prompt keeps its visual context).
         prompt_embeds = prompt_embeds[:, : self.max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, : self.max_sequence_length]
         return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask

@@ -48,22 +48,9 @@ def patch_sd3_lora_pipeline() -> None:
         LoRAPipeline,
     )
 
-    # Mirror the fork's ``(LoRAPipeline, ComposedPipelineBase)`` by prepending the
-    # mixin to upstream's existing ``(ComposedPipelineBase,)``. The idempotency
-    # guard is a direct ``__bases__`` membership test -- deliberately NOT
-    # ``issubclass`` (see the ABCMeta note below).
     if LoRAPipeline not in StableDiffusion3Pipeline.__bases__:
         StableDiffusion3Pipeline.__bases__ = (LoRAPipeline,) + StableDiffusion3Pipeline.__bases__
 
-    # ABCMeta CACHE GOTCHA: ``ComposedPipelineBase`` is an ABC, so
-    # ``isinstance`` / ``issubclass`` route through ABCMeta's per-class cache. A
-    # ``__bases__`` reassignment does NOT bump the ABC invalidation counter, so a
-    # negative ``issubclass(StableDiffusion3Pipeline, LoRAPipeline)`` cached before
-    # the reassignment (an ``issubclass`` idempotency guard, or any earlier check
-    # during import) STICKS: the bases show ``LoRAPipeline`` yet
-    # ``isinstance(pipeline, LoRAPipeline)`` stays False and the worker still
-    # rejects ``set_lora_from_tensors``. ``register`` bumps the global counter
-    # (invalidating the stale negative) and records SD3 as a subclass.
     LoRAPipeline.register(StableDiffusion3Pipeline)
 
 

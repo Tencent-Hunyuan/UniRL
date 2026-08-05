@@ -78,25 +78,11 @@ class RLQwenImagePipeline(QwenImagePipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Upstream ``__init__`` constructs ``self.scheduler``; stash it as
-        # the config donor for the SDE swap. We never swap back — our
-        # scheduler is installed for the lifetime of this pipeline instance.
         self._upstream_scheduler: FlowMatchEulerDiscreteScheduler = self.scheduler
-        # Conditioning-tap state: armed (reset to a fresh dict) every
-        # request, filled by the tap's first/second call; the flag keeps the
-        # install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
-        # Per-request x_T hand-off: armed every request, consumed once by the
-        # ``prepare_latents`` override. ``None`` = upstream RNG fires.
         self._pending_initial_noise: Optional[torch.Tensor] = None
-        # The request's normalized pixel H/W, stashed by ``forward`` for the
-        # harvest-side trajectory unpack.
         self._harvest_hw: Optional[Tuple[int, int]] = None
-
-    # ------------------------------------------------------------------ #
-    # install — once per pipeline lifetime, idempotent
-    # ------------------------------------------------------------------ #
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (the from_config
@@ -140,10 +126,6 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self.encode_prompt = tapped  # type: ignore[assignment]
         self._conditioning_tap_installed = True
 
-    # ------------------------------------------------------------------ #
-    # arm — every request (stale-leak guards)
-    # ------------------------------------------------------------------ #
-
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
@@ -160,9 +142,7 @@ class RLQwenImagePipeline(QwenImagePipeline):
         """Fresh capture buffer so the tap records THIS request's encodes."""
         self._captured_conditioning = {}
 
-    # ------------------------------------------------------------------ #
     # run-phase interception — upstream-called name, cannot be renamed
-    # ------------------------------------------------------------------ #
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
         """Initial-noise injection point: bypass upstream RNG when the driver
@@ -203,10 +183,6 @@ class RLQwenImagePipeline(QwenImagePipeline):
             )
         return self._pack_latents(noise, batch, channels, grid_h, grid_w)
 
-    # ------------------------------------------------------------------ #
-    # harvest — export onto the wire
-    # ------------------------------------------------------------------ #
-
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if not isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             return
@@ -230,16 +206,12 @@ class RLQwenImagePipeline(QwenImagePipeline):
         height, width = self._harvest_hw
         b, t1 = packed.shape[0], packed.shape[1]
         flat = self._unpack_latents(packed.reshape(b * t1, *packed.shape[2:]), height, width, self.vae_scale_factor)
-        flat = flat.squeeze(2)  # [B*(T+1), C, 1, h, w] → [B*(T+1), C, h, w]
+        flat = flat.squeeze(2)
         return flat.reshape(b, t1, *flat.shape[1:])
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning:
             stamp_custom_output(out, "text_capture", self._captured_conditioning)
-
-    # ------------------------------------------------------------------ #
-    # the protocol
-    # ------------------------------------------------------------------ #
 
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
@@ -248,16 +220,11 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self._arm_sde(req)
         self._arm_initial_noise(req)
         self._arm_conditioning_tap()
-        # Mirror upstream forward's H/W resolution (defaults + 16-alignment)
-        # so the harvest unpack uses the exact grid the loop ran on.
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
         self._harvest_hw = (int(height), int(width))
 
-        # Delegate the entire denoise pipeline (prompt encoding, latent prep,
-        # timestep build, diffusion loop, VAE decode) to upstream; the
-        # installed tap/injector fire inside.
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)

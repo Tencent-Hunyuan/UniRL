@@ -67,10 +67,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             differentiable=config.differentiable,
         )
 
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
-
     def _load_model(self) -> None:
         reward_model_path = str(self.model_kwargs["reward_model_path"])
         if not reward_model_path:
@@ -104,10 +100,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         raise NotImplementedError("VideoAlignRewardScorer is REFL-only; use compute_rewards_differentiable().")
 
-    # ------------------------------------------------------------------
-    # Differentiable REFL reward entry point
-    # ------------------------------------------------------------------
-
     def compute_rewards_differentiable(
         self,
         media_tensor: torch.Tensor,
@@ -122,16 +114,9 @@ class VideoAlignRewardScorer(LocalRewardBackend):
                 f"VideoAlignRewardScorer: prompts length {len(prompts)} != batch size {int(media_tensor.shape[0])}."
             )
 
-        # The wrapper expects per-sample [T, C, H, W] in [-1, 1].
-        # NOTE: ``.clamp(-1.0, 1.0)`` mirrors mmrl's ``role.score`` — VAE
-        # decode can produce slightly out-of-range pixels (e.g. -1.02 /
-        # 1.03), and ``_pixels_neg1_to_255`` only clamps the [0, 1]
-        # midpoint afterwards, so values can still spill above 255 or
-        # below 0 without this safeguard. Required for numeric parity
-        # with the mmrl baseline.
         per_sample_videos: List[torch.Tensor] = []
         for v in media_tensor:
-            v = v.to(self.device).permute(1, 0, 2, 3).clamp(-1.0, 1.0).contiguous()  # → (T, C, H, W)
+            v = v.to(self.device).permute(1, 0, 2, 3).clamp(-1.0, 1.0).contiguous()
             per_sample_videos.append(v)
 
         if self._reward_num_frames > 0:
@@ -159,10 +144,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         reward = self._w_vq * scores["VQ"] + self._w_mq * scores["MQ"] + self._w_ta * scores["TA"]
         return reward.float()
 
-    # ------------------------------------------------------------------
-    # Lifecycle hooks (CPU offload between rollouts to free VRAM)
-    # ------------------------------------------------------------------
-
     def offload(self) -> None:
         if self.model is not None and getattr(self.model, "model", None) is not None:
             self.model.model.cpu()
@@ -177,11 +158,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 
     def dispose(self) -> None:
         self.offload()
-
-
-# ---------------------------------------------------------------------------
-# Spec
-# ---------------------------------------------------------------------------
 
 
 @dataclass

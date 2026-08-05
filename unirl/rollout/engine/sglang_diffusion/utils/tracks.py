@@ -31,11 +31,6 @@ from unirl.types.segments.latent import LatentSegment, make_image_segment
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Segment build
-# ---------------------------------------------------------------------------
-
-
 def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
     """Concat per-result trajectory latents on the batch dim (detached, CPU)."""
     latents = []
@@ -171,11 +166,6 @@ def build_latent_segment(
         results=results,
     )
 
-    # Selective trim: when only a subset of trajectory positions is referenced by
-    # the SDE step set, drop unused columns to save Ray IPC bandwidth.
-    # ``compute_trajectory_positions`` returns only the (i, i+1) pairs for
-    # SDE-gated steps; we always preserve the terminal position T so the clean
-    # image latent (``seg.latents[:, -1]``) stays available for VAE decode.
     traj_len = int(trajectories_tensor.shape[1])
     if aux_trajectory is not None:
         require(
@@ -201,14 +191,9 @@ def build_latent_segment(
         if keep_cols and len(keep_cols) < traj_len:
             trajectories_tensor = trajectories_tensor[:, keep_cols]
             indices_t = torch.tensor(keep_cols, dtype=torch.long)
-            # Trim the audio trajectory to the SAME kept columns so it stays indexed
-            # by the same sparse positions as the video latents.
             if aux_trajectory is not None:
                 aux_trajectory = aux_trajectory[:, keep_cols]
 
-    # sde_indices: always populated (trainer needs to know which steps to replay).
-    # sde_logp: best-effort native emission; whether it is used or recomputed is
-    # the training layer's call (``algorithm.old_logp_source``), not an engine flag.
     sde_indices_t: Optional[torch.Tensor] = (
         torch.tensor(list(sde_indices), dtype=torch.long)
         if sde_indices is not None
@@ -250,8 +235,6 @@ def _native_sde_logp(
     if any(lp is None for lp in per_result):
         return None
     log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
-    # [B, T] (one entry per SDE transition). When sde_indices is a subset but the
-    # server emitted the full schedule, slice down to the requested transitions.
     s_dim = int(log_prob_tensor.shape[1])
     expected_s = len(sde_indices) if sde_indices is not None else num_steps
     if s_dim == num_steps and sde_indices is not None and expected_s < num_steps:
@@ -266,11 +249,6 @@ def _native_sde_logp(
         f"source rather than fall back to replay silently.",
     )
     return log_prob_tensor
-
-
-# ---------------------------------------------------------------------------
-# Decoded media
-# ---------------------------------------------------------------------------
 
 
 def stack_decoded_images(
@@ -336,16 +314,11 @@ def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
                 f"stack_decoded_videos: expected 4-D canonical video [C, T, H, W]; "
                 f"got rank {canonical.dim()}, shape {tuple(canonical.shape)}."
             )
-        frames = canonical.permute(1, 0, 2, 3).contiguous().to(torch.float32)  # [T, C, H, W]
+        frames = canonical.permute(1, 0, 2, 3).contiguous().to(torch.float32)
         videos.append(Video(frames=frames))
     if not videos:
         return None
     return Videos.from_list(videos)
-
-
-# ---------------------------------------------------------------------------
-# Conditions packing
-# ---------------------------------------------------------------------------
 
 
 def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
@@ -409,8 +382,6 @@ def _aligned_mask(
             embeds_seq,
         )
         return None
-    # mask_seq < embeds_seq: pad with ones only when the adapter opts in
-    # (Edit-Plus prompt_embeds carry image-token slots beyond the text mask).
     if not allow_pad:
         logger.debug(
             "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
@@ -467,9 +438,6 @@ def fuse_text_conditions(
         if neg_pooled is not None:
             neg_pooled_list.append(neg_pooled.detach().cpu())
 
-        # Negative mask: required alongside negative embeds by mask-consuming
-        # replay paths (Qwen-VL conditioning) — fused symmetrically with the
-        # positive mask rather than dropped.
         neg_mask = fuse_encoder_outputs(result.negative_attention_mask)
         if neg_mask is not None:
             neg_mask_list.append(neg_mask.detach().cpu())

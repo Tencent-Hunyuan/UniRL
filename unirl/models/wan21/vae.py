@@ -79,15 +79,9 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         with nullcontext() if grad else torch.no_grad():
             decoded = self._vae_decode(clean)
 
-        # Decoded layout is [B, C, T_dec, H_dec, W_dec] in [-1, 1].
-        # Normalize to [0, 1] and clamp before packing.
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
 
         return self._pack_videos(decoded)
-
-    # ------------------------------------------------------------------
-    # BPTT path (REFL): differentiable decode of a live grad latent.
-    # ------------------------------------------------------------------
 
     def decode_with_grad(self, z_final: torch.Tensor) -> torch.Tensor:
         """Differentiable VAE decode: ``z_final → pixels`` with autograd alive."""
@@ -97,10 +91,6 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
                 f"[B, C, T_lat, H_lat, W_lat], got {tuple(z_final.shape)}"
             )
         return self._vae_decode(z_final)
-
-    # ------------------------------------------------------------------
-    # Shared decode kernel (used by both `decode` and `decode_with_grad`).
-    # ------------------------------------------------------------------
 
     def _vae_decode(self, clean: torch.Tensor) -> torch.Tensor:
         """Run ``WanVideoVAE.decode`` and return pixels in the VAE's native ``[-1, 1]``."""

@@ -42,9 +42,6 @@ class FusedMultimodalCondition(Condition):
     input_ids: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     attention_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     position_ids: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    # Tuple-valued; SHARED. The smoke / single-process path doesn't cross
-    # a transfer queue. Real cross-process replay would need a tuple-aware
-    # FieldKind; out of scope for this primitive.
     rope_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = shared_field(default=None)
 
 

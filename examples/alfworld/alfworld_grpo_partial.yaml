@@ -107,7 +107,7 @@ rollout:
         cuda_graph_max_bs: 16
         enable_lora: false
     env:
-      _target_: unirl.rollout.loop.alfworld_env.AlfworldEnv
+      _target_: unirl.rollout.env.alfworld.AlfworldEnv
       split: train
       max_steps: 15 # keep == config.max_turns
       step_penalty: 0.0

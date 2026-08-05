@@ -60,8 +60,6 @@ class Segment(Batch):
 
     status: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
 
-    # ---- promotion to Condition ---------------------------------------------
-
     def as_condition(self) -> Optional[Condition]:
         """Encoder-free promotion. Override on subclasses where it makes sense.
 

@@ -82,6 +82,7 @@ class ZImagePipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -98,12 +99,10 @@ class ZImagePipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else ZImageVAEDecodeStage(bundle)
-        # ``shift`` is retained so the hosting engine can read it when
-        # constructing the FlowMatchSchedulePolicy at startup. Z-Image is
-        # static-shift, so this value (3.0) is the schedule shift.
         self.shift = shift
 
     @classmethod
@@ -114,7 +113,7 @@ class ZImagePipeline(Pipeline):
         (``latent_h = 2 * (H // 16)``)."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
-        vae_scale_factor = 8  # AutoencoderKL with 4 block_out_channels
+        vae_scale_factor = 8
         latent_h = 2 * (height // (vae_scale_factor * 2))
         latent_w = 2 * (width // (vae_scale_factor * 2))
         return (16, latent_h, latent_w)
@@ -142,6 +141,7 @@ class ZImagePipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = ZImageVAEDecodeStage(bundle)
         return cls(
@@ -232,15 +232,11 @@ class ZImagePipeline(Pipeline):
         z_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor still wins.
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(z_conds, schedule=schedule, params=params, initial_latents=initial_latents)
         images = self.vae_decode.decode(latent_seg)
 
-        # Fill the frontier shell, carrying the encoded conditions for trainer-side
-        # replay (FlowGRPO re-types Part.conditions via conditions_cls.from_dict).
         filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=z_conds.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 

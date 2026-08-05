@@ -42,7 +42,6 @@ def pils_to_images(pil_images: Sequence[Any]) -> Images:
 
     items: List[Image] = []
     for pil in pil_images:
-        # uint8 [C, H, W] / 255 → float32 [0, 1] per Image(pixels=...) contract.
         t = pil_to_tensor(pil).to(torch.float32) / 255.0
         items.append(Image(pixels=t))
     return Images.from_list(items)
@@ -112,7 +111,6 @@ def _video_frames_from_custom_output(diff_out: Any) -> List[Any]:
 
         _VIDEO_PROCESSOR = VideoProcessor(vae_scale_factor=16)
     frames = _VIDEO_PROCESSOR.postprocess_video(vid, output_type="pil")
-    # postprocess_video returns List[List[PIL]] (batch x frames); B == 1.
     if frames and isinstance(frames[0], list):
         return frames[0]
     return list(frames)
@@ -145,9 +143,6 @@ def collect_dit_outputs(
         diff_outputs.append(diff_out)
         imgs = getattr(diff_out, "images", None) or []
         if not imgs and final_output_type == "video":
-            # Video PIL frames don't survive the engine worker->client wire; the
-            # RL pipeline stamped the decoded video tensor onto custom_output —
-            # recover this sample's frames from there. (LIN-382)
             imgs = _video_frames_from_custom_output(diff_out)
         pil_frames_per_prompt.append(list(imgs))
         pil_images.extend(imgs)
@@ -197,10 +192,6 @@ def build_image_segment(
     traj_log_probs: Optional[torch.Tensor] = torch.cat(per_log_probs, dim=0) if per_log_probs else None
     head = diff_outputs[0]
     seg_sigmas = getattr(head, "trajectory_timesteps", None)
-    # Engine→worker→response σ contract: the engine pinned ``sampling_params.sigmas``
-    # before dispatch, the worker consumed it via ``set_timesteps(sigmas=...)``
-    # and echoed the same values back. Assert equality so a broken wire
-    # surfaces immediately rather than silently de-syncing replay.
     verify_engine_used_sigmas(
         seg_sigmas,
         expected=expected_sigmas,
@@ -211,9 +202,6 @@ def build_image_segment(
 
     indices: Optional[torch.Tensor] = None
     sde_indices: Optional[torch.Tensor] = None
-    # K == 0 happens when the algorithm requested zero SDE steps (NFT /
-    # forward-process). Treat identically to "no log_probs at all":
-    # clean-latents segment with no sde_logp / sde_indices.
     K = int(traj_log_probs.shape[1]) if traj_log_probs is not None else 0
     if K > 0:
         T_plus_1 = int(traj_latents.shape[1]) if traj_latents is not None else K + 1
@@ -228,9 +216,6 @@ def build_image_segment(
                     f"subclass produced inconsistent outputs."
                 )
         else:
-            # Legacy fallback when the pipeline subclass didn't echo the real
-            # step IDs. Only safe when K == T (dense). For sparse K < T this
-            # misaligns replay; raise rather than silently mis-label.
             T = int(traj_latents.shape[1]) - 1 if traj_latents is not None else K
             if K != T:
                 raise RuntimeError(
@@ -241,9 +226,6 @@ def build_image_segment(
                 )
             sde_indices = torch.arange(K, dtype=torch.long)
     elif traj_latents is not None:
-        # Forward-process case (NFT): still emit ``indices`` so the trainer's
-        # clean-latents branch can look up the final latent, but drop the
-        # ``[B, 0]`` log-probs placeholder (it confuses downstream replay).
         traj_log_probs = None
         T_plus_1 = int(traj_latents.shape[1])
         indices = torch.arange(T_plus_1, dtype=torch.long)
@@ -274,11 +256,6 @@ def decoded_text_from_ar(per_request: Sequence[Sequence[Any]]) -> Texts:
     return Texts.from_list(texts)
 
 
-# --------------------------------------------------------------------------- #
-# AR segment capture (Stage 0 tokens + per-token log-probs)
-# --------------------------------------------------------------------------- #
-
-
 def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor]:
     """Best-effort vLLM-logprob → ``[T]`` float tensor.
 
@@ -295,8 +272,6 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
         if step is None:
             values.append(0.0)
             continue
-        # vLLM Logprob objects expose ``.logprob``; dicts usually have one
-        # entry whose value is the Logprob object. Try both shapes.
         if hasattr(step, "logprob"):
             values.append(float(step.logprob))
             continue
@@ -308,8 +283,6 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
     if not values:
         return None
     if len(values) != fallback_len and fallback_len > 0:
-        # Truncate or pad-with-zeros so the downstream stack stays well-shaped
-        # (pad is rare — early-stop / retokenize mismatches).
         if len(values) > fallback_len:
             values = values[:fallback_len]
         else:

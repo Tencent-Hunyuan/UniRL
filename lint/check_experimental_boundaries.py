@@ -43,8 +43,6 @@ def _normalize(name: str) -> str:
 
 def _py_files(base: Path):
     for path in sorted(base.rglob("*.py")):
-        # Intersect repo-relative parts: an absolute-path match would let a checkout
-        # that merely lives under a directory named "vendor" skip every rule.
         if not SKIP_PARTS.intersection(path.relative_to(ROOT).parts):
             yield path
 
@@ -150,7 +148,6 @@ def check_requirements_additive_only(errors: list[str]) -> None:
                 continue
             match = _REQ_NAME_RE.match(line)
             rest = line[match.end() :] if match else ""
-            # "@" covers PEP 508 direct references, spaced or not (name@git+https://...).
             if not match or (rest and rest[0] not in " \t@[<>=!~;,"):
                 errors.append(f"{rel}:{lineno}: {line!r} — unparseable requirement; use PEP 508 name-based pins")
             elif _normalize(match.group(1)) in core:

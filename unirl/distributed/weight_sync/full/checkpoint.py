@@ -71,9 +71,6 @@ class CheckpointWeightSync(FullWeightSync):
         track_prefix: str = "",
         wire_dtype: Any = None,
     ) -> None:
-        # NOTE: no ``bucket_size_mb`` — the base's size-bounded bucketing
-        # (``_iter_buckets``) is for streaming transports; this handler writes the
-        # whole state_dict in one ``torch.save``, so bucketing never runs.
         super().__init__(
             backend=backend,
             flush_cache=flush_cache,
@@ -84,9 +81,6 @@ class CheckpointWeightSync(FullWeightSync):
             wire_dtype=wire_dtype,
         )
         self._rollout = rollout  # local engine sibling (colocate)
-        # Isolate concurrent/restarted jobs. Ray's job id is identical on every
-        # train rank; the rollout class / track prefix isolates multiple checkpoint
-        # bridges within one job.
         scope = self._track_prefix or type(rollout).__name__
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "default"
         self._dir = os.path.join(str(sync_dir), _shared_run_id(run_id), scope)
@@ -110,10 +104,6 @@ class CheckpointWeightSync(FullWeightSync):
 
         if self._my_rank == 0:
             os.makedirs(self._dir, exist_ok=True)
-            # A restarted actor can reuse the same version inside the same Ray
-            # job. Remove that version's stale publication before the first FSDP
-            # all-gather; the collective then keeps every rank from reaching the
-            # marker wait until this cleanup has happened.
             for stale in (path, path + ".tmp", marker, marker + ".tmp"):
                 try:
                     os.remove(stale)
@@ -129,11 +119,11 @@ class CheckpointWeightSync(FullWeightSync):
         if self._my_rank == 0:
             tmp = path + ".tmp"
             torch.save(state_dict, tmp)
-            os.replace(tmp, path)  # atomic publish
+            os.replace(tmp, path)
             marker_tmp = marker + ".tmp"
             with open(marker_tmp, "w") as fh:
                 fh.write(f"version={version}\npath={path}\n")
-            os.replace(marker_tmp, marker)  # marker becomes visible atomically
+            os.replace(marker_tmp, marker)
             del state_dict
 
         self._wait_for_marker(marker, path)
@@ -182,8 +172,6 @@ class CheckpointWeightSync(FullWeightSync):
         if self._my_rank != 0:
             return
         shutil.rmtree(self._dir, ignore_errors=True)
-        # Remove now-empty scope/run/root directories without touching siblings
-        # belonging to another bridge or concurrent Ray job.
         parent = os.path.dirname(self._dir)
         root = os.path.dirname(parent)
         for directory in (parent, root):

@@ -171,15 +171,7 @@ class Qwen3_5Bundle(Bundle):
         meta_init_state = None
         if config.meta_init_transformer:
             if model_type == "qwen3_5_moe":
-                # VeOmni owns the MoE meta build (EP plan, fused kernels) and
-                # constructs on init_device="meta" itself, so it cannot route
-                # through build_meta_init_transformer. Replicate that helper's
-                # finalize inline instead: capture init-computed non-persistent
-                # state (GDN conv/rope buffers absent from the checkpoint, else
-                # to_empty clobbers them), cast (metadata-only on meta), and stamp
-                # init_weights to a no-op so parallelize does not re-init after
-                # to_empty. capture_init_state requires buffers real on CPU, which
-                # VeOmni's meta build provides.
+                # Restore init-only buffers after VeOmni materializes the meta model.
                 from unirl.train.backend.veomni import _compat
 
                 _compat.ensure_qwen3_5_moe_installed()
@@ -226,9 +218,6 @@ class Qwen3_5Bundle(Bundle):
                 **load_kwargs,
             ).to(device)
 
-        # Patch the vision tower's fast_pos_embed_interpolate (verl borrow).
-        # Only when meta_init is on — eager from_pretrained already has the
-        # right devices and the upstream impl is fine.
         if config.meta_init_transformer:
             visual = getattr(transformer.model, "visual", None)
             if (
@@ -239,8 +228,6 @@ class Qwen3_5Bundle(Bundle):
                 _patch_fast_pos_embed_interpolate(visual)
                 logger.info("Patched fast_pos_embed_interpolate on %s", type(visual).__name__)
 
-        # Structural (sets requires_grad, no weight access); persists through
-        # to_empty + load on both meta and eager builds.
         if config.freeze_vision_tower:
             visual = getattr(transformer.model, "visual", None)
             if visual is not None:
@@ -280,10 +267,6 @@ class Qwen3_5Bundle(Bundle):
         )
         if config.meta_init_transformer:
             bundle._transformer_weights_path = path
-            # Ray-robust restore carrier for init-computed non-persistent state
-            # (captured above before to_empty; the transformer is now on meta, so
-            # recapturing here would fail). restore_init_state replays it in
-            # load_trainable_weights after the sharded weight load.
             bundle._meta_init_state = meta_init_state
         return bundle
 

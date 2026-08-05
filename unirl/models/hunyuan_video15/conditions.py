@@ -48,8 +48,6 @@ class HunyuanVideo15Conditions(Batch):
     text_glyph: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text_mllm: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text_glyph: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
-    # I2V slot — v1 always None, T2V uses the zero-placeholder path inside
-    # the diffusion stage.
     vision: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod

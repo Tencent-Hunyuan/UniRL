@@ -24,11 +24,6 @@ if TYPE_CHECKING:
     from unirl.types.segments.base import Segment
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers used by FlowGRPO, FlowDPPO, DiffusionNFT
-# ---------------------------------------------------------------------------
-
-
 def typed_conditions(
     conditions: Mapping[str, "Condition"],
     conditions_cls: Optional[Type[Any]],
@@ -65,14 +60,11 @@ def gather_sde_field(
             f"(ensure prepare_segment ran before compute_loss_and_backward)."
         )
     target_t = torch.tensor(target_steps, dtype=sde_indices.dtype, device=sde_indices.device)
-    # Ensure sde_indices is sorted (searchsorted requirement)
     sort_order = sde_indices.argsort()
     sde_indices = sde_indices[sort_order]
     tensor = tensor[:, sort_order.tolist()]
     positions = torch.searchsorted(sde_indices, target_t)
-    # Clamp to valid range before validation (searchsorted can return len for out-of-range)
     positions = positions.clamp(max=sde_indices.shape[0] - 1)
-    # Validate looked-up positions match
     if (sde_indices[positions] != target_t).any():
         bad = [int(t) for t, p in zip(target_steps, positions) if sde_indices[p] != t]
         raise ValueError(
@@ -127,7 +119,6 @@ def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[st
     """
     with torch.no_grad():
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
-        # expm1 is exp(x)-1 evaluated stably near x=0 (the on-policy regime).
         k3 = torch.expm1(log_r) - log_r
         out = {
             "k3_mean": float(k3.mean()),
@@ -194,11 +185,6 @@ def _grpo_clip_loss(
     return loss_per_elem, metrics
 
 
-# ---------------------------------------------------------------------------
-# Reference-policy KL helpers (FlowGRPO / FlowDPPO ``beta`` term)
-# ---------------------------------------------------------------------------
-
-
 def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``.
 
@@ -233,7 +219,6 @@ def _transition_sigma(
     idx = torch.tensor(target_steps, dtype=torch.long, device=device)
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
-    # sigma_max=sigmas[1] mirrors the stage's sigma==1 handling (used by Flow only).
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
     sigma_t = stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
     return sigma_t.reshape(1, -1, 1, 1, 1)
@@ -312,6 +297,25 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
     return model
 
 
+def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
+    """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor.
+
+    Call from every diffusion algorithm that drives ``stage.replay`` against an
+    anchor — today ``FlowGRPO`` (with its ``BagelFlowUniGRPO`` subclass) and
+    ``FlowDPPO``. Rationale: :mod:`unirl.models.types.batched_replay`.
+    """
+    if not getattr(stage, "batch_replay_steps", False):
+        return
+    if old_logp_source != "replay":
+        raise ValueError(
+            f"{algo}: pipeline.batch_replay_steps=True requires old_logp_source='replay', "
+            f"got {old_logp_source!r}. The batched replay path is numerically equivalent to "
+            f"the serial one but not bit-identical to the rollout forward, so a "
+            f"rollout-sourced anchor puts the PPO ratio outside clip_range. Set "
+            f"old_logp_source='replay', or disable pipeline.batch_replay_steps."
+        )
+
+
 @dataclass(frozen=True)
 class AlgorithmStepResult:
     """Result of one micro-step under the stage-driven contract.
@@ -376,21 +380,9 @@ class StageAlgorithm(Remote, ABC):
 
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
-    # Whether the v2 DiffusionTrainer must inject the FSDP ``backend`` sibling so the
-    # algorithm can reach the trainable model — e.g. FlowGRPO / FlowDPPO disable its
-    # LoRA adapter to forward the reference policy π_ref for the ``beta`` KL term.
-    # Independent of ``requires_ema_rollout`` (DiffusionNFT needs the backend for its
-    # EMA shadow). Default False — most algorithms take only the ``pipeline`` sibling.
     requires_backend: bool = False
-    # Whether the loss requires per-sample advantages. SFT variants set False.
     requires_advantages: bool = True
-    # Weight accumulated losses by samples or the global valid-token count.
     loss_weighting: str = "sample"
-    # Segment fields this algorithm freezes as the π_old anchor in
-    # :meth:`prepare_segment` (GRPO: ``("sde_logp",)``; FlowDPPO:
-    # ``("sde_logp", "sde_means")``). When the anchor is recomputed
-    # (:meth:`recomputes_anchor`), the train stack re-slices and reassembles
-    # exactly these fields at train-time geometry — it never hardcodes them.
     anchor_fields: Tuple[str, ...] = ()
 
     def recomputes_anchor(self) -> bool:

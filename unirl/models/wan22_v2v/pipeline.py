@@ -228,8 +228,7 @@ class WAN22V2VPipeline(Pipeline):
             t_full=t_full,
             t_eff=t_eff,
         )
-        # The returned Part must describe the trajectory that actually ran, not
-        # the discarded full schedule.
+        # The returned Part must describe the trajectory that actually ran, not the discarded full schedule.
         v2v_params = dataclasses.replace(
             params,
             num_inference_steps=t_eff,

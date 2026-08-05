@@ -87,6 +87,16 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
+- **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
+  leaves the full model on every rank, so no parameter bytes cross ranks and only
+  gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the
+  gradient (LoRA on a frozen base re-gathers the whole backbone *every* micro-batch)
+  and the model still fits unsharded — per-rank memory becomes the whole model +
+  grads + optimizer state. `reshard_after_forward` is **not** a no-op here: `false`
+  keeps every block's unsharded compute copy resident, which is a second full copy of
+  the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
+  leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
+  all-reduce per optimizer step. VeOmni only supports `full`.
 
 ## Profiling → Perfetto
 
