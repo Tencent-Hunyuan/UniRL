@@ -529,6 +529,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         schedule = segment.sigmas.to(device)
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
+        self.strategy.init_schedule(schedule)
 
         gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
