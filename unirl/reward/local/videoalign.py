@@ -495,10 +495,10 @@ class _VideoAlignInference:
         max_pixels = self._max_pixels if max_pixels is None else max_pixels
 
         chat_data = []
-        for prompt in prompts:
+        for idx, prompt in enumerate(prompts):
             vid_info: Dict[str, Any] = {
                 "type": "video",
-                "video": video_paths,
+                "video": video_paths[idx],
                 "max_pixels": max_pixels,
                 "sample_type": self._sample_type,
             }
