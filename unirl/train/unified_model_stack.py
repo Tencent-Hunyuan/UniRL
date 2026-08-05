@@ -253,6 +253,18 @@ class UnifiedModelTrainStack(Remote):
         )
         results: Dict[str, TrainStepResult] = {"ar": ar_result, "image": image_result}
         any_backward = ar_backward or image_backward
+        last_micros = image_result.micros or ar_result.micros
+
+        # Deferred reduce-scatter must be performed by the final microbatch.
+        # If that microbatch has no loss while an earlier one did, the accumulated
+        # gradients are still rank-local and must not be stepped silently.
+        if any_backward and last_micros and not last_micros[-1].has_backward and self.fsdp_backend.grad_sync_deferred:
+            raise RuntimeError(
+                "UnifiedModelTrainStack._train_one_step: defer_grad_sync deferred the gradient "
+                "reduce-scatter to the last microbatch, but it reported no backward while "
+                "an earlier microbatch did. Disable training.fsdp.defer_grad_sync or "
+                "investigate the empty final microbatch."
+            )
 
         if any_backward:
             # Defragment between multi-updates before NCCL gradient clipping.
