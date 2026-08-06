@@ -11,6 +11,7 @@ pipelines, not provided by the external dataset.
 import logging
 import os
 from collections import Counter
+from functools import partial
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import torch
@@ -560,6 +561,190 @@ class MultimodalRLDataSource:
             self.iter_eval_batches(batch_size),
             self._prompt_examples_to_batch([]),
         )
+
+
+class MultiDomainRLDataSource:
+    """Round-robin multi-domain prompt source — one domain per rollout batch.
+
+    Composes one ``TextPromptDataset`` + ``DataLoader`` per named domain and
+    cycles them across ``get_samples()`` calls, so every rollout batch is
+    single-domain. Every row is stamped with ``metadata["domain"] = <name>``;
+    downstream components route on that tag (``DiffusionOPD`` picks the frozen
+    teacher adapter of the same name, ``PerDomainRewardScorer`` dispatches each
+    row to its domain's scorer). Because routing is carried by the data itself,
+    resume fast-forwarding or reordering can never desynchronize a batch from
+    its domain.
+
+    Config (Hydra ``args``)::
+
+        args:
+          run:
+            domains:
+              - name: pickscore
+                data_path: datasets/pickscore/train.txt
+                eval_data_path: datasets/pickscore/test.txt   # optional
+              - name: ocr
+                data_path: datasets/ocr/train.txt
+            seed: 42
+          algorithm:
+            prompts_per_rollout: ${batch_size}
+
+    Text-only prompts (``media_refs`` are rejected). Prompt ids are prefixed
+    with the domain name so ids stay unique across domains — including inside
+    the concatenated eval Sample.
+    """
+
+    def __init__(self, args):
+        run_cfg = args.run
+        entries = list(getattr(run_cfg, "domains", None) or [])
+        if not entries:
+            raise ValueError("MultiDomainRLDataSource requires args.run.domains (a non-empty list).")
+
+        self.domains: List[Dict[str, Optional[str]]] = []
+        for entry in entries:
+            get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
+            name, data_path, eval_data_path = get("name"), get("data_path"), get("eval_data_path")
+            if not name or not data_path:
+                raise ValueError(f"Each domain entry needs 'name' and 'data_path'; got {entry!r}.")
+            if not os.path.exists(str(data_path)):
+                raise FileNotFoundError(f"Domain {name!r} data_path not found: {data_path}")
+            if eval_data_path and not os.path.exists(str(eval_data_path)):
+                raise FileNotFoundError(f"Domain {name!r} eval_data_path not found: {eval_data_path}")
+            self.domains.append(
+                {
+                    "name": str(name),
+                    "data_path": str(data_path),
+                    "eval_data_path": str(eval_data_path) if eval_data_path else None,
+                }
+            )
+        names = [d["name"] for d in self.domains]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Domain names must be unique, got {names}.")
+
+        self.seed = getattr(run_cfg, "seed", None)
+        self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
+        self.drop_last = True
+
+        self._datasets: List[TextPromptDataset] = []
+        self._dataloaders: List[DataLoader] = []
+        self._iters: List[Iterator] = []
+        self._eval_datasets: Optional[List[TextPromptDataset]] = None
+        self._iter_counter = 0
+
+        for i, domain in enumerate(self.domains):
+            ds = TextPromptDataset(file_path=domain["data_path"])
+            if len(ds) < self.prompts_per_rollout:
+                raise ValueError(
+                    f"Domain {domain['name']!r} dataset is smaller than prompts_per_rollout, which "
+                    f"would produce an empty DataLoader with drop_last=True "
+                    f"(num_prompts={len(ds)}, prompts_per_rollout={self.prompts_per_rollout})."
+                )
+            # Per-domain generator offset by index; seed=None -> OS entropy
+            # (the base class's seed=null contract).
+            generator = torch.Generator()
+            if self.seed is None:
+                generator.manual_seed(int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF)
+            else:
+                generator.manual_seed(int(self.seed) + i)
+            loader = DataLoader(
+                ds,
+                batch_size=self.prompts_per_rollout,
+                shuffle=True,
+                generator=generator,
+                num_workers=0,  # Keep simple for Ray
+                collate_fn=partial(self._collate_domain, domain["name"]),
+                drop_last=True,
+            )
+            self._datasets.append(ds)
+            self._dataloaders.append(loader)
+            self._iters.append(iter(loader))
+            logger.info(
+                "MultiDomainRLDataSource: domain %r — %d prompts from %s",
+                domain["name"],
+                len(ds),
+                domain["data_path"],
+            )
+
+    def _domain_examples_to_batch(self, domain: str, examples: List[Dict[str, Any]], *, tag: str) -> Sample:
+        """Build a Sample from one domain's prompt examples, domain-stamped."""
+        if any(item.get("media_refs") for item in examples):
+            raise ValueError(
+                f"MultiDomainRLDataSource is text-prompt-only; domain {domain!r} has media_refs. "
+                "Extend it alongside MultimodalRLDataSource._collate_text when a recipe needs media."
+            )
+        prompts = [item["prompt"] for item in examples]
+        prompt_ids = []
+        for idx, item in enumerate(examples):
+            pid = item.get("prompt_id")
+            pid = f"{tag}:{idx}" if pid is None or not str(pid).strip() else str(pid)
+            # Domain prefix keeps ids unique across domains (the eval Sample
+            # concatenates all domains into one id namespace).
+            prompt_ids.append(f"{domain}:{pid}")
+        sample_ids = [f"prompt:{pid}:sample:0" for pid in prompt_ids]
+        metadata_list: List[Optional[Dict[str, Any]]] = []
+        for item in examples:
+            md = dict(item.get("metadata") or {})
+            md["domain"] = domain
+            metadata_list.append(md)
+        return _input_sample({"text": Texts(texts=prompts)}, sample_ids=sample_ids, metadata=metadata_list)
+
+    def _collate_domain(self, domain: str, batch: List[Dict[str, Any]]) -> Sample:
+        return self._domain_examples_to_batch(domain, batch, tag="train")
+
+    def get_samples(self, batch_size: int) -> Sample:
+        """Next single-domain batch; domains cycle in declaration order.
+
+        ``batch_size`` is nominal — the actual size is ``prompts_per_rollout``,
+        fixed at construction (mirrors :class:`MultimodalRLDataSource`).
+        """
+        idx = self._iter_counter % len(self.domains)
+        self._iter_counter += 1
+        try:
+            return next(self._iters[idx])
+        except StopIteration:
+            self._iters[idx] = iter(self._dataloaders[idx])
+            return next(self._iters[idx])
+
+    @property
+    def num_prompts(self) -> int:
+        return sum(len(ds) for ds in self._datasets)
+
+    def _ensure_eval_datasets(self) -> List[TextPromptDataset]:
+        if self._eval_datasets is None:
+            self._eval_datasets = [
+                TextPromptDataset(file_path=domain["eval_data_path"] or domain["data_path"]) for domain in self.domains
+            ]
+        return self._eval_datasets
+
+    def get_eval_samples(self, batch_size: int) -> Sample:
+        """One deterministic eval Sample of up to ``batch_size`` prompts.
+
+        The budget is split evenly across domains (remainder to the earlier
+        ones) and the per-domain slices are concatenated, so every domain is
+        represented in a single eval pass — the trainer chunks the returned
+        Sample itself. ``batch_size <= 0`` returns an empty batch, mirroring
+        :meth:`MultimodalRLDataSource.get_eval_samples`.
+        """
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            return self._domain_examples_to_batch(self.domains[0]["name"], [], tag="eval")
+        eval_datasets = self._ensure_eval_datasets()
+        per_domain, remainder = divmod(batch_size, len(self.domains))
+        batches: List[Sample] = []
+        for i, (domain, ds) in enumerate(zip(self.domains, eval_datasets)):
+            limit = min(per_domain + int(i < remainder), len(ds))
+            if limit <= 0:
+                continue
+            examples = [
+                normalize_prompt_example(ds.get_prompt_example(idx), default_prompt_id=f"eval:{idx}")
+                for idx in range(limit)
+            ]
+            batches.append(self._domain_examples_to_batch(domain["name"], examples, tag="eval"))
+        if not batches:
+            return self._domain_examples_to_batch(self.domains[0]["name"], [], tag="eval")
+        if len(batches) == 1:
+            return batches[0]
+        return Sample.concat(batches)
 
 
 class DefaultDataSource:

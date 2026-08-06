@@ -1,7 +1,8 @@
 # Algorithms
 
 > **Where it fits:** the loss half of the *train* step —
-> rollout → reward → advantage → **train** → sync. In: a track with advantages.
+> rollout → reward → advantage → **train** → sync. In: a track with advantages
+> (supervised / teacher-anchored algorithms opt out via `requires_advantages = False`).
 > Out: gradients on the model (the optimizer step in `../train` consumes them).
 > Full map: [`../README.md`](../README.md).
 
@@ -45,7 +46,11 @@ not just three-tensor arithmetic.
   dual-adapter loop via `predict_noise_at_step`). The families: GRPO is a
   PPO-clipped ratio (`flowgrpo.py` / `grpo.py`); FlowDPPO masks `-A·r` by a
   Gaussian-KL-vs-advantage criterion (`flowdppo.py`); DiffusionNFT is a dual-adapter
-  reconstruction MSE (`diffusionnft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`).
+  reconstruction MSE (`diffusionnft.py`); DRPO is a token-adaptive SPO quadratic (`drpo.py`);
+  DiffusionOPD is the teacher-anchored family — a per-step Gaussian KL against frozen
+  teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
+  it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
+  (`diffusionopd.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -79,6 +84,10 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **`params` must reuse the rollout `guidance_scale`/`eta`/`shift`** — single-track
   recipes bind `params: ${sampling}`; composed recipes bind the sub-block (e.g.
   `${sampling.diffusion}`). A mismatch silently skews log-probs.
+- **DiffusionOPD's ODE recipes keep `sampling.eta` vanishing-but-nonzero** (e.g. `1e-6`,
+  so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
+  near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
+  scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

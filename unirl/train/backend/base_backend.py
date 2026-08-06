@@ -48,9 +48,9 @@ from unirl.train.backend.sharded_state import (
     sharded_optimizer_state_dict,
     trainable_params,
 )
-from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
+from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig, normalize_frozen_adapters
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
-from unirl.train.lora import inject_lora, resolve_target_modules_pattern
+from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
 if TYPE_CHECKING:
@@ -209,6 +209,11 @@ class BaseFSDP2Backend(Remote):
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
             )
+            # Frozen sibling adapters (e.g. OPD teachers): injected pre-wrap so FSDP
+            # shards them and checkpoints stay symmetric; requires_grad=False keeps
+            # them out of the optimizer and weight sync.
+            for spec in normalize_frozen_adapters(getattr(lora_cfg, "frozen_adapters", None)):
+                inject_frozen_adapter(model, name=spec.name, path=spec.path)
         if ema_cfg is not None:
             shadow = inject_mirror(model, prefix=ema_cfg.shadow_prefix)
         return shadow

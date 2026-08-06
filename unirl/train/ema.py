@@ -32,7 +32,9 @@ from unirl.train.configs import EmaFullConfig, EmaLoraConfig
 from unirl.train.deferred import _stamp
 from unirl.train.lora import (
     ModuleSelection,
+    _activate,
     _reset_adapter,
+    _set_adapter_requires_grad,
     normalize_module_selection,
     normalize_optional_module_selection,
 )
@@ -207,18 +209,6 @@ def inject_mirror(
     )
 
 
-def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
-    from peft.tuners.lora import LoraLayer
-
-    for m in model.modules():
-        if not isinstance(m, LoraLayer):
-            continue
-        for key in ("lora_A", "lora_B"):
-            bank = getattr(m, key, {})
-            if name in bank:
-                bank[name].weight.requires_grad = requires_grad
-
-
 def _copy_adapter(model: nn.Module, *, src: str, dst: str) -> None:
     from peft.tuners.lora import LoraLayer
 
@@ -253,14 +243,6 @@ def _adapter_pairs(
                 for sp, dp in zip(bank[default].parameters(), bank[shadow].parameters()):
                     pairs.append((sp, dp))
     return pairs
-
-
-def _activate(model: nn.Module, adapter_name: str) -> None:
-    from peft.tuners.lora import LoraLayer
-
-    for m in model.modules():
-        if isinstance(m, LoraLayer):
-            m.set_adapter(adapter_name)
 
 
 def _activate_keep_grad(model: nn.Module, active: str, *, trainable: str, frozen: str) -> None:
