@@ -66,6 +66,25 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     )
 
 
+def _score_reads(sample: Sample) -> list:
+    """Tensors :meth:`RewardService.score_and_attach` reads — its ``reads=`` selector.
+
+    Scoring touches the decoded output and the decoded input context and nothing
+    else: the frontier's ``segment`` (the denoising trajectory / token payload),
+    its ``conditions`` (encoded prompt embeddings) and ``media_preview`` are
+    training- and logging-side fields that the reward only carries through. On a
+    disaggregated run that makes the difference between shipping the whole
+    rollout across the slab boundary and shipping just the media being scored —
+    and the media is dropped (``BaseTrainer._drop_decoded``) before training ever
+    sees it, so under the old whole-tree localize it crossed only to be freed.
+
+    Must stay in sync with what :func:`_build_reward_request` reads. Segment
+    lengths (the ``truncated_reward`` shaping below) come from framework-managed
+    ``cu_seqlens``, which travels by value and needs no localization.
+    """
+    return [sample.parts[-1].primitives, sample.conditioning(), sample.root_metadata(-1)]
+
+
 class RewardService(Remote):
     """Actor-side reward entry: one backend, scores a Sample's frontier Part in place."""
 
@@ -129,7 +148,7 @@ class RewardService(Remote):
             )
         return self.backend.compute_rewards_differentiable(media_tensor, list(prompts), records=records)
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, reads=_score_reads)
     def score_and_attach(self, sample: Sample) -> Sample:
         """Score the frontier (last) Part's generated media and return the updated Sample.
 
@@ -138,7 +157,9 @@ class RewardService(Remote):
         already row-aligned to the frontier, so there is no request/track expansion
         to reconcile. DP_SCATTER shards the whole Sample by prompt-tree
         (:meth:`Sample.slice`), keeping each shard's conditioning and frontier
-        co-resident.
+        co-resident. ``reads=_score_reads`` keeps the rest of the Sample — the
+        trajectory and encoded conditions training will consume — from being
+        dragged onto the reward's workers just to be handed straight back.
 
         Returns a new :class:`~unirl.types.sample.Sample` with ``rewards`` and
         ``component_rewards`` on the frontier Part; the other parts are untouched

@@ -15,16 +15,23 @@ DP-aware dispatch (DP_SCATTER, DP_SCATTER_HEAD):
   - Workers in the same DP group (varying TP/PP/SP rank) receive the SAME shard
   - Collect filters: only tp_rank==0, pp_last_stage, sp_rank==0 results are kept
   - Kept results are merged via pytree_cat to reconstruct the full batch
+
+Partial localization (``@distributed(reads=...)`` / ``(skips=...)``):
+  - A method may declare which subtrees of its arguments it actually reads
+    (whitelist) or which it provably does not (blacklist)
+  - required_store_keys turns that into the per-shard mask the controller's
+    localize and the worker's fetch both honor, so unread refs never move
 """
 
 from __future__ import annotations
 
 from enum import Enum, auto
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeAlias
 
 from unirl.distributed.tensor.pytree import pytree_cat, pytree_chunk
-from unirl.distributed.utils import Broadcast
+from unirl.distributed.tensor.ref import TensorRef, ref_store_keys
+from unirl.distributed.utils import Broadcast, collect_leaves
 
 if TYPE_CHECKING:
     from unirl.distributed.group.handle import Handle
@@ -240,6 +247,76 @@ def resolve_backward_dispatch_mode(
     return Dispatch.DP_SCATTER
 
 
+# ── Partial localization (``reads=`` / ``skips=``) ──
+
+
+def _subtree_store_keys(selector: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Set[str]:
+    keys: Set[str] = set()
+    for ref in collect_leaves(selector(*args, **kwargs), TensorRef):
+        keys |= ref_store_keys(ref)
+    return keys
+
+
+def has_partial_localization(config: Optional[Dict[str, Any]]) -> bool:
+    """Whether a ``@distributed`` config narrows localization at all."""
+    return bool(config) and (config.get("reads") is not None or config.get("skips") is not None)
+
+
+def required_store_keys(
+    config: Optional[Dict[str, Any]], args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> Optional[Set[str]]:
+    """Store keys one shard must have resolvable on its worker, or ``None`` for all.
+
+    ``None`` — the default when a method declares neither selector — means
+    "localize the whole argument tree", the historical behavior.
+
+    ``reads=`` is a whitelist: the named subtrees are localized and every other
+    ref rides along dehydrated. ``skips=`` is the complement, for a method that
+    reads most of its argument and only wants a known-dead payload held back;
+    a field nobody named is localized, so extending the schema stays safe.
+
+    Both errors bend the same way — toward moving too much. Store keys ALIAS: a
+    backend that sees one tensor object at two tree paths emits two handles over
+    one key (``GPUStoreTransport.put_batch``), so a whitelisted key may drag an
+    unread twin along, and a skipped key is withheld only when no ref outside the
+    skipped subtrees also carries it. Over-localizing costs bandwidth;
+    under-localizing would hand the method a ``TensorRef`` where it wants a
+    tensor.
+
+    Both the controller (``Handle``, deciding what to NCCL) and the worker
+    (``Worker.call``, deciding what to fetch) call this on the SAME shard, so a
+    selector must be pure. An empty shard (``DP_SCATTER_HEAD`` gives non-head
+    ranks no args) needs nothing.
+    """
+    if not has_partial_localization(config):
+        return None
+    if not args and not kwargs:
+        return set()
+    reads_fn, skips_fn = config.get("reads"), config.get("skips")
+    if reads_fn is not None:
+        return _subtree_store_keys(reads_fn, args, kwargs)
+
+    # Blacklist. Identity, not keys, decides which refs are inside the skipped
+    # subtrees; a selector that hands back a VIEW instead of the tree's own ref
+    # matches nothing and degrades to full localization rather than withholding a
+    # tensor. Keys claimed by any ref OUTSIDE those subtrees stay required, which
+    # is what makes the subtraction alias-safe.
+    skipped_refs = {id(ref) for ref in collect_leaves(skips_fn(*args, **kwargs), TensorRef)}
+    everything: Set[str] = set()
+    skipped: Set[str] = set()
+    claimed_elsewhere: Set[str] = set()
+    for ref in collect_leaves(args, TensorRef) + collect_leaves(kwargs, TensorRef):
+        keys = ref_store_keys(ref)
+        everything |= keys
+        if id(ref) in skipped_refs:
+            skipped |= keys
+        else:
+            claimed_elsewhere |= keys
+    return everything - (skipped - claimed_elsewhere)
+
+
+# ── @distributed decorator ──
+
 DISTRIBUTED_CONFIG_ATTR = "_distributed_config"
 
 
@@ -248,11 +325,32 @@ def distributed(
     *,
     dispatch_mode: Dispatch = Dispatch.DP_SCATTER,
     execute_mode: Execute = Execute.ALL,
+    reads: Optional[Callable] = None,
+    skips: Optional[Callable] = None,
 ) -> Callable:
     """Declare SPMD dispatch/execute mode on a Role method.
 
     Handle scans for this attribute and auto-generates proxy methods.
     Default dispatch mode is DP_SCATTER.
+
+    ``reads`` / ``skips`` opt the method into PARTIAL LOCALIZATION. By default
+    every tensor in the argument tree is shipped to the callee's worker, which is
+    pure waste for a cross-slab method that touches one field of a big pytree (a
+    reward scoring one decoded image off a Sample also drags the training
+    trajectory across the slab boundary). Both selectors take the method's own
+    arguments (no ``self``) and name subtrees:
+
+    * ``reads`` — a whitelist, for a method reading a small slice of its
+      argument. Anything unnamed rides along dehydrated and, if the method
+      returns it, comes back still owned by its producing worker.
+    * ``skips`` — the complement, for a method that reads most of its argument
+      and only wants a known-dead payload held back. Safer against schema
+      growth: a field nobody named is still localized.
+
+    A selector must be a pure function of the arguments — the controller and the
+    worker each call it on their own copy of the shard and must reach the same
+    answer. Declaring both is a config error. Incompatible with
+    ``enable_grad()``: an unlocalized input has no worker-side grad leaf.
 
     Usage:
         class DiffusionRemote(Remote):
@@ -263,7 +361,17 @@ def distributed(
             @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
             def get_metrics(self):
                 ...
+
+            @distributed(reads=lambda sample: sample.parts[-1].primitives)
+            def score(self, sample):
+                ...
+
+            @distributed(skips=lambda part, **_: part.primitives)
+            def train(self, part):
+                ...
     """
+    if reads is not None and skips is not None:
+        raise ValueError("@distributed takes reads= or skips=, not both: the mask would be ambiguous.")
 
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -276,6 +384,8 @@ def distributed(
             {
                 "dispatch_mode": dispatch_mode,
                 "execute_mode": execute_mode,
+                "reads": reads,
+                "skips": skips,
             },
         )
         return wrapper

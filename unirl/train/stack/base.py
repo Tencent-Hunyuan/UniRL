@@ -99,6 +99,25 @@ def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepRes
     )
 
 
+def _train_skips(part: Part, **_) -> list:
+    """Payloads training provably never reads — the ``skips=`` selector for dispatch.
+
+    :func:`_align_track_to_model` already documents the invariant on the device
+    side: training consumes the segment, conditions and advantages, never the
+    decoded media or its wandb preview. Declaring it to dispatch enforces the same
+    invariant one step earlier, at the slab boundary, so the payload cannot cross
+    the wire even if a caller reaches ``train_track`` without having run
+    ``BaseTrainer._drop_decoded`` first (every trainer does today, which is why
+    this holds no bytes back in the shipped recipes — it makes the convention
+    unbreakable rather than merely observed).
+
+    Deliberately a blacklist: WHICH segment and condition tensors a step reads is
+    algorithm-specific, so a whitelist would have to be re-derived per algorithm
+    and would silently withhold a field when one grows a new input.
+    """
+    return [part.primitives, part.media_preview]
+
+
 def _align_track_to_model(part: Part, *, device: torch.device) -> None:
     """Move a track's training inputs onto the model's device — SGLang returns them
     on CPU via Ray IPC. Uses :meth:`Batch.to_device` (recursive; carries
@@ -406,7 +425,7 @@ class TrainStack(Remote):
         """
         return self.fsdp_backend.all_reduce_loss_sums(values)
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, skips=_train_skips)
     def eval_track(self, part: Part) -> Dict[str, float]:
         """Weighted forward-only loss over this shard; returns GLOBAL metrics.
 
@@ -451,7 +470,7 @@ class TrainStack(Remote):
             raise ValueError(f"{type(self).__name__}.eval_track: zero eval weight (empty/fully-padded batch?).")
         return {"loss": global_loss / global_weight, "weight": global_weight}
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, skips=_train_skips)
     def train_track(
         self,
         parts: Union[Part, Tuple[Part, ...]],

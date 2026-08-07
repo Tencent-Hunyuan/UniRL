@@ -111,6 +111,45 @@ class TensorSpan(Generic[T]):
         return f"TensorSpan({self.handle!r}[{self.start}:{self.stop}])"
 
 
+def ref_store_keys(ref: "TensorRef") -> set:
+    """Backend store keys this ref resolves through.
+
+    The by-VALUE identity partial localization keys on: a ``reads=`` selector may
+    hand back row-aligned ref VIEWS (``Sample.conditioning`` re-slices ancestor
+    primitives) rather than the argument tree's own ref objects, so the controller
+    and the worker cannot agree by object identity — but a view shares its source
+    spans' ``store_key``.
+
+    Keys are unique per producing device and only within one live ``DevicePool``
+    (each store counts up from zero behind a device/worker prefix), which is the
+    scope every mask is computed and consumed in.
+    """
+    return {key for key in (getattr(s.handle, "store_key", None) for s in ref.spans) if key is not None}
+
+
+def ref_is_required(ref: "TensorRef", required: Optional[set]) -> bool:
+    """Whether ``ref`` must be resolvable on the callee's worker, given a key mask.
+
+    ``None`` is the no-mask default: everything is required. Whole-ref, not
+    per-span, because the controller's ``localize`` and the worker's fetch have to
+    agree and the worker resolves a ref as one unit (``get_batch`` cats its
+    spans). A ref whose spans straddle the mask counts as required — an
+    over-broad mask only costs bandwidth, whereas an under-broad one would hand
+    the callee a ``TensorRef`` where it expects a tensor.
+
+    A ref with NO store key is always required: keyless means plasma-backed (CPU
+    tensors), empty, or from a GLOBAL backend (the transfer queue keys nothing),
+    all of which resolve from any process without a controller-orchestrated
+    transfer. That is the same short-circuit ``WorkerLocalTransport._move_key``
+    applies, so masking such a ref out would withhold a tensor that needs no
+    move — which also means partial localization is inert on a GLOBAL backend.
+    """
+    if required is None:
+        return True
+    keys = ref_store_keys(ref)
+    return not keys or bool(keys & required)
+
+
 def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
     """Concatenate per-ref tensors along dim 0 — the single assembly funnel.
 
@@ -365,4 +404,12 @@ def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:
     return obj
 
 
-__all__ = ["TensorHandle", "TensorSpan", "TensorRef", "cat_rows", "map_tree"]
+__all__ = [
+    "TensorHandle",
+    "TensorSpan",
+    "TensorRef",
+    "cat_rows",
+    "map_tree",
+    "ref_is_required",
+    "ref_store_keys",
+]

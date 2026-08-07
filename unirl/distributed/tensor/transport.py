@@ -214,13 +214,21 @@ class TensorTransport(abc.ABC):
         )
 
     @classmethod
-    def localize(cls, shards: list, pool: Any, device_ids: list, worker_ids: list) -> list:
+    def localize(
+        cls,
+        shards: list,
+        pool: Any,
+        device_ids: list,
+        worker_ids: list,
+        required: Optional[List[Optional[Set[str]]]] = None,
+    ) -> list:
         """Make every ref in each shard resolvable on its target worker.
 
         Base (GLOBAL) backends: identity — a ref resolves from any process, so no
         controller-orchestrated transfer is needed. WorkerLocalTransport overrides
-        with the NCCL/IPC routing skeleton. ``pool`` (topology) and the per-shard
-        ``device_ids``/``worker_ids`` (dst identity) are unused here.
+        with the NCCL/IPC routing skeleton. ``pool`` (topology), the per-shard
+        ``device_ids``/``worker_ids`` (dst identity) and ``required`` (the
+        per-shard partial-localization mask) are all unused here.
         """
         return shards
 
