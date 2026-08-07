@@ -70,6 +70,7 @@ class AgenticTrainer(BaseTrainer):
             sampling_cfg=sampling_cfg,
             algorithm_cfg=algorithm_cfg,
             sync_cfg=sync_cfg,
+            per_worker_inflight=per_worker_inflight,
         )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
 
@@ -90,13 +91,6 @@ class AgenticTrainer(BaseTrainer):
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
 
-            required_concurrency = self._per_worker_inflight + 2
-            if int(self.pool.worker_max_concurrency) < required_concurrency:
-                raise ValueError(
-                    f"worker_max_concurrency ({self.pool.worker_max_concurrency}) must be >= "
-                    f"per_worker_inflight + 2 ({required_concurrency}) so control calls "
-                    "(set_stopping/sleep/weight sync) are not starved by trajectory slots"
-                )
             indices = [
                 index
                 for index, rank_info in enumerate(self.rollout.rank_infos)
@@ -127,9 +121,23 @@ class AgenticTrainer(BaseTrainer):
         sampling_cfg: DictConfig,
         algorithm_cfg: DictConfig,
         sync_cfg: Optional[DictConfig],
+        per_worker_inflight: int,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
+        if int(per_worker_inflight) <= 0:
+            raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
+        # Mirrors the DevicePool default in BaseTrainer; checked here so a bad combination
+        # fails before any expensive runtime construction.
+        worker_max_concurrency = int(cfg.get("worker_max_concurrency", 1))
+        required_concurrency = int(per_worker_inflight) + 2
+        if worker_max_concurrency < required_concurrency:
+            raise ValueError(
+                f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
+                f"({required_concurrency}) so control calls (set_stopping/sleep/weight sync) are not "
+                "starved by trajectory slots; raise worker_max_concurrency in the recipe or lower "
+                "per_worker_inflight"
+            )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
         sync_target = str(sync_cfg.get("_target_", ""))
