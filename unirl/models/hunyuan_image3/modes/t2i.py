@@ -63,10 +63,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     diff_conds = HunyuanImage3DiffusionConditions(
         fused=mm["fused"],
-        # _update_state is the only reader and it runs only when the cache is
-        # on, so with it off this batch-level opaque object would ride the
-        # track transport without anyone able to consume it.
-        tokenizer_output=(mm["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None),
+        tokenizer_output=mm["tokenizer_output"],
     )
     schedule = params.sigmas.to(pipeline.bundle.device)
 
