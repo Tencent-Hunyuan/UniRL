@@ -39,7 +39,8 @@ Naming convention (a symbol's name tells you its layer):
 Ownership map (kept explicit so reading the code doesn't require
 following six getattr chains)::
 
-    Policy        owned by  MODEL CHECKPOINT (scheduler/transformer/vae JSONs)
+    Policy        owned by  MODEL CHECKPOINT (scheduler/transformer/vae JSONs),
+                  time-shift overridable per request (schedule_shift / schedule_mu)
     Params (T,H,W) owned by REQUEST (the gen Part's DiffusionSamplingParams)
     σ computation owned by THIS MODULE (pure function)
     σ flow        carried by the gen Part's sigmas (set by engine, read by
@@ -278,6 +279,8 @@ class FlowMatchSchedulePolicy:
         height: int,
         width: int,
         device: Optional[torch.device] = None,
+        shift_override: Optional[float] = None,
+        mu_override: Optional[float] = None,
     ) -> torch.Tensor:
         """Apply this policy to a request's ``(T, H, W)`` → σ tensor ``[T+1]``.
 
@@ -287,15 +290,37 @@ class FlowMatchSchedulePolicy:
           :meth:`compute_mu` (the per-model override point), then apply the
           diffusers dynamic shift.
 
+        ``shift_override`` / ``mu_override`` let one request run a different
+        time-shift than the policy's own — how evaluation decouples its
+        schedule from the training rollout. Each belongs to exactly one
+        branch, so passing the branch's inert one raises instead of being
+        silently dropped.
+
         The stateless math beyond this point lives in the free functions
         :func:`get_sigma_schedule` / :func:`calculate_dynamic_mu`.
         """
         if not self.use_dynamic_shifting:
-            return get_sigma_schedule(num_inference_steps, self.shift, device, shift_terminal=self.shift_terminal)
-        latent_h = int(height) // int(self.vae_scale_factor)
-        latent_w = int(width) // int(self.vae_scale_factor)
-        image_seq_len = (latent_h // int(self.patch_size)) * (latent_w // int(self.patch_size))
-        mu = self.compute_mu(image_seq_len, num_inference_steps)
+            if mu_override is not None:
+                raise ValueError(
+                    f"FlowMatchSchedulePolicy.compute_sigma: mu_override={mu_override!r} on a "
+                    f"static-shift policy, whose schedule has no μ. Pass shift_override instead."
+                )
+            shift = self.shift if shift_override is None else float(shift_override)
+            return get_sigma_schedule(num_inference_steps, shift, device, shift_terminal=self.shift_terminal)
+        if shift_override is not None:
+            raise ValueError(
+                f"FlowMatchSchedulePolicy.compute_sigma: shift_override={shift_override!r} on a "
+                f"dynamic-shift policy, whose schedule is parameterized by μ and never reads "
+                f"``shift``. Pass mu_override instead (or drop the override and let "
+                f"compute_mu derive μ from the request's resolution and step count)."
+            )
+        if mu_override is None:
+            latent_h = int(height) // int(self.vae_scale_factor)
+            latent_w = int(width) // int(self.vae_scale_factor)
+            image_seq_len = (latent_h // int(self.patch_size)) * (latent_w // int(self.patch_size))
+            mu = self.compute_mu(image_seq_len, num_inference_steps)
+        else:
+            mu = float(mu_override)
         return get_sigma_schedule(
             num_inference_steps,
             self.shift,
@@ -469,6 +494,8 @@ def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
         num_inference_steps=int(diffusion.num_inference_steps),
         height=int(diffusion.height),
         width=int(diffusion.width),
+        shift_override=diffusion.schedule_shift,
+        mu_override=diffusion.schedule_mu,
     )
 
 

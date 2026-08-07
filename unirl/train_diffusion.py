@@ -64,6 +64,12 @@ def main(cfg: DictConfig) -> None:
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
         eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        # Unset ⇒ eval inherits the rollout's `sampling` value.
+        eval_num_inference_steps=cfg.get("eval_num_inference_steps"),
+        eval_height=cfg.get("eval_height"),
+        eval_width=cfg.get("eval_width"),
+        eval_shift=cfg.get("eval_shift"),
+        eval_mu=cfg.get("eval_mu"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=_resolve_task_config(cfg),
     )
