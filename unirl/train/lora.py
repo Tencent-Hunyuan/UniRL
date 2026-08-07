@@ -2,13 +2,21 @@
 
 Build-time structural mutation only: :func:`inject_lora` installs a single
 peft adapter on the trainable stage and stamps the post-materialize reset via
-``unirl.train.deferred``.  No Shadow, no EMA — the dual-adapter NFT variant
-lives in ``unirl.train.ema``.
+``unirl.train.deferred``; :func:`inject_frozen_adapter` installs an additional
+frozen, inference-only adapter (e.g. a distillation teacher) with weights
+loaded from a peft checkpoint.  No Shadow, no EMA — the dual-adapter NFT
+variant lives in ``unirl.train.ema``.
+
+Adapter routing helpers (:func:`adapter_active`, ``_activate``,
+``_set_adapter_requires_grad``) live here so every touch of peft's per-layer
+activation state goes through one module.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 from contextlib import contextmanager
 from functools import partial
@@ -139,6 +147,219 @@ def _reset_adapter(model: nn.Module, *, name: str) -> None:
         logger.info("_reset_adapter(%r): %d LoraLayer(s)", name, n_reset)
 
 
+def _activate(model: nn.Module, adapter_name: str) -> None:
+    from peft.tuners.lora import LoraLayer
+
+    for m in model.modules():
+        if isinstance(m, LoraLayer):
+            m.set_adapter(adapter_name)
+
+
+def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
+    from peft.tuners.lora import LoraLayer
+
+    for m in model.modules():
+        if not isinstance(m, LoraLayer):
+            continue
+        for key in ("lora_A", "lora_B"):
+            bank = getattr(m, key, {})
+            if name in bank:
+                bank[name].weight.requires_grad = requires_grad
+
+
+def adapter_names(model: nn.Module) -> set:
+    """Names of every LoRA adapter present on ``model``'s LoraLayers."""
+    from peft.tuners.lora import LoraLayer
+
+    names: set = set()
+    for m in model.modules():
+        if isinstance(m, LoraLayer):
+            names.update(getattr(m, "lora_A", {}).keys())
+    return names
+
+
+@contextmanager
+def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -> Iterator[None]:
+    """Temporarily route every LoraLayer through the frozen adapter ``name``.
+
+    peft's per-layer ``set_adapter`` couples activation with ``requires_grad``
+    (active -> True, others -> False), which is wrong for a frozen adapter and
+    breaks the trainable adapter under FSDP2 with ``reshard_after_forward=False``
+    (see :func:`unirl.train.ema._activate_keep_grad` — same failure mode). Both
+    enter and exit therefore re-assert the canonical split: ``trainable`` stays
+    grad-enabled, ``name`` stays frozen. Layers that do not carry ``name``
+    (a narrower teacher ``target_modules`` set) fall through to their base
+    weights — exactly the frozen policy those layers represent.
+
+    Exit restores ``trainable`` as the active adapter (the resting state of the
+    plain-LoRA path), not a captured snapshot: activation in this stack always
+    flows through ``_activate``-style whole-model writes, so the resting state
+    is canonical, and hard-restoring it is self-healing.
+    """
+    if name == trainable:
+        raise ValueError(f"adapter_active: {name!r} is the trainable adapter; only frozen adapters can be routed.")
+    _activate(model, name)
+    _set_adapter_requires_grad(model, trainable, True)
+    _set_adapter_requires_grad(model, name, False)
+    try:
+        yield
+    finally:
+        _activate(model, trainable)
+        _set_adapter_requires_grad(model, trainable, True)
+        _set_adapter_requires_grad(model, name, False)
+
+
+def _resolve_adapter_checkpoint(path: str) -> tuple:
+    """Resolve a peft adapter checkpoint to local ``(config_path, weight_path)``.
+
+    Accepts a local directory, an HF repo id (``org/repo``), or an HF repo id
+    with a subfolder (``org/repo/sub/dir``).
+    """
+    if os.path.isdir(path):
+        config_path = os.path.join(path, "adapter_config.json")
+        weight_path = os.path.join(path, "adapter_model.safetensors")
+        if not os.path.exists(weight_path):
+            weight_path = os.path.join(path, "adapter_model.bin")
+        if not os.path.exists(config_path) or not os.path.exists(weight_path):
+            raise FileNotFoundError(
+                f"_resolve_adapter_checkpoint: {path!r} is a directory but lacks "
+                "adapter_config.json + adapter_model.safetensors/.bin."
+            )
+        return config_path, weight_path
+
+    from huggingface_hub import hf_hub_download
+
+    parts = path.split("/")
+    if len(parts) < 2:
+        raise ValueError(
+            f"_resolve_adapter_checkpoint: {path!r} is neither a local directory nor an "
+            "HF repo id ('org/repo' or 'org/repo/subfolder')."
+        )
+    dl_kwargs = {"repo_id": "/".join(parts[:2])}
+    if len(parts) > 2:
+        dl_kwargs["subfolder"] = "/".join(parts[2:])
+    config_path = hf_hub_download(filename="adapter_config.json", **dl_kwargs)
+    try:
+        weight_path = hf_hub_download(filename="adapter_model.safetensors", **dl_kwargs)
+    except Exception:
+        weight_path = hf_hub_download(filename="adapter_model.bin", **dl_kwargs)
+    return config_path, weight_path
+
+
+def inject_frozen_adapter(
+    model: nn.Module,
+    *,
+    name: str,
+    path: str,
+    trainable_adapter: str = "default",
+) -> None:
+    """Inject a frozen, inference-only LoRA adapter with weights from ``path``.
+
+    The adapter's geometry (rank / alpha / target_modules / bias) comes from its
+    own ``adapter_config.json`` — a teacher checkpoint defines its shape, the
+    recipe only names it. Dropout is forced to 0: a frozen policy must be
+    deterministic. After injection the trainable adapter is re-activated and its
+    ``requires_grad`` re-asserted (peft's injection flips it as a side effect).
+
+    Requires an eagerly materialized module: weights are loaded here, pre-wrap,
+    so FSDP shards them with everything else and checkpoints stay symmetric.
+    Meta-init bundles would need a deferred distribute-and-copy — unsupported
+    until a bundle actually needs it.
+    """
+    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+    from peft.tuners.lora import LoraLayer
+
+    if not name or name == trainable_adapter:
+        raise ValueError(
+            f"inject_frozen_adapter: adapter name must be non-empty and differ from "
+            f"the trainable adapter {trainable_adapter!r}; got {name!r}."
+        )
+    if any(p.is_meta for p in model.parameters()):
+        raise NotImplementedError(
+            "inject_frozen_adapter: the trainable module is meta-initialized; frozen "
+            "adapters load real weights at injection time and require an eager bundle."
+        )
+    if name in adapter_names(model):
+        raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
+
+    config_path, weight_path = _resolve_adapter_checkpoint(path)
+    with open(config_path) as f:
+        adapter_cfg = json.load(f)
+
+    peft_cfg = LoraConfig(
+        r=int(adapter_cfg["r"]),
+        lora_alpha=int(adapter_cfg.get("lora_alpha", adapter_cfg["r"])),
+        target_modules=adapter_cfg.get("target_modules") or [],
+        lora_dropout=0.0,
+        bias=str(adapter_cfg.get("bias", "none")),
+    )
+    inject_adapter_in_model(peft_cfg, model, adapter_name=name)
+
+    covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in getattr(m, "lora_A", {})]
+    if not covered:
+        raise ValueError(
+            f"inject_frozen_adapter: adapter {name!r} matched no module — its "
+            f"target_modules {peft_cfg.target_modules!r} found nothing on this model. "
+            "Wrong checkpoint for this architecture?"
+        )
+
+    if weight_path.endswith(".safetensors"):
+        from safetensors.torch import load_file as _load_weights
+    else:
+        import torch
+
+        def _load_weights(p):
+            return torch.load(p, map_location="cpu", weights_only=True)
+
+    load_result = set_peft_model_state_dict(model, _load_weights(weight_path), adapter_name=name)
+    unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+    if unexpected:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {weight_path!r} matched no "
+            f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
+            "line up with this model — refusing a silently partial teacher."
+        )
+    # strict=False ``missing_keys`` spans the whole model; only THIS adapter's lora
+    # banks indicate a truncated checkpoint (peft zero-inits ``lora_B`` -> a missing
+    # tensor silently nulls the teacher on that layer).
+    missing: list = []
+    for key in getattr(load_result, "missing_keys", None) or []:
+        parts = key.split(".")
+        for bank in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+            if bank in parts:
+                bank_idx = parts.index(bank)
+                if bank_idx + 1 < len(parts) and parts[bank_idx + 1] == name:
+                    missing.append(key)
+                break
+    if missing:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
+            f"{weight_path!r} (first: {missing[:3]}). peft zero-initializes the missing side, which "
+            "would silently disable the teacher on those layers — refusing a partial teacher."
+        )
+
+    _set_adapter_requires_grad(model, name, False)
+    # peft's inject/set paths flip other adapters' requires_grad; restore the resting state.
+    _activate(model, trainable_adapter)
+    _set_adapter_requires_grad(model, trainable_adapter, True)
+    # Mirror inject_nft: keep diffusers' PeftAdapterMixin bookkeeping consistent.
+    if hasattr(model, "_hf_peft_config_loaded"):
+        model._hf_peft_config_loaded = True
+
+    if _current_rank() == 0:
+        total = sum(1 for m in model.modules() if isinstance(m, LoraLayer))
+        n_params = sum(p.numel() for m in covered for p in (m.lora_A[name].weight, m.lora_B[name].weight))
+        logger.info(
+            "inject_frozen_adapter: %r from %s — rank=%d, %d/%d LoraLayer(s) covered, %d params (frozen)",
+            name,
+            path,
+            peft_cfg.r,
+            len(covered),
+            total,
+            n_params,
+        )
+
+
 @contextmanager
 def adapters_disabled(model: nn.Module) -> Iterator[None]:
     """Temporarily route every PEFT LoRA layer through its frozen base weights.
@@ -171,7 +392,10 @@ def _current_rank() -> int:
 
 __all__ = [
     "ModuleSelection",
+    "adapter_active",
+    "adapter_names",
     "adapters_disabled",
+    "inject_frozen_adapter",
     "inject_lora",
     "normalize_module_selection",
     "normalize_optional_module_selection",

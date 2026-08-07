@@ -36,6 +36,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.base import prepare_input_sample
+from unirl.types.advantages import finite_mean_std
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import BaseSamplingParams
@@ -328,11 +329,9 @@ class AgenticTrainer(ARTrainer):
         # Give NaN failures zero advantage and exclude them from group statistics.
         finite = torch.isfinite(r)
         if self.adv_normalization_scope == "global":
-            rf = r[finite]
-            mean = rf.mean() if rf.numel() else r.new_zeros(())
+            mean, std = finite_mean_std(r)
             centered = torch.where(finite, r - mean, torch.zeros_like(r))
             if self.normalize_adv_by_std:
-                std = rf.std(unbiased=False) if rf.numel() > 1 else r.new_ones(())
                 centered = centered / (std + 1e-8)
             return torch.where(finite, centered, torch.zeros_like(centered))
         adv = torch.zeros_like(r)
@@ -340,12 +339,11 @@ class AgenticTrainer(ARTrainer):
             idx = torch.tensor(idxs, dtype=torch.long)
             fin = finite[idx]
             g = r[idx]
-            gf = g[fin]
-            if gf.numel() == 0:
+            if not fin.any():
                 continue  # whole group crashed -> zero advantage
-            centered = g - gf.mean()
+            mean, std = finite_mean_std(g)
+            centered = g - mean
             if self.normalize_adv_by_std:
-                std = gf.std(unbiased=False) if gf.numel() > 1 else g.new_ones(())
                 centered = centered / (std + 1e-8)
             adv[idx] = torch.where(fin, centered, torch.zeros_like(centered))
         return adv

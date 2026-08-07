@@ -3,7 +3,8 @@
 Sibling of :mod:`unirl.rollout.engine.sglang_diffusion.adapters.qwen_image`
 (the T2I modality) with two image-edit deltas:
 
-- **Request side.** Edit-Plus **requires** an aligned image conditioning Part
+- **Request side.** Edit-Plus requires a packed image batch in an aligned
+  image-conditioning Part
   (fail-fast if absent — Edit-Plus is edit-only). The adapter extracts PILs
   via :meth:`Images.to_pils` and injects each into the sampling kwargs under
   ``condition_image`` — a SamplingParams field injected by
@@ -20,8 +21,8 @@ Sibling of :mod:`unirl.rollout.engine.sglang_diffusion.adapters.qwen_image`
   captured by :mod:`._patches.patch_conditions` (which extends the IPC-
   survival machinery built for text embeds to also carry ``image_latent`` +
   ``image_latent_sizes`` off the batch). This adapter unpacks the packed
-  latent to spatial ``[B, 16, H_img, W_img]`` and emits it as an
-  :class:`ImageLatentCondition` alongside the inherited ``text`` /
+  latent to spatial ``[16, H_img, W_img]`` per sample and emits a
+  :class:`QwenImageEditPlusLatentCondition` alongside the inherited ``text`` /
   ``negative_text`` conditions.
 
 Everything else (packed-trajectory unpack in ``build_segment``, CFG
@@ -38,14 +39,15 @@ subclass is needed — unlike the vllm_omni path which subclasses
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 
+from unirl.models.qwen_image_edit_plus.conditions import QwenImageEditPlusLatentCondition
+from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.conditions.image import ImageLatentCondition
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
@@ -85,28 +87,14 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         if len(text_turns) != 1 or len(image_batches) != 1:
             raise ValueError(
                 f"modality={self.model_family!r} requires exactly one text turn and one "
-                f"image turn; got {len(text_turns)} text and {len(image_batches)} image turns."
+                f"image turn; got {len(text_turns)} text and {len(image_batches)} image."
             )
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         prompts = list(text_turns[0].texts)
-        unique_prompts, k = self._deexpand_prompts(prompts, gen_part.group_ids)
+        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
         images_prim = image_batches[0]
         pil_images = images_prim.to_pils()
-        if len(pil_images) != len(prompts):
-            raise ValueError(f"build_prompts: image batch {len(pil_images)} != prompt count {len(prompts)}")
-        if len(prompts) != len(gen_part.sample_ids):
-            raise ValueError(
-                f"build_prompts: prompt count {len(prompts)} != diffusion sample count {len(gen_part.sample_ids)}"
-            )
-        if k > 1:
-            unique_pils = self._first_per_group(pil_images, list(gen_part.group_ids))
-            if len(unique_pils) != len(unique_prompts):
-                raise ValueError(
-                    f"build_prompts: collapsed image count {len(unique_pils)} != unique prompt "
-                    f"count {len(unique_prompts)} (group_ids/image misalignment)."
-                )
-        else:
-            unique_pils = pil_images
+        unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
             "condition_image": unique_pils if len(unique_pils) > 1 else unique_pils[0],
@@ -122,17 +110,15 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         slots, then collects the per-result ``image_latent`` (packed
         ``[1, S_img, C*4]``) + ``image_latent_sizes`` (the ``[(vae_width,
         vae_height)]`` pixel pair), unpacks each to spatial
-        ``[1, 16, H_img, W_img]``, and emits the batched tensor as an
-        :class:`ImageLatentCondition`.
+        ``[1, 16, H_img, W_img]``, and preserves the per-sample tensors as a
+        :class:`QwenImageEditPlusLatentCondition`.
         """
         cond_dict = super().build_condition(results)
-        image_latents = self._collect_image_latents(results)
-        if image_latents is not None:
-            cond_dict["image_latent"] = ImageLatentCondition(latents=image_latents)
+        cond_dict["image_latent"] = QwenImageEditPlusLatentCondition(latents=self._collect_image_latents(results))
         return cond_dict
 
-    def _collect_image_latents(self, results: List[RawResult]) -> Optional[torch.Tensor]:
-        """Concatenate per-result image_latents, unpacked to spatial form.
+    def _collect_image_latents(self, results: List[RawResult]) -> List[torch.Tensor]:
+        """Collect per-result image latents without forcing a shared grid.
 
         Each result's ``image_latent`` is the packed source-image latent
         ``[1, S_img, C*4]`` (one-element list injected by ``patch_conditions``).
@@ -165,45 +151,8 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
             latent_h = int(vae_height) // _VAE_SCALE_FACTOR
             latent_w = int(vae_width) // _VAE_SCALE_FACTOR
             spatial = _unpack_latents(packed, latent_h=latent_h, latent_w=latent_w)
-            tensors.append(spatial)
-        shapes = {tuple(t.shape) for t in tensors}
-        if len(shapes) > 1:
-            raise RuntimeError(
-                f"build_condition: Qwen-Image-Edit-Plus image_latent tensors have "
-                f"heterogeneous shapes {sorted(shapes)} — expected a uniform grid "
-                f"(upstream normalizes to vae_size). Check that all source images "
-                f"in the batch have the same aspect ratio, or extend the adapter "
-                f"to ragged-pad."
-            )
-        return torch.cat(tensors, dim=0)
-
-    @staticmethod
-    def _first_per_group(items: List[Any], group_ids: List[str]) -> List[Any]:
-        """First item of each group, in first-seen group order.
-
-        Mirrors how :func:`utils.deexpand_prompts_from_groups` collapses prompts,
-        so the source-image collapse aligns with the prompt collapse regardless
-        of the sample layout (contiguous or interleaved ``group_ids``).
-        """
-        seen: set[str] = set()
-        out: List[Any] = []
-        for item, gid in zip(items, group_ids):
-            if gid not in seen:
-                seen.add(gid)
-                out.append(item)
-        return out
-
-    def _deexpand_prompts(self, prompts: List[str], group_ids: List[str]):
-        """Collapse K-expanded prompts back to unique + repeat count.
-
-        Thin wrapper around :func:`utils.deexpand_prompts_from_groups` so the
-        import stays local (the base class imports utils at module level, but
-        keeping the call explicit aids readability of the image-collapse
-        parallel).
-        """
-        from unirl.rollout.engine.sglang_diffusion import utils
-
-        return utils.deexpand_prompts_from_groups(prompts, list(group_ids))
+            tensors.append(spatial.squeeze(0))
+        return tensors
 
 
 __all__ = ["QwenImageEditPlusAdapter"]

@@ -69,7 +69,7 @@ from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
@@ -555,13 +555,15 @@ class UnifiedModelTrainer(BaseTrainer):
                 rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
 
             n_imgs = 0
-            if img_decoded is not None and getattr(img_decoded, "pixels", None) is not None:
+            if isinstance(img_decoded, Images):
                 from torchvision.utils import save_image
 
-                pixels = hydrate(img_decoded.pixels).detach().to(torch.float32).clamp(0, 1).cpu()
-                n_imgs = int(pixels.shape[0])
-                for k in range(n_imgs):
-                    save_image(pixels[k], os.path.join(out_dir, f"img_{k}.png"))
+                img_decoded = deep_hydrate(img_decoded)
+                images = img_decoded.to_list()
+                n_imgs = len(images)
+                for k, image in enumerate(images):
+                    pixels = image.pixels.detach().to(torch.float32).clamp(0, 1).cpu()
+                    save_image(pixels, os.path.join(out_dir, f"img_{k}.png"))
 
             ar_params = self.sampling_params.get("ar")
             diff_params = self.sampling_params.get("diffusion")

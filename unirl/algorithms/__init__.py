@@ -9,6 +9,7 @@ from .bagel_flow_unigrpo import BagelFlowUniGRPO
 from .base import AlgorithmStepResult, StageAlgorithm
 from .cppo import CPPO, CPPOConfig
 from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
+from .diffusionopd import DiffusionOPD, TeacherSpec
 from .dppo import DPPO, DPPOConfig
 from .drpo import DRPO, DRPOConfig
 from .flowdppo import FlowDPPO, FlowDPPOConfig
@@ -39,6 +40,8 @@ __all__ = [
     "FlowGRPOConfig",
     "DiffusionNFT",
     "DiffusionNFTConfig",
+    "DiffusionOPD",
+    "TeacherSpec",
     "FlowDPPO",
     "FlowDPPOConfig",
     "StageAlgorithm",

@@ -43,7 +43,9 @@ def main(cfg: DictConfig) -> None:
         pipeline_cfg=cfg.pipeline,
         backend_cfg=cfg.backend,
         rollout_cfg=cfg.rollout,
-        reward_cfg=cfg.reward,
+        # Optional for requires_advantages=False algorithms (e.g. DiffusionOPD):
+        # no ``reward:`` block ⇒ no reward model is built and scoring is skipped.
+        reward_cfg=cfg.get("reward"),
         algorithm_cfg=cfg.algorithm,
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
@@ -55,6 +57,7 @@ def main(cfg: DictConfig) -> None:
         reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
+        accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),

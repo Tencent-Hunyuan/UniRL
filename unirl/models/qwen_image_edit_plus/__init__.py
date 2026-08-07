@@ -12,7 +12,10 @@ recipes wire them by ``_target_`` dotpath.
 """
 
 from unirl.models.qwen_image_edit_plus.bundle import QwenImageEditPlusBundle
-from unirl.models.qwen_image_edit_plus.conditions import QwenImageEditPlusConditions
+from unirl.models.qwen_image_edit_plus.conditions import (
+    QwenImageEditPlusConditions,
+    QwenImageEditPlusLatentCondition,
+)
 from unirl.models.qwen_image_edit_plus.config import QwenImageEditPlusPipelineConfig
 from unirl.models.qwen_image_edit_plus.pipeline import QwenImageEditPlusPipeline
 from unirl.models.qwen_image_edit_plus.text_embed import QwenImageEditPlusTextEmbedStage
@@ -20,6 +23,7 @@ from unirl.models.qwen_image_edit_plus.text_embed import QwenImageEditPlusTextEm
 __all__ = [
     "QwenImageEditPlusBundle",
     "QwenImageEditPlusConditions",
+    "QwenImageEditPlusLatentCondition",
     "QwenImageEditPlusPipeline",
     "QwenImageEditPlusPipelineConfig",
     "QwenImageEditPlusTextEmbedStage",

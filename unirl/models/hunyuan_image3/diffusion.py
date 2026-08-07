@@ -43,7 +43,7 @@ import torch
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import NoiseGenerator, StepStrategy
-from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
+from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
@@ -542,7 +542,7 @@ def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> Hun
     fused_cfg = HunyuanImage3FusedMultimodalCondition.concat([conditions.fused, fused_uncond])
     cond_vae = conditions.cond_vae
     if cond_vae is not None:
-        cond_vae = ImageLatentCondition(latents=_dup2(cond_vae.latents))
+        cond_vae = type(cond_vae)(latents=_dup2(cond_vae.latents))
     cond_vit = conditions.cond_vit
     if cond_vit is not None:
         cond_vit = ImageEmbedCondition(

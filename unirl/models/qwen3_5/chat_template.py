@@ -97,12 +97,13 @@ class Qwen3_5ChatTemplateStage:
                 raise ValueError(
                     f"Qwen3_5ChatTemplateStage.embed: only text and image turns are supported; got {unsupported}."
                 )
+            image_turn_count = sum(isinstance(turn.content, Images) for turn in turns)
             require(
-                sum(isinstance(turn.content, Images) for turn in turns) <= 1,
+                image_turn_count <= 1,
                 "Qwen3_5ChatTemplateStage.embed: at most one image turn per request "
                 "is supported (multi-image trajectories are out of scope).",
             )
-            if any(isinstance(turn.content, Images) for turn in turns):
+            if image_turn_count:
                 conversations = build_vision_messages(turns, self.system_instruction)
             else:
                 conversations = build_text_messages(turns, self.system_instruction)

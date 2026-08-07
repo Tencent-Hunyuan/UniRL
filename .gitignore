@@ -79,6 +79,8 @@ local/
 # Datasets: keep committed prompt sets and converter code, ignore local-only data
 datasets/*
 !datasets/pickscore
+!datasets/ocr
+!datasets/geneval
 !datasets/geneval2
 !datasets/video_r1_260k
 !datasets/daily_omni_av
