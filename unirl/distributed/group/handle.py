@@ -562,10 +562,6 @@ class Handle:
         return Slot(self, index)
 
     @property
-    def slots(self) -> List[Slot]:
-        return [Slot(self, index) for index in range(self.world_size)]
-
-    @property
     def ep_size(self) -> int:
         """Expert-parallel degree requested for rollout-side engines."""
         return self.rank_infos[0].ep_size if self.rank_infos else 1
@@ -608,7 +604,7 @@ class Handle:
             config = getattr(method, DISTRIBUTED_CONFIG_ATTR, None)
             if config is None:
                 continue
-            if name in {"slot", "slots"}:
+            if name == "slot":
                 raise TypeError(f"distributed method {name!r} collides with the Handle API")
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]

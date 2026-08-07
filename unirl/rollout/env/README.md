@@ -92,9 +92,10 @@ The included tools are:
 - `ToolEnvironment.step` requires a `Texts` frontier. Direct batched use keeps rows aligned with
   empty observations after one row finishes while a sibling continues; production execution uses
   one trajectory per task and avoids that mixed-row case.
-- The production engine catches an exception from one trajectory, logs it, returns the trajectory
-  accumulated so far as terminal, and continues draining other tasks. Coordinator/pull failures
-  still fail the drain. Teardown failures are logged and suppressed.
+- The harness catches an exception from one trajectory, logs it, and returns the partial trace as
+  a `failed` outcome; the trainer excludes failed trajectories from GRPO statistics. A slot RPC
+  failure poisons the manager and fails the training step. Teardown failures are logged and
+  suppressed.
 - `max_turns` is the hard engine bound. When an environment also exposes
   `max_turns`, the production engine requires it to match. `ToolEnvironment`
   also terminates when no row calls a tool.
