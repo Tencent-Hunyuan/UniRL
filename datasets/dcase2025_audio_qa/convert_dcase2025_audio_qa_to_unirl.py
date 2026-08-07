@@ -46,6 +46,15 @@ def _build_prompt(question: str, choices: list[str]) -> str:
     )
 
 
+def _build_sft_prompt(question: str, choices: list[str]) -> str:
+    options = "\n".join(f"{letter}. {choice}" for letter, choice in zip(LETTERS, choices))
+    return (
+        "Listen to the audio carefully, then answer the following multiple-choice question:\n\n"
+        f"{question}\n\n{options}\n\n"
+        "Provide the final answer in the exact format: The answer is [X]."
+    )
+
+
 def _iter_rows(paths: Iterable[Path]) -> Iterable[tuple[Path, dict[str, Any]]]:
     try:
         import pyarrow.parquet as pq
@@ -86,6 +95,7 @@ def _convert_split(
     *,
     source_split: str,
     output_name: str,
+    supervised: bool = False,
 ) -> Counter[str]:
     paths = sorted(source_dir.glob(f"{source_split}-*.parquet"))
     if not paths:
@@ -126,7 +136,7 @@ def _convert_split(
 
             source_id = str(row.get("id") or audio_name).strip()
             record = {
-                "prompt": _build_prompt(question, choices),
+                "prompt": (_build_sft_prompt if supervised else _build_prompt)(question, choices),
                 "prompt_id": f"dcase2025:{source_split}:{source_id}:{stats['source_rows']}",
                 "media_refs": [
                     {
@@ -147,6 +157,8 @@ def _convert_split(
                     "source_file": source_path.name,
                 },
             }
+            if supervised:
+                record["response"] = f"The answer is {letter}."
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
             stats["written_rows"] += 1
 
@@ -154,7 +166,7 @@ def _convert_split(
     return stats
 
 
-def convert(snapshot: Path, out_dir: Path) -> dict[str, Any]:
+def convert(snapshot: Path, out_dir: Path, *, supervised: bool = False) -> dict[str, Any]:
     snapshot = snapshot.expanduser().resolve(strict=True)
     out_dir = out_dir.expanduser().resolve()
     source_dir = snapshot / "data"
@@ -163,11 +175,27 @@ def convert(snapshot: Path, out_dir: Path) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     split_stats = {
-        "train": _convert_split(source_dir, out_dir, source_split="train", output_name="train.jsonl"),
-        "val": _convert_split(source_dir, out_dir, source_split="test", output_name="val.jsonl"),
+        "train": _convert_split(
+            source_dir,
+            out_dir,
+            source_split="train",
+            output_name="train.jsonl",
+            supervised=supervised,
+        ),
+        "val": _convert_split(
+            source_dir,
+            out_dir,
+            source_split="test",
+            output_name="val.jsonl",
+            supervised=supervised,
+        ),
     }
     manifest = {
-        "format": "UniRL prompt-first standalone-audio MCQA JSONL",
+        "format": (
+            "UniRL supervised standalone-audio MCQA JSONL"
+            if supervised
+            else "UniRL prompt-first standalone-audio MCQA JSONL"
+        ),
         "source": "gijs/dcase2025-audio-qa",
         "source_snapshot": snapshot.name,
         "split_mapping": {"train": "train", "val": "test"},

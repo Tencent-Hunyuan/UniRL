@@ -33,8 +33,9 @@ import torch
 from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Part
+from unirl.types.sample import Part, Turn
 from unirl.types.segments.latent import make_image_segment
 from unirl.types.segments.text import TextSegment
 
@@ -168,6 +169,37 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             return embed_messages(histories, tools=tools)
 
         texts = Texts(texts=[str(r["prompt"]) for r in records])
+        prompt_media_rows: List[List[MediaRef]] = []
+        for r in records:
+            refs: List[MediaRef] = []
+            for ref in r.get("media_refs", []) or []:
+                role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
+                if role != "prompt":
+                    continue
+                if isinstance(ref, MediaRef):
+                    refs.append(ref)
+                elif isinstance(ref, dict):
+                    refs.append(
+                        MediaRef(
+                            modality=str(ref.get("modality", "")),
+                            role=str(role),
+                            uri=str(ref.get("uri", "")),
+                        )
+                    )
+                else:
+                    raise TypeError(
+                        "ARSupervisedTrackBuilder: prompt media refs must be MediaRef values or dictionaries, "
+                        f"got {type(ref).__name__}."
+                    )
+            prompt_media_rows.append(refs)
+        if any(prompt_media_rows):
+            return self._chat_stage.embed(
+                [
+                    Turn(role="user", content=MediaRefs.from_rows(prompt_media_rows)),
+                    Turn(role="user", content=texts),
+                ]
+            )
+
         if not self._embed_takes_images:
             return self._chat_stage.embed(texts)
         images: List[Optional[Any]] = []
