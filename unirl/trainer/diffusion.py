@@ -85,7 +85,8 @@ class DiffusionTrainer(BaseTrainer):
         self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        # Frozen at init so a bad eval combination fails at startup, not an hour in.
+        # Frozen at init, so overlay contradictions surface at startup rather than an
+        # hour in. The σ policy's own shift/μ branch check stays on the worker.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
             self.sampling_params,
             eta=self.eval_eta,
@@ -642,6 +643,9 @@ class DiffusionTrainer(BaseTrainer):
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
+                    if scored is first_scored:
+                        # Captions read part.rewards, which remote scoring returns dehydrated.
+                        scored.parts[-1].rewards = r
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
             if media_prefix and start == 0 and first_scored is not None:
