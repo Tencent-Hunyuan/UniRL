@@ -69,10 +69,11 @@ The current trainer surface is:
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
 provides one launcher per engine slot and lets the manager assemble root groups.
-Async batch trainers retain optimizer-update admission, publication cadence,
-hard boundaries, scoring order, and training policy through `AsyncBatchControl`.
-The barrier-only `AgenticTrainer` does not expose tail, staleness, or cross-step
-buffering policies.
+Async batch trainers own optimizer progress, publication cadence, hard boundaries,
+scoring order, and training policy directly. The manager owns published rollout
+state and applies its configured filter against the trainer-supplied current
+version. The barrier-only `AgenticTrainer` does not expose tail, staleness, or
+cross-step buffering policies.
 
 **Extending it:** a new domain is a new `<Domain>Trainer(BaseTrainer)` that builds its
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the

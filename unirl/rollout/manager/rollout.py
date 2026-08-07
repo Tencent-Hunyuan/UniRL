@@ -73,6 +73,7 @@ class RolloutManager:
         self._rollout.set_stopping(False)
 
         suspended = self._route(completed, allow_suspended=True)
+        self._filter_complete(current_version)
         candidates = [*undispatched, *suspended]
         tails_by_root: Dict[str, List["Sample"]] = defaultdict(list)
         carried = []
@@ -100,11 +101,8 @@ class RolloutManager:
     def sync_weights(self, weight_sync: object, *, output_version: int) -> int:
         self._ensure_open()
         self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-        inflight_count, ready_count = self.counts
-        if inflight_count or ready_count or len(self._pending):
-            raise RuntimeError(
-                "sync_weights requires no queued, in-flight, completed, or partially grouped rollout work"
-            )
+        if self._pool.live:
+            raise RuntimeError("sync_weights requires no queued or in-flight rollout work")
         next_version = int(output_version)
         if next_version < self._published_version:
             raise ValueError(
@@ -116,9 +114,17 @@ class RolloutManager:
         return self._published_version
 
     @property
+    def published_version(self) -> int:
+        return self._published_version
+
+    @property
     def counts(self) -> tuple[int, int]:
         inflight_count, completed_count = self._pool.counts
         return inflight_count, completed_count + len(self._complete)
+
+    @property
+    def empty(self) -> bool:
+        return not self._pool.live and not self._complete and not self._pending
 
     def close(self) -> None:
         if self._closed:

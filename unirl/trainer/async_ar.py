@@ -1,8 +1,8 @@
 """Async autoregressive RL over separate train and rollout GPU slabs.
 
-The trainer owns optimizer-version admission and publication policy through
-``AsyncBatchControl``. The driver-side ``RolloutManager`` owns bounded dispatch,
-completion-order grouping, filtering, and quiescence.
+The trainer owns optimizer progress and publication cadence. The driver-side
+``RolloutManager`` owns bounded dispatch, grouping, filtering, and published
+rollout state.
 """
 
 import inspect
@@ -20,15 +20,14 @@ from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.rollout.manager import RolloutManager, keep_within_lag
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
-from unirl.trainer.async_batch_control import (
-    AsyncBatchControl,
-    log_admission_notes,
-    max_publication_gap_batches,
+from unirl.trainer.async_rollout import (
+    boundary_launch_slots,
+    combine_rollout_chunks,
     next_hard_boundary,
-    unwrap_replicated_int,
+    rollout_version_metrics,
+    training_version_metrics,
 )
-from unirl.trainer.async_rollout import combine_rollout_chunks
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, unwrap_replicated_int
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
@@ -119,10 +118,14 @@ class AsyncARTrainer(ARTrainer):
 
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
-        self._control = AsyncBatchControl(
-            weight_sync_interval=weight_sync_interval,
-            num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
-        )
+        self._weight_sync_interval = int(weight_sync_interval)
+        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        if self._weight_sync_interval < 1:
+            raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
+        if self._num_updates_per_batch < 1:
+            raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
+        self._train_version = 0
+        self._batches_since_sync = 0
         self._train_devices = int(round(self.num_devices * self._train_fraction))
         if self._train_devices <= 0 or self._train_devices >= self.num_devices:
             raise ValueError(
@@ -168,7 +171,7 @@ class AsyncARTrainer(ARTrainer):
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Sync a resident separate-slab engine without colocate handoffs."""
         if sync_weights:
-            self._control.sync_rollout(self._rollout_manager, self.weight_sync)
+            self._sync_rollout(require_empty=True)
         return False
 
     def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
@@ -240,9 +243,17 @@ class AsyncARTrainer(ARTrainer):
         if self.balance_shards:
             train_part = part.balance_shards(self._train_devices)
         result = self.stack.train_track(train_part, training_progress=float(training_progress))
-        self._control.record_optimizer_updates(result.optimizer_updates)
+        self._train_version += result.optimizer_updates
+        self._batches_since_sync += 1
         if extra_metrics is not None:
-            extra_metrics.update(self._control.train_metrics(result.optimizer_updates))
+            extra_metrics.update(
+                training_version_metrics(
+                    train_version=self._train_version,
+                    published_version=self._rollout_manager.published_version,
+                    optimizer_updates=result.optimizer_updates,
+                    batches_since_sync=self._batches_since_sync,
+                )
+            )
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
@@ -265,35 +276,24 @@ class AsyncARTrainer(ARTrainer):
     ) -> None:
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        train_version = unwrap_replicated_int(
+        self._train_version = unwrap_replicated_int(
             self.backend.get_optimizer_step_count(),
             name="backend optimizer step count",
         )
-        self._control.restore(train_version)
+        self._batches_since_sync = 0
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
+        staleness_budget = (self._weight_sync_interval - 1) * self._num_updates_per_batch
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={
                 "adv_normalization_scope": self.adv_normalization_scope,
                 "max_inflight": self._max_inflight,
-                "weight_sync_interval": self._control.weight_sync_interval,
-                "max_staleness": self._control.max_staleness,
-                "staleness_budget": self._control.staleness_budget,
-                "num_updates_per_batch": self._control.num_updates_per_batch,
-                "max_publication_gap_batches": max_publication_gap_batches(
-                    self._control,
-                    eval_interval=self.eval_interval,
-                    save_interval=save_interval,
-                ),
+                "weight_sync_interval": self._weight_sync_interval,
+                "max_staleness": self._weight_sync_interval - 1,
+                "staleness_budget": staleness_budget,
+                "num_updates_per_batch": self._num_updates_per_batch,
             },
-        )
-        # Not in __init__: save_interval arrives with train() and clamps the publication interval.
-        log_admission_notes(
-            self._control,
-            max_inflight=self._max_inflight,
-            eval_interval=self.eval_interval,
-            save_interval=save_interval,
         )
 
         self._rollout_manager = RolloutManager(
@@ -301,12 +301,12 @@ class AsyncARTrainer(ARTrainer):
             launchers=[lambda sample: self.rollout.launch_nowait("generate", sample)],
             capacities=[self._max_inflight],
             group_size=total_samples_per_prompt(self.sampling_params),
-            filter_fn=keep_within_lag(self._control.staleness_budget),
+            filter_fn=keep_within_lag(staleness_budget),
         )
         self._next_generation_id = start_rollout
 
         if resumed or self.eval_interval > 0:
-            self._control.sync_rollout(self._rollout_manager, self.weight_sync, force=True)
+            self._sync_rollout(force=True, require_empty=True)
         if self.eval_interval > 0:
             self.evaluate(rollout_id=-1)
 
@@ -330,16 +330,23 @@ class AsyncARTrainer(ARTrainer):
                     training_progress=training_progress,
                     rollout_id=rollout_id,
                     t0=t0,
-                    extra_metrics=self._control.output_metrics(output_version),
+                    extra_metrics=rollout_version_metrics(
+                        train_version=self._train_version,
+                        output_version=output_version,
+                        num_updates_per_batch=self._num_updates_per_batch,
+                    ),
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
                 step = rollout_id + 1
                 eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
                 save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
-                sync_due = step < num_rollouts and self._control.publication_due
+                sync_due = step < num_rollouts and self._batches_since_sync >= self._weight_sync_interval
                 if eval_due or save_due or sync_due:
-                    self._control.sync_rollout(self._rollout_manager, self.weight_sync)
+                    self._sync_rollout(require_empty=eval_due or save_due)
+
+                if step >= num_rollouts and not self._rollout_manager.empty:
+                    raise RuntimeError("final rollout boundary requires an empty RolloutManager")
 
                 if eval_due:
                     self.evaluate(rollout_id=rollout_id)
@@ -357,6 +364,24 @@ class AsyncARTrainer(ARTrainer):
             finally:
                 self._finish_wandb()
 
+    def _sync_rollout(self, *, force: bool = False, require_empty: bool = False) -> None:
+        manager = self._rollout_manager
+        needs_publish = force or manager.published_version != self._train_version
+        if not needs_publish:
+            if require_empty and not manager.empty:
+                raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
+            self._batches_since_sync = 0
+            return
+
+        carried = manager.quiesce(current_version=self._train_version)
+        if require_empty and (carried or not manager.empty):
+            raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
+        if needs_publish:
+            manager.sync_weights(self.weight_sync, output_version=self._train_version)
+        if carried:
+            manager.submit(carried)
+        self._batches_since_sync = 0
+
     def _next_rollout_batch(
         self,
         rollout_id: int,
@@ -367,7 +392,7 @@ class AsyncARTrainer(ARTrainer):
         manager = self._rollout_manager
         inflight_count, ready_count = manager.counts
         if inflight_count + ready_count == 0:
-            slots = self._control.launch_slots(
+            slots = boundary_launch_slots(
                 inflight_count=0,
                 ready_count=0,
                 max_inflight=self._max_inflight,
@@ -377,12 +402,12 @@ class AsyncARTrainer(ARTrainer):
             )
             self._submit_generations(slots)
 
-        groups = manager.collect(self.batch_size, current_version=self._control.train_version)
+        groups = manager.collect(self.batch_size, current_version=self._train_version)
         completed, gen_id, output_version = combine_rollout_chunks(groups)
         scored = self._score_completed(gen_id, completed)
 
         inflight_count, ready_count = manager.counts
-        slots = self._control.launch_slots(
+        slots = boundary_launch_slots(
             inflight_count=inflight_count,
             ready_count=ready_count + 1,
             max_inflight=self._max_inflight,

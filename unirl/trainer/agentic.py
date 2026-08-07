@@ -16,8 +16,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.async_batch_control import unwrap_replicated_int
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -173,6 +172,8 @@ class AgenticTrainer(BaseTrainer):
         tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
         self._rollout_manager.submit(tasks)
         groups = self._rollout_manager.collect(self.batch_size, current_version=self._train_version)
+        if not self._rollout_manager.empty:
+            raise RuntimeError("agentic barrier rollout must leave RolloutManager empty")
 
         self.rollout.sleep()
         self.backend.onload()

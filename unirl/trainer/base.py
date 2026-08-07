@@ -91,6 +91,19 @@ def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParam
     return {key: instantiate(sub) for key, sub in sampling_cfg.items()}
 
 
+def unwrap_replicated_int(value: object, *, name: str) -> int:
+    """Normalize a BROADCAST return and verify all worker replicas agree."""
+    if isinstance(value, (list, tuple)):
+        if not value or any(not isinstance(item, int) for item in value):
+            raise TypeError(f"{name} returned invalid worker values: {value!r}")
+        if any(item != value[0] for item in value[1:]):
+            raise RuntimeError(f"{name} disagrees across workers: {value!r}")
+        return value[0]
+    if not isinstance(value, int):
+        raise TypeError(f"{name} returned {type(value).__name__}, expected int")
+    return value
+
+
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """Driver-side TransferQueue bootstrap for ``transport_kind=transfer_queue``.
 

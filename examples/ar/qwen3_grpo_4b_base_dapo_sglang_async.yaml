@@ -27,7 +27,7 @@ num_rollouts: 800
 train_fraction: 0.5
 
 max_inflight: 1          # concurrent generations
-weight_sync_interval: 1  # rollout batches per published snapshot; max staleness = interval-1
+weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).
 eval_interval: 10

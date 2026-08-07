@@ -15,7 +15,8 @@ Launch (single node):
 
 Extra config knobs vs the synchronous separate recipe:
   * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``weight_sync_interval`` — rollout batches one published snapshot serves; max staleness is interval - 1.
+  * ``weight_sync_interval`` — trained batches between publications; also derives
+    the default output-version lag filter.
 ``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
 """
 
