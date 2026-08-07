@@ -67,6 +67,7 @@ class WAN21Pipeline(Pipeline):
         diffusion: Optional[WAN21DiffusionStage] = None,
         vae_decode: Optional[WAN21VAEDecodeStage] = None,
         video_encode: Optional[Any] = None,
+        self_forcing: Optional[Any] = None,
         strategy: Optional[StepStrategy] = None,
         shift: float = 5.0,
         autocast_precision: str = "bf16",
@@ -102,6 +103,11 @@ class WAN21Pipeline(Pipeline):
         elif video_encode is not None and not callable(getattr(video_encode, "encode", None)):
             raise TypeError("WAN21Pipeline.video_encode must be a config dict or an object exposing .encode().")
         self.video_encode = video_encode
+        if isinstance(self_forcing, dict):
+            from .self_forcing import WAN21SelfForcingStage
+
+            self_forcing = WAN21SelfForcingStage(diffusion=self.diffusion, **self_forcing)
+        self.self_forcing = self_forcing
         self.shift = shift
 
     @classmethod

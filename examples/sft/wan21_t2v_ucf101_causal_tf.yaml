@@ -1,0 +1,23 @@
+# @package _global_
+# Causal teacher-forcing baseline for the WAN2.1 Self-Forcing experiment.
+#
+# This keeps the ordinary ground-truth flow-matching objective, but replaces
+# WAN's bidirectional temporal attention with block-wise causal attention.
+# Compare it against:
+#   - wan21_t2v_ucf101_full       (bidirectional teacher forcing)
+#   - the dedicated Self-Forcing DMD recipe/trainer (self-generated history)
+
+defaults:
+  - wan21_t2v_ucf101_full
+  - _self_
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,wan21_ucf101_causal_tf}
+  tags: [sft, wan21, t2v, video, ucf101, sports, full, causal, teacher-forcing]
+
+bundle:
+  config:
+    block_causal: true
+    # 17 pixel frames encode to 5 latent frames. One latent frame per block
+    # gives five causal blocks for the initial controlled baseline.
+    causal_frames_per_block: 1

@@ -117,6 +117,14 @@ class WAN21Bundle(Bundle):
             transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
             transformer = transformer.to(device, dtype=dtype)
 
+        if config.block_causal:
+            from .causal import enable_wan_block_causal
+
+            transformer = enable_wan_block_causal(
+                transformer,
+                frames_per_block=int(config.causal_frames_per_block),
+            )
+
         vae: Optional[nn.Module] = None
         if config.load_vae:
             from .wan_video_vae import WanVideoVAE

@@ -1,0 +1,43 @@
+# @package _global_
+# WAN2.1 Self-Forcing DMD experiment on UCF-101 action prompts.
+#
+# This recipe documents the intended dedicated-trainer composition. It is not
+# routed through train_sft: Self-Forcing requires a causal generator, a frozen
+# real score, a separately optimized fake score, and alternating optimizer
+# updates. The causal transformer and rollout kernel are implemented under
+# unirl/models/wan21; the dedicated multi-model trainer is the next integration
+# layer.
+
+num_devices: 8
+batch_size: 8
+num_steps: 300
+eval_interval: 20
+
+model:
+  pretrained_model: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
+  ucf101_checkpoint: ${oc.env:UCF101_CHECKPOINT}
+  precision: bf16
+  block_causal: true
+  latent_frames: 5
+  frames_per_block: 1
+
+self_forcing:
+  denoising_sigmas: [1.0, 0.75, 0.5, 0.25]
+  context_sigma: 0.0
+  guidance_scale: 1.0
+  gradient_window_frames: 5
+  distribution_loss: dmd
+  score_sigma_min: 0.02
+  score_sigma_max: 0.98
+  real_guidance_scale: 3.0
+  fake_score_updates_per_generator: 5
+
+data:
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA}
+
+optimization:
+  generator_lr: 2.0e-6
+  fake_score_lr: 4.0e-7
+  beta1: 0.0
+  beta2: 0.999

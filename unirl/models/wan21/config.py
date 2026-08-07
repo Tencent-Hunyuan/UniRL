@@ -54,10 +54,22 @@ class WAN21PipelineConfig:
 
     meta_init_transformer: bool = False
 
+    # Block-causal WAN execution used by causal teacher forcing and
+    # self-forcing rollout. The patch preserves the diffusers parameter names,
+    # so regular WAN2.1 checkpoints remain directly loadable.
+    block_causal: bool = False
+    causal_frames_per_block: int = 1
+
+    # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="WAN21PipelineConfig.model_precision")
+        if self.causal_frames_per_block < 1:
+            raise ValueError(
+                "WAN21PipelineConfig.causal_frames_per_block must be >= 1; "
+                f"got {self.causal_frames_per_block}."
+            )
 
 
 __all__ = ["WAN21PipelineConfig"]

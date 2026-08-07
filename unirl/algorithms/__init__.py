@@ -18,10 +18,12 @@ from .grpo import GRPO, GRPOConfig
 from .gspo import GSPO, GSPOConfig
 from .ppo import PPO, PPOConfig
 from .sft import SFT, FlowMatchSFT
+from .self_forcing import SelfForcingDMD
 
 __all__ = [
     "SFT",
     "FlowMatchSFT",
+    "SelfForcingDMD",
     "GRPO",
     "GRPOConfig",
     "GSPO",
