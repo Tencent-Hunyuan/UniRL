@@ -1,6 +1,11 @@
+"""Root-atomic retention filters applied by the rollout manager."""
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, List, Set
+from collections import Counter
+from typing import TYPE_CHECKING, Callable, List
+
+from unirl.rollout.manager.buffers import roots_of
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
@@ -8,45 +13,9 @@ if TYPE_CHECKING:
 RolloutFilter = Callable[[List["Sample"], int], List["Sample"]]
 
 
-def _is_incomplete(sample: "Sample") -> bool:
-    status = sample.parts[-1].harness_status if sample.parts else None
-    if status in ("completed", "failed"):
-        return False
-    if status == "suspended":
-        return True
-    generated = sample.gen_parts()
-    if not generated:
-        return True
-    return any(part.output_version is None for part in generated)
-
-
-def _roots_of(sample: "Sample") -> Set[str]:
-    if not sample.parts:
-        return set()
-    return set(sample.root_group_ids(0))
-
-
 def identity(samples: List["Sample"], current_version: int) -> List["Sample"]:
     del current_version
     return samples
-
-
-def chain(*filters: RolloutFilter) -> RolloutFilter:
-    def apply(samples: List["Sample"], current_version: int) -> List["Sample"]:
-        kept = samples
-        for filter_fn in filters:
-            kept = filter_fn(kept, current_version)
-            if not kept:
-                break
-        return kept
-
-    return apply
-
-
-def drop_incomplete(samples: List["Sample"], current_version: int) -> List["Sample"]:
-    del current_version
-    rejected = set().union(*(_roots_of(sample) for sample in samples if _is_incomplete(sample)))
-    return [sample for sample in samples if not (_roots_of(sample) & rejected)]
 
 
 def keep_within_lag(max_lag: int) -> RolloutFilter:
@@ -64,24 +33,20 @@ def keep_within_lag(max_lag: int) -> RolloutFilter:
             if versions and max(versions) > current_version:
                 raise RuntimeError("rollout has a future output version")
             if versions and current_version - min(versions) > max_lag:
-                rejected.update(_roots_of(sample))
-        return [sample for sample in samples if not (_roots_of(sample) & rejected)]
+                rejected.update(roots_of(sample))
+        return [sample for sample in samples if not (set(roots_of(sample)) & rejected)]
 
     return apply
 
 
-def prefer_newer(samples: List["Sample"], current_version: int) -> List["Sample"]:
-    del current_version
-
-    def rollout_id(sample: "Sample") -> int:
-        if not sample.parts or not sample.parts[0].metadata:
-            raise RuntimeError("rollout Sample has no root rollout_id metadata")
-        values = {row.get("rollout_id") for row in sample.parts[0].metadata}
-        if None in values or len(values) != 1:
-            raise RuntimeError(f"rollout Sample must carry one root rollout_id; got {values}")
-        return int(next(iter(values)))
-
-    return sorted(samples, key=rollout_id, reverse=True)
+def validate_filter_output(candidates: List["Sample"], kept: List["Sample"]) -> None:
+    """Enforce the filter contract: ``kept`` is drawn from ``candidates`` without duplication."""
+    candidate_ids = Counter(map(id, candidates))
+    kept_ids = Counter(map(id, kept))
+    if kept_ids - candidate_ids:
+        raise RuntimeError("rollout filter returned a Sample outside its input")
+    if any(count != 1 for count in kept_ids.values()):
+        raise RuntimeError("rollout filter returned the same Sample more than once")
 
 
-__all__ = ["RolloutFilter", "chain", "drop_incomplete", "identity", "keep_within_lag", "prefer_newer"]
+__all__ = ["RolloutFilter", "identity", "keep_within_lag", "validate_filter_output"]

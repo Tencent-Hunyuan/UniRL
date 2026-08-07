@@ -1,3 +1,5 @@
+"""Bounded background dispatch of rollout tasks over per-slot launchers."""
+
 from __future__ import annotations
 
 import threading

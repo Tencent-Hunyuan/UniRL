@@ -1,12 +1,14 @@
+"""Driver-side rollout manager over per-slot launchers; see :class:`RolloutManager`."""
+
 from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
-from unirl.rollout.manager.buffers import CompleteGroups, PendingGroups
+from unirl.rollout.manager.buffers import CompleteGroups, PendingGroups, roots_of
 from unirl.rollout.manager.dispatch import RolloutPool
-from unirl.rollout.manager.filters import RolloutFilter, identity
+from unirl.rollout.manager.filters import RolloutFilter, identity, validate_filter_output
 
 if TYPE_CHECKING:
     from unirl.distributed.group.handle import Handle
@@ -91,7 +93,7 @@ class RolloutManager:
             tails_by_root: Dict[str, List["Sample"]] = defaultdict(list)
             carried = []
             for sample in candidates:
-                roots = _roots_of(sample)
+                roots = roots_of(sample)
                 if len(roots) == 1:
                     tails_by_root[roots[0]].append(sample)
                 elif self._keep_root([sample], current_version=current_version):
@@ -183,7 +185,7 @@ class RolloutManager:
         return suspended
 
     def _batch_group_count(self, sample: "Sample") -> int:
-        roots = _roots_of(sample)
+        roots = roots_of(sample)
         if not sample.gen_parts():
             raise RuntimeError("completed batch rollout has no generated Parts")
         self._require_stamped_generated_parts(sample)
@@ -198,17 +200,21 @@ class RolloutManager:
         return len(roots)
 
     def _filter_complete(self, current_version: int) -> None:
+        before = self._complete.group_count
         self._complete.filter(lambda samples: self._apply_filter(samples, current_version=current_version))
+        dropped = before - self._complete.group_count
+        if dropped:
+            logger.warning(
+                "rollout filter dropped %d/%d buffered rollout group(s) at version %d",
+                dropped,
+                before,
+                current_version,
+            )
 
     def _apply_filter(self, samples: List["Sample"], *, current_version: int) -> List["Sample"]:
         candidates = list(samples)
         kept = list(self._filter(list(candidates), current_version))
-        candidate_ids = Counter(map(id, candidates))
-        kept_ids = Counter(map(id, kept))
-        if kept_ids - candidate_ids:
-            raise RuntimeError("rollout filter returned a Sample outside its input")
-        if any(count != 1 for count in kept_ids.values()):
-            raise RuntimeError("rollout filter returned the same Sample more than once")
+        validate_filter_output(candidates, kept)
         return kept
 
     def _keep_root(self, samples: List["Sample"], *, current_version: int) -> bool:
@@ -237,15 +243,6 @@ class RolloutManager:
         self._raise_if_failed()
         if self._closed:
             raise RuntimeError("RolloutManager is closed")
-
-
-def _roots_of(sample: "Sample") -> List[str]:
-    if not sample.parts:
-        raise ValueError("rollout Sample has no Parts")
-    roots = list(dict.fromkeys(sample.root_group_ids(0)))
-    if not roots:
-        raise ValueError("rollout Sample has no root ids")
-    return roots
 
 
 __all__ = ["RolloutManager"]

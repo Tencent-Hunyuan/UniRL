@@ -1,3 +1,5 @@
+"""Grouping buffers for the rollout manager: sibling assembly and completed FIFO chunks."""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
@@ -8,10 +10,14 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 
-def root_of(sample: "Sample") -> str:
-    if not sample.parts or not sample.parts[0].sample_ids:
-        raise ValueError("trajectory has no root sample id")
-    return sample.parts[0].sample_ids[0]
+def roots_of(sample: "Sample") -> List[str]:
+    """Ordered unique root ids of ``sample``; raises when it has none."""
+    if not sample.parts:
+        raise ValueError("rollout Sample has no Parts")
+    roots = list(dict.fromkeys(sample.root_group_ids(0)))
+    if not roots:
+        raise ValueError("rollout Sample has no root ids")
+    return roots
 
 
 class PendingGroups:
@@ -24,13 +30,15 @@ class PendingGroups:
     def add(self, samples: List["Sample"]) -> List[List["Sample"]]:
         complete = []
         for sample in samples:
-            root = root_of(sample)
-            siblings = self._by_root.setdefault(root, [])
+            roots = roots_of(sample)
+            if len(roots) != 1:
+                raise RuntimeError(f"terminal trajectory must carry exactly one root; got {roots}")
+            siblings = self._by_root.setdefault(roots[0], [])
             siblings.append(sample)
             if len(siblings) > self._group_size:
-                raise RuntimeError(f"root {root!r} has more than {self._group_size} terminal siblings")
+                raise RuntimeError(f"root {roots[0]!r} has more than {self._group_size} terminal siblings")
             if len(siblings) == self._group_size:
-                complete.append(self._by_root.pop(root))
+                complete.append(self._by_root.pop(roots[0]))
         return complete
 
     def get(self, root: str) -> List["Sample"]:
@@ -62,19 +70,14 @@ class CompleteGroups:
         self._chunks.append(_CompleteChunk(group_count, list(samples)))
 
     def filter(self, transform: Callable[[List["Sample"]], List["Sample"]]) -> None:
+        """Apply a filter transform chunk-atomically; the caller has already validated the subset contract."""
         chunks = list(self._chunks)
         if not chunks:
             return
         candidates = [sample for chunk in chunks for sample in chunk.samples]
-        kept = list(transform(list(candidates)))
-        candidate_ids = Counter(map(id, candidates))
-        kept_ids = Counter(map(id, kept))
-        if kept_ids - candidate_ids:
-            raise RuntimeError("rollout filter returned a Sample outside its input")
-        if any(count != 1 for count in kept_ids.values()):
-            raise RuntimeError("rollout filter returned the same Sample more than once")
-        if any(count != 1 for count in candidate_ids.values()):
+        if any(count != 1 for count in Counter(map(id, candidates)).values()):
             raise RuntimeError("rollout buffer contains the same Sample object more than once")
+        kept = list(transform(list(candidates)))
 
         chunk_by_sample = {
             id(sample): chunk_index for chunk_index, chunk in enumerate(chunks) for sample in chunk.samples
@@ -139,4 +142,4 @@ class CompleteGroups:
         self._chunks.extendleft(_CompleteChunk(1, [sample]) for sample in reversed(groups))
 
 
-__all__ = ["CompleteGroups", "PendingGroups", "root_of"]
+__all__ = ["CompleteGroups", "PendingGroups", "roots_of"]
