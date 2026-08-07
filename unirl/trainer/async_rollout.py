@@ -38,9 +38,18 @@ def boundary_launch_slots(
     trained_batches: int,
     num_rollouts: int,
     hard_boundary: int,
+    batches_since_sync: int,
+    weight_sync_interval: int,
 ) -> int:
-    remaining = min(num_rollouts, hard_boundary) - trained_batches - inflight_count - ready_count
-    return max(0, min(max_inflight - inflight_count, remaining))
+    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window.
+
+    ``weight_sync_interval - batches_since_sync`` is how many more batches the published
+    snapshot may serve; admitting past it launches work the staleness filter is
+    guaranteed to discard at the next quiesce.
+    """
+    freshness = weight_sync_interval - batches_since_sync
+    allowed = min(freshness, min(num_rollouts, hard_boundary) - trained_batches)
+    return max(0, min(max_inflight - inflight_count, allowed - inflight_count - ready_count))
 
 
 def rollout_version_metrics(
@@ -268,6 +277,8 @@ class AsyncRolloutTrainerMixin:
                 trained_batches=rollout_id,
                 num_rollouts=num_rollouts,
                 hard_boundary=hard_boundary,
+                batches_since_sync=self._batches_since_sync,
+                weight_sync_interval=self._weight_sync_interval,
             )
             self._submit_generations(slots)
 
@@ -283,6 +294,8 @@ class AsyncRolloutTrainerMixin:
             trained_batches=rollout_id,
             num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
+            batches_since_sync=self._batches_since_sync,
+            weight_sync_interval=self._weight_sync_interval,
         )
         self._submit_generations(slots)
         return scored, output_version
