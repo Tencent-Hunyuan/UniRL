@@ -93,9 +93,7 @@ class WAN21Pipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = (
-            vae_decode
-            if vae_decode is not None
-            else (WAN21VAEDecodeStage(bundle) if bundle.vae is not None else None)
+            vae_decode if vae_decode is not None else (WAN21VAEDecodeStage(bundle) if bundle.vae is not None else None)
         )
         if isinstance(video_encode, dict):
             if set(video_encode) - {"num_frames", "height", "width", "max_decode_frames"}:

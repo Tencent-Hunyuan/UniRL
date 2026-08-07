@@ -31,10 +31,7 @@ class WAN21SelfForcingPromptTrackBuilder(Remote):
                 guidance_scale=self.real_guidance_scale,
             )
         return Part(
-            sample_ids=[
-                str(record.get("sample_id", f"self-forcing:{index}"))
-                for index, record in enumerate(records)
-            ],
+            sample_ids=[str(record.get("sample_id", f"self-forcing:{index}")) for index, record in enumerate(records)],
             conditions=conditions.to_dict(),
             metadata=[dict(record.get("metadata") or {}) for record in records],
         )

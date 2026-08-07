@@ -332,9 +332,7 @@ def _causal_transformer_forward(
     shift, scale = shift.to(hidden_states.device), scale.to(hidden_states.device)
     hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
     hidden_states = self.proj_out(hidden_states)
-    hidden_states = hidden_states.reshape(
-        batch_size, post_frames, post_height, post_width, p_t, p_h, p_w, -1
-    )
+    hidden_states = hidden_states.reshape(batch_size, post_frames, post_height, post_width, p_t, p_h, p_w, -1)
     hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
     output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
     if not return_dict:

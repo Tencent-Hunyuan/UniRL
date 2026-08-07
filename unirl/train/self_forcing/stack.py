@@ -236,9 +236,13 @@ class SelfForcingDMDStack(Remote):
             fake_x0 = xt - s * fake_v
             real_x0 = xt - s * real_v
             grad = fake_x0 - real_x0
-            normalizer = (generated.detach() - real_x0).abs().mean(
-                dim=tuple(range(1, generated.ndim)),
-                keepdim=True,
+            normalizer = (
+                (generated.detach() - real_x0)
+                .abs()
+                .mean(
+                    dim=tuple(range(1, generated.ndim)),
+                    keepdim=True,
+                )
             )
             grad = torch.nan_to_num(grad / normalizer.clamp_min(self.normalization_eps))
 

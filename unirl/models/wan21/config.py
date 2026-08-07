@@ -74,8 +74,7 @@ class WAN21PipelineConfig:
         validate_precision_type(self.model_precision, field="WAN21PipelineConfig.model_precision")
         if self.causal_frames_per_block < 1:
             raise ValueError(
-                "WAN21PipelineConfig.causal_frames_per_block must be >= 1; "
-                f"got {self.causal_frames_per_block}."
+                f"WAN21PipelineConfig.causal_frames_per_block must be >= 1; got {self.causal_frames_per_block}."
             )
 
 

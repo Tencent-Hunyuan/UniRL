@@ -142,9 +142,7 @@ class WAN21SelfForcingStage:
             with torch.no_grad():
                 context = x0.detach()
                 if self.context_sigma:
-                    eps = torch.randn(
-                        context.shape, device=context.device, dtype=torch.float32, generator=generator
-                    )
+                    eps = torch.randn(context.shape, device=context.device, dtype=torch.float32, generator=generator)
                     context = (1.0 - self.context_sigma) * context + self.context_sigma * eps
                 self._predict(
                     conditions,

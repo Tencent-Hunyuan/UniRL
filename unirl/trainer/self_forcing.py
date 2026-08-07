@@ -47,9 +47,7 @@ class WAN21SelfForcingTrainer(BaseTrainer):
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = int(batch_size)
-        self.fake_score_updates_per_generator = int(
-            stack_cfg.get("fake_score_updates_per_generator", 5)
-        )
+        self.fake_score_updates_per_generator = int(stack_cfg.get("fake_score_updates_per_generator", 5))
         self.data_source = instantiate(data_source_cfg)
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -101,16 +99,13 @@ class WAN21SelfForcingTrainer(BaseTrainer):
         self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(
-                f"WAN21SelfForcingTrainer: batch_size={self.batch_size} "
-                f"must be divisible by dp={self.dp_size}."
+                f"WAN21SelfForcingTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}."
             )
 
     def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> Dict[str, Any]:
         part = self.track_builder.build(records)
         if part.batch_size != len(records):
-            raise RuntimeError(
-                f"WAN21SelfForcingTrainer: built {part.batch_size} rows from {len(records)} records."
-            )
+            raise RuntimeError(f"WAN21SelfForcingTrainer: built {part.batch_size} rows from {len(records)} records.")
         rows = self.stack.train_track(part, training_progress=training_progress)
         if not rows:
             raise RuntimeError("WAN21SelfForcingTrainer: stack returned no result rows.")
@@ -118,9 +113,7 @@ class WAN21SelfForcingTrainer(BaseTrainer):
             [{key: value for key, value in row.items() if key != "metrics"} for row in rows]
         )
         summary["fake_score_updates"] = int(round(summary["fake_score_updates"]))
-        summary["metrics"] = aggregate_numeric_metrics(
-            [dict(row.get("metrics") or {}) for row in rows]
-        )
+        summary["metrics"] = aggregate_numeric_metrics([dict(row.get("metrics") or {}) for row in rows])
         return summary
 
     # ------------------------------------------------------------------

@@ -89,18 +89,12 @@ class SelfForcingDMD(StageAlgorithm):
             s = sigma.view(batch, *([1] * (generated.ndim - 1)))
             xt = (1.0 - s) * generated.detach() + s * self._noise(generated, generator)
             sigma_arg = sigma if batch > 1 else sigma.reshape(())
-            fake_v = self.fake_score.predict_noise_at_step(
-                conditions, sample=xt, sigma=sigma_arg, params=self.params
-            )
-            real_v = self.real_score.predict_noise_at_step(
-                conditions, sample=xt, sigma=sigma_arg, params=self.params
-            )
+            fake_v = self.fake_score.predict_noise_at_step(conditions, sample=xt, sigma=sigma_arg, params=self.params)
+            real_v = self.real_score.predict_noise_at_step(conditions, sample=xt, sigma=sigma_arg, params=self.params)
             fake_x0 = xt - s * fake_v
             real_x0 = xt - s * real_v
             grad = fake_x0 - real_x0
-            normalizer = (generated.detach() - real_x0).abs().mean(
-                dim=tuple(range(1, generated.ndim)), keepdim=True
-            )
+            normalizer = (generated.detach() - real_x0).abs().mean(dim=tuple(range(1, generated.ndim)), keepdim=True)
             grad = torch.nan_to_num(grad / normalizer.clamp_min(self.normalization_eps))
 
         target = (generated - grad).detach()
