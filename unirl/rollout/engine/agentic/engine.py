@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, Optional
 
 import torch
@@ -14,8 +13,6 @@ from unirl.rollout.engine.base import SyncRolloutEngine
 from unirl.rollout.harness.protocol import HarnessContext, RolloutHarness
 from unirl.rollout.harness.tool_agent import ToolAgentHarness
 from unirl.types.sample import Sample, _part_with_field
-
-logger = logging.getLogger(__name__)
 
 
 class AgenticRolloutEngine(SyncRolloutEngine):
@@ -47,10 +44,7 @@ class AgenticRolloutEngine(SyncRolloutEngine):
         if not isinstance(inner, SyncRolloutEngine):
             shutdown = getattr(inner, "shutdown", None)
             if callable(shutdown):
-                try:
-                    shutdown()
-                except Exception as exc:
-                    logger.warning("AgenticRolloutEngine invalid inner cleanup raised: %s", exc)
+                shutdown()
             raise ValueError(
                 f"AgenticRolloutEngine inner must implement the single-turn engine contract; got {type(inner).__name__}"
             )
@@ -86,15 +80,11 @@ class AgenticRolloutEngine(SyncRolloutEngine):
     def generate(self, sample: Sample) -> Sample:
         generated_before = len(sample.gen_parts())
         policy_version = self._policy_version
-        try:
-            outcome = self._harness.run(sample, self._harness_ctx)
-            if outcome.status not in ("completed", "suspended", "failed"):
-                raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
-            result = self._stamp_generated_versions(outcome.sample, generated_before, policy_version)
-            return self._stamp_outcome(result, outcome.status)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("AgenticRolloutEngine: harness outcome failed, marking failed: %s", exc, exc_info=True)
-            return self._stamp_outcome(sample, "failed")
+        outcome = self._harness.run(sample, self._harness_ctx)
+        if outcome.status not in ("completed", "suspended", "failed"):
+            raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
+        result = self._stamp_generated_versions(outcome.sample, generated_before, policy_version)
+        return self._stamp_outcome(result, outcome.status)
 
     @staticmethod
     def _stamp_generated_versions(sample: Sample, generated_before: int, policy_version: int) -> Sample:

@@ -34,7 +34,6 @@ the following optimizer step. The manager is quiesced before every weight sync.
 from __future__ import annotations
 
 import logging
-import sys
 import time
 from typing import Any, Optional, Tuple
 
@@ -189,18 +188,10 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                     if carried:
                         self._rollout_manager.submit(carried)
         finally:
-            active_exception = sys.exc_info()[0] is not None
             try:
-                self._rollout_manager.quiesce()
-            except Exception:
-                if not active_exception:
-                    raise
-                logger.exception("Failed to drain in-flight generations during async diffusion teardown")
+                self._rollout_manager.close()
             finally:
-                try:
-                    self._rollout_manager.close()
-                finally:
-                    self._finish_wandb()
+                self._finish_wandb()
 
     def _next_step(
         self,

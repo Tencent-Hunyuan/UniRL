@@ -94,13 +94,6 @@ class RolloutPool:
             self._completed.clear()
             return completed
 
-    def fail(self, exc: BaseException) -> None:
-        with self._condition:
-            if self._failure is None:
-                self._failure = exc
-            self._paused = True
-            self._condition.notify_all()
-
     @property
     def live(self) -> bool:
         with self._condition:

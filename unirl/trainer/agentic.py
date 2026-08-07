@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -146,34 +145,11 @@ class AgenticTrainer(BaseTrainer):
             raise ValueError("batch_size*samples_per_prompt must be divisible by num_devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:
-        try:
-            self.backend.offload()
-        except BaseException:
-            self.backend.onload()
-            raise
-
-        rollout_built = False
-        rollout_released = False
-        try:
-            self.rollout = remote(**parse_hydra_cfg(rollout_cfg))
-            rollout_built = True
-            self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
-            self.rollout.sleep()
-            rollout_released = True
-            self.backend.onload()
-        except BaseException:
-            if rollout_built and not rollout_released:
-                try:
-                    self.rollout.shutdown()
-                    rollout_released = True
-                except BaseException:
-                    logger.exception("Failed to release agentic rollout after bootstrap failure")
-            if rollout_released or not rollout_built:
-                try:
-                    self.backend.onload()
-                except BaseException:
-                    logger.exception("Failed to restore training backend after rollout bootstrap failure")
-            raise
+        self.backend.offload()
+        self.rollout = remote(**parse_hydra_cfg(rollout_cfg))
+        self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+        self.rollout.sleep()
+        self.backend.onload()
 
     def _build_request_sample(self, inputs: Sample, rollout_id: int) -> Sample:
         return prepare_input_sample(
@@ -185,47 +161,17 @@ class AgenticTrainer(BaseTrainer):
         )
 
     def _collect_groups(self, requests: Sample, *, rollout_id: int) -> List[List[Sample]]:
-        original_error: Optional[BaseException] = None
-        wake_started = False
-        train_state_offloaded = False
-        sleep_succeeded = False
-        try:
-            wake_started = True
-            self.rollout.wake_up()
-            self._rollout_manager.sync_weights(self.weight_sync, policy_version=rollout_id)
-            try:
-                self.backend.offload()
-            except BaseException:
-                self.backend.onload()
-                raise
-            train_state_offloaded = True
+        self.rollout.wake_up()
+        self._rollout_manager.sync_weights(self.weight_sync, policy_version=rollout_id)
+        self.backend.offload()
 
-            tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
-            self._rollout_manager.submit(tasks)
-            return self._rollout_manager.collect(self.batch_size)
-        except BaseException as exc:
-            original_error = exc
-            try:
-                self._rollout_manager.quiesce()
-            except BaseException:
-                logger.exception("Agentic rollout cleanup failed")
-            raise
-        finally:
-            if wake_started:
-                try:
-                    self.rollout.sleep()
-                    sleep_succeeded = True
-                except BaseException:
-                    if original_error is None:
-                        raise
-                    logger.exception("Agentic rollout sleep failed")
-            if train_state_offloaded and sleep_succeeded:
-                try:
-                    self.backend.onload()
-                except BaseException:
-                    if original_error is None:
-                        raise
-                    logger.exception("Agentic training backend restore failed")
+        tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
+        self._rollout_manager.submit(tasks)
+        groups = self._rollout_manager.collect(self.batch_size)
+
+        self.rollout.sleep()
+        self.backend.onload()
+        return groups
 
     def train_step(
         self,
@@ -479,50 +425,25 @@ class AgenticTrainer(BaseTrainer):
         if getattr(self, "_runtime_shutdown_done", False):
             return
         self._runtime_shutdown_done = True
-        active_error = sys.exc_info()[1]
-        cleanup_errors: List[Tuple[str, BaseException]] = []
 
         manager = getattr(self, "_rollout_manager", None)
-        if manager is not None:
-            try:
-                manager.close()
-            except BaseException as exc:
-                cleanup_errors.append(("rollout manager", exc))
-
         rollout = getattr(self, "rollout", None)
         shutdown = getattr(rollout, "shutdown", None)
-        if callable(shutdown):
-            try:
-                run_with_timeout(
-                    shutdown,
-                    timeout=_ROLLOUT_SHUTDOWN_TIMEOUT_S,
-                    what="agentic rollout engine shutdown",
-                )
-            except BaseException as exc:
-                cleanup_errors.append(("rollout engine", exc))
-
         pool = getattr(self, "pool", None)
-        if pool is not None:
+        try:
+            if manager is not None:
+                manager.close()
+        finally:
             try:
-                pool.shutdown()
-            except Exception:
-                logger.exception("Failed to shut down agentic trainer device pool")
-
-        if active_error is not None:
-            for operation, error in cleanup_errors:
-                active_error.add_note(f"failed to shut down {operation}: {error!r}")
-                logger.error(
-                    "Failed to shut down agentic %s",
-                    operation,
-                    exc_info=(type(error), error, error.__traceback__),
-                )
-            return
-        if cleanup_errors:
-            operation, error = cleanup_errors[0]
-            for later_operation, later_error in cleanup_errors[1:]:
-                error.add_note(f"also failed to shut down {later_operation}: {later_error!r}")
-            error.add_note(f"agentic shutdown operation: {operation}")
-            raise error
+                if callable(shutdown):
+                    run_with_timeout(
+                        shutdown,
+                        timeout=_ROLLOUT_SHUTDOWN_TIMEOUT_S,
+                        what="agentic rollout engine shutdown",
+                    )
+            finally:
+                if pool is not None:
+                    pool.shutdown()
 
 
 __all__ = ["AgenticTrainer"]

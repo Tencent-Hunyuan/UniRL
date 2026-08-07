@@ -62,39 +62,30 @@ class RolloutManager:
 
         selected: List[_ReadyChunk] = []
         selected_groups = 0
-        try:
-            while selected_groups < n:
-                self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-                self._filter_buffer()
-                while self._buffer and selected_groups < n:
-                    chunk = self._buffer.popleft()
-                    if selected_groups + chunk.group_count > n:
-                        try:
-                            self._split_front(chunk)
-                        except BaseException:
-                            self._buffer.appendleft(chunk)
-                            raise
-                        continue
-                    selected.append(chunk)
-                    selected_groups += chunk.group_count
-                if selected_groups == n:
-                    return [chunk.samples for chunk in selected]
-                if not self._pool.live:
-                    raise RolloutUnderflow(f"needed {n} rollout groups, collected {selected_groups}")
-                self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
-        except BaseException:
-            self._buffer.extendleft(reversed(selected))
-            raise
+        while selected_groups < n:
+            self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
+            self._filter_buffer()
+            while self._buffer and selected_groups < n:
+                chunk = self._buffer.popleft()
+                if selected_groups + chunk.group_count > n:
+                    self._split_front(chunk)
+                    continue
+                selected.append(chunk)
+                selected_groups += chunk.group_count
+            if selected_groups == n:
+                return [chunk.samples for chunk in selected]
+            if not self._pool.live:
+                self._buffer.extendleft(reversed(selected))
+                raise RolloutUnderflow(f"needed {n} rollout groups, collected {selected_groups}")
+            self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
         raise AssertionError("unreachable")
 
     def quiesce(self) -> List["Sample"]:
         self._ensure_open()
         undispatched = self._pool.pause()
-        try:
-            self._rollout.set_stopping(True)
-            completed = self._resolve(self._pool.drain())
-        finally:
-            self._rollout.set_stopping(False)
+        self._rollout.set_stopping(True)
+        completed = self._resolve(self._pool.drain())
+        self._rollout.set_stopping(False)
 
         suspended = self._route(completed, allow_suspended=True)
         candidates = [*undispatched, *suspended]
@@ -145,14 +136,7 @@ class RolloutManager:
             self._closed = True
 
     def _resolve(self, units: List[Any]) -> List[tuple[int, "Sample"]]:
-        samples = []
-        try:
-            for unit in units:
-                samples.append((unit.sequence, unit.pending.result()))
-        except BaseException as exc:
-            self._pool.fail(exc)
-            raise
-        return samples
+        return [(unit.sequence, unit.pending.result()) for unit in units]
 
     def _route(self, results: List[tuple[int, "Sample"]], *, allow_suspended: bool) -> List["Sample"]:
         terminal_trajectories = []

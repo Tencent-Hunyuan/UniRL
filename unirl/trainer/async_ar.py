@@ -30,7 +30,6 @@ opens the colocate ``placement(fraction=1.0)`` block we replace with two slabs).
 
 import inspect
 import logging
-import sys
 import time
 from typing import Dict, Optional, Tuple
 
@@ -338,18 +337,10 @@ class AsyncARTrainer(ARTrainer):
                     if carried:
                         self._rollout_manager.submit(carried)
         finally:
-            active_exception = sys.exc_info()[0] is not None
             try:
-                self._rollout_manager.quiesce()
-            except Exception:
-                if not active_exception:
-                    raise
-                logger.exception("Failed to drain in-flight generations during trainer teardown")
+                self._rollout_manager.close()
             finally:
-                try:
-                    self._rollout_manager.close()
-                finally:
-                    self._finish_wandb()
+                self._finish_wandb()
 
     def _next_step(
         self,
