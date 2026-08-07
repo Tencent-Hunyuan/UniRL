@@ -24,7 +24,6 @@ eval_interval: 20
 eval_num_prompts: 16
 eval_samples_per_prompt: 4
 eval_chunk_prompts: 8
-eval_cfg_text_scale: 1.0
 eval_eta: 0.7
 save_interval: 20
 save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_t2v_trainside}

@@ -52,8 +52,9 @@ def main(cfg: DictConfig) -> None:
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
-        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
+        eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),
