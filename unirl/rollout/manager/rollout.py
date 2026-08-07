@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from unirl.rollout.manager.buffers import CompleteGroups, PendingGroups
 from unirl.rollout.manager.dispatch import RolloutPool
@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class RolloutManager:
+    """Driver-side rollout scheduling: bounded dispatch, sibling-group assembly, root-atomic filtering, published version.
+
+    A failure while resolving or routing completed work poisons the manager: samples may
+    already be lost, so every later call (including ``empty``/``counts``) re-raises the
+    original error instead of reporting clean state; only ``close()`` remains safe.
+    """
+
     def __init__(
         self,
         rollout: "Handle",
@@ -37,6 +44,7 @@ class RolloutManager:
         self._complete = CompleteGroups()
         self._filter = filter_fn
         self._published_version = 0
+        self._failure: Optional[BaseException] = None
         self._closed = False
 
     def submit(self, tasks: List["Sample"]) -> None:
@@ -52,66 +60,78 @@ class RolloutManager:
         if current_version < 0:
             raise ValueError(f"current_version must be non-negative; got {current_version}")
 
-        while True:
-            self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-            self._filter_complete(current_version)
-            selected = self._complete.take(n)
-            if selected is not None:
-                return selected
-            if not self._pool.live:
-                raise RuntimeError(f"needed {n} rollout groups, collected {self._complete.group_count}")
-            self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
+        try:
+            while True:
+                self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
+                self._filter_complete(current_version)
+                selected = self._complete.take(n)
+                if selected is not None:
+                    return selected
+                if not self._pool.live:
+                    raise RuntimeError(f"needed {n} rollout groups, collected {self._complete.group_count}")
+                self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
+        except BaseException as exc:
+            self._poison(exc)
+            raise
 
     def quiesce(self, *, current_version: int) -> List["Sample"]:
         self._ensure_open()
         current_version = int(current_version)
         if current_version < 0:
             raise ValueError(f"current_version must be non-negative; got {current_version}")
-        undispatched = self._pool.pause()
-        self._rollout.set_stopping(True)
-        completed = self._resolve(self._pool.drain())
-        self._rollout.set_stopping(False)
+        try:
+            undispatched = self._pool.pause()
+            self._rollout.set_stopping(True)
+            completed = self._resolve(self._pool.drain())
+            self._rollout.set_stopping(False)
 
-        suspended = self._route(completed, allow_suspended=True)
-        self._filter_complete(current_version)
-        candidates = [*undispatched, *suspended]
-        tails_by_root: Dict[str, List["Sample"]] = defaultdict(list)
-        carried = []
-        for sample in candidates:
-            roots = _roots_of(sample)
-            if len(roots) == 1:
-                tails_by_root[roots[0]].append(sample)
-            elif self._keep_root([sample], current_version=current_version):
-                carried.append(sample)
+            suspended = self._route(completed, allow_suspended=True)
+            self._filter_complete(current_version)
+            candidates = [*undispatched, *suspended]
+            tails_by_root: Dict[str, List["Sample"]] = defaultdict(list)
+            carried = []
+            for sample in candidates:
+                roots = _roots_of(sample)
+                if len(roots) == 1:
+                    tails_by_root[roots[0]].append(sample)
+                elif self._keep_root([sample], current_version=current_version):
+                    carried.append(sample)
 
-        for root, tails in tails_by_root.items():
-            known = [*self._pending.get(root), *tails]
-            if self._keep_root(known, current_version=current_version):
-                carried.extend(tails)
-            else:
-                discarded = self._pending.discard(root)
-                logger.info(
-                    "rollout filter discarded incomplete root=%s tails=%d completed=%d",
-                    root,
-                    len(tails),
-                    discarded,
-                )
-        return carried
+            for root, tails in tails_by_root.items():
+                known = [*self._pending.get(root), *tails]
+                if self._keep_root(known, current_version=current_version):
+                    carried.extend(tails)
+                else:
+                    discarded = self._pending.discard(root)
+                    logger.info(
+                        "rollout filter discarded incomplete root=%s tails=%d completed=%d",
+                        root,
+                        len(tails),
+                        discarded,
+                    )
+            return carried
+        except BaseException as exc:
+            self._poison(exc)
+            raise
 
     def sync_weights(self, weight_sync: object, *, output_version: int) -> int:
         self._ensure_open()
-        self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-        if self._pool.live:
-            raise RuntimeError("sync_weights requires no queued or in-flight rollout work")
         next_version = int(output_version)
         if next_version < self._published_version:
             raise ValueError(
                 f"output_version must be monotonic; current={self._published_version}, next={next_version}"
             )
-        weight_sync.sync()
-        self._rollout.set_version(next_version)
-        self._published_version = next_version
-        return self._published_version
+        try:
+            self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
+            if self._pool.live:
+                raise RuntimeError("sync_weights requires no queued or in-flight rollout work")
+            weight_sync.sync()
+            self._rollout.set_version(next_version)
+            self._published_version = next_version
+            return self._published_version
+        except BaseException as exc:
+            self._poison(exc)
+            raise
 
     @property
     def published_version(self) -> int:
@@ -119,19 +139,24 @@ class RolloutManager:
 
     @property
     def counts(self) -> tuple[int, int]:
+        self._raise_if_failed()
         inflight_count, completed_count = self._pool.counts
         return inflight_count, completed_count + len(self._complete)
 
     @property
     def empty(self) -> bool:
+        self._raise_if_failed()
         return not self._pool.live and not self._complete and not self._pending
 
     def close(self) -> None:
         if self._closed:
             return
         try:
-            if self._pool.live:
+            if self._failure is None and self._pool.live:
                 self.quiesce(current_version=self._published_version)
+        except BaseException:
+            # Teardown path: log instead of re-raising so close() cannot mask the primary error.
+            logger.exception("RolloutManager.close: discarding in-flight rollout work after a failure")
         finally:
             self._pool.close()
             self._closed = True
@@ -199,7 +224,17 @@ class RolloutManager:
         if unstamped:
             raise RuntimeError(f"completed rollout has unstamped generated Parts at indices {unstamped}")
 
+    def _poison(self, exc: BaseException) -> None:
+        # Completed work may have been lost mid-route; the manager must not report clean state after.
+        if self._failure is None:
+            self._failure = exc
+
+    def _raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise RuntimeError("RolloutManager is unusable after an earlier failure") from self._failure
+
     def _ensure_open(self) -> None:
+        self._raise_if_failed()
         if self._closed:
             raise RuntimeError("RolloutManager is closed")
 
