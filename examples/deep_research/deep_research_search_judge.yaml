@@ -21,7 +21,7 @@ batch_size: 4 # P prompts_per_rollout; P*n = 8 must be divisible by num_devices
 num_rollouts: 200
 
 worker_max_concurrency: 10
-per_worker_inflight: 4 # 8 tasks spread evenly across the two rollout slots
+per_worker_inflight: 4 # per-slot trajectory cap (2 slots x 4 covers the 8 concurrent tasks)
 stop: ["</tool_call>"]
 
 sampling:

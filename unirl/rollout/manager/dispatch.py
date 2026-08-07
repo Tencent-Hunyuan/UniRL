@@ -21,6 +21,12 @@ class _PendingUnit:
 
 
 class RolloutPool:
+    """Background dispatch thread keeping every launcher filled up to its capacity.
+
+    Capacity frees when a launch reports ready; resolving results (and surviving a
+    failure there) is the caller's job. A launch or probe failure poisons the pool.
+    """
+
     _PROBE_INTERVAL_S = 0.01
 
     def __init__(
@@ -169,12 +175,15 @@ class RolloutPool:
         load = [0] * len(self._launchers)
         for unit in self._running:
             load[unit.launcher] += 1
-        for index, launch in enumerate(self._launchers):
-            while self._queue and load[index] < self._capacities[index]:
-                sequence, task = self._queue.popleft()
-                pending = launch(task)
-                self._running.append(_PendingUnit(sequence, index, task, pending))
-                load[index] += 1
+        # Most-free launcher first, so tasks spread across slots instead of filling slot 0.
+        while self._queue:
+            index = max(range(len(self._launchers)), key=lambda i: self._capacities[i] - load[i])
+            if load[index] >= self._capacities[index]:
+                return
+            sequence, task = self._queue.popleft()
+            pending = self._launchers[index](task)
+            self._running.append(_PendingUnit(sequence, index, task, pending))
+            load[index] += 1
 
     def _record_failure(self, exc: BaseException) -> None:
         with self._condition:
