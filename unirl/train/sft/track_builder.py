@@ -35,7 +35,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Part, Turn
+from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment
 from unirl.types.segments.text import TextSegment
 
@@ -128,6 +128,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self.max_response_length = max_response_length
         self.append_eos = append_eos
         self._embed_takes_images = "images" in inspect.signature(self._chat_stage.embed).parameters
+        self._embed_sft_prompt = getattr(self._chat_stage, "embed_sft_prompt", None)
         self._warned_truncation = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -193,11 +194,14 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                     )
             prompt_media_rows.append(refs)
         if any(prompt_media_rows):
-            return self._chat_stage.embed(
-                [
-                    Turn(role="user", content=MediaRefs.from_rows(prompt_media_rows)),
-                    Turn(role="user", content=texts),
-                ]
+            if not callable(self._embed_sft_prompt):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support "
+                    "role='prompt' media through embed_sft_prompt(texts, media_refs)."
+                )
+            return self._embed_sft_prompt(
+                texts=texts,
+                media_refs=MediaRefs.from_rows(prompt_media_rows),
             )
 
         if not self._embed_takes_images:
