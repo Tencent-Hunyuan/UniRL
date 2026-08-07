@@ -347,6 +347,11 @@ class BaseTrainer:
         SAME prompts at the SAME noise at every eval, so the panels are a
         like-for-like A/B across training.
 
+        That is the full-trajectory invariant only at ``eval_eta <= 0`` (the
+        default): an SDE eval additionally draws per-step noise seeded from the
+        eval step's sample ids, so its panels differ by noise as well as policy
+        (``DiffusionTrainer.__init__`` warns).
+
         The cap counts SAMPLES, not prompts: siblings are adjacent
         (``Part.fork``), so with ``eval_samples_per_prompt=4`` a cap of 8 shows
         two prompts four ways.

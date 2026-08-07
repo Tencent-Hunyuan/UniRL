@@ -257,8 +257,9 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 block plus, in override order: `eval_eta` (default `0.0` — deterministic ODE;
 `<= 0` also clears the SDE gate, `> 0` keeps the training gate and rejects a
 step-count override), `eval_samples_per_prompt`, then the optional
-`eval_sampling:` overlay, which accepts any `DiffusionSamplingParams` field and
-inherits `sampling:` for every field it does not mention:
+`eval_sampling:` overlay, which accepts any plain `DiffusionSamplingParams`
+field (object-valued fields such as `scheduler` / `sde_strategy` are rejected)
+and inherits `sampling:` for every field it does not mention:
 
 ```yaml
 sampling:                 # the RL rollout: cheap, stochastic
@@ -293,10 +294,12 @@ With `logging.log_media: true`, each eval also uploads up to `media_max_items`
 generations to `eval/generated_media` (`eval/<suite>/generated_media` for
 own-set suites) on the `eval/step` axis, captioned with prompt and reward. The
 eval set is served in a fixed order and eval x_T is keyed on prompt content, so
-every eval renders the same prompts from the same noise — a like-for-like
-filmstrip in which only the policy differs. `media_log_interval` does not apply
-(`eval_interval` already paces the panel), and pipelines without
-driver-authored x_T warn at startup that the panel will not be comparable.
+at the default `eval_eta: 0` every eval renders the same prompts from the same
+noise — a like-for-like filmstrip in which only the policy differs. An SDE eval
+(`eval_eta > 0`) draws per-step noise seeded from the eval step, so its panels
+vary by noise too; the trainer warns at startup then, as it does for pipelines
+without driver-authored x_T. `media_log_interval` does not apply
+(`eval_interval` already paces the panel).
 
 ## Gotchas
 
