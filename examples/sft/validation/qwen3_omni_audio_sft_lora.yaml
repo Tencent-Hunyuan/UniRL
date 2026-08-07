@@ -2,9 +2,10 @@
 # Qwen3-Omni Thinker · standalone WAV audio QA · LoRA SFT · 4 GPU.
 #
 # Prepare:
-#   python datasets/dcase2025_audio_qa/convert_dcase2025_audio_qa_to_sft.py \
+#   python datasets/dcase2025_audio_qa/convert_dcase2025_audio_qa_to_unirl.py \
 #     --snapshot /path/to/dcase2025-audio-qa \
-#     --out-dir datasets/dcase2025_audio_qa_sft
+#     --out-dir datasets/dcase2025_audio_qa_sft \
+#     --supervised
 #
 # Launch:
 #   QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \

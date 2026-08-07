@@ -213,8 +213,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True, help="local Hugging Face dataset snapshot")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--supervised",
+        action="store_true",
+        help="include response targets and use the SFT-compatible answer prompt",
+    )
     args = parser.parse_args()
-    manifest = convert(args.snapshot, args.out_dir)
+    manifest = convert(args.snapshot, args.out_dir, supervised=args.supervised)
     print(json.dumps(manifest["stats"], ensure_ascii=False, sort_keys=True))
 
 
