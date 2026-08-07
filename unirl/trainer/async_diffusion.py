@@ -215,14 +215,14 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             if self._admitted_generations == 0:
                 self._top_up(ceiling, M)
             try:
-                chunks = self._rollout_manager.collect(self.batch_size)
+                groups = self._rollout_manager.collect(self.batch_size)
             except RolloutUnderflow:
                 self._admitted_generations = 0
                 if self._next_generation_id >= ceiling:
                     raise RuntimeError("async rollout buffer underflow with no admissible generations") from None
                 continue
             self._admitted_generations -= 1
-            completed, gen_id = combine_rollout_chunks(chunks)
+            completed, gen_id = combine_rollout_chunks(groups)
             scored = self._score_completed(gen_id, completed)
             self._top_up(ceiling, M)
             return scored

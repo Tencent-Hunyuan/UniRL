@@ -10,7 +10,8 @@ def launch_ceiling(rollout_id: int, *, sync_interval: int, max_staleness: int, n
     return min(num_rollouts, ((rollout_id // sync_interval) + 1 + max_staleness) * sync_interval)
 
 
-def combine_rollout_chunks(chunks: List["Sample"]) -> Tuple["Sample", int]:
+def combine_rollout_chunks(groups: List[List["Sample"]]) -> Tuple["Sample", int]:
+    chunks = [sample for group in groups for sample in group]
     if not chunks:
         raise ValueError("cannot combine an empty rollout result")
     rollout_ids = [_rollout_id(sample) for sample in chunks]

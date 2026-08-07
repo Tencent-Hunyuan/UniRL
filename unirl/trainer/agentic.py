@@ -184,25 +184,6 @@ class AgenticTrainer(BaseTrainer):
             root_control={"ar": {"stop": list(self._stop)}},
         )
 
-    def _complete_groups(self, trajectories: List[Sample]) -> List[List[Sample]]:
-        expected = self.batch_size * self._group_size
-        if len(trajectories) != expected:
-            raise RuntimeError(f"expected {expected} trajectories, got {len(trajectories)}")
-
-        groups: Dict[str, List[Sample]] = {}
-        for trajectory in trajectories:
-            roots = list(dict.fromkeys(trajectory.root_group_ids(0)))
-            if len(roots) != 1:
-                raise RuntimeError("each agentic trajectory must belong to exactly one root group")
-            groups.setdefault(roots[0], []).append(trajectory)
-
-        malformed = {root: len(group) for root, group in groups.items() if len(group) != self._group_size}
-        if len(groups) != self.batch_size or malformed:
-            raise RuntimeError(
-                f"incomplete rollout groups: expected={self.batch_size}, actual={len(groups)}, malformed={malformed}"
-            )
-        return list(groups.values())
-
     def _collect_groups(self, requests: Sample, *, rollout_id: int) -> List[List[Sample]]:
         original_error: Optional[BaseException] = None
         wake_started = False
@@ -221,8 +202,7 @@ class AgenticTrainer(BaseTrainer):
 
             tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
             self._rollout_manager.submit(tasks)
-            trajectories = self._rollout_manager.collect(self.batch_size)
-            return self._complete_groups(trajectories)
+            return self._rollout_manager.collect(self.batch_size)
         except BaseException as exc:
             original_error = exc
             try:

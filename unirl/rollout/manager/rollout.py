@@ -54,7 +54,7 @@ class RolloutManager:
         self._ensure_open()
         self._pool.add(list(tasks))
 
-    def collect(self, n: int) -> List["Sample"]:
+    def collect(self, n: int) -> List[List["Sample"]]:
         self._ensure_open()
         n = int(n)
         if n <= 0:
@@ -78,7 +78,7 @@ class RolloutManager:
                     selected.append(chunk)
                     selected_groups += chunk.group_count
                 if selected_groups == n:
-                    return [sample for chunk in selected for sample in chunk.samples]
+                    return [chunk.samples for chunk in selected]
                 if not self._pool.live:
                     raise RolloutUnderflow(f"needed {n} rollout groups, collected {selected_groups}")
                 self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
