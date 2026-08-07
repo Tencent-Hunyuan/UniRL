@@ -251,6 +251,53 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - Agentic evaluation is not implemented. Barrier and partial variants raise if
   evaluation is enabled; async variants currently force it off.
 
+### Decoupling diffusion eval from the RL rollout
+
+`DiffusionTrainer` (sync and async) evaluates with the training `sampling:`
+block plus, in override order: `eval_eta` (default `0.0` — deterministic ODE;
+`<= 0` also clears the SDE gate, `> 0` keeps the training gate and rejects a
+step-count override), `eval_samples_per_prompt`, then the optional
+`eval_sampling:` overlay, which accepts any `DiffusionSamplingParams` field and
+inherits `sampling:` for every field it does not mention:
+
+```yaml
+sampling:                 # the RL rollout: cheap, stochastic
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 8
+
+eval_interval: 20
+eval_samples_per_prompt: 1
+eval_sampling:            # eval only; unset fields inherit `sampling`
+  num_inference_steps: 28
+  height: 1024
+  width: 1024
+logging:
+  log_media: true         # also uploads the eval panel (below)
+```
+
+CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval
+runs at the training guidance (a CFG-off run cannot silently evaluate with CFG
+on); name it in `eval_sampling:` to decouple the two. BAGEL-family params
+consume `cfg_text_scale`, and passing the inert `guidance_scale` there raises.
+Unknown overlay fields raise, and the retired per-field knobs
+(`eval_cfg_text_scale`, `eval_num_inference_steps`, ...) fail fast with a
+migration hint. Dynamic-shift models re-derive μ from the eval
+steps/resolution, so a decoupled eval stays on the model's official schedule;
+there is no per-eval time-shift override.
+
+With `logging.log_media: true`, each eval also uploads up to `media_max_items`
+generations to `eval/generated_media` (`eval/<suite>/generated_media` for
+own-set suites) on the `eval/step` axis, captioned with prompt and reward. The
+eval set is served in a fixed order and eval x_T is keyed on prompt content, so
+every eval renders the same prompts from the same noise — a like-for-like
+filmstrip in which only the policy differs. `media_log_interval` does not apply
+(`eval_interval` already paces the panel), and pipelines without
+driver-authored x_T warn at startup that the panel will not be comparable.
+
 ## Gotchas
 
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
