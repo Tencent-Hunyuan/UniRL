@@ -1,7 +1,8 @@
 """it2i — image-edit (text + cond image conditioning, image output).
 
 Reads ``primitives["text"]: Texts`` + ``primitives["image"]: Images``
-(the source image to edit) and ``stage_params["diffusion"]: dict``.
+(the source image to edit) and
+``stage_params["diffusion"]: dict``.
 Encodes the source image via the upstream
 ``HunyuanImage3VitEncodeStage.encode_for_cond_vit`` (image_processor)
 and the model's own ``_encode_cond_image`` for VAE latents, builds the
@@ -24,13 +25,13 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
-from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
+from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-from ..conditions import HunyuanImage3DiffusionConditions
+from ..conditions import HunyuanImage3DiffusionConditions, HunyuanImage3VAECondition
 from ..seed import make_cpu_generators
 
 if TYPE_CHECKING:
@@ -62,14 +63,29 @@ def _prepare_seeded_sampling(
     return seeded_params, condition_vae_generators, sde_sample_keys
 
 
-def _encode_cond_images_per_sample(
+def _encode_cond_images(
     transformer,
     batch_cond_images,
     generators: Optional[List[torch.Generator]],
 ):
-    """Encode every source image with the matching per-sample VAE RNG."""
+    """Encode every source image with the matching per-sample VAE RNG.
+
+    Always return list-backed per-sample payloads so DP concat never mixes
+    dense tensors from uniform local shards with ragged lists from mixed ones.
+    """
+
+    def _as_sample_batches(value):
+        return list(value.split(1, dim=0)) if isinstance(value, torch.Tensor) else list(value)
+
     if generators is None:
-        return transformer._encode_cond_image(batch_cond_images, cfg_factor=1, generator=None)
+        cond_vae, cond_timestep, cond_vit = transformer._encode_cond_image(
+            batch_cond_images, cfg_factor=1, generator=None
+        )
+        return (
+            _as_sample_batches(cond_vae),
+            _as_sample_batches(cond_timestep),
+            None if cond_vit is None else _as_sample_batches(cond_vit),
+        )
     if len(generators) != len(batch_cond_images):
         raise ValueError(
             "HunyuanImage3 it2i condition-VAE generator count "
@@ -83,20 +99,12 @@ def _encode_cond_images_per_sample(
             cfg_factor=1,
             generator=[generator],
         )
-        vae_items.append(cond_vae)
-        timestep_items.append(cond_timestep)
+        vae_items.extend(_as_sample_batches(cond_vae))
+        timestep_items.extend(_as_sample_batches(cond_timestep))
         if cond_vit is not None:
-            vit_items.extend(cond_vit)
+            vit_items.extend(_as_sample_batches(cond_vit))
 
-    if all(isinstance(item, torch.Tensor) for item in vae_items) and all(
-        item.shape[1:] == vae_items[0].shape[1:] for item in vae_items
-    ):
-        cond_vae_images = torch.cat(vae_items, dim=0)
-        cond_timestep = torch.cat(timestep_items, dim=0)
-    else:
-        cond_vae_images = vae_items
-        cond_timestep = timestep_items
-    return cond_vae_images, cond_timestep, vit_items or None
+    return vae_items, timestep_items, vit_items or None
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
@@ -134,7 +142,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
-    cond_vae_images, cond_timestep, cond_vit_images = _encode_cond_images_per_sample(
+    cond_vae_images, cond_timestep, cond_vit_images = _encode_cond_images(
         pipeline.bundle.transformer,
         vit["joint_image_info"],
         condition_vae_generators,
@@ -169,7 +177,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         fused_cond = fused_full
         fused_uncond = None
 
-    cond_vae = ImageLatentCondition(latents=cond_vae_images)
+    cond_vae = HunyuanImage3VAECondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
         embeds=cond_vit_images,
         attn_mask=vit_kwargs["attention_mask"],

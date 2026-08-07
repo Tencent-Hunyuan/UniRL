@@ -112,7 +112,7 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
 
         self.schedule_policy = self.adapter.schedule_policy()
 
-        self._weight_version = 0
+        self._version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -127,7 +127,7 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
-            return self._stamp_weight_version(self._generate_core(sample))
+            return self._stamp_output_version(self._generate_core(sample))
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous generation for one whole ``Sample``."""
@@ -262,7 +262,7 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -305,7 +305,7 @@ class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def destroy_weights_update_group(
         self,

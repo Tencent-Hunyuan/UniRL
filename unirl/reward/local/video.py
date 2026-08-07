@@ -70,7 +70,7 @@ class VideoRewardScorer(RewardBackend):
                 frame_pixels = torch.stack([to_tensor(f) for f in frames])
                 frame_request = RewardRequest(
                     primitives={"text": Texts(texts=[prompt] * len(frames))},
-                    generated={"image": Images(pixels=frame_pixels)},
+                    generated={"image": Images.from_dense(frame_pixels)},
                 )
                 frame_response = self.frame_scorer.compute_rewards(frame_request)
                 alignment_reward = sum(frame_response.rewards) / len(frame_response.rewards)

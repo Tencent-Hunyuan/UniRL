@@ -118,7 +118,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
             ports.master_port,
         )
 
-        self._weight_version = 0
+        self._version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -192,7 +192,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("FastVideoRolloutEngine.generate called after shutdown")
-            return self._stamp_weight_version(self._generate_core(sample))
+            return self._stamp_output_version(self._generate_core(sample))
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Generate and fill the frontier diffusion Part."""
@@ -577,7 +577,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
             require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
             self._generator.update_transformer_weights_from_path(checkpoint_path)
             self._last_weights_path = checkpoint_path
-            self._weight_version += 1
+            self._version += 1
             logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 

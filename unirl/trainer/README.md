@@ -60,8 +60,8 @@ The current trainer surface is:
 | `DiffusionTrainer` | one diffusion `Part` → one `TrainStack` | Reference diffusion loop; supports trainside or dedicated rollout, optional separate reward GPUs, FSDP offload, and DiffusionNFT's EMA-adapter rollout. |
 | `ARTrainer` | one AR `Part` → one `TrainStack` | Text or multimodal AR rollout with group/global advantage normalization and optional token-balanced DP shards. |
 | `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
-| `AsyncARTrainer` | buffered AR batch `Sample` → one `TrainStack` | Separate train/rollout slabs with resident generation, bounded staleness, and quiescence before sync, eval, or checkpoint. |
-| `AsyncDiffusionTrainer` | buffered diffusion batch `Sample` → one `TrainStack` | The same separate-slab async loop for DiT. Requires `max_inflight=1` and scores each intact batch before launching the next, so the cross-slab trajectory transfer never queues behind a fresh generation. |
+| `AsyncARTrainer` | FIFO AR generation batch → one `TrainStack` | Separate train/rollout slabs with resident generation, batch-denominated `weight_sync_interval` publication over an optimizer-update clock, and manager quiescence before weight sync, eval, or checkpoint. |
+| `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
 | `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. |
@@ -69,8 +69,9 @@ The current trainer surface is:
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
 provides one launcher per engine slot and lets the manager assemble root groups.
-Trainers retain admission, launch ordering, scoring, and training policy. The
-barrier-only `AgenticTrainer` does not expose tail, staleness, or cross-step
+Async batch trainers retain optimizer-update admission, publication cadence,
+hard boundaries, scoring order, and training policy through `AsyncBatchControl`.
+The barrier-only `AgenticTrainer` does not expose tail, staleness, or cross-step
 buffering policies.
 
 **Extending it:** a new domain is a new `<Domain>Trainer(BaseTrainer)` that builds its
@@ -179,9 +180,11 @@ so EMA decay schedules continue) and resumes the loop from the saved step.
 Synchronous Sample-based trainers continue `training_progress` and
 driver-authored x_T scheduling, fast-forward a deterministically seeded data
 stream, and force the restored weights into a freshly started rollout engine
-when needed. `AsyncARTrainer` also fast-forwards its deterministic input stream
-but rebuilds its rollout buffer. `AgenticTrainer` fast-forwards one input batch
-per completed step and synchronizes before its first resumed rollout; ReFL does
+when needed. Async AR/diffusion resume reads the backend optimizer count as the
+train version, fast-forwards the deterministic input stream to the saved
+rollout step, and syncs those restored weights into the fresh engine.
+`AgenticTrainer` uses the same backend optimizer count for its next published
+rollout version and fast-forwards one input batch per completed step. ReFL does
 not currently fast-forward its data source.
 
 The W&B run also continues: driver-written `trainer_state.json` at the
@@ -242,9 +245,9 @@ an evaluation and checkpoint fall on the same step, evaluation runs first.
 - `DiffusionTrainer`, `PETrainer`, and `UnifiedModelTrainer` report image
   reward; optional `eval_rewards` suites can
   score the same generated samples or their own prompt sets. PE scores only the
-  diffusion/image frontier. `AsyncDiffusionTrainer` quiesces first and then scores
-  the policy already resident in its rollout engine, without a weight sync and
-  without offloading that engine afterwards.
+  diffusion/image frontier. `AsyncDiffusionTrainer` reaches an empty hard
+  boundary, syncs the current train version when needed, and then scores
+  the resident rollout engine without offloading it afterwards.
 - `AgenticTrainer` does not implement evaluation.
 
 ## Gotchas

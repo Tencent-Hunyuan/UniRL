@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Sequence
+from collections import Counter, defaultdict
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence
 
-from unirl.rollout.manager.buffers import PendingGroups
+from unirl.rollout.manager.buffers import CompleteGroups, PendingGroups
 from unirl.rollout.manager.dispatch import RolloutPool
 from unirl.rollout.manager.filters import RolloutFilter, identity
 
@@ -14,12 +13,6 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _ReadyChunk:
-    group_count: int
-    samples: List["Sample"]
 
 
 class RolloutManager:
@@ -41,42 +34,39 @@ class RolloutManager:
         )
         self._group_size = int(group_size)
         self._pending = PendingGroups(group_size)
-        self._buffer: Deque[_ReadyChunk] = deque()
+        self._complete = CompleteGroups()
         self._filter = filter_fn
-        self._policy_version = 0
+        self._published_version = 0
         self._closed = False
 
     def submit(self, tasks: List["Sample"]) -> None:
         self._ensure_open()
         self._pool.add(list(tasks))
 
-    def collect(self, n: int) -> List[List["Sample"]]:
+    def collect(self, n: int, *, current_version: int) -> List[List["Sample"]]:
         self._ensure_open()
         n = int(n)
         if n <= 0:
             raise ValueError(f"collect count must be positive; got {n}")
+        current_version = int(current_version)
+        if current_version < 0:
+            raise ValueError(f"current_version must be non-negative; got {current_version}")
 
-        selected: List[_ReadyChunk] = []
-        selected_groups = 0
-        while selected_groups < n:
+        while True:
             self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-            self._filter_buffer()
-            while self._buffer and selected_groups < n:
-                chunk = self._buffer.popleft()
-                if selected_groups + chunk.group_count > n:
-                    self._split_front(chunk)
-                    continue
-                selected.append(chunk)
-                selected_groups += chunk.group_count
-            if selected_groups == n:
-                return [chunk.samples for chunk in selected]
+            self._filter_complete(current_version)
+            selected = self._complete.take(n)
+            if selected is not None:
+                return selected
             if not self._pool.live:
-                raise RuntimeError(f"needed {n} rollout groups, collected {selected_groups}")
+                raise RuntimeError(f"needed {n} rollout groups, collected {self._complete.group_count}")
             self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
-        raise AssertionError("unreachable")
 
-    def quiesce(self) -> List["Sample"]:
+    def quiesce(self, *, current_version: int) -> List["Sample"]:
         self._ensure_open()
+        current_version = int(current_version)
+        if current_version < 0:
+            raise ValueError(f"current_version must be non-negative; got {current_version}")
         undispatched = self._pool.pause()
         self._rollout.set_stopping(True)
         completed = self._resolve(self._pool.drain())
@@ -90,12 +80,12 @@ class RolloutManager:
             roots = _roots_of(sample)
             if len(roots) == 1:
                 tails_by_root[roots[0]].append(sample)
-            elif self._keep_root([sample]):
+            elif self._keep_root([sample], current_version=current_version):
                 carried.append(sample)
 
         for root, tails in tails_by_root.items():
             known = [*self._pending.get(root), *tails]
-            if self._keep_root(known):
+            if self._keep_root(known, current_version=current_version):
                 carried.extend(tails)
             else:
                 discarded = self._pending.discard(root)
@@ -107,25 +97,35 @@ class RolloutManager:
                 )
         return carried
 
-    def sync_weights(self, weight_sync: object, *, policy_version: int) -> int:
+    def sync_weights(self, weight_sync: object, *, output_version: int) -> int:
         self._ensure_open()
         self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-        if self._pool.live:
-            raise RuntimeError("sync_weights requires no queued or in-flight rollout work")
-        next_version = int(policy_version)
-        if next_version < self._policy_version:
-            raise ValueError(f"policy_version must be monotonic; current={self._policy_version}, next={next_version}")
+        inflight_count, ready_count = self.counts
+        if inflight_count or ready_count or len(self._pending):
+            raise RuntimeError(
+                "sync_weights requires no queued, in-flight, completed, or partially grouped rollout work"
+            )
+        next_version = int(output_version)
+        if next_version < self._published_version:
+            raise ValueError(
+                f"output_version must be monotonic; current={self._published_version}, next={next_version}"
+            )
         weight_sync.sync()
-        self._rollout.set_policy_version(next_version)
-        self._policy_version = next_version
-        return self._policy_version
+        self._rollout.set_version(next_version)
+        self._published_version = next_version
+        return self._published_version
+
+    @property
+    def counts(self) -> tuple[int, int]:
+        inflight_count, completed_count = self._pool.counts
+        return inflight_count, completed_count + len(self._complete)
 
     def close(self) -> None:
         if self._closed:
             return
         try:
             if self._pool.live:
-                self.quiesce()
+                self.quiesce(current_version=self._published_version)
         finally:
             self._pool.close()
             self._closed = True
@@ -143,18 +143,19 @@ class RolloutManager:
                     raise RuntimeError("trajectory suspended outside quiesce")
                 suspended.append(sample)
             elif status is None:
-                self._buffer.append(_ReadyChunk(self._batch_group_count(sample), [sample]))
+                self._complete.add(self._batch_group_count(sample), [sample])
             else:
+                self._require_stamped_generated_parts(sample)
                 terminal_trajectories.append(sample)
         for group in self._pending.add(terminal_trajectories):
-            self._buffer.append(_ReadyChunk(1, group))
+            self._complete.add(1, group)
         return suspended
 
     def _batch_group_count(self, sample: "Sample") -> int:
         roots = _roots_of(sample)
-        unstamped = [index for index, part in enumerate(sample.gen_parts()) if part.weight_version is None]
-        if unstamped:
-            raise RuntimeError(f"completed batch rollout has unstamped generated Parts at indices {unstamped}")
+        if not sample.gen_parts():
+            raise RuntimeError("completed batch rollout has no generated Parts")
+        self._require_stamped_generated_parts(sample)
         descendants = Counter(sample.root_group_ids(-1))
         malformed = {root: descendants.get(root, 0) for root in roots if descendants.get(root, 0) != self._group_size}
         extra = set(descendants) - set(roots)
@@ -165,58 +166,12 @@ class RolloutManager:
             )
         return len(roots)
 
-    def _split_front(self, chunk: _ReadyChunk) -> None:
-        if len(chunk.samples) != 1:
-            raise RuntimeError(
-                f"cannot split a {chunk.group_count}-group chunk containing {len(chunk.samples)} Samples"
-            )
-        groups = chunk.samples[0].split()
-        if len(groups) != chunk.group_count:
-            raise RuntimeError(
-                f"batch chunk reported {chunk.group_count} roots but Sample.split produced {len(groups)}"
-            )
-        self._buffer.extendleft(_ReadyChunk(1, [sample]) for sample in reversed(groups))
+    def _filter_complete(self, current_version: int) -> None:
+        self._complete.filter(lambda samples: self._apply_filter(samples, current_version=current_version))
 
-    def _filter_buffer(self) -> None:
-        chunks = list(self._buffer)
-        if not chunks:
-            return
-        candidates = [sample for chunk in chunks for sample in chunk.samples]
-        kept = self._apply_filter(candidates)
-        by_sample = {id(sample): index for index, sample in enumerate(candidates)}
-        if len(by_sample) != len(candidates):
-            raise RuntimeError("rollout buffer contains the same Sample object more than once")
-
-        chunk_by_sample: Dict[int, int] = {}
-        for chunk_index, chunk in enumerate(chunks):
-            for sample in chunk.samples:
-                chunk_by_sample[id(sample)] = chunk_index
-
-        positions: Dict[int, List[int]] = defaultdict(list)
-        kept_by_chunk: Dict[int, List["Sample"]] = defaultdict(list)
-        chunk_order = []
-        for position, sample in enumerate(kept):
-            chunk_index = chunk_by_sample[id(sample)]
-            if chunk_index not in kept_by_chunk:
-                chunk_order.append(chunk_index)
-            positions[chunk_index].append(position)
-            kept_by_chunk[chunk_index].append(sample)
-
-        filtered = []
-        for chunk_index in chunk_order:
-            chunk = chunks[chunk_index]
-            chunk_samples = kept_by_chunk[chunk_index]
-            if len(chunk_samples) != len(chunk.samples):
-                raise RuntimeError("rollout filter must retain or discard an entire logical root")
-            chunk_positions = positions[chunk_index]
-            if chunk_positions != list(range(chunk_positions[0], chunk_positions[0] + len(chunk_positions))):
-                raise RuntimeError("rollout filter cannot interleave Samples from different logical roots")
-            filtered.append(_ReadyChunk(chunk.group_count, chunk_samples))
-        self._buffer = deque(filtered)
-
-    def _apply_filter(self, samples: List["Sample"]) -> List["Sample"]:
+    def _apply_filter(self, samples: List["Sample"], *, current_version: int) -> List["Sample"]:
         candidates = list(samples)
-        kept = list(self._filter(list(candidates), self._policy_version))
+        kept = list(self._filter(list(candidates), current_version))
         candidate_ids = Counter(map(id, candidates))
         kept_ids = Counter(map(id, kept))
         if kept_ids - candidate_ids:
@@ -225,12 +180,18 @@ class RolloutManager:
             raise RuntimeError("rollout filter returned the same Sample more than once")
         return kept
 
-    def _keep_root(self, samples: List["Sample"]) -> bool:
+    def _keep_root(self, samples: List["Sample"], *, current_version: int) -> bool:
         candidates = list(samples)
-        kept = self._apply_filter(candidates)
+        kept = self._apply_filter(candidates, current_version=current_version)
         if kept and Counter(map(id, kept)) != Counter(map(id, candidates)):
             raise RuntimeError("rollout filter must retain or discard an entire incomplete root")
         return bool(kept)
+
+    @staticmethod
+    def _require_stamped_generated_parts(sample: "Sample") -> None:
+        unstamped = [index for index, part in enumerate(sample.gen_parts()) if part.output_version is None]
+        if unstamped:
+            raise RuntimeError(f"completed rollout has unstamped generated Parts at indices {unstamped}")
 
     def _ensure_open(self) -> None:
         if self._closed:

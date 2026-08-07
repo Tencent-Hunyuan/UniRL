@@ -1,8 +1,8 @@
 """QwenImageEditPlus VAE stages — source-image encoder + (reused) decoder.
 
 ``QwenImageEditPlusVAEEncodeStage`` is the one genuinely new stage: it
-turns a source ``Images`` primitive into an :class:`ImageLatentCondition`
-carrying the VAE-encoded spatial latent ``[B, 16, H/8, W/8]``. The diffusion
+turns source ``Images`` into a :class:`QwenImageEditPlusLatentCondition`
+carrying one VAE-encoded spatial latent ``[16, H_i/8, W_i/8]`` per sample. The diffusion
 step (:class:`QwenImageEditPlusDiffusionStep`) packs both the noise latent
 and this image latent with the same 2×2 channel-pack before concatenating
 along the token dimension — mirrors ``vde_editplus.py:232`` and the
@@ -16,14 +16,15 @@ the Edit-Plus package is self-contained.
 from __future__ import annotations
 
 import math
+from typing import Dict, List
 
 import torch
 
 from unirl.models.types.codec import EncodeStage
-from unirl.types.conditions import ImageLatentCondition
 from unirl.types.primitives import Images
 
 from .bundle import QwenImageEditPlusBundle
+from .conditions import QwenImageEditPlusLatentCondition
 
 # Resize source images to the upstream 1024-square grid so rollout latent shapes match.
 _VAE_IMAGE_AREA = 1024 * 1024
@@ -45,7 +46,7 @@ def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
     return int(vae_width), int(vae_height)
 
 
-class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
+class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLatentCondition]):
     """Encode a source image into a VAE-latent condition for token concat.
 
     Pipeline:
@@ -73,8 +74,8 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
        in :class:`QwenImageVAEDecodeStage` applies the inverse, so
        skipping this would put rollout/trainsite image latents on a
        different scale than the transformer was trained on).
-    6. Return the spatial latent ``[B, 16, H/8, W/8]`` wrapped in an
-       :class:`ImageLatentCondition`. **Do NOT** ``_pack_latents`` here —
+    6. Return one spatial latent ``[16, H_i/8, W_i/8]`` per sample wrapped in
+       :class:`QwenImageEditPlusLatentCondition`. **Do NOT** ``_pack_latents`` here —
        the diffusion step packs both noise and image latents together so
        they share the same 2×2 pack logic; the condition carries the
        spatial latent (mirrors ``Flux2KleinConditions.image_latent``).
@@ -84,22 +85,16 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
         self.bundle = bundle
 
     @torch.no_grad()
-    def encode(self, images: Images, *, height: int, width: int) -> ImageLatentCondition:
-        """Encode source pixels into an :class:`ImageLatentCondition`.
+    def encode(self, images: Images) -> QwenImageEditPlusLatentCondition:
+        """Encode source pixels into a ragged latent condition.
 
         Args:
-            images: source ``Images`` with ``pixels`` ``[B, 3, H, W]`` in
-                ``[0, 1]``.
-            height, width: generation grid (must be divisible by 16: 8× VAE
-                downsample + 2× patchify). Used only for the 16-alignment
-                guard; the source image is resized to the upstream
-                ``VAE_IMAGE_SIZE`` grid (≈1024²), NOT to the generation
-                grid, matching sglang/vllm_omni rollout engines.
+            images: source images with one native ``[3, H_i, W_i]`` tensor per
+                sample in ``[0, 1]``.
 
         Returns:
-            :class:`ImageLatentCondition` with ``latents`` shape
-            ``[B, 16, H_vae/8, W_vae/8]`` on the bundle device, in the
-            bundle dtype.
+            :class:`QwenImageEditPlusLatentCondition` with one
+            ``[16, H_vae_i/8, W_vae_i/8]`` tensor per sample.
         """
         if self.bundle.vae is None:
             raise RuntimeError(
@@ -109,53 +104,52 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
                 "recipes encode in the rollout engine (image_latent arrives "
                 "captured); trainside rollout requires load_vae=True."
             )
-        pixels = images.pixels
-        if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
-            raise ValueError(
-                f"QwenImageEditPlusVAEEncodeStage.encode: expected pixels "
-                f"[B, 3, H, W] in [0,1], got shape "
-                f"{None if pixels is None else tuple(pixels.shape)}"
-            )
-        if int(height) % 16 != 0 or int(width) % 16 != 0:
-            raise ValueError(
-                f"QwenImageEditPlusVAEEncodeStage.encode: height ({height}) and "
-                f"width ({width}) must be divisible by 16 (8× VAE + 2× patchify)"
-            )
+        if not isinstance(images, Images):
+            raise TypeError(f"QwenImageEditPlusVAEEncodeStage.encode: expected Images, got {type(images).__name__}")
+        source_pils = images.to_pils()
+        if not source_pils:
+            raise ValueError("QwenImageEditPlusVAEEncodeStage.encode: empty image batch")
 
         vae = self.bundle.vae
         device = self.bundle.device
         dtype = self.bundle.dtype
         vae_f32 = vae.to(torch.float32)
 
-        pixels = pixels.to(device=device, dtype=torch.float32)
-        src_h = int(pixels.shape[-2])
-        src_w = int(pixels.shape[-1])
-        vae_w, vae_h = _vae_size_for_aspect(src_w, src_h)
-        if src_h != vae_h or src_w != vae_w:
-            pixels = torch.nn.functional.interpolate(pixels, size=(vae_h, vae_w), mode="bilinear", align_corners=False)
+        # Stable shape buckets preserve input order while allowing each VAE
+        # call to stay dense. Portrait and landscape samples never influence
+        # one another's resize target.
+        groups: Dict[tuple[int, int], List[int]] = {}
+        for index, pil in enumerate(source_pils):
+            vae_w, vae_h = _vae_size_for_aspect(*pil.size)
+            groups.setdefault((vae_h, vae_w), []).append(index)
 
-        scaled = pixels * 2.0 - 1.0
-
-        scaled_5d = scaled.unsqueeze(2)
-
-        image_latents = vae_f32.encode(scaled_5d).latent_dist.mode()
-
-        image_latents = image_latents.squeeze(2)
-
+        # Per-channel normalization mirrors the upstream Edit-Plus pipeline.
         z_dim = int(vae.config.z_dim)
-        latents_mean = (
-            torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32)
-            .view(1, z_dim, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(vae.config.latents_std, device=device, dtype=torch.float32)
-            .view(1, z_dim, 1, 1)
-            .to(image_latents.device, image_latents.dtype)
-        )
-        image_latents = (image_latents - latents_mean) / latents_std
+        latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32).view(1, z_dim, 1, 1)
+        latents_std = torch.tensor(vae.config.latents_std, device=device, dtype=torch.float32).view(1, z_dim, 1, 1)
 
-        return ImageLatentCondition(latents=image_latents.to(dtype=dtype))
+        import PIL.Image
+        from torchvision.transforms.functional import pil_to_tensor
+
+        by_index: Dict[int, torch.Tensor] = {}
+        for (vae_h, vae_w), indices in groups.items():
+            resized_items = []
+            for index in indices:
+                pil = source_pils[index]
+                if pil.size != (vae_w, vae_h):
+                    pil = pil.resize((vae_w, vae_h), PIL.Image.Resampling.LANCZOS)
+                pixels = pil_to_tensor(pil).to(device=device, dtype=torch.float32).div_(255.0).unsqueeze(0)
+                resized_items.append(pixels)
+            pixels_batch = torch.cat(resized_items, dim=0)
+            scaled_5d = (pixels_batch * 2.0 - 1.0).unsqueeze(2)
+            image_latents = vae_f32.encode(scaled_5d).latent_dist.mode().squeeze(2)
+            mean = latents_mean.to(image_latents.device, image_latents.dtype)
+            std = latents_std.to(image_latents.device, image_latents.dtype)
+            image_latents = ((image_latents - mean) / std).to(dtype=dtype)
+            for local_index, source_index in enumerate(indices):
+                by_index[source_index] = image_latents[local_index]
+
+        return QwenImageEditPlusLatentCondition(latents=[by_index[index] for index in range(len(source_pils))])
 
 
 __all__ = ["QwenImageEditPlusVAEEncodeStage"]

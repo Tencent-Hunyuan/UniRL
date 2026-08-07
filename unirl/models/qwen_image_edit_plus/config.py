@@ -49,6 +49,8 @@ class QwenImageEditPlusPipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
+    batch_replay_steps: bool = False
+
     shift: float = 3.0
 
     weight_sync_param_name_prefix: str = "transformer."

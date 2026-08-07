@@ -35,7 +35,7 @@ def seed_from_sample_id(sample_id: str) -> int:
 
 
 def pils_to_images(pil_images: Sequence[Any]) -> Images:
-    """``[PIL.Image, …] → Images`` (float32 ``[B, C, H, W]`` in [0, 1])."""
+    """``[PIL.Image, ...]`` → packed ``Images`` with float32 CHW samples in ``[0, 1]``."""
     if not pil_images:
         raise ValueError("pils_to_images: empty image list")
     from torchvision.transforms.functional import pil_to_tensor

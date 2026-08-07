@@ -386,8 +386,12 @@ class Hi3InputAdapter:
         if self.image_input:
             pil = pil_images[i]
             entry["multi_modal_data"] = {"image": pil}
-            entry["height"] = pil.height
-            entry["width"] = pil.width
+            if diff_params is None:
+                entry["height"] = pil.height
+                entry["width"] = pil.width
+            else:
+                entry["height"] = int(diff_params.height)
+                entry["width"] = int(diff_params.width)
         elif self.carries_target_size:
             entry["height"] = int(diff_params.height)
             entry["width"] = int(diff_params.width)

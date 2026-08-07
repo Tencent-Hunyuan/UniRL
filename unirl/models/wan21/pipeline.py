@@ -218,11 +218,9 @@ class WAN21Pipeline(Pipeline):
         wan_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
 
         if images_prim is not None:
-            if images_prim.pixels is None or int(images_prim.pixels.shape[0]) != len(texts.texts):
+            if len(images_prim) != len(texts.texts):
                 raise ValueError(
-                    f"WAN21Pipeline.generate: image count "
-                    f"{None if images_prim.pixels is None else int(images_prim.pixels.shape[0])} "
-                    f"!= text count {len(texts.texts)}"
+                    f"WAN21Pipeline.generate: image count {len(images_prim)} != text count {len(texts.texts)}"
                 )
             image_latent = WAN21ImageLatentEncodeStage(
                 self.bundle,

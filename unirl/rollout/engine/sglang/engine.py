@@ -176,7 +176,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
-        self._weight_version = 0
+        self._version = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
         require(
@@ -192,7 +192,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         return prepared
 
     def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
-        return self._stamp_weight_version(self.adapter.build_response(sample, prepared, raw))
+        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -332,7 +332,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -383,7 +383,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def destroy_weights_update_group(
         self,

@@ -38,11 +38,9 @@ framework-managed hidden attribute:
   rebuild a user-declared field. The two values drift, and per-sample
   slicing becomes incorrect.
 
-These rules generalize to any future ragged-along-dim-0 primitive (e.g.
-``PointClouds`` with varlen point counts). Image-like primitives where
-dim 0 IS the sample axis (``Images.pixels: [B, C, H, W]``) keep using
-``FieldKind.CONCAT`` as before — that's the rectangular case the
-framework's default machinery already handles.
+These rules also apply to images. ``Images.packed_pixels`` flattens each CHW
+sample to one 1-D packed chunk; ``image_shapes`` retains each ``(C, H, W)``.
+Model-specific processors own any resize.
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ from typing import List, Optional, Union
 import PIL.Image
 import torch
 
-from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field
+from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field, packed_field
 from unirl.types.media import MediaRefs
 
 
@@ -138,44 +136,96 @@ class Texts(Batch):
 
 @dataclass
 class Images(Batch):
-    """Batch images packed as a single ``[B, C, H, W]`` tensor.
+    """Image batch with LLM-style packed storage for arbitrary CHW layouts.
 
-    Assumes uniform shape within the batch.
+    ``packed_pixels`` is one flat 1-D tensor containing every sample.
+    ``image_shapes[i]`` stores the corresponding ``(C, H, W)`` and inherited
+    ``cu_seqlens`` stores sample boundaries. Construct with :meth:`from_list`
+    or :meth:`from_dense`; use :meth:`to_dense` only at uniform model boundaries.
     """
 
-    pixels: torch.Tensor = field(kind=FieldKind.CONCAT, default=None)
+    packed_pixels: torch.Tensor = packed_field(default=None)
+    image_shapes: torch.Tensor = concat_field(default=None)
+
+    @property
+    def cu_pixels(self) -> Optional[torch.Tensor]:
+        return self.cu_seqlens
+
+    @classmethod
+    def from_dense(cls, pixels: torch.Tensor) -> "Images":
+        if pixels is None or pixels.ndim != 4:
+            raise ValueError(
+                f"Images.from_dense expects pixels [B, C, H, W], got {None if pixels is None else tuple(pixels.shape)}"
+            )
+        batch_size, channels, height, width = (int(dim) for dim in pixels.shape)
+        sample_size = channels * height * width
+        image_shapes = torch.tensor([[channels, height, width]] * batch_size, dtype=torch.long)
+        instance = cls(packed_pixels=pixels.reshape(-1), image_shapes=image_shapes)
+        object.__setattr__(
+            instance,
+            "_packed_cu_seqlens",
+            torch.arange(batch_size + 1, dtype=torch.long) * sample_size,
+        )
+        return instance
 
     @classmethod
     def from_list(cls, items: List[Image]) -> "Images":
         if not items:
             raise ValueError("Cannot build Images from an empty list")
         pixels_list = [img.pixels for img in items]
-        if len(set(p.shape for p in pixels_list)) != 1:
-            max_h = max(p.shape[-2] for p in pixels_list)
-            max_w = max(p.shape[-1] for p in pixels_list)
-            padded = []
-            for p in pixels_list:
-                if p.shape[-2] == max_h and p.shape[-1] == max_w:
-                    padded.append(p)
-                else:
-                    c, h, w = p.shape
-                    pad_h = max_h - h
-                    pad_w = max_w - w
-                    padded_p = torch.nn.functional.pad(p, (0, pad_w, 0, pad_h), mode="constant", value=0)
-                    padded.append(padded_p)
-            pixels_list = padded
-        stacked = torch.stack(pixels_list, dim=0)
-        return cls(pixels=stacked)
+        if any(p is None or p.ndim != 3 for p in pixels_list):
+            bad = [None if p is None else tuple(p.shape) for p in pixels_list]
+            raise ValueError(f"Images.from_list expects per-sample pixels [C, H, W], got {bad}")
+        channels = {int(p.shape[0]) for p in pixels_list}
+        if len(channels) != 1:
+            raise ValueError(f"Images.from_list requires a consistent channel count, got {sorted(channels)}")
+        shapes = [tuple(p.shape) for p in pixels_list]
+        if len(set(shapes)) == 1:
+            return cls.from_dense(torch.stack(pixels_list, dim=0))
+        image_shapes = torch.tensor(shapes, dtype=torch.long)
+        return cls.pack(
+            packed_pixels=[pixels.reshape(-1) for pixels in pixels_list],
+            image_shapes=image_shapes,
+        )
 
     def to_list(self) -> List[Image]:
-        return [Image(pixels=self.pixels[i]) for i in range(self.pixels.shape[0])]
+        cu = self.cu_pixels
+        if cu is None or self.packed_pixels is None or self.image_shapes is None:
+            return []
+        images: List[Image] = []
+        for index in range(int(cu.shape[0]) - 1):
+            shape = tuple(int(v) for v in self.image_shapes[index].tolist())
+            flat = self.packed_pixels[int(cu[index]) : int(cu[index + 1])]
+            expected = shape[0] * shape[1] * shape[2]
+            if int(flat.numel()) != expected:
+                raise ValueError(
+                    f"Images sample {index} has packed length {int(flat.numel())}, "
+                    f"expected {expected} for shape {shape}"
+                )
+            images.append(Image(pixels=flat.view(shape)))
+        return images
+
+    def to_dense(self) -> torch.Tensor:
+        """Return a uniform ``[B,C,H,W]`` view sharing packed-pixel storage."""
+        if self.packed_pixels is None or self.image_shapes is None or self.cu_pixels is None or len(self) == 0:
+            raise ValueError("Images.to_dense requires a non-empty materialized batch")
+        shape_rows = [tuple(int(v) for v in row.tolist()) for row in self.image_shapes]
+        shapes = set(shape_rows)
+        if len(shapes) != 1:
+            raise ValueError(f"Images.to_dense requires uniform shapes, got {sorted(shapes)}")
+        shape = shape_rows[0]
+        expected = shape[0] * shape[1] * shape[2]
+        if self.lengths is None or any(int(length) != expected for length in self.lengths):
+            raise ValueError(f"Images.to_dense packed lengths do not match shape {shape}")
+        return self.packed_pixels.view(len(self), *shape)
 
     def to_pils(self) -> List[PIL.Image.Image]:
         """Per-sample PIL conversion — batch counterpart of :meth:`Image.to_pil`."""
         return [img.to_pil() for img in self.to_list()]
 
     def __len__(self) -> int:
-        return int(self.pixels.shape[0]) if self.pixels is not None else 0
+        cu = self.cu_pixels
+        return int(cu.shape[0]) - 1 if cu is not None else 0
 
 
 @dataclass

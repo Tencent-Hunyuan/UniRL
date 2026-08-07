@@ -48,6 +48,7 @@ from .flux2_klein_utils import (
     patchify_latents,
     unpatchify_latents,
 )
+from .image import resize_condition_pils
 
 
 class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
@@ -105,7 +106,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = _decode(clean)
 
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 class Flux2KleinVAEEncodeStage:
@@ -142,22 +143,32 @@ class Flux2KleinVAEEncodeStage:
                 "recipes encode in the rollout engine; trainside rollout "
                 "requires load_vae=True."
             )
-        pixels = images.pixels
-        if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
+        if not isinstance(images, Images):
+            raise TypeError(f"Flux2KleinVAEEncodeStage.encode: expected Images, got {type(images).__name__}")
+        pixels_list = [image.pixels for image in images.to_list()]
+        if not pixels_list or any(pixels is None or pixels.ndim != 3 or pixels.shape[0] != 3 for pixels in pixels_list):
             raise ValueError(
-                f"Flux2KleinVAEEncodeStage.encode: expected pixels [B, 3, H, W] in [0,1], "
-                f"got shape {None if pixels is None else tuple(pixels.shape)}"
+                "Flux2KleinVAEEncodeStage.encode: expected per-sample pixels [3, H, W] in [0,1], "
+                f"got {[None if pixels is None else tuple(pixels.shape) for pixels in pixels_list]}"
             )
 
         vae = self.bundle.vae
         device = self.bundle.device
         vae_f32 = vae.to(torch.float32)
 
-        pixels = pixels.to(device=device, dtype=torch.float32)
-        if int(pixels.shape[-2]) != int(height) or int(pixels.shape[-1]) != int(width):
-            pixels = torch.nn.functional.interpolate(
-                pixels, size=(int(height), int(width)), mode="bilinear", align_corners=False
-            )
+        # Resize the source image to the generation size. The data source loads
+        # condition images at native resolution (arbitrary H×W), but the VAE
+        # patchify requires H,W divisible by 16 (8× VAE + 2× patch), and a
+        # consistent token count across a GRPO group needs a fixed size. Using
+        # the generation (height, width) satisfies both (recipe sizes are
+        # multiples of 16) and matches the edited-image resolution.
+        from torchvision.transforms.functional import pil_to_tensor
+
+        condition_pils = resize_condition_pils(images.to_pils(), height=height, width=width)
+        pixels = torch.stack(
+            [pil_to_tensor(pil).to(dtype=torch.float32).div_(255.0) for pil in condition_pils],
+            dim=0,
+        ).to(device=device)
 
         scaled = pixels * 2.0 - 1.0
 

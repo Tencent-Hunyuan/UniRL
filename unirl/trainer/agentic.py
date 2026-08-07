@@ -16,6 +16,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager
 from unirl.train.stack import TrainStepResult
+from unirl.trainer.async_batch_control import unwrap_replicated_int
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample, _part_with_field
@@ -103,6 +104,10 @@ class AgenticTrainer(BaseTrainer):
                 group_size=self._group_size,
                 worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
             )
+            self._train_version = unwrap_replicated_int(
+                self.backend.get_optimizer_step_count(),
+                name="backend optimizer step count",
+            )
         except BaseException:
             self._shutdown_runtime()
             raise
@@ -160,14 +165,14 @@ class AgenticTrainer(BaseTrainer):
             root_control={"ar": {"stop": list(self._stop)}},
         )
 
-    def _collect_groups(self, requests: Sample, *, rollout_id: int) -> List[List[Sample]]:
+    def _collect_groups(self, requests: Sample) -> List[List[Sample]]:
         self.rollout.wake_up()
-        self._rollout_manager.sync_weights(self.weight_sync, policy_version=rollout_id)
+        self._rollout_manager.sync_weights(self.weight_sync, output_version=self._train_version)
         self.backend.offload()
 
         tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
         self._rollout_manager.submit(tasks)
-        groups = self._rollout_manager.collect(self.batch_size)
+        groups = self._rollout_manager.collect(self.batch_size, current_version=self._train_version)
 
         self.rollout.sleep()
         self.backend.onload()
@@ -182,11 +187,11 @@ class AgenticTrainer(BaseTrainer):
     ) -> Tuple[TrainStepResult, float]:
         t0 = time.perf_counter()
         requests = self._build_request_sample(inputs, rollout_id)
-        groups = self._collect_groups(requests, rollout_id=rollout_id)
+        groups = self._collect_groups(requests)
         trajectories = [trajectory for group in groups for trajectory in group]
         rewards = self._score_trajectories(trajectories, rollout_id)
         advantages = self._group_advantages(groups, rewards)
-        return self._train_and_log(
+        result, mean_reward = self._train_and_log(
             trajectories,
             rewards,
             advantages,
@@ -194,6 +199,8 @@ class AgenticTrainer(BaseTrainer):
             training_progress=training_progress,
             t0=t0,
         )
+        self._train_version += result.optimizer_updates
+        return result, mean_reward
 
     def _score_trajectories(self, trajectories: List[Sample], rollout_id: int) -> torch.Tensor:
         rewards = torch.full((len(trajectories),), float("nan"), dtype=torch.float32)
@@ -318,13 +325,12 @@ class AgenticTrainer(BaseTrainer):
             max(depths, default=0),
             dict(sorted(Counter(depths).items())),
         )
-
         if train_parts:
             train_part = self._pad_to_dp_multiple(Part.concat(train_parts))
             result = self.stack.train_track(train_part, training_progress=float(training_progress))
             train_rows = int(train_part.batch_size)
         else:
-            result = TrainStepResult(0.0, 0.0, 0.0, False, [], {})
+            result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
 
         log_sample = self._build_log_sample(trajectories, rewards, advantages, rollout_id)
@@ -392,6 +398,10 @@ class AgenticTrainer(BaseTrainer):
     ) -> None:
         try:
             start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+            self._train_version = unwrap_replicated_int(
+                self.backend.get_optimizer_step_count(),
+                name="backend optimizer step count",
+            )
             for _ in range(start_rollout):
                 self.data_source.get_samples(self.batch_size)
             self._init_wandb(num_rollouts=num_rollouts, extra={"agentic_execution": "barrier"})

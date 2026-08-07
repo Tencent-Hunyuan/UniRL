@@ -4,7 +4,7 @@ Text+image → image editing flow::
 
     Texts ──text_embed──▶ ┐
                          ├─▶ QwenImageEditPlusConditions ──diffuse──▶ LatentSegment
-    Images ──vae_encode──▶ ┘                                              │
+    Images ───────vae_encode▶ ┘                                           │
                                                                          ▼
                                                                      vae_decode
                                                                          │
@@ -56,8 +56,8 @@ class QwenImageEditPlusPipeline(Pipeline):
     Reads from the conditioning ancestors:
 
     - ``primitives["text"]: Texts`` — required edit instructions.
-    - ``primitives["image"]: Images`` — **required** source images (Edit-Plus
-      is edit-only; raises ``TypeError`` if absent — fail-fast, constraint #27).
+    - ``primitives["image"]: Images`` — **required** source images. Packed
+      storage preserves each sample's native resolution (Edit-Plus is edit-only).
       The source remains required for VAE latent concatenation even when
       ``use_condition_image_prompt=False``; that switch only controls whether
       the text encoder also sees the source image.
@@ -89,6 +89,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         max_sequence_length: int = 512,
         use_condition_image_prompt: bool = True,
         processor_path: Optional[str] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -108,6 +109,7 @@ class QwenImageEditPlusPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_encode = vae_encode if vae_encode is not None else QwenImageEditPlusVAEEncodeStage(bundle)
@@ -169,6 +171,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_encode = QwenImageEditPlusVAEEncodeStage(bundle)
         vae_decode = QwenImageVAEDecodeStage(bundle)
@@ -228,6 +231,11 @@ class QwenImageEditPlusPipeline(Pipeline):
                 "QwenImageEditPlusPipeline.generate: frontier sampling_params.sigmas is None; "
                 "the hosting engine must pin the schedule before pipeline.generate."
             )
+        if int(params.height) % 16 or int(params.width) % 16:
+            raise ValueError(
+                f"QwenImageEditPlusPipeline.generate: height ({params.height}) and width "
+                f"({params.width}) must be divisible by 16"
+            )
 
         conditioning = sample.conditioning()
         text_inputs = [value for value in conditioning if isinstance(value, Texts)]
@@ -243,11 +251,9 @@ class QwenImageEditPlusPipeline(Pipeline):
                 f"primitive (Edit-Plus is edit-only), got {len(image_inputs)}"
             )
         texts, images = text_inputs[0], image_inputs[0]
-        if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+        if len(images) != len(texts.texts):
             raise ValueError(
-                f"QwenImageEditPlusPipeline.generate: image batch "
-                f"{None if images.pixels is None else int(images.pixels.shape[0])} "
-                f"!= text batch {len(texts.texts)}"
+                f"QwenImageEditPlusPipeline.generate: image batch {len(images)} != text batch {len(texts.texts)}"
             )
 
         edit_conds = self.build_conditions(
@@ -255,11 +261,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             images=images,
             guidance_scale=float(params.guidance_scale),
         )
-        image_latent = self.vae_encode.encode(
-            images,
-            height=int(params.height),
-            width=int(params.width),
-        )
+        image_latent = self.vae_encode.encode(images)
         edit_conds.image_latent = image_latent
 
         schedule = params.sigmas.to(self.bundle.device)

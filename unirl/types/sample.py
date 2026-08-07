@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
 
@@ -31,12 +31,17 @@ from unirl.distributed.tensor.batch import (
     shared_field,
 )
 from unirl.distributed.tensor.ref import hydrate
-from unirl.types.advantages import compute_gae_advantages as _compute_gae
-from unirl.types.advantages import scatter_terminal_rewards
+from unirl.types.advantages import (
+    compute_gae_advantages as _compute_gae,
+)
+from unirl.types.advantages import (
+    finite_mean_std,
+    scatter_terminal_rewards,
+)
 from unirl.types.conditions import Condition
 from unirl.types.media import MediaRefs
 from unirl.types.media_preview import MediaPreview
-from unirl.types.primitives import Audios, Images, Texts, Videos, primitive_modality_key
+from unirl.types.primitives import Images, PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
 from unirl.types.segments import Segment, TextSegment
@@ -44,7 +49,7 @@ from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
-Primitive = Union[Texts, Images, Videos, Audios, MediaRefs]
+Primitive = PrimitiveValue
 PrimitiveMap = Dict[str, Primitive]
 PrimitiveMetadata = Dict[str, Dict[str, Any]]
 PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio", "media")
@@ -97,7 +102,7 @@ class Part(Batch):
     control: Dict[str, Any] = shared_field(default_factory=dict)
     sampling_params: Optional[BaseSamplingParams] = shared_field(default=None)
     role: Optional[str] = shared_field(default=None)
-    weight_version: Optional[int] = shared_field(default=None)
+    output_version: Optional[int] = shared_field(default=None)
     harness_status: Optional[str] = shared_field(default=None)
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
 
@@ -299,7 +304,7 @@ class Part(Batch):
         conditions: Optional[Dict[str, Condition]] = None,
         media_preview: Optional[MediaPreview] = None,
         status: Optional[torch.Tensor] = None,
-        weight_version: Optional[int] = None,
+        output_version: Optional[int] = None,
     ) -> "Part":
         """Return a copy of this gen-shell part with generation outputs written.
 
@@ -316,7 +321,7 @@ class Part(Batch):
             ("conditions", conditions),
             ("media_preview", media_preview),
             ("status", status),
-            ("weight_version", weight_version),
+            ("output_version", output_version),
         ):
             if value is not None:
                 kwargs[name] = value
@@ -333,16 +338,19 @@ class Part(Batch):
         """GRPO per-group advantage ``(reward - group_mean) / (group_std + eps)``.
 
         ``scope`` picks the normalization mode: ``"group"`` (default) normalizes
-        per group; ``"global"`` z-scores the whole batch (unbiased std — the
-        historical convention) and ignores the grouping knobs. Under
+        per group; ``"global"`` z-scores the whole batch with population std
+        (``unbiased=False``, matching agentic) and ignores the grouping knobs. Under
         ``scope="group"``, ``group_layer`` picks the lineage layer whose ancestor
         id labels the groups (the id's first ``layer + 1`` segments): ``None``
         (default) groups by the immediate parent (:attr:`group_ids`; a root part
         degenerates to per-sample groups → advantage 0), ``0`` by the root prompt.
         Labels must be group-by-parent contiguous with uniform branching (``fork``
         guarantees this at every layer), so the reduce is one ``view``.
-        ``use_global_std`` keeps per-group means but one batch-wide std. Population
-        std (``unbiased=False``) makes ``branch=1`` degenerate to advantage 0.
+        ``use_global_std`` keeps per-group means but one batch-wide std. Non-finite
+        rewards are excluded from statistics and receive zero advantage; population
+        std makes ``branch=1`` (and other single-finite groups) degenerate to
+        advantage 0. The denominator is ``std + eps`` (not ``sqrt(var + eps)``),
+        so ``eps`` only avoids div-by-zero and does not soft-floor near-zero variance.
         """
         if self.rewards is None:
             raise ValueError("Part.compute_advantages: part has no rewards")
@@ -354,10 +362,13 @@ class Part(Batch):
 
         if scope == "global":
             rewards_g = rewards_local.to(torch.float32)
+            finite = torch.isfinite(rewards_g)
+            mean, std = finite_mean_std(rewards_g)
+            centered = torch.where(finite, rewards_g - mean, torch.zeros_like(rewards_g))
             if normalize:
-                adv_g = (rewards_g - rewards_g.mean()) / (rewards_g.std() + eps)
+                adv_g = centered / (std + eps)
             else:
-                adv_g = rewards_g - rewards_g.mean()
+                adv_g = centered
             return _part_with_field(self, "advantages", adv_g)
 
         layer = group_layer if group_layer is not None else max(self.sample_ids[0].count("/") - 1, 0)
@@ -380,15 +391,21 @@ class Part(Batch):
 
         rewards = rewards_local.to(torch.float32)
         reshaped = rewards.view(n_groups, branch)
-        mean = reshaped.mean(dim=1, keepdim=True)
+        # Per-row finite mean/std (same contract as :func:`finite_mean_std`, vectorized).
+        finite = torch.isfinite(reshaped)
+        counts = finite.sum(dim=1, keepdim=True)
+        finite_values = torch.where(finite, reshaped, torch.zeros_like(reshaped))
+        mean = finite_values.sum(dim=1, keepdim=True) / counts.clamp_min(1)
+        centered = torch.where(finite, reshaped - mean, torch.zeros_like(reshaped))
         if normalize:
             if use_global_std:
-                std = rewards.std() + eps
+                _, std = finite_mean_std(rewards)
             else:
-                std = (reshaped.var(dim=1, unbiased=False, keepdim=True) + eps).sqrt()
-            adv = (reshaped - mean) / std
+                variance = (centered * centered).sum(dim=1, keepdim=True) / counts.clamp_min(1)
+                std = torch.where(counts > 1, variance.sqrt(), torch.ones_like(variance))
+            adv = centered / (std + eps)
         else:
-            adv = reshaped - mean
+            adv = centered
         return _part_with_field(self, "advantages", adv.flatten())
 
     def compute_gae_advantages(
@@ -533,7 +550,7 @@ class Sample(Batch):
         :meth:`Part.input_child` so only the head is a root, e.g.::
 
             text = Part.input(ids, primitives={"text": Texts(...)})
-            Sample.request(text, text.input_child({"image": Images(...)}))  # image+text
+            Sample.request(text, text.input_child({"image": Images.from_dense(...)}))  # image+text
 
         :meth:`Sample.conditioning` then surfaces both primitives (text, image)
         in turn order for the gen step. See ``unirl/types/README.md``.
@@ -921,7 +938,7 @@ class Sample(Batch):
         return ts, images
 
     def has_image_input(self) -> bool:
-        """Whether any non-frontier Part carries an ``Images`` primitive — the
+        """Whether any non-frontier Part carries an image primitive — the
         boolean replacement for the retired ``image_input_part`` reject/require
         guards."""
         return any("image" in p.primitives for p in self.parts[:-1])

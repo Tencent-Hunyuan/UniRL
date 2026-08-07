@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Deque, Dict, List, Optional
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
@@ -41,4 +43,100 @@ class PendingGroups:
         return len(self._by_root)
 
 
-__all__ = ["PendingGroups", "root_of"]
+@dataclass(frozen=True)
+class _CompleteChunk:
+    group_count: int
+    samples: List["Sample"]
+
+
+class CompleteGroups:
+    def __init__(self) -> None:
+        self._chunks: Deque[_CompleteChunk] = deque()
+
+    def add(self, group_count: int, samples: List["Sample"]) -> None:
+        group_count = int(group_count)
+        if group_count <= 0:
+            raise ValueError(f"group_count must be positive; got {group_count}")
+        if not samples:
+            raise ValueError("complete rollout chunk must contain at least one Sample")
+        self._chunks.append(_CompleteChunk(group_count, list(samples)))
+
+    def filter(self, transform: Callable[[List["Sample"]], List["Sample"]]) -> None:
+        chunks = list(self._chunks)
+        if not chunks:
+            return
+        candidates = [sample for chunk in chunks for sample in chunk.samples]
+        kept = list(transform(list(candidates)))
+        candidate_ids = Counter(map(id, candidates))
+        kept_ids = Counter(map(id, kept))
+        if kept_ids - candidate_ids:
+            raise RuntimeError("rollout filter returned a Sample outside its input")
+        if any(count != 1 for count in kept_ids.values()):
+            raise RuntimeError("rollout filter returned the same Sample more than once")
+        if any(count != 1 for count in candidate_ids.values()):
+            raise RuntimeError("rollout buffer contains the same Sample object more than once")
+
+        chunk_by_sample = {
+            id(sample): chunk_index for chunk_index, chunk in enumerate(chunks) for sample in chunk.samples
+        }
+        positions: Dict[int, List[int]] = defaultdict(list)
+        kept_by_chunk: Dict[int, List["Sample"]] = defaultdict(list)
+        chunk_order = []
+        for position, sample in enumerate(kept):
+            chunk_index = chunk_by_sample[id(sample)]
+            if chunk_index not in kept_by_chunk:
+                chunk_order.append(chunk_index)
+            positions[chunk_index].append(position)
+            kept_by_chunk[chunk_index].append(sample)
+
+        filtered: Deque[_CompleteChunk] = deque()
+        for chunk_index in chunk_order:
+            chunk = chunks[chunk_index]
+            chunk_samples = kept_by_chunk[chunk_index]
+            if len(chunk_samples) != len(chunk.samples):
+                raise RuntimeError("rollout filter must retain or discard an entire logical root")
+            chunk_positions = positions[chunk_index]
+            if chunk_positions != list(range(chunk_positions[0], chunk_positions[0] + len(chunk_positions))):
+                raise RuntimeError("rollout filter cannot interleave Samples from different logical roots")
+            filtered.append(_CompleteChunk(chunk.group_count, chunk_samples))
+        self._chunks = filtered
+
+    def take(self, group_count: int) -> Optional[List[List["Sample"]]]:
+        group_count = int(group_count)
+        if group_count <= 0:
+            raise ValueError(f"group_count must be positive; got {group_count}")
+        if self.group_count < group_count:
+            return None
+
+        selected: List[List["Sample"]] = []
+        selected_groups = 0
+        while selected_groups < group_count:
+            chunk = self._chunks.popleft()
+            if selected_groups + chunk.group_count > group_count:
+                self._split_front(chunk)
+                continue
+            selected.append(chunk.samples)
+            selected_groups += chunk.group_count
+        return selected
+
+    @property
+    def group_count(self) -> int:
+        return sum(chunk.group_count for chunk in self._chunks)
+
+    def __len__(self) -> int:
+        return len(self._chunks)
+
+    def _split_front(self, chunk: _CompleteChunk) -> None:
+        if len(chunk.samples) != 1:
+            raise RuntimeError(
+                f"cannot split a {chunk.group_count}-group chunk containing {len(chunk.samples)} Samples"
+            )
+        groups = chunk.samples[0].split()
+        if len(groups) != chunk.group_count:
+            raise RuntimeError(
+                f"batch chunk reported {chunk.group_count} roots but Sample.split produced {len(groups)}"
+            )
+        self._chunks.extendleft(_CompleteChunk(1, [sample]) for sample in reversed(groups))
+
+
+__all__ = ["CompleteGroups", "PendingGroups", "root_of"]

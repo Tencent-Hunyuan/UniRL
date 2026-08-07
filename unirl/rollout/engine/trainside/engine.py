@@ -82,7 +82,7 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
         else:
             self.schedule_policy = None
 
-        self._weight_version = 0
+        self._version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -97,7 +97,7 @@ class TrainsideRolloutEngine(SyncRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("TrainsideRolloutEngine.generate called after shutdown")
-            return self._stamp_weight_version(self._generate_core(sample))
+            return self._stamp_output_version(self._generate_core(sample))
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous pipeline forward for one whole ``Sample``."""

@@ -81,7 +81,7 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
@@ -107,7 +107,12 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
                 "configuration — separate-engine recipes encode in the "
                 "rollout engine; trainside / SFT paths require load_vae=True."
             )
-        pixels = p.pixels
+        try:
+            pixels = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                f"SD3VAEEncodeStage.encode requires a non-empty batch with uniform image shapes; {exc}"
+            ) from exc
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
                 f"SD3VAEEncodeStage.encode: expected pixels [B, 3, H, W], got "

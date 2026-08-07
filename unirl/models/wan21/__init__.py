@@ -7,8 +7,8 @@ Implements the ``Bundle`` / ``Pipeline`` / ``EmbedStage`` /
 I2V is wired through two optional ``EncodeStage`` siblings:
 :class:`WAN21ImageLatentEncodeStage` (``Images`` → 20-channel mask + VAE
 latent payload, channel-concatted onto noise before the transformer)
-and :class:`WAN21CLIPVisionEncodeStage` (``Images`` → CLIP penultimate
-patch embeddings, forwarded as ``encoder_hidden_states_image``). Both
+and :class:`WAN21CLIPVisionEncodeStage` (``Images`` → CLIP penultimate patch
+embeddings, forwarded as ``encoder_hidden_states_image``). Both
 fire only when the I2V checkpoint declares ``transformer.config.image_dim
 > 0``; T2V bundles skip them and the pipeline is unchanged.
 

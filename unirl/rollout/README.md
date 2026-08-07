@@ -59,8 +59,10 @@ wrong objective.
 - **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
   agentic trainers. Its progress thread dispatches bounded work and observes
   readiness; trainer-thread collection resolves results, assembles agentic
-  siblings, and applies the configured filter. `AgenticTrainer` collects a
-  complete barrier batch each step; quiescence is reserved for cleanup.
+  siblings, and applies the configured filter. Async batch trainers keep
+  optimizer-update admission and publication policy in `AsyncBatchControl`; the
+  manager preserves completed generations as FIFO batch chunks. `AgenticTrainer`
+  collects one complete barrier batch per step.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
@@ -83,8 +85,10 @@ implements its weight-receive method and a matching `sync:` handler in
 - **Quiesce before weight sync / eval / checkpoint on async paths** —
   `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
   suspends agentic trajectories at turn boundaries. `sync_weights()` rejects
-  live work and pairs the push with an explicit policy version. Batch launch
-  ordering remains trainer policy.
+  queued, in-flight, completed, or partially grouped work, pushes weights, and
+  publishes the optimizer-update `output_version`. Async batch hard-boundary
+  admission guarantees the FIFO is empty instead of discarding old data. Launch
+  and scoring order remains trainer policy.
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

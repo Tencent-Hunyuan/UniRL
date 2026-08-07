@@ -57,7 +57,6 @@ class AgenticRolloutEngine(SyncRolloutEngine):
             f"env.max_turns ({env_max_turns}) must equal config.max_turns ({self._max_turns})",
         )
         self._stopping = False
-        self._policy_version = 0
         self._harness: RolloutHarness = ToolAgentHarness(
             env=self._env,
             sampling=config.episode_sampling,
@@ -78,25 +77,10 @@ class AgenticRolloutEngine(SyncRolloutEngine):
         inner_cfg.chat_template_kwargs = chat_template_kwargs
 
     def generate(self, sample: Sample) -> Sample:
-        generated_before = len(sample.gen_parts())
-        policy_version = self._policy_version
         outcome = self._harness.run(sample, self._harness_ctx)
         if outcome.status not in ("completed", "suspended", "failed"):
             raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
-        result = self._stamp_generated_versions(outcome.sample, generated_before, policy_version)
-        return self._stamp_outcome(result, outcome.status)
-
-    @staticmethod
-    def _stamp_generated_versions(sample: Sample, generated_before: int, policy_version: int) -> Sample:
-        generated_seen = 0
-        parts = []
-        for part in sample.parts:
-            if part.is_gen:
-                if generated_seen >= generated_before:
-                    part = _part_with_field(part, "weight_version", policy_version)
-                generated_seen += 1
-            parts.append(part)
-        return sample.with_parts(parts)
+        return self._stamp_outcome(outcome.sample, outcome.status)
 
     @staticmethod
     def _stamp_outcome(sample: Sample, status: str) -> Sample:
@@ -108,12 +92,6 @@ class AgenticRolloutEngine(SyncRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_stopping(self, stopping: bool = True) -> None:
         self._stopping = bool(stopping)
-
-    @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def set_policy_version(self, policy_version: int) -> None:
-        if policy_version < 0:
-            raise ValueError(f"policy_version must be non-negative; got {policy_version}")
-        self._policy_version = int(policy_version)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
@@ -151,6 +129,10 @@ class AgenticRolloutEngine(SyncRolloutEngine):
 
     def resume(self) -> None:
         self._inner.resume()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        self._inner.set_version(train_version)
 
     def init_weights_update_group(self, **kwargs: Any) -> None:
         self._inner.init_weights_update_group(**kwargs)

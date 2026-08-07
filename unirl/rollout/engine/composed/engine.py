@@ -109,7 +109,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             "diffusion": self._diffusion,
         }
 
-        self._weight_version = 0
+        self._version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -151,6 +151,12 @@ class ComposedRolloutEngine(SyncRolloutEngine):
     def onload_weights(self, *, track_prefix: str = "") -> None:
         for child in self._children_for_track_prefix(track_prefix):
             child.onload_weights()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        for child in self._child_by_name.values():
+            child.set_version(train_version)
+        self._version = train_version
 
     @property
     def is_offloaded(self) -> bool:
@@ -258,7 +264,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             primitive_metadata=dict(diff_child.primitive_metadata),
             conditions=dict(diff_child.conditions),
             media_preview=diff_child.media_preview,
-            weight_version=diff_child.weight_version,
+            output_version=diff_child.output_version,
         )
 
         return Sample(parts=[input_part, ar_part, diffusion_part])

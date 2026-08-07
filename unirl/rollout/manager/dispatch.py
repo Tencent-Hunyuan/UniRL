@@ -100,6 +100,12 @@ class RolloutPool:
             self._raise_if_failed()
             return bool(self._queue or self._running or self._completed)
 
+    @property
+    def counts(self) -> tuple[int, int]:
+        with self._condition:
+            self._raise_if_failed()
+            return len(self._queue) + len(self._running), len(self._completed)
+
     def close(self) -> None:
         with self._condition:
             if self._closed:

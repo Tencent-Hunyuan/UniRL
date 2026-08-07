@@ -58,7 +58,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
         self.cfg = config
-        self._weight_version = 0
+        self._version = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -110,7 +110,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
-            return self._stamp_weight_version(self._generate_core(sample))
+            return self._stamp_output_version(self._generate_core(sample))
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
@@ -164,7 +164,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
 
     @property
     def is_offloaded(self) -> bool:
-        return bool(self._is_offloaded)
+        return self._is_offloaded
 
     def health_check(self) -> bool:
         return self._backend.ping()
@@ -219,7 +219,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -262,7 +262,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -289,7 +289,7 @@ class VLLMOmniRolloutEngine(SyncRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def set_lora_from_tensors(
         self,

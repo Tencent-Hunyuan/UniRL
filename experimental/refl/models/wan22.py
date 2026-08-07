@@ -361,10 +361,9 @@ class Wan22ReflPipeline(WAN22Pipeline):
         conds = self.build_conditions(texts, negatives=negatives, guidance_scale=effective_guidance)
 
         if images is not None:
-            if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+            if len(images) != len(texts.texts):
                 raise ValueError(
-                    f"Wan22ReflPipeline.build_refl_conditions: image count "
-                    f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                    f"Wan22ReflPipeline.build_refl_conditions: image count {len(images)} "
                     f"!= text count {len(texts.texts)}"
                 )
             image_latent = WAN21ImageLatentEncodeStage(
