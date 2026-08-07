@@ -224,6 +224,7 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward = remote_hydra(reward_cfg)
                 self._wire_eval_suites()
 
+        self._validate_residency_config()
         _validate_diffusion_dp_geometry(
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
@@ -283,6 +284,21 @@ class DiffusionTrainer(BaseTrainer):
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+
+    def _validate_residency_config(self) -> None:
+        """Reject requested residency policies that the selected topology drops."""
+        if (
+            self._uses_ema
+            and self._enable_fsdp_offload
+            and self._layout != "separate"
+            and not self._rollout_is_trainside
+        ):
+            raise ValueError(
+                "enable_fsdp_offload is not supported with EMA/DiffusionNFT algorithms and an "
+                "external colocated rollout: generation-time train offload has not been validated "
+                "against backend.ema state. Disable one of the two instead of having the trainer "
+                "silently ignore the requested policy."
+            )
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope.
@@ -435,7 +451,18 @@ class DiffusionTrainer(BaseTrainer):
                     preserve_active_error=sys.exc_info()[0] is not None,
                 )
 
-    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
+    def _sleep_rollout_then_onload_train(self) -> None:
+        """Restore train state only after the colocated rollout is safely asleep."""
+        self.rollout.sleep()
+        self.backend.onload()
+
+    def _generate_with_residency(
+        self,
+        sample: Sample,
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+    ) -> Sample:
         """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
         should_offload_train = (
             self._enable_fsdp_offload
@@ -466,14 +493,29 @@ class DiffusionTrainer(BaseTrainer):
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
                 cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            if wake_attempted and (self._rollout_sleep_after_generate or not generation_succeeded):
+            should_sleep_rollout = wake_attempted and (sleep_rollout or not generation_succeeded)
+            if should_sleep_rollout and train_offload_attempted:
+                # These operations are dependent: if sleep fails, loading FSDP
+                # into a still-resident rollout can turn the original error into
+                # a second OOM and leave both roles partially initialized.
+                cleanup_steps.append(
+                    ("rollout sleep before generate train onload", self._sleep_rollout_then_onload_train)
+                )
+            elif should_sleep_rollout:
                 cleanup_steps.append(("rollout sleep", self.rollout.sleep))
-            if train_offload_attempted:
+            elif train_offload_attempted:
                 cleanup_steps.append(("generate train onload", self.backend.onload))
             _run_cleanup_steps(
                 cleanup_steps,
                 preserve_active_error=sys.exc_info()[0] is not None,
             )
+
+    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
+        return self._generate_with_residency(
+            sample,
+            sync_weights=sync_weights,
+            sleep_rollout=self._rollout_sleep_after_generate,
+        )
 
     def train_step(
         self,
@@ -552,24 +594,55 @@ class DiffusionTrainer(BaseTrainer):
             replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        wake_attempted = False
+        sync_requested = bool(sync_weights)
+        sleep_requested = sleep_after and self._rollout_sleep_after_generate
+        # A no-sync evaluation must preserve the already-resident adapter.
+        # Engines such as SGLang discard their LoRA pool on sleep and cannot
+        # reconstruct it without a push, so keep them awake across chunks and
+        # sleep once at the end. Base-model engines have no such restriction.
+        sleep_each_chunk = sleep_requested and (sync_requested or self.weight_sync is None)
+        sleep_at_end = sleep_requested and not sleep_each_chunk
+        sync_pending = sync_requested
+        generated_any = False
         evaluation_succeeded = False
         try:
-            wake_attempted = True
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            metrics, sync_pending, pass_generated = self._eval_pass(
+                self.data_source,
+                self.eval_num_prompts,
+                scorers,
+                eval_sp,
+                step,
+                sync_weights=sync_pending,
+                sync_each_wake=sleep_each_chunk and sync_requested,
+                sleep_rollout=sleep_each_chunk,
+            )
+            generated_any = generated_any or pass_generated
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    suite_metrics, sync_pending, pass_generated = self._eval_pass(
+                        suite.data_source,
+                        n,
+                        [(suite.name, suite.reward)],
+                        eval_sp,
+                        step,
+                        sync_weights=sync_pending,
+                        sync_each_wake=sleep_each_chunk and sync_requested,
+                        sleep_rollout=sleep_each_chunk,
+                    )
+                    generated_any = generated_any or pass_generated
+                    metrics.update(suite_metrics)
+            if not generated_any:
+                self._prepare_empty_evaluation(sync_weights=sync_pending, sleep_rollout=sleep_requested)
+                sync_pending = False
+            elif sleep_at_end:
+                self.rollout.sleep()
             evaluation_succeeded = True
         finally:
-            if wake_attempted and ((sleep_after and self._rollout_sleep_after_generate) or not evaluation_succeeded):
+            if not evaluation_succeeded:
                 _run_cleanup_steps(
                     [("evaluation rollout sleep", self.rollout.sleep)],
                     preserve_active_error=sys.exc_info()[0] is not None,
@@ -585,6 +658,23 @@ class DiffusionTrainer(BaseTrainer):
         self.wandb_logger.log_eval(step, metrics)
         return metrics["reward"]
 
+    def _prepare_empty_evaluation(self, *, sync_weights: bool, sleep_rollout: bool) -> None:
+        """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
+        wake_attempted = False
+        prepare_succeeded = False
+        try:
+            wake_attempted = True
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            prepare_succeeded = True
+        finally:
+            if wake_attempted and (sleep_rollout or not prepare_succeeded):
+                _run_cleanup_steps(
+                    [("empty evaluation rollout sleep", self.rollout.sleep)],
+                    preserve_active_error=sys.exc_info()[0] is not None,
+                )
+
     def _eval_pass(
         self,
         data_source: Any,
@@ -592,8 +682,12 @@ class DiffusionTrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
-    ) -> Dict[str, float]:
-        """One generate→score sweep over one eval set; returns each scorer's mean.
+        *,
+        sync_weights: bool,
+        sync_each_wake: bool,
+        sleep_rollout: bool,
+    ) -> Tuple[Dict[str, float], bool, bool]:
+        """One generate→score sweep, pending-sync state, and whether it generated.
 
         The eval prompts are CHUNKED (``eval_chunk_prompts``) so one generate
         never holds N x the KV/decoded on the driver (the it2i memory
@@ -605,6 +699,7 @@ class DiffusionTrainer(BaseTrainer):
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
+        sync_pending = bool(sync_weights)
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             _validate_prompt_tree_dp_geometry(
@@ -614,7 +709,14 @@ class DiffusionTrainer(BaseTrainer):
                 context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
-            generated = self.rollout.generate(request)
+            generated = self._generate_with_residency(
+                request,
+                # Engines whose sleep releases the adapter (e.g. SGLang) need
+                # the requested policy re-pushed after every eval-chunk wake.
+                sync_weights=sync_pending or sync_each_wake,
+                sleep_rollout=sleep_rollout,
+            )
+            sync_pending = False
             with self._reward_phase():
                 for name, reward in scorers:
                     scored = reward.score_and_attach(generated)
@@ -623,7 +725,8 @@ class DiffusionTrainer(BaseTrainer):
                         r = hydrate(rewards).to(torch.float32)
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
-        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        return metrics, sync_pending, n_prompts > 0
 
     def train(
         self,

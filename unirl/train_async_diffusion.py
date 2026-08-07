@@ -50,6 +50,7 @@ def main(cfg: DictConfig) -> None:
         # Forwarded so the trainer can reject it — async scores at reap time outside
         # _reward_phase(), and dropping the key here would silently ignore the policy.
         offload_train_during_reward=cfg.get("offload_train_during_reward", False),
+        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),

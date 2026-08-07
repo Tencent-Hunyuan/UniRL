@@ -78,15 +78,14 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
                 "block the reap-time cross-slab transfer on the rollout workers; "
                 f"got {max_inflight}."
             )
-        super().__init__(**diffusion_kwargs)
-
-        if self._offload_train_during_reward:
+        if bool(diffusion_kwargs.get("offload_train_during_reward", False)):
             raise ValueError(
                 "AsyncDiffusionTrainer does not support offload_train_during_reward: async scoring "
                 "runs at reap time outside _reward_phase(), so the option would be silently ignored "
                 "and a reward sharing the train slab could still OOM. Remove the option or use the "
                 "synchronous trainer."
             )
+        super().__init__(**diffusion_kwargs)
 
         if self.weight_sync is None:
             raise ValueError(
