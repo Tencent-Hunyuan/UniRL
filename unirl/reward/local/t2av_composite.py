@@ -49,11 +49,7 @@ class T2AVCompositeScorer(RewardBackend):
 
             # Propagate only fields BOTH the composite and the inner spec declare.
             shared = ("device", "batch_size", "frame_selection")
-            overrides = {
-                f: getattr(config, f)
-                for f in shared
-                if hasattr(inner_spec, f) and hasattr(config, f)
-            }
+            overrides = {f: getattr(config, f) for f in shared if hasattr(inner_spec, f) and hasattr(config, f)}
             if overrides:
                 inner_spec = dataclasses.replace(inner_spec, **overrides)
             self._scorers[name] = inner_cls(config=inner_spec, base_device=base_device)
