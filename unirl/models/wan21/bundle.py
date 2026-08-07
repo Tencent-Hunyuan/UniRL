@@ -44,8 +44,8 @@ class WAN21Bundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
@@ -93,6 +93,8 @@ class WAN21Bundle(Bundle):
             from transformers import T5EncoderModel as UMT5EncoderModel
 
         path = config.pretrained_model_ckpt_path
+        transformer_path = config.transformer_ckpt_path or path
+        transformer_subfolder = None if config.transformer_ckpt_path else "transformer"
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
 
@@ -108,13 +110,38 @@ class WAN21Bundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
-            # Preserve WanRotaryPosEmbed buffers across meta initialization.
-            transformer_config = WanTransformer3DModel.load_config(path, subfolder="transformer")
+            # Meta-init (FSDP / VeOmni load_sharded path): architecture only,
+            # no per-rank weight allocation; the backend to_empty-materializes
+            # and broadcast-loads from the stashed dir after sharding.
+            # build_meta_init_transformer keeps WanRotaryPosEmbed's freqs_cos/
+            # freqs_sin (non-persistent buffers, absent from the checkpoint and
+            # init-computed) REAL and captures them; torch.device("meta") would
+            # force them to meta too -> to_empty leaves them garbage, zeroing
+            # self-attn to_q/to_k LoRA gradients. meta_init_state is stashed on
+            # the bundle below as the Ray-robust restore carrier.
+            load_config_kwargs = {}
+            if transformer_subfolder is not None:
+                load_config_kwargs["subfolder"] = transformer_subfolder
+            transformer_config = WanTransformer3DModel.load_config(
+                transformer_path,
+                **load_config_kwargs,
+            )
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: WanTransformer3DModel.from_config(transformer_config), dtype=dtype
             )
         else:
-            transformer = WanTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
+            transformer_load_kwargs = {"torch_dtype": dtype}
+            if transformer_subfolder is not None:
+                transformer_load_kwargs["subfolder"] = transformer_subfolder
+            transformer = WanTransformer3DModel.from_pretrained(
+                transformer_path,
+                **transformer_load_kwargs,
+            )
+            # Dtype unification matters even though from_pretrained got
+            # torch_dtype=dtype: diffusers leaves some parameters / buffers
+            # (timestep embeddings, RoPE freqs, ...) in fp32, and FSDP's
+            # _init_mp_dtypes asserts a uniform original-param dtype across
+            # the wrapped module.
             transformer = transformer.to(device, dtype=dtype)
 
         if config.block_causal:
@@ -146,12 +173,16 @@ class WAN21Bundle(Bundle):
             )
             vae.requires_grad_(False)
 
-        text_encoder = (
-            UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder.requires_grad_(False)
-
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
+            tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
         image_dim = int(getattr(transformer.config, "image_dim", 0) or 0)
         vision_encoder: Optional[nn.Module] = None
@@ -193,7 +224,13 @@ class WAN21Bundle(Bundle):
             image_processor=image_processor,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            # Consumed by the backend's post-shard weight load.
+            bundle._transformer_weights_path = (
+                transformer_path
+                if transformer_subfolder is None
+                else os.path.join(transformer_path, transformer_subfolder)
+            )
+            # Ray-robust restore carrier for init-computed non-persistent state.
             bundle._meta_init_state = meta_init_state
         return bundle
 

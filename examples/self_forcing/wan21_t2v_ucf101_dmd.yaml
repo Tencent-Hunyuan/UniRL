@@ -1,43 +1,217 @@
 # @package _global_
-# WAN2.1 Self-Forcing DMD experiment on UCF-101 action prompts.
+# WAN2.1 Self-Forcing + DMD on UCF-101 action prompts.
 #
-# This recipe documents the intended dedicated-trainer composition. It is not
-# routed through train_sft: Self-Forcing requires a causal generator, a frozen
-# real score, a separately optimized fake score, and alternating optimizer
-# updates. The causal transformer and rollout kernel are implemented under
-# unirl/models/wan21; the dedicated multi-model trainer is the next integration
-# layer.
+# ``UCF101_TRANSFORMER`` should point at a Diffusers transformer directory
+# exported from the UCF-101 Full-SFT checkpoint. When unset, all three models
+# start from the base WAN2.1 transformer (useful only for smoke tests).
+#
+# Train:
+#   ENTRY=train_self_forcing \
+#   UCF101_TRANSFORMER=/path/to/ucf101-full-transformer \
+#   SFT_DATA=/path/to/ucf101/train.jsonl \
+#   OUTPUT_DIR=/path/to/output \
+#   bash examples/run_experiment_single_node.sh self_forcing/wan21_t2v_ucf101_dmd
 
 num_devices: 8
 batch_size: 8
 num_steps: 300
-eval_interval: 20
+save_interval: 100
+save_dir: ${oc.env:OUTPUT_DIR,outputs/wan21_t2v_ucf101_self_forcing_dmd}
+save_mode: full
+load_dir: null
+transport_kind: colocate_store
+workers_per_device: 1
 
-model:
-  pretrained_model: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
-  ucf101_checkpoint: ${oc.env:UCF101_CHECKPOINT}
-  precision: bf16
-  block_causal: true
-  latent_frames: 5
-  frames_per_block: 1
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-self-forcing}
+  run_name: ${oc.env:WANDB_RUN_NAME,wan21_ucf101_self_forcing_dmd}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [wan21, t2v, ucf101, self-forcing, dmd, full]
 
-self_forcing:
+generator_bundle:
+  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  config:
+    _target_: unirl.models.wan21.config.WAN21PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
+    transformer_ckpt_path: ${oc.env:UCF101_TRANSFORMER,''}
+    model_precision: bf16
+    shift: 5.0
+    max_sequence_length: 512
+    load_vae: false
+    load_text_encoder: true
+    meta_init_transformer: true
+    block_causal: true
+    causal_frames_per_block: 1
+
+generator_pipeline:
+  _target_: unirl.models.wan21.pipeline.WAN21Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+generator_backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    # Cached causal rollout mutates a detached KV cache. Do not recompute it.
+    activation_checkpointing: false
+    use_torch_compile: false
+    checkpoint_format: dcp
+    checkpoint_async: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 2.0e-6
+    adam_beta1: 0.0
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_steps}
+
+fake_score_bundle:
+  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  config:
+    _target_: unirl.models.wan21.config.WAN21PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
+    transformer_ckpt_path: ${oc.env:UCF101_TRANSFORMER,''}
+    model_precision: bf16
+    shift: 5.0
+    max_sequence_length: 512
+    load_vae: false
+    load_text_encoder: false
+    meta_init_transformer: true
+    block_causal: false
+
+fake_score_pipeline:
+  _target_: unirl.models.wan21.pipeline.WAN21Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+fake_score_backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    checkpoint_format: dcp
+    checkpoint_async: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 4.0e-7
+    adam_beta1: 0.0
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1500
+
+real_score_bundle:
+  _target_: unirl.models.wan21.bundle.WAN21Bundle.from_config
+  config:
+    _target_: unirl.models.wan21.config.WAN21PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
+    transformer_ckpt_path: ${oc.env:UCF101_TRANSFORMER,''}
+    model_precision: bf16
+    shift: 5.0
+    max_sequence_length: 512
+    load_vae: false
+    load_text_encoder: false
+    meta_init_transformer: true
+    block_causal: false
+
+real_score_pipeline:
+  _target_: unirl.models.wan21.pipeline.WAN21Pipeline
+  shift: 5.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 512
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+real_score_backend:
+  _target_: unirl.train.backend.fsdp.FrozenFSDPModel
+  block_class_names: ["WanTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+
+stack:
+  _target_: unirl.train.self_forcing.SelfForcingDMDStack
+  params: ${sampling}
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.wan21.conditions.WAN21Conditions
+  micro_batch_size: 1
+  generator_max_grad_norm: 1.0
+  fake_score_max_grad_norm: 1.0
+  fake_score_updates_per_generator: 5
   denoising_sigmas: [1.0, 0.75, 0.5, 0.25]
+  frames_per_block: 1
   context_sigma: 0.0
-  guidance_scale: 1.0
-  gradient_window_frames: 5
-  distribution_loss: dmd
+  generator_guidance_scale: 1.0
+  real_guidance_scale: 3.0
+  fake_guidance_scale: 1.0
   score_sigma_min: 0.02
   score_sigma_max: 0.98
+  latent_channels: 16
+  latent_frames: 5
+  latent_height: 32
+  latent_width: 56
+
+track_builder:
+  _target_: unirl.train.self_forcing.WAN21SelfForcingPromptTrackBuilder
   real_guidance_scale: 3.0
-  fake_score_updates_per_generator: 5
 
-data:
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
   manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42
 
-optimization:
-  generator_lr: 2.0e-6
-  fake_score_lr: 4.0e-7
-  beta1: 0.0
-  beta2: 0.999
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  height: 256
+  width: 448
+  num_frames: 17

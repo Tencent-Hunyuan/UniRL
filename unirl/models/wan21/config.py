@@ -31,6 +31,10 @@ class WAN21PipelineConfig:
     """
 
     pretrained_model_ckpt_path: str
+    # Optional direct Diffusers transformer directory. This lets distillation
+    # initialize the DiT from an exported SFT checkpoint while loading the
+    # tokenizer/text encoder/VAE from ``pretrained_model_ckpt_path``.
+    transformer_ckpt_path: Optional[str] = None
     vae_ckpt_path: Optional[str] = None
     text_encoder_ckpt_path: Optional[str] = None
     image_encoder_ckpt_path: Optional[str] = None
@@ -62,6 +66,9 @@ class WAN21PipelineConfig:
 
     # Trainer-side VAE. False for separate-engine recipes (engine owns encode/decode).
     load_vae: bool = True
+    # Score-only Self-Forcing bundles consume prompt embeddings produced by the
+    # generator bundle, so they can skip loading duplicate UMT5/tokenizer copies.
+    load_text_encoder: bool = True
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="WAN21PipelineConfig.model_precision")

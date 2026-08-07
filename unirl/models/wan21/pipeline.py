@@ -92,7 +92,11 @@ class WAN21Pipeline(Pipeline):
                 logprob_precision=logprob_precision,
             )
         self.diffusion = diffusion
-        self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
+        self.vae_decode = (
+            vae_decode
+            if vae_decode is not None
+            else (WAN21VAEDecodeStage(bundle) if bundle.vae is not None else None)
+        )
         if isinstance(video_encode, dict):
             if set(video_encode) - {"num_frames", "height", "width", "max_decode_frames"}:
                 raise ValueError(
@@ -262,6 +266,11 @@ class WAN21Pipeline(Pipeline):
         latent_seg = self.diffusion.diffuse(
             wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
+        if self.vae_decode is None:
+            raise RuntimeError(
+                "WAN21Pipeline.generate: no VAE decoder loaded (load_vae=False). "
+                "This pipeline instance is score-only and cannot emit videos."
+            )
         videos = self.vae_decode.decode(latent_seg)
 
         filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=wan_conds.to_dict())

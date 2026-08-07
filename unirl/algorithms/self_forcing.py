@@ -112,6 +112,110 @@ class SelfForcingDMD(StageAlgorithm):
             "generated_x0_norm": float(generated.detach().float().pow(2).mean().item()),
         }
 
+    def _fake_score_flow_matching_loss(
+        self,
+        conditions: Any,
+        *,
+        shape_like: torch.Tensor,
+        sample_weight: Optional[torch.Tensor],
+        generator: Optional[torch.Generator],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Train ``fake_score`` on detached samples from the current generator.
+
+        The fake score models the generator distribution used by the DMD
+        gradient. Its target is the same flow-matching velocity convention as
+        WAN SFT: ``x_sigma = (1-sigma) * x0 + sigma * eps`` and
+        ``v_target = eps - x0``. Generator rollout is intentionally detached so
+        this update only accumulates gradients on ``fake_score``.
+        """
+        with torch.no_grad():
+            rollout = self.rollout_stage.rollout(
+                conditions,
+                initial_noise=self._noise(shape_like, generator),
+                generator=generator,
+            )
+            generated = rollout.latents.detach()
+            batch = int(generated.shape[0])
+            sigma = torch.rand(batch, device=generated.device, generator=generator)
+            sigma = self.score_sigma_min + sigma * (self.score_sigma_max - self.score_sigma_min)
+            noise = self._noise(generated, generator)
+            s = sigma.view(batch, *([1] * (generated.ndim - 1)))
+            xt = (1.0 - s) * generated + s * noise
+            v_target = noise - generated
+
+        sigma_arg = sigma if batch > 1 else sigma.reshape(())
+        fake_v = self.fake_score.predict_noise_at_step(
+            conditions,
+            sample=xt,
+            sigma=sigma_arg,
+            params=self.params,
+        )
+        if fake_v.ndim == generated.ndim - 1:
+            fake_v = fake_v.unsqueeze(0)
+        if fake_v.shape != generated.shape:
+            raise ValueError(
+                "SelfForcingDMD: fake_score prediction shape "
+                f"{tuple(fake_v.shape)} != generated latent shape {tuple(generated.shape)}."
+            )
+
+        per_sample = (fake_v.float() - v_target).pow(2).mean(dim=tuple(range(1, generated.ndim)))
+        if sample_weight is None:
+            loss = per_sample.mean()
+            weight = torch.ones_like(per_sample)
+        else:
+            weight = sample_weight.to(device=per_sample.device, dtype=per_sample.dtype).flatten()
+            if weight.shape != per_sample.shape:
+                raise ValueError(
+                    "SelfForcingDMD: loss_mask shape "
+                    f"{tuple(weight.shape)} != fake-score batch shape {tuple(per_sample.shape)}."
+                )
+            weight_sum = weight.sum()
+            if float(weight_sum.item()) <= 0.0:
+                raise ValueError("SelfForcingDMD: fake-score update has zero valid sample weight.")
+            loss = (per_sample * weight).sum() / weight_sum
+
+        return loss, {
+            "fake_score_fm_mse": float(loss.detach().item()),
+            "fake_score_sigma_mean": float(sigma.mean().item()),
+            "fake_score_generated_x0_norm": float(generated.float().pow(2).mean().item()),
+            "fake_score_target_abs_mean": float(v_target.abs().mean().item()),
+            "fake_score_valid_samples": float(weight.sum().item()),
+        }
+
+    def compute_fake_score_loss_and_backward(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: LatentSegment,
+        loss_scale: float,
+        generator: Optional[torch.Generator] = None,
+    ) -> AlgorithmStepResult:
+        """Compute one detached-rollout fake-score update and call backward.
+
+        This is a dedicated-trainer hook rather than the
+        :class:`StageAlgorithm` entry point: generator and fake-score updates
+        have separate optimizers and update frequencies.
+        """
+        clean = self._clean_latents(segment)
+        if clean is None:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+        loss, metrics = self._fake_score_flow_matching_loss(
+            typed_conditions(conditions, self.conditions_cls),
+            shape_like=clean,
+            sample_weight=getattr(segment, "loss_mask", None),
+            generator=generator,
+        )
+        (loss * float(loss_scale)).backward()
+        value = float(loss.detach().item())
+        if not math.isfinite(value):
+            raise RuntimeError(f"SelfForcingDMD: non-finite fake-score loss {value!r}.")
+        return AlgorithmStepResult(
+            loss=value,
+            metrics=metrics,
+            num_steps_or_tokens=int(clean.shape[0]),
+            has_backward=True,
+        )
+
     def compute_loss_and_backward(
         self,
         *,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -61,19 +62,26 @@ class WAN21SelfForcingStage:
         commit_cache: bool,
     ) -> torch.Tensor:
         sigma_tensor = torch.tensor(sigma, device=sample.device, dtype=torch.float32)
-        return self.diffusion.step.predict_noise(
-            self.diffusion.model,
-            sample,
-            sigma_tensor,
-            conditions,
-            guidance_scale=self.guidance_scale,
-            attention_kwargs={
-                "frames_per_block": self.frames_per_block,
-                "frame_offset": frame_offset,
-                "kv_cache": cache,
-                "commit_cache": commit_cache,
-            },
+        autocast_dtype = getattr(self.diffusion, "autocast_dtype", None)
+        autocast = (
+            torch.autocast("cuda", dtype=autocast_dtype)
+            if sample.device.type == "cuda" and autocast_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
         )
+        with autocast:
+            return self.diffusion.step.predict_noise(
+                self.diffusion.model,
+                sample,
+                sigma_tensor,
+                conditions,
+                guidance_scale=self.guidance_scale,
+                attention_kwargs={
+                    "frames_per_block": self.frames_per_block,
+                    "frame_offset": frame_offset,
+                    "kv_cache": cache,
+                    "commit_cache": commit_cache,
+                },
+            )
 
     def rollout(
         self,
