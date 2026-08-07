@@ -13,6 +13,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.eval_sampling import build_eval_sampling, cfg_scale_of, reject_retired_eval_keys
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
@@ -59,16 +60,13 @@ class DiffusionTrainer(BaseTrainer):
         eval_chunk_prompts: int = 16,
         eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
-        eval_num_inference_steps: Optional[int] = None,
-        eval_height: Optional[int] = None,
-        eval_width: Optional[int] = None,
-        eval_shift: Optional[float] = None,
-        eval_mu: Optional[float] = None,
+        eval_sampling_cfg: Optional[Any] = None,
         eval_media_max_items: int = 0,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        reject_retired_eval_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
@@ -91,12 +89,13 @@ class DiffusionTrainer(BaseTrainer):
         self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        self._eval_sampling_params: Dict[str, BaseSamplingParams] = self._build_eval_sampling_params(
-            num_inference_steps=eval_num_inference_steps,
-            height=eval_height,
-            width=eval_width,
-            shift=eval_shift,
-            mu=eval_mu,
+        # Frozen at init so a bad eval combination fails at startup, not an hour in.
+        self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
+            self.sampling_params,
+            cfg_text_scale=self.eval_cfg_text_scale,
+            eta=self.eval_eta,
+            samples_per_prompt=self.eval_samples_per_prompt,
+            overrides=eval_sampling_cfg,
         )
 
         self._noise_latent_shape: Optional[list] = (
@@ -337,59 +336,6 @@ class DiffusionTrainer(BaseTrainer):
         else:
             self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
-    def _build_eval_sampling_params(
-        self,
-        *,
-        num_inference_steps: Optional[int],
-        height: Optional[int],
-        width: Optional[int],
-        shift: Optional[float],
-        mu: Optional[float],
-    ) -> Dict[str, BaseSamplingParams]:
-        """The frozen eval sampling dict: rollout params with the eval overrides applied.
-
-        Every ``eval_*`` override is optional and anything left unset is
-        inherited from ``sampling``, so a recipe that sets none evaluates at the
-        rollout's own settings. Steps and resolution ride on the request; the
-        time shift rides as a per-request override of the model-owned σ policy
-        (``schedule_shift`` for static-shift models, ``schedule_mu`` for
-        dynamic-shift ones — see :mod:`unirl.sde.runtime`). Dynamic-shift models
-        left without ``eval_mu`` re-derive μ from the eval steps/resolution,
-        which is what keeps a decoupled eval on the model's official schedule.
-
-        Built once at init so a bad combination fails at startup rather than at
-        the first eval, an hour into a run.
-        """
-        base = self.sampling_params.get("diffusion")
-        overrides: Dict[str, Any] = dict(samples_per_prompt=self.eval_samples_per_prompt, eta=self.eval_eta)
-        if self.eval_eta <= 0.0:
-            # Deterministic eval must also clear the SDE gate: eta=0 with gated
-            # steps is a contradictory request — the central kernel degrades such
-            # steps to ODE, but worker-resident schedulers (BAGEL) refuse the pair.
-            overrides.update(sde_indices=[], scheduler=None)
-        elif num_inference_steps is not None and int(num_inference_steps) != int(base.num_inference_steps):
-            raise ValueError(
-                f"eval_eta={self.eval_eta} leaves the SDE gate on, but eval_num_inference_steps="
-                f"{num_inference_steps} differs from the rollout's {base.num_inference_steps}: the "
-                f"gated step indices are resolved against the rollout's step count and would not "
-                f"address the eval schedule. Set eval_eta: 0 or drop eval_num_inference_steps."
-            )
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base)}:
-            overrides["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            overrides["guidance_scale"] = self.eval_cfg_text_scale
-        if num_inference_steps is not None:
-            overrides["num_inference_steps"] = int(num_inference_steps)
-        if height is not None:
-            overrides["height"] = int(height)
-        if width is not None:
-            overrides["width"] = int(width)
-        if shift is not None:
-            overrides["schedule_shift"] = float(shift)
-        if mu is not None:
-            overrides["schedule_mu"] = float(mu)
-        return {**self.sampling_params, "diffusion": dataclasses.replace(base, **overrides)}
-
     def _resolve_noise_latent_shape(
         self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
     ) -> Optional[list]:
@@ -601,12 +547,10 @@ class DiffusionTrainer(BaseTrainer):
         """Periodic eval on the eval set (no training); returns the mean reward.
 
         Mirrors :meth:`_rollout_and_score`'s rollout+reward path but skips advantage/backward.
-        Generates at the deterministic best-quality setting
-        (:meth:`_build_eval_sampling_params`: ``eval_cfg_text_scale``,
-        ``eta=eval_eta`` — at ``eval_eta=0`` the SDE gate is also cleared, so the
-        request is pure ODE; ``eval_samples_per_prompt`` x_T per prompt; plus the
-        optional steps / resolution / time-shift overrides) and scores. The
-        training reward plus every shared-set ``eval_rewards`` suite scores the
+        Eval sampling INHERITS the training ``sampling:`` block and overlays the
+        ``eval_*`` knobs plus the recipe's ``eval_sampling:`` block on top — see
+        :func:`unirl.trainer.eval_sampling.build_eval_sampling` for the precedence.
+        The training reward plus every shared-set ``eval_rewards`` suite scores the
         SAME generated images over the default
         eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
         own-set suite then gets its own generation pass over its own prompts.
@@ -659,8 +603,8 @@ class DiffusionTrainer(BaseTrainer):
             int(eval_diffusion.num_inference_steps),
             int(eval_diffusion.height),
             int(eval_diffusion.width),
-            self.eval_cfg_text_scale,
-            self.eval_eta,
+            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
