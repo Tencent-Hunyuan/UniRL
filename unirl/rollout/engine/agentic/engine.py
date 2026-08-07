@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 import torch
@@ -13,6 +14,8 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.harness.protocol import HarnessContext, RolloutHarness
 from unirl.rollout.harness.tool_agent import ToolAgentHarness
 from unirl.types.sample import Sample, _part_with_field
+
+logger = logging.getLogger(__name__)
 
 
 class AgenticRolloutEngine(BaseRolloutEngine):
@@ -77,10 +80,16 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         inner_cfg.chat_template_kwargs = chat_template_kwargs
 
     def generate(self, sample: Sample) -> Sample:
-        outcome = self._harness.run(sample, self._harness_ctx)
-        if outcome.status not in ("completed", "suspended", "failed"):
-            raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
-        return self._stamp_outcome(outcome.sample, outcome.status)
+        try:
+            outcome = self._harness.run(sample, self._harness_ctx)
+            if outcome.status not in ("completed", "suspended", "failed"):
+                raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
+            return self._stamp_outcome(outcome.sample, outcome.status)
+        except Exception:  # noqa: BLE001 — last-resort net: a harness bug fails one trajectory, not the run
+            logger.warning(
+                "AgenticRolloutEngine: harness escaped its own net; marking trajectory failed", exc_info=True
+            )
+            return self._stamp_outcome(sample, "failed")
 
     @staticmethod
     def _stamp_outcome(sample: Sample, status: str) -> Sample:
