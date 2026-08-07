@@ -72,7 +72,27 @@ pipeline:
   _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
   config: ${bundle.config}
   strategy:
-    _target_: unirl.sde.kernels.FlowSDEStrategy
+    # CPS, not the usual FlowSDE. MEASURED, and the difference is large enough
+    # that FlowSDE is simply not usable on this checkpoint at any interesting
+    # eta. A flow denoiser expects a specific noise level at each sigma -- that
+    # is what the schedule IS. FlowSDE adds its exploration noise ON TOP of that
+    # level, handing the next step a state noisier than anything the model was
+    # trained on; H3 is guidance-distilled, so it has the least capacity of any
+    # model class to spend steps cleaning that up, and the residue lands in the
+    # output as speckle. CPS instead reallocates WITHIN the budget --
+    # det^2 + std^2 == sigma_next^2 exactly -- so every state stays on-schedule.
+    #
+    # K=4 per eta, one shared x_T, scored with the real videopickscore:
+    #     kernel   eta   quality  explore  latent std  video
+    #     CPS      0.7   0.8776   0.0162   1.001       clean
+    #     FlowSDE  0.2   0.8748   0.0039   1.028       clean   <- the old default
+    #     FlowSDE  0.7   0.7282   0.0195   1.228       SPECKLE
+    #
+    # Note the trap in that last row: FlowSDE at 0.7 has the HIGHEST reward
+    # spread in the sweep and the WORST video. That spread is speckle variance,
+    # not scene diversity. Never tune eta on in-group reward std alone -- it
+    # selects exactly the setting that destroys the sample. Look at frames.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -203,29 +223,28 @@ sampling:
   height: 768
   width: 768
   num_frames: 124
-  # MEASURED TWICE. Not the usual flow-GRPO 0.7 — that value destroys this
-  # checkpoint. H3 is GUIDANCE-DISTILLED, so its trajectory is sharp and it was
-  # never trained to recover from states the SDE noise knocks it onto. At 0.7
-  # the rollout produced blue/white blobs and every reward was scored on
-  # garbage, so the curve was flat by construction.
+  # 0.7 IS ONLY SAFE UNDER CPS. Under the old FlowSDE kernel this same value
+  # produced speckle (quality 0.7282, latent std 1.228 against a correct ~1.01)
+  # and the recipe was pinned at 0.2 because of it. CPS keeps every state on the
+  # noise schedule, so eta becomes a bounded knob on [0,1] -- see the strategy
+  # block above for the kernel comparison and the numbers behind this.
   #
-  # Pass 1, eyeballed decoded frames at 768x768/124f, 10 steps:
-  #     0.00 clean (ODE) · 0.05 clean · 0.10 clean · 0.20 softening
-  #     0.30 speckle + smeared edges · 0.70 unrecognisable
+  # Measured under CPS, K=4 per eta sharing one x_T, real videopickscore:
+  #     eta    quality   explore   latent std
+  #     0.20   0.9018    0.0061    1.012
+  #     0.40   0.8960    0.0124    0.995
+  #     0.70   0.8776    0.0162    1.001     <- chosen: peak exploration
+  #     0.90   0.8928    0.0136    0.990        past the peak
   #
-  # Pass 2 scores the same sweep with the ACTUAL reward (videopickscore), 4
-  # samples per eta sharing one x_T so the spread is exactly the diversity the
-  # policy's log-prob covers. Quality = mean, exploration = std:
-  #     eta    quality   explore
-  #     0.10   0.9186    0.0034     quality ceiling, almost no signal
-  #     0.20   0.8799    0.0121     3.6x the signal for -4% quality  <- chosen
-  #     0.30   0.8577    0.0083     DOMINATED by 0.2 on both axes
-  #     0.40   0.8020    0.0209     most signal, -13% quality
+  # Exploration PEAKS at 0.7 and falls at 0.9: there the deterministic component
+  # is only 0.155*sigma_next, so each SDE step nearly discards the trajectory and
+  # restarts from fresh noise, and the denoiser pulls every sample back to its
+  # dominant mode. Over-randomising converges rather than diverges.
   #
-  # 0.1 is the better *sampler* and the worse *policy*: a 0.0034 spread gives
-  # GRPO almost nothing to rank. 0.2 is the knee. Do not read the 0.3 dip as
-  # structure — with K=4 the std estimate is itself noisy.
-  eta: 0.2
+  # With K=4 the std estimate is itself noisy -- 0.0136 vs 0.0162 is within
+  # sampling error, so do not treat the peak LOCATION as exact. The quality
+  # column is the reliable half.
+  eta: 0.7
   # MEASURED CONSTRAINT, not a preference. replay() builds ONE autograd graph
   # across every replayed step, and at ~22k packed rows each step retains
   # ~12 GB of activation-checkpoint boundaries (50 layers x 21982 x 5376 bf16).
