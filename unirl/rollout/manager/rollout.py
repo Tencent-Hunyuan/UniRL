@@ -32,15 +32,10 @@ class RolloutManager:
         launchers: Sequence[Callable[["Sample"], Any]],
         capacities: Sequence[int],
         group_size: int,
-        worker_max_concurrency: int = 0,
         filter_fn: RolloutFilter = identity,
     ) -> None:
         self._rollout = rollout
-        self._pool = RolloutPool(
-            launchers,
-            capacities,
-            worker_max_concurrency=worker_max_concurrency,
-        )
+        self._pool = RolloutPool(launchers, capacities)
         self._group_size = int(group_size)
         self._pending = PendingGroups(group_size)
         self._complete = CompleteGroups()

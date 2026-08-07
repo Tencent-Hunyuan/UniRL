@@ -35,8 +35,6 @@ class RolloutPool:
         self,
         launchers: Sequence[Launch],
         capacities: Sequence[int],
-        *,
-        worker_max_concurrency: int = 0,
     ) -> None:
         self._launchers = list(launchers)
         self._capacities = [int(capacity) for capacity in capacities]
@@ -48,12 +46,6 @@ class RolloutPool:
             )
         if any(capacity <= 0 for capacity in self._capacities):
             raise ValueError(f"RolloutPool capacities must be positive; got {self._capacities}")
-        if worker_max_concurrency:
-            required = max(self._capacities) + 2
-            if worker_max_concurrency < required:
-                raise ValueError(
-                    f"worker_max_concurrency ({worker_max_concurrency}) must be >= launcher capacity + 2 ({required})"
-                )
 
         self._queue: Deque[tuple[int, "Sample"]] = deque()
         self._running: List[_PendingUnit] = []

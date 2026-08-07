@@ -17,6 +17,7 @@ from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
+from unirl.types.advantages import finite_mean_std
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -89,6 +90,13 @@ class AgenticTrainer(BaseTrainer):
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
 
+            required_concurrency = self._per_worker_inflight + 2
+            if int(self.pool.worker_max_concurrency) < required_concurrency:
+                raise ValueError(
+                    f"worker_max_concurrency ({self.pool.worker_max_concurrency}) must be >= "
+                    f"per_worker_inflight + 2 ({required_concurrency}) so control calls "
+                    "(set_stopping/sleep/weight sync) are not starved by trajectory slots"
+                )
             indices = [
                 index
                 for index, rank_info in enumerate(self.rollout.rank_infos)
@@ -101,7 +109,6 @@ class AgenticTrainer(BaseTrainer):
                 launchers=launchers,
                 capacities=[self._per_worker_inflight] * len(launchers),
                 group_size=self._group_size,
-                worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
             )
             self._train_version = unwrap_replicated_int(
                 self.backend.get_optimizer_step_count(),
@@ -274,12 +281,9 @@ class AgenticTrainer(BaseTrainer):
             end = offset + len(group)
             group_rewards = rewards[offset:end]
             finite = torch.isfinite(group_rewards)
-            valid = group_rewards[finite]
-            if valid.numel():
-                centered = group_rewards - valid.mean()
-                std = valid.std(unbiased=False) if valid.numel() > 1 else valid.new_ones(())
-                normalized = centered / (std + 1e-8)
-                advantages[offset:end] = torch.where(finite, normalized, torch.zeros_like(normalized))
+            mean, std = finite_mean_std(group_rewards)
+            normalized = (group_rewards - mean) / (std + 1e-8)
+            advantages[offset:end] = torch.where(finite, normalized, torch.zeros_like(normalized))
             offset = end
         if offset != rewards.numel():
             raise RuntimeError("rollout group/reward cardinality mismatch")
