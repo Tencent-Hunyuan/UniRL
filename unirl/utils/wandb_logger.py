@@ -336,6 +336,19 @@ class UniRLWandBLogger:
         """Current ``train/`` step-axis value — checkpointed for resume."""
         return self._optimizer_step
 
+    def set_optimizer_step(self, step: int) -> None:
+        """Advance the explicit ``train/step`` cursor used by custom trainers.
+
+        Most trainers call :meth:`_log_train`, which increments this counter
+        automatically. Dedicated loops that emit already-aggregated metrics via
+        :meth:`log_step` can keep checkpoint/resume metadata aligned by setting
+        the cursor after a successful log.
+        """
+        step = int(step)
+        if step < 0:
+            raise ValueError(f"optimizer_step must be >= 0; got {step}.")
+        self._optimizer_step = step
+
     def _handle_init_failure(
         self,
         message: str,

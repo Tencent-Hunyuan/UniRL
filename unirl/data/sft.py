@@ -17,6 +17,8 @@ against the manifest's directory):
 - Diffusion:  ``{"prompt": str, "media": [{"modality": "image",
   "role": "target", "uri": "img/0.png"}]}`` (``caption`` accepted as an alias
   for ``prompt``)
+- Video diffusion: ``{"prompt": str, "media": [{"modality": "video",
+  "role": "target", "uri": "video/0.mp4"}]}``
 
 Rows are OPAQUE records driver-side — media loading and tokenization happen on
 the training workers (``unirl/train/sft/track_builder.py`` track builders), so nothing heavy crosses

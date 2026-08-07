@@ -33,9 +33,9 @@ import torch
 from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, Texts, Video, Videos
 from unirl.types.sample import Part
-from unirl.types.segments.latent import make_image_segment
+from unirl.types.segments.latent import make_image_segment, make_video_segment
 from unirl.types.segments.text import TextSegment
 
 logger = logging.getLogger(__name__)
@@ -55,13 +55,14 @@ def _load_pil_image(uri: str):
     return PILImage.open(uri).convert("RGB")
 
 
-def _media_uris(record: Record, *, role: str) -> List[str]:
-    """URIs of the record's media refs with the given role (dataclass or dict form)."""
+def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:
+    """URIs of media refs matching a role and optional modality."""
     uris: List[str] = []
     for ref in record.get("media_refs", []) or []:
         ref_role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
+        ref_modality = getattr(ref, "modality", None) if not isinstance(ref, dict) else ref.get("modality")
         ref_uri = getattr(ref, "uri", None) if not isinstance(ref, dict) else ref.get("uri")
-        if ref_role == role and ref_uri:
+        if ref_role == role and (modality is None or ref_modality == modality) and ref_uri:
             uris.append(str(ref_uri))
     return uris
 
@@ -172,7 +173,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             return self._chat_stage.embed(texts)
         images: List[Optional[Any]] = []
         for r in records:
-            uris = _media_uris(r, role="condition")
+            uris = _media_uris(r, role="condition", modality="image")
             if len(uris) > 1:
                 raise ValueError(
                     f"ARSupervisedTrackBuilder: at most one role='condition' image per record "
@@ -342,7 +343,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
 
         rows: List[torch.Tensor] = []
         for r in records:
-            uris = _media_uris(r, role="target")
+            uris = _media_uris(r, role="target", modality="image")
             if len(uris) != 1:
                 raise ValueError(
                     f"DiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly one "
@@ -357,8 +358,122 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
         return torch.stack(rows, dim=0)
 
 
+def _decode_video(uri: str, *, max_frames: Optional[int] = None) -> Video:
+    """Decode one local video (or tensor fixture) to ``Video[T,C,H,W]``."""
+    if uri.startswith(("http://", "https://", "s3://", "gs://")):
+        raise NotImplementedError(
+            f"VideoDiffusionSupervisedTrackBuilder: remote media URIs are not supported yet ({uri!r}); "
+            "download to local/shared storage and reference the path."
+        )
+    if uri.endswith((".pt", ".pth")):
+        frames = torch.load(uri, map_location="cpu", weights_only=True)
+    elif uri.endswith((".npy", ".npz")):
+        import numpy as np
+
+        loaded = np.load(uri)
+        if isinstance(loaded, np.lib.npyio.NpzFile):
+            try:
+                frames = torch.as_tensor(loaded["frames"])
+            finally:
+                loaded.close()
+        else:
+            frames = torch.as_tensor(loaded)
+    else:
+        from unirl.models.qwen3_omni.video import sample_video_frames_pyav
+
+        frames, _ = sample_video_frames_pyav(uri, target_fps=1_000_000.0, max_frames=max_frames)
+    if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or int(frames.shape[1]) != 3:
+        raise ValueError(
+            f"VideoDiffusionSupervisedTrackBuilder: expected decoded frames [T, 3, H, W], "
+            f"got {type(frames).__name__ if not isinstance(frames, torch.Tensor) else tuple(frames.shape)} "
+            f"from {uri!r}."
+        )
+    if frames.numel() == 0 or int(frames.shape[0]) < 1:
+        raise ValueError(f"VideoDiffusionSupervisedTrackBuilder: target video has no decoded frames: {uri}")
+    if frames.dtype == torch.uint8:
+        frames = frames.to(dtype=torch.float32).div_(255.0)
+    else:
+        frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
+    return Video(frames=frames)
+
+
+class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
+    """Dataset records → video-diffusion ``Part`` with a clean x0 latent.
+
+    Records must contain one ``(modality="video", role="target")`` media ref.
+    Decoding happens on the training worker; the configured pipeline's
+    ``video_encode`` stage owns frame sampling, resize, and VAE normalization.
+    """
+
+    def __init__(
+        self,
+        *,
+        pipeline: Any,
+        encode_stage_attr: str = "video_encode",
+        guidance_scale: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        self.guidance_scale = float(guidance_scale)
+        self._encode = getattr(pipeline, encode_stage_attr, None)
+        if self._encode is None or not callable(getattr(self._encode, "encode", None)):
+            raise ValueError(
+                f"VideoDiffusionSupervisedTrackBuilder: pipeline.{encode_stage_attr} is missing or has no "
+                ".encode(); configure the model pipeline with a target-video VAE encode stage."
+            )
+        build_conditions = getattr(pipeline, "build_conditions", None)
+        if not callable(build_conditions):
+            raise ValueError("VideoDiffusionSupervisedTrackBuilder: pipeline has no build_conditions(texts, ...).")
+        self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": self.guidance_scale}
+        max_decode_frames = getattr(self._encode, "max_decode_frames", None)
+        self._max_decode_frames = None if max_decode_frames is None else int(max_decode_frames)
+        if self._max_decode_frames is not None and self._max_decode_frames < 1:
+            raise ValueError(
+                "VideoDiffusionSupervisedTrackBuilder: encode stage max_decode_frames must be >= 1 or None."
+            )
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def build(self, records: List[Record]) -> Part:
+        if not records:
+            raise ValueError("VideoDiffusionSupervisedTrackBuilder.build: empty record shard.")
+        with torch.no_grad():
+            texts = Texts(texts=[str(r["prompt"]) for r in records])
+            conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
+            videos = self._load_target_videos(records)
+            latents = self._encode.encode(videos).latents
+        if latents.shape[0] != len(records):
+            raise RuntimeError(
+                f"VideoDiffusionSupervisedTrackBuilder.build: encoded {latents.shape[0]} latents "
+                f"from {len(records)} records."
+            )
+        pad = torch.tensor([0.0 if p else 1.0 for p in _pad_flags(records)], dtype=torch.float32)
+        segment = make_video_segment(
+            latents=latents.unsqueeze(1),
+            loss_mask=pad.to(latents.device),
+        )
+        return Part(
+            sample_ids=_sample_ids(records),
+            conditions=conditions.to_dict(),
+            segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
+        )
+
+    def _load_target_videos(self, records: Sequence[Record]) -> Videos:
+        rows: List[Video] = []
+        for r in records:
+            uris = _media_uris(r, role="target", modality="video")
+            if len(uris) != 1:
+                raise ValueError(
+                    f"VideoDiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly "
+                    f"one role='target' video media ref (got {len(uris)})."
+                )
+            rows.append(_decode_video(uris[0], max_frames=self._max_decode_frames))
+        return Videos.from_list(rows)
+
+
 __all__ = [
     "ARSupervisedTrackBuilder",
     "DiffusionSupervisedTrackBuilder",
     "SupervisedTrackBuilder",
+    "VideoDiffusionSupervisedTrackBuilder",
 ]

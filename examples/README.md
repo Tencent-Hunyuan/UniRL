@@ -68,6 +68,18 @@ trainers; the hi3 meta-init recipe is not yet supported) — the full
 train → resume → export → upload lifecycle is in
 [Checkpointing](../unirl/trainer/README.md#checkpointing).
 
+## WAN2.1 UCF-101 full-transformer SFT
+
+[`sft/wan21_t2v_ucf101_full`](sft/wan21_t2v_ucf101_full.yaml) performs full
+WAN2.1 transformer finetuning from caption/target-video manifests on an
+18-class UCF-101 sports/action subset.
+
+The UCF-101 run used 2,367 training videos and 128 held-out videos, 17 frames at
+256x448, global batch 8, learning rate `2e-6`, and 300 optimizer steps on one
+8xH20 node. Deterministic held-out eval loss improved from `0.21981` at
+initialization to a best `0.16230` at step 260 (-26.2%), finishing at `0.16264`
+at step 300.
+
 ## Reading a recipe name
 
 A recipe filename is a fixed-order, `_`-joined chain of segments. Every segment

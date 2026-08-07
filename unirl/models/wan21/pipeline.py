@@ -41,6 +41,7 @@ from .diffusion import WAN21DiffusionStage, WAN21DiffusionStep
 from .image_encode import WAN21ImageLatentEncodeStage
 from .text_embed import WAN21TextEmbedStage
 from .vae import WAN21VAEDecodeStage
+from .video_encode import WANVideoLatentEncodeStage
 
 
 class WAN21Pipeline(Pipeline):
@@ -65,6 +66,8 @@ class WAN21Pipeline(Pipeline):
         text_embed: Optional[WAN21TextEmbedStage] = None,
         diffusion: Optional[WAN21DiffusionStage] = None,
         vae_decode: Optional[WAN21VAEDecodeStage] = None,
+        video_encode: Optional[Any] = None,
+        self_forcing: Optional[Any] = None,
         strategy: Optional[StepStrategy] = None,
         shift: float = 5.0,
         autocast_precision: str = "bf16",
@@ -89,7 +92,24 @@ class WAN21Pipeline(Pipeline):
                 logprob_precision=logprob_precision,
             )
         self.diffusion = diffusion
-        self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
+        self.vae_decode = (
+            vae_decode if vae_decode is not None else (WAN21VAEDecodeStage(bundle) if bundle.vae is not None else None)
+        )
+        if isinstance(video_encode, dict):
+            if set(video_encode) - {"num_frames", "height", "width", "max_decode_frames"}:
+                raise ValueError(
+                    "WAN21Pipeline.video_encode only accepts num_frames, height, width, and max_decode_frames "
+                    "when passed as a config."
+                )
+            video_encode = WANVideoLatentEncodeStage(bundle, **video_encode)
+        elif video_encode is not None and not callable(getattr(video_encode, "encode", None)):
+            raise TypeError("WAN21Pipeline.video_encode must be a config dict or an object exposing .encode().")
+        self.video_encode = video_encode
+        if isinstance(self_forcing, dict):
+            from .self_forcing import WAN21SelfForcingStage
+
+            self_forcing = WAN21SelfForcingStage(diffusion=self.diffusion, **self_forcing)
+        self.self_forcing = self_forcing
         self.shift = shift
 
     @classmethod
@@ -244,6 +264,11 @@ class WAN21Pipeline(Pipeline):
         latent_seg = self.diffusion.diffuse(
             wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
+        if self.vae_decode is None:
+            raise RuntimeError(
+                "WAN21Pipeline.generate: no VAE decoder loaded (load_vae=False). "
+                "This pipeline instance is score-only and cannot emit videos."
+            )
         videos = self.vae_decode.decode(latent_seg)
 
         filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=wan_conds.to_dict())

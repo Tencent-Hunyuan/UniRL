@@ -84,6 +84,12 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def _encode(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
+        if bundle.text_encoder is None or bundle.tokenizer is None:
+            raise RuntimeError(
+                "WAN21TextEmbedStage.embed: no text encoder/tokenizer loaded "
+                "(load_text_encoder=False). Reuse conditions encoded by a bundle "
+                "that owns UMT5 instead of calling build_conditions here."
+            )
         device = bundle.device
 
         text_inputs = bundle.tokenizer(

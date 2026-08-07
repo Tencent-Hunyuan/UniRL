@@ -73,6 +73,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         conditions: WAN21Conditions,
         *,
         guidance_scale: float,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """Run WAN transformer with CFG batched ``[uncond, cond]`` forward.
 
@@ -128,6 +129,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
                 encoder_hidden_states=torch.cat([negative_prompt_embeds, prompt_embeds], dim=0),
                 timestep=torch.cat([timestep, timestep], dim=0),
                 return_dict=False,
+                attention_kwargs=attention_kwargs,
                 **extra,
             )[0]
             noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2, dim=0)
@@ -141,6 +143,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             encoder_hidden_states=prompt_embeds,
             timestep=timestep,
             return_dict=False,
+            attention_kwargs=attention_kwargs,
             **extra,
         )[0]
 

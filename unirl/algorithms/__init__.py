@@ -17,11 +17,13 @@ from .flowgrpo import FlowGRPO, FlowGRPOConfig
 from .grpo import GRPO, GRPOConfig
 from .gspo import GSPO, GSPOConfig
 from .ppo import PPO, PPOConfig
+from .self_forcing import SelfForcingDMD
 from .sft import SFT, FlowMatchSFT
 
 __all__ = [
     "SFT",
     "FlowMatchSFT",
+    "SelfForcingDMD",
     "GRPO",
     "GRPOConfig",
     "GSPO",

@@ -11,12 +11,14 @@ and :class:`WAN21CLIPVisionEncodeStage` (``Images`` → CLIP penultimate patch
 embeddings, forwarded as ``encoder_hidden_states_image``). Both
 fire only when the I2V checkpoint declares ``transformer.config.image_dim
 > 0``; T2V bundles skip them and the pipeline is unchanged.
+``WANVideoLatentEncodeStage`` is the target-video encoder used by T2V SFT.
 
 Importing this package re-exports its bundle / pipeline / config classes;
 recipes wire them by ``_target_`` dotpath.
 """
 
 from unirl.models.wan21.bundle import WAN21Bundle
+from unirl.models.wan21.causal import WAN21CausalCache, enable_wan_block_causal
 from unirl.models.wan21.clip_vision_encode import WAN21CLIPVisionEncodeStage
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.config import WAN21PipelineConfig
@@ -26,11 +28,14 @@ from unirl.models.wan21.diffusion import (
 )
 from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.pipeline import WAN21Pipeline
+from unirl.models.wan21.self_forcing import WAN21SelfForcingOutput, WAN21SelfForcingStage
 from unirl.models.wan21.text_embed import WAN21TextEmbedStage
 from unirl.models.wan21.vae import WAN21VAEDecodeStage
+from unirl.models.wan21.video_encode import WANVideoLatentEncodeStage
 
 __all__ = [
     "WAN21Bundle",
+    "WAN21CausalCache",
     "WAN21CLIPVisionEncodeStage",
     "WAN21Conditions",
     "WAN21DiffusionStage",
@@ -38,6 +43,10 @@ __all__ = [
     "WAN21ImageLatentEncodeStage",
     "WAN21Pipeline",
     "WAN21PipelineConfig",
+    "WAN21SelfForcingOutput",
+    "WAN21SelfForcingStage",
     "WAN21TextEmbedStage",
     "WAN21VAEDecodeStage",
+    "WANVideoLatentEncodeStage",
+    "enable_wan_block_causal",
 ]

@@ -7,6 +7,7 @@
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
 #   train_ar                   examples/ar/ (qwen_vl_grpo_*, qwen3_drpo_*)
 #   train_sft                  examples/sft/ (qwen3, qwen_vl, BAGEL, SD3)
+#   train_self_forcing         examples/self_forcing/ (WAN causal DMD)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
 #   train_unified_model        examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
 #   train_agentic              examples/deep_research/ (barrier, answer-graded reward)
