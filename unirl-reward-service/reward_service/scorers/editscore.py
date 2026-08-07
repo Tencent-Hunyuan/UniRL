@@ -70,6 +70,7 @@ class EditScoreScorer(BaseScorer):
         extra_llm_kwargs: dict[str, Any] | None = None,
         report_sub_metrics: list[str] | None = None,
         max_image_side: int | None = 1536,
+        batched: bool = True,
     ) -> None:
         import importlib
 
@@ -140,6 +141,10 @@ class EditScoreScorer(BaseScorer):
         self.supports_offload = bool(enable_sleep_mode)
         self._sleep_enabled = bool(enable_sleep_mode)
         self._max_image_side = max_image_side
+        self._batched = bool(batched) and backbone in _VLLM_BACKBONE_MODULES
+        self._num_pass = num_pass
+        self._score_range = score_range
+        self._seed = seed
 
     def _cap_image(self, img: Image.Image) -> Image.Image:
         """Bound vision tokens so requests always fit max_model_len.
@@ -156,8 +161,9 @@ class EditScoreScorer(BaseScorer):
         return img
 
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
-        results: list[dict[str, float]] = []
-        for item in items:
+        rows: list[tuple[int, str, Image.Image, Image.Image]] = []
+        results: list[dict[str, float] | None] = [None] * len(items)
+        for i, item in enumerate(items):
             try:
                 if len(item.history) < 2:
                     raise ValueError(
@@ -167,14 +173,87 @@ class EditScoreScorer(BaseScorer):
                 _, edited_image = item.history[1]
                 if source_image is None or edited_image is None:
                     raise ValueError("Both source and edited images must be provided")
-                source_image = self._cap_image(source_image)
-                edited_image = self._cap_image(edited_image)
-                out = self.es.evaluate([source_image, edited_image], prompt)
-                results.append({k: float(out[k]) for k in self.sub_metric_names})
+                rows.append((i, prompt, self._cap_image(source_image), self._cap_image(edited_image)))
             except Exception:
-                logger.exception("EditScore failed to score item %d", len(results))
-                results.append({k: float("nan") for k in self.sub_metric_names})
-        return results
+                logger.exception("EditScore failed to score item %d", i)
+                results[i] = {k: float("nan") for k in self.sub_metric_names}
+
+        if rows:
+            try:
+                scored = self._score_rows_batched(rows) if self._batched else None
+            except Exception:
+                logger.exception("EditScore batched scoring failed; falling back to per-item")
+                scored = None
+            if scored is not None:
+                for (i, _, _, _), out in zip(rows, scored):
+                    results[i] = out
+            else:
+                for i, prompt, src, edited in rows:
+                    try:
+                        out = self.es.evaluate([src, edited], prompt)
+                        results[i] = {k: float(out[k]) for k in self.sub_metric_names}
+                    except Exception:
+                        logger.exception("EditScore failed to score item %d", i)
+                        results[i] = {k: float("nan") for k in self.sub_metric_names}
+        return [r if r is not None else {k: float("nan") for k in self.sub_metric_names} for r in results]
+
+    def _score_rows_batched(self, rows) -> list[dict[str, float]]:
+        """Batched twin of ``EditScore.evaluate``.
+
+        The package scores one item at a time (two ``generate`` calls per
+        pass), so a rollout's batch is 2*N*num_pass sequential engine round
+        trips. Here all SC prompts and all PQ prompts of a pass go through
+        ``batch_inference`` as two batched calls and vLLM schedules them
+        concurrently. Parsing, the per-request seed (``seed + pass``), the
+        min-over-heads scaling and the sqrt(SC*PQ) overall compose exactly as
+        in ``evaluate``; items whose output still fails the tolerant parse
+        get the give-up parse, and only then NaN.
+        """
+        import numpy as np
+        from editscore.utils import mllm_output_to_dict
+
+        es = self.es
+        scale = self._score_range / 10
+        sc_msgs = [es.model.prepare_input([src, ed], es.SC_prompt.replace("<instruction>", p)) for _, p, src, ed in rows]
+        pq_msgs = [es.model.prepare_input(ed, es.PQ_prompt) for _, _, _, ed in rows]
+
+        per_pass: list[list[dict[str, float] | None]] = []
+        for i in range(self._num_pass):
+            sc_texts = es.model.batch_inference(sc_msgs, seed=self._seed + i)
+            pq_texts = es.model.batch_inference(pq_msgs, seed=self._seed + i)
+            pass_outs: list[dict[str, float] | None] = []
+            for (_, prompt, _, _), sc_text, pq_text in zip(rows, sc_texts, pq_texts):
+                out = None
+                try:
+                    sc = mllm_output_to_dict(sc_text, give_up_parsing=False, text_prompt=prompt, score_range=self._score_range)
+                    pq = mllm_output_to_dict(pq_text, give_up_parsing=False, text_prompt=prompt, score_range=self._score_range)
+                    if sc is False:
+                        sc = mllm_output_to_dict(sc_text, give_up_parsing=True, text_prompt=prompt, score_range=self._score_range)
+                    if pq is False:
+                        pq = mllm_output_to_dict(pq_text, give_up_parsing=True, text_prompt=prompt, score_range=self._score_range)
+                    if isinstance(sc, dict) and isinstance(pq, dict):
+                        sc_score = min(sc["score"]) / scale
+                        pq_score = min(pq["score"]) / scale
+                        out = {
+                            "prompt_following": sc["score"][0] / scale,
+                            "consistency": sc["score"][1] / scale,
+                            "perceptual_quality": pq_score,
+                            "overall": float(np.sqrt(sc_score * pq_score)),
+                        }
+                except Exception:
+                    logger.exception("EditScore batched parse failed for one item")
+                pass_outs.append(out)
+            per_pass.append(pass_outs)
+
+        merged: list[dict[str, float]] = []
+        for idx in range(len(rows)):
+            outs = [p[idx] for p in per_pass if p[idx] is not None]
+            if outs:
+                full = {k: float(np.mean([o[k] for o in outs])) for k in outs[0]}
+                merged.append({k: full[k] for k in self.sub_metric_names})
+            else:
+                merged.append({k: float("nan") for k in self.sub_metric_names})
+        return merged
 
     def _engine(self):
         return self.es.model.model  # EditScore -> Qwen3VL wrapper -> vllm.LLM
