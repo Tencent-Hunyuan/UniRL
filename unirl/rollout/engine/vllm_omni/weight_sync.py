@@ -198,7 +198,7 @@ class WeightSync:
         run base weights. Fail-fast on failure: clears the activation flag
         and raises so the training loop crashes instead of shipping silent
         base-model rollouts (the caller — the engine's ``wake_up`` — rolls the
-        engine back to offloaded, or latches its ``_wake_failed`` guard when
+        engine back to offloaded, or latches an unknown partial transition when
         even the rollback fails, so ``generate`` refuses either way).
         """
         if self._last_lora_tensors is None:
