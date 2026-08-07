@@ -15,6 +15,7 @@ _RETIRED_EVAL_KEYS = {
     "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
     "eval_height": "eval_sampling: {height: X}",
     "eval_width": "eval_sampling: {width: X}",
+    "eval_media_max_items": "logging: {log_media: true, media_max_items: X}",
     "eval_shift": "eval_sampling: {schedule_shift: X}",
     "eval_mu": "eval_sampling: {schedule_mu: X}",
 }

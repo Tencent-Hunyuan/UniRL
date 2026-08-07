@@ -697,6 +697,17 @@ class UniRLWandBLogger:
         """
         return self.enabled and self.log_media and (int(rollout_id) % self.media_log_interval == 0)
 
+    def should_log_eval_media(self) -> bool:
+        """Whether eval generations should be captured/logged — ``eval_interval`` is the only cadence.
+
+        Same master switch as the rollout panel (``log_media``), but
+        ``media_log_interval`` deliberately does NOT apply: it paces the rollout
+        panel against the per-rollout clock, while eval already fires on its own,
+        much coarser ``eval_interval``. Intersecting the two would silently drop
+        most eval grids — the panel a run is actually read from.
+        """
+        return self.enabled and self.log_media
+
     def log_rollout_step(
         self,
         rollout_id: int,

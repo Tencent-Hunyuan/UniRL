@@ -60,7 +60,6 @@ class DiffusionTrainer(BaseTrainer):
         eval_chunk_prompts: int = 16,
         eval_eta: float = 0.0,
         eval_sampling_cfg: Optional[Any] = None,
-        eval_media_max_items: int = 0,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -76,7 +75,6 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_chunk_prompts = int(eval_chunk_prompts)
         self.eval_eta = float(eval_eta)
-        self.eval_media_max_items = int(eval_media_max_items)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
@@ -115,12 +113,11 @@ class DiffusionTrainer(BaseTrainer):
                 sampling_spec=self._eval_sampling_params.get("diffusion"),
             )
         )
-        if self.eval_media_max_items > 0 and self._eval_noise_latent_shape is None:
+        if bool((self.logging_cfg or {}).get("log_media", False)) and self._eval_noise_latent_shape is None:
             logger.warning(
-                "eval_media_max_items=%d, but this pipeline has no driver-authored x_T "
+                "logging.log_media is on, but this pipeline has no driver-authored x_T "
                 "(DISABLE_DRIVER_XT, or latent_shape() opted out), so every eval draws fresh "
-                "noise and the logged images will not be comparable across evals.",
-                self.eval_media_max_items,
+                "noise and the eval panel will not be comparable across evals."
             )
 
         self.weight_sync = None
@@ -623,8 +620,8 @@ class DiffusionTrainer(BaseTrainer):
         bottleneck). Scores the single scorable (segment-carrying) track with
         every scorer — single-track for now; revisit if multi-track lands.
 
-        ``media_key`` names the wandb panel for the first
-        ``eval_media_max_items`` generations, captioned with the FIRST
+        ``media_key`` names the wandb panel for the first ``media_max_items``
+        generations (``logging.log_media`` gates it), captioned with the FIRST
         scorer's rewards. Those are always the same prompts (the eval set is
         served in a fixed order from index 0) rendered from the same x_T (keyed
         on prompt content in :meth:`_build_request_sample`), so the panel is a
@@ -635,7 +632,8 @@ class DiffusionTrainer(BaseTrainer):
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
-        media_budget = self.eval_media_max_items if media_key and self.wandb_logger.enabled else 0
+        wb = self.wandb_logger
+        media_budget = wb.media_max_items if media_key and wb.should_log_eval_media() else 0
         previews: List[Any] = []
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
@@ -659,9 +657,7 @@ class DiffusionTrainer(BaseTrainer):
         if previews:
             from unirl.types.media_preview import MediaPreview
 
-            self.wandb_logger.log_generated_media(
-                step, MediaPreview.concat(previews), key=media_key, step_key="eval/step"
-            )
+            wb.log_generated_media(step, MediaPreview.concat(previews), key=media_key, step_key="eval/step")
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def _build_eval_media_preview(self, scored: Sample, max_items: int) -> Optional[Any]:

@@ -65,7 +65,6 @@ def main(cfg: DictConfig) -> None:
         eval_eta=cfg.get("eval_eta", 0.0),
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
-        eval_media_max_items=cfg.get("eval_media_max_items", 0),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=_resolve_task_config(cfg),
     )
