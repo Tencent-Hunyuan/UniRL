@@ -612,8 +612,25 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         from torch.distributed.fsdp import FSDPModule
 
         if isinstance(unwrapped, FSDPModule):
-            hf_cls = type(unwrapped).__mro__[FSDPModule._orig_cls_mro_index]
-    except (ImportError, IndexError):
+            # PyTorch used to expose the original model's position through the
+            # private ``_orig_cls_mro_index`` attribute.  That attribute is no
+            # longer present in newer FSDP2 releases, while the dynamically
+            # mixed-in original class is still available in the instance MRO.
+            # Prefer the old hint when available, otherwise find the first
+            # actual HF model class in the MRO.
+            orig_index = getattr(FSDPModule, "_orig_cls_mro_index", None)
+            if orig_index is not None:
+                hf_cls = type(unwrapped).__mro__[orig_index]
+            else:
+                hf_cls = next(
+                    (
+                        cls
+                        for cls in type(unwrapped).__mro__
+                        if cls is not FSDPModule and issubclass(cls, PreTrainedModel)
+                    ),
+                    type(unwrapped),
+                )
+    except (ImportError, IndexError, StopIteration):
         pass
     if not issubclass(hf_cls, PreTrainedModel):
         return state_dict
