@@ -30,7 +30,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_CLASSES = (
     "Archery",
     "Basketball",
@@ -121,12 +120,7 @@ def main() -> None:
         val = val[: args.max_val_samples]
 
     val_ids = {row["sample_id"] for row in val}
-    train = [
-        row
-        for class_name in classes
-        for row in by_class[class_name]
-        if row["sample_id"] not in val_ids
-    ]
+    train = [row for class_name in classes for row in by_class[class_name] if row["sample_id"] not in val_ids]
     rng.shuffle(train)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
