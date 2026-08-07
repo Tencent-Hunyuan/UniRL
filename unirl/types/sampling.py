@@ -115,12 +115,6 @@ class DiffusionSamplingParams(BaseSamplingParams):
     # Debug opt-out: let each rollout engine generate its own initial noise.
     disable_driver_xt: bool = False
     sigmas: Optional[torch.Tensor] = None
-    # Per-request time-shift overrides for the model-owned σ policy: schedule_shift
-    # replaces a static-shift policy's ``shift``, schedule_mu replaces a
-    # dynamic-shift policy's derived μ. Each is inert on the other branch, so
-    # ``FlowMatchSchedulePolicy.compute_sigma`` rejects the mismatched one.
-    schedule_shift: Optional[float] = None
-    schedule_mu: Optional[float] = None
 
     eta: float = 1.0
     sde_strategy: Any = None

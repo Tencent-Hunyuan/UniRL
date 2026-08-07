@@ -9,15 +9,15 @@ from omegaconf import OmegaConf
 
 from unirl.types.sampling import BaseSamplingParams
 
-# Per-field eval knobs the overlay replaced, and what to write instead.
+# Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
 _RETIRED_EVAL_KEYS = {
     "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
     "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
     "eval_height": "eval_sampling: {height: X}",
     "eval_width": "eval_sampling: {width: X}",
     "eval_media_max_items": "logging: {log_media: true, media_max_items: X}",
-    "eval_shift": "eval_sampling: {schedule_shift: X}",
-    "eval_mu": "eval_sampling: {schedule_mu: X}",
+    "eval_shift": "no equivalent: the per-request time-shift override was dropped (static-shift models keep their checkpoint shift)",
+    "eval_mu": "not needed: dynamic-shift μ re-derives from the eval steps/resolution",
 }
 
 
@@ -43,8 +43,8 @@ def reject_retired_eval_keys(cfg: Any) -> None:
         return
     moves = "\n".join(f"  {key}: X   ->   {_RETIRED_EVAL_KEYS[key]}" for key in present)
     raise ValueError(
-        "These per-field eval knobs were replaced by the `eval_sampling:` overlay, which accepts "
-        f"ANY DiffusionSamplingParams field:\n{moves}"
+        "These per-field eval knobs are not supported — most moved into the `eval_sampling:` overlay, "
+        f"which accepts ANY DiffusionSamplingParams field:\n{moves}"
     )
 
 
@@ -65,8 +65,7 @@ def build_eval_sampling(
     3. ``overrides`` — the recipe's ``eval_sampling:`` block: ANY
        :class:`~unirl.types.sampling.DiffusionSamplingParams` field
        (``guidance_scale``, ``num_inference_steps``, ``height`` / ``width``,
-       ``schedule_mu``, ``seed``, ...). Unknown keys raise rather than being
-       silently dropped.
+       ``seed``, ...). Unknown keys raise rather than being silently dropped.
 
     CFG needs no knob of its own: an unmentioned ``guidance_scale`` inherits the
     training guidance, so a CFG-off run cannot silently evaluate with CFG on, and

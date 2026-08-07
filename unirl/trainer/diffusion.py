@@ -86,7 +86,7 @@ class DiffusionTrainer(BaseTrainer):
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         # Frozen at init, so overlay contradictions surface at startup rather than an
-        # hour in. The σ policy's own shift/μ branch check stays on the worker.
+        # hour in.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
             self.sampling_params,
             eta=self.eval_eta,
@@ -114,7 +114,11 @@ class DiffusionTrainer(BaseTrainer):
                 sampling_spec=self._eval_sampling_params.get("diffusion"),
             )
         )
-        if bool((self.logging_cfg or {}).get("log_media", False)) and self._eval_noise_latent_shape is None:
+        if (
+            self.eval_interval > 0
+            and bool((self.logging_cfg or {}).get("log_media", False))
+            and self._eval_noise_latent_shape is None
+        ):
             logger.warning(
                 "logging.log_media is on, but this pipeline has no driver-authored x_T "
                 "(DISABLE_DRIVER_XT, or latent_shape() opted out), so every eval draws fresh "
