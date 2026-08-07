@@ -40,7 +40,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
-from unirl.rollout.manager import RolloutManager, RolloutUnderflow, chain, keep_within_lag, prefer_newer
+from unirl.rollout.manager import RolloutManager, chain, keep_within_lag, prefer_newer
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
 from unirl.trainer.async_rollout import combine_rollout_chunks, launch_ceiling
@@ -350,19 +350,12 @@ class AsyncARTrainer(ARTrainer):
         stale: int,
         num_rollouts: int,
     ) -> Sample:
-        while True:
-            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
-            self._top_up(ceiling, M)
-            try:
-                groups = self._rollout_manager.collect(self.batch_size)
-            except RolloutUnderflow:
-                self._admitted_generations = 0
-                if self._next_generation_id >= ceiling:
-                    raise RuntimeError("async rollout buffer underflow with no admissible generations") from None
-                continue
-            self._admitted_generations -= 1
-            completed, gen_id = combine_rollout_chunks(groups)
-            return self._score_completed(gen_id, completed)
+        ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
+        self._top_up(ceiling, M)
+        groups = self._rollout_manager.collect(self.batch_size)
+        self._admitted_generations -= 1
+        completed, gen_id = combine_rollout_chunks(groups)
+        return self._score_completed(gen_id, completed)
 
     def _top_up(self, ceiling: int, capacity: int) -> None:
         while self._admitted_generations < capacity and self._next_generation_id < ceiling:

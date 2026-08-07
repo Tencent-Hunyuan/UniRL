@@ -40,7 +40,7 @@ from typing import Any, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager, RolloutUnderflow, chain, keep_within_lag, prefer_newer
+from unirl.rollout.manager import RolloutManager, chain, keep_within_lag, prefer_newer
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import combine_rollout_chunks, launch_ceiling
 from unirl.trainer.diffusion import DiffusionTrainer
@@ -201,22 +201,15 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         stale: int,
         num_rollouts: int,
     ) -> Sample:
-        while True:
-            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
-            if self._admitted_generations == 0:
-                self._top_up(ceiling, M)
-            try:
-                groups = self._rollout_manager.collect(self.batch_size)
-            except RolloutUnderflow:
-                self._admitted_generations = 0
-                if self._next_generation_id >= ceiling:
-                    raise RuntimeError("async rollout buffer underflow with no admissible generations") from None
-                continue
-            self._admitted_generations -= 1
-            completed, gen_id = combine_rollout_chunks(groups)
-            scored = self._score_completed(gen_id, completed)
+        ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
+        if self._admitted_generations == 0:
             self._top_up(ceiling, M)
-            return scored
+        groups = self._rollout_manager.collect(self.batch_size)
+        self._admitted_generations -= 1
+        completed, gen_id = combine_rollout_chunks(groups)
+        scored = self._score_completed(gen_id, completed)
+        self._top_up(ceiling, M)
+        return scored
 
     def _top_up(self, ceiling: int, capacity: int) -> None:
         while self._admitted_generations < capacity and self._next_generation_id < ceiling:

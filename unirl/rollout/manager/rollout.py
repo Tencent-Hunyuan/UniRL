@@ -16,10 +16,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RolloutUnderflow(RuntimeError):
-    pass
-
-
 @dataclass(frozen=True)
 class _ReadyChunk:
     group_count: int
@@ -75,8 +71,7 @@ class RolloutManager:
             if selected_groups == n:
                 return [chunk.samples for chunk in selected]
             if not self._pool.live:
-                self._buffer.extendleft(reversed(selected))
-                raise RolloutUnderflow(f"needed {n} rollout groups, collected {selected_groups}")
+                raise RuntimeError(f"needed {n} rollout groups, collected {selected_groups}")
             self._route(self._resolve(self._pool.take_completed(block=True)), allow_suspended=False)
         raise AssertionError("unreachable")
 
@@ -251,4 +246,4 @@ def _roots_of(sample: "Sample") -> List[str]:
     return roots
 
 
-__all__ = ["RolloutManager", "RolloutUnderflow"]
+__all__ = ["RolloutManager"]
