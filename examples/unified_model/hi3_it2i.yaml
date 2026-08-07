@@ -211,9 +211,7 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  samples_per_prompt: 2          # GRPO group size. Pinned at 2: samples_per_prompt>2 trips a
-                                 # cond_vit list-merge (spatial_shapes/attn_mask are Python lists)
-                                 # in the DP merge — see the PR's "future work" note.
+  samples_per_prompt: 2          # GRPO group size.
   num_inference_steps: 8
   guidance_scale: 1.0            # TRAIN cfg=1 (matches bundle.config.guidance_scale)
   height: 1024

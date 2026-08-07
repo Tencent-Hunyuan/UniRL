@@ -124,11 +124,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
     )
 
-    require(
-        int(params.samples_per_prompt) <= 2,
-        f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet; "
-        "per-sample cond_vit lists are not transport-safe above 2.",
-    )
     schedule = params.sigmas.to(pipeline.bundle.device)
     cfg = float(params.guidance_scale) > 1.0
 
