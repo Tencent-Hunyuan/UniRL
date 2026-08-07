@@ -58,7 +58,6 @@ class DiffusionTrainer(BaseTrainer):
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
         eval_chunk_prompts: int = 16,
-        eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
         eval_sampling_cfg: Optional[Any] = None,
         eval_media_max_items: int = 0,
@@ -76,7 +75,6 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_chunk_prompts = int(eval_chunk_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
         self.eval_media_max_items = int(eval_media_max_items)
         self._eval_rewards_cfg = eval_rewards_cfg
@@ -92,7 +90,6 @@ class DiffusionTrainer(BaseTrainer):
         # Frozen at init so a bad eval combination fails at startup, not an hour in.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
             self.sampling_params,
-            cfg_text_scale=self.eval_cfg_text_scale,
             eta=self.eval_eta,
             samples_per_prompt=self.eval_samples_per_prompt,
             overrides=eval_sampling_cfg,

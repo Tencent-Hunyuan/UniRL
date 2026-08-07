@@ -9,13 +9,14 @@ from omegaconf import OmegaConf
 
 from unirl.types.sampling import BaseSamplingParams
 
-# Per-field eval knobs the overlay replaced, and the params field each maps to.
+# Per-field eval knobs the overlay replaced, and what to write instead.
 _RETIRED_EVAL_KEYS = {
-    "eval_num_inference_steps": "num_inference_steps",
-    "eval_height": "height",
-    "eval_width": "width",
-    "eval_shift": "schedule_shift",
-    "eval_mu": "schedule_mu",
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
+    "eval_height": "eval_sampling: {height: X}",
+    "eval_width": "eval_sampling: {width: X}",
+    "eval_shift": "eval_sampling: {schedule_shift: X}",
+    "eval_mu": "eval_sampling: {schedule_mu: X}",
 }
 
 
@@ -39,7 +40,7 @@ def reject_retired_eval_keys(cfg: Any) -> None:
     present = sorted(key for key in _RETIRED_EVAL_KEYS if cfg is not None and cfg.get(key) is not None)
     if not present:
         return
-    moves = "\n".join(f"  {key}: X   ->   eval_sampling: {{{_RETIRED_EVAL_KEYS[key]}: X}}" for key in present)
+    moves = "\n".join(f"  {key}: X   ->   {_RETIRED_EVAL_KEYS[key]}" for key in present)
     raise ValueError(
         "These per-field eval knobs were replaced by the `eval_sampling:` overlay, which accepts "
         f"ANY DiffusionSamplingParams field:\n{moves}"
@@ -49,7 +50,6 @@ def reject_retired_eval_keys(cfg: Any) -> None:
 def build_eval_sampling(
     sampling_params: Dict[str, BaseSamplingParams],
     *,
-    cfg_text_scale: float,
     eta: float = 0.0,
     samples_per_prompt: Optional[int] = None,
     overrides: Any = None,
@@ -61,12 +61,17 @@ def build_eval_sampling(
 
     1. ``eta`` — recipe ``eval_eta`` (default ``0.0``: deterministic ODE eval).
     2. ``samples_per_prompt`` when given — recipe ``eval_samples_per_prompt``.
-    3. the CFG scale — recipe ``eval_cfg_text_scale``, written onto whichever
-       field this params family carries.
-    4. ``overrides`` — the recipe's ``eval_sampling:`` block: ANY
+    3. ``overrides`` — the recipe's ``eval_sampling:`` block: ANY
        :class:`~unirl.types.sampling.DiffusionSamplingParams` field
-       (``num_inference_steps``, ``height`` / ``width``, ``schedule_mu``,
-       ``seed``, ...). Unknown keys raise rather than being silently dropped.
+       (``guidance_scale``, ``num_inference_steps``, ``height`` / ``width``,
+       ``schedule_mu``, ``seed``, ...). Unknown keys raise rather than being
+       silently dropped.
+
+    CFG needs no knob of its own: an unmentioned ``guidance_scale`` inherits the
+    training guidance, so a CFG-off run cannot silently evaluate with CFG on, and
+    naming it decouples the two. It is the field the pipeline consumes, so a
+    family that reads ``cfg_text_scale`` must be given THAT one — the inert
+    sibling raises instead of being accepted and ignored.
 
     A resolved ``eta <= 0`` then clears the SDE gate (``sde_indices=[]``,
     ``scheduler=None``): eta=0 with gated steps is a contradictory request — the
@@ -86,8 +91,16 @@ def build_eval_sampling(
     updates: Dict[str, Any] = {"eta": float(eta)}
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = int(samples_per_prompt)
-    updates["cfg_text_scale" if "cfg_text_scale" in field_names else "guidance_scale"] = float(cfg_text_scale)
     updates.update(_resolve_overrides(overrides, field_names))
+
+    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
+    # field at all and _resolve_overrides already rejected it.
+    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
+        raise ValueError(
+            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
+            "pipeline discards — the eval would silently run at the training CFG. "
+            "Set `cfg_text_scale` instead."
+        )
 
     steps = int(updates.get("num_inference_steps", base.num_inference_steps))
     if float(updates["eta"]) <= 0.0:
