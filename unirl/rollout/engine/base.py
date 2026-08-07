@@ -21,7 +21,7 @@ class BaseEngineConfig(ABC):
 
 
 class BaseRolloutEngine(Remote, ABC):
-    """Rollout engine ABC."""
+    """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
     @abstractmethod
     def shutdown(self) -> None:
@@ -66,7 +66,7 @@ class BaseRolloutEngine(Remote, ABC):
 
     @abstractmethod
     def generate(self, sample: Sample) -> Sample:
-        """Synchronously run rollout generation; each concrete contract owns its dispatch mode."""
+        """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
@@ -150,15 +150,7 @@ class BaseRolloutEngine(Remote, ABC):
         del track_prefix
         raise NotImplementedError
 
-
-class SyncRolloutEngine(BaseRolloutEngine, ABC):
-    """Engines that fill and return one ``Sample``; ``generate`` may be called concurrently."""
-
     _version: int = 0
-
-    @abstractmethod
-    def generate(self, sample: Sample) -> Sample:
-        """Synchronously fill and return one request ``Sample``."""
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_version(self, train_version: int) -> None:
@@ -175,4 +167,4 @@ class SyncRolloutEngine(BaseRolloutEngine, ABC):
         return sample.with_parts([*sample.parts[:-1], gen])
 
 
-__all__ = ["BaseRolloutEngine", "SyncRolloutEngine"]
+__all__ = ["BaseRolloutEngine"]

@@ -28,7 +28,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import SyncRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
@@ -39,7 +39,7 @@ from unirl.types.sample import Sample
 logger = logging.getLogger(__name__)
 
 
-class SGLangRolloutEngine(SyncRolloutEngine):
+class SGLangRolloutEngine(BaseRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"

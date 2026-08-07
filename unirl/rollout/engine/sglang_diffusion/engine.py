@@ -25,7 +25,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import SyncRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -46,7 +46,7 @@ _OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
 _CPU_BACKUP_TAGS = ("vae", "text_encoder")
 
 
-class SGLangDiffusionRolloutEngine(SyncRolloutEngine):
+class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by ``sglang.multimodal_gen.DiffGenerator`` (v2 layout)."""
 
     _component_name = "sglang_diffusion"

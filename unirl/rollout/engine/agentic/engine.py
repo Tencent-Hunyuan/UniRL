@@ -9,13 +9,13 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
-from unirl.rollout.engine.base import SyncRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.harness.protocol import HarnessContext, RolloutHarness
 from unirl.rollout.harness.tool_agent import ToolAgentHarness
 from unirl.types.sample import Sample, _part_with_field
 
 
-class AgenticRolloutEngine(SyncRolloutEngine):
+class AgenticRolloutEngine(BaseRolloutEngine):
     """Run one environment-backed trajectory over a local inner engine."""
 
     _component_name = "agentic"
@@ -41,14 +41,14 @@ class AgenticRolloutEngine(SyncRolloutEngine):
         require(self._env is not None, "AgenticRolloutEngine requires an env (config.env)")
         self._maybe_inject_tool_schemas(config.inner, self._env)
         inner = config.inner.make_engine(strategy=strategy, **deps)
-        if not isinstance(inner, SyncRolloutEngine):
+        if not isinstance(inner, BaseRolloutEngine):
             shutdown = getattr(inner, "shutdown", None)
             if callable(shutdown):
                 shutdown()
             raise ValueError(
                 f"AgenticRolloutEngine inner must implement the single-turn engine contract; got {type(inner).__name__}"
             )
-        self._inner: SyncRolloutEngine = inner
+        self._inner: BaseRolloutEngine = inner
 
         self._max_turns = int(config.max_turns)
         env_max_turns = getattr(self._env, "max_turns", None)
@@ -114,7 +114,7 @@ class AgenticRolloutEngine(SyncRolloutEngine):
         return self._inner.is_offloaded
 
     @property
-    def tensor_weight_sync_target(self) -> SyncRolloutEngine:
+    def tensor_weight_sync_target(self) -> BaseRolloutEngine:
         """The concrete receiver whose serializer contract tensor sync follows."""
         return self._inner
 

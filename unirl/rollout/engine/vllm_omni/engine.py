@@ -31,7 +31,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import SyncRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
@@ -42,7 +42,7 @@ from unirl.types.sample import Sample
 logger = logging.getLogger(__name__)
 
 
-class VLLMOmniRolloutEngine(SyncRolloutEngine):
+class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"

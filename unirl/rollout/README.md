@@ -66,7 +66,7 @@ wrong objective.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
-`engine/<name>/engine.py` (subclass `SyncRolloutEngine`, implement
+`engine/<name>/engine.py` (subclass `BaseRolloutEngine`, implement
 synchronous generation over the whole-`Sample` contract — thread-safe for
 concurrent callers if it should serve as an agentic inner, else serialized
 internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
