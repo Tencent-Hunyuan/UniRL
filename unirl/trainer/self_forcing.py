@@ -271,6 +271,7 @@ class WAN21SelfForcingTrainer(BaseTrainer):
                     },
                     prefix="",
                 )
+                self.wandb_logger.set_optimizer_step(step + 1)
                 self._save_checkpoint(
                     step + 1,
                     num_steps,
