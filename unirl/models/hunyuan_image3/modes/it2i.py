@@ -184,8 +184,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         cond_vae=cond_vae,
         cond_vit=cond_vit,
         cond_timestep=cond_timestep,
-        # See modes/t2i.py: only the KV-cached path reads tokenizer_output, so
-        # with the cache off it is dropped rather than transported.
+        # _update_state is the only reader and it runs only when the cache is
+        # on, so with it off this object would ride the transport unread.
         tokenizer_output=(mm["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None),
     )
 
