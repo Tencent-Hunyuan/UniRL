@@ -15,8 +15,7 @@ Launch (single node):
 
 Extra config knobs vs the synchronous separate recipe:
   * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``buffer_max_staleness`` — regular rollout-weight syncs a buffered group may
-    cross. ``0``/unset never crosses a sync; ``>0`` enables bounded policy lag.
+  * ``weight_sync_interval`` — rollout batches one published snapshot serves; max staleness is interval - 1.
 ``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
 """
 
@@ -57,11 +56,10 @@ def main(cfg: DictConfig) -> None:
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),
-        buffer_max_staleness=cfg.get("buffer_max_staleness"),
+        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),
-        weight_sync_interval=cfg.get("weight_sync_interval", 1),
         save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),

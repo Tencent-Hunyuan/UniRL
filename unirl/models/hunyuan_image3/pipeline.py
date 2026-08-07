@@ -50,7 +50,8 @@ class HunyuanImage3Pipeline(Pipeline):
     Reads via ``sample.conditioning()`` / the gen Part's ``sampling_params``:
 
     - the prompt ``Texts`` (``conditioning()[0]``) — required prompts.
-    - a chained ``Images`` input — required for i2t / it2i.
+    - a chained ``Images`` input — required for i2t / it2i; packed storage
+      preserves per-sample image shapes.
     - ``parts[0].control["task"]: str`` — one of ``{"t2t", "i2t", "t2i",
       "it2i", "t2ti"}``. Defaults to ``"t2i"`` if absent.
     - ``parts[0].control["bot_task"]: str`` — chat-template flag forwarded to

@@ -26,19 +26,8 @@ num_rollouts: 800
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
-# Async knobs (one unified loop): max_inflight = concurrent generations (overlap
-# depth; 1 ≈ one-step pipeline). buffer_max_staleness = weight-syncs a buffered
-# group may cross: 0 = on-policy (ratio≈1), >0 = off-policy continuous buffer.
-max_inflight: 1
-buffer_max_staleness: 0
-
-# Push the full dense weights into SGLang every N rollouts. =1 is the on-policy
-# reward-parity baseline vs the colocate ARTrainer (a sync sits between every
-# gen/train pair, so there is NO overlap). Set >1 to actually overlap
-# generate(N+1) with train(N): the data is then off-policy by <= interval
-# weight versions, absorbed by the rollout-anchored PPO ratio (old_logp =
-# segment.log_probs), exactly the slime train_async trade-off.
-weight_sync_interval: 1
+max_inflight: 1          # concurrent generations
+weight_sync_interval: 1  # rollout batches per published snapshot; max staleness = interval-1
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).
 eval_interval: 10

@@ -64,14 +64,14 @@ wrong objective.
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
 - **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
-  to `engine/synchronous.py`'s worker-side sync contracts). Both engines expose the
-  same consumer verbs the async trainers program against: `poll` / `drain_freshest` /
-  `pop_evicted` / `quiesce` + engine-owned `weight_version`. `AsyncBatchRolloutEngine`
-  (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps
-  versions at launch, used by `AsyncARTrainer`/`AsyncDiffusionTrainer`) and
-  `AsyncAgenticRolloutEngine` (trajectory granularity over the agentic rank-0
+  to `engine/synchronous.py`'s worker-side sync contracts). `AsyncBatchRolloutEngine`
+  (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps the
+  synced train version at launch, and exposes completion-order FIFO train batches
+  to `AsyncARTrainer`/`AsyncDiffusionTrainer`) and `AsyncAgenticRolloutEngine`
+  (trajectory granularity over the agentic rank-0
   coordinator; normalizes the `[0]` unwraps, assembles n-sibling GRPO groups,
-  stamps versions at completion, used by the partial/async agentic trainers).
+  stamps sync-generation versions at completion, and retains the
+  `drain_freshest`/`pop_evicted` surface used by partial/async agentic trainers).
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
@@ -94,12 +94,14 @@ implements its weight-receive method and a matching `sync:` handler in
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
 - **Quiesce before weight sync / eval / checkpoint on the batch async path** —
   `AsyncBatchRolloutEngine.quiesce()` drains every in-flight generation; a
-  weight + KV update corrupts one mid-flight. The agentic quiesce is a
+  weight + KV update corrupts one mid-flight. A batch weight publication also
+  requires the completed FIFO to be empty; hard-boundary admission guarantees
+  this rather than silently discarding data. The agentic quiesce is a
   turn-boundary `abort` + final poll, folded into
   `AsyncAgenticRolloutEngine.quiesce()`; its `sync_weights()` rejects a live
   drive, then pairs the weight push with the version bump and logs the sync.
-  Reap-vs-launch ordering is trainer
-  statement order (diffusion polls before topping up; see its `_next_step`).
+  Reap-vs-launch ordering is trainer statement order (diffusion polls before
+  topping up; see its `_next_rollout_batch`).
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

@@ -94,7 +94,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
             frame_pixels = torch.stack([to_tensor(f) for f in pil_frames])
             request = RewardRequest(
                 primitives=dict(request.primitives),
-                generated={"image": Images(pixels=frame_pixels)},
+                generated={"image": Images.from_dense(frame_pixels)},
                 prompt_ids=request.prompt_ids,
                 sample_ids=request.sample_ids,
                 group_ids=request.group_ids,

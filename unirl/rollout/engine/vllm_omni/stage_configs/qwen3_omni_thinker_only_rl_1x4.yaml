@@ -15,10 +15,9 @@ stage_args:
       distributed_executor_backend: "mp"
 
       gpu_memory_utilization: 0.35
-      # Audio-in-video decoder numerics become batch-sensitive when several
-      # long multimodal requests share one packed forward. Serialize requests
-      # to keep rollout/replay K3 near the bf16 numerical floor.
-      max_num_seqs: 1
+      # Standalone image, audio, and video prompts are safe to batch.
+      # Audio-in-video uses the dedicated serialized stage config instead.
+      max_num_seqs: 64
       max_num_batched_tokens: 32768
       enable_chunked_prefill: true
 

@@ -176,7 +176,6 @@ class TensorWeightSync(FullWeightSync):
             if torch.cuda.is_available():
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
-        self.weight_version += 1
 
     @staticmethod
     def _serialize_payload(grouped, flat_bucket_cls, serializer_cls) -> str:

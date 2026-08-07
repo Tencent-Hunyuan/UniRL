@@ -27,7 +27,8 @@ class RewardRequest:
     ``primitives``
         Input context — what was fed to the model. From the scored
         ``Sample``'s conditioning (its ancestor input Parts). Typical keys:
-        ``"text"`` (prompt ``Texts``), ``"image"`` (conditioning ``Images``).
+        ``"text"`` (prompt ``Texts``), ``"image"`` (conditioning
+        packed ``Images``).
 
     ``generated``
         Model output being scored — the frontier ``Part``'s complete
@@ -64,7 +65,7 @@ class RewardRequest:
             return None
         from unirl.utils.media import tensor_frame_to_pil
 
-        return [tensor_frame_to_pil(img) for img in prim.pixels.unbind(0)]
+        return [tensor_frame_to_pil(image.pixels) for image in prim.to_list()]
 
     @property
     def videos(self) -> Optional[List[torch.Tensor]]:

@@ -127,7 +127,6 @@ class IPCWeightSync(FullWeightSync):
             thread.join()
         if "exc" in recv_error:
             raise RuntimeError("IPCWeightSync: rollout receiver failed") from recv_error["exc"]
-        self.weight_version += 1
 
 
 __all__ = ["IPCWeightSync"]

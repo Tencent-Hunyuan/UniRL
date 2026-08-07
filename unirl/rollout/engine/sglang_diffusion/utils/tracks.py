@@ -24,7 +24,7 @@ from unirl.rollout.engine.sglang_diffusion.utils.tensors import (
 )
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Images, Video, Videos
+from unirl.types.primitives import Image, Images, Video, Videos
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_image_segment
 
@@ -251,18 +251,20 @@ def _native_sde_logp(
     return log_prob_tensor
 
 
-def stack_decoded_images(
+def pack_decoded_images(
     results: Sequence[RawResult],
     *,
     squeeze_single_frame_4d: bool = True,
 ) -> Optional[Images]:
-    """Stack per-result decoded ``samples`` into ``Images.pixels [B, C, H, W]``.
+    """Pack per-result decoded ``samples`` into an ``Images`` batch.
 
     Image-output adapters may opt into squeezing a singleton temporal axis
     ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
     run through the legacy image path should disable this so a true single-frame
     video is dropped like any other 4-D video sample. Multi-frame 4-D samples are
     dropped with a warning either way (no Videos packing on the image track).
+    Each decoded image is packed independently, so mixed spatial resolutions are
+    preserved safely.
     """
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
@@ -278,7 +280,7 @@ def stack_decoded_images(
             skipped_video = True
         else:
             raise RuntimeError(
-                f"stack_decoded_images: unexpected canonical media rank {canonical.dim()}; want 3 (image) or 4 (video)."
+                f"pack_decoded_images: unexpected canonical media rank {canonical.dim()}; want 3 (image) or 4 (video)."
             )
     if skipped_video:
         logger.warning(
@@ -287,13 +289,13 @@ def stack_decoded_images(
         )
     if not per_sample_tensors:
         return None
-    return Images(pixels=torch.stack(per_sample_tensors, dim=0))
+    return Images.from_list([Image(pixels=pixels) for pixels in per_sample_tensors])
 
 
 def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
     """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch.
 
-    The video counterpart of :func:`stack_decoded_images`. ``decode_sample``
+    The video counterpart of :func:`pack_decoded_images`. ``decode_sample``
     returns canonical channels-first video ``[C, T, H, W]`` (see
     :func:`unirl.rollout.engine.sglang_diffusion.utils.tensors.normalize_media`);
     the :class:`~unirl.types.primitives.Video` primitive — and the video reward
@@ -301,7 +303,7 @@ def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
     — want frame-major ``[T, C, H, W]``, so we permute before packing.
     ``Videos.from_list`` concatenates along T and lets the Batch framework
     compute the per-sample ``cu_frames`` offsets. Each result carries exactly
-    one decoded sample (mirrors :func:`stack_decoded_images`'s one-per-result
+    one decoded sample (mirrors :func:`pack_decoded_images`'s one-per-result
     contract). Returns ``None`` when no recognizable video was produced.
     """
     videos: List[Video] = []
@@ -471,7 +473,7 @@ def fuse_text_conditions(
 __all__ = [
     "derive_timestep_alignment",
     "build_latent_segment",
-    "stack_decoded_images",
+    "pack_decoded_images",
     "stack_decoded_videos",
     "fuse_text_conditions",
 ]

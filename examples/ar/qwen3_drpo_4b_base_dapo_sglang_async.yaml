@@ -23,17 +23,8 @@ num_rollouts: 800
 
 # Train slab share (rollout gets the rest). 0.5 -> equal split.
 train_fraction: 0.5
-# Async knobs (one unified loop): max_inflight = concurrent generations (overlap
-# depth; 1 ≈ one-step pipeline). buffer_max_staleness = weight-syncs a buffered
-# group may cross: 0 = on-policy (ratio≈1), >0 = off-policy continuous buffer.
-max_inflight: 1
-buffer_max_staleness: 0
-
-# =1 is the on-policy reward-parity baseline vs the colocate ARTrainer (a sync
-# sits between every gen/train pair -> NO overlap). Set >1 to overlap
-# generate(N+1) with train(N): data is then off-policy by <= interval weight
-# versions, absorbed by DRPO's rollout-anchored ratio (old_logp_source: rollout).
-weight_sync_interval: 1
+max_inflight: 1          # concurrent generations
+weight_sync_interval: 1  # rollout batches per published snapshot; max staleness = interval-1
 
 eval_interval: 10
 adv_normalization_scope: group

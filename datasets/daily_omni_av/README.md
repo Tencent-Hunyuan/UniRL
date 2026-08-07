@@ -92,9 +92,12 @@ Each output line:
 
 ## Why cook it this way
 
-- **One video ref, no audio ref.** `MultimodalRLDataSource` does not support audio media refs.
-  Qwen3-Omni instead reads the MP4's AAC track because the recipes set
-  `use_audio_in_video: true`; the standalone `_audio.wav` is not referenced.
+- **One video ref, no separate audio ref.** UniRL supports standalone
+  `(audio, prompt)` references, but Daily-Omni is intentionally cooked as one
+  `(video, prompt)` reference because its task requires aligned image and audio
+  from the same MP4. The recipes set `use_audio_in_video: true`, so the processor
+  demuxes the MP4's AAC track. The shipped `_audio.wav` files are therefore not
+  referenced; adding one would duplicate the audio rather than improve alignment.
 - **`role: "prompt"`, not `"condition"`.** `(video, condition)` decodes the clip into a frame
   tensor for diffusion V2V. `(video, prompt)` passes the URI through to the Qwen3-Omni
   conversation builder, which is what an AR prompt video needs. A batch may not mix the two.

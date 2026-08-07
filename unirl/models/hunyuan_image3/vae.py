@@ -86,16 +86,15 @@ class HunyuanImage3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 class HunyuanImage3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
     """HunyuanImage3 3D-VAE encode stage (it2i edit conditioning).
 
-    Encodes ``Images`` (``[B, C, H, W]`` in ``[0, 1]``) into VAE latents
-    and packages them as ``ImageLatentCondition.latents``. Used by the
-    it2i path in PR 5 to carry the original image into the DiT stage's
-    conditioning.
+    Encodes uniform ``Images`` into dense VAE latents and packages them as
+    ``ImageLatentCondition.latents``. Used by the it2i path in PR 5 to carry
+    the original image into the DiT stage's conditioning.
     """
 
     def __init__(self, bundle: HunyuanImage3Bundle) -> None:
@@ -110,11 +109,17 @@ class HunyuanImage3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
         ``[B, C_lat, H_lat, W_lat]`` consistent with the rest of the
         unirl image pipeline.
         """
-        if p.pixels is None:
-            raise ValueError("HunyuanImage3VAEEncodeStage.encode: pixels is None")
+        try:
+            pixels = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                "HunyuanImage3VAEEncodeStage.encode requires uniform image shapes; "
+                "the canonical i2t/it2i path must use the upstream per-sample image processor"
+            ) from exc
         scaling_factor = getattr(self.bundle.vae.config, "scaling_factor", 1.0)
         with torch.no_grad():
-            x = (p.pixels.to(dtype=torch.float32) * 2.0 - 1.0).unsqueeze(2)
+            # pixels: [B, 3, H, W] in [0, 1] → [B, 3, 1, H, W] in [-1, 1]
+            x = (pixels.to(dtype=torch.float32) * 2.0 - 1.0).unsqueeze(2)
             latents = self.bundle.vae.to(torch.float32).encode(x).latent_dist.sample()
             if latents.dim() == 5:
                 latents = latents.squeeze(2)

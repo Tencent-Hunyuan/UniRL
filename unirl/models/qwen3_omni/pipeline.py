@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from unirl.models.types.conversations import build_omni_messages
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample, Turn
@@ -130,7 +131,11 @@ class Qwen3OmniPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
-        return chat_stage.embed(turns)
+        conversations = build_omni_messages(
+            turns,
+            system_instruction,
+        )
+        return chat_stage.embed_messages(conversations)
 
     def generate(self, sample: Sample) -> Sample:
         """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""

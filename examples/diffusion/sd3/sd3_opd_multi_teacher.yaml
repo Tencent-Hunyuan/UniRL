@@ -1,0 +1,242 @@
+# @package _global_
+# DiffusionOPD — multi-teacher on-policy distillation for SD3.5-Medium (MOPD).
+#
+# Distills 3 task-specific teacher LoRA adapters (PickScore aesthetics / OCR /
+# GenEval compositionality) into one student via closed-form per-step KL
+# matching on the student's own rollout trajectories (arXiv 2605.15055).
+#
+# Wiring overview (each piece is independently reusable):
+#   - backend.lora_cfg.frozen_adapters   -> teachers injected pre-FSDP-wrap, frozen
+#   - data_source (MultiDomainRLDataSource) -> single-domain batches, metadata["domain"]
+#   - algorithm (DiffusionOPD)           -> picks the teacher named by the batch's domain
+#   - reward (PerDomainRewardScorer)     -> MONITORING-ONLY per-domain curves
+#     (reward_pickscore / reward_ocr / reward_geneval; the loss never uses rewards)
+#
+# The classical GenEval scorer (mmdet Mask2Former + CLIP) needs a py<=3.10 /
+# mmcv-full stack that conflicts with the trainer image, so it runs
+# OUT-OF-PROCESS in unirl-reward-service (configs/geneval_service.yaml) on a
+# sidecar node/env; this recipe reaches it over HTTP via REWARD_SERVICE_URL.
+# PickScore and OCR stay local.
+#
+# Launch (1 node x 8 GPUs; start the geneval service first or swap that scorer out):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_multi_teacher
+
+num_devices: 8
+batch_size: 8
+# Must be a multiple of accumulate_rollouts (the trainer fail-fasts otherwise):
+# run/save/resume boundaries have to land on full task-cycle windows because
+# accumulated gradients are not part of checkpoints.
+num_rollouts: 9999
+# MOPD task-cycle accumulation: one optimizer step per FULL teacher cycle
+# (pickscore + ocr + geneval backwards averaged at 1/3 each, single step) —
+# the official DiffusionOPD config sets gradient_accumulation_steps =
+# num_batches_per_epoch = len(teachers). Must be a multiple of the domain
+# count. Effective optimizer steps = num_rollouts / accumulate_rollouts; the
+# wandb train/step axis keeps counting rollouts.
+accumulate_rollouts: 3
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sd3-opd}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sd3, opd, distillation, multi-teacher]
+  log_media: true
+  media_max_items: 4
+  media_log_interval: 200
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    shift: 3.0
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: false
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+    # Frozen teacher adapters, injected pre-wrap and loaded from their own
+    # peft checkpoints (rank/alpha/target_modules come from each checkpoint's
+    # adapter_config.json). Names double as the data-source domain tags and
+    # the algorithm's teacher keys.
+    frozen_adapters:
+      - name: pickscore
+        path: ${oc.env:TEACHER_PICKSCORE_PATH,quanhaol/DiffusionOPD/AesTeacher/lora}
+      - name: ocr
+        path: ${oc.env:TEACHER_OCR_PATH,quanhaol/DiffusionOPD/OCRTeacher/lora}
+      - name: geneval
+        path: ${oc.env:TEACHER_GENEVAL_PATH,quanhaol/DiffusionOPD/GenEvalTeacher/lora}
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 2
+
+# Reward is MONITORING-ONLY for OPD (the loss is teacher-driven; the algorithm
+# declares requires_advantages=false, so the trainer skips advantage
+# derivation). Per-domain routing keys off metadata["domain"].
+# OPTIONAL: delete this whole ``reward:`` block to train with no reward model
+# at all (no per-domain wandb curves, and eval_interval must then be 0) — e.g.
+# when the GenEval sidecar service is unavailable.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.per_domain.PerDomainRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.per_domain.PerDomainSpec
+      batch_size: 8
+      device: auto
+      scorers:
+        pickscore:
+          _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.pickscore.PickScoreSpec
+            batch_size: 8
+            device: auto
+            processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+            model_id: yuvalkirstain/PickScore_v1
+        ocr:
+          _target_: unirl.reward.local.ocr.OCRRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.ocr.OCRSpec
+            # OCRSpec only accepts ``lang``: PaddleOCR runs on CPU
+            # sequentially, so batch_size / device don't apply.
+            lang: en
+        geneval:
+          _target_: unirl.reward.remote.RemoteRewardBackend
+          base_device: cpu
+          config:
+            _target_: unirl.reward.remote.RemoteRewardSpec
+            base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+            required_rewards: [geneval]
+            reward_weights: {geneval: 1.0}
+            timeout: 300.0
+
+algorithm:
+  _target_: unirl.algorithms.diffusionopd.DiffusionOPD
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+  # ODE mode (paper's headline MOPD config): plain mean-matching 0.5*delta^2.
+  # true would normalize by the SDE transition std — only for noised rollouts
+  # (a real eta > 0), never with the vanishing eta below.
+  add_kl_coefficient: false
+  # name = frozen adapter name = data-source domain tag. Per-teacher CFG scale
+  # matches the scale each teacher was trained at (paper: GenEval uses 1.0).
+  teachers:
+    - name: pickscore
+      guidance_scale: 4.5
+    - name: ocr
+      guidance_scale: 4.5
+    - name: geneval
+      guidance_scale: 1.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 3
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultiDomainRLDataSource
+  args:
+    run:
+      # One prompt set per teacher domain; batches cycle pickscore -> ocr ->
+      # geneval and each batch is single-domain (metadata["domain"] carries the
+      # routing — nothing depends on this list's order matching the algorithm).
+      # The ocr/geneval prompt sets ship in-repo (imported from X-GenGroup/
+      # Flow-Factory dataset/, Apache-2.0; geneval include/exclude normalized
+      # from JSON-encoded strings to real JSON values).
+      domains:
+        - name: pickscore
+          data_path: datasets/pickscore/train.txt
+          eval_data_path: datasets/pickscore/test.txt
+        - name: ocr
+          data_path: datasets/ocr/train.txt
+          eval_data_path: datasets/ocr/test.txt
+        - name: geneval
+          data_path: datasets/geneval/train.jsonl
+          eval_data_path: datasets/geneval/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 4.5
+  height: 512
+  width: 512
+  # OPD distills on a deterministic (ODE) rollout. eta is vanishing-but-NONZERO
+  # (1e-6, noise negligible) because stage.replay requires per-step log-probs
+  # to exist; pair this with algorithm.add_kl_coefficient=false — see the
+  # DiffusionOPD gotcha in unirl/algorithms/README.md.
+  eta: 1.0e-6
+  # OPD supervises each trajectory pointwise; group-relative advantages are
+  # unused, so one sample per prompt is the right budget.
+  samples_per_prompt: 1
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    # OPD distills (nearly) ALL steps, unlike GRPO's sparse SDE gating.
+    # Paper: timestep_fraction=0.99 -> 9/10 steps trained.
+    num_sde_steps: 9
+    timestep_fraction: [0, 0.99]

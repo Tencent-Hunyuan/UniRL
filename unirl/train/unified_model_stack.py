@@ -34,6 +34,7 @@ optimizer step, in contrast to the single-stage ``TrainStack``.
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Dict, List, Mapping, Tuple
@@ -215,6 +216,7 @@ class UnifiedModelTrainStack(Remote):
             has_backward=has_backward,
             micros=micros,
             metrics=aggregated,
+            optimizer_updates=0,
         )
         return partial, has_backward
 
@@ -250,9 +252,16 @@ class UnifiedModelTrainStack(Remote):
             logger.warning("UnifiedModelTrainStack._train_one_step: no algorithm reported backward; skipping step.")
 
         lr = self._current_lr()
+        optimizer_updates = 1 if any_backward and math.isfinite(grad_norm) else 0
         for name, r in list(results.items()):
             results[name] = TrainStepResult(
-                loss=r.loss, grad_norm=grad_norm, lr=lr, has_backward=r.has_backward, micros=r.micros, metrics=r.metrics
+                loss=r.loss,
+                grad_norm=grad_norm,
+                lr=lr,
+                has_backward=r.has_backward,
+                micros=r.micros,
+                metrics=r.metrics,
+                optimizer_updates=optimizer_updates,
             )
         return results
 

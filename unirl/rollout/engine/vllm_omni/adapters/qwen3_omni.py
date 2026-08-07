@@ -8,9 +8,8 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from unirl.config.require import require
-from unirl.models.qwen3_omni.media import extract_audio_from_video_pyav
-from unirl.models.qwen3_omni.video import limit_video_frames, sample_video_frames_pyav
-from unirl.models.types.conversations import build_video_messages
+from unirl.models.qwen3_omni.media import prepare_omni_media
+from unirl.models.types.conversations import build_omni_messages
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3TextOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (
@@ -171,77 +170,66 @@ class Qwen3OmniThinkerInputAdapter:
     def _prepare_messages(
         self,
         messages: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], Optional[Any], float, Optional[Any]]:
-        """Decode/sample the one supported video block without mutating turns."""
-        prepared: List[Dict[str, Any]] = []
-        video_frames: Optional[Any] = None
-        effective_fps = self.video_fps
-        audio_wave: Optional[Any] = None
-        for message in messages:
-            content = message.get("content")
-            if not isinstance(content, list):
-                prepared.append(dict(message))
-                continue
-            blocks: List[Dict[str, Any]] = []
-            for raw_block in content:
-                block = dict(raw_block)
-                if block.get("type") == "video":
-                    if video_frames is not None:
-                        raise ValueError(
-                            "Qwen3OmniThinkerInputAdapter supports at most one persistent "
-                            "source video per conversation."
-                        )
-                    raw_video = block.get("video")
-                    if isinstance(raw_video, str):
-                        video_frames, effective_fps = sample_video_frames_pyav(
-                            raw_video,
-                            target_fps=self.video_fps,
-                            max_frames=self.video_max_frames,
-                        )
-                        if self.use_audio_in_video:
-                            sample_rate = int(
-                                getattr(
-                                    getattr(self._processor, "feature_extractor", None),
-                                    "sampling_rate",
-                                    16000,
-                                )
-                            )
-                            audio_wave = extract_audio_from_video_pyav(raw_video, sample_rate)
-                    else:
-                        video_frames, effective_fps = limit_video_frames(
-                            raw_video,
-                            fps=self.video_fps,
-                            max_frames=self.video_max_frames,
-                        )
-                    block["video"] = video_frames
-                blocks.append(block)
-            copied = dict(message)
-            copied["content"] = blocks
-            prepared.append(copied)
-        return prepared, video_frames, effective_fps, audio_wave
+    ) -> tuple[List[Dict[str, Any]], Optional[Any], Optional[Any], float, Optional[Any], Optional[int], bool]:
+        """Decode one row's typed URI media without mutating turns."""
+        sample_rate = int(
+            getattr(
+                getattr(self._processor, "feature_extractor", None),
+                "sampling_rate",
+                16000,
+            )
+        )
+        media = prepare_omni_media(
+            messages,
+            sample_rate=sample_rate,
+            video_fps=self.video_fps,
+            video_max_frames=self.video_max_frames,
+            use_audio_in_video=self.use_audio_in_video,
+        )
+        return (
+            media.messages,
+            media.image,
+            media.video_frames,
+            media.effective_fps,
+            media.audio_waveform,
+            media.audio_sample_rate,
+            media.audio_in_video,
+        )
 
     def _encode_one(
         self,
         messages: List[Dict[str, Any]],
         template_overrides: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Optional[Any], float, Optional[Any]]:
-        prepared, video_frames, effective_fps, audio_wave = self._prepare_messages(messages)
+    ) -> tuple[
+        Dict[str, Any],
+        Optional[Any],
+        Optional[Any],
+        float,
+        Optional[Any],
+        Optional[int],
+        bool,
+    ]:
+        prepared, image, video_frames, effective_fps, audio_wave, audio_sample_rate, audio_in_video = (
+            self._prepare_messages(messages)
+        )
         template_kwargs = dict(self.chat_template_kwargs)
         template_kwargs.update(template_overrides)
 
-        if audio_wave is not None:
+        if image is not None or video_frames is not None or audio_wave is not None:
             template_kwargs.update(add_generation_prompt=True, tokenize=False)
             prompt_text = self._processor.apply_chat_template(prepared, **template_kwargs)
-            processor_kwargs = self._multimodal_processor_kwargs(video_fps=effective_fps)
-            processor_kwargs.update(
-                text=[prompt_text],
-                videos=[video_frames],
-                audio=[audio_wave],
-                use_audio_in_video=True,
-                return_tensors="pt",
-            )
+            processor_kwargs: Dict[str, Any] = {"text": [prompt_text], "truncation": True, "return_tensors": "pt"}
+            if image is not None:
+                processor_kwargs["images"] = [image]
+            if video_frames is not None:
+                processor_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
+                processor_kwargs["videos"] = [video_frames]
+            if audio_wave is not None:
+                processor_kwargs["audio"] = [audio_wave]
+            if audio_in_video:
+                processor_kwargs["use_audio_in_video"] = True
             encoding = self._processor(**processor_kwargs)
-            return encoding, video_frames, effective_fps, audio_wave
+            return encoding, image, video_frames, effective_fps, audio_wave, audio_sample_rate, audio_in_video
 
         if video_frames is not None:
             template_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
@@ -252,7 +240,7 @@ class Qwen3OmniThinkerInputAdapter:
             return_tensors="pt",
         )
         encoding = self._processor.apply_chat_template(prepared, **template_kwargs)
-        return encoding, video_frames, effective_fps, audio_wave
+        return encoding, image, video_frames, effective_fps, audio_wave, audio_sample_rate, audio_in_video
 
     def build(self, sample: Sample) -> List[GenerateCall]:
         frontier = sample.frontier_gen_part(ARSamplingParams)
@@ -262,7 +250,10 @@ class Qwen3OmniThinkerInputAdapter:
         chat_overrides = dict((sample.parts[0].control or {}).get("chat") or {})
         system_instruction = chat_overrides.get("system_instruction", self.system_instruction)
         template_overrides = dict(chat_overrides.get("template_kwargs") or {})
-        conversations = build_video_messages(sample.turns(), system_instruction)
+        conversations = build_omni_messages(
+            sample.turns(),
+            system_instruction,
+        )
         require(
             bool(conversations),
             "Qwen3OmniThinkerInputAdapter: Sample carries no text/video conditioning turns.",
@@ -276,10 +267,19 @@ class Qwen3OmniThinkerInputAdapter:
         prompts: List[Dict[str, Any]] = []
         self._last_encodings = []
         for messages in conversations:
-            enc, video_frames, effective_fps, audio_wave = self._encode_one(messages, template_overrides)
+            (
+                enc,
+                image,
+                video_frames,
+                effective_fps,
+                audio_wave,
+                audio_sample_rate,
+                audio_in_video,
+            ) = self._encode_one(messages, template_overrides)
+            enc["_unirl_audio_in_video"] = bool(audio_in_video)
             expanded_ids = enc["input_ids"].squeeze(0).tolist()
             if len(expanded_ids) > self.max_prompt_length:
-                if video_frames is not None or audio_wave is not None:
+                if image is not None or video_frames is not None or audio_wave is not None:
                     raise ValueError(
                         f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(expanded_ids)} tokens, "
                         f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_frames, "
@@ -290,21 +290,27 @@ class Qwen3OmniThinkerInputAdapter:
                 enc["attention_mask"] = enc["attention_mask"][..., -self.max_prompt_length :]
                 expanded_ids = enc["input_ids"].squeeze(0).tolist()
             rollout_ids = (
-                self._compress_prompt_ids(expanded_ids, use_audio_in_video=audio_wave is not None)
-                if video_frames is not None or audio_wave is not None
+                self._compress_prompt_ids(expanded_ids, use_audio_in_video=audio_in_video)
+                if image is not None or video_frames is not None or audio_wave is not None
                 else expanded_ids
             )
             entry: Dict[str, Any] = {"prompt_token_ids": rollout_ids}
             media: Dict[str, Any] = {}
+            if image is not None:
+                media["image"] = [image]
             if video_frames is not None:
                 media["video"] = [video_frames]
             if audio_wave is not None:
-                media["audio"] = [audio_wave]
+                if audio_sample_rate is None:
+                    raise RuntimeError("Qwen3-Omni canonical audio is missing its sampling rate.")
+                media["audio"] = [(audio_wave, int(audio_sample_rate))]
             if media:
                 entry["multi_modal_data"] = media
-            if video_frames is not None or audio_wave is not None:
-                mm_processor_kwargs = self._multimodal_processor_kwargs(video_fps=effective_fps)
-                if audio_wave is not None:
+            if image is not None or video_frames is not None or audio_wave is not None:
+                mm_processor_kwargs: Dict[str, Any] = {"truncation": True}
+                if video_frames is not None:
+                    mm_processor_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
+                if audio_in_video:
                     mm_processor_kwargs["use_audio_in_video"] = True
                     temporal_patch_size = int(getattr(self._processor.video_processor, "temporal_patch_size", 2))
                     mm_processor_kwargs["second_per_grid_ts"] = [temporal_patch_size / effective_fps]
@@ -387,12 +393,17 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
             input_ids[i, :L] = ids[:L].to(torch.long)
             attention_mask[i, :L] = mask[:L]
 
+        pixel_values: List[Any] = []
+        image_grid_thw: List[Any] = []
         pixel_values_videos: List[Any] = []
         video_grid_thw: List[Any] = []
         video_second_per_grid: List[Any] = []
         input_features: List[Any] = []
         feature_attention_mask: List[Any] = []
+        use_audio_in_video: List[bool] = []
         for e in encs:
+            pixel_values.append(e.get("pixel_values"))
+            image_grid_thw.append(e.get("image_grid_thw"))
             pvv = e.get("pixel_values_videos")
             vgt = e.get("video_grid_thw")
             vspg = e.get("video_second_per_grid")
@@ -403,16 +414,21 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
             video_second_per_grid.append(vspg if vspg is not None else None)
             input_features.append(e.get("input_features"))
             feature_attention_mask.append(e.get("feature_attention_mask"))
+            use_audio_in_video.append(bool(e.get("_unirl_audio_in_video", False)))
 
+        has_image = any(p is not None for p in pixel_values)
         has_video = any(p is not None for p in pixel_values_videos)
         has_audio = any(a is not None for a in input_features)
         cond = Qwen3OmniARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
+            pixel_values=pixel_values if has_image else None,
+            image_grid_thw=image_grid_thw if has_image else None,
             pixel_values_videos=pixel_values_videos if has_video else None,
             video_grid_thw=video_grid_thw if has_video else None,
             video_second_per_grid=video_second_per_grid if has_video else None,
             input_features=input_features if has_audio else None,
             feature_attention_mask=feature_attention_mask if has_audio else None,
+            use_audio_in_video=use_audio_in_video if has_audio else None,
         )
         return cond.to_dict()
 
@@ -545,8 +561,8 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
 
     def validate_request(self, sample: Sample) -> None:
         sample.frontier_gen_part(ARSamplingParams)
-        conversations = build_video_messages(sample.turns())
-        require(bool(conversations), f"modality={self.modality!r} requires text/video conditioning turns.")
+        conversations = build_omni_messages(sample.turns())
+        require(bool(conversations), f"modality={self.modality!r} requires conditioning turns.")
 
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:
         return self.input_adapter.build(sample)

@@ -74,6 +74,13 @@ class ARTrainer(BaseTrainer):
             stack_cfg=stack_cfg,
         )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        # ``media`` (URI-backed MediaRefs) is an Omni prompt-input channel.
+        # Keep other AR models on the decoded image/video contract so a miswired
+        # dataset fails at request build instead of silently dropping media.
+        self._allowed_input_primitives = {"text", "image", "video"}
+        pipeline_target = str(pipeline_cfg.get("_target_", ""))
+        if "qwen3_omni" in pipeline_target:
+            self._allowed_input_primitives.add("media")
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
@@ -348,7 +355,7 @@ class ARTrainer(BaseTrainer):
         request = prepare_input_sample(
             inputs,
             rollout_id,
-            allowed_primitives={"text", "image", "video"},
+            allowed_primitives=self._allowed_input_primitives,
             caller="ARTrainer._build_request_sample",
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))

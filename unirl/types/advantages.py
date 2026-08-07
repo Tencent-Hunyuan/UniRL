@@ -1,8 +1,9 @@
 """Advantage computation helpers for generated parts.
 
 GRPO-style group normalization lives on :meth:`Part.compute_advantages` in
-:mod:`unirl.types.sample`. GAE and other per-step estimators live here as pure
-tensor utilities consumed by trainers before the train step.
+:mod:`unirl.types.sample`. :func:`finite_mean_std` is the shared finite-only
+population mean/std used by that path and agentic trainers. GAE and other
+per-step estimators also live here as pure tensor utilities.
 """
 
 from __future__ import annotations
@@ -10,6 +11,21 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+
+
+def finite_mean_std(values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Population mean/std over finite entries of ``values``.
+
+    Non-finite values are ignored. Empty finite set → ``(0, 1)``; a single finite
+    value → std ``1`` so ``(x - mean) / (std + eps)`` collapses to advantage 0
+    (GRPO singleton / all-equal-after-filter degenerate case).
+    """
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return values.new_zeros(()), values.new_ones(())
+    mean = finite.mean()
+    std = finite.std(unbiased=False) if finite.numel() > 1 else values.new_ones(())
+    return mean, std
 
 
 def compute_gae_advantages(

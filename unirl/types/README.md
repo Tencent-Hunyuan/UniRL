@@ -49,7 +49,7 @@ it is not inferred from `sampling_params.samples_per_prompt`.
 | --- | --- |
 | `sample_ids` | Root input `Part.sample_ids` |
 | `group_ids` | Derived from lineage with `Part.group_ids` or `Sample.root_group_ids(part_index)`; it is no longer stored independently |
-| `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, or `audio`) |
+| `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, `audio`, or sparse URI container `media`) |
 | `request_conditions` | No single request-level replacement. Keep raw inputs on ancestor `Part.primitives`; the generated part stores the encoded replay inputs in `Part.conditions`. Precomputed diffusion `initial_latents` belong on the generated `LatentSegment.initial_latents` |
 | `sampling_params` | One typed `Part.sampling_params` per generated stage. Composed rollouts use one fork per stage |
 | `stage_config` | Root input `Part.control` |
@@ -160,3 +160,24 @@ request = (
 Do not manually repeat ancestor prompts or images during a fork. Their
 frontier-aligned values are recovered from the sample-ID lineage by the
 conditioning views.
+
+## Prompt media (`MediaRefs`) — breaking note
+
+URI-backed prompt inputs for Qwen3-Omni (and any consumer that opts into the
+sparse media channel) now live under:
+
+```python
+Part.primitives["media"] = MediaRefs.from_rows([[MediaRef("video", "prompt", uri), ...], ...])
+```
+
+Use `Sample.prompt_media_refs()` to read that channel. Do **not** look for
+prompt video/audio/image URIs under `primitives["video"|"image"|"audio"]`.
+
+Those decoded modality keys remain the contract for **condition** media
+(diffusion / V2V / image-edit): loaded `Images` / `Videos` tensors with
+`role="condition"`.
+
+`build_omni_messages` still accepts deprecated URI-backed `Videos.from_uris`
+and normalizes them to video `MediaRef` rows; migrate callers to `MediaRefs`.
+Waveform `Audios` and decoded frame `Videos` / `Images` stay rejected for
+Omni prompts.

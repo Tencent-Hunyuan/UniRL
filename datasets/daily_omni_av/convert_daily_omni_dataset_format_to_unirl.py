@@ -10,8 +10,10 @@ that ``unirl.data.data_source.MultimodalRLDataSource`` expects::
      "media_refs": [{"modality": "video", "role": "prompt", "uri": "<abs>/<id>_video.mp4"}],
      "metadata": {"answer": "<A|B|C|D>", "video_id": <str>, "qa_type": <str>}}
 
-Only a video media ref is emitted: the loader has no audio role, and Qwen3-Omni extracts the
-embedded audio track from that same file when ``use_audio_in_video=true``.
+Only a video media ref is emitted: Daily-Omni requires aligned audio and video,
+so Qwen3-Omni extracts the embedded audio track from that same file when
+``use_audio_in_video=true``. Standalone-audio datasets instead use an
+``(audio, prompt)`` media ref and set ``use_audio_in_video=false``.
 
 Daily-Omni is published as a benchmark with no official split, so the split is carved here by
 ``video_id`` — several questions share one clip, and splitting per row would leak the same

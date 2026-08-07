@@ -16,9 +16,8 @@ Extra config knobs vs the colocate recipe:
     Constraint: ``train_fraction * num_devices`` and ``(1-train_fraction) * num_devices``
     must both be integers, AND ``batch_size * samples_per_prompt`` must be divisible
     by each slab size (DP_SCATTER divisibility).
-  * ``max_inflight`` — concurrent generations (overlap depth). ``1`` ≈ one-step pipeline.
-  * ``buffer_max_staleness`` — weight-syncs a buffered group may cross. ``0``/unset =
-    on-policy (``ratio≈1``); ``>0`` = off-policy continuous buffer.
+  * ``max_inflight`` — concurrent generations (resource/overlap limit).
+  * ``weight_sync_interval`` — rollout batches one published snapshot serves; max staleness is interval - 1.
 """
 
 from __future__ import annotations
@@ -56,11 +55,10 @@ def main(cfg: DictConfig) -> None:
         eval_temperature=float(cfg.get("eval_temperature", 1.0)),
         train_fraction=float(cfg.get("train_fraction", 0.5)),
         max_inflight=int(cfg.get("max_inflight", 1)),
-        buffer_max_staleness=cfg.get("buffer_max_staleness"),
+        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
     )
     trainer.train(
         num_rollouts=int(cfg.get("num_rollouts", 100)),
-        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
         save_interval=int(cfg.get("save_interval", 0)),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),

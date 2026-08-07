@@ -317,7 +317,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             texts = Texts(texts=[str(r["prompt"]) for r in records])
             conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
             pixels = self._load_target_pixels(records)
-            latents = self._encode.encode(Images(pixels=pixels)).latents
+            latents = self._encode.encode(Images.from_dense(pixels)).latents
         if latents.shape[0] != len(records):
             raise RuntimeError(
                 f"DiffusionSupervisedTrackBuilder.build: encoded {latents.shape[0]} latents "
