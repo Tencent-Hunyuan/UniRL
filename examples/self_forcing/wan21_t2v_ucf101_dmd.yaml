@@ -73,7 +73,7 @@ generator_backend:
     checkpoint_async: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 2.0e-6
+    learning_rate: 1.0e-6
     adam_beta1: 0.0
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
@@ -182,17 +182,26 @@ stack:
     _target_: hydra.utils.get_class
     path: unirl.models.wan21.conditions.WAN21Conditions
   micro_batch_size: 1
-  generator_max_grad_norm: 1.0
-  fake_score_max_grad_norm: 1.0
+  generator_max_grad_norm: 10.0
+  fake_score_max_grad_norm: 10.0
   fake_score_updates_per_generator: 5
-  denoising_sigmas: [1.0, 0.75, 0.5, 0.25]
+  # Official Self-Forcing starts from nominal WAN timesteps
+  # [1000, 750, 500, 250] and warps them through shift=5.
+  denoising_sigmas: [1.0, 0.9375, 0.8333333333, 0.625]
+  same_exit_step_across_blocks: true
   frames_per_block: 1
   context_sigma: 0.0
   generator_guidance_scale: 1.0
-  real_guidance_scale: 3.0
-  fake_guidance_scale: 1.0
+  # Official DMD uses cond + 3 * (cond - uncond), which is equivalent to the
+  # standard uncond + cfg * (cond - uncond) convention with cfg=4.
+  real_guidance_scale: 4.0
+  # Official DMD uses the conditional fake score directly; only the frozen
+  # real teacher receives classifier-free guidance.
+  fake_guidance_scale: 0.0
   score_sigma_min: 0.02
   score_sigma_max: 0.98
+  score_timestep_shift: 5.0
+  dmd_grad_clip: 0.5
   latent_channels: 16
   latent_frames: 5
   latent_height: 32
@@ -200,7 +209,7 @@ stack:
 
 track_builder:
   _target_: unirl.train.self_forcing.WAN21SelfForcingPromptTrackBuilder
-  real_guidance_scale: 3.0
+  real_guidance_scale: 4.0
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource

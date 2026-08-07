@@ -50,14 +50,17 @@ class SelfForcingDMDStack(Remote):
         fake_score_max_grad_norm: float = 1.0,
         fake_score_updates_per_generator: int = 5,
         denoising_sigmas: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
+        same_exit_step_across_blocks: bool = True,
         frames_per_block: int = 1,
         context_sigma: float = 0.0,
         generator_guidance_scale: float = 1.0,
         real_guidance_scale: float = 3.0,
-        fake_guidance_scale: float = 1.0,
+        fake_guidance_scale: float = 0.0,
         score_sigma_min: float = 0.02,
         score_sigma_max: float = 0.98,
+        score_timestep_shift: float = 5.0,
         normalization_eps: float = 1e-6,
+        dmd_grad_clip: float = 1.0,
         latent_channels: int = 16,
         latent_frames: int = 5,
         latent_height: int = 32,
@@ -70,6 +73,10 @@ class SelfForcingDMDStack(Remote):
             raise ValueError("fake_score_updates_per_generator must be >= 1.")
         if not 0.0 < float(score_sigma_min) < float(score_sigma_max) < 1.0:
             raise ValueError("score sigma bounds must satisfy 0 < min < max < 1.")
+        if not float(score_timestep_shift) > 0.0:
+            raise ValueError("score_timestep_shift must be > 0.")
+        if not float(dmd_grad_clip) > 0.0:
+            raise ValueError("dmd_grad_clip must be > 0.")
         if any(int(v) < 1 for v in (latent_channels, latent_frames, latent_height, latent_width)):
             raise ValueError("all latent shape dimensions must be >= 1.")
 
@@ -85,9 +92,12 @@ class SelfForcingDMDStack(Remote):
         self.generator_max_grad_norm = float(generator_max_grad_norm)
         self.fake_score_max_grad_norm = float(fake_score_max_grad_norm)
         self.fake_score_updates_per_generator = int(fake_score_updates_per_generator)
+        self.same_exit_step_across_blocks = bool(same_exit_step_across_blocks)
         self.score_sigma_min = float(score_sigma_min)
         self.score_sigma_max = float(score_sigma_max)
+        self.score_timestep_shift = float(score_timestep_shift)
         self.normalization_eps = float(normalization_eps)
+        self.dmd_grad_clip = float(dmd_grad_clip)
         self.latent_shape = (
             int(latent_channels),
             int(latent_frames),
@@ -140,18 +150,44 @@ class SelfForcingDMDStack(Remote):
 
     def _score_sigma(self, batch: int, *, device: torch.device) -> torch.Tensor:
         sigma = torch.rand(batch, device=device, dtype=torch.float32)
-        return self.score_sigma_min + sigma * (self.score_sigma_max - self.score_sigma_min)
+        shift = self.score_timestep_shift
+        sigma = shift * sigma / (1.0 + (shift - 1.0) * sigma)
+        return sigma.clamp(min=self.score_sigma_min, max=self.score_sigma_max)
 
-    def _synced_exit_step(self) -> int:
-        """Choose one deterministic denoising exit shared by every FSDP rank.
+    def _synced_exit_steps(self, num_samples: int, *, device: torch.device) -> Tuple[int, ...]:
+        """Sample denoising exits and synchronize them across ranks.
 
-        A rank-local choice would make different ranks execute different
-        numbers of generator forwards before ``break`` and deadlock the FSDP
-        all-gathers. Cycling by the synchronized generator optimizer counter
-        covers every exit uniformly without adding another collective.
+        Rank-local choices would make FSDP ranks execute different numbers of
+        forwards and deadlock, so rank 0 samples the vector and broadcasts it
+        before the rollout.
         """
-        step = int(self.generator_backend._optimizer_step_count)
-        return step % len(self.rollout_stage.denoising_sigmas)
+        if num_samples < 1:
+            raise ValueError(f"num_samples must be >= 1; got {num_samples}.")
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0:
+            exits = torch.randint(
+                len(self.rollout_stage.denoising_sigmas),
+                (num_samples,),
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            exits = torch.empty(num_samples, device=device, dtype=torch.long)
+        if dist.is_available() and dist.is_initialized():
+            dist.broadcast(exits, src=0)
+        return tuple(int(value) for value in exits.tolist())
+
+    def _rollout_exit_steps(self, *, total_frames: int, device: torch.device) -> Tuple[int, ...]:
+        frames_per_block = int(self.rollout_stage.frames_per_block)
+        if total_frames % frames_per_block:
+            raise ValueError(f"latent frames {total_frames} must be divisible by frames_per_block={frames_per_block}.")
+        num_blocks = total_frames // frames_per_block
+        sampled = self._synced_exit_steps(
+            1 if self.same_exit_step_across_blocks else num_blocks,
+            device=device,
+        )
+        return sampled * num_blocks if self.same_exit_step_across_blocks else sampled
 
     def _typed_conditions(self, part: Part) -> Any:
         return typed_conditions(part.conditions, self.conditions_cls)
@@ -206,10 +242,11 @@ class SelfForcingDMDStack(Remote):
         conditions = self._typed_conditions(micro)
         device = conditions.text.embeds.device
         shape = (micro.batch_size, *self.latent_shape)
+        exit_steps = self._rollout_exit_steps(total_frames=shape[2], device=device)
         rollout = self.rollout_stage.rollout(
             conditions,
             initial_noise=self._noise(shape, device=device),
-            exit_step=self._synced_exit_step(),
+            exit_steps=exit_steps,
         )
         generated = rollout.latents
         batch = generated.shape[0]
@@ -245,6 +282,7 @@ class SelfForcingDMDStack(Remote):
                 )
             )
             grad = torch.nan_to_num(grad / normalizer.clamp_min(self.normalization_eps))
+            grad = grad.clamp(min=-self.dmd_grad_clip, max=self.dmd_grad_clip)
 
         target = (generated - grad).detach()
         selected = (generated.float() - target.float()).pow(2)[rollout.gradient_mask]
@@ -257,6 +295,9 @@ class SelfForcingDMDStack(Remote):
             "real_fake_x0_gap": float((fake_x0 - real_x0).abs().mean().item()),
             "score_sigma_mean": float(sigma.mean().item()),
             "rollout_exit_step": float(rollout.exit_step),
+            "rollout_exit_step_min": float(min(rollout.exit_steps)),
+            "rollout_exit_step_max": float(max(rollout.exit_steps)),
+            "rollout_exit_step_mean": float(sum(rollout.exit_steps) / len(rollout.exit_steps)),
             "generated_x0_norm": float(generated.detach().float().pow(2).mean().item()),
         }
 
@@ -265,10 +306,11 @@ class SelfForcingDMDStack(Remote):
         device = conditions.text.embeds.device
         shape = (micro.batch_size, *self.latent_shape)
         with torch.no_grad():
+            exit_steps = self._rollout_exit_steps(total_frames=shape[2], device=device)
             rollout = self.rollout_stage.rollout(
                 conditions,
                 initial_noise=self._noise(shape, device=device),
-                exit_step=self._synced_exit_step(),
+                exit_steps=exit_steps,
             )
             generated = rollout.latents.detach()
             batch = generated.shape[0]

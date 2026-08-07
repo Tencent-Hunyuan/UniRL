@@ -17,6 +17,7 @@ class WAN21SelfForcingOutput:
     latents: torch.Tensor
     gradient_mask: torch.Tensor
     exit_step: int
+    exit_steps: tuple[int, ...]
 
 
 class WAN21SelfForcingStage:
@@ -89,6 +90,7 @@ class WAN21SelfForcingStage:
         *,
         initial_noise: torch.Tensor,
         exit_step: int | None = None,
+        exit_steps: Sequence[int] | None = None,
         generator: torch.Generator | None = None,
     ) -> WAN21SelfForcingOutput:
         if initial_noise.ndim != 5:
@@ -98,26 +100,39 @@ class WAN21SelfForcingStage:
             raise ValueError(
                 f"latent frames {total_frames} must be divisible by frames_per_block={self.frames_per_block}."
             )
-        if exit_step is None:
-            exit_step = int(
-                torch.randint(
-                    len(self.denoising_sigmas),
-                    (1,),
-                    device=initial_noise.device,
-                    generator=generator,
-                ).item()
-            )
-        if not 0 <= exit_step < len(self.denoising_sigmas):
-            raise ValueError(f"exit_step must lie in [0,{len(self.denoising_sigmas)}), got {exit_step}.")
+        num_blocks = total_frames // self.frames_per_block
+        if exit_step is not None and exit_steps is not None:
+            raise ValueError("pass either exit_step or exit_steps, not both.")
+        if exit_steps is None:
+            if exit_step is not None:
+                exit_steps = (int(exit_step),) * num_blocks
+            else:
+                exit_steps = tuple(
+                    int(value)
+                    for value in torch.randint(
+                        len(self.denoising_sigmas),
+                        (num_blocks,),
+                        device=initial_noise.device,
+                        generator=generator,
+                    ).tolist()
+                )
+        else:
+            exit_steps = tuple(int(value) for value in exit_steps)
+        if len(exit_steps) != num_blocks:
+            raise ValueError(f"exit_steps length {len(exit_steps)} != num_blocks={num_blocks}.")
+        invalid = [value for value in exit_steps if not 0 <= value < len(self.denoising_sigmas)]
+        if invalid:
+            raise ValueError(f"exit_steps must lie in [0,{len(self.denoising_sigmas)}); got invalid values {invalid}.")
 
         cache = WAN21CausalCache.empty(len(self.diffusion.model.transformer.blocks))
         blocks = []
         grad_masks = []
-        for frame_offset in range(0, total_frames, self.frames_per_block):
+        for block_index, frame_offset in enumerate(range(0, total_frames, self.frames_per_block)):
+            block_exit_step = exit_steps[block_index]
             x = initial_noise[:, :, frame_offset : frame_offset + self.frames_per_block]
             x0 = None
             for step_index, sigma in enumerate(self.denoising_sigmas):
-                track_grad = step_index == exit_step
+                track_grad = step_index == block_exit_step
                 with torch.set_grad_enabled(track_grad):
                     velocity = self._predict(
                         conditions,
@@ -156,7 +171,8 @@ class WAN21SelfForcingStage:
         return WAN21SelfForcingOutput(
             latents=torch.cat(blocks, dim=2),
             gradient_mask=torch.cat(grad_masks, dim=2),
-            exit_step=exit_step,
+            exit_step=exit_steps[0],
+            exit_steps=exit_steps,
         )
 
 
