@@ -23,9 +23,8 @@ a persistent buffer and therefore never enters FSDP state dicts.
 
 from __future__ import annotations
 
-import math
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -214,6 +213,35 @@ def _causal_block_forward(
     return (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
 
 
+def _causal_bound_block_forward(
+    self: Any,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb: torch.Tensor,
+    rotary_emb: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    causal_state: Optional[_CausalState] = None,
+) -> torch.Tensor:
+    """FSDP-visible block entry point for the causal implementation.
+
+    Calling the helper directly from the transformer loop bypasses FSDP2's
+    per-block pre-forward unshard hook and leaves parameters as DTensor shards.
+    Binding this method onto each block and invoking ``block(...)`` keeps the
+    normal module call boundary, so FSDP materializes the full block before the
+    causal math and reshards it afterwards.
+    """
+    if causal_state is None:
+        raise ValueError("WAN causal block forward requires causal_state.")
+    return _causal_block_forward(
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        temb,
+        rotary_emb,
+        causal_state=causal_state,
+    )
+
+
 def _causal_transformer_forward(
     self: Any,
     hidden_states: torch.Tensor,
@@ -278,17 +306,14 @@ def _causal_transformer_forward(
         # rollout forwards intentionally bypass model gradient checkpointing.
         if cache is None and torch.is_grad_enabled() and self.gradient_checkpointing:
             hidden_states = self._gradient_checkpointing_func(
-                lambda h, e, t, r: _causal_block_forward(
-                    block, h, e, t, r, causal_state=state
-                ),
+                lambda h, e, t, r: block(h, e, t, r, causal_state=state),
                 hidden_states,
                 encoder_hidden_states,
                 timestep_proj,
                 rotary_emb,
             )
         else:
-            hidden_states = _causal_block_forward(
-                block,
+            hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
                 timestep_proj,
@@ -324,6 +349,7 @@ def enable_wan_block_causal(transformer: Any, *, frames_per_block: int = 1) -> A
     transformer._causal_frames_per_block = int(frames_per_block)
     for index, block in enumerate(transformer.blocks):
         block.attn1.set_processor(WAN21CausalAttnProcessor(index))
+        block.forward = types.MethodType(_causal_bound_block_forward, block)
     transformer.forward = types.MethodType(_causal_transformer_forward, transformer)
     transformer._wan_block_causal_enabled = True
     return transformer
