@@ -159,7 +159,7 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = _decode(clean)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
         # Return decoded pixels on CPU to avoid driver-side GPU gathers.
-        return Images(pixels=pixels.cpu())
+        return Images.from_dense(pixels.cpu())
 
 
 def patchify_latent(
@@ -198,7 +198,12 @@ class BagelVAEEncodeStage:
     def encode(self, p: Images) -> "ImageLatentCondition":
         from unirl.types.conditions.image import ImageLatentCondition
 
-        pixels = p.pixels
+        try:
+            pixels = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                f"BagelVAEEncodeStage.encode requires a non-empty batch with uniform image shapes; {exc}"
+            ) from exc
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
                 f"BagelVAEEncodeStage.encode: expected pixels [B, 3, H, W], got "

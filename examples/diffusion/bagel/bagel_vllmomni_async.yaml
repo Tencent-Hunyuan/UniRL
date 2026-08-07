@@ -1,24 +1,9 @@
 # @package _global_
 # BAGEL-7B-MoT x PickScore x LoRA — vLLM-Omni rollout GRPO recipe.
 #
-# This is the vllm_omni-rollout sibling of examples/diffusion/bagel/bagel_trainside_lora.yaml.
-# It keeps that recipe's model / precision / algorithm / data setup verbatim and
-# diverges ONLY on the rollout path: instead of the in-process
-# TrainsideRolloutEngine, generation runs in a separate vLLM-Omni worker
-# subprocess (the BAGEL single-stage DiT topology), and the freshly-trained LoRA
-# is pushed cross-slab on the configured cadence via RemoteLoraWeightSync.
+# Async sibling of bagel_trainside_lora.yaml: generation runs on its own vLLM-Omni slab, LoRA pushed by RemoteLoraWeightSync.
 #
-# What makes BAGEL's vllm_omni path different from SD3's (all handled in
-# unirl/rollout/engine/vllm_omni/{adapters,pipelines}/bagel.*):
-#   - The worker uses RLBagelPipeline, which sets BAGEL's native generate_image
-#     scheduler to a BagelFlowSDEScheduler (SDE math == trainside FlowSDEStrategy)
-#     and injects the driver-authored x_T into bagel.prepare_vae_latent.
-#   - num_inference_steps is sent as steps+1 (BAGEL loops num_timesteps-1) and
-#     BAGEL builds its own sigma schedule (shift 3.0 == trainside) — the response
-#     sigma-echo verification asserts it matches the diffusion Part's pinned sigmas.
-#   - BAGEL conditioning (opaque KV caches) can't cross the IPC boundary, so the
-#     adapter ships the PROMPTS and BagelDiffusionStage rebuilds the KV contexts
-#     trainer-side at replay (the und/text path is frozen → identical contexts).
+# BAGEL scheduler/sigma/latent/conditioning handling lives in unirl/rollout/engine/vllm_omni/{adapters,pipelines}/bagel.*.
 #
 # 16 prompts/rollout, 16 samples/prompt, 2 optimizer updates/rollout, cfg=1.
 #
@@ -36,36 +21,12 @@ save_interval: 0
 transport_kind: colocate_store
 workers_per_device: 1
 
-# ASYNC: disjoint train/rollout slabs (required for AsyncDiffusionTrainer). Async
-# variant of bagel_vllmomni.yaml — same model/data/sampling/algorithm as
-# bagel_trainside_lora, but a dedicated vLLM-Omni rollout engine on its own slab,
-# generation overlapped with training, LoRA pushed cross-slab via RemoteLoraWeightSync.
+# AsyncDiffusionTrainer requires disjoint train/rollout slabs.
 layout: separate
 train_fraction: 0.5            # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool
 
-# LoRA weight-sync cadence (loop concern, read by the trainer). >1 is required
-# for async overlap: interval=1 drains every step (every rollout is a cold sync
-# boundary, no generation can overlap a train step). interval=4 gives 3 of every
-# 4 rollouts a generation overlapped with training. old_logp_source=rollout keeps
-# the emitted π_old as a valid importance-sampling anchor; the ratio may move as
-# the resident rollout policy and current train policy diverge.
-weight_sync_interval: 4
-
-# ---- async knobs (AsyncDiffusionTrainer) ----
-# max_inflight: concurrent generations. MUST be 1: the trajectory-segment
-# cross-slab transfer (NCCL send) runs on the rollout worker; a second in-flight
-# generation co-tenanting that worker blocks the send behind it (~150s/rollout).
-# With max_inflight=1 the trainer polls (reaps) before topping up launches, so
-# each generation transfers in the idle window before the next launch, then
-# that next generation overlaps the train step. Real overlap needs
-# weight_sync_interval>1 (interval=1 drains every step).
-# buffer_max_staleness: how many weight syncs a buffered group may cross.
-#   0 = never crosses a regular rollout-weight sync (~174s/rollout on BAGEL 4+4).
-#   2 = throughput-optimal continuous buffer (~148s/rollout, matches vllm
-#       colocate); sync-boundary cold rollouts disappear. The emitted π_old
-#       remains a valid anchor, while the measured ratio may reflect policy lag.
-max_inflight: 1
-buffer_max_staleness: 2
+max_inflight: 1                # must stay 1: a queued generation blocks the reap-time cross-slab transfer
+weight_sync_interval: 12       # rollout batches per snapshot (11-batch max staleness); lower if the ratio destabilizes
 
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
@@ -220,7 +181,7 @@ sampling:
 # LoRA weight sync → vLLM-Omni rollout. Separate slabs ⇒ RemoteLoraWeightSync:
 # rank 0 ships the freshly-trained LoRA adapter to each cross-slab rollout Worker
 # by Ray RPC (no NCCL rendezvous, no name_remap — pushes the adapter directly).
-# The train loop drives cadence via weight_sync_interval.
+# The train loop publishes on weight_sync_interval or an earlier eval/save boundary.
 sync:
   _target_: unirl.distributed.weight_sync.lora.RemoteLoraWeightSync
   verify: true                         # checksum read-back asserts the synced LoRA landed; catches a wrong prefix

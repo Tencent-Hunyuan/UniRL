@@ -1,44 +1,4 @@
-"""Async diffusion RL trainer — disaggregated train/rollout slabs for DiT.
-
-Diffusion sibling of :class:`~unirl.trainer.async_ar.AsyncARTrainer`. It subclasses
-:class:`~unirl.trainer.diffusion.DiffusionTrainer` with ``layout="separate"`` to
-REUSE its two-slab build (train slab + dedicated rollout engine slab), the
-cross-slab weight-sync wiring (``RemoteLoraWeightSync`` for the BAGEL recipe;
-``NCCLWeightSync`` is also supported by ``_connect_separate``) and the diffusion
-plumbing (``_build_request_sample`` / ``_drop_decoded`` / ``evaluate`` /
-checkpoint / FlowGRPO ``stack.train_track``).
-
-The async loop runs over the shared
-:class:`~unirl.rollout.engine.asynchronous.AsyncBatchRolloutEngine` (the same engine
-``AsyncARTrainer`` drives) — one single-threaded driver loop over non-blocking
-Ray dispatch, no producer thread and no locks. This trainer supplies only the
-diffusion hooks:
-
-* ``_build_async_sample`` — one data batch → one request ``Sample``.
-* ``_score_completed`` — reward at reap time, then split into tree-complete
-  groups. Generation overlaps training; reward scoring itself does not.
-* ``_advantage_and_train`` — advantage + FlowGRPO optimizer step over the
-  freshest ``batch_size`` groups; it never calls the reward.
-
-Two numeric knobs (identical semantics to AsyncARTrainer):
-  * ``max_inflight`` — must be ``1`` so a reap-time transfer never competes with
-    a queued generation on the rollout workers.
-  * ``buffer_max_staleness`` — regular rollout-weight syncs a buffered group may
-    cross. ``0`` (default) never crosses a sync; ``>0`` enables a bounded
-    policy-lag buffer.
-
-``_next_step`` polls (reaps) BEFORE topping up launches, which is what makes the
-overlap fast here: reaping a generation pulls its trajectory segment off the
-rollout slab (the reward's cross-slab localize, an NCCL send issued on the
-rollout workers), so a generation launched ahead of that send blocks it —
-measured ~150s/rollout on BAGEL instead of ~8s. Reaping first hands the send
-idle workers, and the launch that follows still happens before the step returns,
-so the next generation overlaps this step's training.
-
-Draining all in-flight generations before each weight sync is MANDATORY (a
-weight + KV update corrupts an in-flight generation); that is the
-single-threaded ``_drain_all`` quiesce.
-"""
+"""Async diffusion RL over separate train and rollout GPU slabs — the diffusion counterpart of ``AsyncARTrainer``."""
 
 from __future__ import annotations
 
@@ -50,8 +10,15 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, launch_ceiling
+from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, RolloutBatch
 from unirl.train.stack import TrainStepResult
+from unirl.trainer.async_batch_control import (
+    AsyncBatchControl,
+    log_admission_notes,
+    max_publication_gap_batches,
+    next_hard_boundary,
+    unwrap_replicated_int,
+)
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
 
@@ -65,7 +32,7 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         self,
         *,
         max_inflight: int = 1,
-        buffer_max_staleness: Optional[int] = None,
+        weight_sync_interval: int = 1,
         **diffusion_kwargs: Any,
     ) -> None:
         layout = diffusion_kwargs.setdefault("layout", "separate")
@@ -86,7 +53,10 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             )
 
         self._max_inflight = max_inflight
-        self._buffer_max_staleness = buffer_max_staleness
+        self._control = AsyncBatchControl(
+            weight_sync_interval=weight_sync_interval,
+            num_updates_per_batch=diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1),
+        )
 
     def _build_async_sample(self, gen_id: int) -> Sample:
         """Consume one data batch and build the request Sample for ``gen_id``."""
@@ -105,15 +75,6 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         self._drop_decoded(scored, rollout_id=gen_id)
         return scored.split()
 
-    def _drain_all(self) -> None:
-        """Finish + buffer EVERY in-flight generation (the single-threaded quiesce).
-
-        Mandatory before a weight sync (a weight + KV update corrupts an in-flight
-        generate), before eval/checkpoint (shared engine), and in ``finally`` (no
-        leaked ObjectRefs).
-        """
-        self._async_engine.quiesce()
-
     def _advantage_and_train(
         self,
         sample: Sample,
@@ -121,8 +82,9 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         training_progress: float,
         rollout_id: int,
         t0: Optional[float] = None,
+        extra_metrics: Optional[dict[str, float]] = None,
     ) -> Tuple[TrainStepResult, float]:
-        """Advantage + optimizer step for a SCORED ``Sample`` (rewards already attached)."""
+        """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
         if t0 is None:
             t0 = time.perf_counter()
         part = sample.parts[-1]
@@ -135,7 +97,16 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
         sample = sample.replace_frontier(part)
         result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
-        self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
+        self._control.record_optimizer_updates(result.optimizer_updates)
+        if extra_metrics is not None:
+            extra_metrics.update(self._control.train_metrics(result.optimizer_updates))
+        self.wandb_logger.log_rollout_step(
+            rollout_id,
+            result,
+            sample,
+            step_time_s=time.perf_counter() - t0,
+            extra_metrics=extra_metrics,
+        )
         self._reset_transport_buffers()
         return result, mean_reward
 
@@ -143,70 +114,103 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
         self,
         *,
         num_rollouts: int,
-        weight_sync_interval: int = 1,
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        interval = max(1, weight_sync_interval)
-        stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
-        M = self._max_inflight
-
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
+        train_version = unwrap_replicated_int(
+            self.backend.get_optimizer_step_count(),
+            name="backend optimizer step count",
+        )
+        self._control.restore(train_version)
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={
-                "max_inflight": M,
-                "buffer_max_staleness": stale,
-                "weight_sync_interval": interval,
+                "max_inflight": self._max_inflight,
+                "weight_sync_interval": self._control.weight_sync_interval,
+                "max_staleness": self._control.max_staleness,
+                "staleness_budget": self._control.staleness_budget,
+                "num_updates_per_batch": self._control.num_updates_per_batch,
+                "max_publication_gap_batches": max_publication_gap_batches(
+                    self._control,
+                    eval_interval=self.eval_interval,
+                    save_interval=save_interval,
+                ),
                 "train_fraction": self._train_fraction,
             },
+        )
+        # Not in __init__: save_interval arrives with train() and clamps the publication interval.
+        log_admission_notes(
+            self._control,
+            max_inflight=self._max_inflight,
+            eval_interval=self.eval_interval,
+            save_interval=save_interval,
         )
 
         self._async_engine = AsyncBatchRolloutEngine(
             self.rollout,
-            complete=self._score_completed,
+            process_completion=self._score_completed,
+            groups_per_batch=self.batch_size,
             start_gen_id=start_rollout,
         )
 
-        if resumed and self.weight_sync is not None:
-            self.weight_sync.sync()
+        if resumed:
+            self._control.sync_rollout(self._async_engine, self.rollout, self.weight_sync, force=True)
         if self.eval_interval > 0:
             self.evaluate(start_rollout, sync_weights=False, sleep_after=False)
 
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
-                picked = self._next_step(rollout_id, interval, M, stale, num_rollouts)
-                sample = Sample.concat(picked)
+                hard_boundary = next_hard_boundary(
+                    rollout_id,
+                    num_rollouts=num_rollouts,
+                    eval_interval=self.eval_interval,
+                    save_interval=save_interval,
+                )
+                batch = self._next_rollout_batch(
+                    rollout_id,
+                    num_rollouts=num_rollouts,
+                    hard_boundary=hard_boundary,
+                )
+                sample = Sample.concat(batch.groups)
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
-                    sample, training_progress=training_progress, rollout_id=rollout_id, t0=t0
+                    sample,
+                    training_progress=training_progress,
+                    rollout_id=rollout_id,
+                    t0=t0,
+                    extra_metrics=self._control.output_metrics(batch.output_version),
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
                 step = rollout_id + 1
-                if self.eval_interval > 0 and step % self.eval_interval == 0:
-                    self._drain_all()
+                eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
+                save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
+                sync_due = step < num_rollouts and self._control.publication_due
+                if eval_due or save_due or sync_due:
+                    self._control.sync_rollout(self._async_engine, self.rollout, self.weight_sync)
+
+                if eval_due:
                     self.evaluate(step, sync_weights=False, sleep_after=False)
-                if save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts):
-                    self._drain_all()
+                if save_due:
                     self.maybe_save_checkpoint(
-                        rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                        rollout_id,
+                        num_rollouts,
+                        save_interval=save_interval,
+                        save_dir=save_dir,
+                        save_mode=save_mode,
                     )
-                if step % interval == 0 and self.weight_sync is not None:
-                    self._drain_all()
-                    self.weight_sync.sync()
-                    self._async_engine.bump_weight_version()
         finally:
             # Cleanup failures must not mask the exception that stopped training.
             active_exception = sys.exc_info()[0] is not None
             try:
-                self._drain_all()
+                self._async_engine.quiesce()
             except Exception:
                 if not active_exception:
                     raise
@@ -214,38 +218,37 @@ class AsyncDiffusionTrainer(DiffusionTrainer):
             finally:
                 self._finish_wandb()
 
-    def _next_step(
+    def _next_rollout_batch(
         self,
         rollout_id: int,
-        interval: int,
-        M: int,
-        stale: int,
+        *,
         num_rollouts: int,
-    ) -> List[Sample]:
-        """Reap completed generations, top up launches, and return the freshest
-        ``batch_size`` scored group Samples for ``rollout_id`` (blocking on the
-        oldest in-flight generation if the buffer is short).
-
-        Polls BEFORE topping up: reaping pulls the trajectory segment off the
-        rollout slab, so it must not queue behind a freshly launched generation,
-        and the post-reap launch is what overlaps this step (module docstring).
-
-        The launch clamp is the load-bearing on-policy guarantee: a generation
-        launched now is consumed later, so bound how far ahead we launch to
-        ``stale`` weight-syncs. ``stale=0`` ⇒ never launch into a future
-        sync-window ⇒ no generation crosses a regular rollout-weight sync.
-        """
+        hard_boundary: int,
+    ) -> RolloutBatch:
+        """Reap, launch, consume one FIFO train batch; reaping first keeps the cross-slab segment transfer unqueued."""
         engine = self._async_engine
         while True:
-            ceiling = launch_ceiling(rollout_id, sync_interval=interval, max_staleness=stale, num_rollouts=num_rollouts)
             engine.poll()
-            while engine.next_gen_id < ceiling and engine.inflight < M:
-                engine.submit(self._build_async_sample(engine.next_gen_id))
-            picked = engine.drain_freshest(self.batch_size, max_staleness=stale)
-            engine.pop_evicted()
-            if picked is not None:
-                return picked
-            if engine.inflight:
+            slots = self._control.launch_slots(
+                inflight_count=engine.inflight_count,
+                ready_count=engine.ready_count,
+                max_inflight=self._max_inflight,
+                trained_batches=rollout_id,
+                num_rollouts=num_rollouts,
+                hard_boundary=hard_boundary,
+            )
+            for _ in range(slots):
+                engine.submit(
+                    self._build_async_sample(engine.next_gen_id),
+                    output_version=self._control.published_version,
+                )
+            batch = engine.pop_next_batch(
+                train_version=self._control.train_version,
+                staleness_budget=self._control.staleness_budget,
+            )
+            if batch is not None:
+                return batch
+            if engine.inflight_count:
                 engine.wait_oldest()
             else:
-                raise RuntimeError("async rollout buffer underflow with no in-flight generations")
+                raise RuntimeError("async rollout queue is empty and the staleness budget admits no new generation")

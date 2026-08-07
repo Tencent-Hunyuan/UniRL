@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, TypeVar
+
+T = TypeVar("T")
 
 
 def deexpand_prompts_from_groups(
@@ -51,4 +53,14 @@ def deexpand_prompts_from_groups(
     return unique_prompts, k
 
 
-__all__ = ["deexpand_prompts_from_groups"]
+def first_per_group(items: List[T], group_ids: List[str]) -> List[T]:
+    """Return the first item for each group in first-seen order."""
+    if len(items) != len(group_ids):
+        raise ValueError(f"items/group_ids length mismatch: {len(items)} != {len(group_ids)}")
+    first: Dict[str, T] = {}
+    for item, group_id in zip(items, group_ids):
+        first.setdefault(group_id, item)
+    return list(first.values())
+
+
+__all__ = ["deexpand_prompts_from_groups", "first_per_group"]

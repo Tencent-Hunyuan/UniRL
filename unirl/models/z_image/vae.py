@@ -81,7 +81,7 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 __all__ = ["ZImageVAEDecodeStage"]

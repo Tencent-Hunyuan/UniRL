@@ -198,7 +198,7 @@ class Sd3ReflVAEDecodeStage(SD3VAEDecodeStage):
                 f"Sd3ReflVAEDecodeStage.decode_with_grad: expected 4D z_final [B, C, H, W], got {tuple(z_final.shape)}"
             )
         segment = LatentSegment(latents=z_final.unsqueeze(1))
-        return self.decode(segment, grad=True, activation_checkpoint=True).pixels
+        return self.decode(segment, grad=True, activation_checkpoint=True).to_dense()
 
 
 class Sd3ReflPipeline(SD3Pipeline):

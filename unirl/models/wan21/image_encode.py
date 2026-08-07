@@ -1,4 +1,4 @@
-"""WAN21ImageLatentEncodeStage — Images → 20-channel mask+VAE latent payload.
+"""WAN21ImageLatentEncodeStage — packed Images → mask+VAE latent payload.
 
 Mirrors diffusers ``pipelines/wan/pipeline_wan_i2v.py:423-481`` for the
 ``expand_timesteps=False`` path (WAN 2.1 I2V + WAN 2.2 14B I2V). Encode
@@ -63,18 +63,18 @@ class WAN21ImageLatentEncodeStage(EncodeStage[Images, ImageLatentCondition]):
             )
         if not isinstance(p, Images):
             raise TypeError(f"WAN21ImageLatentEncodeStage.encode: expected Images, got {type(p).__name__}")
-        pixels = p.pixels
-        if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
+        pixels_list = [image.pixels for image in p.to_list()]
+        if not pixels_list or any(pixels is None or pixels.ndim != 3 or pixels.shape[0] != 3 for pixels in pixels_list):
             raise ValueError(
-                f"WAN21ImageLatentEncodeStage.encode: expected pixels [B, 3, H, W], "
-                f"got shape {None if pixels is None else tuple(pixels.shape)}"
+                "WAN21ImageLatentEncodeStage.encode: expected per-sample pixels [3, H, W], "
+                f"got {[None if pixels is None else tuple(pixels.shape) for pixels in pixels_list]}"
             )
 
         device = self.bundle.device
         dtype = self.bundle.dtype
         vae = self.bundle.vae
 
-        batch_size = int(pixels.shape[0])
+        batch_size = len(pixels_list)
         target_h = int(self.height)
         target_w = int(self.width)
         num_frames = int(self.num_frames)
@@ -82,14 +82,20 @@ class WAN21ImageLatentEncodeStage(EncodeStage[Images, ImageLatentCondition]):
         latent_w = target_w // _SPATIAL_DOWNSAMPLE
         latent_t = (num_frames - 1) // _TEMPORAL_DOWNSAMPLE + 1
 
-        pixels = pixels.to(device=device, dtype=torch.float32)
-        resized = F.interpolate(
-            pixels,
-            size=(target_h, target_w),
-            mode="bicubic",
-            align_corners=False,
-            antialias=True,
-        )
+        resized_items = []
+        for pixels in pixels_list:
+            pixels = pixels.to(device=device, dtype=torch.float32).unsqueeze(0)
+            if tuple(pixels.shape[-2:]) != (target_h, target_w):
+                pixels = F.interpolate(
+                    pixels,
+                    size=(target_h, target_w),
+                    mode="bicubic",
+                    align_corners=False,
+                    antialias=True,
+                )
+            resized_items.append(pixels)
+        resized = torch.cat(resized_items, dim=0)
+        # [0, 1] → [-1, 1] (VAE input convention).
         scaled = resized * 2.0 - 1.0
         video_condition = torch.cat(
             [scaled.unsqueeze(2), scaled.new_zeros(batch_size, 3, num_frames - 1, target_h, target_w)],

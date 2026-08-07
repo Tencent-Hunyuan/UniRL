@@ -1,4 +1,4 @@
-"""WAN21CLIPVisionEncodeStage — Images → ImageEmbedCondition via CLIP vision.
+"""WAN21CLIPVisionEncodeStage — packed Images → CLIP vision condition.
 
 Mirrors diffusers ``pipelines/wan/pipeline_wan_i2v.py`` CLIP encoding:
 preprocess via ``CLIPImageProcessor``, run ``CLIPVisionModel`` with

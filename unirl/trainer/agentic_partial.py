@@ -23,8 +23,8 @@ pattern. The driver-side :class:`~unirl.rollout.engine.asynchronous.AsyncAgentic
 Correctness: `TensorWeightSync.sync` writes the live SRT weight pool, so it must run **awake +
 decode-idle** — sync sits at the top (post-`wake_up`, pre-`submit`, barrier parity) and `abort`
 (not `sleep`) provides the pre-sleep quiesce. The off-policy carried tail is corrected per-token
-(each gen Part keeps its own `weight_version` + logprobs); `buffer_max_staleness` separately bounds
-how long a completed group remains eligible in the buffer.
+(each gen Part keeps its own `output_version` + logprobs); `buffer_max_staleness` is converted
+to an update-version budget for completed groups.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from typing import Dict, List, Literal, Optional
 from unirl.rollout.engine.asynchronous import AsyncAgenticRolloutEngine, root_of
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.agentic_env import _EnvRewardSource
+from unirl.trainer.async_batch_control import unwrap_replicated_int
 from unirl.types.sample import Part, Sample
 
 logger = logging.getLogger(__name__)
@@ -58,13 +59,15 @@ class AgenticPartialTrainer(AgenticTrainer):
         tail_policy: Literal["carry", "drop"] = "carry",
         **kwargs,
     ) -> None:
+        num_updates_per_batch = int(kwargs["stack_cfg"].get("num_updates_per_batch", 1))
         super().__init__(**kwargs)
-        self._n = int(samples_per_prompt)
-        self._oversample = int(oversample_batch_size) if oversample_batch_size else int(self.batch_size)
+        self._n = samples_per_prompt
+        self._oversample = oversample_batch_size or self.batch_size
         if self._oversample < self.batch_size:
             raise ValueError(f"oversample_batch_size={self._oversample} must be >= batch_size={self.batch_size}")
         self._buffer_max_staleness = buffer_max_staleness
-        self._tail_policy = str(tail_policy)
+        self._num_updates_per_batch = num_updates_per_batch
+        self._tail_policy = tail_policy
         if self._tail_policy not in ("carry", "drop"):
             raise ValueError(f"tail_policy must be 'carry' or 'drop'; got {self._tail_policy!r}")
         self._drive_seq = 0
@@ -118,28 +121,33 @@ class AgenticPartialTrainer(AgenticTrainer):
             self._last_discarded_completed_trajectories,
         )
 
-    def _drain_buffer(self, n: int, *, max_staleness: int) -> Optional[List[List[Sample]]]:
+    def _drain_buffer(self, n: int, *, staleness_budget: int) -> Optional[List[List[Sample]]]:
         """Drain fresh groups and forget ground truth for stale evictions."""
-        picked = self._engine.drain_freshest(n, max_staleness=max_staleness)
+        picked = self._engine.drain_freshest(n, staleness_budget=staleness_budget)
         for group in self._engine.pop_evicted():
             if group:
                 self._gt_by_root.pop(root_of(group[0]), None)
         return picked
 
-    def _collect_until(self, batch_size: int, rollout_id: int, stale: int) -> List[List[Sample]]:
+    def _collect_until(
+        self,
+        batch_size: int,
+        rollout_id: int,
+        staleness_budget: int,
+    ) -> List[List[Sample]]:
         """Pump the in-flight drive until the buffer holds ``batch_size`` complete groups within
         the staleness bound, then drain the freshest. If the drive drains without filling the
         buffer (small over-sample / failures / eviction), refill with a fresh drive."""
         refills = 0
         while True:
             self._engine.poll()
-            picked = self._drain_buffer(batch_size, max_staleness=stale)
+            picked = self._drain_buffer(batch_size, staleness_budget=staleness_budget)
             if picked is not None:
                 return picked
             if self._engine.finalize_if_drained() is None:
                 time.sleep(self._POLL_INTERVAL_S)
                 continue
-            picked = self._drain_buffer(batch_size, max_staleness=stale)
+            picked = self._drain_buffer(batch_size, staleness_budget=staleness_budget)
             if picked is not None:
                 return picked
 
@@ -152,14 +160,23 @@ class AgenticPartialTrainer(AgenticTrainer):
                 )
             self._engine.submit(self._build_tasks([], rollout_id))
 
-    def _drive_partial(self, rollout_id: int, sync_weights: bool, stale: int) -> List[List[Sample]]:
+    def _drive_partial(
+        self,
+        rollout_id: int,
+        sync_weights: bool,
+        staleness_budget: int,
+    ) -> List[List[Sample]]:
         self.rollout.wake_up()
         if sync_weights and self.weight_sync is not None:
-            self._engine.sync_weights(self.weight_sync)
+            train_version = unwrap_replicated_int(
+                self.backend.get_optimizer_step_count(),
+                name="backend optimizer step count",
+            )
+            self._engine.sync_weights(self.weight_sync, train_version=train_version)
         tasks = self._build_tasks(self._carried, rollout_id)
         self._carried = []
         self._engine.submit(tasks)
-        groups = self._collect_until(self.batch_size, rollout_id, stale)
+        groups = self._collect_until(self.batch_size, rollout_id, staleness_budget)
         carried = self._engine.quiesce()
         self.rollout.sleep()
         tail_depths = [len(t.gen_parts()) for t in carried]
@@ -187,7 +204,9 @@ class AgenticPartialTrainer(AgenticTrainer):
         save_mode: str = "auto",
     ) -> None:
         interval = max(1, weight_sync_interval)
-        stale = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
+        max_staleness_syncs = self._buffer_max_staleness if self._buffer_max_staleness is not None else 0
+        # buffer_max_staleness counts weight syncs; the buffer compares optimizer-update versions.
+        staleness_budget_updates = max_staleness_syncs * interval * self._num_updates_per_batch
 
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
@@ -198,7 +217,8 @@ class AgenticPartialTrainer(AgenticTrainer):
             extra={
                 "adv_normalization_scope": self.adv_normalization_scope,
                 "oversample_batch_size": self._oversample,
-                "buffer_max_staleness": stale,
+                "buffer_max_staleness_intervals": max_staleness_syncs,
+                "buffer_staleness_budget_updates": staleness_budget_updates,
                 "tail_policy": self._tail_policy,
                 "weight_sync_interval": interval,
             },
@@ -217,8 +237,23 @@ class AgenticPartialTrainer(AgenticTrainer):
                     resumed and rollout_id == start_rollout
                 )
 
-                groups = self._drive_partial(rollout_id, sync_weights, stale)
+                groups = self._drive_partial(
+                    rollout_id,
+                    sync_weights,
+                    staleness_budget_updates,
+                )
                 trajs: List[Sample] = [t for group in groups for t in group]
+                versions = [part.output_version for traj in trajs for part in traj.gen_parts()]
+                version_metrics: Dict[str, int] = {"partial/published_version": self._engine.version}
+                if versions and all(version is not None for version in versions):
+                    head_version = min(versions)
+                    version_metrics.update(
+                        {
+                            "partial/head_output_version": head_version,
+                            "partial/head_staleness_updates": self._engine.version - head_version,
+                            "partial/output_version_span_updates": max(versions) - head_version,
+                        }
+                    )
                 rewards, group_ids = self._rewards_and_groups(self._reconstruct_request(trajs), trajs, rollout_id)
                 for root in {root_of(traj) for traj in trajs}:
                     self._gt_by_root.pop(root, None)
@@ -237,7 +272,7 @@ class AgenticPartialTrainer(AgenticTrainer):
                         "partial/discarded_completed_trajectories": self._last_discarded_completed_trajectories,
                         "partial/assembler_pending_roots": self._engine.pending_groups(),
                         "partial/buffer_groups": self._engine.buffered_groups(),
-                        "partial/weight_version": self._engine.weight_version,
+                        **version_metrics,
                     },
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)

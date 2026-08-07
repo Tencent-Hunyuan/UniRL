@@ -69,7 +69,7 @@ from unirl.distributed.tensor.batch import Batch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
@@ -372,9 +372,9 @@ class UnifiedModelTrainer(BaseTrainer):
         prompts = input_part.primitives.get("text")
         if not isinstance(prompts, Texts):
             raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
-        n_rec = int(ar_shell.sampling_params.samples_per_prompt)
-        n_img = int(image_shell.sampling_params.samples_per_prompt)
-        rid = int(self._dump_rollout_id)
+        n_rec = ar_shell.sampling_params.samples_per_prompt
+        n_img = image_shell.sampling_params.samples_per_prompt
+        rid = self._dump_rollout_id
 
         ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
         n_ar = len(ar_texts.texts)
@@ -400,7 +400,7 @@ class UnifiedModelTrainer(BaseTrainer):
             segment=ar_gen.segment,
             primitives={"text": recaptions},
             conditions=dict(ar_gen.conditions),
-            weight_version=ar_gen.weight_version,
+            output_version=ar_gen.output_version,
         )
 
         dit_prompts = Texts(texts=[prompts.texts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
@@ -426,7 +426,7 @@ class UnifiedModelTrainer(BaseTrainer):
             primitive_metadata=dict(img_gen.primitive_metadata),
             conditions=dict(img_gen.conditions),
             media_preview=img_gen.media_preview,
-            weight_version=img_gen.weight_version,
+            output_version=img_gen.output_version,
         )
 
         # Materialize engine outputs before DP reshards a single transport handle.
@@ -555,13 +555,15 @@ class UnifiedModelTrainer(BaseTrainer):
                 rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
 
             n_imgs = 0
-            if img_decoded is not None and getattr(img_decoded, "pixels", None) is not None:
+            if isinstance(img_decoded, Images):
                 from torchvision.utils import save_image
 
-                pixels = hydrate(img_decoded.pixels).detach().to(torch.float32).clamp(0, 1).cpu()
-                n_imgs = int(pixels.shape[0])
-                for k in range(n_imgs):
-                    save_image(pixels[k], os.path.join(out_dir, f"img_{k}.png"))
+                img_decoded = deep_hydrate(img_decoded)
+                images = img_decoded.to_list()
+                n_imgs = len(images)
+                for k, image in enumerate(images):
+                    pixels = image.pixels.detach().to(torch.float32).clamp(0, 1).cpu()
+                    save_image(pixels, os.path.join(out_dir, f"img_{k}.png"))
 
             ar_params = self.sampling_params.get("ar")
             diff_params = self.sampling_params.get("diffusion")

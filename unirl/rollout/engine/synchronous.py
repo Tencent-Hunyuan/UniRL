@@ -151,18 +151,24 @@ class BaseRolloutEngine(Remote, ABC):
 class SyncRolloutEngine(BaseRolloutEngine, ABC):
     """Engines that fill and return one ``Sample``; ``generate`` may be called concurrently (agentic drain)."""
 
-    _weight_version: int = 0
+    _version: int = 0
 
     @abstractmethod
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``."""
 
-    def _stamp_weight_version(self, sample: Sample) -> Sample:
-        """Stamp ``self._weight_version`` onto the frontier (last) gen Part."""
-        v = getattr(self, "_weight_version", None)
-        if v is None or not sample.parts:
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        """Set the committed-update version after a full weight publication."""
+        if train_version < 0:
+            raise ValueError(f"train_version must be >= 0, got {train_version}")
+        self._version = train_version
+
+    def _stamp_output_version(self, sample: Sample) -> Sample:
+        """Stamp ``self._version`` onto the frontier (last) gen Part."""
+        if not sample.parts:
             return sample
-        gen = sample.parts[-1].fill(weight_version=int(v))
+        gen = sample.parts[-1].fill(output_version=self._version)
         return sample.with_parts([*sample.parts[:-1], gen])
 
 

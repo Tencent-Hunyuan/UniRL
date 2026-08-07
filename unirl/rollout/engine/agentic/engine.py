@@ -442,6 +442,10 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     def resume(self) -> None:
         self._inner.resume()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        self._inner.set_version(train_version)
+
     def init_weights_update_group(self, **kwargs: Any) -> None:
         self._inner.init_weights_update_group(**kwargs)
 
