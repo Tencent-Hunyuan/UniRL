@@ -122,7 +122,17 @@ backend:
     learning_rate: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
-    adam_epsilon: 1.0e-8
+    # MEASURED, NOT THE USUAL DEFAULT. Adam's step is lr*m/(sqrt(v)+eps), which
+    # is scale-invariant only while sqrt(v) >> eps. This adapter has 166,297,600
+    # trainable params and a grad_norm of ~5e-5, i.e. a PER-COORDINATE gradient
+    # of ~3.9e-9 -- BELOW the usual 1e-8. Epsilon then dominates the denominator
+    # and the update shrinks in proportion to the gradient, degrading Adam
+    # toward SGD. Measured: ||B|| after 2 rollouts was 0.194 under CPS vs 0.707
+    # under FlowSDE, a 3.6x handicap that is an artefact of eps, not of the
+    # kernel. At 1e-8 even the FlowSDE runs were getting only ~60% of a full
+    # step. 1e-12 puts eps ~4 orders below sqrt(v) so it is negligible again,
+    # while staying far above fp32 underflow (v ~ 1.5e-17).
+    adam_epsilon: 1.0e-12
     weight_decay: 0.0
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
