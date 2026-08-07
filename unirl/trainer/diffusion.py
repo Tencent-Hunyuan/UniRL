@@ -64,6 +64,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_width: Optional[int] = None,
         eval_shift: Optional[float] = None,
         eval_mu: Optional[float] = None,
+        eval_media_max_items: int = 0,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -79,6 +80,7 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_chunk_prompts = int(eval_chunk_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
+        self.eval_media_max_items = int(eval_media_max_items)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
@@ -117,6 +119,13 @@ class DiffusionTrainer(BaseTrainer):
                 sampling_spec=self._eval_sampling_params.get("diffusion"),
             )
         )
+        if self.eval_media_max_items > 0 and self._eval_noise_latent_shape is None:
+            logger.warning(
+                "eval_media_max_items=%d, but this pipeline has no driver-authored x_T "
+                "(DISABLE_DRIVER_XT, or latent_shape() opted out), so every eval draws fresh "
+                "noise and the logged images will not be comparable across evals.",
+                self.eval_media_max_items,
+            )
 
         self.weight_sync = None
         # None when the recipe has no ``reward:`` block (validated below).
@@ -624,11 +633,22 @@ class DiffusionTrainer(BaseTrainer):
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            metrics = self._eval_pass(
+                self.data_source, self.eval_num_prompts, scorers, eval_sp, step, media_key="eval/generated_media"
+            )
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                            media_key=f"eval/{suite.name}/generated_media",
+                        )
+                    )
         finally:
             if sleep_after:
                 self.rollout.sleep()
@@ -653,6 +673,7 @@ class DiffusionTrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        media_key: Optional[str] = None,
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean.
 
@@ -660,24 +681,72 @@ class DiffusionTrainer(BaseTrainer):
         never holds N x the KV/decoded on the driver (the it2i memory
         bottleneck). Scores the single scorable (segment-carrying) track with
         every scorer — single-track for now; revisit if multi-track lands.
+
+        ``media_key`` names the wandb panel for the first
+        ``eval_media_max_items`` generations, captioned with the FIRST
+        scorer's rewards. Those are always the same prompts (the eval set is
+        served in a fixed order from index 0) rendered from the same x_T (keyed
+        on prompt content in :meth:`_build_request_sample`), so the panel is a
+        like-for-like filmstrip of one fixed sample across the run.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
+        media_budget = self.eval_media_max_items if media_key and self.wandb_logger.enabled else 0
+        previews: List[Any] = []
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
+            primary_scored = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if primary_scored is None:
+                    primary_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if media_budget > 0 and primary_scored is not None:
+                preview = self._build_eval_media_preview(primary_scored, media_budget)
+                if preview is not None:
+                    previews.append(preview)
+                    media_budget -= len(preview)
+        if previews:
+            from unirl.types.media_preview import MediaPreview
+
+            self.wandb_logger.log_generated_media(
+                step, MediaPreview.concat(previews), key=media_key, step_key="eval/step"
+            )
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+
+    def _build_eval_media_preview(self, scored: Sample, max_items: int) -> Optional[Any]:
+        """Up to ``max_items`` decoded generations of one eval chunk, or ``None``.
+
+        Mirrors :meth:`BaseTrainer._drop_decoded`'s preview construction, but
+        does not clear the decoded payloads: eval discards the whole Sample
+        right after, and the later scorers of the pass still need them.
+        """
+        from unirl.types.media_preview import build_media_preview_for_part
+        from unirl.types.primitives import Images
+
+        part = scored.parts[-1]
+        preview = part.media_preview
+        if preview is None and part.primitives:
+            cond = scored.conditioning()
+            prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
+            input_image = next((c for c in cond if isinstance(c, Images)), None)
+            preview = build_media_preview_for_part(
+                part=part, max_items=max_items, prompts=prompts, input_image=input_image
+            )
+        if preview is None:
+            return None
+        if len(preview) > max_items:
+            preview = preview.slice(0, max_items)
+        return preview
 
     def train(
         self,

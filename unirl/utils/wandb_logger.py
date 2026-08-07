@@ -533,6 +533,7 @@ class UniRLWandBLogger:
         key: str = "rollout/generated_media",
         video_key: Optional[str] = None,
         video_fps: int = 8,
+        step_key: str = "rollout/step",
     ) -> None:
         """Log rollout media preview payload produced by the rollout pipeline.
 
@@ -543,8 +544,10 @@ class UniRLWandBLogger:
 
         Images and videos go to *separate* wandb keys so wandb renders each
         as its native panel type. Both are logged in a single ``wandb.log``
-        call sharing ``"rollout/step"`` so the panels line up on the same
-        step axis. Captions ("``{prompt:.100} | reward: {r:.2f}``") are
+        call sharing ``step_key`` so the panels line up on the same step
+        axis; it must be the axis ``key``'s namespace was declared against
+        in :meth:`_init_metric_axes` (``eval/*`` panels need
+        ``"eval/step"``). Captions ("``{prompt:.100} | reward: {r:.2f}``") are
         built once and applied to both ``wandb.Image`` and ``wandb.Video``
         so a sample's image and video panels show identical caption text.
 
@@ -616,7 +619,7 @@ class UniRLWandBLogger:
                     return f"{prompt[:100]} | reward: {reward_values[idx]:.2f}"
                 return f"{prompt[:100]}"
 
-            payload: Dict[str, Any] = {"rollout/step": int(rollout_id)}
+            payload: Dict[str, Any] = {step_key: int(rollout_id)}
 
             if has_images:
                 wandb_images = [

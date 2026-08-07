@@ -59,6 +59,7 @@ def main(cfg: DictConfig) -> None:
         eval_width=cfg.get("eval_width"),
         eval_shift=cfg.get("eval_shift"),
         eval_mu=cfg.get("eval_mu"),
+        eval_media_max_items=cfg.get("eval_media_max_items", 0),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),
