@@ -68,6 +68,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
     max_prompt_length: Optional[int] = None
+    image_max_pixels: Optional[int] = None
     video_fps: Optional[float] = None
     video_max_pixels: Optional[int] = None
     use_audio_in_video: Optional[bool] = None

@@ -52,18 +52,13 @@ bundle:
     lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     use_gradient_checkpointing: true
     max_prompt_length: 16384
-    video_fps: 1.0
-    video_max_frames: 64
-    video_max_pixels: 262144
-    use_audio_in_video: false
+    # Shared by HF replay and vLLM rollout through the processor's image size kwargs.
+    image_max_pixels: 262144
 
 pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 16384
-  video_fps: 1.0
-  video_max_frames: 64
-  video_max_pixels: 262144
-  use_audio_in_video: false
+  image_max_pixels: ${bundle.config.image_max_pixels}
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -117,9 +112,7 @@ rollout:
     stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml
     enable_sleep_mode: true
     max_prompt_length: 16384
-    video_fps: 1.0
-    video_max_pixels: 262144
-    use_audio_in_video: false
+    image_max_pixels: ${bundle.config.image_max_pixels}
     omni_extra:
       stage_init_timeout: 1200
       init_timeout: 1800
