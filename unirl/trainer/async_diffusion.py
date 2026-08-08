@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import resolve_lane_window
+from unirl.rollout.manager import resolve_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
 from unirl.trainer.diffusion import DiffusionTrainer
@@ -22,7 +22,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         self,
         *,
         max_inflight: int = 1,
-        per_lane_window: int = 1,
+        per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
         **diffusion_kwargs: Any,
     ) -> None:
@@ -53,8 +53,8 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         self._max_inflight = max_inflight
         self._require_single_generation = True
         engine_cfg = diffusion_kwargs["rollout_cfg"].get("config", {})
-        self._per_lane_window = resolve_lane_window(
-            per_lane_window,
+        self._per_worker_inflight = resolve_worker_inflight(
+            per_worker_inflight,
             worker_max_concurrency=self.pool.worker_max_concurrency,
             engine_concurrency=engine_cfg.get("concurrency"),
         )

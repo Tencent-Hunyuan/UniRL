@@ -218,13 +218,13 @@ class RolloutPool:
             self._condition.notify_all()
 
 
-def resolve_lane_window(
+def resolve_worker_inflight(
     requested: int,
     *,
     worker_max_concurrency: int,
     engine_concurrency: Optional[int],
 ) -> int:
-    """Clamp a requested per-engine window to actor and engine capacity."""
+    """Clamp per-worker rollout concurrency to actor and engine capacity."""
     window = max(1, int(requested))
     worker_limit = 1 if int(worker_max_concurrency) <= 1 else max(1, int(worker_max_concurrency) - 2)
     window = min(window, worker_limit)
@@ -233,4 +233,4 @@ def resolve_lane_window(
     return window
 
 
-__all__ = ["RolloutPool", "resolve_lane_window"]
+__all__ = ["RolloutPool", "resolve_worker_inflight"]

@@ -10,7 +10,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import resolve_lane_window
+from unirl.rollout.manager import resolve_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
@@ -50,7 +50,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         eval_temperature: float = 1.0,
         train_fraction: float = 0.5,
         max_inflight: int = 1,
-        per_lane_window: int = 1,
+        per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
     ) -> None:
         self._allowed_input_primitives = ar_preflight(
@@ -90,8 +90,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
         engine_cfg = rollout_cfg.get("config", {})
-        self._per_lane_window = resolve_lane_window(
-            per_lane_window,
+        self._per_worker_inflight = resolve_worker_inflight(
+            per_worker_inflight,
             worker_max_concurrency=self.pool.worker_max_concurrency,
             engine_concurrency=engine_cfg.get("concurrency"),
         )

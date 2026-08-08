@@ -25,7 +25,7 @@ num_rollouts: 800
 train_fraction: 0.5
 
 max_inflight: 1          # globally admitted batch-equivalents
-per_lane_window: 1       # concurrent prompt units per rollout-engine lane
+per_worker_inflight: 1   # concurrent prompt units per rollout-engine worker
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).

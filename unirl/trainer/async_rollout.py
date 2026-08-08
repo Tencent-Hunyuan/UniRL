@@ -64,30 +64,6 @@ def next_hard_boundary(
     return boundary
 
 
-def boundary_launch_slots(
-    *,
-    inflight_count: int,
-    ready_count: int,
-    max_inflight: int,
-    trained_batches: int,
-    num_rollouts: int,
-    hard_boundary: int,
-    batches_since_sync: int,
-    weight_sync_interval: int,
-    leased_count: int = 0,
-) -> int:
-    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window."""
-    freshness = weight_sync_interval - batches_since_sync
-    allowed = min(freshness, min(num_rollouts, hard_boundary) - trained_batches)
-    return max(
-        0,
-        min(
-            max_inflight - inflight_count,
-            allowed - inflight_count - ready_count - leased_count,
-        ),
-    )
-
-
 def boundary_launch_units(
     *,
     outstanding_units: int,
@@ -136,27 +112,6 @@ def training_version_metrics(
         "async/optimizer_updates": optimizer_updates,
         "async/batches_since_sync": batches_since_sync,
     }
-
-
-def combine_rollout_chunks(groups: List[List["Sample"]]) -> Tuple["Sample", int, int]:
-    chunks = [sample for group in groups for sample in group]
-    if not chunks:
-        raise ValueError("cannot combine an empty rollout result")
-    rollout_ids = [_rollout_id(sample) for sample in chunks]
-    if len(set(rollout_ids)) != 1:
-        raise RuntimeError(f"rollout batch combines multiple generation ids: {sorted(set(rollout_ids))}")
-    versions = {part.output_version for sample in chunks for part in sample.gen_parts()}
-    if not versions or None in versions:
-        raise RuntimeError("rollout batch is missing output_version provenance")
-    if len(versions) != 1:
-        raise RuntimeError(f"rollout batch has mixed output versions: {sorted(versions)}")
-    output_version = int(next(iter(versions)))
-    if len(chunks) == 1:
-        return chunks[0], rollout_ids[0], output_version
-
-    from unirl.types.sample import Sample
-
-    return Sample.concat(chunks), rollout_ids[0], output_version
 
 
 def combine_rollout_units(
@@ -213,10 +168,6 @@ class AsyncRolloutTrainerMixin:
         """Whether this trainer may launch replacement work before scoring."""
         return False
 
-    def _build_async_sample(self, gen_id: int) -> "Sample":
-        """Consume one data batch and build the request Sample for ``gen_id``."""
-        return self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
-
     def _score_completed(self, gen_id: int, completed: "Sample") -> "Sample":
         scored = self.reward.score_and_attach(completed)
         self._drop_decoded(scored, rollout_id=gen_id)
@@ -246,7 +197,7 @@ class AsyncRolloutTrainerMixin:
             extra={
                 "max_inflight": self._max_inflight,
                 "max_inflight_units": self._max_inflight_units,
-                "per_lane_window": self._per_lane_window,
+                "per_worker_inflight": self._per_worker_inflight,
                 "weight_sync_interval": self._weight_sync_interval,
                 "max_staleness": self._weight_sync_interval - 1,
                 "staleness_budget": staleness_budget,
@@ -262,13 +213,14 @@ class AsyncRolloutTrainerMixin:
             start_batch_id=start_rollout,
         )
         engine_slots = self.rollout.engine_slots
+        launchers = [
+            lambda sample, slot=slot: slot.launch("generate_one", sample)
+            for slot in engine_slots
+        ]
         self._rollout_manager = RolloutManager(
             self.rollout,
-            launchers=[
-                lambda sample, slot=slot: slot.launch("generate_one", sample)
-                for slot in engine_slots
-            ],
-            capacities=[self._per_lane_window] * len(engine_slots),
+            launchers=launchers,
+            capacities=[self._per_worker_inflight] * len(engine_slots),
             group_size=total_samples_per_prompt(self.sampling_params),
             filter_fn=keep_within_lag(staleness_budget),
         )
@@ -401,8 +353,6 @@ class AsyncRolloutTrainerMixin:
 __all__ = [
     "AsyncRolloutTrainerMixin",
     "boundary_launch_units",
-    "boundary_launch_slots",
-    "combine_rollout_chunks",
     "combine_rollout_units",
     "next_hard_boundary",
     "rollout_version_metrics",
