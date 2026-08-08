@@ -122,12 +122,11 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             )
             super().__init__(config=remote_spec, base_device=base_device)
             # per_call means "on GPU only while scoring" — including BEFORE the
-            # first score call. The child boots resident (model loaded to CUDA),
-            # so without this initial offload it holds its full footprint through
-            # the whole first generation phase and can OOM a colocated rollout
-            # before any scoring ever happens.
-            if self.process_config.lifecycle == "per_call":
-                self.offload()
+            # first score call and before the child is even ready. The child is
+            # started with --boot-offloaded, so it leaves the GPU (or, for
+            # scorers honoring UNIRL_SCORER_BOOT_OFFLOADED, never touches it)
+            # BEFORE _start_child sees it ready; a parent-side offload here
+            # would reopen the bootstrap window it is meant to close.
         except Exception:
             self._stop_child()
             raise
@@ -147,6 +146,11 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             env["TRANSFORMERS_OFFLINE"] = "1"
         env.pop("RAY_ADDRESS", None)
         env["UNIRL_REWARD_PARENT_PID"] = str(os.getpid())
+        if cfg.lifecycle == "per_call":
+            # Construction-time hint: scorers that can build on CPU (e.g.
+            # EditReward) read this and never touch the GPU during boot, closing
+            # the bootstrap window entirely instead of merely shrinking it.
+            env["UNIRL_SCORER_BOOT_OFFLOADED"] = "1"
         device = str(cfg.scorer.params.get("device", "cuda"))
         _validate_visible_device(
             env,
@@ -185,6 +189,8 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 "--params-json",
                 json.dumps(cfg.scorer.params, separators=(",", ":")),
             ]
+            if cfg.lifecycle == "per_call":
+                command.append("--boot-offloaded")
             logger.info(
                 "starting managed reward child scorer=%s port=%d cuda_visible=%s python=%s log=%s",
                 cfg.scorer.name,
@@ -206,6 +212,10 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         base_url = f"http://127.0.0.1:{port}"
         session = requests.Session()
         session.trust_env = False
+        # A per_call child boots offloaded (--boot-offloaded): the scorer must be
+        # off the GPU by the time it first reports ready, so that is the ready
+        # state to wait for. Resident children report "resident" as before.
+        expected_state = "offloaded" if cfg.lifecycle == "per_call" else "resident"
         deadline = time.monotonic() + float(cfg.process.startup_timeout)
         try:
             while time.monotonic() < deadline:
@@ -219,8 +229,22 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                         body = response.json()
                         scorer = body.get("scorer") or {}
                         if (
-                            cfg.scorer.name in dict(body.get("rewards") or {})
+                            expected_state == "offloaded"
                             and body.get("state") == "resident"
+                            and cfg.scorer.name in dict(body.get("rewards") or {})
+                        ):
+                            # An up-to-date child never reports resident before a
+                            # per_call parent has seen it offloaded — this is an
+                            # old server that ignored --boot-offloaded. Fail now
+                            # instead of burning the whole startup_timeout.
+                            raise RuntimeError(
+                                "reward child came up resident despite --boot-offloaded; "
+                                f"unirl-reward-service at {cfg.process.service_root!r} predates "
+                                f"the per_call boot protocol; log={log_path}"
+                            )
+                        if (
+                            cfg.scorer.name in dict(body.get("rewards") or {})
+                            and body.get("state") == expected_state
                             and scorer.get("input_kind") == "image"
                         ):
                             if cfg.lifecycle == "per_call" and not scorer.get("supports_offload"):

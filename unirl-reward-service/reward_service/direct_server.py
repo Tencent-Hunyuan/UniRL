@@ -12,6 +12,8 @@ import math
 import os
 import signal
 import socket
+import threading
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -95,6 +97,7 @@ def create_direct_app(
     *,
     input_kind: str = "image",
     cache_size: int = 1024,
+    boot_offloaded: bool = False,
 ) -> FastAPI:
     if input_kind not in {"image", "image_edit"}:
         raise ValueError(f"direct managed scorer supports image/image_edit only, got {input_kind!r}")
@@ -120,8 +123,29 @@ def create_direct_app(
         app.state.scorer = scorer
         app.state.score_lock = asyncio.Lock()
         app.state.result_cache = OrderedDict()
-        app.state.lifecycle_state = "resident"
-        logger.info("direct scorer ready name=%s version=%s", scorer_name, scorer.version)
+        if boot_offloaded:
+            # per_call boot protocol: leave the GPU BEFORE the parent can see us
+            # ready. Waiting for the parent's first /lifecycle/offload would keep
+            # the scorer resident next to whatever the trainer already holds for
+            # the whole readiness poll — exactly the window that OOMs a colocated
+            # boot. Scorers that honor UNIRL_SCORER_BOOT_OFFLOADED construct on
+            # CPU and make this offload a no-op; engine-backed scorers at least
+            # shrink the window to construction itself.
+            if not scorer.supports_offload:
+                raise ValueError(
+                    f"--boot-offloaded requires scorer {scorer_name!r} to support offload "
+                    "(needed for lifecycle='per_call')"
+                )
+            await asyncio.to_thread(scorer.offload)
+            app.state.lifecycle_state = "offloaded"
+        else:
+            app.state.lifecycle_state = "resident"
+        logger.info(
+            "direct scorer ready name=%s version=%s state=%s",
+            scorer_name,
+            scorer.version,
+            app.state.lifecycle_state,
+        )
         try:
             yield
         finally:
@@ -280,12 +304,62 @@ def create_direct_app(
     return app
 
 
+def _spawn_group_reaper() -> None:
+    """Sweep the process group if this frontend dies without running cleanup.
+
+    PDEATHSIG covers parent->frontend only: when the frontend itself is
+    SIGKILLed (ray worker teardown at driver exit, an external kill), engine
+    subprocesses spawned by the scorer — e.g. a vLLM EngineCore — survive
+    re-parented to init and keep their GPU memory. Observed repeatedly with
+    both sleeping and resident engines whose own frontend-liveness watchdog
+    never fired. The parent's _stop_child() killpg covers the graceful path;
+    this sibling covers every path where nobody calls it: it shares this
+    process group, watches this PID, and sweeps the group (TERM, 5s grace,
+    KILL) the moment the frontend is gone. On a normal exit the group by then
+    holds only the reaper itself, so the sweep is a self-kill.
+    """
+    import subprocess
+    import sys
+
+    source = (
+        "import os,signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "watched = int(os.environ['_UNIRL_REAPER_WATCH_PID'])\n"
+        "while os.getppid() == watched:\n"
+        "    time.sleep(2.0)\n"
+        "group = os.getpgrp()\n"
+        "try:\n"
+        "    os.killpg(group, signal.SIGTERM)\n"
+        "except ProcessLookupError:\n"
+        "    pass\n"
+        "time.sleep(5.0)\n"
+        "try:\n"
+        "    os.killpg(group, signal.SIGKILL)\n"
+        "except ProcessLookupError:\n"
+        "    pass\n"
+    )
+    env = dict(os.environ, _UNIRL_REAPER_WATCH_PID=str(os.getpid()))
+    subprocess.Popen(
+        [sys.executable, "-c", source],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scorer", required=True)
     parser.add_argument("--params-json", required=True)
     parser.add_argument("--input-kind", default="image")
     parser.add_argument("--cache-size", type=int, default=1024)
+    parser.add_argument(
+        "--boot-offloaded",
+        action="store_true",
+        help="offload the scorer before first reporting ready (per_call boot protocol)",
+    )
     parser.add_argument("--fd", type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
@@ -293,10 +367,17 @@ def main() -> None:
     args = parser.parse_args()
 
     _arm_parent_death_signal()
+    _spawn_group_reaper()
     params = json.loads(args.params_json)
     if not isinstance(params, dict):
         raise TypeError("--params-json must decode to an object")
-    app = create_direct_app(args.scorer, params, input_kind=args.input_kind, cache_size=args.cache_size)
+    app = create_direct_app(
+        args.scorer,
+        params,
+        input_kind=args.input_kind,
+        cache_size=args.cache_size,
+        boot_offloaded=args.boot_offloaded,
+    )
 
     import uvicorn
 

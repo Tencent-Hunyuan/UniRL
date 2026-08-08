@@ -49,7 +49,15 @@ class EditRewardScorer(BaseScorer):
 
         self._target_device = device if torch.cuda.is_available() else "cpu"
         self._offload_between_calls = bool(offload_between_calls and self._target_device != "cpu")
-        initial_device = "cpu" if self._offload_between_calls else self._target_device
+        # UNIRL_SCORER_BOOT_OFFLOADED is the managed parent's per_call boot hint:
+        # construct on CPU so the child never touches the GPU before it reports
+        # ready (the server's boot offload then finds nothing to move). Unlike
+        # offload_between_calls this does not change per-score behavior — the
+        # parent drives onload/offload through the lifecycle endpoints.
+        boot_offloaded = os.environ.get("UNIRL_SCORER_BOOT_OFFLOADED") == "1"
+        initial_device = (
+            "cpu" if (self._offload_between_calls or boot_offloaded) else self._target_device
+        )
         self._rm_head_type = rm_head_type
 
         # If checkpoint_path looks like a HF repo ID (not a local dir),
