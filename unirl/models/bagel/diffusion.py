@@ -223,6 +223,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         conditions: BagelDiffusionConditions,
         *,
         differentiable: bool = False,
+        force_rebuild: bool = False,
     ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch."""
         if differentiable and conditions.input_images:
@@ -233,7 +234,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 differentiable=True,
             )
             return gen, cfg_text, cfg_img, image_shape
-        if conditions.has_contexts():
+        if conditions.has_contexts() and not force_rebuild:
             return conditions.single()
         prompt, input_image, image_shape = conditions.single_prompt()
         gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
@@ -471,11 +472,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         *,
         params: BagelDiffusionParams,
         device: torch.device,
+        force_rebuild: bool = False,
     ) -> Dict[str, Any]:
         """Rebuild the KV contexts → the step-invariant ``_forward_flow`` kwargs."""
         gen, cfg_text, cfg_img, image_shape = self._resolve_single(
             conditions,
             differentiable=torch.is_grad_enabled(),
+            force_rebuild=force_rebuild,
         )
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         return self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
