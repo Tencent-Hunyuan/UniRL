@@ -58,14 +58,14 @@ bundle:
     lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     use_gradient_checkpointing: true
     max_prompt_length: 16384
-    video_fps: 1.0
+    video_fps: 2.0
     video_max_frames: 64
     video_max_pixels: 262144
 
 pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 16384
-  video_fps: 1.0
+  video_fps: 2.0
   video_max_frames: 64
   video_max_pixels: 262144
 
@@ -186,7 +186,7 @@ data_source:
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
   samples_per_prompt: 8
-  temperature: 1.0
+  temperature: 0.0
   top_p: 1.0
   top_k: 0
-  max_new_tokens: 2048
+  max_new_tokens: 8192
