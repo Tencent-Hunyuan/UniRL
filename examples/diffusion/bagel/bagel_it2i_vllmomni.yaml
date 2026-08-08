@@ -204,7 +204,14 @@ reward:
         batch_size: 8
         request_batch_size: 8
         timeout: 600.0
-        sub_metric_reduce: mean
+        # `first` == the scorer's first sub-metric == reward column 0. The pinned
+        # config above pools its two semantic heads INSIDE the model
+        # (pooling_strategy: mean) and emits output_dim=2 as [reward, log-sigma] —
+        # see the "sum" branch of the vendored model, which reads column 1 as
+        # exp()-able sigma. Those columns are not instruction-following and visual
+        # quality, so `mean` would spend half the training signal driving the reward
+        # model's own uncertainty. Column 1 stays visible as a logged sub-metric.
+        sub_metric_reduce: first
         aggregation_method: weighted_sum
         input_kind: image
       lifecycle: resident
