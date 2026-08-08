@@ -44,6 +44,38 @@ def _arm_parent_death_signal() -> None:
         raise OSError(errno, os.strerror(errno))
     if os.getppid() != parent_pid:
         raise SystemExit("reward parent exited before child initialization")
+    _start_orphan_reaper(parent_pid)
+
+
+def _start_orphan_reaper(parent_pid: int, grace_seconds: float = 20.0) -> None:
+    """Guarantee no scorer subprocess outlives an orphaned server.
+
+    PDEATHSIG only covers this process: an engine-backed scorer (e.g. a vLLM
+    judge) spawns its own workers, and when this server dies by signal those
+    grandchildren reparent to init still holding GPU memory — engine-side
+    parent monitors have been observed not to fire, an idle/slept engine in
+    particular. This daemon thread watches for reparenting and, after a grace
+    period for the SIGTERM-driven graceful shutdown to finish, SIGKILLs the
+    server's own process group (the parent starts us with start_new_session,
+    so the group is exactly this server plus everything it spawned).
+    """
+
+    def _watch() -> None:
+        while True:
+            if os.getppid() != parent_pid:
+                time.sleep(grace_seconds)
+                # Only nuke the group when we lead it (start_new_session in the
+                # managed parent). Under a debug shell the group is the user's
+                # session — exit alone instead of killing their terminal.
+                if os.getpgid(0) == os.getpid():
+                    try:
+                        os.killpg(os.getpgid(0), signal.SIGKILL)
+                    except OSError:
+                        pass
+                os._exit(1)
+            time.sleep(1.0)
+
+    threading.Thread(target=_watch, name="orphan-reaper", daemon=True).start()
 
 
 def _normalize_score(
