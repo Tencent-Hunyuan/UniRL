@@ -177,4 +177,4 @@ sampling:
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  max_new_tokens: 2048
+  max_new_tokens: 8192
