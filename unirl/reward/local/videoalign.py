@@ -473,7 +473,8 @@ class _VideoAlignInference:
         qwen_model = _AutoVLM.from_config(qwen_config)
 
         has_special = model_cfg.get("use_special_tokens", False)
-        in_dim = qwen_config.hidden_size
+        # transformers>=5 nests the LM dims under `text_config`; 4.x had them flat.
+        in_dim = getattr(qwen_config, "hidden_size", None) or qwen_config.text_config.hidden_size
         if special_token_ids is not None:
             qwen_model.resize_token_embeddings(len(self.processor.tokenizer))
 
