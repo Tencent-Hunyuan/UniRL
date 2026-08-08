@@ -155,6 +155,12 @@ def create_direct_app(
             if unknown:
                 raise HTTPException(status_code=400, detail=f"unknown rewards for this worker: {unknown}")
 
+        # Fingerprinting (and the decode below) is CPU work proportional to the b64
+        # media in the chunk. Run on the event loop it stalls /health and the
+        # lifecycle endpoints for the whole walk, so the parent sees a live child
+        # as unavailable mid-scoring.
+        fingerprints = await asyncio.to_thread(lambda: [_request_fingerprint(request) for request in body.requests])
+
         async with app.state.score_lock:
             if app.state.lifecycle_state != "resident":
                 raise HTTPException(
@@ -166,14 +172,17 @@ def create_direct_app(
             identities: list[RewardIdentity] = [
                 request.identity(actual_scorer_version=app.state.scorer.version) for request in body.requests
             ]
-            uncached_items = []
+            # One in-flight chunk must never evict its own rows, or a retry after a
+            # lost response recomputes exactly what the cache exists to deduplicate.
+            cache_limit = max(cache_size, len(body.requests))
+            uncached_requests = []
             uncached_indices: list[int] = []
             pending_fingerprints: dict[str, str] = {}
             pending_key_indices: dict[str, int] = {}
             duplicate_indices: dict[int, int] = {}
             for index, request in enumerate(body.requests):
                 key = request.idempotency_key
-                fingerprint = _request_fingerprint(request)
+                fingerprint = fingerprints[index]
                 if key:
                     prior = pending_fingerprints.setdefault(key, fingerprint)
                     if prior != fingerprint:
@@ -198,10 +207,13 @@ def create_direct_app(
                     continue
                 if key:
                     pending_key_indices[key] = index
-                uncached_items.append(request_to_item(request, allow_video=False))
+                uncached_requests.append(request)
                 uncached_indices.append(index)
 
-            if uncached_items:
+            if uncached_requests:
+                uncached_items = await asyncio.to_thread(
+                    lambda: [request_to_item(request, allow_video=False) for request in uncached_requests]
+                )
                 try:
                     scores = await asyncio.to_thread(app.state.scorer.score, uncached_items)
                 except Exception as exc:
@@ -226,8 +238,8 @@ def create_direct_app(
                             _cache_put(
                                 app.state.result_cache,
                                 key,
-                                (_request_fingerprint(body.requests[index]), normalized, error),
-                                cache_size,
+                                (fingerprints[index], normalized, error),
+                                cache_limit,
                             )
             for index, source_index in duplicate_indices.items():
                 results[index] = dict(results[source_index])
