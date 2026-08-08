@@ -112,6 +112,18 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
         pool: WorkerPool = app.state.pool
         if body.protocol_version != "1":
             raise HTTPException(status_code=400, detail=f"unsupported protocol_version={body.protocol_version!r}")
+        if any(request.scorer_version is not None for request in body.requests):
+            # One gateway request may name several rewards and the pool reports no
+            # per-scorer version, so this identity field can never be filled in
+            # truthfully here. Say so instead of echoing None and making the client
+            # reject every response as a version mismatch.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "scorer_version pinning is not supported by the multi-reward gateway; "
+                    "drop expected_scorer_version or point the client at a managed single-scorer child"
+                ),
+            )
         if not body.requests:
             return ScoreResponse(results=[], errors=[])
 

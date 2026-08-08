@@ -611,6 +611,7 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
     # None preserves the legacy one-POST-per-DP-shard behavior.
     request_batch_size: Optional[int] = None
     require_identity_echo: bool = False
+    # Managed/direct single-scorer servers only; the multi-reward gateway rejects a pin.
     expected_scorer_version: Optional[str] = None
     sub_metric_reduce: str = "first"
     aggregation_method: str = "weighted_sum"
