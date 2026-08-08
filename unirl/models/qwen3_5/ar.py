@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -564,20 +563,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             "temperature": temperature,
             "autocast_dtype": (self.autocast_dtype if device.type == "cuda" else None),
         }
-        if (
-            os.environ.get("HUNYUAN_KERNEL_BITWISE_LEVEL", "").strip().lower()
-            == "hybrid_chunk_recurrent"
-        ):
-            # The physical prompt/response boundary is the shared dense prompt
-            # width. Each GDN layer derives the real prompt start from
-            # ``attention_mask`` so left-padded rows still start their chunk
-            # schedule at the first real token.
-            forward_kwargs["gdn_prompt_lengths"] = torch.full(
-                (batch_size,),
-                max_real_len,
-                device=device,
-                dtype=torch.int32,
-            )
         forward_kwargs.update(_dense_flash_attention_kwargs(full_ids))
         if pv is not None:
             forward_kwargs["pixel_values"] = pv
