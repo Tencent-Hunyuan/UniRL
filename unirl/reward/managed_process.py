@@ -258,9 +258,14 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         with self._lifecycle_lock:
             self.onload()
             try:
-                return super().compute_rewards(request)
-            finally:
-                self.offload()
+                response = super().compute_rewards(request)
+            except BaseException:
+                # A child that crashed mid-score fails this offload too; that
+                # lifecycle error must not replace the real scoring failure.
+                self._lifecycle("offload", tolerate_failure=True)
+                raise
+            self.offload()
+            return response
 
     def is_available(self) -> bool:
         if self._process is None or self._process.poll() is not None:
