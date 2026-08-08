@@ -363,10 +363,30 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
     """
     from safetensors.torch import load_file
 
+    # The published weights (KlingTeam/VideoReward) are a single
+    # `checkpoint-*/model.pth` — a .pth in a SUBDIRECTORY. A non-recursive
+    # `*.safetensors` glob matches nothing there, and because the load below is
+    # `strict=False`, an empty state dict was a SILENT no-op: the reward heads
+    # stayed randomly initialised and every score came back 0.0. Search
+    # recursively, accept torch checkpoints, and fail loudly on nothing found.
     state_dicts = []
-    for pattern in ("*.safetensors", "adapter_*.safetensors"):
-        for fpath in sorted(glob.glob(os.path.join(checkpoint_dir, pattern))):
-            state_dicts.append(load_file(fpath))
+    for fpath in sorted(glob.glob(os.path.join(checkpoint_dir, "**", "*.safetensors"), recursive=True)):
+        state_dicts.append(load_file(fpath))
+    if not state_dicts:
+        for pattern in ("**/*.pth", "**/*.bin"):
+            for fpath in sorted(glob.glob(os.path.join(checkpoint_dir, pattern), recursive=True)):
+                obj = torch.load(fpath, map_location="cpu", weights_only=True)
+                # Some releases wrap the tensors; unwrap the common containers.
+                for key in ("state_dict", "model", "module"):
+                    if isinstance(obj, dict) and key in obj and isinstance(obj[key], dict):
+                        obj = obj[key]
+                        break
+                state_dicts.append(obj)
+    if not state_dicts:
+        raise FileNotFoundError(
+            f"VideoAlign: no weights under {checkpoint_dir} (looked for *.safetensors, *.pth, *.bin "
+            f"recursively). Loading nothing leaves the reward heads random and every score 0.0."
+        )
 
     full_state = {}
     for sd in state_dicts:
@@ -396,6 +416,16 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
     skipped = len(filtered_state) - matched
     if skipped:
         print(f"[VideoAlign] Checkpoint key remap: {matched} matched, {skipped} skipped", flush=True)
+    # The reward heads are the whole point; if they did not come from the
+    # checkpoint the scorer silently returns garbage under strict=False.
+    head_keys = [k for k in model_state if k.startswith(("VQ_head", "MQ_head", "TA_head"))]
+    heads_loaded = sum(1 for k in head_keys if k in filtered_state)
+    if matched == 0 or heads_loaded == 0:
+        raise RuntimeError(
+            f"VideoAlign: checkpoint matched {matched} model keys and {heads_loaded}/{len(head_keys)} "
+            f"reward-head keys — the heads would stay randomly initialised. Checkpoint layout "
+            f"under {checkpoint_dir} does not match the expected VideoAlign state dict."
+        )
 
     inference_obj.model.load_state_dict(filtered_state, strict=False)
     inference_obj.model.to(device=device, dtype=dtype)
