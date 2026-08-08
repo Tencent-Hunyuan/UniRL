@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from collections import deque
+from typing import TYPE_CHECKING, Callable, Deque, Dict, List, Optional, Tuple
 
 from unirl.rollout.manager import RolloutManager, keep_within_lag
 from unirl.trainer.base import unwrap_replicated_int
@@ -14,6 +15,39 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+
+class _PromptUnitSource:
+    """Split normal data batches into independently dispatched prompt trees."""
+
+    def __init__(
+        self,
+        data_source: object,
+        build_request: Callable[["Sample", int], "Sample"],
+        *,
+        batch_size: int,
+        start_batch_id: int,
+    ) -> None:
+        self._data_source = data_source
+        self._build_request = build_request
+        self._batch_size = int(batch_size)
+        self._next_batch_id = int(start_batch_id)
+        self._units: Deque["Sample"] = deque()
+
+    def take(self, count: int) -> List["Sample"]:
+        while len(self._units) < count:
+            request = self._build_request(
+                self._data_source.get_samples(self._batch_size),
+                self._next_batch_id,
+            )
+            self._next_batch_id += 1
+            units = request.split()
+            if len(units) != self._batch_size:
+                raise RuntimeError(
+                    f"request batch split into {len(units)} prompt units; expected {self._batch_size}"
+                )
+            self._units.extend(units)
+        return [self._units.popleft() for _ in range(count)]
 
 
 def next_hard_boundary(
@@ -52,6 +86,24 @@ def boundary_launch_slots(
             allowed - inflight_count - ready_count - leased_count,
         ),
     )
+
+
+def boundary_launch_units(
+    *,
+    outstanding_units: int,
+    max_inflight_units: int,
+    batch_size: int,
+    trained_batches: int,
+    num_rollouts: int,
+    hard_boundary: int,
+    batches_since_sync: int,
+    weight_sync_interval: int,
+) -> int:
+    """Prompt units admissible without crossing a sync or hard boundary."""
+    freshness_batches = max(0, weight_sync_interval - batches_since_sync)
+    remaining_batches = max(0, min(num_rollouts, hard_boundary) - trained_batches)
+    allowed_units = min(freshness_batches, remaining_batches) * batch_size
+    return max(0, min(max_inflight_units - outstanding_units, allowed_units - outstanding_units))
 
 
 def rollout_version_metrics(
@@ -105,6 +157,36 @@ def combine_rollout_chunks(groups: List[List["Sample"]]) -> Tuple["Sample", int,
     from unirl.types.sample import Sample
 
     return Sample.concat(chunks), rollout_ids[0], output_version
+
+
+def combine_rollout_units(
+    groups: List[List["Sample"]],
+    *,
+    require_single_rollout_id: bool = False,
+) -> Tuple["Sample", int]:
+    """Combine dynamically completed prompt trees sharing one published version."""
+    chunks = [sample for group in groups for sample in group]
+    if not chunks:
+        raise ValueError("cannot combine an empty rollout result")
+    if require_single_rollout_id:
+        rollout_ids = {_rollout_id(sample) for sample in chunks}
+        if len(rollout_ids) != 1:
+            raise RuntimeError(
+                "rollout batch combines multiple generation ids with incompatible shared schedules: "
+                f"{sorted(rollout_ids)}"
+            )
+    versions = {part.output_version for sample in chunks for part in sample.gen_parts()}
+    if not versions or None in versions:
+        raise RuntimeError("rollout batch is missing output_version provenance")
+    if len(versions) != 1:
+        raise RuntimeError(f"rollout batch has mixed output versions: {sorted(versions)}")
+    output_version = int(next(iter(versions)))
+    if len(chunks) == 1:
+        return chunks[0], output_version
+
+    from unirl.types.sample import Sample
+
+    return Sample.concat(chunks), output_version
 
 
 def _rollout_id(sample: "Sample") -> int:
@@ -163,6 +245,8 @@ class AsyncRolloutTrainerMixin:
             num_rollouts=num_rollouts,
             extra={
                 "max_inflight": self._max_inflight,
+                "max_inflight_units": self._max_inflight_units,
+                "per_lane_window": self._per_lane_window,
                 "weight_sync_interval": self._weight_sync_interval,
                 "max_staleness": self._weight_sync_interval - 1,
                 "staleness_budget": staleness_budget,
@@ -171,14 +255,23 @@ class AsyncRolloutTrainerMixin:
             },
         )
 
+        self._unit_source = _PromptUnitSource(
+            self.data_source,
+            self._build_request_sample,
+            batch_size=self.batch_size,
+            start_batch_id=start_rollout,
+        )
+        engine_slots = self.rollout.engine_slots
         self._rollout_manager = RolloutManager(
             self.rollout,
-            launchers=[lambda sample: self.rollout.launch_nowait("generate", sample)],
-            capacities=[self._max_inflight],
+            launchers=[
+                lambda sample, slot=slot: slot.launch("generate_one", sample)
+                for slot in engine_slots
+            ],
+            capacities=[self._per_lane_window] * len(engine_slots),
             group_size=total_samples_per_prompt(self.sampling_params),
             filter_fn=keep_within_lag(staleness_budget),
         )
-        self._next_generation_id = start_rollout
 
         if resumed or self.eval_interval > 0:
             self._sync_rollout(force=True, require_empty=True)
@@ -267,52 +360,50 @@ class AsyncRolloutTrainerMixin:
         manager = self._rollout_manager
         inflight_count, ready_count = manager.counts
         if inflight_count + ready_count == 0:
-            slots = boundary_launch_slots(
-                inflight_count=0,
-                ready_count=0,
-                max_inflight=self._max_inflight,
+            units = boundary_launch_units(
+                outstanding_units=0,
+                max_inflight_units=self._max_inflight_units,
+                batch_size=self.batch_size,
                 trained_batches=rollout_id,
                 num_rollouts=num_rollouts,
                 hard_boundary=hard_boundary,
                 batches_since_sync=self._batches_since_sync,
                 weight_sync_interval=self._weight_sync_interval,
             )
-            self._submit_generations(slots)
+            self._submit_prompt_units(units)
 
         groups = manager.collect(self.batch_size, current_version=self._train_version)
-        completed, gen_id, output_version = combine_rollout_chunks(groups)
-        scored = None
-        if not self._refill_before_score():
-            scored = self._score_completed(gen_id, completed)
+        completed, output_version = combine_rollout_units(
+            groups,
+            require_single_rollout_id=getattr(self, "_require_single_generation", False),
+        )
+        scored = self._score_completed(rollout_id, completed)
 
         inflight_count, ready_count = manager.counts
-        slots = boundary_launch_slots(
-            inflight_count=inflight_count,
-            ready_count=ready_count,
-            max_inflight=self._max_inflight,
-            trained_batches=rollout_id,
+        units = boundary_launch_units(
+            outstanding_units=inflight_count + ready_count,
+            max_inflight_units=self._max_inflight_units,
+            batch_size=self.batch_size,
+            trained_batches=rollout_id + 1,
             num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
-            batches_since_sync=self._batches_since_sync,
+            batches_since_sync=self._batches_since_sync + 1,
             weight_sync_interval=self._weight_sync_interval,
-            leased_count=1,
         )
-        self._submit_generations(slots)
-        if scored is None:
-            scored = self._score_completed(gen_id, completed)
+        self._submit_prompt_units(units)
         return scored, output_version
 
-    def _submit_generations(self, count: int) -> None:
-        for _ in range(count):
-            gen_id = self._next_generation_id
-            self._rollout_manager.submit([self._build_async_sample(gen_id)])
-            self._next_generation_id += 1
+    def _submit_prompt_units(self, count: int) -> None:
+        if count:
+            self._rollout_manager.submit(self._unit_source.take(count))
 
 
 __all__ = [
     "AsyncRolloutTrainerMixin",
+    "boundary_launch_units",
     "boundary_launch_slots",
     "combine_rollout_chunks",
+    "combine_rollout_units",
     "next_hard_boundary",
     "rollout_version_metrics",
     "training_version_metrics",

@@ -218,4 +218,19 @@ class RolloutPool:
             self._condition.notify_all()
 
 
-__all__ = ["RolloutPool"]
+def resolve_lane_window(
+    requested: int,
+    *,
+    worker_max_concurrency: int,
+    engine_concurrency: Optional[int],
+) -> int:
+    """Clamp a requested per-engine window to actor and engine capacity."""
+    window = max(1, int(requested))
+    worker_limit = 1 if int(worker_max_concurrency) <= 1 else max(1, int(worker_max_concurrency) - 2)
+    window = min(window, worker_limit)
+    if engine_concurrency is not None:
+        window = min(window, max(1, int(engine_concurrency)))
+    return window
+
+
+__all__ = ["RolloutPool", "resolve_lane_window"]

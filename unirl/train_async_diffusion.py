@@ -45,6 +45,7 @@ def main(cfg: DictConfig) -> None:
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),
+        per_lane_window=int(cfg.get("per_lane_window", 1)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
     )
     trainer.train(

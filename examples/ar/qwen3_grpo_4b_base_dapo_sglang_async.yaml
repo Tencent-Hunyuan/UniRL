@@ -12,11 +12,9 @@
 #   python -m unirl.train_async_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang_async \
 #     num_devices=4 batch_size=8 sampling.samples_per_prompt=4
 #
-# DIVISIBILITY (DP_SCATTER): with train_fraction=0.5 the slabs are
-# num_devices/2 each. Both `batch_size * samples_per_prompt % train_slab == 0`
-# AND `% rollout_slab == 0` must hold, and `train_fraction * num_devices` must
-# be an integer. At num_devices=32 / batch_size=64 / spp=8 → 16/16 slabs,
-# 512 % 16 == 0 (OK). Changing train_fraction or the batch can break this.
+# DIVISIBILITY: `batch_size * samples_per_prompt` must divide evenly over
+# the train slab, and `train_fraction * num_devices` must be an integer.
+# Prompt-unit rollout dispatch has no rollout-DP divisibility requirement.
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -26,7 +24,8 @@ num_rollouts: 800
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
-max_inflight: 1          # concurrent generation calls
+max_inflight: 1          # globally admitted batch-equivalents
+per_lane_window: 1       # concurrent prompt units per rollout-engine lane
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).

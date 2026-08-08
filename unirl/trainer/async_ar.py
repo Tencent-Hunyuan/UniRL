@@ -10,6 +10,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.rollout.manager import resolve_lane_window
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
@@ -17,21 +18,6 @@ from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
-
-
-def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
-    """Compute the rollout Handle's DP width before constructing GPU roles."""
-    from unirl.distributed.group.handle import _parallel_shape_from_init_kwargs
-
-    role_cls = rollout_parsed["role_cls"]
-    init_kwargs = {key: value for key, value in rollout_parsed.items() if key != "role_cls"}
-    sp_size, tp_size, pp_size, _ = _parallel_shape_from_init_kwargs(
-        init_kwargs,
-        world_size,
-        role_cls,
-    )
-    non_dp_width = sp_size if sp_size > 1 else tp_size * pp_size
-    return world_size // non_dp_width
 
 
 class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
@@ -64,6 +50,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         eval_temperature: float = 1.0,
         train_fraction: float = 0.5,
         max_inflight: int = 1,
+        per_lane_window: int = 1,
         weight_sync_interval: int = 1,
     ) -> None:
         self._allowed_input_primitives = ar_preflight(
@@ -102,6 +89,13 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
+        engine_cfg = rollout_cfg.get("config", {})
+        self._per_lane_window = resolve_lane_window(
+            per_lane_window,
+            worker_max_concurrency=self.pool.worker_max_concurrency,
+            engine_concurrency=engine_cfg.get("concurrency"),
+        )
+        self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
@@ -125,17 +119,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
                 f"slab size {self._train_devices}; adjust batch_size / samples_per_prompt / train_fraction."
             )
-        rollout_dp_size = _rollout_dp_size_from_parsed_config(
-            rollout_parsed,
-            world_size=self._rollout_devices,
-        )
-        if prompts % rollout_dp_size != 0:
-            raise ValueError(
-                f"batch_size = {prompts} prompts is not divisible by the rollout DP size "
-                f"{rollout_dp_size} ({self._rollout_devices} rollout GPUs; each prompt-tree "
-                "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
-            )
-
         with placement(self.pool, fraction=self._train_fraction, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)

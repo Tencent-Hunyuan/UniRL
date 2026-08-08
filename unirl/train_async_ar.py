@@ -36,6 +36,7 @@ def main(cfg: DictConfig) -> None:
         eval_temperature=float(cfg.get("eval_temperature", 1.0)),
         train_fraction=float(cfg.get("train_fraction", 0.5)),
         max_inflight=int(cfg.get("max_inflight", 1)),
+        per_lane_window=int(cfg.get("per_lane_window", 1)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
     )
     trainer.train(

@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
+from unirl.rollout.manager import resolve_lane_window
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
 from unirl.trainer.diffusion import DiffusionTrainer
@@ -21,17 +22,18 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         self,
         *,
         max_inflight: int = 1,
+        per_lane_window: int = 1,
         weight_sync_interval: int = 1,
         **diffusion_kwargs: Any,
     ) -> None:
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
-        max_inflight = int(max_inflight)
+        max_inflight = max(1, int(max_inflight))
         if max_inflight != 1:
             raise ValueError(
-                "AsyncDiffusionTrainer requires max_inflight=1: multiple queued generations "
-                "block the reap-time cross-slab transfer on the rollout workers; "
+                "AsyncDiffusionTrainer requires max_inflight=1 so dynamically completed "
+                "prompt units retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
         if bool(diffusion_kwargs.get("offload_train_during_reward", False)):
@@ -49,6 +51,14 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             )
 
         self._max_inflight = max_inflight
+        self._require_single_generation = True
+        engine_cfg = diffusion_kwargs["rollout_cfg"].get("config", {})
+        self._per_lane_window = resolve_lane_window(
+            per_lane_window,
+            worker_max_concurrency=self.pool.worker_max_concurrency,
+            engine_concurrency=engine_cfg.get("concurrency"),
+        )
+        self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
