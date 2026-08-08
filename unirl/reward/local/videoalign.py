@@ -427,7 +427,15 @@ class _VideoAlignInference:
 
     def _load(self, checkpoint_dir: str) -> None:
         """Load model, config, processor, and checkpoint weights."""
-        from transformers import AutoConfig, AutoModelForTextToVideo, AutoProcessor
+        from transformers import AutoConfig, AutoProcessor
+
+        # transformers>=5 dropped AutoModelForTextToVideo; the Qwen2-VL backbone
+        # this wraps now resolves through AutoModelForImageTextToText (both give
+        # Qwen2VLForConditionalGeneration). Import-time fallback keeps 4.x working.
+        try:
+            from transformers import AutoModelForImageTextToText as _AutoVLM
+        except ImportError:  # transformers < 5
+            from transformers import AutoModelForTextToVideo as _AutoVLM
 
         config_path = os.path.join(checkpoint_dir, "model_config.json")
         with open(config_path) as f:
@@ -462,7 +470,7 @@ class _VideoAlignInference:
                 print(f"[VideoAlign] Added {num_added} special reward tokens; ids={special_token_ids}", flush=True)
 
         qwen_config = AutoConfig.from_pretrained(qwen_path)
-        qwen_model = AutoModelForTextToVideo.from_config(qwen_config)
+        qwen_model = _AutoVLM.from_config(qwen_config)
 
         has_special = model_cfg.get("use_special_tokens", False)
         in_dim = qwen_config.hidden_size
