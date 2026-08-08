@@ -59,7 +59,7 @@ class BagelDiffusionConditions(Condition):
     cfg_text_contexts: List[Any] = concat_field(default_factory=list)
     cfg_img_contexts: List[Any] = concat_field(default_factory=list)
     prompts: List[Any] = concat_field(default_factory=list)
-    input_images: List[Any] = concat_field(default_factory=list)  # Raw source PILs for deferred it2i replay.
+    input_images: List[Any] = concat_field(default_factory=list)  # Raw it2i PILs retained for context rebuilds.
     image_shapes: List[Tuple[int, int]] = concat_field(default_factory=list)
 
     @property
