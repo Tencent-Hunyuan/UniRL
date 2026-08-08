@@ -458,6 +458,10 @@ class Handle:
     @property
     def engine_slots(self) -> List[Slot]:
         """Slots that host addressable rollout-engine heads, one per DP replica."""
+        if self.sp_size > 1:
+            raise RuntimeError(
+                f"slot-local rollout dispatch does not support sequence-parallel engines; got sp_size={self.sp_size}"
+            )
         slots = [
             self.slot(index)
             for index, info in enumerate(self.rank_infos)

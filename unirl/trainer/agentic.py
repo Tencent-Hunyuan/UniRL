@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager
+from unirl.rollout.manager import RolloutManager, resolve_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -125,19 +125,13 @@ class AgenticTrainer(BaseTrainer):
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
-        if int(per_worker_inflight) <= 0:
-            raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
         # Mirrors the DevicePool default in BaseTrainer; checked here so a bad combination
         # fails before any expensive runtime construction.
-        worker_max_concurrency = int(cfg.get("worker_max_concurrency", 1))
-        required_concurrency = int(per_worker_inflight) + 2
-        if worker_max_concurrency < required_concurrency:
-            raise ValueError(
-                f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
-                f"({required_concurrency}) so control calls (set_stopping/sleep/weight sync) are not "
-                "starved by trajectory slots; raise worker_max_concurrency in the recipe or lower "
-                "per_worker_inflight"
-            )
+        resolve_worker_inflight(
+            per_worker_inflight,
+            worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
+            engine_concurrency=None,
+        )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
         sync_target = str(sync_cfg.get("_target_", ""))

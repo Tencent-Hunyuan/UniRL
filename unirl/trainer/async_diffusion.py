@@ -29,11 +29,12 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
-        max_inflight = max(1, int(max_inflight))
+        max_inflight = int(max_inflight)
         if max_inflight != 1:
             raise ValueError(
-                "AsyncDiffusionTrainer requires max_inflight=1 so dynamically completed "
-                "prompt units retain one rollout_id and one SDE schedule per training batch; "
+                "AsyncDiffusionTrainer requires max_inflight=1: queued generations can block "
+                "reap-time cross-slab transfer, and dynamically completed prompt units must "
+                "retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
         if bool(diffusion_kwargs.get("offload_train_during_reward", False)):

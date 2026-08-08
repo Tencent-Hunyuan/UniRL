@@ -68,7 +68,7 @@ class BaseRolloutEngine(Remote, ABC):
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
-    def generate_one(self, sample: Sample) -> Sample:
+    def generate_on_slot(self, sample: Sample) -> Sample:
         """Undecorated per-engine entry point for driver-side lane dispatch."""
         return self.generate(sample)
 

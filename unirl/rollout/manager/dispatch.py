@@ -224,13 +224,24 @@ def resolve_worker_inflight(
     worker_max_concurrency: int,
     engine_concurrency: Optional[int],
 ) -> int:
-    """Clamp per-worker rollout concurrency to actor and engine capacity."""
-    window = max(1, int(requested))
-    worker_limit = 1 if int(worker_max_concurrency) <= 1 else max(1, int(worker_max_concurrency) - 2)
-    window = min(window, worker_limit)
-    if engine_concurrency is not None:
-        window = min(window, max(1, int(engine_concurrency)))
-    return window
+    """Validate per-worker rollout concurrency against actor and engine capacity."""
+    requested = int(requested)
+    if requested <= 0:
+        raise ValueError(f"per_worker_inflight must be positive; got {requested}")
+
+    # Reserve two actor threads for control calls such as set_stopping, sleep,
+    # and weight synchronization while rollout calls occupy their own slots.
+    worker_max_concurrency = int(worker_max_concurrency)
+    required_concurrency = requested + 2
+    if worker_max_concurrency < required_concurrency:
+        raise ValueError(
+            f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
+            f"({required_concurrency}) so rollout calls cannot starve control calls"
+        )
+
+    if engine_concurrency is not None and requested > int(engine_concurrency):
+        raise ValueError(f"per_worker_inflight ({requested}) exceeds engine concurrency ({int(engine_concurrency)})")
+    return requested
 
 
 __all__ = ["RolloutPool", "resolve_worker_inflight"]

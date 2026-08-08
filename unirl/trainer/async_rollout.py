@@ -43,9 +43,7 @@ class _PromptUnitSource:
             self._next_batch_id += 1
             units = request.split()
             if len(units) != self._batch_size:
-                raise RuntimeError(
-                    f"request batch split into {len(units)} prompt units; expected {self._batch_size}"
-                )
+                raise RuntimeError(f"request batch split into {len(units)} prompt units; expected {self._batch_size}")
             self._units.extend(units)
         return [self._units.popleft() for _ in range(count)]
 
@@ -119,7 +117,12 @@ def combine_rollout_units(
     *,
     require_single_rollout_id: bool = False,
 ) -> Tuple["Sample", int]:
-    """Combine dynamically completed prompt trees sharing one published version."""
+    """Combine dynamically completed prompt trees sharing one published version.
+
+    Unit admission stops at every publication boundary, so one consumed training
+    batch must never straddle output versions. Keep the explicit check as a
+    guardrail for future admission changes.
+    """
     chunks = [sample for group in groups for sample in group]
     if not chunks:
         raise ValueError("cannot combine an empty rollout result")
@@ -168,9 +171,9 @@ class AsyncRolloutTrainerMixin:
         """Whether this trainer may launch replacement work before scoring."""
         return False
 
-    def _score_completed(self, gen_id: int, completed: "Sample") -> "Sample":
+    def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
         scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=gen_id)
+        self._drop_decoded(scored, rollout_id=rollout_id)
         return scored
 
     def _train_async_loop(
@@ -213,10 +216,7 @@ class AsyncRolloutTrainerMixin:
             start_batch_id=start_rollout,
         )
         engine_slots = self.rollout.engine_slots
-        launchers = [
-            lambda sample, slot=slot: slot.launch("generate_one", sample)
-            for slot in engine_slots
-        ]
+        launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
         self._rollout_manager = RolloutManager(
             self.rollout,
             launchers=launchers,
@@ -293,6 +293,9 @@ class AsyncRolloutTrainerMixin:
             self._batches_since_sync = 0
             return
 
+        # Unit admission exhausts exactly at this boundary. Quiesce still
+        # returns carried work defensively, but completed and relaunched units
+        # must not later be combined across output versions.
         carried = manager.quiesce(current_version=self._train_version)
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
@@ -311,18 +314,17 @@ class AsyncRolloutTrainerMixin:
     ) -> Tuple["Sample", int]:
         manager = self._rollout_manager
         inflight_count, ready_count = manager.counts
-        if inflight_count + ready_count == 0:
-            units = boundary_launch_units(
-                outstanding_units=0,
-                max_inflight_units=self._max_inflight_units,
-                batch_size=self.batch_size,
-                trained_batches=rollout_id,
-                num_rollouts=num_rollouts,
-                hard_boundary=hard_boundary,
-                batches_since_sync=self._batches_since_sync,
-                weight_sync_interval=self._weight_sync_interval,
-            )
-            self._submit_prompt_units(units)
+        units = boundary_launch_units(
+            outstanding_units=inflight_count + ready_count,
+            max_inflight_units=self._max_inflight_units,
+            batch_size=self.batch_size,
+            trained_batches=rollout_id,
+            num_rollouts=num_rollouts,
+            hard_boundary=hard_boundary,
+            batches_since_sync=self._batches_since_sync,
+            weight_sync_interval=self._weight_sync_interval,
+        )
+        self._submit_prompt_units(units)
 
         groups = manager.collect(self.batch_size, current_version=self._train_version)
         completed, output_version = combine_rollout_units(
