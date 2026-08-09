@@ -26,7 +26,7 @@ worker_max_concurrency: 3      # one rollout call + two control-call threads per
 layout: separate
 train_fraction: 0.5            # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool
 
-max_inflight: 1                # one admitted batch-equivalent preserves a single SDE schedule
+max_inflight: 1                # must stay 1: protects cross-slab transfer and one SDE schedule per batch
 per_worker_inflight: 1         # concurrent prompt units per rollout-engine worker
 weight_sync_interval: 12       # trained batches per publication; also sets the output-version lag filter
 
