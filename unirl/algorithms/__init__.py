@@ -10,12 +10,14 @@ from .base import AlgorithmStepResult, StageAlgorithm
 from .cosmos3_sft import Cosmos3JointFlowMatchSFT
 from .cppo import CPPO, CPPOConfig
 from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
+from .diffusionopd import DiffusionOPD, TeacherSpec
 from .dppo import DPPO, DPPOConfig
 from .drpo import DRPO, DRPOConfig
 from .flowdppo import FlowDPPO, FlowDPPOConfig
 from .flowgrpo import FlowGRPO, FlowGRPOConfig
 from .grpo import GRPO, GRPOConfig
 from .gspo import GSPO, GSPOConfig
+from .ppo import PPO, PPOConfig
 from .sft import SFT, FlowMatchSFT
 
 __all__ = [
@@ -25,6 +27,8 @@ __all__ = [
     "GRPOConfig",
     "GSPO",
     "GSPOConfig",
+    "PPO",
+    "PPOConfig",
     "CPPO",
     "CPPOConfig",
     "Cosmos3JointFlowMatchSFT",
@@ -38,6 +42,8 @@ __all__ = [
     "FlowGRPOConfig",
     "DiffusionNFT",
     "DiffusionNFTConfig",
+    "DiffusionOPD",
+    "TeacherSpec",
     "FlowDPPO",
     "FlowDPPOConfig",
     "StageAlgorithm",

@@ -16,7 +16,7 @@
 # the diffuse↔replay ratio==1 bit-exactness. This = the known-good v3 config on the
 # central-kitchen (reuse) Bagel stack.
 #
-# Launch:  bash scripts/migration/run_reuse_smoke.sh   (offline smoke) or a long-run launcher
+# Launch:  bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_trainside_lora
 # Compose: cd UniRL-main && PYTHONPATH=$PWD python -m unirl.train_diffusion \
 #            --config-name diffusion/bagel/bagel_trainside_lora --cfg job --resolve
 

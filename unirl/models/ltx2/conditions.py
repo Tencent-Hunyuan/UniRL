@@ -23,17 +23,13 @@ class LTX2Conditions(Batch):
         image_latent: VAE-encoded first frame for I2V conditioning.
     """
 
-    # Video text conditioning (connector output → video hidden dim)
     text: Optional[TextEmbedCondition] = concat_field(default=None)
 
-    # Audio text conditioning (connector output → audio hidden dim, T2AV only)
     audio_text: Optional[TextEmbedCondition] = concat_field(default=None)
 
-    # Negative prompts for CFG
     negative_text: Optional[TextEmbedCondition] = concat_field(default=None)
     negative_audio_text: Optional[TextEmbedCondition] = concat_field(default=None)
 
-    # I2V conditioning: VAE-encoded first frame latents
     image_latent: Optional[torch.Tensor] = concat_field(default=None)
 
     @classmethod

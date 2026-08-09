@@ -4,6 +4,7 @@ Pipeline stages (each ``X → Y`` between tiers):
 
 - ``EncodeStage[P, C]`` — Primitive → Condition (e.g. VAE encode).
 - ``EmbedStage[P, C]`` — Primitive → Condition (e.g. text encoder).
+- ``ImageConditionedEmbedStage[P, ImageP, C]`` — Primitive + image → Condition.
 - ``DiffusionStage`` — Conditions → LatentSegment.
 - ``ARStage`` — Conditions → TextSegment.
 - ``DecodeStage[S, P]`` — Segment → Primitive (e.g. VAE decode).
@@ -21,10 +22,11 @@ modulo the model they wrap.
 from __future__ import annotations
 
 from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.codec import DecodeStage, EncodeStage
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, ImageConditionedEmbedStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.models.types.replay_result import ReplayResult
 
@@ -32,12 +34,14 @@ __all__ = [
     "ARSamplingParams",
     "ARStage",
     "ARStep",
+    "BatchedStepReplayMixin",
     "Bundle",
     "DecodeStage",
     "DiffusionStage",
     "DiffusionStep",
     "EmbedStage",
     "EncodeStage",
+    "ImageConditionedEmbedStage",
     "Pipeline",
     "ReplayResult",
 ]

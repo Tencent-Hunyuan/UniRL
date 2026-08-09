@@ -1,13 +1,4 @@
-"""Rollout engine base class for the ``RolloutReq``/``RolloutResp`` path.
-
-Subclasses (``VLLMOmniRolloutEngine``, ``SGLangDiffusionRolloutEngine``,
-``TrainsideRolloutEngine``) take all runtime deps as ``__init__`` kwargs
-and complete construction in one shot — no separate ``initialize(device)``
-step. After ``__init__`` returns the engine is fully usable: model loaded,
-worker subprocesses spawned, dist groups brought up. This matches the
-actor flow where ``_setup_distributed_env`` runs before the engine is
-built.
-"""
+"""Rollout engine contracts. Engines complete construction in ``__init__``; no separate initialize step."""
 
 from __future__ import annotations
 
@@ -18,57 +9,37 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 
 class BaseEngineConfig(ABC):
-    """Marker base for all rollout engine config dataclasses.
-
-    Used as the type annotation / base class for the engine config dataclasses.
-    Each concrete engine config maps itself to its runtime engine class via
-    :meth:`make_engine`.
-    """
+    """Marker base for rollout engine config dataclasses."""
 
     def make_engine(self, **deps: Any) -> "BaseRolloutEngine":
-        """Construct the runtime engine declared by this config.
-
-        ``deps`` carry the runtime injections (``device``, ``strategy``,
-        ``rank``, ``model_config``); the engine ctor contract is uniformly
-        ``Engine(config=self, **deps)``. Subclasses override to import (lazily,
-        so config modules stay importable without the engine's heavy optional
-        deps) and return their engine class.
-        """
+        """Construct the runtime engine declared by this config; ctor contract is ``Engine(config=self, **deps)``."""
         raise NotImplementedError(f"{type(self).__name__} must implement make_engine()")
 
 
 class BaseRolloutEngine(Remote, ABC):
-    """Rollout engine ABC. One-shot construction; new types only."""
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
     @abstractmethod
     def shutdown(self) -> None:
         """Release worker subprocesses and any other engine-owned resources."""
 
+    # Overrides of sleep/wake_up must re-apply @distributed; Handle binds the subclass attribute only.
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Best-effort runtime offload. Default no-op.
-
-        Decorated so the driver-side ``Handle.sleep()`` dispatches to every
-        worker. Subclasses that override should re-apply ``@distributed``
-        on their override (Handle's method-binding sees the subclass's
-        attribute and won't pick up a base-class decorator alone).
-        """
+        """Best-effort runtime offload. Default no-op."""
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        """Restore runtime resources after ``sleep``. Default no-op.
+        """Restore runtime resources after ``sleep``. Default no-op."""
 
-        Same dispatch contract as :meth:`sleep`; see its docstring.
-        """
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_stopping(self, stopping: bool = True) -> None:
+        """Arm cooperative rollout suspension. Default no-op."""
+        del stopping
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
         """Restore the resources needed to receive a weight update."""
@@ -85,7 +56,7 @@ class BaseRolloutEngine(Remote, ABC):
         return True
 
     def get_memory_info(self) -> Dict[str, float]:
-        """Per-engine GPU memory snapshot. Default reads CUDA totals."""
+        """Per-engine GPU memory snapshot."""
         if not torch.cuda.is_available():
             return {}
         return {
@@ -93,17 +64,20 @@ class BaseRolloutEngine(Remote, ABC):
             "cached_gb": torch.cuda.memory_reserved() / 1e9,
         }
 
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
-
     @abstractmethod
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run one rollout against the engine and return its typed response."""
+    def generate(self, sample: Sample) -> Sample:
+        """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
-    # ------------------------------------------------------------------
-    # Weight sync — bucketed CUDA-IPC (verl-omni pattern)
-    # ------------------------------------------------------------------
+    def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
+        """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
+        del ids
+        return []
+
+    def pause(self) -> None:
+        """Stop admitting new generation (best-effort). Default no-op."""
+
+    def resume(self) -> None:
+        """Resume generation after :meth:`pause`. Default no-op."""
 
     def update_weights_from_ipc(
         self,
@@ -115,10 +89,6 @@ class BaseRolloutEngine(Remote, ABC):
     ) -> None:
         """Receive a state dict over a per-rank ZMQ + CUDA-IPC channel."""
         raise NotImplementedError
-
-    # ------------------------------------------------------------------
-    # Weight sync — NCCL broadcast
-    # ------------------------------------------------------------------
 
     def init_weights_update_group(
         self,
@@ -157,10 +127,6 @@ class BaseRolloutEngine(Remote, ABC):
         """Tear down a previously-initialized NCCL update group."""
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
-    # Weight sync — LoRA tensor bag
-    # ------------------------------------------------------------------
-
     def set_lora_from_tensors(
         self,
         adapter_name: str,
@@ -170,10 +136,6 @@ class BaseRolloutEngine(Remote, ABC):
     ) -> None:
         """Load a LoRA adapter directly from in-memory tensors."""
         raise NotImplementedError
-
-    # ------------------------------------------------------------------
-    # Weight sync — SGLang-shape one-bag tensor payload
-    # ------------------------------------------------------------------
 
     def update_weights_from_tensor(
         self,
@@ -187,6 +149,22 @@ class BaseRolloutEngine(Remote, ABC):
         """Receive a state-dict packed as a single SGLang-shape payload per TP rank."""
         del track_prefix
         raise NotImplementedError
+
+    _version: int = 0
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        """Set the committed-update version after a full weight publication."""
+        if train_version < 0:
+            raise ValueError(f"train_version must be >= 0, got {train_version}")
+        self._version = train_version
+
+    def _stamp_output_version(self, sample: Sample) -> Sample:
+        """Stamp ``self._version`` onto the frontier (last) gen Part."""
+        if not sample.parts:
+            return sample
+        gen = sample.parts[-1].fill(output_version=self._version)
+        return sample.with_parts([*sample.parts[:-1], gen])
 
 
 __all__ = ["BaseRolloutEngine"]

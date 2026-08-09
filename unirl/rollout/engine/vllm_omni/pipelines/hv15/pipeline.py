@@ -53,18 +53,10 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Config donor for the SDE swap.
         self._upstream_scheduler = self.scheduler
-        # Conditioning-tap state: armed (reset) every request, filled by the
-        # tap's first call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
-        # Per-request x_T hand-off (same pattern as SD3).
         self._pending_initial_noise: Optional[torch.Tensor] = None
-
-    # ------------------------------------------------------------------ #
-    # install — once per pipeline lifetime, idempotent
-    # ------------------------------------------------------------------ #
 
     def _install_sde_scheduler(self) -> None:
         """Swap in the trajectory-capturing SDE scheduler (from_config keeps
@@ -101,13 +93,10 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
                     neg_mask_2,
                 ) = result
                 pipeline_self._captured_conditioning = {
-                    # MLLM (Qwen2.5-VL) text encoder output
                     "prompt_embeds": detach_cpu(prompt_embeds),
                     "prompt_embeds_mask": detach_cpu(prompt_embeds_mask),
-                    # ByT5 glyph encoder output
                     "prompt_embeds_2": detach_cpu(prompt_embeds_2),
                     "prompt_embeds_mask_2": detach_cpu(prompt_embeds_mask_2),
-                    # Negative (for CFG)
                     "negative_prompt_embeds": detach_cpu(neg_embeds),
                     "negative_prompt_embeds_mask": detach_cpu(neg_mask),
                     "negative_prompt_embeds_2": detach_cpu(neg_embeds_2),
@@ -117,10 +106,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
         self.encode_prompt = tapped  # type: ignore[assignment]
         self._conditioning_tap_installed = True
-
-    # ------------------------------------------------------------------ #
-    # arm — every request (stale-leak guards)
-    # ------------------------------------------------------------------ #
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
@@ -135,10 +120,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
     def _arm_conditioning_tap(self) -> None:
         """Fresh capture buffer so the tap records THIS request's first encode."""
         self._captured_conditioning = None
-
-    # ------------------------------------------------------------------ #
-    # run-phase interceptions
-    # ------------------------------------------------------------------ #
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
         """Initial-noise injection point (consume-once; upstream signature:
@@ -186,10 +167,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         finally:
             del sched.set_timesteps
 
-    # ------------------------------------------------------------------ #
-    # harvest — export onto the wire
-    # ------------------------------------------------------------------ #
-
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             drain_trajectory_into(out, self.scheduler)
@@ -197,10 +174,6 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
             stamp_custom_output(out, "text_capture", self._captured_conditioning)
-
-    # ------------------------------------------------------------------ #
-    # the protocol
-    # ------------------------------------------------------------------ #
 
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         self._install_sde_scheduler()
@@ -210,17 +183,9 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self._arm_initial_noise(req)
         self._arm_conditioning_tap()
 
-        # Delegate to upstream (encode, latent prep, denoise loop, VAE
-        # decode); the installed tap/injector fire inside.
         with self._sigma_override(req):
             out = super().forward(req, **kwargs)
 
-        # The engine post-processes out.output into PIL frames, but for video
-        # those do NOT survive the worker->client wire — only tensors carried in
-        # custom_output / trajectory_* cross; PIL image lists are dropped, so the
-        # trainer-side response would see empty ``images`` (LIN-382). Stamp the
-        # decoded video tensor (CHW-by-frame, [B, C, F, H, W]) onto custom_output
-        # so ``collect_dit_outputs`` can recover frames for the reward.
         decoded = getattr(out, "output", None)
         if decoded is not None:
             stamp_custom_output(out, "rl_decoded_video", detach_cpu(decoded))

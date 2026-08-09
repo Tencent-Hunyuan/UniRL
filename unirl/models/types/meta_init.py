@@ -69,7 +69,14 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
         if owner is None or not hasattr(owner, buf_name):
             continue
         live = getattr(owner, buf_name)
-        live.copy_(value.to(device=live.device, dtype=live.dtype))
+        tgt = live.to_local() if hasattr(live, "to_local") else live
+        src = value.to(device=tgt.device, dtype=tgt.dtype)
+        if tuple(tgt.shape) != tuple(src.shape):
+            raise RuntimeError(
+                f"restore_init_state: captured buffer {fqn!r} shape {tuple(src.shape)} "
+                f"does not match live local shape {tuple(tgt.shape)}."
+            )
+        tgt.copy_(src)
     for (mod_name, attr), value in attrs.items():
         owner = modules.get(mod_name)
         if owner is not None:
@@ -78,6 +85,93 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
     if n:
         logger.info("restore_init_state: recovered %d non-persistent buffer(s) + plain attr(s)", n)
     return n
+
+
+def recover_rope_inv_freq(model: nn.Module) -> int:
+    """Guaranteed post-materialize RoPE ``inv_freq`` recovery (idempotent).
+
+    ``meta`` init + ``to_empty()`` zero the non-persistent RoPE ``inv_freq`` (not in
+    the checkpoint). The capture/stamp/restore recovery is unreliable under FSDP2
+    (empty capture, module renaming, or DTensor buffers), leaving ``inv_freq == 0``
+    -> RoPE becomes the identity (cos=1, sin=0 at every position) -> a position-blind
+    model -> teacher-forced (replay) logprobs are systematically wrong -> the
+    rollout/replay ratio collapses (~0.11) -> a PPO/GRPO trainer clips ~every token
+    and reward cannot move.
+
+    Robust to module renaming (found by ``inv_freq`` presence, not FQN); recomputes
+    from each rotary module's ``config`` (or the model ``config``): explicit
+    scaled variants use transformers' matching ``ROPE_INIT_FUNCTIONS`` entry,
+    while default Qwen RoPE keeps the rollout-verified theta formula. Writes
+    into the LOCAL shard and fails on unsupported scaling or shape drift.
+    """
+    device = None
+    for p in model.parameters():
+        loc = p.to_local() if hasattr(p, "to_local") else p
+        device = loc.device
+        break
+    n = 0
+    for module_name, m in model.named_modules():
+        if getattr(m, "inv_freq", None) is None:
+            continue
+        cfg = getattr(m, "config", None) or getattr(model, "config", None)
+        if cfg is None:
+            raise RuntimeError(f"recover_rope_inv_freq: rotary module {module_name!r} has no config.")
+        rope_config = getattr(cfg, "rope_parameters", None) or getattr(cfg, "rope_scaling", None)
+        rope_type = getattr(m, "rope_type", None)
+        if rope_type is None and isinstance(rope_config, dict):
+            rope_type = rope_config.get("rope_type") or rope_config.get("type")
+        rope_type = rope_type or "default"
+
+        if rope_type == "default":
+            theta = getattr(cfg, "rope_theta", None)
+            if theta is None and isinstance(rope_config, dict):
+                theta = rope_config.get("rope_theta")
+            theta = theta or 10000.0
+            hd = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
+            inv_freq = 1.0 / (theta ** (torch.arange(0, hd, 2, dtype=torch.float32, device=device) / hd))
+        else:
+            try:
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+                rope_init = ROPE_INIT_FUNCTIONS[rope_type]
+                inv_freq, attention_scaling = rope_init(cfg, device)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"recover_rope_inv_freq: failed to initialize rope_type={rope_type!r} for module {module_name!r}."
+                ) from exc
+            m.attention_scaling = attention_scaling
+        with torch.no_grad():
+            for bn in ("inv_freq", "original_inv_freq"):
+                b = getattr(m, bn, None)
+                if b is None:
+                    continue
+                tgt = b.to_local() if hasattr(b, "to_local") else b
+                src = inv_freq.to(device=tgt.device, dtype=tgt.dtype)
+                if tuple(tgt.shape) != tuple(src.shape):
+                    raise RuntimeError(
+                        f"recover_rope_inv_freq: {module_name}.{bn} shape "
+                        f"{tuple(tgt.shape)} != recomputed {tuple(src.shape)}."
+                    )
+                tgt.copy_(src)
+        n += 1
+    if n:
+        logger.info("recover_rope_inv_freq: recomputed inv_freq on %d rotary module(s)", n)
+    return n
+
+
+def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Module:
+    """Apply the shared post-build contract for a meta transformer.
+
+    The dtype cast is metadata-only on meta parameters, so ``to_empty`` later
+    allocates the requested master dtype directly. VeOmni calls
+    ``init_weights`` after materialization; replace it with a no-op because the
+    real checkpoint is loaded immediately afterwards.
+    """
+    if not any(param.is_meta for param in transformer.parameters()):
+        raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
+    transformer = transformer.to(dtype)
+    transformer.init_weights = lambda: None
+    return transformer
 
 
 def build_meta_init_transformer(
@@ -102,13 +196,14 @@ def build_meta_init_transformer(
     with init_empty_weights(include_buffers=False):
         transformer = factory()
     captured = capture_init_state(transformer)
-    transformer = transformer.to(dtype)
-    transformer.init_weights = lambda: None
+    transformer = finalize_meta_init(transformer, dtype=dtype)
     return transformer, captured
 
 
 __all__ = [
     "capture_init_state",
     "restore_init_state",
+    "recover_rope_inv_freq",
+    "finalize_meta_init",
     "build_meta_init_transformer",
 ]

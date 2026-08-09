@@ -23,14 +23,8 @@ from __future__ import annotations
 from typing import List, Protocol, Tuple, runtime_checkable
 
 from unirl.algorithms import StageAlgorithm
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.types.sample import Part
 
-# A plan is built before any forward runs:
-#     Plan       = List[UpdatePlan]   # the whole rollout shard
-#     UpdatePlan = List[Range]        # one optimizer step (= one "update")
-#     Range      = (start, end)       # one micro's CONTIGUOUS sample membership
-# Because packing reorders the track up front (sort-then-slice), a micro is ALWAYS
-# a contiguous range — no index lists.
 Range = Tuple[int, int]
 UpdatePlan = List[Range]
 Plan = List[UpdatePlan]
@@ -89,8 +83,6 @@ class MicroPlanner(Protocol):
     the algorithm precondition the grouping needs, checked once when the stack is built.
     """
 
-    def arrange(
-        self, resp_track: RolloutTrack, *, num_updates: int, micro_batch_size: int
-    ) -> Tuple[RolloutTrack, Plan]: ...
+    def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> Tuple[Part, Plan]: ...
 
     def validate(self, algorithm: StageAlgorithm) -> None: ...

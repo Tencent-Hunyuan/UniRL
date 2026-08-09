@@ -124,11 +124,6 @@ def _collect_list(
             _collect_list(elem, subkey, leaf_type, collected, setters, filter_fn)
 
 
-# ---------------------------------------------------------------------------
-# TensorTransport ABC
-# ---------------------------------------------------------------------------
-
-
 class TensorTransport(abc.ABC):
     """Backend-agnostic tensor transport — the universal contract.
 
@@ -229,8 +224,6 @@ class TensorTransport(abc.ABC):
         """
         return shards
 
-    # ---- dehydrate / hydrate ------------------------------------------------
-
     def dehydrate(self, value: Any) -> Any:
         """Replace tensors with ``TensorRef`` refs.
 
@@ -289,8 +282,6 @@ class TensorTransport(abc.ABC):
             if key in setters:
                 setters[key](tensor)
         return value
-
-    # ---- session ------------------------------------------------------------
 
     @contextmanager
     def session(self) -> Iterator["TransportSession"]:

@@ -74,6 +74,7 @@ class LTX2Bundle(Bundle):
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
+        aux_device = torch.device("cpu") if getattr(config, "aux_components_on_cpu", False) else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
@@ -81,44 +82,34 @@ class LTX2Bundle(Bundle):
         te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
-        # Transformer (trainable)
         transformer = LTX2VideoTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
         transformer = transformer.to(device, dtype=dtype)
 
-        # Video VAE (frozen)
-        vae = AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+        vae = (
+            AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+            .to(aux_device)
+            .eval()
+        )
         vae.requires_grad_(False)
 
-        # Text encoder — Gemma3 (frozen). LTX-2 uses Gemma-3-12B whose config is
-        # nested (text_config/vision_config); loading it with the v1
-        # GemmaForCausalLM class crashes in GenerationConfig.from_model_config
-        # ('dict' has no attribute 'to_dict'). Match diffusers' LTX2 pipeline,
-        # which uses Gemma3ForConditionalGeneration.
         text_encoder = (
             Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
+            .to(aux_device)
             .eval()
         )
         text_encoder.requires_grad_(False)
 
         tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        # Connectors (Gemma per-layer hidden states → video/audio text
-        # embeddings, frozen). REQUIRED for LTX-2.0: the DiT was trained on
-        # connector outputs, not raw Gemma hidden states — diffusers declares
-        # ``connectors`` in the pipeline's component sequence. The class is
-        # ``LTX2TextConnectors`` (NOT ``LTX2Connector``, which does not exist).
         from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
         connectors = (
-            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(device).eval()
+            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(aux_device).eval()
         )
         connectors.requires_grad_(False)
 
-        # Scheduler
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
-        # Optional audio components (LTX-2.3)
         audio_vae: Optional[nn.Module] = None
         vocoder: Optional[nn.Module] = None
         if config.enable_audio:
@@ -126,15 +117,6 @@ class LTX2Bundle(Bundle):
                 from diffusers import AutoencoderKLLTX2Audio
                 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 
-                # low_cpu_mem_usage=False: the vocoder holds non-persistent
-                # anti-alias filter buffers (``*.upsample.filter`` /
-                # ``*.downsample.filter``) that are computed at init, NOT stored
-                # in the checkpoint. With the default meta-device load path those
-                # buffers stay on ``meta`` (HF warns "newly initialized"), and the
-                # subsequent ``.to(device)`` raises "Cannot copy out of meta
-                # tensor". Forcing a real (CPU) instantiation materializes the
-                # filters so ``.to(device)`` works. Mirrors load_pipeline's
-                # low_cpu_mem_usage=False used elsewhere for FSDP compatibility.
                 audio_vae = (
                     AutoencoderKLLTX2Audio.from_pretrained(
                         path, subfolder="audio_vae", torch_dtype=vae_dtype, low_cpu_mem_usage=False

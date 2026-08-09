@@ -41,7 +41,7 @@ class Segment(Batch):
     live here for a planned interleaved multi-segment-per-sample contract;
     every producer only ever emitted the identity mapping and nothing read
     it, so it was removed. If interleaved rollouts land, reintroduce the
-    mapping together with ``Batch.select`` / ``RolloutResp.split`` support —
+    mapping together with ``Batch.select`` / ``Sample.split`` support —
     those index segment rows positionally and assume the 1:1 alignment.)
 
     ``log_probs`` and ``loss_mask`` are intentionally NOT declared on the
@@ -59,8 +59,6 @@ class Segment(Batch):
     modality: ClassVar[Modality]
 
     status: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-
-    # ---- promotion to Condition ---------------------------------------------
 
     def as_condition(self) -> Optional[Condition]:
         """Encoder-free promotion. Override on subclasses where it makes sense.

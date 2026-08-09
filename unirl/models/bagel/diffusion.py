@@ -8,8 +8,7 @@ contexts (gen / cfg_text / cfg_img) and returns the CFG-combined velocity ``v_t`
 This stage reads **exactly like** :class:`unirl.models.sd3.diffusion.SD3DiffusionStage`
 — it rides UniRL's shared diffusion runtime and only swaps in Bagel's velocity call:
 
-- **σ / timestep schedule** comes from ``req.sigmas`` (pinned by the engine via
-  :func:`unirl.sde.runtime.ensure_req_sigmas` from the pipeline's
+- **σ / timestep schedule** comes from ``params.sigmas`` (pinned by the engine from the pipeline's
   ``build_schedule_policy``), passed in as ``schedule`` — NOT computed here.
 - **which steps run SDE** comes from ``params.sde_indices`` (the driver resolved it
   via :meth:`DiffusionSamplingParams.resolve_sde_indices` → the recipe's indices
@@ -72,29 +71,23 @@ class BagelDiffusionParams(DiffusionSamplingParams):
     ``init_same_noise`` / ``scheduler`` / ``sde_indices``), while
     :class:`BagelDiffusionStage` reads the Bagel-specific CFG knobs added here.
 
-    Bagel runs **one prompt at a time** (``bs=1`` packed): ``samples_per_prompt``
-    fan-out is materialized by the trainer (``RolloutInputs.expand``) into separate
-    samples, not batched inside one ``_forward_flow``.
+    Each Bagel ``_forward_flow`` row remains a packed ``bs=1`` sequence. The
+    Sample lineage materializes every generated row, while capable rollout
+    engines group prompts and use native ``num_outputs_per_prompt`` fan-out.
 
     The SDE machinery is now **all inherited / central**: ``eta`` is the SDE noise
     scale (flow_grpo's ``noise_level``); ``scheduler`` (the recipe's
     :class:`~unirl.utils.scheduler_utils.AllSDEScheduler`) picks the SDE steps via
-    :meth:`resolve_sde_indices`; the σ schedule rides on ``req.sigmas``. No
+    :meth:`resolve_sde_indices`; the σ schedule rides on ``params.sigmas``. No
     Bagel-specific window / schedule fields remain.
     """
 
-    # Override base defaults for Bagel. ``num_inference_steps`` is the number of
-    # STEPS (the σ schedule has steps+1 points); BAGEL's flow_grpo setup uses a
-    # 15-point schedule → 14 steps.
     num_inference_steps: int = 14
     guidance_scale: float = 1.0
     height: int = 512
     width: int = 512
-    # SDE noise scale (== flow_grpo's ``noise_level``); consumed by FlowSDEStrategy
-    # as ``eta``. Inherited field, surfaced here for the BAGEL default.
     eta: float = 1.0
 
-    # Bagel-specific CFG knobs (consumed by the navit ``_forward_flow``).
     cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
     cfg_interval: Tuple[float, float] = (0.0, 1.0)
@@ -114,8 +107,6 @@ class BagelDiffusionParams(DiffusionSamplingParams):
         )
 
 
-# The vendored ``prepare_*`` helpers build their packed index tensors on CPU;
-# the MoT forward needs them on the model device. Shared with the AR adapters.
 _to_device = rl_ops._to_device
 
 
@@ -145,10 +136,6 @@ class BagelDiffusionStep:
         scalar ``t_cur``) and does the CFG combine internally (gen / cfg_text /
         cfg_img contexts in ``forward_kwargs`` + the gated scales).
         """
-        # The pristine ``_forward_flow`` reads ``language_model.model.enable_taylorseer``
-        # (the official ``generate_image`` sets it; the RL path calls ``_forward_flow``
-        # directly). Set it here — the single chokepoint before every velocity call —
-        # so the TaylorSeer cache is off (per-step determinism for replay). Idempotent.
         rl_ops.disable_inference_cache(bagel)
         seq = int(x_t.shape[0])
         timestep = torch.full((seq,), float(t_cur), device=x_t.device)
@@ -245,15 +232,15 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
     Owns the bundle, the per-step navit kernel, the SDE ``strategy``, and the
     precision policy. ``diffuse`` runs the full sampling loop over the engine-pinned
-    ``schedule`` (``req.sigmas``), recording SDE log-probs at ``params.sde_indices``;
+    ``schedule`` (``params.sigmas``), recording SDE log-probs at ``params.sde_indices``;
     ``replay`` recomputes those log-probs for GRPO. Reuses
     ``unirl.algorithms.flowgrpo.FlowGRPO`` unchanged.
 
     Implements the ``DiffusionStage`` protocol (``diffuse`` / ``replay`` /
     ``predict_noise_at_step``) so the trainside engine's ``isinstance(stage,
     DiffusionStage)`` check passes → it builds the σ-schedule policy from
-    :meth:`BagelPipeline.build_schedule_policy` and pins ``req.sigmas`` via
-    ``ensure_req_sigmas`` before ``generate`` (same path as SD3 / Wan / Qwen-Image).
+    :meth:`BagelPipeline.build_schedule_policy` and pins ``params.sigmas`` via
+    ``ensure_sample_sigmas`` before ``generate`` (same path as SD3 / Wan / Qwen-Image).
     """
 
     def __init__(
@@ -266,19 +253,12 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
     ) -> None:
-        # ``model`` is the bundle (kept name-compatible with the other stages so
-        # the pipeline / FSDPPolicy treat it uniformly). The Bagel nn.Module is
-        # ``model.model``; the trainable MoT is ``model.transformer``.
         self.model = model
         self.step = step if step is not None else BagelDiffusionStep()
         self.strategy = strategy if strategy is not None else FlowSDEStrategy()
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-
-    # ------------------------------------------------------------------
-    # Helpers (navit adapter)
-    # ------------------------------------------------------------------
 
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
@@ -300,19 +280,19 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         inf = self.model.inferencer
         device = torch.device(self.model.device)
-        # Match the worker pipeline's prompt preprocessing EXACTLY
-        # (vllm_omni/diffusion/models/bagel/pipeline_bagel.py): it strips any
-        # ``<|im_start|>`` / ``<|im_end|>`` wrappers before ``prepare_prompts`` so
-        # bos/eos aren't double-added. If replay tokenized a differently-wrapped
-        # prompt, the KV context (and thus every step's v_t / log-prob) would
-        # diverge from rollout — a silent rollout↔replay mismatch.
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx(device):
-            cfg_text = deepcopy(gen)  # snapshot before the prompt text → unconditional
-            gen = inf.update_context_text(clean_prompt, gen)
-            cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+        mot = self.model.transformer
+        was_training = mot.training
+        mot.eval()
+        try:
+            with torch.no_grad(), self._autocast_ctx(device):
+                cfg_text = deepcopy(gen)
+                gen = inf.update_context_text(clean_prompt, gen)
+                cfg_img = inf.update_context_text(clean_prompt, cfg_img)
+        finally:
+            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
     def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
@@ -414,10 +394,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             return float(params.cfg_text_scale), float(params.cfg_img_scale)
         return 1.0, 1.0
 
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
-
     def diffuse(
         self,
         conditions: BagelDiffusionConditions,
@@ -468,16 +444,12 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         self.strategy.init_schedule(schedule)
 
-        # Store SDE step boundaries (x_t before AND after each SDE step) so replay can
-        # re-score them, plus the final clean latent (T) for VAE decode.
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
         stored_pairs: List[Tuple[int, torch.Tensor]] = []
         if 0 in needed:
             stored_pairs.append((0, x_t.detach().clone()))
         sde_logp_list: List[torch.Tensor] = []
-        # Per-SDE-step mean μ_old (the deterministic transition mean), recorded on the
-        # same SDE steps as sde_logp; consumed by BagelFlowUniGRPO(ratio_norm=True).
         sde_means_list: List[torch.Tensor] = []
 
         with torch.no_grad(), self._autocast_ctx(device):
@@ -504,15 +476,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     stored_pairs.append((i + 1, x_t.detach().clone()))
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
-                    # Nested on purpose: prev_mean is non-None on every step, so appending it
-                    # outside this block would misalign sde_means with sde_logp / sde_indices.
                     if prev_mean is not None:
                         sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)  # [1, K, seq, C]
-        sde_logp = torch.stack(sde_logp_list, dim=0).unsqueeze(0) if sde_logp_list else None  # [1, S]
-        sde_means = torch.stack(sde_means_list, dim=0).unsqueeze(0) if sde_means_list else None  # [1, S, seq, C]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)
+        sde_logp = torch.stack(sde_logp_list, dim=0).unsqueeze(0) if sde_logp_list else None
+        sde_means = torch.stack(sde_means_list, dim=0).unsqueeze(0) if sde_means_list else None
         sde_indices = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
 
         indices = torch.tensor(positions_collected, dtype=torch.long, device=device)
@@ -525,10 +495,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             sde_means=sde_means,
             sde_indices=sde_indices,
         )
-
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
 
     def replay(
         self,
@@ -575,7 +541,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 t_cur = schedule[step_idx]
                 t_next = schedule[step_idx + 1]
                 cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
-                x_t = segment.latents_at(step_idx)[0].to(device)  # [seq, C]
+                x_t = segment.latents_at(step_idx)[0].to(device)
                 prev_sample = segment.latents_at(step_idx + 1)[0].to(device)
                 _, log_prob, prev_mean = self.step.step_with_logp(
                     bagel,
@@ -598,13 +564,9 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 log_probs.append(log_prob)
                 prev_sample_means.append(prev_mean)
 
-        log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)  # [1, S']
-        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)  # [1, S', seq, C]
+        log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)
+        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    # ------------------------------------------------------------------
-    # Single-step velocity (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
 
     def build_forward_kwargs(
         self,
@@ -647,7 +609,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
         cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(t_val, params)
         sample = sample.to(device)
-        if sample.dim() == 3:  # [1, seq, C] → [seq, C] (navit bs=1)
+        if sample.dim() == 3:
             sample = sample[0]
         with self._autocast_ctx(device):
             return self.step.predict_velocity(
@@ -680,10 +642,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         device = torch.device(self.model.device)
         forward_kwargs = self.build_forward_kwargs(conditions, params=params, device=device)
         return self.predict_velocity_at(forward_kwargs, sample=sample, sigma=sigma, params=params)
-
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
 
     def trainable_module(self) -> "torch.nn.Module":
         """The MoT transformer (``bundle.transformer`` == ``model.language_model``).

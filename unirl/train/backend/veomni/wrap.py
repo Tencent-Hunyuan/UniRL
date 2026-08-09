@@ -27,15 +27,9 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from unirl.utils.dtypes import parse_torch_dtype
+from unirl.utils.dtypes import canonical_torch_dtype_name, parse_torch_dtype
 
 logger = logging.getLogger(__name__)
-
-_DTYPE_NAMES = {
-    torch.bfloat16: "bfloat16",
-    torch.float16: "float16",
-    torch.float32: "float32",
-}
 
 
 def veomni_parallelize(
@@ -68,14 +62,8 @@ def veomni_parallelize(
     from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
 
     compute_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
-    dtype_name = _DTYPE_NAMES.get(compute_dtype)
-    if dtype_name is None:
-        raise ValueError(f"veomni_parallelize: unsupported param_dtype {param_dtype!r}")
+    dtype_name = canonical_torch_dtype_name(compute_dtype, field_name="training.fsdp.param_dtype")
 
-    # Master-weight dtype: cast on meta (dtype-only, no data) so to_empty
-    # materializes storage in this dtype; MixedPrecisionPolicy(param_dtype) then
-    # casts the compute copy to bf16. master_dtype=None -> master follows
-    # param_dtype (all-bf16). Mirrors fsdp_wrap's master/compute split.
     master_t = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype else compute_dtype
     )
@@ -124,6 +112,9 @@ def veomni_parallelize(
         for layer in block_instances:
             layer.forward = torch.compile(layer.forward)
 
+    # Populate VeOmni EP parameter groups or EP-aware gradient clipping crashes.
+    _attach_extra_parallel_param_groups(model)
+
     if _current_rank() == 0:
         logger.info(
             "veomni_parallelize: wrapped %d block(s) of class %r + root (dtype=%s, reshard=%s, ac=%s, compile=%s)",
@@ -136,6 +127,53 @@ def veomni_parallelize(
         )
 
 
+def _attach_extra_parallel_param_groups(model: nn.Module) -> None:
+    """Classify params into extra-parallel (EP) vs non-EP groups and cache them on
+    the model as ``_extra_parallel_param_groups`` (the contract the VeOmni
+    EP-aware grad-clip / optimizer helpers read).
+
+    A param belongs to extra-parallel ``para`` iff it is a DTensor whose device
+    mesh carries a ``{para}_fsdp`` dim — exactly VeOmni's own test in
+    ``veomni/optim/optimizer.py``. No-op (leaves no attribute) when no extra
+    parallel is enabled, so the non-EP clip path is preserved verbatim.
+    """
+    from unirl.train.backend.veomni import _compat
+
+    _compat.ensure_installed()
+    from veomni.distributed.parallel_state import get_parallel_state
+
+    ps = get_parallel_state()
+    if not getattr(ps, "any_extra_parallel_enabled", False):
+        return
+
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:  # pragma: no cover - older torch
+        from torch.distributed._tensor import DTensor
+
+    para_names = list(ps.extra_parallel_names)
+    groups: dict = {para: [] for para in para_names}
+    non_ep: list = []
+    for _name, p in model.named_parameters():
+        matched = False
+        if isinstance(p, DTensor):
+            mesh = getattr(p, "device_mesh", None)
+            dim_names = getattr(mesh, "mesh_dim_names", ()) if mesh is not None else ()
+            for para in para_names:
+                if f"{para}_fsdp" in dim_names:
+                    groups[para].append(p)
+                    matched = True
+                    break
+        if not matched:
+            non_ep.append(p)
+    groups["non_extra_parallel"] = non_ep
+    model._extra_parallel_param_groups = groups
+
+    if _current_rank() == 0:
+        counts = {k: len(v) for k, v in groups.items()}
+        logger.info("veomni_parallelize: attached _extra_parallel_param_groups %s", counts)
+
+
 def _enumerate_block_instances(
     model: nn.Module,
     class_names: Tuple[str, ...],
@@ -143,9 +181,6 @@ def _enumerate_block_instances(
     if not class_names:
         return ()
     names = set(class_names)
-    # ``parallelize_model_fsdp2`` (run before this) ``fully_shard``s each block,
-    # which renames its class to ``FSDP<OriginalName>``; strip that prefix before
-    # matching (a no-op when absent) so AC actually finds the post-shard blocks.
     return tuple(m for _, m in model.named_modules() if type(m).__name__.removeprefix("FSDP") in names)
 
 

@@ -23,8 +23,8 @@ Three layers, all owned by this module:
    is what lets sglang / vllm-omni engines compute σ without holding the
    model in memory.
 
-3. **Glue** — :func:`ensure_req_sigmas` validates a ``RolloutReq`` and pins
-   ``policy.compute_sigma(...)`` onto ``RolloutReq.sigmas`` (every rollout
+3. **Glue** — :func:`ensure_sample_sigmas` validates a Sample and pins the gen Part's
+   ``policy.compute_sigma(...)`` σ onto the gen Part's ``DiffusionSamplingParams.sigmas`` (every rollout
    engine calls it at the top of its ``generate``).
 
 Naming convention (a symbol's name tells you its layer):
@@ -34,15 +34,15 @@ Naming convention (a symbol's name tells you its layer):
   per-model μ; ``compute_sigma`` → the full per-request σ).
 - free ``get_sigma_schedule`` / ``calculate_dynamic_mu`` are **stateless
   math primitives** — fully-resolved scalars in, no policy state.
-- ``ensure_req_sigmas`` is **request glue** — it operates on a RolloutReq.
+- ``ensure_sample_sigmas`` is **Sample glue** — it locates the diffusion gen Part.
 
 Ownership map (kept explicit so reading the code doesn't require
 following six getattr chains)::
 
     Policy        owned by  MODEL CHECKPOINT (scheduler/transformer/vae JSONs)
-    Params (T,H,W) owned by REQUEST (RolloutReq.sampling_params.diffusion)
+    Params (T,H,W) owned by REQUEST (the gen Part's DiffusionSamplingParams)
     σ computation owned by THIS MODULE (pure function)
-    σ flow        carried by RolloutReq.sigmas (set by engine, read by
+    σ flow        carried by the gen Part's sigmas (set by engine, read by
                   pipeline / worker / replay; verified end-to-end by
                   unirl.rollout.engine.sigma_verify)
 """
@@ -59,11 +59,6 @@ import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
-
-
-# ===========================================================================
-# Layer 1 — pure math
-# ===========================================================================
 
 
 def get_sigma_schedule(
@@ -96,8 +91,6 @@ def get_sigma_schedule(
     growing an untested hand-rolled stretch.
     """
     if mu is None:
-        # DELETE-WHEN: diffusers #13243 fixed → drop this branch and route
-        # static through diffusers too (symmetric with the dynamic branch).
         if shift_terminal is not None:
             raise ValueError(
                 f"get_sigma_schedule: shift_terminal={shift_terminal!r} is only "
@@ -141,11 +134,6 @@ def calculate_dynamic_mu(
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
     return image_seq_len * m + b
-
-
-# ===========================================================================
-# Layer 2 — schedule policy (model-owned config + behavior, from the checkpoint)
-# ===========================================================================
 
 
 def _read_json(path: Path) -> Optional[dict]:
@@ -412,9 +400,6 @@ class FlowMatchSchedulePolicy:
         I.4). Each Pipeline's ``build_schedule_policy()`` knows its own
         dynamic-shift posture and passes the right hints.
         """
-        # Local JSON dir unreadable — either no path given, or an HF repo ID
-        # not yet on disk. Both fall back the same way: require_dynamic →
-        # build from overrides (raises if absent); otherwise static-only.
         root = Path(path) if path is not None else None
         if root is None or not root.exists():
             if require_dynamic:
@@ -429,15 +414,10 @@ class FlowMatchSchedulePolicy:
                 )
             return cls.static_only(shift)
 
-        defaults = cls()  # canonical default values
+        defaults = cls()
         sched_path = root / "scheduler" / "scheduler_config.json"
         sched = _read_json(sched_path)
         if sched is None:
-            # Dynamic-shift information lives in this JSON; silent
-            # fallback to static would mis-shift a dynamic-shift model
-            # (caught by ``verify_engine_used_sigmas`` at rollout time
-            # but worth surfacing here so the cause is obvious in
-            # logs).
             logger.warning(
                 "FlowMatchSchedulePolicy.from_pretrained: %s not found; "
                 "dynamic-shift fields default to static-only behavior. "
@@ -464,34 +444,28 @@ class FlowMatchSchedulePolicy:
         )
 
 
-# ===========================================================================
-# Layer 3 — request glue (pin σ onto a RolloutReq)
-# ===========================================================================
+def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
+    """Compute and pin σ onto a Sample's diffusion generation parameters.
 
-
-def ensure_req_sigmas(req: Any, policy: FlowMatchSchedulePolicy) -> None:
-    """Compute and pin the σ schedule onto ``req.sigmas``.
-
-    Every rollout engine calls this once at the top of ``generate(req)``.
-
-    ``req`` must expose ``req.sigmas`` (read/write) and
-    ``req.sampling_params`` with diffusion params containing
-    ``num_inference_steps`` / ``height`` / ``width`` keys.
+    AR-only Samples are a no-op. A diffusion Sample must carry
+    ``DiffusionSamplingParams`` with ``num_inference_steps`` / ``height`` /
+    ``width``.
 
     All three keys are **required** —  silent ``height=1024`` /
     ``width=1024`` defaults would mis-derive μ for dynamic-shift models
     when the request actually rendered at a different resolution
     (e.g. WAN T2V at 480×832). The driver always sets all three at request
-    construction (the trainer's ``_build_req``); absence means a wiring bug.
+    construction; absence means a wiring bug.
     """
-    if req.sigmas is not None:
+    from unirl.types.sampling import DiffusionSamplingParams
+
+    if not sample.parts or not isinstance(sample.parts[-1].sampling_params, DiffusionSamplingParams):
         return
-    diffusion = req.sampling_params.get("diffusion")
-    if diffusion is None:
-        raise ValueError(
-            "ensure_req_sigmas: req.sampling_params must contain diffusion params for σ schedule computation."
-        )
-    req.sigmas = policy.compute_sigma(
+    gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
+    diffusion = gen_part.sampling_params
+    if diffusion.sigmas is not None:
+        return
+    diffusion.sigmas = policy.compute_sigma(
         num_inference_steps=int(diffusion.num_inference_steps),
         height=int(diffusion.height),
         width=int(diffusion.width),
@@ -499,11 +473,8 @@ def ensure_req_sigmas(req: Any, policy: FlowMatchSchedulePolicy) -> None:
 
 
 __all__ = [
-    # Layer 2 — the per-model schedule object (engines build it; models subclass)
     "FlowMatchSchedulePolicy",
-    # Layer 3 — request glue (rollout engines call this)
-    "ensure_req_sigmas",
-    # Layer 1 — stateless math primitives (used directly by tests / advanced callers)
+    "ensure_sample_sigmas",
     "get_sigma_schedule",
     "calculate_dynamic_mu",
 ]

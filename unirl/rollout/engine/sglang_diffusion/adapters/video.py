@@ -33,7 +33,8 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import make_video_segment
 
 
@@ -47,14 +48,11 @@ class VideoAdapter(ImageAdapter):
     and the decoded media is packed as ``Videos`` rather than dropped.
     """
 
-    #: RolloutResp track key (video, not image).
-    track_name: str = "video"
-    #: Modality stamp for the latent segment.
     segment_factory = staticmethod(make_video_segment)
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -78,14 +76,15 @@ class VideoAdapter(ImageAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
 
-    def build_decoded(self, req: RolloutReq, results: List[RawResult]):
+    def build_decoded(self, sample: Sample, results: List[RawResult]):
+        del sample
         return utils.stack_decoded_videos(results)
 
 
@@ -93,8 +92,6 @@ class VideoAdapter(ImageAdapter):
 class MochiAdapter(ImageAdapter):
     """Mochi — image-path parity (see module note); migrate to VideoAdapter when it has a video reward baseline."""
 
-    # Legacy image-path video family: drop 4-D decoded samples (incl. single-frame)
-    # rather than squeezing them into images.
     squeeze_single_frame_4d = False
 
 
@@ -192,8 +189,8 @@ class Wan22T2VAdapter(VideoAdapter):
     ``guidance_scale``) when unset, so a ``guidance_scale=1.0`` smoke is unaffected.
     """
 
-    def build_sampling(self, req: RolloutReq, *, diffusion: Any) -> Dict[str, Any]:
-        kwargs = super().build_sampling(req, diffusion=diffusion)
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
         g2 = getattr(diffusion, "guidance_scale_2", None)
         if g2 is not None:
             kwargs["guidance_scale_2"] = float(g2)
@@ -214,10 +211,107 @@ class Wan21T2VAdapter(VideoAdapter):
     pass
 
 
+@register_adapter("ltx2")
+class Ltx2T2VAdapter(VideoAdapter):
+    """LTX-2 T2V — ~19B AV DiT with packed video and audio trajectories."""
+
+    def schedule_policy(self):
+        from unirl.models.ltx2.schedule import build_ltx2_schedule_policy
+
+        return build_ltx2_schedule_policy(float(self.model_config.shift))
+
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
+        kwargs["max_sequence_length"] = int(self.model_config.max_sequence_length)
+
+        from unirl.models.ltx2.diffusion import audio_latent_shape
+        from unirl.types.noise_recipe import NoiseRecipe
+
+        audio_noise = NoiseRecipe.from_sample(sample).resolve(
+            salt="audio",
+            latent_shape=audio_latent_shape(diffusion),
+        )
+        if audio_noise is not None:
+            kwargs["initial_audio_noise"] = audio_noise
+        return kwargs
+
+    @staticmethod
+    def _fuse_audio_condition(results: List[RawResult], field: str) -> Optional[TextEmbedCondition]:
+        tensors = []
+        for result in results:
+            value = utils.fuse_encoder_outputs(getattr(result, field, None))
+            if value is not None:
+                tensors.append(value.detach().cpu())
+        if not tensors:
+            return None
+        require(
+            len(tensors) == len(results),
+            f"LTX-2: {field} must be present for every result or none",
+        )
+        return TextEmbedCondition(embeds=torch.cat(tensors, dim=0))
+
+    def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
+        out = super().build_condition(results)
+        text = out.get("text")
+        negative_text = out.get("negative_text")
+
+        if text is not None:
+            text = TextEmbedCondition(embeds=text.embeds, pooled=text.pooled)
+            out["text"] = text
+        if negative_text is not None:
+            negative_text = TextEmbedCondition(embeds=negative_text.embeds, pooled=negative_text.pooled)
+            out["negative_text"] = negative_text
+
+        audio_text = self._fuse_audio_condition(results, "audio_prompt_embeds")
+        negative_audio_text = self._fuse_audio_condition(results, "negative_audio_prompt_embeds")
+        if audio_text is not None:
+            out["audio_text"] = audio_text
+        if negative_audio_text is not None:
+            out["negative_audio_text"] = negative_audio_text
+        return out
+
+    def build_segment(
+        self,
+        sample: Sample,
+        results: List[RawResult],
+        *,
+        num_steps: int,
+        sde_indices: Optional[List[int]],
+        emit_native_logprob: bool,
+    ):
+        """LTX-2 latents are PACKED token sequences, not a spatial video grid.
+
+        WAN/HunyuanVideo carry a 6-D ``[B, T+1, C, F, H, W]`` trajectory, but LTX-2's
+        DiT operates on a patchified token sequence, so the rollout trajectory is
+        rank-4 ``[B, T+1, seq, dim]`` (e.g. ``[B, 11, 192, 128]``). ``VideoAdapter``'s
+        strict 6-D gate rejects it; ``build_latent_segment`` itself only needs the
+        ``T+1`` axis at dim 1 and is otherwise shape-agnostic, so accept the packed
+        trajectory directly (the trainside replays the identical packed latents, so
+        rollout↔replay stays aligned).
+        """
+        traj = utils.collect_trajectory_latents(results)
+        if traj.ndim < 3:
+            raise ValueError(
+                f"ltx2: expected a packed trajectory [B, T+1, ...]; got rank {traj.ndim}, shape {tuple(traj.shape)}."
+            )
+        aux_traj = utils.collect_aux_trajectory_latents(results)
+        return utils.build_latent_segment(
+            traj,
+            results=results,
+            expected_sigmas=sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.sigmas,
+            num_steps=num_steps,
+            sde_indices=sde_indices,
+            emit_native_logprob=emit_native_logprob,
+            segment_factory=self.segment_factory,
+            aux_trajectory=aux_traj,
+        )
+
+
 __all__ = [
     "VideoAdapter",
     "MochiAdapter",
     "HunyuanVideoAdapter",
     "Wan21T2VAdapter",
     "Wan22T2VAdapter",
+    "Ltx2T2VAdapter",
 ]

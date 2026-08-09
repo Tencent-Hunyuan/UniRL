@@ -48,6 +48,7 @@ from .flux2_klein_utils import (
     patchify_latents,
     unpatchify_latents,
 )
+from .image import resize_condition_pils
 
 
 class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
@@ -85,7 +86,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 f"Flux2KleinVAEDecodeStage.decode: expected latents [N, K, C, H, W], got {tuple(s.latents.shape)}"
             )
 
-        clean = s.latents[:, -1]  # [B, 128, H_pat, W_pat]
+        clean = s.latents[:, -1]
 
         vae = self.bundle.vae
 
@@ -105,7 +106,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = _decode(clean)
 
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 class Flux2KleinVAEEncodeStage:
@@ -127,8 +128,6 @@ class Flux2KleinVAEEncodeStage:
     Returns ``(image_tokens [B, N, 128], image_ids [B, N, 4])``.
     """
 
-    # Time-axis offset for the single reference image (diffusers uses
-    # ``scale + scale * t``; for one image t=0 → T-coord = scale = 10).
     REFERENCE_TIME_SCALE: int = 10
 
     def __init__(self, bundle: Flux2KleinBundle) -> None:
@@ -144,11 +143,13 @@ class Flux2KleinVAEEncodeStage:
                 "recipes encode in the rollout engine; trainside rollout "
                 "requires load_vae=True."
             )
-        pixels = images.pixels
-        if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
+        if not isinstance(images, Images):
+            raise TypeError(f"Flux2KleinVAEEncodeStage.encode: expected Images, got {type(images).__name__}")
+        pixels_list = [image.pixels for image in images.to_list()]
+        if not pixels_list or any(pixels is None or pixels.ndim != 3 or pixels.shape[0] != 3 for pixels in pixels_list):
             raise ValueError(
-                f"Flux2KleinVAEEncodeStage.encode: expected pixels [B, 3, H, W] in [0,1], "
-                f"got shape {None if pixels is None else tuple(pixels.shape)}"
+                "Flux2KleinVAEEncodeStage.encode: expected per-sample pixels [3, H, W] in [0,1], "
+                f"got {[None if pixels is None else tuple(pixels.shape) for pixels in pixels_list]}"
             )
 
         vae = self.bundle.vae
@@ -161,31 +162,29 @@ class Flux2KleinVAEEncodeStage:
         # consistent token count across a GRPO group needs a fixed size. Using
         # the generation (height, width) satisfies both (recipe sizes are
         # multiples of 16) and matches the edited-image resolution.
-        pixels = pixels.to(device=device, dtype=torch.float32)
-        if int(pixels.shape[-2]) != int(height) or int(pixels.shape[-1]) != int(width):
-            pixels = torch.nn.functional.interpolate(
-                pixels, size=(int(height), int(width)), mode="bilinear", align_corners=False
-            )
+        from torchvision.transforms.functional import pil_to_tensor
 
-        # [0, 1] → [-1, 1] (VAE input convention).
+        condition_pils = resize_condition_pils(images.to_pils(), height=height, width=width)
+        pixels = torch.stack(
+            [pil_to_tensor(pil).to(dtype=torch.float32).div_(255.0) for pil in condition_pils],
+            dim=0,
+        ).to(device=device)
+
         scaled = pixels * 2.0 - 1.0
 
-        # Deterministic latents (mode), patchify, BN-normalize.
-        image_latents = vae_f32.encode(scaled).latent_dist.mode()  # [B, 32, H/8, W/8]
-        image_latents = patchify_latents(image_latents)  # [B, 128, H/16, W/16]
+        image_latents = vae_f32.encode(scaled).latent_dist.mode()
+        image_latents = patchify_latents(image_latents)
         image_latents = normalize_patchified_latents(image_latents, vae_f32)
 
         batch_size, _, h_pat, w_pat = image_latents.shape
 
-        # Pack to tokens [B, h*w, 128].
         image_tokens = pack_latents(image_latents)
 
-        # 4-axis ids (T, H, W, L) with the reference time offset on T.
         t = torch.full((1,), self.REFERENCE_TIME_SCALE, device=device, dtype=torch.long)
         h = torch.arange(h_pat, device=device)
         w = torch.arange(w_pat, device=device)
         s = torch.arange(1, device=device)
-        coords = torch.cartesian_prod(t, h, w, s)  # [h*w, 4]
+        coords = torch.cartesian_prod(t, h, w, s)
         image_ids = coords.unsqueeze(0).expand(batch_size, -1, -1)
 
         return image_tokens.to(dtype=self.bundle.dtype), image_ids

@@ -98,8 +98,6 @@ class WAN22Bundle(Bundle):
     ) -> None:
         super().__init__()
         self.transformer = transformer
-        # Sub-transformer handles also exposed for hooks that need to
-        # iterate them individually (e.g. checkpoint loading verifiers).
         self.high_noise_transformer = high_noise_transformer
         self.low_noise_transformer = low_noise_transformer
         self.vae = vae
@@ -123,26 +121,9 @@ class WAN22Bundle(Bundle):
 
             WanTransformer3DModel = AutoModel
 
-        # Step 1: reuse ``WAN21Bundle.from_config`` to load the shared
-        # WAN 2.x components — VAE, UMT5 text encoder, tokenizer — plus
-        # the transformer at the ``transformer/`` subfolder. This works
-        # because:
-        #   - VAE / text encoder / tokenizer are architecturally
-        #     identical between WAN 2.1 and 2.2; reusing one loader keeps
-        #     the wiring in sync.
-        #   - WAN 2.2 checkpoints store the high-noise transformer at
-        #     ``transformer/`` and the low-noise transformer at
-        #     ``transformer_2/``. So the proxy's ``.transformer`` field is
-        #     intentionally repurposed as our ``high_noise_transformer``
-        #     here.
-        # We don't expose ``WAN21Bundle`` itself — callers see only the
-        # ``WAN22Bundle`` surface — but we pluck the loaded modules off
-        # it. ``WAN22PipelineConfig(WAN21PipelineConfig)`` so
-        # ``WAN21Bundle.from_config`` accepts our config.
         aux = WAN21Bundle.from_config(config)
         high_noise_transformer = aux.transformer
 
-        # Step 2: load the low-noise transformer separately.
         transformer_2_path = config.transformer_2_pretrained_path or config.pretrained_model_ckpt_path
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         low_noise_transformer = WanTransformer3DModel.from_pretrained(
@@ -150,14 +131,8 @@ class WAN22Bundle(Bundle):
             subfolder="transformer_2",
             torch_dtype=dtype,
         )
-        # Dtype unification, same reason as in WAN 2.1: diffusers leaves
-        # some buffers in fp32; FSDP2 asserts a uniform dtype across the
-        # wrapped module.
         low_noise_transformer = low_noise_transformer.to(aux.device, dtype=dtype)
 
-        # Step 3: expose both branches through the composite. The composite
-        # is the stage's trainable-module surface; FSDPPolicy then discovers
-        # and wraps the WanTransformerBlock children under both branches.
         transformer = WanDualTransformer(
             high_noise=high_noise_transformer,
             low_noise=low_noise_transformer,
@@ -178,10 +153,6 @@ class WAN22Bundle(Bundle):
             guidance_scale_2=config.guidance_scale_2,
             num_train_timesteps=int(config.num_train_timesteps),
         )
-
-    # ------------------------------------------------------------------
-    # Weight-sync name mapping (vllm-omni cross-process compatibility)
-    # ------------------------------------------------------------------
 
     def weight_sync_name_map(self) -> Dict[str, str]:
         """Return the prefix-substitution map for cross-process weight sync.

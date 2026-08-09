@@ -53,7 +53,6 @@ class HPSv3RewardScorer(LocalRewardBackend):
             batch_images = images[i : i + self.batch_size]
             batch_prompts = prompts[i : i + self.batch_size]
 
-            # Ensure PIL Image inputs
             pil_images = []
             for img in batch_images:
                 if isinstance(img, Image.Image):
@@ -62,15 +61,9 @@ class HPSv3RewardScorer(LocalRewardBackend):
                     pil_images.append(Image.fromarray(img).convert("RGB"))
 
             with torch.no_grad():
-                # Pass by keyword: the hpsv3 package's reward() is
-                # ``reward(image_paths, prompts)`` (PyPI 1.0.0) but later source
-                # reorders to ``reward(prompts, image_paths)`` — keywords are
-                # correct under both. (Images accept PIL directly.)
                 scores = self._hpsv3_inferencer.reward(prompts=batch_prompts, image_paths=pil_images)
-                # scores shape: [B, 2] (mu, sigma); take mu
                 if scores.ndim == 2:
                     scores = scores[:, 0]
-                # Normalize to ~0-1 range (benchmark max ~11.79)
                 scores = scores / 15.0
                 all_rewards.extend(scores.cpu().tolist())
 

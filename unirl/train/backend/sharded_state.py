@@ -27,11 +27,6 @@ logger = logging.getLogger(__name__)
 StateDict = Dict[str, object]
 
 
-# ------------------------------------------------------------------
-# Model state dict (DCP, full-state-dict, rank-0 gather / rank-0 broadcast)
-# ------------------------------------------------------------------
-
-
 def gather_state_dict(model: nn.Module) -> StateDict:
     """Rank-0 DCP gather.  Returns full state on rank 0, empty on others."""
     from torch.distributed.checkpoint.state_dict import get_model_state_dict
@@ -47,9 +42,18 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     return _to_cpu_state_dict(full)
 
 
-def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
-    """Load a full state dict, broadcasting from rank 0 across ranks.
+def load_model_state_dict(
+    model: nn.Module,
+    state_dict: StateDict,
+    *,
+    strict: bool = True,
+    broadcast_from_rank0: bool = True,
+) -> None:
+    """Load a full state dict and reshard it into ``model``.
 
+    With ``broadcast_from_rank0=True`` (default), only rank 0 needs the full
+    state. Set it to ``False`` when every rank carries a deliberately different
+    full state, such as its own pre-sliced expert block under VeOmni EP.
     ``strict=False`` loads a partial dict (adapter-only checkpoints, or the
     backend's post-parallelize weight load where injected adapter params are
     legitimately absent): keys absent from ``state_dict`` keep the model's
@@ -59,7 +63,7 @@ def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bo
 
     options = _build_state_dict_options(
         full_state_dict=True,
-        broadcast_from_rank0=True,
+        broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
         strict=strict,
     )
@@ -67,11 +71,6 @@ def load_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bo
         set_model_state_dict(model, state_dict, options=options)
     except TypeError:
         set_model_state_dict(model, state_dict)
-
-
-# ------------------------------------------------------------------
-# Optimizer state dict (DCP) — used by FSDPBackend; VeOmni uses plain state_dict()
-# ------------------------------------------------------------------
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
@@ -122,18 +121,25 @@ def gather_lora_state_dict(model: nn.Module) -> StateDict:
     return gathered
 
 
-def load_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict) -> None:
-    """Load a full optimizer state dict, broadcasting from rank 0 across ranks.
+def load_optimizer_state_dict(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state_dict: StateDict,
+    *,
+    broadcast_from_rank0: bool = True,
+) -> None:
+    """Load a full optimizer state dict and reshard it into ``optimizer``.
 
     Pass the rank-0 dict from :func:`gather_optimizer_state_dict`; other ranks
-    pass ``{}`` (their input is ignored — tensors broadcast from rank 0 and
-    re-shard into each rank's local state).
+    pass ``{}`` when ``broadcast_from_rank0=True``. Set it to ``False`` when
+    every rank supplies an intentionally different full state (VeOmni EP
+    pre-slices expert moments before this call).
     """
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(
         full_state_dict=True,
-        broadcast_from_rank0=True,
+        broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
     try:
@@ -230,11 +236,6 @@ def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> No
                 state[k] = v.to(device)
 
 
-# ------------------------------------------------------------------
-# Adapter export filters
-# ------------------------------------------------------------------
-
-
 def lora_state_dict(
     model: nn.Module,
     full_sd: Optional[StateDict] = None,
@@ -269,11 +270,6 @@ def nft_state_dict(
     return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
 
 
-# ------------------------------------------------------------------
-# Tensor / module utilities
-# ------------------------------------------------------------------
-
-
 def local_view(tensor: Tensor) -> Tensor:
     """DTensor -> local shard.  Identity for non-DTensors."""
     if hasattr(tensor, "_local_tensor"):
@@ -298,11 +294,6 @@ def infer_device(model: nn.Module) -> torch.device:
     if torch.cuda.is_available():
         return torch.device(f"cuda:{torch.cuda.current_device()}")
     return torch.device("cpu")
-
-
-# ------------------------------------------------------------------
-# Internal helpers
-# ------------------------------------------------------------------
 
 
 def _current_rank() -> int:

@@ -27,6 +27,7 @@ from .base import (
     _grpo_clip_loss,
     _reference_kl_loss,
     _reference_replay_means,
+    _require_replay_anchor_for_batched_replay,
     _resolve_clip_range_from_schedule,
     _resolve_reference_model,
     _transition_sigma,
@@ -83,16 +84,11 @@ class FlowGRPO(StageAlgorithm):
             forwards the dict verbatim (unit-test path).
     """
 
-    # prepare_segment freezes segment.sde_logp once, so the PPO ratio stays
-    # anchored across every num_updates_per_batch optimizer step.
     supports_multi_update = True
-    # beta>0 disables the LoRA adapter for a reference-policy replay, so the v2
-    # trainer must inject the FSDP backend (the trainable model lives on it).
     requires_backend = True
     anchor_fields = ("sde_logp",)
 
     def recomputes_anchor(self) -> bool:
-        # Only ``replay`` re-derives sde_logp; ``rollout`` keeps the engine's emission.
         return self.old_logp_source == "replay"
 
     def __init__(
@@ -125,6 +121,7 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
 
     def prepare_segment(
@@ -187,8 +184,8 @@ class FlowGRPO(StageAlgorithm):
             params=self.params,
             step_indices=target_steps,
         )
-        new_logp = replay_result.log_probs  # [B, S']
-        new_means = replay_result.prev_sample_means  # [B, S', ...]; used only when beta>0
+        new_logp = replay_result.log_probs
+        new_means = replay_result.prev_sample_means
 
         old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
             dtype=new_logp.dtype, device=new_logp.device
@@ -211,8 +208,6 @@ class FlowGRPO(StageAlgorithm):
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
 
-        # Optional reference-policy KL penalty (Flow-GRPO eq.5): pull pi_theta toward
-        # pi_ref (LoRA-disabled base model).
         if self.beta > 0.0:
             if new_means is None:
                 raise RuntimeError(
@@ -248,8 +243,6 @@ class FlowGRPO(StageAlgorithm):
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
         )
-
-    # -- helpers --------------------------------------------------------
 
     def _resolve_target_steps(self, segment: "LatentSegment") -> List[int]:
         """All SDE-recorded step indices on the segment.

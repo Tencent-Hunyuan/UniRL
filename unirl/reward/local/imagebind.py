@@ -89,8 +89,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
         self.model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
 
-    # ---- audio preprocessing -------------------------------------------------
-
     def _preprocess_audio_to_melspec(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
         import torch.nn.functional as Fn
         import torchaudio.functional as AF
@@ -102,7 +100,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
             if wf.ndim == 2:
                 ch_axis = 0 if wf.shape[0] <= wf.shape[1] else 1
                 wf = wf.mean(dim=ch_axis)
-            wf = wf.reshape(1, -1)  # (1, T)
+            wf = wf.reshape(1, -1)
             if src_sample_rate != _IB_AUDIO_SAMPLE_RATE:
                 wf = AF.resample(wf, src_sample_rate, _IB_AUDIO_SAMPLE_RATE)
 
@@ -153,8 +151,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
         spacing = (duration_s - clip_duration) / max(num_clips - 1, 1)
         return [i * spacing for i in range(num_clips)]
 
-    # ---- video preprocessing -------------------------------------------------
-
     def _preprocess_video(self, video_list: List[torch.Tensor]) -> torch.Tensor:
         batch_result = []
         for video in video_list:
@@ -170,7 +166,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
     @staticmethod
     def _temporal_subsample_clips(video: torch.Tensor, num_clips: int, frames_per_clip: int) -> List[torch.Tensor]:
-        T = video.shape[0]
+        T = video.shape[1]
         clips = []
         for i in range(num_clips):
             center = int((i + 0.5) * T / num_clips)
@@ -179,7 +175,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
                 min(T - 1, center + frames_per_clip // 2 - 1),
                 frames_per_clip,
             ).long()
-            clips.append(video[indices].permute(1, 0, 2, 3))
+            clips.append(video[:, indices])
         return clips
 
     @staticmethod
@@ -212,8 +208,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
             for x in offsets:
                 crops.append(clip[:, :, :, x : x + crop_size])
         return crops
-
-    # ---- scoring -------------------------------------------------------------
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         from imagebind.data import load_and_transform_text

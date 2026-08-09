@@ -1,8 +1,8 @@
 """``vllm_omni`` engine core — wiring + delegation only.
 
 A thin core over the backend seam: it names no concrete modality (the adapter,
-picked from the registry by ``config.modality``, owns the
-``RolloutReq``↔``RolloutResp`` conversion and the per-modality topology knobs)
+picked from the registry by ``config.modality``, owns the ``Sample`` →
+``Sample`` conversion and the per-modality topology knobs)
 and no concrete backend (the seam owns the runtime — boot, ports, env quirks,
 the per-stage ``collective_rpc`` fan-out). Weight sync is a :class:`WeightSync`
 component constructed over the seam; the offload lifecycle (a single flag)
@@ -23,6 +23,8 @@ worker partitions.
 
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -34,9 +36,10 @@ from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
 from unirl.rollout.engine.vllm_omni.weight_sync import WeightSync
-from unirl.sde.runtime import ensure_req_sigmas
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.sde.runtime import ensure_sample_sigmas
+from unirl.types.sample import Sample
+
+logger = logging.getLogger(__name__)
 
 
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
@@ -55,36 +58,32 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
         self.cfg = config
-        # Carried for subclass / extension use; the synchronous Omni
-        # entrypoint does not consume them directly.
+        self._version = 0
+        self._generate_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        self._shutdown_complete = False
         self.device = device
         self.strategy = strategy
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        logger.info(
+            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            config,
+            model_config is not None,
+            model_config,
+        )
 
-        # Adapter (the only read of the modality knob) — owns the conversion,
-        # topology knobs, and the σ schedule. ``tokenize_fn`` is late-bound to
-        # the backend's tokenize verb (the backend doesn't exist yet here).
         self.adapter = get_adapter(config.modality)(
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
         )
 
-        # Resolve the σ schedule before spawning the backend so a bad diffusion
-        # configuration fails fast. AR-only adapters have no diffusion schedule
-        # and must not touch ``model_config.shift``.
         self.schedule_policy = self.adapter.schedule_policy() if self.adapter.needs_sigmas else None
 
-        # Ports — engine-reserved on this node at the last moment before the
-        # spawn (bind-to-0; replaces v1's base + rank*stride math). Tests
-        # inject a fixed set.
         if ports is None:
             ports = VLLMOmniPorts.reserve()
 
-        # Backend (the seam) — booted from the config-spelled intent (adapter
-        # boot extras + reserved ports overlaid). Patches, spawn start method,
-        # the CVD quirk, the stage-YAML temp file, and the tokenizer all live
-        # behind this call.
         intent = config.server_intent(
             model_config=model_config,
             ports=ports,
@@ -92,7 +91,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         )
         self._backend = VLLMOmniBackend.boot(intent)
 
-        # Weight sync — owns all sync/LoRA state, over the live seam.
         self._weight_sync = WeightSync(
             self._backend,
             uses_lora=bool(getattr(model_config, "use_lora", False)),
@@ -103,38 +101,42 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
         return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
 
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
-
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        # Defense-in-depth the v1 wake-failure path documented but never
-        # implemented: a failed LoRA re-push keeps the engine offloaded so
-        # this guard catches callers that swallowed the wake_up exception.
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole DP shard synchronously."""
+        return self._generate_locked(sample)
+
+    def _generate_locked(self, sample: Sample) -> Sample:
+        with self._generate_lock:
+            if self._shutdown_requested:
+                raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
+            return self._stamp_output_version(self._generate_core(sample))
+
+    def _generate_core(self, sample: Sample) -> Sample:
+        """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
         require(
             not self._is_offloaded,
             "VLLMOmniRolloutEngine.generate: engine is offloaded (wake_up first).",
         )
-        self.adapter.validate_request(req)
-        # Main-repo SSOT for σ: pin once via the shared helper; the adapter
-        # forwards it on the wire and ``build_image_segment`` asserts the
-        # worker echoed it back. AR-only modalities have no diffusion params,
-        # so the adapter opts out (ensure_req_sigmas would raise on them).
+        self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
             require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
-            ensure_req_sigmas(req, self.schedule_policy)
-        calls = self.adapter.build_inputs(req)
+            self._ensure_sample_sigmas(sample)
+        calls = self.adapter.build_inputs(sample)
         per_request = self._backend.generate(
             calls,
             attach_lora=self._weight_sync.lora_loaded,
             ar_lora_passthrough=self.adapter.ar_lora_passthrough,
         )
-        return self.adapter.build_response(req, per_request)
+        return self.adapter.build_response(sample, per_request)
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle — the offload flag lives here; decorators re-applied
-    # ------------------------------------------------------------------ #
+    def _ensure_sample_sigmas(self, sample: Sample) -> None:
+        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``.
+
+        σ is computed from the model-owned schedule policy and shared across the
+        Part's samples. Idempotent — a pre-pinned σ is left as-is.
+        """
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
@@ -143,8 +145,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             return
         self._backend.sleep_task()
         self._is_offloaded = True
-        # The released memory includes the worker-side LoRA pool; the wake
-        # path restores it from the component's cache.
         self._weight_sync.mark_weights_released()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -152,20 +152,10 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
         if not self._is_offloaded:
             return
-        # This body executes INSIDE each colocated train actor (BROADCAST).
-        # Return the actor's train-phase allocation peak to the driver before
-        # the engine subprocess re-maps its ~50 GiB weight pool: without
-        # activation checkpointing the peak stays reserved in the actor's
-        # caching allocator and the post-wake generate OOMs at a 2 MiB
-        # allocation (LIN-382 qwen e2e-c/d — a driver-side flush in
-        # trainer.train_step demonstrably does NOT reach this process).
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self._backend.wake_task()
         try:
-            # v1 parity: actively re-push the cached adapter (NOT the passive
-            # lora_dirty model). On failure the engine STAYS offloaded so the
-            # next generate also raises rather than serving base weights.
             self._weight_sync.restore_lora_after_wake()
         except Exception:
             self._is_offloaded = True
@@ -174,30 +164,44 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @property
     def is_offloaded(self) -> bool:
-        return bool(self._is_offloaded)
+        return self._is_offloaded
 
     def health_check(self) -> bool:
         return self._backend.ping()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        self._backend.shutdown()
+        shutdown_lock = getattr(self, "_shutdown_lock", None)
+        if shutdown_lock is None:
+            backend = getattr(self, "_backend", None)
+            if backend is not None:
+                backend.shutdown()
+            return
 
-    # ------------------------------------------------------------------ #
-    # Stage topology
-    # ------------------------------------------------------------------ #
+        with shutdown_lock:
+            if getattr(self, "_shutdown_complete", False):
+                return
+
+            generate_lock = getattr(self, "_generate_lock", None)
+            if generate_lock is None:
+                self._shutdown_requested = True
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    backend.shutdown()
+            else:
+                with generate_lock:
+                    self._shutdown_requested = True
+                backend = getattr(self, "_backend", None)
+                if backend is not None:
+                    with generate_lock:
+                        backend.shutdown()
+            self._shutdown_complete = True
 
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the
         stage YAML at boot). The IPC weight-sync handler needs this to skip
         orphan train ranks that exceed a stage's TP size."""
         return self._backend.tp_per_stage()
-
-    # ------------------------------------------------------------------ #
-    # Weight sync — frozen base.py surface; thin forwards to the component.
-    # Un-decorated (except the documented copy-variant): reached per worker
-    # via the raw ``Worker.call`` RPC, not through ``@distributed``.
-    # ``track_prefix`` is absorbed here.
-    # ------------------------------------------------------------------ #
 
     def update_weights_from_ipc(
         self,
@@ -215,6 +219,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
+        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -257,6 +262,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
+        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -283,6 +289,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
+        self._version += 1
 
     def set_lora_from_tensors(
         self,

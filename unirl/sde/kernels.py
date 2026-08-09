@@ -5,13 +5,12 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, List, Optional, Tuple, Union
 
 import torch
 
-# ---------------------------------------------------------------------------
-# Base class hierarchy
-# ---------------------------------------------------------------------------
+GeneratorLike = Optional[Union[torch.Generator, List[torch.Generator]]]
+NoiseGenerator = GeneratorLike
 
 
 class StepStrategy(ABC):
@@ -26,7 +25,7 @@ class StepStrategy(ABC):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -49,6 +48,7 @@ class StepStrategy(ABC):
         *,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -56,17 +56,15 @@ class StepStrategy(ABC):
 
         ``prev_sample=None`` ⇒ sampling; otherwise log-prob replay. ``log_prob``
         is ``None`` for ODE strategies and for SDE strategies with ``eta<1e-7``.
+        ``generator=None`` preserves the historical engine-local RNG behaviour;
+        callers may opt in with one generator or a sample-aligned generator list.
         """
         input_dtype = sample.dtype
         noise_pred = noise_pred.float()
         sample = sample.float()
         if prev_sample is not None:
             prev_sample = prev_sample.float()
-        # Ensure sigma/sigma_next are float32 to match sglang's explicit
-        # `sigma = self.sigmas[step_indices].to(sample.device).to(sample.dtype)`.
-        # Without this, sigma may arrive as float64 (torch.linspace default),
-        # causing prev_sample_mean / std_var to compute in float64 while sglang
-        # uses float32 — a systematic precision mismatch amplified by 1/(2σ²).
+        # Use fp32 sigmas to match SGLang transition math.
         sigma = sigma.float()
         sigma_next = sigma_next.float()
 
@@ -85,7 +83,7 @@ class StepStrategy(ABC):
             sigma_next=sigma_next,
             eta=eta,
             prev_sample=prev_sample,
-            generator=None,  # DONOT PASS GENERATOR HERE - It will hurt diversity and performance
+            generator=generator,
             sigma_max=sigma_max,
             step_index=step_index,
         )
@@ -145,7 +143,7 @@ class SDEStrategy(StepStrategy, ABC):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -213,18 +211,13 @@ class SDEStrategy(StepStrategy, ABC):
         return prev_sample, log_prob
 
 
-# ---------------------------------------------------------------------------
-# SDE strategy implementations
-# ---------------------------------------------------------------------------
-
-
 class FlowSDEStrategy(SDEStrategy):
     """Standard SDE formulation from FlowGRPO."""
 
     canonical_name: ClassVar[str] = "flow"
 
     def __init__(self, *, config: Optional["FlowSpec"] = None) -> None:
-        del config  # empty Spec — strategy has no per-instance fields
+        del config
 
     def compute_log_prob(
         self,
@@ -258,7 +251,7 @@ class FlowSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -316,8 +309,6 @@ class CPSSDEStrategy(SDEStrategy):
         eta: float,
         sigma_max: float = 0.99,
     ) -> torch.Tensor:
-        # CPS adds noise as std_dev_t * noise (no sqrt(-dt)), so the transition
-        # Gaussian std IS std_dev_t -- the KL must not multiply by sqrt(-dt).
         return self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
 
     def step(
@@ -328,7 +319,7 @@ class CPSSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -387,7 +378,7 @@ class DanceSDEStrategy(SDEStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -409,11 +400,6 @@ class DanceSDEStrategy(SDEStrategy):
         std_var = std_dev_t * torch.sqrt(-dt)
 
         return prev_sample, prev_sample_mean, std_var
-
-
-# ---------------------------------------------------------------------------
-# DPM2 deterministic ODE strategy (migrated from sd3_sampler.py)
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -523,7 +509,6 @@ def _dpm_step(
 
     if order == 1 or dpm_state.lower_order_nums < 1 or lower_order_final:
         if step_index == 0 or lower_order_final:
-            # DDIM update with eta=0
             t, s = local_sigmas[step_index + 1], local_sigmas[step_index]
             noise_pred = (sample - (1 - s) * model_output) / s
             prev_mean = (1 - t) * model_output + torch.sqrt(t**2) * noise_pred
@@ -575,7 +560,7 @@ class DPM2Strategy(StepStrategy):
         sigma_next: torch.Tensor,
         eta: float = 1.0,
         prev_sample: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:

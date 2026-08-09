@@ -56,12 +56,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._copy = bool(copy)
-        # Rollout engines' (role_name, [worker_handles]) pairs, cached on rank 0 by
-        # the driver's set_rollout_targets() (plain Ray handles, NOT a HandleRef).
         self._targets: List[tuple] = []
-        # Rank-0 hold of (lora_tensors, peft_config) between extract() and push() —
-        # lets a memory-constrained trainer (HI3) gather while engines are asleep,
-        # offload the base, wake the engines, then push.
         self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
@@ -164,12 +159,23 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
         pending = [
-            (role, worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}))
+            (
+                role,
+                worker.call.remote(role, "tp_per_stage", (), {}),
+                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
+            )
             for role, workers in self._targets
             for worker in workers
         ]
-        for role, ref in pending:
-            self._assert_loaded(exp_a, exp_b, ray.get(ref), label=f"engine {role!r}")
+        for role, topology_ref, loaded_ref in pending:
+            topology, loaded = ray.get([topology_ref, loaded_ref])
+            self._assert_loaded(
+                exp_a,
+                exp_b,
+                loaded,
+                topology=topology,
+                label=f"engine {role!r}",
+            )
         logger.info(
             "[LoRA-SYNC] rank 0: verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
             len(self._targets),

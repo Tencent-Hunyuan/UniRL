@@ -27,9 +27,9 @@ from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
-# Qwen-Image patchified spatial size: pixel / (vae_scale_factor=8 * patchify_factor=2).
 _QWEN_DOWNSAMPLE = 16
 
 
@@ -39,7 +39,7 @@ class QwenImageAdapter(ImageAdapter):
 
     def build_segment(
         self,
-        req: RolloutReq,
+        sample: Sample,
         results: List[RawResult],
         *,
         num_steps: int,
@@ -54,10 +54,11 @@ class QwenImageAdapter(ImageAdapter):
         NOT ``height // 8`` — the two differ for dims that are multiples of 8 but
         not of 16. 5-D arrivals (image-form) skip the unpack.
         """
+        diffusion = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 5:
             B, T, S, C, h_pat, w_pat = utils.validate_packed_trajectory(
-                traj, req, family="qwen_image", downsample=_QWEN_DOWNSAMPLE
+                traj, diffusion, family="qwen_image", downsample=_QWEN_DOWNSAMPLE
             )
             from unirl.models.qwen_image.diffusion import _unpack_latents
 
@@ -67,19 +68,12 @@ class QwenImageAdapter(ImageAdapter):
         return utils.build_latent_segment(
             traj,
             results=results,
-            expected_sigmas=req.sigmas,
+            expected_sigmas=diffusion.sigmas,
             num_steps=num_steps,
             sde_indices=sde_indices,
             emit_native_logprob=emit_native_logprob,
             segment_factory=self.segment_factory,
         )
-
-    # build_condition: inherited from ImageAdapter. The engine emits Qwen-Image's
-    # embeds-aligned ``prompt_embeds_mask`` (the mask the server's DiT attends under)
-    # via ``_patches/patch_conditions``, and ``utils.tracks.fuse_text_conditions``
-    # mounts it whenever it aligns with the embeds — so no model-specific backfill is
-    # needed. If the mask is genuinely absent, trainside replay raises (fail loud)
-    # rather than fabricating an all-ones mask that is wrong for mixed-length batches.
 
 
 __all__ = ["QwenImageAdapter"]

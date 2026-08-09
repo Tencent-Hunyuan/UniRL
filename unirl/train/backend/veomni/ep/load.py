@@ -21,6 +21,8 @@ from typing import Callable, Dict
 import torch
 from torch import nn
 
+from unirl.train.backend.veomni.ep.placement import assign_local_block
+
 
 def load_ep_experts(
     model: nn.Module,
@@ -34,7 +36,7 @@ def load_ep_experts(
     model package owns the naming). Returns the number of expert params loaded.
     """
     import torch.distributed as dist
-    from torch.distributed.tensor import DTensor, distribute_tensor
+    from torch.distributed.tensor import DTensor
     from veomni.distributed.parallel_state import get_parallel_state
 
     rank0 = (not dist.is_initialized()) or dist.get_rank() == 0
@@ -45,18 +47,11 @@ def load_ep_experts(
     for name, param in model.named_parameters():
         if not is_expert_key(name):
             continue
-        if not isinstance(param, DTensor):  # ep_size==1: plain replicated param
+        if not isinstance(param, DTensor):
             if rank0:
                 param.data.copy_(expert_state_dict[name].to(device=param.device, dtype=param.dtype))
             n += 1
             continue
-        # The param's dim-0 is ALREADY this rank's local experts (E/ep). Send each
-        # ep_rank's [E/ep,...] block separately (one broadcast per EP group) and keep
-        # only the block this rank owns, then re-shard it with the param's own
-        # mesh/placement (handles the dim-1 ep_fsdp shard). Per-block (not full-[E,...])
-        # so every rank's transient stays [E/ep,...] — the EP memory saving must hold
-        # at LOAD time too, else an 80B model OOMs here even when the sharded steady
-        # state fits. Broadcast-only (no scatter) to work on every NCCL build.
         local_experts = param.shape[0]
         block_shape = (local_experts, *param.shape[1:])
         full = expert_state_dict[name].to(device=param.device, dtype=param.dtype) if rank0 else None
@@ -71,9 +66,8 @@ def load_ep_experts(
                 dist.broadcast(block, src=0)
             if ep_rank == j:
                 my_block = block
-        sharded = distribute_tensor(my_block, param.device_mesh, param.placements)
-        param.to_local().copy_(sharded.to_local())
-        del full, my_block, sharded
+        assign_local_block(param, my_block)
+        del full, my_block
         n += 1
     return n
 
@@ -133,7 +127,7 @@ def register_unsharded_param_hooks(model: nn.Module) -> Dict[str, int]:
         leaf = name.rsplit(".", 1)[-1]
         if isinstance(mod, nn.Embedding):
             kind = "wte"
-        elif leaf == "ln_f":  # the model's final RMSNorm (per-layer norms unshard via FSDP)
+        elif leaf == "ln_f":
             kind = "ln_f"
         elif leaf == "lm_head":
             kind = "lm_head"

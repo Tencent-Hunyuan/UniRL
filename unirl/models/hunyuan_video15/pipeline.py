@@ -1,4 +1,4 @@
-"""HunyuanVideo15Pipeline — RolloutReq → RolloutResp end-to-end for HunyuanVideo-1.5.
+"""HunyuanVideo15Pipeline — ``Sample → Sample`` end-to-end for HunyuanVideo-1.5.
 
 Implements the four-tier flow::
 
@@ -14,9 +14,9 @@ constants from the config.
 σ schedule contract
 -------------------
 The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` BEFORE calling
-``generate(req)``; this pipeline reads ``req.sigmas`` and uses it
+/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
+``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
+pipeline reads ``params.sigmas`` and uses it
 verbatim. HunyuanVideo-1.5 uses **static** flow-match shift (default
 5.0); the engine builds
 :meth:`FlowMatchSchedulePolicy.from_pretrained(path, shift=pipeline.shift)`
@@ -28,11 +28,10 @@ Negative prompts (CFG-on contract)
 ----------------------------------
 HunyuanVideo-1.5's CFG is part of its inference contract — the upstream
 pipeline ALWAYS encodes a negative branch (defaulting to empty strings
-when not provided). This pipeline preserves this behavior:
-``req.primitives["negative_text"]`` is optional, but if absent we
-synthesize ``Texts(texts=[""] * batch_size)`` so the diffusion stage
-always has both ``negative_text_mllm`` and ``negative_text_glyph``
-populated when ``guidance_scale > 1.0``.
+when not provided). This pipeline preserves this behavior: user-supplied
+negatives are deferred, and when ``guidance_scale > 1.0`` we synthesize
+``Texts(texts=[""] * batch_size)`` so the diffusion stage always has both
+``negative_text_mllm`` and ``negative_text_glyph`` populated.
 """
 
 from __future__ import annotations
@@ -41,9 +40,9 @@ from typing import Any, Optional
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import HunyuanVideo15Bundle
@@ -58,23 +57,18 @@ from .vae import HunyuanVideo15VAEDecodeStage
 
 
 class HunyuanVideo15Pipeline(Pipeline):
-    """HunyuanVideo-1.5 generate pipeline (T2V; I2V deferred).
+    """HunyuanVideo-1.5 generate pipeline (T2V; I2V deferred): ``Sample → Sample``.
 
-    Reads from ``RolloutReq``:
+    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
+    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
+    hosting engine). Reads the prompt via ``sample.conditioning()`` and fills the
+    frontier Part:
 
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives;
-      defaults to empty strings when absent.
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`HunyuanVideo15DiffusionParams`.
-    - ``sigmas: Tensor[T+1]`` — pinned by the engine adapter (required).
+    - ``segment: LatentSegment`` — the denoising trajectory.
+    - ``primitives["video"]: Videos`` — the decoded videos.
 
-    Writes to ``RolloutResp``:
-
-    - ``conditions["text_mllm" | "text_glyph" | optional
-      "negative_text_*"]: TextEmbedCondition``.
-    - ``tracks["video"].segment: LatentSegment``.
-    - ``tracks["video"].decoded: Videos``.
+    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
+    deferred; CFG uses a synthesized empty negative across the MLLM + Glyph encoders.
     """
 
     def __init__(
@@ -124,9 +118,6 @@ class HunyuanVideo15Pipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo15VAEDecodeStage(bundle)
-        # ``shift`` is retained as an attribute so the hosting engine can
-        # build the FlowMatchSchedulePolicy at startup. Static shift only
-        # (HunyuanVideo-1.5 doesn't use dynamic mu).
         self.shift = shift
 
     @classmethod
@@ -197,10 +188,6 @@ class HunyuanVideo15Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
             vision_num_semantic_tokens=config.vision_num_semantic_tokens,
             vision_states_dim=config.vision_states_dim,
-            # Pass through the config-side override so the stage uses the
-            # same channel count the driver assumed in ``latent_shape``.
-            # When ``None``, the stage's existing VAE/transformer
-            # inference takes over.
             latent_channels=config.latent_channels,
         )
         vae_decode = HunyuanVideo15VAEDecodeStage(bundle)
@@ -232,6 +219,11 @@ class HunyuanVideo15Pipeline(Pipeline):
         signal. Either-both-or-both-None: the diffusion step (line 191-202)
         raises if only one of mllm/glyph is set.
         """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"HunyuanVideo15Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))
 
@@ -251,64 +243,45 @@ class HunyuanVideo15Pipeline(Pipeline):
             negative_text_glyph=negative_text_glyph,
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run HunyuanVideo-1.5 T2V end-to-end. Requires ``req.sigmas`` to
-        be pinned by the hosting engine adapter."""
-        if req.sigmas is None:
-            raise ValueError(
-                "HunyuanVideo15Pipeline.generate: req.sigmas is None. The hosting "
-                "engine (Trainside / SGLang / VLLMOmni) must call "
-                "unirl.sde.runtime.ensure_req_sigmas(req, policy) before "
-                "invoking pipeline.generate."
+    def generate(self, sample: Sample) -> Sample:
+        """Run HunyuanVideo-1.5 T2V end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine before the call; see the σ ownership note in
+        ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"HunyuanVideo15Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
             )
-        texts = req.primitives.get("text")
+        if params.sigmas is None:
+            raise ValueError(
+                "HunyuanVideo15Pipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"HunyuanVideo15Pipeline.generate: req.primitives['text'] must be "
-                f"Texts, got {type(texts).__name__ if texts is not None else 'None'}"
+                f"HunyuanVideo15Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        batch_size = len(texts.texts)
 
-        # Validate negative_text shape if caller passed one. The empty-
-        # negative default (when caller didn't pass) is applied AFTER
-        # params is built so we can gate on guidance_scale — mirrors
-        # upstream HV1.5 (diffusers v0.37.1
-        # ``pipeline_hunyuan_video1_5.py:684``), which only encodes the
-        # negative branch when ``self.guider._enabled and num_conditions > 1``.
-        negatives_raw = req.primitives.get("negative_text")
-        if isinstance(negatives_raw, Texts):
-            negatives = negatives_raw
-            if len(negatives.texts) != batch_size:
-                raise ValueError(
-                    f"HunyuanVideo15Pipeline.generate: negative_text length "
-                    f"{len(negatives.texts)} != text length {batch_size}"
-                )
-        else:
-            negatives = None
+        hv_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        schedule = params.sigmas.to(self.bundle.device)
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-
-        hv_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=float(params.guidance_scale))
-
-        schedule = req.sigmas.to(self.bundle.device)
-
-        initial_cond = (req.request_conditions or {}).get("initial_latents")
-        initial_latents = getattr(initial_cond, "latents", None) if initial_cond is not None else None
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(hv_conds, schedule=schedule, params=params, initial_latents=initial_latents)
         videos = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "video": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=hv_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=videos,
-                ),
-            }
-        )
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=hv_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["HunyuanVideo15Pipeline"]

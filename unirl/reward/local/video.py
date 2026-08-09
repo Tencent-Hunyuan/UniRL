@@ -37,8 +37,6 @@ class VideoRewardScorer(RewardBackend):
         inner_scorer_cls = resolve_builtin_reward_scorer_class(inner_model)
         inner_spec_cls = resolve_builtin_reward_spec_class(inner_model)
         inner_spec = inner_spec_cls()
-        # Outer VideoSpec overrides what the inner Spec accepts. OCR has no
-        # device/batch_size; everything else does — hasattr keeps this generic.
         overrides = {
             field_name: getattr(config, field_name)
             for field_name in ("device", "batch_size")
@@ -72,7 +70,7 @@ class VideoRewardScorer(RewardBackend):
                 frame_pixels = torch.stack([to_tensor(f) for f in frames])
                 frame_request = RewardRequest(
                     primitives={"text": Texts(texts=[prompt] * len(frames))},
-                    generated={"image": Images(pixels=frame_pixels)},
+                    generated={"image": Images.from_dense(frame_pixels)},
                 )
                 frame_response = self.frame_scorer.compute_rewards(frame_request)
                 alignment_reward = sum(frame_response.rewards) / len(frame_response.rewards)

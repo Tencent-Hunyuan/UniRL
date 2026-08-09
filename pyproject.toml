@@ -25,7 +25,14 @@ dependencies = [
   # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
   "transformers>=5.6,<5.7",
   "huggingface-hub>=0.34",
-  "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
+  # Vendored Boogu-Image DiT (unirl/models/boogu_image/vendor/) imports einops
+  # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
+  # engine-agnostic.
+  "einops>=0.7",
+  # 0.20 floor: older peft imports transformers cache symbols (HybridCache)
+  # removed in 5.x and fails at import against the transformers pin above.
+  # exclude_modules support (>=0.14) used by LoRA/NFT adapter injection.
+  "peft>=0.20",
   "safetensors>=0.4",
   "Pillow>=10",
   "requests>=2.31",
@@ -57,6 +64,13 @@ sglang = [
   "torch==2.11.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
+  # Flash-Linear-Attention (FLA) fast path for Qwen3.5 hybrid attention layers
+  # (3 GDN + 1 full per 4). Without it, transformers falls back to the torch
+  # implementation ("The fast path is not available because one of the required
+  # library is not installed"). The [conv1d] extra pulls causal-conv1d, the
+  # [tilelang] extra is already satisfied transitively. Pin to the version
+  # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
+  "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
 ]
 # CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
 vllm = [
@@ -65,6 +79,7 @@ vllm = [
   "torch==2.11.0+cu129 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
   "wandb>=0.16,<0.20",
@@ -169,8 +184,8 @@ include = [
 line-length = 120
 target-version = "py312"
 # unirl-reward-service/ is a vendored standalone sub-project with its own pyproject and
-# lint/test tooling; it is not governed by this repo's lint (mirrors its
-# exclusion from this repo's pytest). Its vendored upstream model code carries
+# lint/test tooling; it is not governed by this repo's lint. Its vendored
+# upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
 extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]

@@ -103,6 +103,14 @@ class _RawResultView:
         return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
 
     @property
+    def aux_trajectory_latents(self) -> Any:
+        """LTX-2's co-denoised AUDIO trajectory ([B, T+1, ...]), attached onto
+        ``dit_trajectory.audio_latents`` by ``patch_ltx2_rollout_sde`` and carried
+        through the per-output concat/slice. ``None`` for models without it."""
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
+
+    @property
     def trajectory_log_probs(self) -> Any:
         rtd = getattr(self._result, "rollout_trajectory_data", None)
         return getattr(rtd, "rollout_log_probs", None)
@@ -118,10 +126,6 @@ class SGLangBackend:
         self._gen = generator
         self._rt = runtime
         self._server_args = server_args
-
-    # ------------------------------------------------------------------ #
-    # Boot — the only place from_pretrained / the import live
-    # ------------------------------------------------------------------ #
 
     @classmethod
     def boot(
@@ -153,10 +157,6 @@ class SGLangBackend:
         )
         return cls(generator, rt, server_args)
 
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
-
     def generate(self, sampling_kwargs: Dict[str, Any]) -> List[RawResult]:
         raw = self._gen.generate(sampling_params_kwargs=sampling_kwargs)
         if raw is None:
@@ -171,9 +171,6 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        # SGLang populates arch_config.vae_scale_factor lazily in
-        # vae_config.post_init(); our standalone call here (init_same_noise path)
-        # can run before that hook fired — populate it idempotently.
         vae_cfg = getattr(pcfg, "vae_config", None)
         arch = getattr(vae_cfg, "arch_config", None)
         if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):
@@ -183,15 +180,7 @@ class SGLangBackend:
         full_shape = pcfg.prepare_latent_shape(batch_stub, batch_size, num_frames)
         return tuple(full_shape[1:])
 
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
-
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
-        # Stock upstream DiffGenerator has no memory-occupation methods (the fork
-        # added them); route through the scheduler client to the handlers that
-        # ``patch_scheduler`` installs, keyed on the ``_patches`` req types
-        # (mirrors the v1 engine's ``_call_memory_api``).
         self._forward(
             self._rt["ReleaseMemoryOccupationReqInput"](
                 tags=list(tags),
@@ -222,10 +211,6 @@ class SGLangBackend:
         except Exception as exc:  # noqa: BLE001
             logger.warning("SGLang health_check ping failed: %s", exc)
             return False
-
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs (io_struct types stay here; no RL types cross)
-    # ------------------------------------------------------------------ #
 
     def update_from_tensor(
         self,
@@ -324,10 +309,6 @@ class SGLangBackend:
         if not (isinstance(output, dict) and output):
             raise RuntimeError(f"SGLang checksum query returned invalid payload: {output!r}")
         return output
-
-    # ------------------------------------------------------------------ #
-    # Scheduler request plumbing
-    # ------------------------------------------------------------------ #
 
     def _forward(self, request: Any, *, op: str) -> Any:
         response = self._rt["sync_scheduler_client"].forward(request)

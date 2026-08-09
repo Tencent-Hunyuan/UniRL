@@ -28,11 +28,30 @@ import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.value_head import ValueHead
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3PipelineConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _stamp_value_head_reset(transformer: nn.Module) -> None:
+    """Zero checkpoint-absent value-head params after meta materialization."""
+    from unirl.train.deferred import _stamp
+
+    def _reset(model: nn.Module) -> None:
+        reset: list[str] = []
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name.startswith("value_head."):
+                    param.zero_()
+                    reset.append(name)
+        if not reset:
+            raise RuntimeError("Qwen3 meta-init: value_head parameters disappeared before post-load reset")
+        logger.info("Qwen3 meta-init: zero-initialized checkpoint-absent value head: %s", reset)
+
+    _stamp(transformer, _reset)
 
 
 class Qwen3Bundle(Bundle):
@@ -69,15 +88,7 @@ class Qwen3Bundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         if config.meta_init_transformer:
-            # Meta-init (FSDP / VeOmni load_sharded path): parameters on the meta
-            # device, materialized + loaded by the backend from the checkpoint
-            # root after sharding (AR layout: no transformer/ subfolder, so the
-            # stashed dir is the root). build_meta_init_transformer keeps
-            # buffers/attrs real on CPU: HF rotary inv_freq / original_inv_freq
-            # are non-persistent buffers computed in __init__ and absent from the
-            # checkpoint, so to_empty later clobbers them -> garbage RoPE. It
-            # captures them; meta_init_state is stashed on the BUNDLE below and
-            # restored by load_trainable_weights after the sharded weight load.
+            # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
@@ -96,8 +107,6 @@ class Qwen3Bundle(Bundle):
                 **load_kwargs,
             ).to(device)
 
-        # Structural (no weight access); runs on both the meta and eager builds
-        # and persists through to_empty + load.
         if config.use_gradient_checkpointing:
             if hasattr(transformer, "gradient_checkpointing_enable"):
                 transformer.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -115,6 +124,13 @@ class Qwen3Bundle(Bundle):
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
+        if config.use_value_head:
+            hidden_size = int(getattr(transformer.config, "hidden_size"))
+            transformer_device = next(transformer.parameters()).device
+            transformer.value_head = ValueHead(hidden_size, device=transformer_device)
+            if config.meta_init_transformer:
+                _stamp_value_head_reset(transformer)
+
         bundle = cls(
             transformer=transformer,
             tokenizer=tokenizer,
@@ -123,9 +139,7 @@ class Qwen3Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            # AR checkpoints store *.safetensors at the root (no subfolder).
             bundle._transformer_weights_path = path
-            # Ray-robust restore carrier for init-computed non-persistent state.
             bundle._meta_init_state = meta_init_state
         return bundle
 

@@ -10,7 +10,7 @@ plain prompt dicts + :class:`StageSampling` intent (kind + kwargs; the impl
 constructs the real ``vllm.SamplingParams`` / ``OmniDiffusionSamplingParams``
 objects) — and returns per-request-grouped lists of :class:`OmniRawResult`
 (a structural view of vllm-omni's ``OmniRequestOutput``). The engine core +
-adapters do the ``RolloutReq``↔``RolloutResp`` translation.
+adapters do the ``Sample``↔wire translation.
 
 The seam absorbs the transport asymmetries: ``Omni.generate``'s flat output
 list is grouped back to per-request order by the ``"{i}_{uuid}"`` request-id
@@ -38,9 +38,6 @@ from typing import (
 if TYPE_CHECKING:
     import torch
 
-#: ``StageSampling.kind`` values: ``"ar"`` builds ``vllm.SamplingParams``;
-#: ``"diffusion"`` builds ``OmniDiffusionSamplingParams`` (and is the LoRA
-#: attach point when an adapter is active).
 STAGE_KIND_AR = "ar"
 STAGE_KIND_DIFFUSION = "diffusion"
 
@@ -144,7 +141,6 @@ class OmniRawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``vllm_omni`` collaborator reaches the runtime through."""
 
-    # generation
     def generate(
         self,
         calls: Sequence[GenerateCall],
@@ -153,17 +149,12 @@ class Backend(Protocol):
         ar_lora_passthrough: bool = False,
     ) -> List[List[OmniRawResult]]: ...
     def tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]: ...
-    # stage topology
     def num_stages(self) -> int: ...
     def tp_per_stage(self) -> Dict[int, int]: ...
-    # memory / lifecycle / health
     def sleep_task(self) -> None: ...
     def wake_task(self) -> None: ...
     def shutdown(self) -> None: ...
     def ping(self) -> bool: ...
-    # weight-sync verbs — per-stage collective_rpc fan-out lives INSIDE the impl;
-    # runtime payload shaping (MultiprocessingSerializer / torch.save byte copy,
-    # PEFT-envelope wrapping, remove-then-add ordering) stays there too.
     def update_from_ipc(
         self,
         *,

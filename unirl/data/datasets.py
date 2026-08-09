@@ -123,9 +123,11 @@ def normalize_prompt_example(
 def _resolve_media_uri(raw_path: str, *, base_dir: Optional[str] = None) -> str:
     """Resolve a media path to an absolute URI.
 
-    - Absolute paths and URLs (http://, https://, s3://, gs://) are returned as-is.
+    - Absolute paths and HTTP(S) URLs are returned as-is.
     - Relative paths are joined with *base_dir* (if provided) to produce an
       absolute filesystem path.
+    - ``s3://`` / ``gs://`` pass through here but are rejected when constructing
+      :class:`MediaRef` until a materialize step exists.
     """
     if raw_path.startswith(("http://", "https://", "s3://", "gs://")):
         return raw_path
@@ -192,11 +194,9 @@ class TextPromptDataset(PromptExampleDataset):
         self.samples: List[Dict[str, Any]] = []
         self._base_dir = os.path.dirname(os.path.abspath(file_path))
 
-        # Load prompts
         self._source_prefix = os.path.basename(self.file_path) or "prompt_source"
         self._load_prompts()
 
-        # Shuffle if requested
         if shuffle:
             if seed is not None:
                 random.Random(seed).shuffle(self.samples)
@@ -250,7 +250,6 @@ class TextPromptDataset(PromptExampleDataset):
                 for item in data:
                     _append_item(item, context="item")
             elif isinstance(data, dict):
-                # Handle dict format with prompts key
                 if "prompts" in data:
                     prompts = data["prompts"]
                     if isinstance(prompts, list):
@@ -272,7 +271,6 @@ class TextPromptDataset(PromptExampleDataset):
                     _append_item(data, context="top-level caption item")
 
         elif self.file_path.endswith(".jsonl"):
-            # JSON Lines format: one JSON object per line
             with open(self.file_path, "r") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()

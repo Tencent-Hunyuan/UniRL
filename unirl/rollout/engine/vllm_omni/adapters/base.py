@@ -1,4 +1,4 @@
-"""Driver-side ``RolloutReq``↔``RolloutResp`` conversion: the adapter ABC + registry.
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
 
 A thin top ABC (registry + knobs + the two conversion verbs). Concrete
 modality adapters live in family files (``hi3`` / ``sd3`` / ``hv15``) and are
@@ -28,12 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from unirl.config.require import require
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
-
-# --------------------------------------------------------------------------- #
-# Registry
-# --------------------------------------------------------------------------- #
+from unirl.types.sample import Sample
 
 _REGISTRY: Dict[str, type["ModelAdapter"]] = {}
 
@@ -66,11 +61,6 @@ def registered_adapters() -> Tuple[str, ...]:
     return tuple(sorted(_REGISTRY))
 
 
-# --------------------------------------------------------------------------- #
-# ABC
-# --------------------------------------------------------------------------- #
-
-
 class ModelAdapter(ABC):
     """Thin ABC: registry key + topology knobs + the two conversion seams.
 
@@ -82,30 +72,13 @@ class ModelAdapter(ABC):
 
     modality: str = ""
 
-    # ---- topology knobs (one line per v1 frozenset membership) ----
-    #: The stage-config YAML this modality boots (+ where it ships).
     stage_yaml: str = ""
     stage_yaml_source: str = "local"
-    #: ``Omni(mode=...)`` kwarg; ``None`` omits it (v1 engine.py:377-378).
     omni_mode: Optional[str] = None
-    #: Request carries diffusion params → pin σ via ``ensure_req_sigmas``
-    #: (v1 ``_DIT_BEARING_MODALITIES``; AR-only requests would raise on it).
     needs_sigmas: bool = True
-    #: Driver-side tokenizer for ``build_prompt_tokens`` (v1 engine.py:322 —
-    #: everything except sd35_t2i / t2v, including dit_recaption, which loads
-    #: one without using it; kept for parity).
     needs_driver_tokenizer: bool = True
-    #: HI3 AR-prelude family: pass ``lora_request`` as a top-level
-    #: ``Omni.generate`` kwarg (requires the passthrough patch; v1
-    #: ``_HI3_MODALITIES`` — see patches/__init__ for the DELETE-WHEN).
     ar_lora_passthrough: bool = False
-    #: HI3 multi-GPU stages: clear ``CUDA_VISIBLE_DEVICES`` before boot so
-    #: vllm-omni pins stages to their yaml ``runtime.devices`` (v1
-    #: ``_HI3_MULTI_GPU_MODALITIES``). ⚠️ Safe only when the engine is wired
-    #: as a single multi-GPU actor — see the v1 colocate-landmine note.
     clear_cuda_visible: bool = False
-    #: Re-push LoRA after wake via the byte-copy transport (TP>1 stages where
-    #: the zero-copy handle crashes ranks 2..N; v1 wake branch).
     lora_copy_transport: bool = False
 
     def __init__(
@@ -122,7 +95,6 @@ class ModelAdapter(ABC):
         self._sde_label = self.resolve_sde_label(strategy)
         self.validate()
 
-    # ---- SDE label (parity no-op; injection point only) ----
     @staticmethod
     def resolve_sde_label(strategy: Any) -> Optional[str]:
         """Deliberately ``None``: vllm-omni rides raw ``eta`` + ``sde_indices``
@@ -134,7 +106,6 @@ class ModelAdapter(ABC):
         del strategy
         return None
 
-    # ---- boot intent (consumed by ``config.server_intent``) ----
     def boot_kwargs(self) -> Dict[str, Any]:
         """Model-specific boot intent beyond the generic config spelling.
 
@@ -154,7 +125,6 @@ class ModelAdapter(ABC):
             kwargs["mode"] = self.omni_mode
         return kwargs
 
-    # ---- σ schedule policy (generic FlowMatch; v1 engine.py:420-427) ----
     def schedule_policy(self) -> Any:
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
@@ -166,12 +136,7 @@ class ModelAdapter(ABC):
             dynamic_overrides=getattr(mc, "dynamic_shift_overrides", None),
         )
 
-    # ---- construction-time validation (v1 engine.py:404-409) ----
     def validate(self) -> None:
-        # ``shift`` parametrizes the FlowMatch σ schedule and only matters for
-        # adapters that actually run one. AR-only adapters (``needs_sigmas`` is
-        # False) never call :meth:`schedule_policy`, so requiring a diffusion
-        # ``model_config.shift`` from them is spurious.
         if self.needs_sigmas:
             mc = self.model_config
             require(
@@ -181,22 +146,20 @@ class ModelAdapter(ABC):
                 f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
             )
 
-    # ---- per-request validation (ports v1 ``_validate_request``) ----
-    def validate_request(self, req: RolloutReq) -> None:
+    def validate_request(self, sample: Sample) -> None:
         """Modality-specific request gate; default accepts everything."""
 
-    # ---- the two conversion seams the engine drives ----
     @abstractmethod
-    def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        """Translate a ``RolloutReq`` into the seam's generate calls.
+    def build_inputs(self, sample: Sample) -> List[GenerateCall]:
+        """Translate a request ``Sample`` into the seam's generate calls.
 
         Normally one call carrying the whole batch; ``dit_recaption`` returns
         N seeded single-prompt calls.
         """
 
     @abstractmethod
-    def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
-        """Translate the seam's per-request-grouped results into a ``RolloutResp``."""
+    def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
+        """Fill the request ``Sample``'s gen Parts from the seam's per-request-grouped results."""
 
 
 __all__ = [

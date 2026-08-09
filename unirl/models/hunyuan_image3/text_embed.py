@@ -76,10 +76,6 @@ class HunyuanImage3TextEmbedStage:
         self.bundle = bundle
         self.max_sequence_length = max_sequence_length
 
-    # ------------------------------------------------------------------
-    # Shared input-prep internals.
-    # ------------------------------------------------------------------
-
     def _apply_chat_template(
         self,
         *,
@@ -99,24 +95,14 @@ class HunyuanImage3TextEmbedStage:
         config = transformer.config
         gen_config = transformer.generation_config
 
-        # The wrapper around the HF tokenizer (which knows how to splice in
-        # <boi>, <eoi>, <img>, <timestep>, <img_ratio_*> markers) is lazily
-        # populated upstream — ``load_tokenizer`` must be called explicitly
-        # after ``from_pretrained``. It resolves its arg as a path
-        # (from_pretrained), so pass the checkpoint path, not the tokenizer
-        # object. Newer (Instruct) snapshots expose the wrapper as
-        # ``_tokenizer``; older ones auto-populate ``_tkwrapper``.
         if getattr(transformer, "_tkwrapper", None) is None and getattr(transformer, "_tokenizer", None) is None:
+            # Default omitted model_version; the tokenizer ignores its value.
+            if not hasattr(config, "model_version"):
+                config.model_version = "instruct"
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
-        # transformers 5.x loads HunyuanImage3TokenizerFast's Rust backend
-        # char-level (pre_tokenizer/decoder=None) -> char-level, space-less
-        # prompts -> char-by-char generation. Re-attach the correct BPE backend
-        # from tokenizer.json. Idempotent (no-op once repaired). See compat.py.
         repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
 
-        # Cond-image kwarg name differs by checkpoint snapshot (base:
-        # batch_cond_image_info, Instruct: batch_cond_images).
         _cond_kw = (
             "batch_cond_images"
             if "batch_cond_images" in inspect.signature(tkw.apply_chat_template).parameters
@@ -150,7 +136,7 @@ class HunyuanImage3TextEmbedStage:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
+        torch.Tensor,
         Optional[torch.Tensor],
     ]:
         """Tensor prep shared by the AR and gen_image paths.
@@ -165,14 +151,11 @@ class HunyuanImage3TextEmbedStage:
         config = transformer.config
         gen_config = transformer.generation_config
 
-        # Anchor every tensor to the ``wte`` device — under ``device_map="auto"``
-        # this is typically cuda:0; HF hooks shuttle activations downstream.
         device = transformer.model.wte.weight.device
 
-        input_ids: torch.Tensor = output.tokens.to(device)  # [N, L] long
+        input_ids: torch.Tensor = output.tokens.to(device)
         n, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
 
-        # mRoPE rope tables: (cos, sin), each [N, rope_seq_len, head_dim] float.
         rope_image_info = transformer.build_batch_rope_image_info(output, sections)
         build_batch_2d_rope = _resolve_build_batch_2d_rope()
         cos, sin = build_batch_2d_rope(
@@ -183,27 +166,19 @@ class HunyuanImage3TextEmbedStage:
             base=config.rope_theta,
         )
 
-        # Position ids share across batch via expand to save memory: [N, L] long.
         position_ids: torch.Tensor = torch.arange(0, seq_len, dtype=torch.long, device=device)[None].expand(n, -1)
 
-        # 4D causal+image-bidirectional attention mask: [N, 1, L, L] bool.
         attention_mask: torch.Tensor = transformer._prepare_attention_mask_for_generation(
             input_ids,
             gen_config,
             model_kwargs={"tokenizer_output": output},
         ).to(device)
 
-        # When the wrapper saw cond images, ``output`` carries the mask that
-        # pins where <img> tokens land in input_ids. The unified-MM forward
-        # consumes this to scatter ViT patch embeds into ``inputs_embeds``
-        # via ``instantiate_vit_image_tokens``.
         cond_vit_image_mask = _optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device)
 
-        return device, input_ids, attention_mask, position_ids, (cos, sin), cond_vit_image_mask
-
-    # ------------------------------------------------------------------
-    # Chat-template-driven input prep — canonical AR entry point.
-    # ------------------------------------------------------------------
+        # Stack RoPE so it travels as a per-sample CONCAT tensor.
+        rope_cache = torch.stack([cos, sin], dim=1)
+        return device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask
 
     def embed_for_ar(
         self,
@@ -256,7 +231,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[B, L] long``,
                                   attention_mask ``[B, 1, L, L] bool``,
                                   position_ids ``[B, L] long``,
-                                  rope_cache ``(cos, sin)`` each ``[B, L, D] float``,
+                                  rope_cache ``[B, 2, L, D] float`` (stacked cos/sin),
                                   cond_vit_image_mask ``[B, L] bool`` (i2t / it2i;
                                   ``None`` for t2t).
                 tokenizer_output: opaque upstream apply_chat_template output (carries
@@ -280,11 +255,6 @@ class HunyuanImage3TextEmbedStage:
             batch_cond_image_info=batch_cond_image_info,
         )
 
-        # Upstream (hunyuan.py:2306-2310) sizes the rope to
-        # ``generation_config.max_length`` for ``mode="gen_text"`` so decode
-        # steps' position_ids (which advance past the prompt) stay in range.
-        # ``rope_image_info`` is empty for every sample in gen_text -- there
-        # are no <img> sections.
         prompt_len = int(output.tokens.shape[1])
         rope_seq_len = int(getattr(gen_config, "max_length", prompt_len))
         rope_seq_len = max(rope_seq_len, prompt_len)
@@ -293,29 +263,16 @@ class HunyuanImage3TextEmbedStage:
             output, sections, rope_seq_len=rope_seq_len
         )
 
-        # HI3-Instruct cond images are dual-encoded: the wrapper also splices
-        # VAE <img> slots + a cond <timestep> token (i2t/it2i). Pin them so the
-        # AR forward can scatter the VAE latents (else those slots stay bare
-        # <img> embeddings → garbage comprehension). None for t2t (no cond image).
         cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), _device)
         cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), _device)
 
-        # Per-sample TRUE prompt length for the right-padded batch. The upstream
-        # tokenizer right-pads a mixed-length batch to ``max_len`` and records the
-        # real end in ``real_pos`` (one-past-last-valid → == prompt length, the
-        # same quantity the rollout prefill reads at ``real_pos - 1``). Carry it on
-        # ``fused`` so trainside ``replay`` slices off the right-pad — the same
-        # ``prompt_lengths`` contract the two-engine adapter (adapters/hi3.py)
-        # fills. Without it, ``replay`` would fall back to the padded length and
-        # compute per-token logp at pad-shifted positions for short samples →
-        # silent GRPO ratio error.
         prompt_lengths: Optional[torch.Tensor] = None
         real_pos = getattr(output, "real_pos", None)
         if real_pos is not None:
             rp = real_pos.to(device=_device, dtype=torch.long)
             if rp.dim() == 2:
                 rp = rp[:, -1]
-            prompt_lengths = rp.reshape(-1)  # [B]
+            prompt_lengths = rp.reshape(-1)
 
         fused = HunyuanImage3FusedMultimodalCondition(
             input_ids=input_ids,
@@ -328,10 +285,6 @@ class HunyuanImage3TextEmbedStage:
             prompt_lengths=prompt_lengths,
         )
         return {"fused": fused, "tokenizer_output": output}
-
-    # ------------------------------------------------------------------
-    # Chat-template-driven input prep — t2i / it2i diffusion entry point.
-    # ------------------------------------------------------------------
 
     def embed_for_gen_image(
         self,
@@ -403,7 +356,7 @@ class HunyuanImage3TextEmbedStage:
                                   carries input_ids ``[N, L] long``,
                                   attention_mask ``[N, 1, L, L] bool``,
                                   position_ids ``[N, L] long``,
-                                  rope_cache ``(cos, sin)`` ``([N, L, D], [N, L, D]) float``,
+                                  rope_cache ``[N, 2, L, D] float`` (stacked cos/sin),
                                   gen_image_mask ``[N, L] bool``,
                                   gen_timestep_scatter_index ``[N, K] long``,
                                   cond_vae_image_mask / cond_vit_image_mask /
@@ -426,11 +379,6 @@ class HunyuanImage3TextEmbedStage:
             raise ValueError("HunyuanImage3TextEmbedStage.embed_for_gen_image: prompts is empty")
         cfg_factor = 2 if cfg else 1
 
-        # Image info from explicit (h, w). Upstream's image_processor
-        # snaps to the closest preset ratio. The method name differs
-        # across HI3 checkpoints: Base ships ``build_image_info``,
-        # Instruct ships ``build_gen_image_info`` (same semantics, two
-        # default kwargs we don't need).
         ip = transformer.image_processor
         if hasattr(ip, "build_image_info"):
             image_info = ip.build_image_info(f"{int(height)}x{int(width)}")
@@ -442,10 +390,6 @@ class HunyuanImage3TextEmbedStage:
             )
         batch_gen_image_info = [image_info] * len(prompts)
 
-        # Tokenize + splice in special markers (<boi>, <img>, <timestep>,
-        # <eoi>, ratio, plus cond-image <img> blocks for it2i). With
-        # cfg_factor=2, the wrapper internally duplicates the prompt slot
-        # for the unconditional branch (cond first).
         output, sections = self._apply_chat_template(
             mode="gen_image",
             batch_prompt=prompts,
@@ -461,14 +405,9 @@ class HunyuanImage3TextEmbedStage:
             output, sections
         )
 
-        # gen_image_mask: [N, L] bool — positions of generated-image patches.
         gen_image_mask: torch.Tensor = output.gen_image_mask.to(device)
-        # gen_timestep_scatter_index: [N, K] long (K is small, index of <timestep> tokens)
         gen_timestep_scatter_index: torch.Tensor = output.gen_timestep_scatter_index.to(device)
 
-        # When ``batch_cond_image_info`` was passed, the wrapper emits
-        # cond-image position pin-points and the cond-timestep scatter
-        # index. ``None`` for vanilla t2i.
         cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), device)
         cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), device)
 
@@ -483,11 +422,6 @@ class HunyuanImage3TextEmbedStage:
             cond_vit_image_mask=cond_vit_image_mask,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
         )
-        # Opaque tokenizer wrapper output. Carries the slice info the
-        # KV-cache path's first ``_update_model_kwargs_for_generation``
-        # call needs to gather position_ids / attention_mask /
-        # gen_timestep_scatter_index down from full-L to the L' changed
-        # slice (timestep + image tokens) for steps 1..T-1.
         return {"fused": fused, "tokenizer_output": output}
 
 

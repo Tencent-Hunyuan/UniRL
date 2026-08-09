@@ -7,11 +7,11 @@ rollout (the rollout reads the live FSDP modules, so no weight sync).
 
 One ``train_step``::
 
-    rollout.generate(req)           → 2-track RolloutResp {"ar", "diffusion"}
-    reward.score_and_attach(image)  → score the "diffusion" (image) track only
-    resp.propagate_rewards("mean")  → credit-assign image reward up to "ar"
-    track.compute_advantages()      → per-track GRPO (ar by prompt, diff by rewrite)
-    {name}.stack.train_track(track) → route each track to its own model
+    rollout.generate(sample)         → 3-part Sample [input, ar, diffusion]
+    reward.score_and_attach(sample)  → score the frontier (image) Part only
+    sample.propagate_rewards("mean") → credit-assign image reward up to "ar"
+    part.compute_advantages()        → per-Part GRPO (ar by prompt, diff by rewrite)
+    {name}.stack.train_track(part)   → route each Part to its own model
 
 Mirrors :class:`~unirl.trainer.diffusion.DiffusionTrainer` but wires two
 of everything and a composed rollout. Deferred (same as the reference trainer):
@@ -37,17 +37,14 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
-from unirl.types.prompts import RolloutInputs
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.sampling import BaseSamplingParams
+from unirl.types.sample import Sample
+from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
 
-# Track names match PEPipeline's output and the per-side attributes on the
-# trainer (``self.ar`` / ``self.diffusion``); also the algorithms' stage_attr.
 TRACK_NAMES: Tuple[str, ...] = ("ar", "diffusion")
 
 
@@ -111,84 +108,42 @@ class PETrainer(BaseTrainer):
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
-        # Offload both tracks' FSDP train state to CPU during generate so the
-        # awake sglang engines have room; onload before the train backward.
-        # Never runs for trainside (it samples the live FSDP modules) — see train_step.
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._rollout_is_trainside = False
-        # Frozen LLM: the AR side is a rollout-only rewriter — built bundle +
-        # pipeline (so the composed PEPipeline can sample it under no_grad), but
-        # NO backend / algorithm / stack, so it never trains. Only the diffusion
-        # track updates. ``_train_tracks`` is the set ``train_step`` routes to
-        # ``stack.train_track``; with a frozen LLM that's diffusion alone.
         self._freeze_llm = bool(freeze_llm)
         self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
-        # Diffusion-track GRPO grouping level (the advantage baseline):
-        #   "rewrite" (default): group = the M images of one rewrite (group by
-        #       the rewrite's sample id) — images compared only to siblings with
-        #       identical conditioning text. Byte-identical to the prior behavior.
-        #   "prompt": group = all N*M images descended from one original prompt
-        #       (group by the ROOT prompt id) — a rewrite that systematically
-        #       beats the prompt-wide mean earns non-zero advantage, so diffusion
-        #       learns to render well for the original intent across the rewriter's
-        #       rephrasings. Pairs with ``freeze_llm`` (fixed rewriter) for the
-        #       "same semantics, different wordings → better images" objective.
         self._diffusion_group_scope = str(diffusion_group_scope)
         if self._diffusion_group_scope not in ("rewrite", "prompt"):
             raise ValueError(
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
 
-        # Periodic eval on the eval set (run.eval_data_path), logged under eval/*;
-        # eval_interval=0 disables it. Scores only the image ("diffusion") track,
-        # generated at the deterministic best-quality setting (CFG=
-        # eval_cfg_text_scale, eta=eval_eta) — same knobs/semantics as
-        # DiffusionTrainer; extra eval-only rewards: unirl.trainer.eval_suites.
-        # No eval_samples_per_prompt knob: the P->P*N*M two-level fan-out makes
-        # a single per-prompt count ambiguous (N*M is already a dense eval).
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
 
-        # PE prompt-rewrite knobs forwarded to the composed PEPipeline (trainside
-        # only — they shape the LLM rewrite + the text the diffusion child sees,
-        # mirroring the sglang ComposedRolloutEngine's pe_instruction / pe_marker).
-        # ``None`` everywhere preserves the prior bare-prompt behavior.
         pe = pe_cfg if pe_cfg is not None else {}
         self._pe_instruction = pe.get("pe_instruction", None)
         self._pe_marker = pe.get("pe_marker", None)
         self._pe_max_chars = pe.get("pe_max_chars", None)
 
-        # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
 
-        # {"ar": ARSamplingParams(N), "diffusion": DiffusionSamplingParams(M)} —
-        # the modality-keyed sampling dict driving PEPipeline's two-level fan-out.
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
-        # Per-track weight-sync bridges; None trainside (shares the modules).
         self.diffusion_sync = None
         self.ar_sync = None
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.diffusion = self._wire_side(diffusion_cfg)
-            # Frozen LLM → rollout-only AR (bundle + pipeline, no training trio).
             self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
-            # Pass the (composed) pipeline only to engines whose role_cls
-            # declares it (trainside). For a separate-process engine
-            # (``composed_pe``: sglang + sglang_diffusion) there is no shared
-            # pipeline — trained weights reach the engine via the sync bridges.
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
             takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
             # Trainside samples the live FSDP modules → must not FSDP-offload.
             self._rollout_is_trainside = bool(takes_pipeline)
             if takes_pipeline:
-                # Trainside: the composed PE pipeline shares both trained child
-                # pipelines in-process, so the rollout samples the live FSDP
-                # modules — no weight sync. ``stage_attrs: [diffusion, ar]``
-                # eval-scopes both trained models.
                 self.pe_pipeline = remote(
                     PEPipeline,
                     diffusion_pipeline=self.diffusion.pipeline,
@@ -203,16 +158,10 @@ class PETrainer(BaseTrainer):
                 self.rollout = remote(**rollout_parsed)
 
             self.reward = remote_hydra(reward_cfg)
-            # Extra eval-only rewards (eval_rewards) — siblings of the training
-            # reward on this slab; see unirl.trainer.eval_suites.
             self._eval_suites = build_eval_suites(
                 eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
             )
 
-            # Non-trainside: one bridge per track, each routed to its child of
-            # the composed engine by ``track_prefix`` (set in the sync block).
-            # A frozen LLM has no AR backend (and never trains), so it needs no
-            # AR sync bridge — only the diffusion adapter is pushed to the engine.
             if sync_cfg is not None:
                 self.diffusion_sync = remote_hydra(
                     sync_cfg.diffusion, backend=self.diffusion.backend, rollout=self.rollout
@@ -249,43 +198,49 @@ class PETrainer(BaseTrainer):
         pipeline = remote_hydra(cfg.pipeline, bundle=bundle)
         return _Side(bundle=bundle, pipeline=pipeline)
 
-    def _build_req(
-        self, inputs: RolloutInputs, rollout_id: int, *, base_sampling: Optional[Dict[str, BaseSamplingParams]] = None
-    ) -> RolloutReq:
-        """Turn a data-source batch of ``P`` prompts into a typed ``RolloutReq``.
+    def _build_request_sample(
+        self,
+        inputs: Sample,
+        rollout_id: int,
+        *,
+        sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+    ) -> Sample:
+        """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``.
 
-        No pre-expansion: ``PEPipeline`` fans out ``P → P*N → P*N*M`` internally
-        from the sampling dict (``ar.samples_per_prompt`` rewrites,
-        ``diffusion.samples_per_prompt`` images each). The single-track trainer
-        pre-expands here; PE must not, or it would double-count.
+        Namespaces the data source's single text input Part, then pre-forks
+        the two gen shells the composed engine expects — ``[input, ar_shell(P*N),
+        diff_shell(P*N*M)]``, located by sampling-params type. The two forks encode
+        ``ar.samples_per_prompt`` rewrites and ``diffusion.samples_per_prompt``
+        images per rewrite.
 
-        ``rollout_id`` keys the diffusion SDE-step schedule: the indices are
-        resolved off the diffusion sub-block (``resolve_sde_indices``), stamped
-        onto a per-request copy, and the ``scheduler`` is nulled so only the
-        concrete ``sde_indices`` ride to the engine (mirrors
-        :meth:`DiffusionTrainer._build_req` / :meth:`UnifiedModelTrainer._build_req`).
-        The AR sub-block has no SDE machinery and is left untouched.
-
-        ``base_sampling`` overrides the modality-keyed sampling dict (``evaluate``
-        passes its own deterministic params); ``None`` uses ``self.sampling_params``.
+        ``rollout_id`` keys the diffusion SDE-step schedule (resolved off the
+        diffusion sub-block, ``scheduler`` nulled so only the concrete
+        ``sde_indices`` ride) and salts the root ids so the diffusion x_T varies
+        per rollout — the engine derives the noise key from the gen Part ids. The
+        AR sub-block has no SDE machinery and is left untouched.
+        ``sampling`` overrides the modality-keyed sampling dictionary for
+        evaluation; ``None`` uses the training parameters.
         """
-        base = base_sampling if base_sampling is not None else self.sampling_params
+        base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
+        ar_params = base.get("ar")
         sde_indices = diff_params.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
-        sampling_params = {**base, "diffusion": diffusion}
-        return RolloutReq(
-            sample_ids=list(inputs.sample_ids),
-            group_ids=list(inputs.group_ids),
-            primitives=dict(inputs.primitives),
-            request_conditions={},
-            sampling_params=sampling_params,
-            metadata=list(inputs.metadata) if inputs.metadata else [],
+        request = prepare_input_sample(
+            inputs,
+            rollout_id,
+            allowed_primitives={"text"},
+            caller="PETrainer._build_request_sample",
+            root_control={"ar": {}, "chat": {}},
+            require_single_input_part=True,
+        )
+        return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
+            diffusion.samples_per_prompt, sampling_params=diffusion
         )
 
     def train_step(
         self,
-        req: RolloutReq,
+        sample: Sample,
         *,
         training_progress: float = 0.0,
         sync_weights: bool = False,
@@ -307,78 +262,51 @@ class PETrainer(BaseTrainer):
             self.diffusion_sync.sync()
             if self.ar_sync is not None:
                 self.ar_sync.sync()
-        # Free both tracks' train state during the separate-engine generate.
-        # Sync above reads the FSDP weights, so offload only after it. A frozen
-        # LLM has no AR backend, so only the diffusion train state is offloaded.
         do_fsdp_offload = self._enable_fsdp_offload and not self._rollout_is_trainside
         if do_fsdp_offload:
             self.diffusion.backend.offload()
             if self.ar.backend is not None:
                 self.ar.backend.offload()
-        resp = self.rollout.generate(req)
+        sample = self.rollout.generate(sample)
         self.rollout.sleep()
         if do_fsdp_offload:
             self.diffusion.backend.onload()
             if self.ar.backend is not None:
                 self.ar.backend.onload()
 
-        # 1. Score the IMAGE track only — the AR track's TextSegment is not
-        #    directly scorable; its reward is credit-assigned below.
-        #    ``score_and_attach`` is DP_SCATTER: it shards the diffusion track
-        #    (P*N*M) across workers, but the P-prompt ``req`` would broadcast
-        #    whole, so each worker would see a (track-shard) vs P size
-        #    mismatch. Expand the req prompt-major to the track size first
-        #    (mirrors DiffusionTrainer's pre-expanded single-track req) so the
-        #    req and track shard identically across DP workers.
-        diff_track = resp.tracks["diffusion"]
-        n_track, p = len(diff_track.sample_ids), max(1, req.batch_size)
-        reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
-        scored = self.reward.score_and_attach(req=reward_req, track=diff_track)
-        # propagate_rewards reshapes child.rewards directly (no hydration), so
-        # turn the worker-returned TensorRef into a real tensor first.
-        if scored.rewards is not None:
-            scored.rewards = hydrate(scored.rewards)
-        resp.tracks["diffusion"] = scored
+        ar_idx = sample.gen_part_index(ARSamplingParams)
+        diff_idx = sample.gen_part_index(DiffusionSamplingParams)
+        parts_by_name = {"ar": ar_idx, "diffusion": diff_idx}
 
-        # 2. Credit-assign image reward up the lineage → fills the "ar" track
-        #    (mean over the M images of each rewrite). Kept even with a frozen
-        #    LLM: it is cheap and gives the AR track a logged reward for parity,
-        #    though the resulting AR advantage is unused when the LLM is frozen.
-        resp = resp.propagate_rewards(op="mean")
+        sample = self.reward.score_and_attach(sample)
+        diff_part = sample.parts[diff_idx]
+        if diff_part.rewards is not None:
+            diff_part.rewards = hydrate(diff_part.rewards)
+        if isinstance(diff_part.component_rewards, dict):
+            diff_part.component_rewards = {name: hydrate(value) for name, value in diff_part.component_rewards.items()}
 
-        # 3. Mean image reward for the log line.
+        sample = sample.propagate_rewards(op="mean")
+
         mean_reward = 0.0
-        di_rewards = resp.tracks["diffusion"].rewards
+        di_rewards = sample.parts[diff_idx].rewards
         if di_rewards is not None:
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
-        # 4. Per-track GRPO advantages. "ar" groups by prompt (its N rewrites).
-        #    "diffusion" groups by rewrite (M images) by default, or — when
-        #    ``diffusion_group_scope="prompt"`` — by the ROOT prompt (all N*M
-        #    images of a prompt) so cross-rewrite quality becomes signal. Only
-        #    the trained tracks need advantages; a frozen LLM skips the AR one.
+        new_parts = list(sample.parts)
         for name in self._train_tracks:
-            if name == "diffusion" and self._diffusion_group_scope == "prompt":
-                resp.tracks[name] = resp.compute_track_advantages(name, group_key="root", normalize=True)
-            else:
-                resp.tracks[name] = resp.tracks[name].compute_advantages(normalize=True)
+            idx = parts_by_name[name]
+            layer = 0 if (name == "diffusion" and self._diffusion_group_scope == "prompt") else None
+            new_parts[idx] = new_parts[idx].compute_advantages(normalize=True, group_layer=layer)
+        sample = sample.with_parts(new_parts)
 
-        # ``reward_req`` text is repeat_interleaved to the diffusion track size
-        # (one prompt per sample), so it captions the image previews correctly —
-        # unlike ``req`` (one prompt per group).
-        self._drop_decoded(
-            req,
-            resp,
-            rollout_id=rollout_id,
-            media_prompts={"diffusion": list(reward_req.primitives["text"].texts)},
-        )
-        # 5. Route each TRAINED track to its own stack (each DP_SCATTER-sharded
-        #    on dispatch). A frozen LLM trains the diffusion track only.
+        self._drop_decoded(sample, rollout_id=rollout_id)
         results: Dict[str, TrainStepResult] = {
-            name: getattr(self, name).stack.train_track(resp.tracks[name], training_progress=float(training_progress))
+            name: getattr(self, name).stack.train_track(
+                sample.parts[parts_by_name[name]], training_progress=float(training_progress)
+            )
             for name in self._train_tracks
         }
-        self.wandb_logger.log_rollout_step(rollout_id, results, resp, step_time_s=time.perf_counter() - t0)
+        self.wandb_logger.log_rollout_step(rollout_id, results, sample, step_time_s=time.perf_counter() - t0)
         return results, mean_reward
 
     def evaluate(self, step: int) -> float:
@@ -395,10 +323,6 @@ class PETrainer(BaseTrainer):
         land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``); returns
         ``eval/reward``.
         """
-        # Override only the "diffusion" entry of the modality-keyed sampling dict.
-        # CFG strength lives in ``cfg_text_scale`` on Bagel-style sampling params
-        # and in ``guidance_scale`` on the standard DiffusionSamplingParams (SD3,
-        # ...) — same fallback as :meth:`DiffusionTrainer.evaluate`.
         base_diffusion = self.sampling_params.get("diffusion")
         replace_kwargs = dict(eta=self.eval_eta)
         if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
@@ -408,18 +332,21 @@ class PETrainer(BaseTrainer):
         eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         self.rollout.wake_up()
-        if self.diffusion_sync is not None:  # no-op trainside (bridges are None)
-            self.diffusion_sync.sync()
-            if self.ar_sync is not None:
-                self.ar_sync.sync()
-        # Default pass: training reward + shared-set suites score the SAME images.
-        scorers = [("reward", self.reward)] + [(s.name, s.reward) for s in self._eval_suites if s.data_source is None]
-        metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
-        for suite in self._eval_suites:
-            if suite.data_source is not None:
-                n = suite.num_prompts or self.eval_num_prompts
-                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
-        self.rollout.sleep()
+        try:
+            if self.diffusion_sync is not None:
+                self.diffusion_sync.sync()
+                if self.ar_sync is not None:
+                    self.ar_sync.sync()
+            scorers = [("reward", self.reward)] + [
+                (s.name, s.reward) for s in self._eval_suites if s.data_source is None
+            ]
+            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            for suite in self._eval_suites:
+                if suite.data_source is not None:
+                    n = suite.num_prompts or self.eval_num_prompts
+                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+        finally:
+            self.rollout.sleep()
         logger.info(
             "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
             step,
@@ -446,30 +373,23 @@ class PETrainer(BaseTrainer):
         (``num_prompts`` not a multiple of ``batch_size``) is floored off.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
-        n_prompts = len(all_inputs.sample_ids)
+        n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
         usable = n_prompts - n_prompts % chunk or n_prompts
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
-            req = self._build_req(sub, step, base_sampling=eval_sp)
-            resp = self.rollout.generate(req)
-            # Score the image track only; align the P-prompt req to the P*N*M
-            # image track so req and track shard identically across DP workers
-            # (same expansion as train_step).
-            diff_track = resp.tracks["diffusion"]
-            n_track, p = len(diff_track.sample_ids), max(1, req.batch_size)
-            reward_req = req.repeat_interleave(n_track // p) if n_track > p and n_track % p == 0 else req
+            request = self._build_request_sample(sub, step, sampling=eval_sp)
+            generated = self.rollout.generate(request)
             for name, reward in scorers:
-                scored = reward.score_and_attach(req=reward_req, track=diff_track)
-                if scored.rewards is not None:
-                    r = hydrate(scored.rewards).to(torch.float32)
+                scored = reward.score_and_attach(generated)
+                rewards = scored.parts[-1].rewards
+                if rewards is not None:
+                    r = hydrate(rewards).to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
-
-    # ---- checkpointing (PE trains two sides → one subdir per trained side) --
 
     def _ckpt_sides(self):
         """The trained sides to checkpoint: diffusion always; ar only when it trains.
@@ -484,10 +404,13 @@ class PETrainer(BaseTrainer):
             sides.append(("ar", self.ar))
         return sides
 
-    def _wait_for_checkpoints(self) -> None:
+    def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
         """Flush both side backends before another save or worker teardown."""
         for _, side in self._ckpt_sides():
-            side.backend.wait_for_checkpoint()
+            if timeout is None:
+                side.backend.wait_for_checkpoint()
+            else:
+                side.backend.wait_for_checkpoint(_ray_get_timeout=timeout)
 
     def maybe_save_checkpoint(
         self,
@@ -540,7 +463,7 @@ class PETrainer(BaseTrainer):
         start = 0
         for name, side in self._ckpt_sides():
             result = side.backend.load(os.path.join(load_dir, name))
-            if isinstance(result, list):  # BROADCAST dispatch collects one result per worker
+            if isinstance(result, list):
                 result = result[0]
             start = int(result or 0)
         state_path = os.path.join(load_dir, "trainer_state.json")
@@ -581,34 +504,26 @@ class PETrainer(BaseTrainer):
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        # Fast-forward the data stream to the resume point — exact when
-        # run.seed is set (deterministic shuffle); with seed=null the stream
-        # is non-reproducible anyway.
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
             if self.eval_interval > 0:
-                self.evaluate(start_rollout)  # baseline eval before any training
+                self.evaluate(start_rollout)
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
-                req = self._build_req(inputs, rollout_id)
-                # Sync before generate; skip step 0 (nothing trained yet). On
-                # resume, force the first sync — the engine booted with fresh
-                # weights and needs the restored adapter before generate.
+                sample = self._build_request_sample(inputs, rollout_id)
                 sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
                     resumed and rollout_id == start_rollout
                 )
                 results, mean_reward = self.train_step(
-                    req,
+                    sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, results, mean_reward, logger=logger)
-                # eval(k) BEFORE save(checkpoint-k) at the same step, so a
-                # resumed checkpoint re-runs the same eval (A/B consistency).
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     self.evaluate(rollout_id + 1)
                 self.maybe_save_checkpoint(

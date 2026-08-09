@@ -18,6 +18,12 @@ _DTYPE_ALIASES = {
     "float": torch.float32,
 }
 
+_CANONICAL_DTYPE_NAMES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
 
 def parse_torch_dtype(
     value: Any,
@@ -42,6 +48,14 @@ def parse_torch_dtype(
 
     valid = "bf16/fp16/fp32" + ("/auto" if allow_auto else "")
     raise ValueError(f"Unsupported {field_name}={value!r}. Use one of {valid}.")
+
+
+def canonical_torch_dtype_name(dtype: torch.dtype, *, field_name: str = "dtype") -> str:
+    """Return the canonical PyTorch attribute name for a supported dtype."""
+    name = _CANONICAL_DTYPE_NAMES.get(dtype)
+    if name is None:
+        raise ValueError(f"Unsupported {field_name}={dtype!r}; expected bf16/fp16/fp32.")
+    return name
 
 
 def inject_model_dtype_kwarg(

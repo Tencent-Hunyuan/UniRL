@@ -76,7 +76,7 @@ class SFT(StageAlgorithm):
     under supervision.
     """
 
-    supports_multi_update = True  # anchor-free: each disjoint update is plain SGD on its slice
+    supports_multi_update = True
     requires_advantages = False
 
     def __init__(
@@ -100,13 +100,7 @@ class SFT(StageAlgorithm):
         self.loss_agg_mode = loss_agg_mode
         self.horizon = horizon
         self.conditions_cls = conditions_cls
-        # token-mean pairs with the stack's global-token weighting; the seq-mean
-        # modes weigh sequences equally, i.e. sample-share weighting.
         self.loss_weighting = "token" if self.loss_agg_mode == "token-mean" else "sample"
-
-    # ------------------------------------------------------------------
-    # StageAlgorithm contract
-    # ------------------------------------------------------------------
 
     def compute_loss_and_backward(
         self,
@@ -117,7 +111,7 @@ class SFT(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        del advantages, training_progress  # supervised: no advantage signal, no schedules
+        del advantages, training_progress
         if segment is None or segment.tokens is None or segment.lengths is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         if segment.tokens.shape[0] == 0:
@@ -161,10 +155,6 @@ class SFT(StageAlgorithm):
         _, aux = self._masked_ce(conditions, segment)
         return aux["objective_sum"], aux["objective_weight"]
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _masked_ce(
         self,
         conditions: Mapping[str, Condition],
@@ -175,7 +165,7 @@ class SFT(StageAlgorithm):
         ``temperature=1.0`` — plain CE, never a sampling-matched rescale.
         """
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=1.0)  # [total_tokens] fp32
+        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=1.0)
         nll = -new_logp
 
         mask = segment.loss_mask
@@ -201,7 +191,7 @@ class SFT(StageAlgorithm):
             valid_parts = [(p, weight) for p, weight in zip(parts, token_weights) if weight > 0.0]
             if self.loss_agg_mode == "seq-mean-token-sum-norm":
                 per_seq = [p.sum() / self.horizon for p, _ in valid_parts]
-            else:  # seq-mean-token-mean
+            else:
                 per_seq = [p.sum() / weight for p, weight in valid_parts]
             objective_sum = torch.stack(per_seq).sum() if per_seq else ce_sum * 0.0
             objective_weight = float(len(per_seq))
@@ -252,9 +242,9 @@ class FlowMatchSFT(StageAlgorithm):
             learning).
     """
 
-    supports_multi_update = True  # anchor-free
+    supports_multi_update = True
     requires_advantages = False
-    loss_weighting = "sample"  # each image/video sample weighs equally
+    loss_weighting = "sample"
 
     def __init__(
         self,
@@ -293,10 +283,6 @@ class FlowMatchSFT(StageAlgorithm):
         self.timestep_shift = timestep_shift
         self.sigma_min = sigma_min
         self.eval_seed = eval_seed
-
-    # ------------------------------------------------------------------
-    # StageAlgorithm contract
-    # ------------------------------------------------------------------
 
     def compute_loss_and_backward(
         self,
@@ -362,10 +348,6 @@ class FlowMatchSFT(StageAlgorithm):
             return float((per_sample * mask).sum().item()), float(mask.sum().item())
         return float(per_sample.sum().item()), float(per_sample.shape[0])
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _clean_latents(segment: LatentSegment) -> Optional[torch.Tensor]:
         if segment is None or segment.latents is None:
@@ -376,8 +358,6 @@ class FlowMatchSFT(StageAlgorithm):
         x0 = segment.latents[:, -1]
         if x0.numel() == 0:
             return None
-        # fp32 endpoint math — bf16 loses precision when σ approaches 0 or 1
-        # (same rationale as DiffusionNFT's fp32 timestep path).
         return x0.float()
 
     def _draw_sigma(self, batch: int, device: torch.device, generator: Optional[torch.Generator]) -> torch.Tensor:
@@ -436,11 +416,9 @@ class FlowMatchSFT(StageAlgorithm):
         xt = (1.0 - s) * x0 + s * noise
         v_target = noise - x0
 
-        # Single-sample micros pass a 0-dim σ — accepted by every stage
-        # (SD3 broadcasts; Bagel's packed forward requires the scalar form).
         sigma_arg = sigma if batch > 1 else sigma.reshape(())
         v_pred = self.stage.predict_noise_at_step(typed_conds, sample=xt, sigma=sigma_arg, params=self.params)
-        if v_pred.ndim == x0.ndim - 1:  # unit-batch stages may squeeze the batch dim
+        if v_pred.ndim == x0.ndim - 1:
             v_pred = v_pred.unsqueeze(0)
         per_sample = (v_pred.float() - v_target).pow(2).mean(dim=tuple(range(1, x0.ndim)))
         loss = per_sample.mean()

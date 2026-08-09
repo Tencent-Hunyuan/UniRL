@@ -20,41 +20,53 @@ import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.ar import ARTrainer
+from unirl.utils.graceful_shutdown import GracefulShutdown
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="ar/qwen_vl_grpo_geo3k_mc_4x8")
 def main(cfg: DictConfig) -> None:
-    trainer = ARTrainer(
-        cfg=cfg,
-        batch_size=cfg.batch_size,
-        bundle_cfg=cfg.bundle,
-        pipeline_cfg=cfg.pipeline,
-        backend_cfg=cfg.backend,
-        rollout_cfg=cfg.rollout,
-        reward_cfg=cfg.reward,
-        algorithm_cfg=cfg.algorithm,
-        stack_cfg=cfg.stack,
-        data_source_cfg=cfg.data_source,
-        sampling_cfg=cfg.sampling,
-        sync_cfg=cfg.get("sync"),
-        logging_cfg=cfg.get("logging"),
-        adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
-        normalize_adv_by_std=cfg.get("normalize_adv_by_std", True),
-        balance_shards=cfg.get("balance_shards", False),
-        eval_interval=cfg.get("eval_interval", 0),
-        eval_num_prompts=cfg.get("eval_num_prompts", -1),
-        eval_batch_size=cfg.get("eval_batch_size", 8),
-        eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 16),
-        eval_temperature=cfg.get("eval_temperature", 1.0),
-    )
-    trainer.train(
-        num_rollouts=cfg.get("num_rollouts", 100),
-        weight_sync_interval=cfg.get("weight_sync_interval", 1),
-        save_interval=cfg.get("save_interval", 0),
-        save_dir=cfg.get("save_dir"),
-        load_dir=cfg.get("load_dir"),
-        save_mode=cfg.get("save_mode", "auto"),
-    )
+    trainer = None
+
+    def teardown() -> None:
+        if trainer is not None:
+            trainer.shutdown()
+
+    with GracefulShutdown(teardown, name="ar-train") as guard:
+        trainer = ARTrainer(
+            cfg=cfg,
+            batch_size=cfg.batch_size,
+            bundle_cfg=cfg.bundle,
+            pipeline_cfg=cfg.pipeline,
+            backend_cfg=cfg.backend,
+            rollout_cfg=cfg.rollout,
+            reward_cfg=cfg.reward,
+            algorithm_cfg=cfg.algorithm,
+            stack_cfg=cfg.stack,
+            data_source_cfg=cfg.data_source,
+            sampling_cfg=cfg.sampling,
+            sync_cfg=cfg.get("sync"),
+            logging_cfg=cfg.get("logging"),
+            adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
+            normalize_adv_by_std=cfg.get("normalize_adv_by_std", True),
+            advantage_mode=cfg.get("advantage_mode", "grpo"),
+            balance_shards=cfg.get("balance_shards", False),
+            eval_interval=cfg.get("eval_interval", 0),
+            eval_num_prompts=cfg.get("eval_num_prompts", -1),
+            eval_batch_size=cfg.get("eval_batch_size", 8),
+            eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 16),
+            eval_temperature=cfg.get("eval_temperature", 1.0),
+            rollout_anchor_device=cfg.get("rollout_anchor_device", None),
+            enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
+        )
+        guard.claim_signals()
+        trainer.train(
+            num_rollouts=cfg.get("num_rollouts", 100),
+            weight_sync_interval=cfg.get("weight_sync_interval", 1),
+            save_interval=cfg.get("save_interval", 0),
+            save_dir=cfg.get("save_dir"),
+            load_dir=cfg.get("load_dir"),
+            save_mode=cfg.get("save_mode", "auto"),
+        )
 
 
 if __name__ == "__main__":

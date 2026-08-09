@@ -57,12 +57,7 @@ _SGLANG_ENGINE_TARGET_SUFFIX = "SGLangDiffusionRolloutEngine"
 _VLLM_OMNI_ENGINE_TARGET_SUFFIX = "VLLMOmniRolloutEngine"
 _TRAINSIDE_ENGINE_TARGET_SUFFIX = "TrainsideRolloutEngine"
 _DIRECT_SAMPLING_ENGINE_SUFFIXES: tuple = (_TRAINSIDE_ENGINE_TARGET_SUFFIX,)
-# Sync handlers that only one engine implements. Listed here so the validator
-# can fail fast on a mismatched pairing. UpdateWeightFromTensor /
-# UpdateWeightFromDistributed work on BOTH sglang and vllm-omni — they're
-# transport-shape contracts, not engine-specific (vllm-omni's receivers live
-# in unirl.rollout.engine.vllm_omni.worker.{ipc,nccl}_receive_mixin).
-_IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})  # vllm-omni only
+_IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})
 
 
 def is_direct_sampling(cfg: DictConfig) -> bool:
@@ -189,11 +184,6 @@ def validate_keep_local_contract(cfg: DictConfig) -> None:
         "cfg.training.execution.keep_local=True is mutually exclusive with "
         "transfer_queue (both move data off the driver); enable exactly one.",
     )
-    # Keep-local shards each rollout by prompt-group across the train actors;
-    # the gathered path instead re-balances
-    # samples evenly on the driver. The two partitions — and thus each rank's
-    # mean loss and the FSDP-averaged gradient — coincide only when the prompt
-    # groups split evenly across actors, so require that here.
     actor_count = cfg.training.topology.get("actor_count", None)
     if actor_count is not None:
         n = int(actor_count)
@@ -290,8 +280,8 @@ def validate_multi_track_mini_batch_geometry(cfg: DictConfig) -> None:
     """Multi-track mini-batching requires per-actor sample counts divisible by num_updates.
 
     In a multi-track PE joint setup (ar + diffusion), the train actor splits the
-    rollout response into ``num_updates_per_batch`` mini-batches along the root
-    track (ar).  The root track's per-actor batch size is
+    generated Sample into ``num_updates_per_batch`` mini-batches along the AR
+    Part. The AR Part's per-actor batch size is
     ``P * N / actor_count`` and must divide evenly by ``num_updates_per_batch``;
     otherwise the lineage-aware split cannot produce equal-sized chunks.
 
@@ -307,7 +297,6 @@ def validate_multi_track_mini_batch_geometry(cfg: DictConfig) -> None:
     if tracks is None or len(tracks) <= 1:
         return
 
-    # Compute root (ar) track per-actor batch size: P * N / actor_count.
     P = int(cfg.algorithm.get("prompts_per_rollout", 1))
     N = int(cfg.algorithm.get("pe_rewrites_per_prompt", 1))
     actor_count = int(cfg.training.topology.get("actor_count", 1))
@@ -326,7 +315,6 @@ def validate_multi_track_mini_batch_geometry(cfg: DictConfig) -> None:
         f"num_updates_per_batch to satisfy ar_per_actor % num_updates == 0.",
     )
 
-    # Also check diffusion track: P * N * M / actor_count.
     M = int(cfg.algorithm.get("samples_per_prompt", 1))
     diff_per_actor = (P * N * M) // max(actor_count, 1)
     require(

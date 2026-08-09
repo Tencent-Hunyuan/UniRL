@@ -17,7 +17,7 @@ that was free to begin with:
   climbs as the model actually applies the requested edit.
 
 The source condition frame is available because ``RewardService`` copies the
-rollout request's ``primitives`` (including the ``video`` condition) into the
+Sample's conditioning primitives (including the ``video`` condition) into the
 reward request and ``repeat_interleave``s them to per-sample alignment.
 """
 
@@ -53,21 +53,9 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 
     def __init__(self, *, config: "VideoCLIPDeltaSpec", base_device: str) -> None:
         self.lambda_source = float(getattr(config, "lambda_source", 0.25))
-        # Score K evenly-spaced frames (not just the first) so the edit reward
-        # reflects the whole clip rather than a single-frame proxy.
         self.num_score_frames = max(1, int(getattr(config, "num_score_frames", 3)))
-        # Cap on the source-divergence reward: clamp the edited-vs-source CLIP
-        # cosine to this floor so once a frame is "different enough" there is no
-        # further reward for diverging more. This bounds the penalty's
-        # contribution and zeroes its gradient past the floor, which stops the
-        # reward-hacking failure mode where the policy destroys content just to
-        # look maximally unlike the source.
         self.source_sim_floor = float(getattr(config, "source_sim_floor", 0.3))
         super().__init__(config=config, base_device=base_device)
-
-    # ------------------------------------------------------------------
-    # Frame + embedding helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _sample_frames_pil(video: "Video", k: int) -> list["Image.Image"]:
@@ -108,10 +96,6 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
         emb = self.model.get_text_features(**inputs)
         return emb / emb.norm(p=2, dim=-1, keepdim=True)
 
-    # ------------------------------------------------------------------
-    # Reward
-    # ------------------------------------------------------------------
-
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         edited = request.generated.get("video")
         if edited is None:
@@ -136,15 +120,11 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
             )
 
         k = self.num_score_frames
-        # Flatten to n*k frames so each video contributes exactly k frames.
         edited_frames = [f for v in edited_videos for f in self._sample_frames_pil(v, k)]
         source_frames = [f for v in source_videos for f in self._sample_frames_pil(v, k)]
 
         rewards: List[float] = []
         with torch.no_grad():
-            # Both terms use the SAME PickScore scaling (logit_scale / 26), so
-            # lambda_source is a pure, scale-invariant relative weight between
-            # "match the target text" and "stop looking like the source".
             scale = self.model.logit_scale.exp() / 26.0
             for v_lo in range(0, n, self.batch_size):
                 v_hi = min(v_lo + self.batch_size, n)
@@ -153,14 +133,11 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
                 s = source_frames[v_lo * k : v_hi * k]
                 p = prompts[v_lo:v_hi]
 
-                edited_emb = self._embed_images(e)  # [nb*k, d]
-                source_emb = self._embed_images(s)  # [nb*k, d]
-                text_emb = self._embed_texts(p).repeat_interleave(k, dim=0)  # [nb*k, d]
+                edited_emb = self._embed_images(e)
+                source_emb = self._embed_images(s)
+                text_emb = self._embed_texts(p).repeat_interleave(k, dim=0)
 
-                # Per-frame cosines, averaged over the k frames of each video.
                 text_cos = (text_emb * edited_emb).sum(dim=-1)
-                # Cap the source-divergence reward: clamp the cosine from below so
-                # diverging past the floor earns nothing more (and gets no gradient).
                 source_cos = (edited_emb * source_emb).sum(dim=-1).clamp(min=self.source_sim_floor)
                 text_align = (scale * text_cos).view(nb, k).mean(dim=1)
                 source_sim = (scale * source_cos).view(nb, k).mean(dim=1)

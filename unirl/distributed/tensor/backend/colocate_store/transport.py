@@ -58,25 +58,16 @@ class ColocateStoreTransport(WorkerLocalTransport):
     def is_ref(self, value: Any) -> bool:
         return isinstance(value, TensorRef)
 
-    # ── lifecycle ──
-
     def incref(self, key: Any) -> None:
         self._store.incref(key)
 
     def decref(self, key: Any) -> None:
         self._store.decref(key)
 
-    # locality: colocate is single-slot per device, so a ref is local only if produced
-    # by the dst worker itself — exactly WorkerLocalTransport's default _is_local. The
-    # shared localize skeleton (cross-device → slot0↔slot0 NCCL) is inherited.
-
-    # ── cross-worker transfer ──
-
     def setup_transfer(self, global_rank: int, world_size: int) -> None:
         self._store.setup_global_pg(global_rank, world_size)
 
     def nccl_send(self, dst_rank: int, spans: List[TensorSpan]) -> None:
-        # Each ref is a span → send ONLY its [start:stop) rows (exact-row routing).
         items = [(s.handle.store_key, s.start, s.stop) for s in spans]
         self._store._nccl_send(dst_rank, items)
 
@@ -84,7 +75,6 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return self._store._nccl_recv(src_rank, shapes, dtypes)
 
 
-# Backwards-compatible alias (older name).
 TensorStoreTransport = ColocateStoreTransport
 
 __all__ = ["ColocateStoreTransport", "TensorStoreTransport"]

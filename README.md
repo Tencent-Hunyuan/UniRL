@@ -39,6 +39,10 @@ the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
 Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
 runtime loop, deployment modes, and module map.
 
+The agentic entrypoint extends the AR path with multi-turn tool interaction. It
+preserves each turn as a `Sample` lineage, scores terminal answers through a
+reward service, and trains at a colocated rollout barrier.
+
 ## Team-Proposed Algorithms 🌟
 
 > **🌟 These algorithms are proposed by our team — the highlight of UniRL.** Each
@@ -101,6 +105,25 @@ Examples are self-contained YAML files selected with
 
 See [`examples/README.md`](examples/README.md) for the full launch guide, naming
 schema, and how to add a recipe.
+
+## Agentic Workflows 🤖
+
+The agentic rollout engine repeatedly performs model generation followed by an
+environment step and returns a trajectory of `Sample` objects. One public
+workflow is supported:
+
+| Workflow | Entrypoint | Example recipe |
+|---|---|---|
+| Service-scored multi-turn tool use | `train_agentic` | [`deep_research/deep_research_search_judge`](examples/deep_research/deep_research_search_judge.yaml) |
+
+`AgenticTrainer` synchronizes current training weights before every rollout,
+dispatches sibling trajectories concurrently, and waits for complete GRPO groups
+before scoring and training. Each successful trajectory receives one group-normalized
+advantage, which is applied to every generated assistant turn. Failed
+trajectories are excluded from the update.
+
+See the [agent environment guide](unirl/rollout/env/README.md) for the
+environment, tool, and trajectory contracts.
 
 ## Getting Started ⚡
 

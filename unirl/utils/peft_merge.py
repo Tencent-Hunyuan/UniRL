@@ -5,9 +5,23 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 _PEFT_PREFIX = "base_model.model."
+_PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "qwen3_5_moe"})
+
+
+def lora_targets_ep_experts(model: torch.nn.Module) -> bool:
+    """Whether PEFT injected LoRA tensors into fused EP expert modules.
+
+    Attention/shared-expert LoRA remains compatible with EP because those
+    tensors use the normal FSDP mesh. LoRA inside ``.experts.`` would itself
+    need an outer EP gather and per-expert conversion, which neither the LoRA
+    nor merged-full receiver formats can represent safely.
+    """
+    if not getattr(model, "_extra_parallel_param_groups", None):
+        return False
+    return any(".experts." in name and (".lora_A." in name or ".lora_B." in name) for name in model.state_dict())
 
 
 def _strip_peft_prefix(name: str) -> str:
@@ -29,6 +43,115 @@ def _to_full_tensor(tensor: torch.Tensor, dtype: torch.dtype | None = None) -> t
     return tensor
 
 
+def _iter_rollout_tensors(
+    name: str,
+    tensor: torch.Tensor,
+    dtype: torch.dtype | None = None,
+    *,
+    unpack_qwen_moe: bool = False,
+    moe_intermediate: int | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield rollout-compatible full tensors, streaming packed MoE experts.
+
+    Transformers 5 stores supported Qwen MoE experts as packed 3D parameters,
+    while SGLang 0.5.x live reload accepts the original per-expert checkpoint
+    keys. Slice before materializing a DTensor so each collective gathers one
+    expert projection instead of the complete packed expert table.
+
+    ``moe_intermediate`` (when the model config provides it) pins the expected
+    packed layout — ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` — so
+    a Transformers layout change fails loudly instead of exporting silently
+    transposed expert weights.
+    """
+    if unpack_qwen_moe and tensor.ndim == 3 and name.endswith(".mlp.experts.gate_up_proj"):
+        if tensor.shape[1] % 2 != 0 or (moe_intermediate is not None and tensor.shape[1] != 2 * moe_intermediate):
+            expected = f"2 * moe_intermediate_size = {2 * moe_intermediate}" if moe_intermediate else "even"
+            raise RuntimeError(
+                f"Qwen MoE export: packed gate_up_proj {name!r} has shape {tuple(tensor.shape)}, "
+                f"but dim 1 must be {expected} for the [E, 2*I, H] layout this splitter assumes — "
+                "the packed expert layout may have changed."
+            )
+        tensor, dtype = _prepare_qwen_moe_dtensor(tensor, dtype)
+        base = name.removesuffix(".gate_up_proj")
+        split = tensor.shape[1] // 2
+        for expert_id in range(tensor.shape[0]):
+            expert = tensor[expert_id]
+            yield (
+                f"{base}.{expert_id}.gate_proj.weight",
+                _to_full_tensor(expert[:split], dtype).contiguous(),
+            )
+            yield (
+                f"{base}.{expert_id}.up_proj.weight",
+                _to_full_tensor(expert[split:], dtype).contiguous(),
+            )
+        return
+
+    if unpack_qwen_moe and tensor.ndim == 3 and name.endswith(".mlp.experts.down_proj"):
+        if moe_intermediate is not None and tensor.shape[2] != moe_intermediate:
+            raise RuntimeError(
+                f"Qwen MoE export: packed down_proj {name!r} has shape {tuple(tensor.shape)}, "
+                f"but dim 2 must be moe_intermediate_size = {moe_intermediate} for the [E, H, I] "
+                "layout this exporter assumes — the packed expert layout may have changed."
+            )
+        tensor, dtype = _prepare_qwen_moe_dtensor(tensor, dtype)
+        base = name.removesuffix(".down_proj")
+        for expert_id in range(tensor.shape[0]):
+            yield (
+                f"{base}.{expert_id}.down_proj.weight",
+                _to_full_tensor(tensor[expert_id], dtype).contiguous(),
+            )
+        return
+
+    yield name, _to_full_tensor(tensor, dtype)
+
+
+def _prepare_qwen_moe_dtensor(
+    tensor: torch.Tensor,
+    dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.dtype | None]:
+    """Make expert selection safe for an FSDP2 ``Shard(0)`` packed tensor.
+
+    DTensor's ``select`` must replicate an input sharded on the selected expert
+    dimension. Redistribute that shard to the packed tensor's last dimension
+    once instead; selecting an expert then stays sharded and only the emitted
+    2D projection is all-gathered by :func:`_to_full_tensor`.
+    """
+    if not isinstance(tensor, DTensor):
+        return tensor, dtype
+
+    if dtype is not None and tensor.is_floating_point() and tensor.dtype != dtype:
+        tensor = tensor.to(dtype)
+
+    placements = [Shard(tensor.ndim - 1) if isinstance(p, Shard) and p.dim == 0 else p for p in tensor.placements]
+    if placements != list(tensor.placements):
+        tensor = tensor.redistribute(placements=placements)
+    return tensor, None
+
+
+def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
+    """Whether this model uses a supported packed Qwen MoE checkpoint layout."""
+    parallel_groups = getattr(model, "_extra_parallel_param_groups", None) or {}
+    if parallel_groups.get("ep"):
+        return False
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    return model_type in _PACKED_QWEN_MOE_MODEL_TYPES
+
+
+def _moe_intermediate_size(model: torch.nn.Module) -> int | None:
+    """Resolve ``moe_intermediate_size`` from text-only or multimodal configs.
+
+    Returns ``None`` when the config does not expose it — the packed-layout
+    shape check in :func:`_iter_rollout_tensors` then degrades to the
+    even-split invariant only.
+    """
+    config = getattr(model, "config", None)
+    for owner in (config, getattr(config, "text_config", None)):
+        value = getattr(owner, "moe_intermediate_size", None)
+        if value is not None and int(value) > 0:
+            return int(value)
+    return None
+
+
 def merged_state_dict(
     model: torch.nn.Module,
     adapter_name: str = "default",
@@ -44,6 +167,8 @@ def merged_state_dict(
     cast — so the merge numerics are unchanged by the wire dtype.
     """
     skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+    unpack_qwen_moe = _unpack_qwen_moe(model)
+    moe_intermediate = _moe_intermediate_size(model) if unpack_qwen_moe else None
 
     def _cast(t: torch.Tensor) -> torch.Tensor:
         if dtype is not None and t.is_floating_point() and t.dtype != dtype:
@@ -54,7 +179,9 @@ def merged_state_dict(
         for name, param in model.state_dict().items():
             if skip_lm_head and name == "lm_head.weight":
                 continue
-            yield (name, _to_full_tensor(param, dtype))
+            yield from _iter_rollout_tensors(
+                name, param, dtype, unpack_qwen_moe=unpack_qwen_moe, moe_intermediate=moe_intermediate
+            )
         return
 
     peft_cfg = model.peft_config[adapter_name]
@@ -85,28 +212,65 @@ def merged_state_dict(
         else:
             regular_keys.append(raw_name)
 
+    unsupported_expert_lora = [
+        name
+        for name, group in lora_groups.items()
+        if unpack_qwen_moe and ".mlp.experts" in name and "base" not in group
+    ]
+    if unsupported_expert_lora:
+        raise NotImplementedError(
+            "merged_state_dict does not support PEFT target_parameters on packed Qwen MoE experts: "
+            f"{unsupported_expert_lora[:3]}"
+        )
+
     for original_name, group in lora_groups.items():
         if "base" not in group:
             continue
         if skip_lm_head and original_name == "lm_head.weight":
             continue
-        # Merge inputs stay master-width (no ``dtype`` here): pre-casting them
-        # to the wire dtype would round the LoRA update away before the fold.
+        if (
+            unpack_qwen_moe
+            and original_name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
+            and not ("lora_A" in group and "lora_B" in group)
+        ):
+            yield from _iter_rollout_tensors(
+                original_name,
+                state_dict[group["base"]],
+                dtype,
+                unpack_qwen_moe=True,
+                moe_intermediate=moe_intermediate,
+            )
+            continue
         base = _to_full_tensor(state_dict[group["base"]])
         if "lora_A" in group and "lora_B" in group:
             lora_a = _to_full_tensor(state_dict[group["lora_A"]])
             lora_b = _to_full_tensor(state_dict[group["lora_B"]])
-            # Merge in fp32: bf16 base + bf16 delta rounds the LoRA update away.
             merged = (base.float() + (lora_b.float() @ lora_a.float()) * scaling).to(base.dtype)
-            yield (original_name, _cast(merged))
+            yield from _iter_rollout_tensors(
+                original_name,
+                _cast(merged),
+                unpack_qwen_moe=unpack_qwen_moe,
+                moe_intermediate=moe_intermediate,
+            )
         else:
-            yield (original_name, _cast(base))
+            yield from _iter_rollout_tensors(
+                original_name,
+                _cast(base),
+                unpack_qwen_moe=unpack_qwen_moe,
+                moe_intermediate=moe_intermediate,
+            )
 
     for raw_name in regular_keys:
         stripped = _strip_peft_prefix(raw_name)
         if skip_lm_head and stripped == "lm_head.weight":
             continue
-        yield (stripped, _to_full_tensor(state_dict[raw_name], dtype))
+        yield from _iter_rollout_tensors(
+            stripped,
+            state_dict[raw_name],
+            dtype,
+            unpack_qwen_moe=unpack_qwen_moe,
+            moe_intermediate=moe_intermediate,
+        )
 
 
 def raw_state_dict(
@@ -119,9 +283,16 @@ def raw_state_dict(
     ``dtype`` (optional) is the wire dtype: floating tensors are cast to it
     shard-side in :func:`_to_full_tensor`, before the DTensor all-gather.
     """
+    unpack_qwen_moe = _unpack_qwen_moe(model)
+    moe_intermediate = _moe_intermediate_size(model) if unpack_qwen_moe else None
+    skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
     if not hasattr(model, "peft_config"):
         for name, param in model.state_dict().items():
-            yield (name, _to_full_tensor(param, dtype))
+            if skip_lm_head and name == "lm_head.weight":
+                continue
+            yield from _iter_rollout_tensors(
+                name, param, dtype, unpack_qwen_moe=unpack_qwen_moe, moe_intermediate=moe_intermediate
+            )
         return
 
     state_dict = model.state_dict()
@@ -149,14 +320,35 @@ def raw_state_dict(
         else:
             regular_keys.append(raw_name)
 
+    if unpack_qwen_moe and any(prefix.endswith(".mlp.experts") for prefix in set(lora_a_keys) | set(lora_b_keys)):
+        raise NotImplementedError("raw_state_dict does not support PEFT target_parameters on packed Qwen MoE experts")
+
     for raw_name, stripped_name in base_names.items():
-        yield (stripped_name.replace(".base_layer.", "."), _to_full_tensor(state_dict[raw_name], dtype))
+        output_name = stripped_name.replace(".base_layer.", ".")
+        if skip_lm_head and output_name == "lm_head.weight":
+            continue
+        yield from _iter_rollout_tensors(
+            output_name,
+            state_dict[raw_name],
+            dtype,
+            unpack_qwen_moe=unpack_qwen_moe,
+            moe_intermediate=moe_intermediate,
+        )
     for prefix, raw_name in lora_a_keys.items():
         yield (prefix + ".lora_A", _to_full_tensor(state_dict[raw_name], dtype))
     for prefix, raw_name in lora_b_keys.items():
         yield (prefix + ".lora_B", _to_full_tensor(state_dict[raw_name], dtype))
     for raw_name in regular_keys:
-        yield (_strip_peft_prefix(raw_name), _to_full_tensor(state_dict[raw_name], dtype))
+        stripped = _strip_peft_prefix(raw_name)
+        if skip_lm_head and stripped == "lm_head.weight":
+            continue
+        yield from _iter_rollout_tensors(
+            stripped,
+            state_dict[raw_name],
+            dtype,
+            unpack_qwen_moe=unpack_qwen_moe,
+            moe_intermediate=moe_intermediate,
+        )
 
 
 def extract_lora_tensors(
@@ -199,11 +391,7 @@ def extract_lora_tensors(
             result[out_name] = _to_full_tensor(param, dtype).detach().cpu()
             break
 
-    # Defensive dtype check: vllm punica kernel hard-asserts inputs.dtype in
-    # {fp16, bf16}. Catch fp32 LoRA here in trainer (cheap) rather than
-    # crashing ~20min later in rollout. With ``dtype`` passed (the normal path)
-    # this never fires; it backstops a caller that forgot to thread the wire
-    # dtype while running master_dtype=fp32.
+    # Reject fp32 LoRA tensors before vLLM's bf16/fp16-only kernel.
     _bad_dtype = [
         (k, v.dtype) for k, v in result.items() if ".lora_" in k and v.dtype not in (torch.bfloat16, torch.float16)
     ]

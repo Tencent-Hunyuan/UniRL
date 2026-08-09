@@ -1,0 +1,54 @@
+"""Construction config for the Qwen3.5 VL AR pipeline.
+
+Mirror of :class:`unirl.models.qwen_vl.QwenVLPipelineConfig` (vision tower,
+min/max pixels, meta-init) plus the chat-template knobs from
+:class:`unirl.models.qwen3.Qwen3PipelineConfig` (``system_instruction``,
+``enable_thinking``). Qwen3.5 degrades to text-only when no image is
+supplied, so a single config covers both supported recipe shapes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, List, Optional
+
+from unirl.config.validation import validate_precision_type
+
+
+@dataclass
+class Qwen3_5PipelineConfig:
+    """Construction args for ``Qwen3_5Pipeline.from_config``."""
+
+    pretrained_model_ckpt_path: str
+    tokenizer_ckpt_path: Optional[str] = None
+    trust_remote_code: bool = False
+
+    model_precision: Any = "bf16"
+    attn_implementation: Optional[str] = None
+    device: Any = None
+
+    autocast_precision: str = "bf16"
+    logprob_precision: str = "fp32"
+
+    use_gradient_checkpointing: bool = False
+
+    weight_sync_param_name_prefix: str = "model."
+
+    use_lora: bool = False
+    lora_target_modules: Optional[List[str]] = None
+
+    freeze_vision_tower: bool = True
+    max_prompt_length: int = 4096
+    min_pixels: int = 256 * 28 * 28
+    max_pixels: int = 1280 * 28 * 28
+
+    meta_init_transformer: bool = False
+
+    system_instruction: Optional[str] = None
+    enable_thinking: bool = False
+
+    def __post_init__(self) -> None:
+        validate_precision_type(self.model_precision, field="Qwen3_5PipelineConfig.model_precision")
+
+
+__all__ = ["Qwen3_5PipelineConfig"]

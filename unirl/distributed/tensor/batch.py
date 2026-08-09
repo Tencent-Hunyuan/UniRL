@@ -75,10 +75,6 @@ import torch
 
 T = TypeVar("T", bound="Batch")
 
-# Metadata key under which the field kind enum is stored. The string value is
-# also the kwarg name accepted by ``field()`` below — caller writes
-# ``field(kind=FieldKind.CONCAT, ...)`` and the routing is identical to the
-# legacy ``concat_field()`` helper.
 _FIELD_KIND_KEY = "kind"
 
 
@@ -94,14 +90,7 @@ class FieldKind(Enum):
 
 _REDUCTION_KINDS = frozenset({FieldKind.MAX, FieldKind.MIN, FieldKind.SUM, FieldKind.MEAN})
 
-# Cache of dataclasses.field's accepted kwargs so the generic ``field()`` below
-# can route arbitrary keyword args between dc.field params and free-form metadata.
 _DC_FIELD_PARAMS = frozenset(_inspect.signature(_dc_field).parameters)
-
-
-# ---------------------------------------------------------------------------
-# Field constructors
-# ---------------------------------------------------------------------------
 
 
 def field(**kwargs: Any) -> Any:
@@ -145,11 +134,11 @@ def packed_field(**kwargs: Any) -> Any:
     hidden instance state on the ``Batch`` container — the user neither
     declares a sibling cu_seqlens field nor sets one explicitly.
 
-    Construction is via the regular ``@dataclass`` constructor: pass a
-    ``Sequence[Tensor]`` of per-sample tensors and the framework's
-    ``Batch.__post_init__`` packs them and computes cu_seqlens. Multiple
-    ``packed_field``s on the same dataclass must agree on per-sample sizes
-    (they share the single instance-level cu_seqlens).
+    User-facing construction is via :meth:`Batch.pack`: pass a
+    ``Sequence[Tensor]`` of per-sample tensors and it packs them while computing
+    cu_seqlens. The regular dataclass constructor is reserved for already-packed
+    internal values whose cu_seqlens are attached by framework operations.
+    Multiple packed fields must agree on per-sample sizes.
 
     See :class:`Batch` for the auto-pack / propagation contract and
     :attr:`Batch.cu_seqlens` / :attr:`Batch.lengths` for read access
@@ -195,11 +184,6 @@ def mean_field(**kwargs: Any) -> Any:
 
 def _field_kind(f: Any) -> FieldKind:
     return f.metadata.get(_FIELD_KIND_KEY, FieldKind.SHARED)
-
-
-# ---------------------------------------------------------------------------
-# Value-level helpers
-# ---------------------------------------------------------------------------
 
 
 def _infer_batch_size(value: Any) -> Optional[int]:
@@ -372,6 +356,9 @@ def _repeat_interleave_value(value: Any, n: int, batch_size: int) -> Any:
         return tuple(v for v in value for _ in range(n))
     if isinstance(value, dict):
         return {k: _repeat_interleave_value(v, n, batch_size) for k, v in value.items()}
+    if hasattr(value, "select_ranges") and getattr(value, "batch_size", None) == batch_size:
+        ranges = [(index, index + 1) for index in range(batch_size) for _ in range(n)]
+        return value.select_ranges(ranges)
     if isinstance(value, Batch):
         return value.repeat_interleave(n)
     return value
@@ -407,11 +394,6 @@ def _clone_value(value: Any) -> Any:
     if isinstance(value, Batch):
         return value.clone()
     return copy.deepcopy(value)
-
-
-# ---------------------------------------------------------------------------
-# Packed-varlen helpers (data + cu_seqlens algorithms)
-# ---------------------------------------------------------------------------
 
 
 def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
@@ -463,10 +445,6 @@ def _concat_packed_data(values: List[Optional[torch.Tensor]]) -> Optional[torch.
     if not non_none:
         return None
     if all(isinstance(v, Batch) for v in non_none):
-        # Transport placeholders (e.g. TensorRef returned from a DP_SCATTER
-        # dispatch) carry routing handles, not real tensors — defer to their own
-        # concat, exactly like _concat_value's Batch branch. A raw torch.cat
-        # would choke on them ("expected Tensor ... but got TensorRef").
         return type(non_none[0]).concat(non_none)
     return torch.cat(non_none, dim=0)
 
@@ -507,7 +485,6 @@ def _select_packed_data(
             return value.select_ranges([])
         return value[:0].clone()
     if hasattr(value, "select_ranges"):
-        # TensorRef: token-range gather as a lazy range view (no data motion).
         return value.select_ranges([(int(cu[i].item()), int(cu[i + 1].item())) for i in indices])
     chunks = [value[int(cu[i].item()) : int(cu[i + 1].item())] for i in indices]
     return torch.cat(chunks, dim=0)
@@ -527,9 +504,14 @@ def _repeat_interleave_packed_data(
             "construct via the regular dataclass __init__ with per-sample lists."
         )
     if n <= 0:
+        if hasattr(value, "select_ranges"):
+            return value.select_ranges([])
         return value[:0].clone()
     if n == 1:
         return value.clone()
+    if hasattr(value, "select_ranges"):
+        ranges = [(int(cu[i].item()), int(cu[i + 1].item())) for i in range(int(cu.numel()) - 1) for _ in range(n)]
+        return value.select_ranges(ranges)
     chunks: List[torch.Tensor] = []
     for i in range(int(cu.numel()) - 1):
         chunk = value[int(cu[i].item()) : int(cu[i + 1].item())]
@@ -546,11 +528,6 @@ def _repeat_interleave_cu_seqlens(cu: torch.Tensor, n: int) -> torch.Tensor:
     for s in new_sizes:
         cu_list.append(cu_list[-1] + s)
     return torch.tensor(cu_list, dtype=cu.dtype, device=cu.device)
-
-
-# ---------------------------------------------------------------------------
-# Base class
-# ---------------------------------------------------------------------------
 
 
 class Batch:
@@ -573,11 +550,6 @@ class Batch:
     properties; there is no setter and no constructor argument.
     """
 
-    # Hidden cumulative-offsets metadata for ``packed_field`` values on
-    # this instance.  Initialized to None (class-level default); populated
-    # by :meth:`pack` when packed fields are present, and propagated by
-    # ``concat`` / ``slice`` / ``select``.  Never set directly by user
-    # code — read via :attr:`cu_seqlens` / :attr:`lengths`.
     _packed_cu_seqlens: Optional[torch.Tensor] = None
 
     @property

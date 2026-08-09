@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pprint import pformat
 from typing import Any, Dict, List, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
@@ -42,8 +43,11 @@ from unirl.rollout.engine.vllm_omni.backends.base import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.utils.graceful_shutdown import terminate_descendants
 
 logger = logging.getLogger(__name__)
+
+_ENGINE_PROC_PREFIX = "VLLM::"
 
 
 def _import_omni_runtime() -> Dict[str, Any]:
@@ -169,10 +173,6 @@ class VLLMOmniBackend:
         self._tokenizer = tokenizer
         self._tp_per_stage = dict(tp_per_stage)
 
-    # ------------------------------------------------------------------ #
-    # Boot — the only place the runtime import / spawn / env override live
-    # ------------------------------------------------------------------ #
-
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn.
@@ -184,14 +184,10 @@ class VLLMOmniBackend:
         :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
         temp file. See the module docstring for the load-bearing boot order.
         """
-        # 1. Patches first: install() wraps mp.Process so spawn children
-        #    re-run the hijack at startup — the primary mechanism for
-        #    propagating patches across the spawn boundary.
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
 
-        # 2. Spawn start method before any Omni mp object exists.
         import multiprocessing as mp
 
         try:
@@ -201,36 +197,12 @@ class VLLMOmniBackend:
 
         rt = _import_omni_runtime()
 
-        # 3. Scoped-env last resort: HI3 multi-GPU stages need to see ALL
-        #    physical GPUs so vllm-omni can pin each stage to its yaml
-        #    ``runtime.devices``. Permanent pop, matching v1 (a restore-after-
-        #    boot is a post-parity follow-up; see _HI3 colocate landmine note
-        #    in the adapter).
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
-        #
-        # Node-local boot serialization: colocated replicas (8 per node) each
-        # spawn worker subprocesses that hold ~20 GiB anon RSS while
-        # materializing weights (safetensors -> dtype-cast staging). Eight
-        # simultaneous boots burst past the pod's k8s memcg limit and the
-        # kernel OOM-kills raylet/python (LIN-382 qwen probe, 2026-06-07:
-        # "Memory cgroup out of memory: Killed process ... anon-rss:
-        # 20216496kB", raylet SIGKILL -> ActorUnavailableError). An exclusive
-        # flock makes the heavy-load window single-file per node — boots take
-        # N * t_load instead of dying; it also narrows the master-port settle
-        # TOCTOU window as a side effect. Disable via
-        # DIFFRL_OMNI_BOOT_SERIALIZE=0 (e.g. single-replica smokes).
         import fcntl
 
-        # Return the host process's reserved-but-unallocated CUDA pool to the
-        # driver before spawning the engine. boot() runs inside the trainer's
-        # ray actor: the colocate flow full-loads the model per rank before
-        # FSDP shards it, leaving ~35-40 GiB reserved in THIS process's torch
-        # caching allocator — memory the engine SUBPROCESS cannot see or use
-        # (LIN-382 qwen probe-c: engine model 53.7 GiB + dummy run hit "116
-        # MiB free" on a 95 GiB GPU with the trainer's pool holding the rest).
+        # Release the trainer CUDA cache before spawning the engine process.
         try:
             import torch
 
@@ -240,44 +212,75 @@ class VLLMOmniBackend:
             pass
 
         yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+        omni_kwargs = _assemble_omni_kwargs(intent)
+        logger.info(
+            "VLLM-Omni boot intent (before engine startup):\n%s",
+            pformat(
+                {
+                    **intent,
+                    "stage_yaml_path": yaml_path,
+                    "assembled_omni_kwargs": omni_kwargs,
+                },
+                sort_dicts=True,
+            ),
+        )
         serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
         lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
+        omni = None
         try:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-            omni = rt["Omni"](
-                model=str(intent["model_path"]),
-                stage_configs_path=yaml_path,
-                **_assemble_omni_kwargs(intent),
+            try:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                omni = rt["Omni"](
+                    model=str(intent["model_path"]),
+                    stage_configs_path=yaml_path,
+                    **omni_kwargs,
+                )
+            finally:
+                if lock_file is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    lock_file.close()
+
+            try:
+                from omegaconf import OmegaConf
+
+                resolved_stage_configs = OmegaConf.to_container(
+                    OmegaConf.create(omni.stage_configs),
+                    resolve=True,
+                )
+            except Exception:  # noqa: BLE001 - config logging must never block boot
+                resolved_stage_configs = omni.stage_configs
+            logger.info(
+                "VLLM-Omni resolved runtime stage configs (after all overrides):\n%s",
+                pformat(resolved_stage_configs, sort_dicts=True),
             )
-        finally:
-            if lock_file is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-                lock_file.close()
 
-        # Driver-side tokenizer for AR prompt-token construction (workers
-        # reload their own from the model path). Pure-DiT modalities skip it.
-        tokenizer = None
-        if intent.get("needs_driver_tokenizer"):
-            tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
+            tokenizer = None
+            if intent.get("needs_driver_tokenizer"):
+                tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
 
-        return cls(
-            omni,
-            rt,
-            tokenizer=tokenizer,
-            # The runtime's own merged per-stage configs — authoritative,
-            # no YAML re-read.
-            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
-        )
+            return cls(
+                omni,
+                rt,
+                tokenizer=tokenizer,
+                tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
+            )
+        except BaseException:
+            logger.exception("VLLM-Omni boot failed; tearing down any engine processes")
+            if omni is not None:
+                try:
+                    close = getattr(omni, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.exception("Failed to close the half-booted vLLM-Omni engine")
+            terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+            raise
 
     def _require_omni(self) -> Any:
         if self._omni is None:
             raise RuntimeError("VLLMOmniBackend: engine not initialized (shut down?)")
         return self._omni
-
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
 
     def generate(
         self,
@@ -306,24 +309,15 @@ class VLLMOmniBackend:
             if call.group_by_request_id:
                 groups.extend(_group_by_request(flat, len(call.prompts)))
             else:
-                # Single-prompt call: its flat list IS the per-request group
-                # (the v1 dit_recaption per-prompt path, byte-for-byte).
                 groups.append(flat)
         return groups
 
     def _build_sampling_params(self, sampling: StageSampling, *, attach_lora: bool) -> Any:
         if sampling.kind == STAGE_KIND_AR:
-            # ``logprobs=1`` rides in the kwargs (the adapter sets it) so vLLM
-            # emits per-token logp on the sampled token.
             return self._rt["VLLMSamplingParams"](**sampling.kwargs)
         sp = self._rt["OmniDiffusionSamplingParams"](**sampling.kwargs)
         if attach_lora:
-            # Without the attach, vllm-omni's DiT worker resets the active
-            # adapter to None on every forward and the loaded adapter would
-            # silently never run on the rollout pass.
             sp.lora_request = self._lora_request()
-            # ``lora_scale`` is read alongside lora_request in
-            # ``diffusion_worker.execute_model``; 1.0 = apply as-loaded.
             sp.lora_scale = 1.0
         return sp
 
@@ -358,10 +352,6 @@ class VLLMOmniBackend:
 
         return build_prompt_tokens(text, self._tokenizer, task=task, sys_type=sys_type)
 
-    # ------------------------------------------------------------------ #
-    # Stage topology
-    # ------------------------------------------------------------------ #
-
     def num_stages(self) -> int:
         return int(self._require_omni().engine.num_stages)
 
@@ -370,10 +360,6 @@ class VLLMOmniBackend:
 
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
-
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
 
     def sleep_task(self) -> None:
         """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
@@ -401,8 +387,6 @@ class VLLMOmniBackend:
                 stage_ids=[int(sid)],
             )
         if torch.cuda.is_available():
-            # Mirrors AsyncOmni.wake_up's synchronize(); ensures pool
-            # restoration is visible before the next generate.
             torch.cuda.synchronize()
 
     def ping(self) -> bool:
@@ -417,9 +401,9 @@ class VLLMOmniBackend:
             finally:
                 self._omni = None
 
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs — per-stage collective_rpc fan-out lives here
-    # ------------------------------------------------------------------ #
+        reaped = terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
+        if reaped:
+            logger.warning("Reaped %d engine process(es) that outlived the vLLM-Omni shutdown", reaped)
 
     def update_from_ipc(
         self,
@@ -443,8 +427,6 @@ class VLLMOmniBackend:
             "replica_rank": replica_rank,
         }
         for sid in self._stage_ids():
-            # stage_id rides the kwargs so the worker extension's zmq-handle
-            # computation sees it.
             omni.engine.collective_rpc(
                 method="update_weights_from_ipc",
                 args=(),
@@ -545,10 +527,6 @@ class VLLMOmniBackend:
                 stage_ids=[int(sid)],
             )
 
-    # ------------------------------------------------------------------ #
-    # LoRA tensor bag — two genuinely different transports
-    # ------------------------------------------------------------------ #
-
     def set_lora_handle(
         self,
         *,
@@ -578,11 +556,6 @@ class VLLMOmniBackend:
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
-        # Pass primitive fields, not an ``OmniTensorLoRARequest``: vllm's
-        # msgspec wire encoder doesn't recognise our Struct subclass and
-        # decodes it positionally as a list. The inner tensors can't survive
-        # the msgpack wire either — encode via the vendored serializer; the
-        # worker mixin deserialises and rebuilds the struct locally.
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             MultiprocessingSerializer,
         )
@@ -687,10 +660,6 @@ class VLLMOmniBackend:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ #
-    # Post-load value-correctness read-back
-    # ------------------------------------------------------------------ #
-
     def param_checksums(self, *, names: List[str]) -> dict:
         """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks.
 
@@ -704,8 +673,6 @@ class VLLMOmniBackend:
                 args=(list(names),),
                 stage_ids=[int(sid)],
             )
-            # collective_rpc returns ``[stage_results]`` where stage_results
-            # is ``[rank0, rank1, ...]`` — strip the outer list.
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
 

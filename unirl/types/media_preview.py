@@ -3,7 +3,7 @@
 Carries PIL images and raw 4D video tensors keyed to per-sample prompts /
 rewards for wandb logging. Lives in its own module so the type survives
 independently of the legacy ``RolloutSamples`` container (which used to
-own it). Consumed via ``RolloutTrack.media_preview``.
+own it). Consumed via ``Part.media_preview``.
 """
 
 from __future__ import annotations
@@ -14,11 +14,10 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from unirl.distributed.tensor.batch import Batch, concat_field
-from unirl.types.primitives import Images, Videos
+from unirl.types.primitives import Audios, Images, Videos
 
 if TYPE_CHECKING:
-    from unirl.types.rollout_req import RolloutReq
-    from unirl.types.rollout_resp import RolloutTrack
+    from unirl.types.sample import Part
 
 
 @dataclass
@@ -55,12 +54,7 @@ class MediaPreview(Batch):
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
-    # Per-sample audio waveforms (mono [L] float32 CPU tensors) for muxing into
-    # the mp4 upload. Parallel to ``videos`` — same length. ``None``/empty for
-    # non-audio tracks.
     audios: List[Any] = concat_field(default_factory=list)
-    # Source sample rate of the waveforms in ``audios``. Batch-shared (one rate
-    # per preview). None when audios is empty.
     audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
@@ -95,29 +89,34 @@ class MediaPreview(Batch):
 def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     """Smallest sample count >= ``min_items`` landing on a TensorRef ref boundary.
 
-    ``decoded`` reaches the driver dehydrated: its tensor leaf (``Images.pixels``
-    / ``Videos.frames``) is a ``TensorRef`` whose refs partition the batch by DP
-    shard, and ``TensorRef`` only supports ref-boundary slicing. The cheapest
-    preview prefix is the first shard boundary covering ``min_items`` samples, so
-    media logging hydrates one shard instead of the full decoded batch.
-    ``Videos`` ref sizes count frames (PACKED), so shard frame boundaries are
-    mapped back to sample indices via the driver-side ``cu_seqlens``. Returns the
-    full batch size when the leaf is already a real tensor (nothing to save) or a
-    boundary cannot be mapped.
+    ``decoded`` reaches the driver dehydrated: its packed tensor leaf
+    (``Images.packed_pixels`` / ``Videos.frames``) is a ``TensorRef`` whose refs
+    partition the batch by DP shard, and ``TensorRef`` only supports ref-boundary
+    slicing. The cheapest preview prefix is the first shard boundary covering
+    ``min_items`` samples, so media logging hydrates one shard instead of the full
+    decoded batch. Ref sizes count packed pixels for ``Images`` and frames for
+    ``Videos``, so both are mapped back to sample indices via the driver-side
+    ``cu_seqlens``. Returns the full batch size when the leaf is already a real
+    tensor (nothing to save) or a boundary cannot be mapped.
     """
     from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
     want = max(1, min(int(min_items), total))
     if isinstance(decoded, Images):
-        meta = decoded.pixels
-        if not isinstance(meta, TensorRef):
+        meta = decoded.packed_pixels
+        cu = decoded.cu_seqlens
+        if not isinstance(meta, TensorRef) or cu is None:
             return total
-        rows = 0
+        sample_at_pixel = {int(v): i for i, v in enumerate(cu.tolist())}
+        pixels = 0
         for size in meta.sizes:
-            rows += int(size)
-            if rows >= want:
-                return rows
+            pixels += int(size)
+            sample_idx = sample_at_pixel.get(pixels)
+            if sample_idx is None:
+                return total
+            if sample_idx >= want:
+                return sample_idx
         return total
     meta = decoded.frames
     cu = decoded.cu_seqlens
@@ -135,49 +134,44 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     return total
 
 
-def build_media_preview_for_track(
+def build_media_preview_for_part(
     *,
-    req: "RolloutReq",
-    track: "RolloutTrack",
+    part: "Part",
     max_items: int,
     prompts: Optional[List[str]] = None,
+    input_image: Optional[Images] = None,
 ) -> Optional[MediaPreview]:
-    """Build a wandb-bound :class:`MediaPreview` from one track's decoded media.
+    """Build a wandb-bound :class:`MediaPreview` from one gen Part's decoded media.
 
-    ``prompts`` (when given) is a per-sample caption list already aligned 1:1
-    with this track's samples — pass it for multi-track recipes (PE / unified)
-    whose ``req.primitives["text"]`` holds only the original prompts (shorter
-    than the expanded track). When ``None`` the captions fall back to
-    ``req.primitives["text"]``, which is correct for the single-track diffusion
-    / AR path where ``_build_req`` already expands text 1:1 with samples.
+    ``prompts`` is a per-sample caption list aligned 1:1 with this Part's samples
+    (the original prompt texts); ``None`` yields empty captions. ``input_image``
+    is the it2i source image (the chained image input Part's packed ``Images``),
+    paired beside the output as an edit preview when present.
 
-    Two parallel modality paths, mirroring the legacy
-    ``RolloutResponse.attach_media_preview``:
+    Two parallel modality paths:
 
-    - **Image path** (``isinstance(track.decoded, Images)``): unbinds
-      ``Images.pixels`` along batch dim into per-sample 3D ``[C, H, W]``
-      tensors and converts each to PIL via ``tensor_frame_to_pil`` (the
-      wandb boundary). Slices to the first 3 channels first — drops
-      alpha / model-specific 4th channel so wandb gets RGB.
-    - **Video path** (``isinstance(track.decoded, Videos)``): reads
+    - **Image path** (``isinstance(part.primitives["image"], Images)``): hydrates
+      packed storage, reconstructs per-sample 3D ``[C, H, W]`` tensors via
+      ``Images.to_list()``, and converts each to PIL via
+      ``tensor_frame_to_pil`` (the wandb boundary). Slices to the first 3
+      channels first — drops alpha / model-specific 4th channel so wandb gets
+      RGB.
+    - **Video path** (``isinstance(part.primitives["video"], Videos)``): reads
       per-sample 4D ``[C, T, H, W]`` CPU ``float32`` tensors via
       ``Videos.to_list()`` + ``permute(1, 0, 2, 3)``; keeps them raw,
       NOT pre-built ``wandb.Video`` (encoding is owned by
       ``UniRLWandBLogger.log_generated_media``).
 
-    Returns ``None`` when the track's ``decoded`` is neither ``Images``
-    nor ``Videos`` (e.g. text track) or when nothing is selected.
+    Returns ``None`` when the Part's primitive map contains neither ``Images``
+    nor ``Videos`` (e.g. a text Part) or when nothing is selected.
     """
-    decoded = track.decoded
+    decoded = part.primitives.get("image")
+    if decoded is None:
+        decoded = part.primitives.get("video")
     if not isinstance(decoded, (Images, Videos)):
         return None
     limit = max(1, int(max_items))
 
-    # ``decoded`` reaches the driver dehydrated (its tensor leaf is a
-    # ``TensorRef`` proxy partitioned by DP shard). Slice to the smallest
-    # ref-boundary prefix covering ``limit`` samples, then hydrate only that
-    # shard so we pull one shard instead of the full decoded batch. Both steps
-    # are no-ops when the leaf is already a real tensor (e.g. unit tests).
     from unirl.distributed.tensor import hydrate, map_tree
 
     prefix = _ref_aligned_prefix_len(decoded, limit)
@@ -185,14 +179,10 @@ def build_media_preview_for_track(
         decoded = decoded.slice(0, prefix)
     decoded = map_tree(decoded, hydrate)
 
-    if prompts is not None:
-        prompt_texts: List[str] = [str(p) for p in prompts]
-    else:
-        text_prim = req.primitives.get("text")
-        prompt_texts = list(text_prim.texts) if text_prim is not None and getattr(text_prim, "texts", None) else []
+    prompt_texts: List[str] = [str(p) for p in prompts] if prompts is not None else []
     rewards_flat: List[float] = []
-    if track.rewards is not None and torch.is_tensor(track.rewards):
-        rewards_flat = [float(v) for v in track.rewards.detach().cpu().reshape(-1).tolist()]
+    if part.rewards is not None and torch.is_tensor(part.rewards):
+        rewards_flat = [float(v) for v in part.rewards.detach().cpu().reshape(-1).tolist()]
 
     images: List[Any] = []
     videos: List[Any] = []
@@ -201,22 +191,21 @@ def build_media_preview_for_track(
     if isinstance(decoded, Images):
         from unirl.utils.media import hstack_pils, tensor_frame_to_pil
 
-        pixels = decoded.pixels
-        if pixels is None:
+        per_sample = decoded.to_list()
+        if not per_sample:
             return None
-        # it2i carries the per-sample input image in req.primitives["image"]; pair
-        # it beside the output when it covers the (possibly shard-prefixed) batch.
-        input_pixels = None
-        image_prim = req.primitives.get("image")
-        if isinstance(image_prim, Images) and image_prim.pixels is not None:
-            input_pixels = image_prim.pixels
-        show_edit_pairs = input_pixels is not None and int(input_pixels.shape[0]) >= int(pixels.shape[0])
-        for idx in range(int(pixels.shape[0])):
+        input_pixels: Optional[List[Any]] = None
+        if isinstance(input_image, Images):
+            input_image = map_tree(input_image, hydrate)
+            input_pixels = [image.pixels for image in input_image.to_list()]
+        show_edit_pairs = input_pixels is not None and len(input_pixels) >= len(per_sample)
+        for idx, image in enumerate(per_sample):
             if len(selected_indices) >= limit:
                 break
-            out_pil = tensor_frame_to_pil(pixels[idx][:3])
+            out_pil = tensor_frame_to_pil(image.pixels[:3])
             if show_edit_pairs:
-                in_pil = tensor_frame_to_pil(input_pixels[idx][:3])
+                input_tensor = input_pixels[idx]
+                in_pil = tensor_frame_to_pil(input_tensor[:3])
                 images.append(hstack_pils(in_pil, out_pil))
             else:
                 images.append(out_pil)
@@ -235,11 +224,10 @@ def build_media_preview_for_track(
     if not selected_indices:
         return None
 
-    # T2AV: extract per-sample audio waveforms for muxing into the mp4 upload.
     audios_out: List[Any] = []
     audio_sr: Optional[int] = None
-    decoded_audio = getattr(track, "decoded_audio", None)
-    if decoded_audio is not None and hasattr(decoded_audio, "to_list"):
+    decoded_audio = part.primitives.get("audio")
+    if isinstance(decoded_audio, Audios):
         from unirl.distributed.tensor import hydrate, map_tree
 
         decoded_audio = map_tree(decoded_audio, hydrate)
@@ -249,8 +237,7 @@ def build_media_preview_for_track(
                 audios_out.append(audio_list[idx].waveform.detach().cpu().float())
             else:
                 audios_out.append(None)
-        audio_sr = getattr(track, "audio_sample_rate", None)
-        # Drop audio if none of the selected samples have it
+        audio_sr = part.primitive_metadata.get("audio", {}).get("sample_rate")
         if all(a is None for a in audios_out):
             audios_out = []
             audio_sr = None
@@ -267,4 +254,4 @@ def build_media_preview_for_track(
     )
 
 
-__all__ = ["MediaPreview", "build_media_preview_for_track"]
+__all__ = ["MediaPreview", "build_media_preview_for_part"]

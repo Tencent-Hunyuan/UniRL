@@ -25,6 +25,12 @@ which is itself clean: safetensors + stable ``transformers.utils`` APIs)
 before ``torch_parallelize`` is imported.  :func:`ensure_installed` runs
 both stub steps in that order; call it before importing any veomni symbol.
 
+The Qwen3-MoE and Qwen3.5-MoE bundles are the intentional model-layer
+consumers. :func:`ensure_qwen3_moe_installed` and
+:func:`ensure_qwen3_5_moe_installed` preserve the same selective-import
+discipline and register only the requested family, without executing
+``veomni.models.transformers.__init__`` and its full model-zoo imports.
+
 Zero veomni functions are replaced; this is selective importing, not
 behavior patching (the veomni dependency is exact-pinned in ``pyproject.toml``).
 """
@@ -75,8 +81,6 @@ def _install_path_stubs() -> None:
         _stub_package("veomni", pkg_dir)
     else:
         pkg_dir = list(sys.modules["veomni"].__path__)[0]
-    # NOTE: never importlib.util.find_spec("veomni.models") — resolving a
-    # submodule spec imports the parent package for real.
     _stub_package("veomni.models", os.path.join(pkg_dir, "models"))
 
 
@@ -107,6 +111,53 @@ def ensure_installed() -> None:
     _install_path_stubs()
     _attach_models_names()
     logger.info("veomni distributed layer installed via selective-import shim")
+
+
+@functools.cache
+def ensure_qwen3_moe_installed() -> None:
+    """Register only VeOmni's Qwen3-MoE modeling implementation.
+
+    ``ensure_installed`` deliberately stubs ``veomni.models`` to avoid importing
+    the entire version-locked model zoo. ``build_foundation_model`` still needs
+    the requested family registered in ``MODELING_REGISTRY``, so stub the
+    intermediate ``transformers`` package as well and execute only
+    ``qwen3_moe/__init__.py``. Qwen3-MoE model construction consumes VeOmni's
+    complete ops registry anyway, so load it before installing the selective
+    attention patch. This ordering matters: installing the attention patch
+    first would leave an intentionally minimal ``veomni.ops`` path stub where
+    ``build_foundation_model`` expects ``apply_ops_config``.
+    """
+    ensure_installed()
+    pkg_dir = list(sys.modules["veomni"].__path__)[0]
+    _stub_package(
+        "veomni.models.transformers",
+        os.path.join(pkg_dir, "models", "transformers"),
+    )
+    importlib.import_module("veomni.models.transformers.qwen3_moe")
+    importlib.import_module("veomni.ops")
+    ensure_attention_patch_installed()
+    logger.info("veomni Qwen3-MoE modeling registered via selective import")
+
+
+@functools.cache
+def ensure_qwen3_5_moe_installed() -> None:
+    """Register only VeOmni's Qwen3.5-MoE modeling implementation.
+
+    VeOmni 0.1.11's full model-zoo import reaches transformer APIs removed in
+    the project's Transformers 5.6 runtime. Selectively importing the generated
+    Qwen3.5-MoE family keeps its EP plan and fused ops without executing those
+    unrelated model modules.
+    """
+    ensure_installed()
+    pkg_dir = list(sys.modules["veomni"].__path__)[0]
+    _stub_package(
+        "veomni.models.transformers",
+        os.path.join(pkg_dir, "models", "transformers"),
+    )
+    importlib.import_module("veomni.models.transformers.qwen3_5_moe")
+    importlib.import_module("veomni.ops")
+    ensure_attention_patch_installed()
+    logger.info("veomni Qwen3.5-MoE modeling registered via selective import")
 
 
 @functools.cache

@@ -34,6 +34,7 @@ Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, sim
 
 When editing existing code:
 - Don't "improve" adjacent code, comments, or formatting.
+- In first-party Python files, keep only essential, concise one-line comments; inline annotations are fine for non-obvious shapes, units, or invariants.
 - Don't refactor things that aren't broken.
 - Match existing style, even if you'd do it differently.
 - If you notice unrelated dead code, mention it - don't delete it.
@@ -84,6 +85,10 @@ Fail closed when the work is not ready:
 - If the change is duplicate, too trivial, missing context, or lacks a credible verification path, stop and explain what is missing.
 - Do not invent process exceptions just to keep moving.
 
+Verification harnesses and guard scripts:
+- `lint/` holds only guard scripts wired into `.pre-commit-config.yaml`; a file there that no hook `entry:` references does not belong in the repo.
+- One-off verification harnesses written to prove a PR correct are run and their commands + results quoted in the PR's Test Plan, **not committed**. The tests/ tree was removed by policy (#99/#267); do not recreate it under any name (`tests/`, `scripts/`, `tools/`, ...).
+
 ## 6. Review and Domain Guides
 
 **Verify guidance against the current repo before applying it.**
@@ -96,7 +101,7 @@ Local skills currently in this repo:
 
 | Area | Skill | Read before |
 | --- | --- | --- |
-| Model bundles | `.claude/skills/development/add-model-bundle/SKILL.md` | Adding or updating diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, RolloutReq/RolloutResp plumbing, or multimodal text/image/video conditioning. |
+| Model bundles | `.claude/skills/development/add-model-bundle/SKILL.md` | Adding or updating diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, Sample/Part plumbing, or multimodal text/image/video/audio conditioning. |
 | Pull requests | `.claude/skills/development/pr-workflow/SKILL.md` | Creating or updating PRs, editing PR bodies, handling PR Body or Semantic Pull Request CI failures, or running `gh pr create`. |
 
 ---

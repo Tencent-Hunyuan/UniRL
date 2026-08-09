@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -50,6 +50,10 @@ def _tensor_stats(prefix: str, tensor: Optional[torch.Tensor]) -> Dict[str, floa
     if tensor is None or (not torch.is_tensor(tensor)) or tensor.numel() == 0:
         return {}
     flat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
+    # Non-finite marks "not scored" rows (per-domain component rewards use NaN).
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        return {}
     return {
         f"{prefix}_mean": float(flat.mean().item()),
         f"{prefix}_std": float(flat.std(unbiased=False).item()),
@@ -83,60 +87,65 @@ def _zero_std_group_counts_from_ids(
     return zero_std, len(ordered)
 
 
-def compute_rollout_resp_metrics(*, resp: Any, trunc_len: Optional[int] = None) -> Dict[str, float]:
-    """Build rollout metrics directly from a :class:`RolloutResp`.
+def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = None) -> Dict[str, float]:
+    """Build rollout metrics directly from a :class:`Sample`.
 
-    Walks ``resp.tracks`` and emits per-track metrics under the
-    ``rollout/`` prefix:
+    Walks the **gen Parts** of ``sample`` (those with ``sampling_params``
+    set) and emits per-part metrics under the ``rollout/`` prefix:
 
-    - ``num_samples`` (sum across tracks for the resp batch_size)
-    - For each track: ``reward_{mean,std,min,max}``,
+    - ``num_samples`` (the sample's ``batch_size``)
+    - For each gen Part: ``reward_{mean,std,min,max}``,
       ``advantage_{mean,std,min,max}``,
       ``reward_<component>_{mean,std,min,max}`` per
-      ``track.component_rewards`` entry (``/`` flattened to ``_``),
+      ``part.component_rewards`` entry (``/`` flattened to ``_``),
       ``group_count``, ``zero_std_group_ratio``,
-      ``zero_std_group_count`` when the track's ``group_ids`` is
+      ``zero_std_group_count`` when the part's ``group_ids`` is
       populated.
 
-    For single-track resps (the common case today: one diffusion
-    track), keys are emitted unprefixed. For multi-track resps each
-    track's metrics are namespaced under its track name (e.g.
-    ``image_reward_mean``, ``refined_reward_mean``).
+    Each gen Part is named ``"ar"`` when its ``sampling_params`` is an
+    :class:`ARSamplingParams`, else ``"image"`` (matching
+    ``BaseTrainer._drop_decoded``). For a single gen-part sample (the
+    common case today: one diffusion or one AR part) keys are emitted
+    unprefixed. With multiple gen Parts each part's metrics are
+    namespaced under its derived name (e.g. ``image_reward_mean``,
+    ``ar_reward_mean``).
     """
+    from unirl.types.sampling import ARSamplingParams
+
     metrics: Dict[str, float] = {}
 
-    metrics["num_samples"] = float(int(getattr(resp, "batch_size", 0)))
-
-    tracks = getattr(resp, "tracks", None)
-    if not isinstance(tracks, dict):
+    parts = getattr(sample, "parts", None)
+    if not isinstance(parts, list):
+        metrics["num_samples"] = float(int(getattr(sample, "batch_size", 0)))
         return metrics
 
-    multi = len(tracks) > 1
-    for name, track in tracks.items():
+    gen_parts = [p for p in parts if getattr(p, "is_gen", False)]
+    metrics["num_samples"] = (
+        float(int(gen_parts[-1].batch_size)) if gen_parts else float(int(getattr(sample, "batch_size", 0)))
+    )
+    multi = len(gen_parts) > 1
+    for part in gen_parts:
+        name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
         prefix = f"{name}_" if multi else ""
-        rewards = getattr(track, "rewards", None)
+        rewards = getattr(part, "rewards", None)
         if torch.is_tensor(rewards) and rewards.numel() > 0:
             rewards_f = rewards.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}reward", rewards_f))
             zero_cnt, group_cnt = _zero_std_group_counts_from_ids(
                 rewards_f,
-                getattr(track, "group_ids", None),
+                getattr(part, "group_ids", None),
             )
             if group_cnt > 0:
                 metrics[f"{prefix}zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
                 metrics[f"{prefix}zero_std_group_count"] = float(zero_cnt)
                 metrics[f"{prefix}group_count"] = float(group_cnt)
 
-        advantages = getattr(track, "advantages", None)
+        advantages = getattr(part, "advantages", None)
         if torch.is_tensor(advantages) and advantages.numel() > 0:
             adv_f = advantages.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}advantage", adv_f))
 
-        # Response-length stats from the packed varlen segment (AR tracks):
-        # `segment.lengths[i]` = generated tokens for sample i. `trunc_ratio` is
-        # the fraction that hit the generation budget (= truncated, usually no
-        # final answer -> reward 0) — mirrors verl's response_length/{mean,clip_ratio}.
-        segment = getattr(track, "segment", None)
+        segment = getattr(part, "segment", None)
         lengths = getattr(segment, "lengths", None) if segment is not None else None
         if torch.is_tensor(lengths) and lengths.numel() > 0:
             len_f = lengths.detach().to(dtype=torch.float32).reshape(-1).cpu()
@@ -146,7 +155,7 @@ def compute_rollout_resp_metrics(*, resp: Any, trunc_len: Optional[int] = None) 
                     (len_f >= float(int(trunc_len))).to(dtype=torch.float32).mean().item()
                 )
 
-        component_rewards = getattr(track, "component_rewards", None)
+        component_rewards = getattr(part, "component_rewards", None)
         if isinstance(component_rewards, dict):
             for cname, tensor in component_rewards.items():
                 if not torch.is_tensor(tensor) or tensor.numel() == 0:
@@ -155,6 +164,37 @@ def compute_rollout_resp_metrics(*, resp: Any, trunc_len: Optional[int] = None) 
                 cat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
                 metrics.update(_tensor_stats(f"{prefix}reward_{safe_name}", cat))
 
+    return metrics
+
+
+def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
+    """Reward metrics pooled over an accumulation window's gen Parts.
+
+    Emits the same keys as the single-gen-part branch of
+    :func:`compute_rollout_sample_metrics` (``num_samples``, ``reward_*``,
+    ``reward_<component>_*``, group stats), so the trainer can merge them over
+    the final rollout's partial view via ``extra_metrics``. With per-domain
+    scorers each rollout carries NaN outside its own domain; pooling plus the
+    finite-filter in :func:`_tensor_stats` gives every domain a finite point.
+    """
+    metrics: Dict[str, float] = {"num_samples": float(sum(int(p.batch_size) for p in parts))}
+    rewards = [getattr(p, "rewards", None) for p in parts]
+    if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
+        pooled = torch.cat([r.detach().to(dtype=torch.float32).reshape(-1).cpu() for r in rewards])
+        metrics.update(_tensor_stats("reward", pooled))
+        group_ids = [g for p in parts for g in (getattr(p, "group_ids", None) or [])]
+        zero_cnt, group_cnt = _zero_std_group_counts_from_ids(pooled, group_ids)
+        if group_cnt > 0:
+            metrics["zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
+            metrics["zero_std_group_count"] = float(zero_cnt)
+            metrics["group_count"] = float(group_cnt)
+    components = [getattr(p, "component_rewards", None) for p in parts]
+    if components and all(isinstance(c, dict) for c in components):
+        for cname in sorted(set.intersection(*(set(c) for c in components))):
+            tensors = [c[cname] for c in components]
+            if all(torch.is_tensor(t) and t.numel() > 0 for t in tensors):
+                pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
+                metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
     return metrics
 
 

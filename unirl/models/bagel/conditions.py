@@ -16,13 +16,13 @@ contexts, not a stacked tensor):
 - ``cfg_img_contexts[i]``  : image-CFG context
 - ``image_shapes[i]``      : (H, W) for sample i
 
-These are ``concat_field`` lists so :meth:`RolloutTrack.slice` / ``concat`` /
+These are ``concat_field`` lists so :meth:`Part.slice` / ``concat`` /
 ``select`` (which the train stack drives per micro-batch) re-index them per sample
 exactly like SD3's tensor conditions — the framework's list-field machinery
 (``_slice_value`` / ``_concat_value``) handles arbitrary objects (each opaque
 context is one list element).
 
-``Condition`` subclass so it is a valid ``RolloutTrack.conditions`` dict value;
+``Condition`` subclass so it is a valid ``Part.conditions`` dict value;
 ``to_dict`` emits it under a single ``"bagel"`` key, ``from_dict`` reads it back.
 
 Replay approximation (frozen contexts): the contexts are prefilled under
@@ -66,7 +66,7 @@ class BagelARConditions(Condition):
       output (final preprocessed pixels), ingested ViT-only (understanding path).
 
     Covers t2t ``[text]``, i2t ``[vit]``, it2t ``[vit, text]`` and arbitrary
-    future interleaves. ``concat_field`` lists so ``RolloutTrack.slice`` /
+    future interleaves. ``concat_field`` lists so ``Part.slice`` /
     ``concat`` / ``select`` re-index per sample, exactly like the diffusion
     conditions.
     """
@@ -92,7 +92,7 @@ class BagelARConditions(Condition):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelARConditions":
-        """Read the conditions back from a ``RolloutTrack.conditions`` dict."""
+        """Read the conditions back from a ``Part.conditions`` dict."""
         bagel_ar = d.get("bagel_ar")
         if isinstance(bagel_ar, cls):
             return bagel_ar
@@ -102,7 +102,7 @@ class BagelARConditions(Condition):
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Emit as a single ``"bagel_ar"`` entry for ``RolloutTrack.conditions``."""
+        """Emit as a single ``"bagel_ar"`` entry for ``Part.conditions``."""
         return {"bagel_ar": self}
 
 
@@ -120,8 +120,6 @@ class BagelDiffusionConditions(Condition):
 
     @property
     def batch_size(self) -> int:
-        # Opaque-context path counts gen_contexts; deferred-prompt path (vllm_omni)
-        # has empty context lists, so fall back to the prompt count.
         return len(self.gen_contexts) or len(self.prompts)
 
     def has_contexts(self) -> bool:
@@ -209,7 +207,7 @@ class BagelDiffusionConditions(Condition):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelDiffusionConditions":
-        """Read the conditions back from a ``RolloutTrack.conditions`` dict.
+        """Read the conditions back from a ``Part.conditions`` dict.
 
         Accepts the canonical ``{"bagel": <BagelDiffusionConditions>}`` shape that
         :meth:`to_dict` emits (already an instance, possibly sliced by the train
@@ -224,7 +222,7 @@ class BagelDiffusionConditions(Condition):
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Emit as a single ``"bagel"`` entry for ``RolloutTrack.conditions``.
+        """Emit as a single ``"bagel"`` entry for ``Part.conditions``.
 
         The whole container is one ``Condition`` dict value; the train stack's
         ``slice`` / ``concat`` re-index its per-sample lists alongside the segment.

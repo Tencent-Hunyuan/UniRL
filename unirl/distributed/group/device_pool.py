@@ -16,6 +16,7 @@ PlacementGroup bundles reserve CPU quota for all slots upfront.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import ray
@@ -27,6 +28,8 @@ from unirl.distributed.group.worker import Worker
 from unirl.distributed.utils import get_node_ip_and_port
 
 logger = logging.getLogger(__name__)
+
+_ROLE_TEARDOWN_TIMEOUT_S = 45.0
 
 
 class DevicePool:
@@ -52,6 +55,7 @@ class DevicePool:
         workers_per_device: int = 1,
         transport_kind: str = "colocate_store",
         tq_handoff: Optional[dict] = None,
+        worker_max_concurrency: int = 1,
     ) -> None:
         if num_devices % devices_per_node != 0:
             raise ValueError(f"num_devices ({num_devices}) must be divisible by devices_per_node ({devices_per_node})")
@@ -64,36 +68,27 @@ class DevicePool:
                 f"colocate_store supports one worker per device (got workers_per_device="
                 f"{self.workers_per_device}); use transport_kind='gpu_store' for colocated multi-slot."
             )
-        # Driver's TransferQueue actor handoff; required when transport_kind is
-        # transfer_queue (fanned to each Worker before it builds its transport).
         self.tq_handoff = tq_handoff
 
-        # slot0 workers indexed by device_id (backward-compatible)
+        self.worker_max_concurrency = max(1, int(worker_max_concurrency))
+
         self.workers: List[ray.actor.ActorHandle] = []
 
-        # Per-GPU TensorWorker actors (gpu_store backend only), keyed by device_id.
         self._tw_by_device: Dict[int, Any] = {}
 
-        # MASTER_ADDR/PORT forwarded to TensorWorker actors so their cross-GPU NCCL
-        # PG can bind. Set in _create_workers; mirrors the slot0 Worker env injection.
         self._master_addr: Optional[str] = None
         self._master_port: Optional[str] = None
 
         self._pgs: List = []
         self._next_device: int = 0
 
-        # Devices reserved by a top-level placement scope. Subsequent sibling
-        # scopes carve from the complement; nested scopes carve from their
-        # parent's slab and do not touch this set.
         self._claimed: Set[int] = set()
 
-        # Internal mappings (private — use public methods from outside)
         self._worker_id_to_device_id: Dict[str, int] = {}
         self._worker_id_to_slot: Dict[str, int] = {}
         self._device_to_workers: Dict[int, List] = {}  # device_id → [slot0, slot1, ...]
         self._worker_by_id: Dict[str, Any] = {}  # worker_id → handle
 
-    # Keep num_gpus as a read-only alias for backward compatibility
     @property
     def num_gpus(self) -> int:
         return self.num_devices
@@ -129,8 +124,6 @@ class DevicePool:
 
         self._create_placement_groups()
         self._create_workers()
-        # GLOBAL transports (transfer_queue) resolve refs from any process and have no
-        # cross-worker NCCL; only worker-local backends (colocate/gpu) need the global PG.
         if self.num_devices > 1 and issubclass(self.transport_cls, WorkerLocalTransport):
             self._setup_nccl()
 
@@ -141,7 +134,6 @@ class DevicePool:
         even though slot1+ workers are created lazily.
         """
         num_nodes = self.num_devices // self.devices_per_node
-        # gpu_store adds one CPU per bundle for the per-GPU TensorWorker actor.
         extra_cpu = 1 if self.transport_kind in ("gpu_store", "gpu") else 0
         bundles = [{"GPU": 1, "CPU": self.workers_per_device + extra_cpu} for _ in range(self.devices_per_node)]
         pgs = [placement_group(bundles, strategy="STRICT_PACK") for _ in range(num_nodes)]
@@ -185,6 +177,8 @@ class DevicePool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
+        if self.worker_max_concurrency > 1:
+            options["max_concurrency"] = self.worker_max_concurrency
         if env_vars:
             options["runtime_env"] = {"env_vars": env_vars}
 
@@ -205,9 +199,6 @@ class DevicePool:
         self._worker_id_to_device_id[worker_id] = device_id
         self._worker_id_to_slot[worker_id] = slot
 
-        # gpu_store defers its transport build: the shared per-GPU TensorWorker is
-        # created after the Worker exists, so inject it then build. colocate and
-        # transfer_queue build in Worker.__init__ (deps ready at construction).
         if self.transport_kind in ("gpu_store", "gpu"):
             tw = self._get_or_create_tw(device_id)
             ray.get(w.set_tensor_worker.remote(tw))
@@ -228,11 +219,6 @@ class DevicePool:
 
         pg = self._pgs[device_id // self.devices_per_node]
         bundle_index = device_id % self.devices_per_node
-        # The TensorWorker shares the bundle's physical GPU with the slot0 Worker(s).
-        # With num_gpus=0 Ray hides all GPUs from the actor (CUDA_VISIBLE_DEVICES="");
-        # disable that override and mirror the slot0 Worker's CUDA_VISIBLE_DEVICES so the
-        # TW sees exactly that one GPU as cuda:0. MASTER_ADDR/PORT let its cross-GPU NCCL
-        # ProcessGroup bind (slot0 Workers get these via _spawn_worker's env_vars).
         cvd = ray.get(self.slot0_worker(device_id).get_cuda_visible_devices.remote())
         tw = (
             ray.remote(TensorWorker)
@@ -280,8 +266,6 @@ class DevicePool:
         slot0_workers = [self._device_to_workers[d][0] for d in range(self.num_devices)]
         ray.get([w.setup_global_pg.remote() for w in slot0_workers])
 
-    # ── Public interface ──
-
     def slot0_worker(self, device_id: int) -> ray.actor.ActorHandle:
         """Return the slot0 worker handle for device_id."""
         return self._device_to_workers[device_id][0]
@@ -319,7 +303,7 @@ class DevicePool:
             return
         rt.reset_actors_zero_copy_buffer_free(self.all_workers())
         if rt.backend is not None and rt.backend.manager_type == "MooncakeStorageManager":
-            rt.reset_zero_copy_buffer_free()  # the driver client's own registered buffers
+            rt.reset_zero_copy_buffer_free()
 
     def get_worker(self, worker_id: str) -> ray.actor.ActorHandle:
         """Return the worker handle for the given worker_id."""
@@ -395,14 +379,10 @@ class DevicePool:
             elif n_gpus is not None:
                 device_ids = self.allocate(n_gpus)
             else:
-                # Implicit defaults: full pool, slot 0. Bare back-to-back
-                # create_remote calls colocate (shared workers). Does NOT
-                # touch _claimed — bare calls opt out of scope tracking.
                 device_ids = list(range(self.num_devices))
         if slot_id is None:
             slot_id = 0
 
-        # Ensure slot workers exist for all requested devices
         for d in list(device_ids):
             self._get_or_create_worker(d, slot_id)
 
@@ -416,7 +396,8 @@ class DevicePool:
         )
 
     def shutdown(self) -> None:
-        """Kill all Worker actors and remove PlacementGroups."""
+        """Release roles, then kill all Worker actors and remove PlacementGroups."""
+        self._release_roles()
         for tw in self._tw_by_device.values():
             ray.kill(tw, no_restart=True)
         for w in self._worker_by_id.values():
@@ -437,3 +418,25 @@ class DevicePool:
         for pg in self._pgs:
             ray.util.remove_placement_group(pg)
         self._pgs = []
+
+    def _release_roles(self) -> None:
+        """Give every worker a chance to close its roles before we kill it.
+
+        ``ray.kill`` is a SIGKILL — no ``finally``, no destructors. A role
+        holding an inference engine needs to be asked first, or its subprocess
+        tree is orphaned still holding device memory.
+
+        One deadline is shared across all workers rather than applied per
+        worker: they are torn down for the same reason at the same time, and a
+        per-worker timeout would multiply by the pool size in exactly the case
+        that matters (everything wedged at once).
+        """
+        if not self._worker_by_id:
+            return
+        pending = {wid: w.teardown.remote() for wid, w in self._worker_by_id.items()}
+        deadline = time.monotonic() + _ROLE_TEARDOWN_TIMEOUT_S
+        for wid, ref in pending.items():
+            try:
+                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)

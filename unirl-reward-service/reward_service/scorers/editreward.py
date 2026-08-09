@@ -64,16 +64,84 @@ class EditRewardScorer(BaseScorer):
         if not items:
             return []
 
-        results: list[dict[str, float]] = []
-
-        for item in items:
+        # Score ALL valid items in ONE batched inferencer.reward() call. The
+        # previous loop ran the 7B VLM once PER item (a batch of 1), so a
+        # rollout's worth of scoring was N sequential forwards (~2h at 896
+        # items). inferencer.reward() already takes parallel lists and runs a
+        # single padded batch — the model was trained with batching, so batched
+        # inference yields the same per-item scores at a fraction of the cost.
+        results: list[dict[str, float]] = [None] * len(items)  # type: ignore[list-item]
+        rows: list[int] = []
+        prompts: list = []
+        srcs: list = []
+        edits: list = []
+        for i, item in enumerate(items):
             try:
-                result = self._score_single(item)
+                if len(item.history) < 2:
+                    raise ValueError(
+                        f"EditReward requires 2 history turns (source + edited), got {len(item.history)}"
+                    )
+                prompt, source_image = item.history[0]
+                _, edited_image = item.history[1]
+                if source_image is None or edited_image is None:
+                    raise ValueError("Both source and edited images must be provided")
+                rows.append(i)
+                prompts.append(prompt)
+                srcs.append(source_image)
+                edits.append(edited_image)
             except Exception:
-                result = {k: float("nan") for k in self.sub_metric_names}
-            results.append(result)
+                results[i] = {k: float("nan") for k in self.sub_metric_names}
+
+        if rows:
+            try:
+                rewards = self.inferencer.reward(prompts=prompts, image_src=srcs, image_paths=edits)
+                for row, i in enumerate(rows):
+                    results[i] = self._shape_reward(rewards, row)
+            except Exception:
+                # A single bad item must not nan the whole batch — fall back to
+                # the one-at-a-time path only on the error case.
+                for i in rows:
+                    try:
+                        results[i] = self._score_single(items[i])
+                    except Exception:
+                        results[i] = {k: float("nan") for k in self.sub_metric_names}
 
         return results
+
+    def _shape_reward(self, rewards, row: int) -> dict[str, float]:
+        """Map row ``row`` of a batched ``reward()`` output to the sub-metric dict.
+
+        Mirrors :meth:`_score_single`'s shaping exactly, indexed by batch row, so
+        the single batched forward produces the same per-item values the
+        one-at-a-time path produced.
+        """
+        if self._rm_head_type == "ranknet_multi_head":
+            if isinstance(rewards, torch.Tensor):
+                if rewards.dim() >= 2 and rewards.shape[-1] >= 2:
+                    return {
+                        "edit_following": float(rewards[row, 0].item()),
+                        "edit_quality": float(rewards[row, 1].item()),
+                    }
+                return {
+                    "edit_following": float(rewards[row].item()),
+                    "edit_quality": float("nan"),
+                }
+            if isinstance(rewards, (list, tuple)):
+                scores = [float(r[row].item()) if torch.is_tensor(r) else float(r) for r in rewards]
+                return {
+                    "edit_following": scores[0] if len(scores) > 0 else float("nan"),
+                    "edit_quality": scores[1] if len(scores) > 1 else float("nan"),
+                }
+        else:
+            if isinstance(rewards, torch.Tensor):
+                val = float(rewards[row, 0].item()) if rewards.dim() >= 2 else float(rewards[row].item())
+            else:
+                val = float(rewards[row])
+            return {
+                "edit_following": val,
+                "edit_quality": float("nan"),
+            }
+        return {k: float("nan") for k in self.sub_metric_names}
 
     def _score_single(self, item: ScoreItem) -> dict[str, float]:
         """Score a single item.

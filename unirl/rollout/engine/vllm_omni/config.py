@@ -58,26 +58,23 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
         return VLLMOmniRolloutEngine(config=self, **deps)
 
-    # Required: model checkpoint path. Set per experiment or via
-    # ``cfg.rollout.engine.model_path=...`` on the CLI.
     model_path: str = MISSING
-    # Adapter registry key — one of ``registered_adapters()`` (family-namespaced,
-    # e.g. ``hi3_t2i``). Kept as ``str`` because OmegaConf structured configs reject
-    # ``Literal[...]``; ``__post_init__`` validates against the live registry.
     modality: str = "hi3_t2i"
 
-    # Overlay ``enable_sleep_mode: True`` onto each stage's ``engine_args`` at
-    # boot so worker.sleep()/wake_up() (level 2) can run. Disable to fall back
-    # to the upstream YAML defaults (CuMemAllocator pool off, sleep raises).
-    # Required for ``cfg.training.execution.offload_rollout = True``.
     enable_sleep_mode: bool = True
 
-    # Passthrough for advanced ``Omni`` kwargs not surfaced as typed fields.
+    stage_yaml_override: Optional[str] = None
+
     omni_extra: Dict[str, Any] = field(default_factory=dict)
+
+    max_prompt_length: Optional[int] = None
+    video_fps: Optional[float] = None
+    video_max_pixels: Optional[int] = None
+    use_audio_in_video: Optional[bool] = None
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
-        # Validate against the live adapter registry (importing it registers them).
         from unirl.rollout.engine.vllm_omni.adapters import registered_adapters
 
         valid = registered_adapters()
@@ -85,10 +82,6 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             self.modality in valid,
             f"VLLMOmniEngineConfig.modality must be one of {set(valid)}; got {self.modality!r}",
         )
-
-    # ------------------------------------------------------------------
-    # Boot intent (consumed by ``VLLMOmniBackend.boot``)
-    # ------------------------------------------------------------------
 
     def server_intent(
         self,
@@ -121,14 +114,12 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             "enable_sleep_mode": bool(self.enable_sleep_mode),
             "ports": ports,
         }
-        # Adapter boot extras: stage_yaml / stage_yaml_source /
-        # needs_driver_tokenizer / clear_cuda_visible.
         intent.update(extra)
 
+        if self.stage_yaml_override:
+            intent["stage_yaml"] = str(self.stage_yaml_override)
+
         omni_kwargs: Dict[str, Any] = dict(
-            # HI3 weights are ~150GB; loading from cephfs over the network
-            # easily blows past the 300s default. Allow up to 20 min per
-            # stage, 30 min for the orchestrator. Override via omni_extra.
             stage_init_timeout=1200,
             init_timeout=1800,
         )

@@ -5,13 +5,14 @@ this module owns the *noise* side of the sampling loop — per-sample x_T
 generation, per-group noise sharing, and the deterministic per-group seed
 derivation (``_derive_group_seed``) that keys each sample's x_T.
 
-The driver (``DiffusionTrainer._build_req``) ships only a deterministic x_T
-RECIPE — per-sample ``init_noise_group_ids`` + ``init_noise_latent_shape`` on
-the ``RolloutReq`` — and every engine regenerates the byte-identical x_T from
-it via :func:`regen_initial_noise` (a CPU-fp32 wrapper over
-:func:`generate_shared_noise`). The plain ``generate_latents`` fallback runs
-only when neither a recipe nor ``request_conditions['initial_latents']`` is
-present, i.e. the engine draws its own noise.
+The driver ships only a deterministic x_T recipe on the request ``Sample``'s
+diffusion generation Part: lineage-derived sample/group ids plus
+``DiffusionSamplingParams.init_noise_latent_shape``. Every engine regenerates
+the byte-identical x_T from it via :func:`regen_initial_noise` (a CPU-fp32
+wrapper over :func:`generate_shared_noise`). The plain ``generate_latents``
+fallback runs only when :class:`unirl.types.noise_recipe.NoiseRecipe` resolves
+neither a recipe nor a Part-carried ``initial_latents`` tensor, so the engine
+must draw its own noise.
 """
 
 import hashlib
@@ -20,13 +21,9 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-# Inclusive max for torch.Generator.manual_seed and torch initial_seed conventions.
 MAX_TORCH_SEED = (1 << 63) - 1
 
 
-# Group-id prefix selecting prompt-content seeding: x_T is keyed only on the prompt text
-# (rank/step-independent), so the same prompt yields the same image across steps/checkpoints.
-# Used by eval for reproducible, comparable generations.
 PROMPT_SEED_PREFIX = "prompt:"
 
 
@@ -72,6 +69,38 @@ def _derive_group_seed(base_seed: int, group_id: str) -> int:
     payload = f"{int(base_seed)}::{gid}".encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % (MAX_TORCH_SEED + 1)
+
+
+def derive_denoise_step_seed(base_seed: int, step_index: int, sample_id: str) -> int:
+    """Derive the cross-engine per-sample, per-step SDE-noise seed."""
+    payload = (f"{int(base_seed)}::step::{int(step_index)}::sample::{str(sample_id)}").encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
+
+
+def make_denoise_step_generators(
+    *,
+    base_seed: int,
+    step_index: int,
+    sample_ids: List[str],
+) -> List[torch.Generator]:
+    """Build deterministic CPU generators for one SDE transition.
+
+    CPU generation keeps the random values independent of GPU architecture and
+    byte-identical between trainside and SGLang for the same seed tuple.
+    """
+    generators: List[torch.Generator] = []
+    for sample_id in sample_ids:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(
+            derive_denoise_step_seed(
+                base_seed=int(base_seed),
+                step_index=int(step_index),
+                sample_id=str(sample_id),
+            )
+        )
+        generators.append(generator)
+    return generators
 
 
 def generate_shared_noise(

@@ -14,10 +14,6 @@ from typing import Any, Optional
 
 from unirl.config.validation import validate_precision_type
 
-# LTX-2 3D-VAE geometry (fixed for the LTX-2 / LTX-2.3 family): 32x spatial,
-# 8x temporal compression, 128 latent channels. Single source of truth shared
-# by the pipeline (driver ``latent_shape`` + unpack) and the diffusion stage
-# (per-step RoPE coord geometry). Module-level so both import without a cycle.
 LTX2_SPATIAL_COMPRESSION = 32
 LTX2_TEMPORAL_COMPRESSION = 8
 LTX2_LATENT_CHANNELS = 128
@@ -41,44 +37,29 @@ class LTX2PipelineConfig:
     text_encoder_dtype: Any = None
     device: Any = None
 
-    # Stage-level precision / numerical policy.
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
-    # FlowMatch schedule shift. LTX-2 uses dynamic shift based on resolution.
     shift: float = 1.0
 
-    # Text encoder max sequence length (Gemma3).
     max_sequence_length: int = 512
 
-    # Audio support (LTX-2.3). Set True to load audio VAE + vocoder.
     enable_audio: bool = False
 
-    # When True (and the bundle has audio), video+audio form a SINGLE joint SDE
-    # policy: audio is SDE-stepped with the same ``eta`` as video, emits its own
-    # per-step log-prob, and the two are merged by an element-weighted mean (the
-    # mean a single SDE over the concatenated ``[video|audio]`` latent would
-    # produce). This keeps the RL importance ratio consistent with the
-    # audio<->video cross-attention coupling. When False, audio is denoised with
-    # ODE (``eta=0``, no log-prob, no RL gradient) and only video carries the
-    # policy signal — the legacy behavior. No effect for ``enable_audio=False``
-    # (T2V): the audio stream is then a synthetic placeholder that is never
-    # decoded or rewarded, so it stays out of the policy regardless of this flag.
     audio_joint_sde: bool = True
 
-    # Video generation defaults.
     default_height: int = 512
     default_width: int = 768
     default_num_frames: int = 121  # ~5s at 24fps
     default_frame_rate: float = 24.0
 
-    # Weight sync prefix (trainer-side vs engine-side key namespace).
     weight_sync_param_name_prefix: str = "transformer."
 
-    # Whether to use LoRA (read by recipes, not by bundle).
     use_lora: bool = False
     lora_target_modules: Optional[list] = None
+
+    aux_components_on_cpu: bool = False
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")

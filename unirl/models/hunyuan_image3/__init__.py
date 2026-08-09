@@ -23,6 +23,7 @@ from unirl.models.hunyuan_image3.conditions import (
     HunyuanImage3ARConditions,
     HunyuanImage3DiffusionConditions,
     HunyuanImage3FusedMultimodalCondition,
+    HunyuanImage3VAECondition,
 )
 from unirl.models.hunyuan_image3.config import HunyuanImage3PipelineConfig
 from unirl.models.hunyuan_image3.diffusion import (
@@ -51,6 +52,7 @@ __all__ = [
     "HunyuanImage3DiffusionStage",
     "HunyuanImage3DiffusionStep",
     "HunyuanImage3FusedMultimodalCondition",
+    "HunyuanImage3VAECondition",
     "HunyuanImage3Pipeline",
     "HunyuanImage3PipelineConfig",
     "HunyuanImage3TextEmbedStage",

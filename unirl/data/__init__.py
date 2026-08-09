@@ -4,7 +4,7 @@ Data loading utilities for GRPO training.
 Provides multimodal data sources and prompt datasets for GRPO training.
 """
 
-from .data_source import DefaultDataSource, MultimodalRLDataSource
+from .data_source import DefaultDataSource, MultiDomainRLDataSource, MultimodalRLDataSource
 from .datasets import (
     PromptExampleDataset,
     TextPromptDataset,
@@ -12,10 +12,9 @@ from .datasets import (
 )
 
 __all__ = [
-    # Data sources
     "MultimodalRLDataSource",
+    "MultiDomainRLDataSource",
     "DefaultDataSource",
-    # Datasets
     "PromptExampleDataset",
     "TextPromptDataset",
     "normalize_prompt_example",

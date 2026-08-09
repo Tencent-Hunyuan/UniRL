@@ -14,7 +14,7 @@ not via cond/uncond stacking.
 
 Pairs ``from_dict`` / ``to_dict`` mirroring HV15 / SD3 for round-tripping
 between the typed form (used inside the pipeline at stage call sites) and
-the generic ``Conditions = Dict[str, Condition]`` shape on ``RolloutResp``.
+the generic generic ``Dict[str, Condition]`` shape on a ``Part``.
 Keys emitted: ``text_llama`` / ``pooled_clip``.
 """
 
@@ -34,9 +34,7 @@ from unirl.types.conditions import (
 class HunyuanVideoConditions(Batch):
     """Typed conditions container for HunyuanVideo-1.0 diffusion."""
 
-    # LLaMA encoder: 3D [B, seq, 4096] + attn_mask [B, seq].
     text_llama: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, transport=True, default=None)
-    # CLIP pooled: embeds [B, 768] (attn_mask not used by transformer).
     pooled_clip: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, transport=True, default=None)
 
     @classmethod
@@ -68,7 +66,7 @@ class HunyuanVideoConditions(Batch):
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.conditions``.
+        packing into ``Part.conditions``.
         """
         if self.text_llama is None or self.pooled_clip is None:
             raise ValueError(

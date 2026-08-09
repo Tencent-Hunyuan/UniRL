@@ -52,42 +52,31 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
         return SGLangDiffusionRolloutEngine(config=self, **deps)
 
-    # --- Sampling (live interpolation back to top-level cfg.sampling) ---
     sampling: Any = dc_field(default_factory=lambda: SI("${sampling}"))
 
-    # --- Model family: selects the adapter (registry key) ---
     model_family: str = "sd3"
 
-    # --- Conditions packing ---
     populate_conditions: bool = True
 
-    # --- Engine-internal noise fallback (only when caller didn't pre-ship latents) ---
     init_same_noise: bool = False
 
-    # --- Parallelism & GPU ---
     num_gpus: int = 1
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
 
-    # --- SGLang engine behaviour ---
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # --- Forward chunking (None = whole batch in one forward) ---
     forward_batch_size: Optional[int] = None
 
-    # --- Weight sync ---
     target_modules: Optional[Tuple[str, ...]] = None
 
-    # --- LoRA ---
     lora_merge_mode: Optional[str] = None
 
-    # --- SGLang network (remote mode only; local mode self-reserves its ports) ---
     host: Optional[str] = None
     port: Optional[int] = None
     scheduler_port: Optional[int] = None
 
-    # --- Escape hatch for rare / advanced ServerArgs overrides ---
     engine_kwargs: Optional[Dict[str, Any]] = dc_field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -95,7 +84,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             self.engine_kwargs = {}
 
         self.model_family = str(self.model_family or "").strip().lower()
-        # Validate against the live adapter registry (importing it registers them).
         from unirl.rollout.engine.sglang_diffusion.adapters import registered_adapters
 
         valid_families = registered_adapters()
@@ -129,10 +117,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"got port={self.port!r}, scheduler_port={self.scheduler_port!r}",
         )
 
-    # ------------------------------------------------------------------
-    # SGLang ServerArgs intent (successor of the legacy ``build_server_kwargs``)
-    # ------------------------------------------------------------------
-
     def server_intent(
         self,
         *,
@@ -153,11 +137,8 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         """
         intent: Dict[str, Any] = {}
 
-        # Layer 1: escape-hatch (lowest priority). Non-ServerArgs keys are dropped
-        # by the backend's allowed-keys filter, so passing them through is harmless.
         intent.update(self.engine_kwargs or {})
 
-        # Layer 2: typed cfg + model_config fields.
         if model_config.pretrained_model_ckpt_path:
             intent["model_path"] = model_config.pretrained_model_ckpt_path
         intent["num_gpus"] = int(self.num_gpus)
@@ -177,11 +158,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.host is not None:
             intent["host"] = str(self.host)
 
-        # Layer 3: adapter model-specific extras (override hook).
         if extra:
             intent.update(extra)
 
-        # Layer 4: ports (highest). Local mode → reserved set; remote → cfg fields.
         if ports is not None:
             intent["port"] = ports.server_port
             intent["scheduler_port"] = ports.scheduler_port

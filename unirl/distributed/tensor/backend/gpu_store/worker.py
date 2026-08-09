@@ -56,9 +56,6 @@ class TensorWorker:
 
     def __init__(self, device_id: int):
         self.device_id = device_id
-        # Handles produced by this TW are owned by the slot0 worker on this GPU.
-        # source_id is a worker_id string so controller-side locality (handle._unwrap,
-        # pool.device_id_of) resolves it; all slots on this GPU share this TW.
         self.source_id = f"dw{device_id}"
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
@@ -74,23 +71,10 @@ class TensorWorker:
         self._counter = 0
         self._global_pg = None
 
-        # ipc_collect is deferred: called only when cumulative freed count OR bytes
-        # hits a threshold, amortizing the ~620 µs cost across many decref→0 events.
-        #
-        # In the normal flow (Worker closes IPC view BEFORE controller GC fires decref),
-        # del buf + empty_cache() already returns memory to CUDA without needing
-        # ipc_collect(). The thresholds here are a safety net for edge cases where
-        # consumers close late (e.g., slow GC, explicit copy.copy handles).
-        #
-        # Tunable via env vars forwarded by DevicePool:
-        #   MMRL_IPC_COLLECT_COUNT  (default 128)
-        #   MMRL_IPC_COLLECT_BYTES  (default 1 GB)
         self._limbo_count: int = 0
         self._limbo_bytes: int = 0
         self._ipc_collect_count: int = int(os.environ.get("MMRL_IPC_COLLECT_COUNT", "128"))
         self._ipc_collect_bytes: int = int(os.environ.get("MMRL_IPC_COLLECT_BYTES", str(1 << 30)))
-
-    # ── Allocation: put path ──
 
     def batch_allocate(self, requests: List[Tuple[tuple, torch.dtype]]) -> List[Tuple[str, tuple, tuple]]:
         """Batch-allocate buffers, return [(store_key, ipc_h, stride), ...].
@@ -125,8 +109,6 @@ class TensorWorker:
                 self._store[key] = buf
                 self._ref_counts[key] = 1
 
-    # ── Borrow: read path ──
-
     def batch_borrow(self, store_keys: List[str]) -> List[Tuple[tuple, tuple, tuple]]:
         """Batch-create IPC handles for reading, return [(ipc_h, shape, stride), ...].
 
@@ -142,8 +124,6 @@ class TensorWorker:
                 (self._store[k].untyped_storage()._share_cuda_(), tuple(self._store[k].shape), self._store[k].stride())
                 for k in store_keys
             ]
-
-    # ── Reference counting ──
 
     def incref(self, key: str) -> None:
         """Increment reference count. Called by GPUTensorHandle __copy__ on controller."""
@@ -200,8 +180,6 @@ class TensorWorker:
             if key not in self._ref_counts:
                 raise KeyError(f"TensorWorker: unknown key '{key}'")
             return self._ref_counts[key]
-
-    # ── Tensor operations (called by GPUTensorHandle.remote_op / TensorRef.materialize) ──
 
     def tensor_op(self, handle: GPUTensorHandle, op: str, *op_args) -> GPUTensorHandle:
         """Execute a tensor operation directly in _store (no IPC needed).
@@ -266,8 +244,6 @@ class TensorWorker:
                 self._limbo_count = 0
                 self._limbo_bytes = 0
 
-    # ── Cross-worker NCCL transfer ──
-
     def setup_global_pg(self, global_rank: int, global_world_size: int) -> None:
         """Initialize the global ProcessGroup for cross-GPU NCCL transfers.
 
@@ -282,6 +258,8 @@ class TensorWorker:
             timeout=timedelta(seconds=30),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
+        # Reserve NCCL communicators before models consume device memory.
+        self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
         """Send stored tensors (or row ranges of them) to dst_rank via NCCL.

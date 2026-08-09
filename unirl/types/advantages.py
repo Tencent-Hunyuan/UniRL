@@ -1,8 +1,9 @@
-"""Advantage computation helpers for rollout tracks.
+"""Advantage computation helpers for generated parts.
 
-GRPO-style group normalization lives on :meth:`RolloutTrack.compute_advantages`
-in :mod:`unirl.types.rollout_resp`. GAE and other per-step estimators live here
-as pure tensor utilities consumed by trainers before the train step.
+GRPO-style group normalization lives on :meth:`Part.compute_advantages` in
+:mod:`unirl.types.sample`. :func:`finite_mean_std` is the shared finite-only
+population mean/std used by that path and agentic trainers. GAE and other
+per-step estimators also live here as pure tensor utilities.
 """
 
 from __future__ import annotations
@@ -10,6 +11,21 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
+
+
+def finite_mean_std(values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Population mean/std over finite entries of ``values``.
+
+    Non-finite values are ignored. Empty finite set → ``(0, 1)``; a single finite
+    value → std ``1`` so ``(x - mean) / (std + eps)`` collapses to advantage 0
+    (GRPO singleton / all-equal-after-filter degenerate case).
+    """
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return values.new_zeros(()), values.new_ones(())
+    mean = finite.mean()
+    std = finite.std(unbiased=False) if finite.numel() > 1 else values.new_ones(())
+    return mean, std
 
 
 def compute_gae_advantages(
@@ -69,6 +85,34 @@ def compute_gae_advantages(
 
     returns = advantages + values
     return advantages, returns
+
+
+def scatter_terminal_rewards(
+    rewards_per_sample: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Scatter each trajectory reward onto its final packed response token."""
+    if rewards_per_sample.ndim != 1:
+        raise ValueError(f"scatter_terminal_rewards: expected 1D rewards, got shape {tuple(rewards_per_sample.shape)}")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() == 0:
+        raise ValueError("scatter_terminal_rewards: cu_seqlens must be a non-empty 1D tensor")
+    batch_size = int(cu_seqlens.numel()) - 1
+    if int(rewards_per_sample.numel()) != batch_size:
+        raise ValueError(
+            f"scatter_terminal_rewards: rewards batch ({int(rewards_per_sample.numel())}) "
+            f"!= packed batch ({batch_size})"
+        )
+
+    cu = [int(offset) for offset in cu_seqlens.tolist()]
+    if cu[0] != 0 or any(end < start for start, end in zip(cu, cu[1:])):
+        raise ValueError(f"scatter_terminal_rewards: invalid cumulative offsets {cu}")
+
+    token_rewards = rewards_per_sample.new_zeros(cu[-1])
+    for reward, start, end in zip(rewards_per_sample, cu, cu[1:]):
+        if end > start:
+            token_rewards[end - 1] = reward
+    return token_rewards
 
 
 def _gae_1d(

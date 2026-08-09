@@ -1,0 +1,183 @@
+# @package _global_
+# AR GRPO Qwen3-30B-A3B (MoE) — VeOmni FSDP2 backend with EXPERT PARALLELISM (ep_size),
+# SGLang rollout, 8 GPU. Sibling of qwen3_grpo_4b_veomni_sp_sglang.yaml: same GRPO /
+# data / reward / sampling, but the dense Qwen3-4B is swapped for the 128-expert MoE
+# Qwen3-30B-A3B and the VeOmni backend shards the experts across ep_size ranks
+# (each rank owns num_experts/ep_size experts; tokens routed via all-to-all + fused
+# grouped-GEMM). The single switch is backend.fsdp_cfg.ep_size; ep_size=1 is a true
+# no-op (== the SP/FSDP-only path).
+#
+# PREREQUISITES:
+#   1. A LOCAL checkpoint dir. Both layouts load directly (no offline merge): HF
+#      original per-expert (experts.N.gate_proj/up_proj/down_proj) AND VeOmni stacked
+#      (experts.gate_up_proj/down_proj). The EP-aware loader
+#      (unirl.train.backend.sharded_load._load_state_dict_ep_sliced) reconstructs each
+#      rank's fused expert block from the per-expert keys on the fly. Point
+#      QWEN3_MOE_PATH at a local download of Qwen/Qwen3-30B-A3B (HF repo IDs are not
+#      fetched here — sharded_load reads *.safetensors from a local dir).
+#   2. EP-aware weight sync — IMPLEMENTED. TensorWeightSync (via FullWeightSync.
+#      _iter_full_tensors_ep) all-gathers the EP-sharded experts over the ep group and
+#      reverse-converts stacked->HF per-expert names for SGLang's expert_params_mapping
+#      (verified bit-exact). BUT TensorWeightSync is TP=1, so rollout.tp_size MUST be 1
+#      here. A real 30B-A3B rollout needs TP>1 → a TP-aware sync (per-TP payloads, or
+#      NCCLWeightSync). <-- remaining external/infra work.
+#
+# Run (8 GPU):
+#   QWEN3_MOE_PATH=/path/to/qwen3-30b-a3b-stacked DATA_PATH=data/dapo_math/train.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang num_devices=8
+
+num_devices: 8
+batch_size: 32
+num_rollouts: 400
+weight_sync_interval: 1   # see PREREQUISITE #2 (EP-aware sync) before trusting on-policy
+eval_interval: 10
+
+adv_normalization_scope: group
+normalize_adv_by_std: false
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-grpo
+  run_name: grpo_qwen3-30b-a3b_moe_veomni_ep
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [grpo, qwen3-moe, 30b-a3b, ep, veomni, sglang]
+
+bundle:
+  # VeOmni-patched Qwen3-MoE (get_parallel_plan Shard(0) on stacked experts + fused
+  # MoE op) — the EP-capable bundle. Reuses Qwen3PipelineConfig (meta-init + precision).
+  _target_: unirl.models.qwen3_moe.bundle.Qwen3MoeBundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH}
+    meta_init_transformer: true
+    model_precision: bf16
+    # flash_attention_2 is the train-side global attn backend (replay + decode).
+    attn_implementation: flash_attention_2
+    autocast_precision: bf16
+    logprob_precision: fp32
+    use_gradient_checkpointing: true
+
+pipeline:
+  # Reused verbatim from the dense Qwen3 pipeline — the AR stage's replay forward is
+  # architecture-agnostic (needs only .model + .lm_head), so it drives the MoE model.
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.veomni.backend.VeOmniBackend
+  # MoE decoder layer (NOT the dense Qwen3DecoderLayer): VeOmni fully_shards these
+  # per block; the stacked experts inside are EP-sharded on the (ep, ep_fsdp) submesh.
+  block_class_names: ["Qwen3MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    sp_size: 1
+    # EXPERT PARALLELISM: shard the experts across ep_size ranks. Must divide
+    # world_size (= dp_shard x ulysses) AND num_experts. ep_size=1 == no-op.
+    ep_size: 8
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+
+rollout:
+  # SGLang serving Qwen3-30B-A3B.
+  # ⚠️ tp_size=1 REQUIRED with the colocate TensorWeightSync below: that sync is
+  # TP=1 (each train rank ships ONE serialized tensor bag to serialized_named_tensors[0]).
+  # A 30B-A3B does not fit a single GPU for rollout, so a real run needs TP>1 —
+  # which in turn needs a TP-aware sync (extend TensorWeightSync to emit per-TP
+  # payloads, or switch to NCCLWeightSync). Until that lands, keep tp_size=1
+  # (smaller MoE) so the recipe is self-consistent. See PREREQUISITE #2.
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH}
+    tp_size: 1
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    samples_pre_expanded: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      mem_fraction_static: 0.4
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: 0.28
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 8192
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  # Full-finetune EP sync: fused experts are gathered across the ep group and
+  # emitted under SGLang's HF per-expert names. For an EP + LoRA recipe, use a
+  # LoRA sync handler or set lora_merged=true; LoRA inside fused expert modules
+  # is rejected because that adapter layout has no safe receiver representation.
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 32
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

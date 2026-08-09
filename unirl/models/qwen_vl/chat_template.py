@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional, Union
 
-import PIL.Image
 import torch
 
+from unirl.config.require import require
+from unirl.models.types.conversations import build_vision_messages
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Images, Texts
+from unirl.types.sample import Turn
 
 from .bundle import QwenVLBundle
 from .conditions import QwenVLARConditions
+
+QwenVLChatInput = Union[List[Turn], Texts]
 
 
 class QwenVLChatTemplateStage:
@@ -24,37 +28,62 @@ class QwenVLChatTemplateStage:
         self.bundle = bundle
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
-        # When True, pad every prompt to a fixed `max_prompt_length` instead of
-        # the per-batch dynamic max. Required by the v2 DP trainer: shards from
-        # different rollout workers are concatenated (dim 0) at merge time, so
-        # input_ids/attention_mask must share one sequence length across shards.
-        # Default False preserves the v1 dynamic-pad behavior.
         self.pad_to_max_length = bool(pad_to_max_length)
 
     def embed(
         self,
-        texts: Texts,
-        images: Optional[List[Optional[PIL.Image.Image]]] = None,
+        value: QwenVLChatInput,
+        images: Optional[List[Optional[Any]]] = None,
     ) -> QwenVLARConditions:
+        """Render role-aware turns or supervised single-turn rows.
+
+        ``List[Turn]`` is the Sample-native rollout path; image content is already
+        carried by image Turns. ``Texts`` plus an optional PIL per row is the SFT
+        path. Both normalize to the same processor-message representation and
+        share all tokenization, truncation, padding, and condition packing below.
+        """
+        if isinstance(value, Texts):
+            batch_size = len(value)
+            if batch_size == 0:
+                raise ValueError("QwenVLChatTemplateStage.embed: expected at least one text row.")
+            image_rows = [None] * batch_size if images is None else list(images)
+            if len(image_rows) != batch_size:
+                raise ValueError(
+                    f"QwenVLChatTemplateStage.embed: images length {len(image_rows)} != text batch {batch_size}."
+                )
+            conversations = []
+            for text, image in zip(value.texts, image_rows):
+                messages = []
+                if self.system_instruction:
+                    messages.append({"role": "system", "content": self.system_instruction})
+                content = []
+                if image is not None:
+                    content.append({"type": "image", "image": image})
+                content.append({"type": "text", "text": text})
+                messages.append({"role": "user", "content": content})
+                conversations.append(messages)
+        else:
+            turns = value
+            if images is not None:
+                raise ValueError(
+                    "QwenVLChatTemplateStage.embed: images must be carried by Turn content; "
+                    "the separate images argument is only valid with Texts input."
+                )
+            if not turns:
+                raise ValueError("QwenVLChatTemplateStage.embed: expected at least one conversation turn.")
+            require(
+                sum(isinstance(t.content, Images) for t in turns) <= 1,
+                "QwenVLChatTemplateStage.embed: at most one image turn per request is "
+                "supported (multi-image trajectories are out of scope).",
+            )
+            conversations = build_vision_messages(turns, self.system_instruction)
+
         processor = self.bundle.processor
         device = self.bundle.device
         dtype = self.bundle.dtype
-        batch_size = len(texts.texts)
 
         per_sample_inputs = []
-        for i, text in enumerate(texts.texts):
-            content: list = []
-            sample_images: list = []
-            if images is not None and i < len(images) and images[i] is not None:
-                content.append({"type": "image", "image": images[i]})
-                sample_images.append(images[i])
-            content.append({"type": "text", "text": text})
-
-            messages: list = []
-            if self.system_instruction is not None:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({"role": "user", "content": content})
-
+        for messages in conversations:
             inputs = processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -63,6 +92,7 @@ class QwenVLChatTemplateStage:
                 return_tensors="pt",
             )
             per_sample_inputs.append(inputs)
+        batch_size = len(per_sample_inputs)
 
         if self.pad_to_max_length:
             max_len = self.max_prompt_length
@@ -88,10 +118,6 @@ class QwenVLChatTemplateStage:
             mask = inp["attention_mask"].squeeze(0)
             attention_mask[i, :L] = mask[:L].to(device)
 
-        # Per-sample lists for pixel_values and image_grid_thw.
-        # Each list has batch_size elements (one per sample, possibly None).
-        # Using per-sample lists with FieldKind.CONCAT ensures correct
-        # concatenation when multiple rollout workers' conditions are merged.
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:

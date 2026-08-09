@@ -96,8 +96,8 @@ class TextTokenCondition(Condition):
     def concat(cls, items: Sequence["TextTokenCondition"]) -> "TextTokenCondition":
         """Concat token-id conditions, right-padding variable lengths first.
 
-        SGLang's per-shard ``build_rollout_resp`` right-pads prompt
-        ``input_ids`` to that shard's in-batch max, so different rollout
+        SGLang's per-shard condition packing right-pads prompt ``input_ids``
+        to that shard's in-batch max, so different rollout
         actors carry different sequence lengths. The generic batch concat
         uses plain ``torch.cat(dim=0)``; pad dim 1 to the global max with
         zeros (attention_mask zeros the same positions out, so the pad

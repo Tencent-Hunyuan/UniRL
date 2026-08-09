@@ -1,7 +1,5 @@
 from setuptools import find_packages, setup
 
-# Compatibility metadata for older pip/setuptools editable installs.
-# Newer tooling uses pyproject.toml as the source of truth.
 setup(
     name="unirl",
     version="0.1.0",

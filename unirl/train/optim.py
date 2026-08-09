@@ -93,12 +93,6 @@ def build_optimizer(
         if backend_optimizer is not None:
             return backend_optimizer
 
-    # ``foreach=False`` disables the multi-tensor kernel path. Required whenever
-    # the param list mixes regular ``torch.Tensor`` (non-FSDP-wrapped sub-modules
-    # — e.g. SD3's embed/norm layers when only transformer blocks are
-    # ``fully_shard``-wrapped) with ``DTensor`` (FSDP-wrapped block params):
-    # ``_foreach_lerp_`` rejects the mixed bag and trips ``RuntimeError: got mixed
-    # torch.Tensor and DTensor``. Single-tensor kernels handle each independently.
     adam_kwargs = dict(
         betas=(float(config.adam_beta1), float(config.adam_beta2)),
         eps=float(config.adam_epsilon),
@@ -131,8 +125,8 @@ def build_lr_scheduler(
 
     Supports the same backend-override path as :func:`build_optimizer`.
     Returns ``None`` if ``config.type`` is not one of the supported values
-    (``constant`` / ``linear`` / ``cosine``) and the backend did not provide
-    an override.
+    (``constant`` / ``linear`` / ``linear_warmup`` / ``cosine``) and the backend
+    did not provide an override.
     """
     del actor
     if backend is not None:
@@ -166,6 +160,27 @@ def build_lr_scheduler(
             return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if scheduler_type == "linear_warmup":
+        constant = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=1.0,
+            total_iters=1,
+        )
+        if warmup_steps <= 0:
+            return constant
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-8,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, constant],
+            milestones=[warmup_steps],
+        )
 
     if scheduler_type == "cosine":
 

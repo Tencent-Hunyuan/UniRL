@@ -37,7 +37,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import QwenImageBundle
 
-# Chat-template constants (upstream Qwen-Image convention).
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
     "texture, quantity, text, spatial relationships of the objects and background:"
@@ -45,6 +44,14 @@ PROMPT_TEMPLATE = (
 )
 PROMPT_TEMPLATE_START_IDX = 34
 TOKENIZER_MAX_LENGTH = 1024
+
+
+def extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> List[torch.Tensor]:
+    """Split padded ``[B, T, D]`` states into variable-length sample tensors."""
+    bool_mask = mask.bool()
+    valid_lengths = bool_mask.sum(dim=1)
+    selected = hidden_states[bool_mask]
+    return list(torch.split(selected, valid_lengths.tolist(), dim=0))
 
 
 class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
@@ -73,24 +80,12 @@ class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             pooled=None,
         )
 
-    # ---- helpers -----------------------------------------------------------
-
-    @staticmethod
-    def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> List[torch.Tensor]:
-        """Split a padded ``[B, T, D]`` tensor into ``B`` variable-length
-        ``[t_i, D]`` slices using a ``[B, T]`` 0/1 mask."""
-        bool_mask = mask.bool()
-        valid_lengths = bool_mask.sum(dim=1)
-        selected = hidden_states[bool_mask]
-        return list(torch.split(selected, valid_lengths.tolist(), dim=0))
-
     def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
         texts = [PROMPT_TEMPLATE.format(item) for item in prompts]
-        # Tokenizer cap includes the chat-template prefix.
         max_length = TOKENIZER_MAX_LENGTH + PROMPT_TEMPLATE_START_IDX
         text_inputs = bundle.tokenizer(
             texts,
@@ -108,8 +103,7 @@ class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             )
         hidden_states = encoder_out.hidden_states[-1]
 
-        split_hidden_states = self._extract_masked_hidden(hidden_states, text_inputs.attention_mask)
-        # Strip the chat-template prefix from every prompt.
+        split_hidden_states = extract_masked_hidden(hidden_states, text_inputs.attention_mask)
         split_hidden_states = [item[PROMPT_TEMPLATE_START_IDX:] for item in split_hidden_states]
         attn_mask_list = [
             torch.ones(item.size(0), dtype=torch.long, device=item.device) for item in split_hidden_states
@@ -126,10 +120,9 @@ class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             [torch.cat([item, item.new_zeros(max_seq_len - item.size(0))]) for item in attn_mask_list]
         )
 
-        # Final slice to the configured budget.
         prompt_embeds = prompt_embeds[:, : self.max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, : self.max_sequence_length]
         return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
 
 
-__all__ = ["QwenImageTextEmbedStage"]
+__all__ = ["QwenImageTextEmbedStage", "extract_masked_hidden"]

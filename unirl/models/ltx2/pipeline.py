@@ -18,9 +18,8 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.primitives import Audio, Audios, Images, Texts
+from unirl.types.sample import Sample
 
 from .bundle import LTX2Bundle
 from .conditions import LTX2Conditions
@@ -37,8 +36,6 @@ from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
 
 logger = logging.getLogger(__name__)
 
-# LTX-2 3D-VAE geometry constants now live in config.py (shared with the
-# diffusion stage). Local aliases kept for readability in this module.
 _LTX2_SPATIAL_COMPRESSION = LTX2_SPATIAL_COMPRESSION
 _LTX2_TEMPORAL_COMPRESSION = LTX2_TEMPORAL_COMPRESSION
 _LTX2_LATENT_CHANNELS = LTX2_LATENT_CHANNELS
@@ -65,10 +62,6 @@ class LTX2Pipeline(Pipeline):
         self.vae_encode = vae_encode
         self.audio_decode = audio_decode
         self.config = config
-        # Exposed for the hosting engine (TrainsideRolloutEngine reads
-        # ``pipeline.shift`` to build a FlowMatchSchedulePolicy at startup) —
-        # same convention as SD3/flux2klein. ``generate`` itself reads
-        # ``self.config.shift`` directly.
         self.shift = config.shift
 
     @classmethod
@@ -107,8 +100,6 @@ class LTX2Pipeline(Pipeline):
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
-        # Audio decode is only meaningful for LTX-2.3 T2AV (bundle has audio_vae
-        # + vocoder). For T2V it stays None and the audio path is never taken.
         audio_decode = LTX2AudioDecodeStage(bundle) if bundle.has_audio else None
 
         return cls(
@@ -125,7 +116,8 @@ class LTX2Pipeline(Pipeline):
         """Build the LTX-2 schedule policy (constant-μ exponential shift).
 
         The hosting engine (``TrainsideRolloutEngine``) calls this at startup
-        to pin ``req.sigmas`` before ``generate``. LTX-2 uses dynamic-shifting
+        to pin the gen Part's ``DiffusionSamplingParams.sigmas`` before ``generate``.
+        LTX-2 uses dynamic-shifting
         with μ ≡ ``max_shift`` (2.05) — NOT the static ``shift=1.0`` the engine
         would otherwise fall back to (which under-resolves the trajectory and
         yields blurry frames). See ``schedule.py`` for the diffusers alignment.
@@ -204,100 +196,87 @@ class LTX2Pipeline(Pipeline):
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         return latents * std / float(vae.config.scaling_factor) + mean
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run T2V / I2V / T2AV based on request primitives."""
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"LTX2Pipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
+    def build_conditions(
+        self,
+        texts: Texts,
+        *,
+        negatives: Optional[Texts] = None,
+        guidance_scale: float = 1.0,
+    ) -> LTX2Conditions:
+        """Encode prompts and optional CFG negatives into ``LTX2Conditions``.
 
-        images = req.primitives.get("image")
-        # ``req.sampling_params`` is the per-stage dict keyed by stage name —
-        # same accessor every sibling pipeline uses (sd3/wan21/…). (The earlier
-        # ``get_diffusion_params`` helper only exists on the in-flight
-        # ComposedSamplingParams branch, not on main, so it broke import here.)
-        params = req.sampling_params.get("diffusion")
+        CFG empty-negative: LTX-2's diffusers pipeline defaults negative_prompt to
+        ``""`` when guidance is on, so the model sees its trained unconditional
+        embedding. Without this, predict_noise would skip the CFG branch entirely
+        (negative_text is None) and guidance_scale would be a silent no-op.
+        The Sample path intentionally carries no negative prompt; direct callers
+        such as ReFL can supply one through this public builder.
+        """
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"LTX2Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if negatives is None and float(guidance_scale) > 1.0:
+            negatives = Texts(texts=[""] * len(texts.texts))
+        embed_result = self.text_embed.encode(texts, negative_texts=negatives)
+        return LTX2Conditions.from_dict(embed_result)
+
+    def generate(self, sample: Sample) -> Sample:
+        """Run LTX-2 T2V end-to-end, filling the frontier (pre-forked) gen Part.
+
+        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
+        by the hosting engine (a fallback ``get_sigma_schedule`` is computed if not,
+        for parity with the prior req path); see the σ ownership note in
+        ``unirl.models.types.pipeline``.
+        """
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
         if params is None:
             raise ValueError("LTX2Pipeline.generate: DiffusionSamplingParams required.")
 
-        # Determine mode
-        has_image = isinstance(images, Images)
-        if has_image:
-            # I2V is NOT wired end-to-end yet: the encode step below sets
-            # conditions.image_latent, but LTX2DiffusionStep.predict_noise never
-            # consumes it, so the image condition would be silently dropped
-            # (I2V degrades to T2V with no error). Fail loudly until the
-            # transformer image-conditioning path is implemented.
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"LTX2Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+
+        if any(isinstance(c, Images) for c in conditioning[1:]):
             raise NotImplementedError(
-                "LTX2Pipeline: I2V (req.primitives['image']) is not supported yet — "
+                "LTX2Pipeline: I2V (a chained image input) is not supported yet — "
                 "the diffusion stage does not consume conditions.image_latent. "
-                "Only T2V is wired. Drop the image primitive, or implement the "
+                "Only T2V is wired. Drop the image input, or implement the "
                 "image-conditioning path in LTX2DiffusionStep.predict_noise."
             )
 
-        # 1. Text embedding. CFG empty-negative: LTX-2's diffusers pipeline
-        # defaults negative_prompt to "" when guidance is on, so the model sees
-        # its trained unconditional embedding. Without this, predict_noise would
-        # skip the CFG branch entirely (negative_text is None) and guidance_scale
-        # would be a silent no-op.
-        negative_texts = req.primitives.get("negative_text")
-        neg = negative_texts if isinstance(negative_texts, Texts) else None
-        if neg is None and float(params.guidance_scale) > 1.0:
-            neg = Texts(texts=[""] * len(texts.texts))
-        embed_result = self.text_embed.encode(texts, negative_texts=neg)
+        conditions = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
 
-        # 2. Build conditions
-        conditions = LTX2Conditions.from_dict(embed_result)
-
-        # I2V: encode condition image
-        if has_image and self.vae_encode is not None:
-            image_latents = self.vae_encode.encode(images.pixels)
-            conditions.image_latent = image_latents
-
-        # 3. Sigma schedule
-        num_steps = int(params.num_inference_steps)
         sigmas = get_sigma_schedule(
-            num_steps=num_steps,
+            num_steps=int(params.num_inference_steps),
             shift=self.config.shift,
             device=self.bundle.device,
         )
-        if req.sigmas is not None:
-            sigmas = req.sigmas.to(self.bundle.device)
+        if params.sigmas is not None:
+            sigmas = params.sigmas.to(self.bundle.device)
 
-        # 4. Initial latents — driver-authoritative x_T via the model-aware
-        # recipe (NoiseRecipe). The driver ships only a lightweight recipe
-        # (init_noise_group_ids + init_noise_latent_shape, the 5D shape from
-        # this pipeline's ``latent_shape``); we regenerate the byte-identical
-        # UNPACKED 5D noise here, then pack into the transformer's
-        # ``(B, seq, C)`` token layout. Pure x_T noise is NOT normalized —
-        # diffusers ``prepare_latents`` only normalizes PROVIDED img2img latents;
-        # the randn path packs raw N(0,1) noise (flow-matching x_T). Only the
-        # FINAL latents are denormalized before VAE decode (step 6).
-        # ``resolve()`` returns None only under DISABLE_DRIVER_XT — then the
-        # recipe shape is None too and we cannot draw video noise without a
-        # shape, so that path is unsupported here.
-        video_recipe = NoiseRecipe.from_rollout_req(req)
+        video_recipe = NoiseRecipe.from_sample(sample)
         latents_5d = video_recipe.resolve(device=self.bundle.device)
         if latents_5d is None:
             raise ValueError(
                 "LTX2Pipeline.generate: no initial latents. The driver x_T recipe "
-                "(init_noise_group_ids + init_noise_latent_shape) is required; "
+                "(noise_group_ids + init_noise_latent_shape) is required; "
                 "DISABLE_DRIVER_XT is not supported for LTX2 (video noise needs a "
                 "driver-resolved 5D latent shape)."
             )
         patch_size, patch_size_t = self._patch_sizes()
         initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
-        # Audio x_T: an ``::audio``-salted sibling of the SAME video recipe
-        # (driver-authoritative, independent but reproducible) instead of a bare
-        # randn inside the stage.
         initial_audio_latents = video_recipe.resolve(
             device=self.bundle.device, salt="audio", latent_shape=audio_latent_shape(params)
         )
 
-        # 5. Diffusion loop
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
         segment = self.diffusion.generate(
             conditions,
@@ -306,23 +285,16 @@ class LTX2Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
+            denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
+            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
         )
 
-        # 6. Unpack + denormalize → 5D latents → VAE decode → video frames.
-        # The clean final latent is the last trajectory step (step T); the
-        # segment stores it sparsely, retrieved via ``latents_at``.
         _, latent_t, latent_h, latent_w = self.latent_shape(model_config=self.config, sampling_spec=params)
         final_latents = segment.latents_at(int(params.num_inference_steps))
         unpacked = self._unpack_latents(final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t)
         unpacked = self._denormalize_latents(unpacked)
-        decoded = self.vae_decode.decode(unpacked)  # → varlen-packed Videos
+        decoded = self.vae_decode.decode(unpacked)
 
-        # 6b. LTX-2.3 T2AV: decode the jointly-generated audio. The audio latent
-        # trajectory rides on ``segment.aux_latents`` (same sparse indices as
-        # the video latents), so the clean final-step audio is at step T. Decode
-        # it to a waveform and carry it as a parallel ``Audios`` on the track so
-        # the reward service can feed audio scorers (CLAP / ImageBind) alongside
-        # the video. T2V (no audio_decode) skips this entirely.
         decoded_audio = None
         audio_sample_rate = None
         if self.audio_decode is not None and segment.aux_latents is not None:
@@ -331,12 +303,7 @@ class LTX2Pipeline(Pipeline):
             audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
             final_audio = segment.aux_latents_at(int(params.num_inference_steps))
             waveforms = self.audio_decode.decode(final_audio, audio_latent_length=audio_t)
-            # vocoder output: (B, C, L) or (B, L); package one Audio per sample.
-            from unirl.types.primitives import Audio, Audios
-
             wf = waveforms.detach().float().cpu()
-            # Store one mono ``[L]`` waveform per sample so ``Audios`` packs
-            # cleanly along its varlen L axis and ``to_list`` recovers ``[L]``.
             audio_list = []
             for i in range(int(wf.shape[0])):
                 w = wf[i]
@@ -346,23 +313,18 @@ class LTX2Pipeline(Pipeline):
             decoded_audio = Audios.from_list(audio_list)
             audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
 
-        # 7. Build response. ``parent_ids=req.group_ids`` makes sibling samples
-        # of one prompt a GRPO group (RolloutTrack.group_ids is a derived
-        # read-only property — NOT a constructor arg). ``decoded`` is the single
-        # Videos primitive for this track (the reward service reads it directly),
-        # not a modality-keyed dict. Track key ``"video"`` matches the WAN21
-        # video convention. ``decoded_audio`` (T2AV only) is the parallel audio.
-        track = RolloutTrack(
-            sample_ids=list(req.sample_ids),
-            parent_ids=list(req.group_ids),
-            conditions=conditions.to_dict(),
+        primitives = {"video": decoded}
+        primitive_metadata = {}
+        if decoded_audio is not None:
+            primitives["audio"] = decoded_audio
+            primitive_metadata["audio"] = {"sample_rate": audio_sample_rate}
+        filled = frontier.fill(
             segment=segment,
-            decoded=decoded,
-            decoded_audio=decoded_audio,
-            audio_sample_rate=audio_sample_rate,
+            primitives=primitives,
+            primitive_metadata=primitive_metadata,
+            conditions=conditions.to_dict(),
         )
-
-        return RolloutResp(tracks={"video": track})
+        return sample.replace_frontier(filled)
 
 
 __all__ = ["LTX2Pipeline"]

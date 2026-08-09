@@ -1,0 +1,165 @@
+# @package _global_
+# AR GRPO Qwen3.5 (dense) VL on Geometry3K-MC — train_ar (ARTrainer),
+# SGLang rollout, full-weight TensorWeightSync, colocate.
+#
+# Smoke default uses tiny-random/qwen3.5 (<10MB, 4 layers) so the recipe runs
+# end-to-end on 1 GPU. Override QWEN3_5_PATH for real training.
+#
+# Data prep (one-time):
+#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#
+# Smoke (1 GPU, 1 rollout, tiny model):
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_9b_geo3k_mc_sglang num_devices=1 num_rollouts=1
+#
+# Real run (32 GPU):
+#   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
+#   QWEN3_5_PATH=/path/to/Qwen3.5-9B \
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_9b_geo3k_mc_sglang num_devices=8
+
+num_devices: 8
+batch_size: 64  # prompts_per_rollout (ms-swift global_batch_size=64)
+num_rollouts: 2000
+weight_sync_interval: 1
+eval_interval: 10
+
+adv_normalization_scope: global
+normalize_adv_by_std: false  # ms-swift scale_rewards=none (Dr.GRPO style)
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-grpo
+  run_name: grpo_qwen3_5_vl_geo3k_mc_sglang
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [grpo, qwen3_5, dense, vl, geo3k-mc, sglang]
+
+bundle:
+  _target_: unirl.models.qwen3_5.bundle.Qwen3_5Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3_5.config.Qwen3_5PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_PATH,tiny-random/qwen3.5}
+    # Keep fp32 master shards; forward/backward and sync remain bf16 below.
+    model_precision: fp32
+    freeze_vision_tower: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+    # Qwen3.5 hybrid attention (3 GDN + 1 full per 4 layers): GDN layers do not
+    # support flex/flash sparse-block kernels, so leave attn None (sdpa) and rely
+    # on padding_replay (the AR stage forces _SPARSE_PACKED_ATTN=()).
+    attn_implementation: null
+    trust_remote_code: false
+
+pipeline:
+  _target_: unirl.models.qwen3_5.pipeline.Qwen3_5Pipeline.from_bundle
+  max_prompt_length: 2048
+  enable_thinking: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3_5DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 2000
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_PATH,tiny-random/qwen3.5}
+    tp_size: 1
+    samples_pre_expanded: true
+    # Selects the VLM adapter. The official Qwen3.5 processor renders
+    # "<|vision_start|><|image_pad|><|vision_end|>" and expands the inner
+    # image_pad to match image_grid_thw; this value is not the full image marker.
+    image_token: "<|image_pad|>"
+    response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    chat_template_kwargs:
+      enable_thinking: false
+    engine_kwargs:
+      mem_fraction_static: 0.3
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mc_exact_match.MCExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mc_exact_match.MCExactMatchSpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: 0.28  # DAPO clip-higher (ms-swift epsilon_high=0.28)
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-mean  # ms-swift loss_type=grpo
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  wire_dtype: bf16
+  flush_cache: true
+  # Qwen3.5 HF namespace: model.visual (frozen vision tower) + model.language_model.
+  # Drop the vision tower and remap language_model.* → model.* for the SRT server.
+  name_remap: {"model.visual.*": null, "model.language_model.*": "model.*"}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 2
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 64
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192
