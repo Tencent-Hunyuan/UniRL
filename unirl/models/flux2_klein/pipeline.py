@@ -159,7 +159,7 @@ class Flux2KleinPipeline(Pipeline):
                 f"Flux2KleinPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        source_image = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+        references = [c for c in conditioning[1:] if isinstance(c, Images)]
 
         allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
         params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
@@ -169,13 +169,15 @@ class Flux2KleinPipeline(Pipeline):
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
         klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
-        if source_image is not None:
-            if len(source_image) != len(texts.texts):
-                raise ValueError(
-                    f"Flux2KleinPipeline.generate: image count {len(source_image)} != text count {len(texts.texts)}"
-                )
+        if references:
+            for slot, reference in enumerate(references):
+                if len(reference) != len(texts.texts):
+                    raise ValueError(
+                        f"Flux2KleinPipeline.generate: reference slot {slot} image count "
+                        f"{len(reference)} != text count {len(texts.texts)}"
+                    )
             image_tokens, image_ids = self.vae_encode.encode(
-                source_image,
+                references,
                 height=int(params.height),
                 width=int(params.width),
             )
