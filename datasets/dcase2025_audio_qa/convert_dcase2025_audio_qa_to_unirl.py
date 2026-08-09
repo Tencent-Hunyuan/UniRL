@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 LETTERS = "ABCD"
 DEFAULT_OUT_DIR = Path("datasets/dcase2025_audio_qa")
+# Separate default: the two modes write different prompts, so one must not overwrite the other.
+DEFAULT_SUPERVISED_OUT_DIR = Path("datasets/dcase2025_audio_qa_sft")
 
 
 def _answer_letter(answer: Any, choices: list[str]) -> str | None:
@@ -212,14 +214,20 @@ def convert(snapshot: Path, out_dir: Path, *, supervised: bool = False) -> dict[
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True, help="local Hugging Face dataset snapshot")
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"default: {DEFAULT_OUT_DIR} (RL) or {DEFAULT_SUPERVISED_OUT_DIR} (--supervised)",
+    )
     parser.add_argument(
         "--supervised",
         action="store_true",
         help="include response targets and use the SFT-compatible answer prompt",
     )
     args = parser.parse_args()
-    manifest = convert(args.snapshot, args.out_dir, supervised=args.supervised)
+    out_dir = args.out_dir or (DEFAULT_SUPERVISED_OUT_DIR if args.supervised else DEFAULT_OUT_DIR)
+    manifest = convert(args.snapshot, out_dir, supervised=args.supervised)
     print(json.dumps(manifest["stats"], ensure_ascii=False, sort_keys=True))
 
 

@@ -1,10 +1,9 @@
 # @package _global_
 # Qwen3-Omni Thinker · standalone WAV audio QA · LoRA SFT · 4 GPU.
 #
-# Prepare:
+# Prepare (--supervised defaults to datasets/dcase2025_audio_qa_sft):
 #   python datasets/dcase2025_audio_qa/convert_dcase2025_audio_qa_to_unirl.py \
 #     --snapshot /path/to/dcase2025-audio-qa \
-#     --out-dir datasets/dcase2025_audio_qa_sft \
 #     --supervised
 #
 # Launch:
@@ -17,11 +16,11 @@
 num_devices: 4
 devices_per_node: 4
 batch_size: 4
-num_steps: 50
+num_steps: 200
 eval_interval: 10
 eval_batch_size: 4
 eval_num_samples: 64
-save_interval: 10
+save_interval: 50
 save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen3_omni_audio}
 save_mode: auto
 

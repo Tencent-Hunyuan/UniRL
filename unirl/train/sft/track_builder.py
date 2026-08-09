@@ -170,29 +170,11 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             return embed_messages(histories, tools=tools)
 
         texts = Texts(texts=[str(r["prompt"]) for r in records])
-        prompt_media_rows: List[List[MediaRef]] = []
-        for r in records:
-            refs: List[MediaRef] = []
-            for ref in r.get("media_refs", []) or []:
-                role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
-                if role != "prompt":
-                    continue
-                if isinstance(ref, MediaRef):
-                    refs.append(ref)
-                elif isinstance(ref, dict):
-                    refs.append(
-                        MediaRef(
-                            modality=str(ref.get("modality", "")),
-                            role=str(role),
-                            uri=str(ref.get("uri", "")),
-                        )
-                    )
-                else:
-                    raise TypeError(
-                        "ARSupervisedTrackBuilder: prompt media refs must be MediaRef values or dictionaries, "
-                        f"got {type(ref).__name__}."
-                    )
-            prompt_media_rows.append(refs)
+        # The data layer normalizes every manifest media entry to MediaRef, so no dict form here.
+        prompt_media_rows: List[List[MediaRef]] = [
+            [ref for ref in (r.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "prompt"]
+            for r in records
+        ]
         if any(prompt_media_rows):
             if not callable(self._embed_sft_prompt):
                 raise ValueError(
@@ -205,6 +187,13 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             )
 
         if not self._embed_takes_images:
+            unconsumed = [r.get("sample_id") for r in records if r.get("media_refs")]
+            if unconsumed:
+                raise ValueError(
+                    f"ARSupervisedTrackBuilder: records {unconsumed[:3]} carry media_refs that this chat stage "
+                    "cannot consume — prompt media must use role='prompt' (see unirl/data/sft.py row shapes). "
+                    "Embedding them as text-only would train the model without the media, undetectably."
+                )
             return self._chat_stage.embed(texts)
         images: List[Optional[Any]] = []
         for r in records:
