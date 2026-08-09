@@ -322,11 +322,22 @@ class PendingHandleCall:
     ``result()`` that raised may be retried.
     """
 
-    def __init__(self, handle: "Handle", method_name: str, refs: List[Any], worker_local: bool) -> None:
+    def __init__(
+        self,
+        handle: "Handle",
+        method_name: str,
+        refs: List[Any],
+        worker_local: bool,
+        *,
+        targets: Optional[List[Any]] = None,
+        collect_fn: Optional[Callable] = None,
+    ) -> None:
         self._handle = handle
         self._method_name = method_name
         self._refs = refs
         self._worker_local = worker_local
+        self._targets = targets
+        self._collect_fn = collect_fn
         self._consumed = False
         self._value: Any = None
 
@@ -344,10 +355,62 @@ class PendingHandleCall:
         if self._consumed:
             return self._value
         handle = self._handle
-        _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._resolve_call(collect_fn, self._refs, worker_local=self._worker_local)
+        collect_fn = self._collect_fn
+        if collect_fn is None:
+            _, _, collect_fn, _ = handle._method_configs[self._method_name]
+        self._value = handle._resolve_call(
+            collect_fn,
+            self._refs,
+            worker_local=self._worker_local,
+            targets=self._targets,
+        )
         self._consumed = True
         return self._value
+
+
+class Slot:
+    """Driver-side handle to one worker in a :class:`Handle`."""
+
+    def __init__(self, handle: "Handle", index: int) -> None:
+        self._handle = handle
+        self._index = int(index)
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    def launch(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
+        """Launch an undecorated role method on this worker."""
+        handle = self._handle
+        if method_name in handle._method_configs:
+            raise AttributeError(f"{method_name!r} is distributed; call it on the Handle")
+        if not hasattr(_owning_class(handle.role_cls), method_name):
+            raise AttributeError(f"{method_name!r} is not a method of {_owning_class(handle.role_cls).__name__}")
+        if current_grad_context() is not None:
+            raise RuntimeError(f"Slot call {method_name!r} is not valid inside a GradContext")
+
+        transport_cls = handle.pool.transport_cls
+        worker_local = issubclass(transport_cls, WorkerLocalTransport)
+        shards = transport_cls.localize(
+            [(args, kwargs)],
+            handle.pool,
+            [handle.device_ids[self._index]],
+            [handle.worker_ids[self._index]],
+        )
+        worker = handle.workers[self._index]
+        s_args, s_kwargs = shards[0]
+        ref = worker.call.remote(handle.role_name, method_name, s_args, s_kwargs, False, None)
+        return PendingHandleCall(
+            handle,
+            method_name,
+            [ref],
+            worker_local,
+            targets=[worker],
+            collect_fn=lambda _, results: results[0],
+        )
+
+    def call(self, method_name: str, *args, **kwargs) -> Any:
+        return self.launch(method_name, *args, **kwargs).result()
 
 
 class Handle:
@@ -493,6 +556,11 @@ class Handle:
         """Pipeline-parallel degree of this handle's rank layout."""
         return self.rank_infos[0].pp_size if self.rank_infos else 1
 
+    def slot(self, index: int) -> Slot:
+        if index < 0 or index >= self.world_size:
+            raise IndexError(f"slot index {index} outside [0, {self.world_size})")
+        return Slot(self, index)
+
     @property
     def ep_size(self) -> int:
         """Expert-parallel degree requested for rollout-side engines."""
@@ -536,6 +604,8 @@ class Handle:
             config = getattr(method, DISTRIBUTED_CONFIG_ATTR, None)
             if config is None:
                 continue
+            if name == "slot":
+                raise TypeError(f"distributed method {name!r} collides with the Handle API")
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]
             dispatch_fn = fns["dispatch_fn"]
@@ -656,6 +726,7 @@ class Handle:
         *,
         worker_local: bool,
         ray_get_timeout: Optional[float] = None,
+        targets: Optional[List[Any]] = None,
     ):
         """Resolve a launched call into its collected method return value.
 
@@ -663,7 +734,8 @@ class Handle:
         ``handle_fn`` and :meth:`PendingHandleCall.result`.
         """
         results = ray.get(refs, timeout=ray_get_timeout)
-        results = [self._rebind_tree(r, self.workers[i], worker_local=worker_local) for i, r in enumerate(results)]
+        workers = self.workers if targets is None else targets
+        results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
         return collect_fn(self, results)
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:

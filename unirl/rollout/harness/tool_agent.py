@@ -9,20 +9,14 @@ mask-0 input Part, and signals ``done``. The loop holds no other control
 decision; queueing, concurrency, buffers, and abort belong to the hosting
 runtime.
 
-Resume-aware: ``turns_done = len(request.gen_parts())``, so a carried partial
-continues from where it stopped (``env.reset`` is idempotent/turn-derived).
-Suspension is checked at the top of each turn — the in-flight turn always
-finishes naturally first (turn boundary). Whether a suspended trajectory can
-actually RESUME is the env's property, not this loop's: stateless tool envs
-re-derive state from the Sample; stateful envs (ALFWorld episodes, persistent
-sessions) are torn down by ``close`` on suspension, so their recipes pair with
-``tail_policy: drop``.
+Suspension is checked at the top of each turn, so an in-flight turn always
+finishes naturally before the partial trace is returned.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from unirl.rollout.harness.protocol import HarnessContext, HarnessOutcome
 
@@ -51,22 +45,19 @@ class ToolAgentHarness:
 
     def run(self, request: "Sample", context: HarnessContext) -> HarnessOutcome:
         sample = request
-        env_reward: Optional[float] = None
         try:
             sample = self.env.reset(request)
             turns_done = len(sample.gen_parts())
             for _ in range(self.max_turns - turns_done):
                 if context.suspend_requested():
-                    return HarnessOutcome(sample, "suspended", env_reward)
+                    return HarnessOutcome(sample, "suspended")
                 sample = context.generate(self.ENGINE, sample.fork(1, sampling_params=self.sampling))
-                observation, done, info = self.env.step(sample)
-                if isinstance(info, dict) and info.get("reward") is not None:
-                    env_reward = float(info["reward"])
+                observation, done, _ = self.env.step(sample)
                 if done:
-                    return HarnessOutcome(sample, "completed", env_reward)
+                    return HarnessOutcome(sample, "completed")
                 if observation is not None:
                     sample = sample.observe(observation)
-            return HarnessOutcome(sample, "completed", env_reward)
+            return HarnessOutcome(sample, "completed")
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
             logger.warning("ToolAgentHarness: trajectory failed: %s", exc, exc_info=True)
             return HarnessOutcome(sample, "failed")

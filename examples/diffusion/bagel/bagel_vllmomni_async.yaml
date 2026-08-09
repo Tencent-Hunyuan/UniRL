@@ -26,7 +26,7 @@ layout: separate
 train_fraction: 0.5            # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool
 
 max_inflight: 1                # must stay 1: a queued generation blocks the reap-time cross-slab transfer
-weight_sync_interval: 12       # rollout batches per snapshot (11-batch max staleness); lower if the ratio destabilizes
+weight_sync_interval: 12       # trained batches per publication; also sets the output-version lag filter
 
 logging:
   report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)

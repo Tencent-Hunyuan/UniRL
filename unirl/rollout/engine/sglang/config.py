@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from unirl.config.require import require
+from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
-from unirl.rollout.engine.synchronous import BaseEngineConfig
 
 _SGLANG_GRPC_PORT_OFFSET = 30000
 _SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET

@@ -21,21 +21,19 @@ entrypoint's built-in `config_name` — a safe place to start.
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
-Agentic workflows use separate entrypoints for their reward source and execution topology.
-The entrypoint names the capability; the recipe names the task:
+Agentic training has one service-scored, colocated barrier workflow:
 
-| Reward source | Barrier | Colocated partial rollout | Disaggregated async |
-|---|---|---|---|
-| Environment return (e.g. [`alfworld/`](alfworld/)) | `python -m unirl.train_agentic_env` | `python -m unirl.train_agentic_env_partial` | `python -m unirl.train_agentic_env_async` |
-| Graded answer (e.g. [`deep_research/`](deep_research/)) | `python -m unirl.train_agentic` | `python -m unirl.train_agentic_partial` | `python -m unirl.train_agentic_async` |
+| Workflow | Entrypoint | Recipe |
+|---|---|---|
+| Multi-turn tool use with a graded terminal answer | `python -m unirl.train_agentic` | [`deep_research/deep_research_search_judge`](deep_research/deep_research_search_judge.yaml) |
 
 ## Running a recipe
 
 The bash launchers live in this directory. The first argument is the
 domain-qualified recipe name (passed to Hydra as `--config-name`); any extra args
 are forwarded verbatim as Hydra overrides. `ENTRY` selects a non-diffusion
-entrypoint (`train_ar`, `train_sft`, `train_pe`, `train_unified_model`, or an
-agentic entrypoint); the default is `train_diffusion`.
+entrypoint (`train_ar`, `train_sft`, `train_pe`, `train_unified_model`, or
+`train_agentic`); the default is `train_diffusion`.
 
 ```bash
 # 0. Compose-check first — verifies the config composes and every ${oc.env:...} resolves
@@ -63,8 +61,8 @@ start it on the head node with `bash examples/mooncake_master.sh start` before l
 
 To save and resume checkpoints and export them to Hugging Face, append the
 `+save_interval` / `+save_dir` / `+load_dir` overrides
-(diffusion/ar/sft/pe/unified
-trainers; the hi3 meta-init recipe is not yet supported) — the full
+(diffusion/ar/sft/pe/unified/agentic trainers; the hi3 meta-init recipe is not
+yet supported) — the full
 train → resume → export → upload lifecycle is in
 [Checkpointing](../unirl/trainer/README.md#checkpointing).
 

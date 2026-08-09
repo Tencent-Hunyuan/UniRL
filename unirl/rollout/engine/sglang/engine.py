@@ -6,7 +6,7 @@ picked from the registry by ``config.model_family``, owns the
 owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
 picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
 constructed over the seam; the offload lifecycle (the two staged flags) lives
-directly on the engine. The frozen ``synchronous.py`` surface is implemented as thin
+directly on the engine. The frozen ``base.py`` surface is implemented as thin
 forwards here — they must be real class attributes anyway (``Worker.call``
 dispatches by name; ``@distributed`` binds the most-derived attribute) — which
 also absorbs the surface quirks (``track_prefix``) so the component keeps clean
@@ -14,7 +14,7 @@ signatures.
 
 One-shot construction: after ``__init__`` returns, the SRT server is spawned and
 healthy and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
-re-apply ``@distributed`` (the decorator is not inherited — see ``synchronous.py``).
+re-apply ``@distributed`` (the decorator is not inherited — see ``base.py``).
 No environment mutation happens here — the spawn-scoped env the SRT
 subprocesses need is quarantined in the backends' ``boot``.
 """
@@ -28,18 +28,18 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangRolloutEngine(SyncRolloutEngine):
+class SGLangRolloutEngine(BaseRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"
