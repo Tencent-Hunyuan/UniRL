@@ -308,6 +308,32 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         else:
             logger.info("managed data plane: http (%s)", reason or "declined")
 
+    def compute_rewards_differentiable(
+        self,
+        media_tensor,
+        prompts,
+        records=None,
+    ):
+        """ReFL entry: satisfy the DifferentiableReward capability across the
+        process boundary (segmented backward over the cuda_ipc data plane).
+
+        ``media_tensor`` is a grad-carrying image batch [B, C, H, W] in [0, 1];
+        the returned [B] reward tensor carries a grad_fn whose backward relays
+        dL/dr to the child and splices dL/dimage back into the caller's graph.
+        Requires transport=cuda_ipc and a supports_grad scorer; video tensors
+        are not wired yet (image rewards only).
+        """
+        import torch
+
+        from unirl.reward.differentiable import score_differentiable
+
+        if not torch.is_tensor(media_tensor) or media_tensor.dim() != 4:
+            raise ValueError(
+                "managed differentiable scoring expects an image batch [B, C, H, W]; "
+                f"got {getattr(media_tensor, 'shape', type(media_tensor))}"
+            )
+        return score_differentiable(self, media_tensor, list(prompts))
+
     def _post_lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
         try:
             response = self._session.post(f"{self.base_url}/lifecycle/{action}", timeout=timeout)

@@ -56,7 +56,7 @@ class RewardBackend(ABC):
 
 @runtime_checkable
 class DifferentiableReward(Protocol):
-    """Optional capability: in-process ``nn.Module`` rewards returning a grad-carrying score tensor for ReFL."""
+    """Optional capability: grad-carrying score tensor for ReFL, from an in-process module or the managed child."""
 
     def compute_rewards_differentiable(
         self,

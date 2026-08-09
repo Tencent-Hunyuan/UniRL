@@ -1,0 +1,160 @@
+# @package _global_
+# REFL SD3.5 T2I — PickScore reward (ported from the legacy core path,
+# examples/diffusion/refl_sd3.yaml; hyperparameters preserved).
+#
+# Second family on the experimental.refl contract: only pipeline_target,
+# model_config, the reward backend, and the sampling geometry differ from
+# the WAN configs. The reward comes straight from core
+# (unirl.reward.local.pickscore) — no package-local reward needed.
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 200
+save_interval: 0
+save_dir: ${oc.env:OUTPUT_DIR,outputs/sd3_pickscore_refl}
+save_mode: adapter
+max_grad_norm: 1.0
+
+actor:
+  _target_: experimental.refl.roles.ReflActorRole
+  pipeline_target: experimental.refl.models.sd3.Sd3ReflPipeline
+  block_class_names: ["JointTransformerBlock"]
+  # REFL loss: -(reward - baseline) / scale * weight + kl_weight * KL.
+  reward_weight: 1.0
+  reward_baseline: 0.0
+  reward_scale: 1.0
+  kl_weight: 0.0
+  strategy:
+    # sampling.eta=0.0 reduces FlowSDE to the deterministic ODE.
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+  model_config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    shift: 3.0
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # fp32 LoRA master over the bf16 base — the setting the historical ReFL
+    # curves (#120 era) were trained with; a bf16 master rounds away most
+    # AdamW steps at lora_A's magnitude. Needs the pinned torch (>=2.11):
+    # older FSDP2 asserts uniform dtype over ALL params in a group; the
+    # pinned family checks trainables only.
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    ac_wrap_order: inside            # the order this recipe's 10-rollout REFL validation ran under
+    use_torch_compile: false
+    root_wrap: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+# Managed differentiable reward (PR6): the same PickScore, but in a child
+# process on the negotiated cuda_ipc data plane. Gradients relay across the
+# boundary via segmented backward (score retains the child-side subgraph,
+# /backward seeds it with dL/dr and returns dL/dimage handles), so REFL's
+# reward -> decode -> LoRA chain is identical to the in-process variant —
+# only the reward segment lives in another process (optionally another venv).
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.managed_process.ManagedScorerProcessBackend
+    base_device: cuda
+    config:
+      _target_: unirl.reward.managed_process.ManagedScorerProcessSpec
+      process:
+        _target_: unirl.reward.managed_process.ManagedProcessConfig
+        python_executable: ${oc.env:PICKSCORE_PYTHON,/root/unirl/.venv/bin/python}
+        service_root: ${oc.env:REWARD_SERVICE_ROOT,unirl-reward-service}
+        startup_timeout: 600
+        shutdown_timeout: 30
+        log_dir: ${oc.env:PICKSCORE_CHILD_LOG_DIR,/tmp/unirl-reward}
+        offline: true
+        transport: cuda_ipc      # differentiable scoring has no b64 fallback
+      scorer:
+        _target_: unirl.reward.managed_process.ManagedScorerConfig
+        name: pickscore
+        input_kind: image
+        version: "1"
+        params:
+          model_name: ${oc.env:PICKSCORE_MODEL,yuvalkirstain/PickScore_v1}
+          dtype: float32
+          device: cuda
+      client:
+        _target_: unirl.reward.remote.RemoteRewardSpec
+        base_url: managed://rank-affine
+        required_rewards: [pickscore]
+        reward_weights: {pickscore: 1.0}
+        batch_size: 8
+        request_batch_size: 8
+        timeout: 600.0
+        sub_metric_reduce: first
+        aggregation_method: weighted_sum
+        input_kind: image
+      lifecycle: resident        # differentiable window = forward+backward pair
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+      shuffle: false
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  # 4 inference steps, grad through the final step only (DRaFT-1):
+  # mid_timestep = final_timestep = 3.
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.0
+  samples_per_prompt: 1
+  seed: 42
+  init_same_noise: false
+  sampler_kwargs:
+    mid_timestep: 3
+    final_timestep: 3
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-refl}
+  run_name: ${oc.env:WANDB_RUN_NAME,sd3_pickscore_refl}
+  tags: ["sd3.5", "refl", "draft-k", "pickscore"]
+  log_media: false
