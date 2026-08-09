@@ -5,7 +5,6 @@ driver is ``unirl/trainer/sft.py``; this package holds only the piece that is
 genuinely new to supervision: turning dataset records into stage-ready tracks.
 """
 
-from unirl.train.sft.cosmos3 import Cosmos3SupervisedTrackBuilder
 from unirl.train.sft.track_builder import (
     ARSupervisedTrackBuilder,
     DiffusionSupervisedTrackBuilder,
@@ -14,7 +13,6 @@ from unirl.train.sft.track_builder import (
 
 __all__ = [
     "ARSupervisedTrackBuilder",
-    "Cosmos3SupervisedTrackBuilder",
     "DiffusionSupervisedTrackBuilder",
     "SupervisedTrackBuilder",
 ]

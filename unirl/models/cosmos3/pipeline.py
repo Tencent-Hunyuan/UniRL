@@ -8,8 +8,7 @@ from typing import Any, Optional, Sequence
 import torch
 
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 from .bundle import Cosmos3Bundle, _import_diffusers_classes
 from .packing import (
@@ -224,7 +223,7 @@ class Cosmos3Pipeline(Pipeline):
         self.bundle = bundle
         self.joint = Cosmos3JointStage(bundle)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
+    def generate(self, sample: Sample) -> Sample:
         raise NotImplementedError("Cosmos3Pipeline currently supports supervised packed-stage training only.")
 
 

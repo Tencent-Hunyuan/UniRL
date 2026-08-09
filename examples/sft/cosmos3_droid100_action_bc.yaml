@@ -1,6 +1,32 @@
 # @package _global_
-# Cosmos3-Nano policy-mode behavior cloning on droid_100. Future video and the
-# full action chunk share one sigma; vision/action terms are balanced 1:1.
+# SFT — Cosmos3-Nano policy-mode action behavior cloning on droid_100
+# (full finetune, gen stream).
+#
+# The Cosmos3-Nano-Policy objective: clean observation at latent frame 0,
+# jointly noise future video and the full action chunk with ONE sigma, and
+# regress both velocity targets (vision/action MSE balanced 1:1 via 10/10
+# weights). 17 frames pair with a 16-step action chunk (chunk_size + 1).
+# Same numeric conventions as the videopred recipe: fp32 storage + bf16 FSDP
+# compute, frozen und stream, logit-normal sigma through the official
+# short-edge shift tiers (256→3, 480→5, 720→10).
+#
+# droid_100 is DEBUG-scale: its collapsed 7-D action differs from the canonical
+# 10-D droid_lerobot layout (9D EE pose + 1D gripper), so the pretrained action
+# head semantics are not preserved — fine for exercising the pipeline, not for
+# faithful Policy-DROID reproduction.
+#
+# Env:
+#   PRETRAINED_MODEL  diffusers-layout nvidia/Cosmos3-Nano checkpoint
+#                     (needs the `cosmos3` install extra: diffusers>=0.39)
+#   SFT_DATA          train manifest (defaults to the prep output below)
+#   SFT_EVAL_DATA     eval manifest (held-out episodes from the same prep)
+#
+# Data prep (LeRobot droid_100; 192x320 is exactly the tier-256 action canvas):
+#   python -m unirl.utils.prepare_droid100 --root datasets/droid100_debug
+#
+# Launch:
+#   ENTRY=train_sft PRETRAINED_MODEL=/path/to/Cosmos3-Nano \
+#   bash examples/run_experiment_single_node.sh sft/cosmos3_droid100_action_bc
 
 num_devices: 8
 batch_size: 8
@@ -81,7 +107,7 @@ stack:
   max_grad_norm: 1.0
 
 track_builder:
-  _target_: unirl.train.sft.cosmos3.Cosmos3SupervisedTrackBuilder
+  _target_: unirl.models.cosmos3.track_builder.Cosmos3SupervisedTrackBuilder
   train_action: true
 
 data_source:

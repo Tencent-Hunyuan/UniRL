@@ -1,4 +1,11 @@
-"""Worker-side Cosmos3 video/action supervised track builder."""
+"""Worker-side Cosmos3 video/action supervised track builder.
+
+Lives in the model package (not ``unirl/train/sft/``) because its record →
+(conditions, segment) mapping is inherently Cosmos3-specific: it packs
+:class:`Cosmos3SFTCondition` through the joint stage's own tokenize/encode
+helpers. The generic builders in ``unirl/train/sft/track_builder.py`` stay
+model-agnostic; per-model logic stays here, per that package's contract.
+"""
 
 from __future__ import annotations
 
@@ -8,10 +15,9 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.cosmos3.conditions import Cosmos3SFTCondition
-from unirl.types.rollout_resp import RolloutTrack
+from unirl.train.sft.track_builder import SupervisedTrackBuilder
+from unirl.types.sample import Part
 from unirl.types.segments.latent import make_video_segment
-
-from .track_builder import SupervisedTrackBuilder
 
 Record = Dict[str, Any]
 
@@ -45,7 +51,7 @@ class Cosmos3SupervisedTrackBuilder(SupervisedTrackBuilder):
         self.train_action = bool(train_action)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def build(self, records: List[Record]) -> RolloutTrack:
+    def build(self, records: List[Record]) -> Part:
         if not records:
             raise ValueError("Cosmos3SupervisedTrackBuilder.build: empty record shard.")
 
@@ -125,19 +131,18 @@ class Cosmos3SupervisedTrackBuilder(SupervisedTrackBuilder):
             latents=x0.unsqueeze(1),
             loss_mask=torch.tensor(pad_rows, dtype=torch.float32, device=x0.device),
         )
-        track = RolloutTrack(
+        part = Part(
             sample_ids=[str(r.get("sample_id", f"cosmos3:{i}")) for i, r in enumerate(records)],
-            parent_ids=None,
-            parent_track=None,
             conditions={"cosmos3": condition},
             segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
         )
-        if condition.batch_size != len(records) or track.batch_size != len(records):
+        if condition.batch_size != len(records) or part.batch_size != len(records):
             raise RuntimeError(
-                "Cosmos3SupervisedTrackBuilder: record/condition/track batch sizes diverged: "
-                f"{len(records)}/{condition.batch_size}/{track.batch_size}."
+                "Cosmos3SupervisedTrackBuilder: record/condition/part batch sizes diverged: "
+                f"{len(records)}/{condition.batch_size}/{part.batch_size}."
             )
-        return track
+        return part
 
 
 __all__ = ["Cosmos3SupervisedTrackBuilder"]

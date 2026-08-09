@@ -1,6 +1,25 @@
 # @package _global_
-# Cosmos3-Nano video-prediction SFT on droid_100: clean observation frame 0,
-# then flow-match the next 16 frames through the shared SFT stack.
+# SFT — Cosmos3-Nano video prediction on droid_100 (full finetune, gen stream).
+#
+# Clean observation at latent frame 0, flow-match the remaining latent frames
+# through the shared SFT stack (SupervisedDataSource → Cosmos3SupervisedTrackBuilder
+# → Part → TrainStack → Cosmos3JointFlowMatchSFT). The transformer is stored fp32
+# (stable optimizer master) and FSDP-gathered bf16 for compute; the und (text)
+# stream is frozen, only the gen tower trains. Training sigma is logit-normal
+# warped by the official short-edge shift tiers (256→3, 480→5, 720→10).
+#
+# Env:
+#   PRETRAINED_MODEL  diffusers-layout nvidia/Cosmos3-Nano checkpoint
+#                     (needs the `cosmos3` install extra: diffusers>=0.39)
+#   SFT_DATA          train manifest (defaults to the prep output below)
+#   SFT_EVAL_DATA     eval manifest (held-out episodes from the same prep)
+#
+# Data prep (LeRobot droid_100; 192x320 is exactly the tier-256 action canvas):
+#   python -m unirl.utils.prepare_droid100 --root datasets/droid100_debug
+#
+# Launch:
+#   ENTRY=train_sft PRETRAINED_MODEL=/path/to/Cosmos3-Nano \
+#   bash examples/run_experiment_single_node.sh sft/cosmos3_droid100_videopred
 
 num_devices: 8
 batch_size: 8
@@ -76,7 +95,7 @@ stack:
   max_grad_norm: 1.0
 
 track_builder:
-  _target_: unirl.train.sft.cosmos3.Cosmos3SupervisedTrackBuilder
+  _target_: unirl.models.cosmos3.track_builder.Cosmos3SupervisedTrackBuilder
   train_action: false
 
 data_source:
