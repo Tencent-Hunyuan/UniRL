@@ -35,6 +35,11 @@ class ManagedProcessConfig:
     log_dir: str = "/tmp"
     offline: bool = True
     allow_multiple_visible_devices: bool = False
+    #: Data plane for tensor payloads. HTTP is the control plane regardless.
+    #: "auto": negotiate cuda_ipc via /handshake, fall back to http silently.
+    #: "cuda_ipc": require the negotiation to succeed (fail startup otherwise) —
+    #: differentiable scoring needs this. "http": never negotiate (b64 only).
+    transport: str = "auto"
 
 
 @dataclass
@@ -127,6 +132,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             # scorers honoring UNIRL_SCORER_BOOT_OFFLOADED, never touches it)
             # BEFORE _start_child sees it ready; a parent-side offload here
             # would reopen the bootstrap window it is meant to close.
+            self._negotiate_transport()
         except Exception:
             self._stop_child()
             raise
@@ -260,6 +266,47 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             session.close()
         self._stop_child()
         raise TimeoutError(f"reward child did not become ready within {cfg.process.startup_timeout}s; log={log_path}")
+
+    def _negotiate_transport(self) -> None:
+        """Negotiate the data plane with the ready child (dual-plane design).
+
+        cuda_ipc is same-device, torch-version- and allocator-gated; the child
+        applies the checks and its answer is authoritative. "auto" degrades to
+        http silently; an explicit "cuda_ipc" request that cannot be honored is
+        a configuration error and fails startup — differentiable scoring has no
+        b64 fallback.
+        """
+        self._transport = "http"
+        requested = getattr(self.spec.process, "transport", "auto")
+        if requested == "http":
+            return
+        try:
+            from unirl.reward.tensor_ipc import ipc_fingerprint
+
+            response = self._session.post(
+                f"{self.base_url}/handshake",
+                json={
+                    "fingerprint": {k: str(v) for k, v in ipc_fingerprint().items()},
+                    "proposed_transport": "cuda_ipc",
+                },
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            body = response.json()
+            accepted = body.get("accepted_transport", "http")
+            reason = body.get("reason", "")
+        except Exception as exc:
+            if requested == "cuda_ipc":
+                raise RuntimeError(f"cuda_ipc transport was required but the handshake failed: {exc!r}") from exc
+            logger.info("cuda_ipc handshake unavailable, staying on http: %r", exc)
+            return
+        if accepted == "cuda_ipc":
+            self._transport = "cuda_ipc"
+            logger.info("managed data plane: cuda_ipc (%s)", reason or "negotiated")
+        elif requested == "cuda_ipc":
+            raise RuntimeError(f"cuda_ipc transport was required but the child declined: {reason}")
+        else:
+            logger.info("managed data plane: http (%s)", reason or "declined")
 
     def _post_lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
         try:
