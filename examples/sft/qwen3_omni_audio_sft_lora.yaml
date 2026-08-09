@@ -11,7 +11,7 @@
 #   SFT_DATA=datasets/dcase2025_audio_qa_sft/train.jsonl \
 #   SFT_EVAL_DATA=datasets/dcase2025_audio_qa_sft/val.jsonl \
 #   ENTRY=train_sft bash examples/run_experiment_single_node.sh \
-#     sft/validation/qwen3_omni_audio_sft_lora
+#     sft/qwen3_omni_audio_sft_lora
 
 num_devices: 4
 devices_per_node: 4

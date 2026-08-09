@@ -2,7 +2,7 @@
 # Validation run: BAGEL-7B-MoT LoRA flow-matching T2I SFT on naruto-blip-captions.
 #
 # Launch (1×8):
-#   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/bagel_sft_lora
+#   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/bagel_sft_lora
 
 num_devices: 8
 batch_size: 16
