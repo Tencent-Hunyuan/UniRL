@@ -4,6 +4,16 @@ Wraps the EditRewardInferencer (Qwen2.5-VL-7B based) from the EditReward
 package. Evaluates how well an edited image follows the editing instruction
 (dim1: instruction following) and visual quality (dim2: visual quality).
 
+Column semantics depend on the pinned model config. With the official
+EditReward-MiMo-VL-7B-SFT-2508 config (``pooling_strategy: mean``,
+``output_dim: 2``, ``loss_type: uncertainty``) the two heads are pooled
+INSIDE the model and the returned columns are ``[reward mean, log-sigma]``
+— NOT two semantic scores. The sub-metric names below are historical wire
+identifiers; under such configs ``edit_following`` carries the reward and
+``edit_quality`` carries the heteroscedastic log-uncertainty, which is a
+diagnostic, not a training signal. Consume the score channel only
+(``sub_metric_reduce: first`` in recipes); never average the two.
+
 Input convention:
     history[0] = (prompt, source_image)   — source image before editing
     history[1] = (prompt, edited_image)   — edited image after editing
