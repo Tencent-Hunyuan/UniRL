@@ -2,7 +2,7 @@
 
 import torch
 
-from unirl.models.wan21.video_encode import WANVideoLatentEncodeStage
+from unirl.models.wan21.vae import WANVideoLatentEncodeStage
 
 
 class WAN22VideoLatentEncodeStage(WANVideoLatentEncodeStage):

@@ -40,8 +40,7 @@ from .config import WAN21PipelineConfig
 from .diffusion import WAN21DiffusionStage, WAN21DiffusionStep
 from .image_encode import WAN21ImageLatentEncodeStage
 from .text_embed import WAN21TextEmbedStage
-from .vae import WAN21VAEDecodeStage
-from .video_encode import WANVideoLatentEncodeStage
+from .vae import WAN21VAEDecodeStage, WANVideoLatentEncodeStage
 
 
 class WAN21Pipeline(Pipeline):
