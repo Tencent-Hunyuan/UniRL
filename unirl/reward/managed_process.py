@@ -220,28 +220,23 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         try:
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
+                    # A service tree predating --boot-offloaded exits at argparse
+                    # ("unrecognized arguments") before ever binding the socket.
+                    hint = (
+                        " (an 'unrecognized arguments: --boot-offloaded' log means "
+                        f"unirl-reward-service at {cfg.process.service_root!r} predates "
+                        "the per_call boot protocol)"
+                        if cfg.lifecycle == "per_call"
+                        else ""
+                    )
                     raise RuntimeError(
-                        f"reward child exited during startup with code {self._process.returncode}; log={log_path}"
+                        f"reward child exited during startup with code {self._process.returncode}; log={log_path}{hint}"
                     )
                 try:
                     response = session.get(f"{base_url}/health", timeout=2.0)
                     if response.status_code == 200:
                         body = response.json()
                         scorer = body.get("scorer") or {}
-                        if (
-                            expected_state == "offloaded"
-                            and body.get("state") == "resident"
-                            and cfg.scorer.name in dict(body.get("rewards") or {})
-                        ):
-                            # An up-to-date child never reports resident before a
-                            # per_call parent has seen it offloaded — this is an
-                            # old server that ignored --boot-offloaded. Fail now
-                            # instead of burning the whole startup_timeout.
-                            raise RuntimeError(
-                                "reward child came up resident despite --boot-offloaded; "
-                                f"unirl-reward-service at {cfg.process.service_root!r} predates "
-                                f"the per_call boot protocol; log={log_path}"
-                            )
                         if (
                             cfg.scorer.name in dict(body.get("rewards") or {})
                             and body.get("state") == expected_state

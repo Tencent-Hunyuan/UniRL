@@ -163,6 +163,11 @@ class EditRewardInferencer:
         self.use_special_tokens = model_config.use_special_tokens
         self.reward_dim = reward_dim
         self.rm_head_type = model_config.rm_head_type
+        # Surfaced for the scorer: these decide what reward()'s columns MEAN
+        # (per-head scores vs pooled [reward, log-sigma]).
+        self.output_dim = int(model_config.output_dim)
+        self.pooling_strategy = model_config.pooling_strategy
+        self.loss_type = str(getattr(model_config, "loss_type", "regular"))
 
         # Load checkpoint
         full_ckpt = os.path.join(checkpoint_path, "model.pth")

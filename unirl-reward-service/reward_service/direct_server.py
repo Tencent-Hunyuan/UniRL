@@ -148,6 +148,14 @@ def create_direct_app(
                 f"managed image server requires scorer input_kind='image'; "
                 f"{scorer_name!r} declares {scorer_input_kind!r}"
             )
+        if boot_offloaded and not getattr(scorer_cls, "supports_offload", False):
+            # Checked on the CLASS, before construction: a per_call
+            # misconfiguration must not pay a full model load (possibly onto the
+            # exact GPU the protocol protects) just to be told no.
+            raise ValueError(
+                f"--boot-offloaded requires scorer {scorer_name!r} to support offload "
+                "(needed for lifecycle='per_call')"
+            )
         logger.info("direct scorer loading name=%s params=%s", scorer_name, params)
         scorer = await asyncio.to_thread(scorer_cls, **params)
         if not tuple(scorer.sub_metric_names):
@@ -163,11 +171,6 @@ def create_direct_app(
             # boot. Scorers that honor UNIRL_SCORER_BOOT_OFFLOADED construct on
             # CPU and make this offload a no-op; engine-backed scorers at least
             # shrink the window to construction itself.
-            if not scorer.supports_offload:
-                raise ValueError(
-                    f"--boot-offloaded requires scorer {scorer_name!r} to support offload "
-                    "(needed for lifecycle='per_call')"
-                )
             await asyncio.to_thread(scorer.offload)
             app.state.lifecycle_state = "offloaded"
         else:
@@ -353,13 +356,26 @@ def _spawn_group_reaper() -> None:
     import subprocess
     import sys
 
+    if os.getpgrp() != os.getpid():
+        # Not the group leader: the group belongs to whoever launched us (a
+        # wrapper script, a Popen without start_new_session), and sweeping it
+        # would kill unrelated processes. The managed parent always starts the
+        # frontend with start_new_session, so this only skips manual launches.
+        logger.warning(
+            "group reaper disabled: frontend pid %d is not its process-group leader (pgrp %d)",
+            os.getpid(),
+            os.getpgrp(),
+        )
+        return
+
     source = (
-        "import os,signal,time\n"
+        "import os,signal,sys,time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "watched = int(os.environ['_UNIRL_REAPER_WATCH_PID'])\n"
         "while os.getppid() == watched:\n"
         "    time.sleep(2.0)\n"
         "group = os.getpgrp()\n"
+        "print(f'reward group reaper: frontend {watched} gone, sweeping pgid {group}', file=sys.stderr, flush=True)\n"
         "try:\n"
         "    os.killpg(group, signal.SIGTERM)\n"
         "except ProcessLookupError:\n"
@@ -376,7 +392,9 @@ def _spawn_group_reaper() -> None:
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # The parent already routes this frontend's stderr into the per-child
+        # log; a sweep that vaporizes the group must leave a trace there.
+        stderr=None,
         close_fds=True,
     )
 

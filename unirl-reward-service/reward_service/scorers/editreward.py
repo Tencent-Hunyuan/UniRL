@@ -23,15 +23,10 @@ The text prompt (editing instruction) is taken from history[0][0].
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
-
-if TYPE_CHECKING:
-    pass
 
 
 class EditRewardScorer(BaseScorer):
@@ -86,6 +81,20 @@ class EditRewardScorer(BaseScorer):
             reward_dim="dim1",
             rm_head_type=rm_head_type,
         )
+
+        # Column semantics come from the pinned model config, not this wrapper.
+        # With in-model head pooling and the uncertainty loss, reward() returns
+        # [pooled reward, pooled log-sigma] — NOT two semantic scores; naming
+        # the second column "edit_quality" would log (and, under
+        # sub_metric_reduce: mean, optimize) the critic's own spread as a score.
+        # Per-head score pairs keep the semantic names.
+        if (
+            self._rm_head_type == "ranknet_multi_head"
+            and self.inferencer.pooling_strategy is not None
+            and self.inferencer.output_dim == 2
+            and self.inferencer.loss_type == "uncertainty"
+        ):
+            self.sub_metric_names = ("reward", "log_sigma")
 
     @torch.inference_mode()
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
@@ -144,28 +153,29 @@ class EditRewardScorer(BaseScorer):
         return results
 
     def _shape_reward(self, rewards, row: int) -> dict[str, float]:
-        """Map row ``row`` of a batched ``reward()`` output to the sub-metric dict.
+        """Map row ``row`` of a ``reward()`` output to the sub-metric dict.
 
-        Mirrors :meth:`_score_single`'s shaping exactly, indexed by batch row, so
-        the single batched forward produces the same per-item values the
-        one-at-a-time path produced.
+        The single shaping path for both the batched forward and the
+        one-at-a-time fallback (``_score_single`` calls this with row 0), keyed
+        by the instance's ``sub_metric_names``.
         """
+        first, second = self.sub_metric_names
         if self._rm_head_type == "ranknet_multi_head":
             if isinstance(rewards, torch.Tensor):
                 if rewards.dim() >= 2 and rewards.shape[-1] >= 2:
                     return {
-                        "edit_following": float(rewards[row, 0].item()),
-                        "edit_quality": float(rewards[row, 1].item()),
+                        first: float(rewards[row, 0].item()),
+                        second: float(rewards[row, 1].item()),
                     }
                 return {
-                    "edit_following": float(rewards[row].item()),
-                    "edit_quality": float("nan"),
+                    first: float(rewards[row].item()),
+                    second: float("nan"),
                 }
             if isinstance(rewards, (list, tuple)):
                 scores = [float(r[row].item()) if torch.is_tensor(r) else float(r) for r in rewards]
                 return {
-                    "edit_following": scores[0] if len(scores) > 0 else float("nan"),
-                    "edit_quality": scores[1] if len(scores) > 1 else float("nan"),
+                    first: scores[0] if len(scores) > 0 else float("nan"),
+                    second: scores[1] if len(scores) > 1 else float("nan"),
                 }
         else:
             if isinstance(rewards, torch.Tensor):
@@ -173,8 +183,8 @@ class EditRewardScorer(BaseScorer):
             else:
                 val = float(rewards[row])
             return {
-                "edit_following": val,
-                "edit_quality": float("nan"),
+                first: val,
+                second: float("nan"),
             }
         return {k: float("nan") for k in self.sub_metric_names}
 
@@ -201,41 +211,7 @@ class EditRewardScorer(BaseScorer):
             image_src=[source_image],
             image_paths=[edited_image],
         )
-
-        # rewards shape depends on rm_head_type:
-        # ranknet_multi_head: tensor of shape (batch, num_heads) or list of tensors
-        if self._rm_head_type == "ranknet_multi_head":
-            # Multi-head returns scores for both dims
-            if isinstance(rewards, torch.Tensor):
-                if rewards.dim() >= 2 and rewards.shape[-1] >= 2:
-                    return {
-                        "edit_following": float(rewards[0, 0].item()),
-                        "edit_quality": float(rewards[0, 1].item()),
-                    }
-                else:
-                    return {
-                        "edit_following": float(rewards[0].item()),
-                        "edit_quality": float("nan"),
-                    }
-            elif isinstance(rewards, (list, tuple)):
-                scores = [float(r[0].item()) if torch.is_tensor(r) else float(r) for r in rewards]
-                return {
-                    "edit_following": scores[0] if len(scores) > 0 else float("nan"),
-                    "edit_quality": scores[1] if len(scores) > 1 else float("nan"),
-                }
-        else:
-            # Single-head: only one score
-            if isinstance(rewards, torch.Tensor):
-                val = float(rewards[0, 0].item()) if rewards.dim() >= 2 else float(rewards[0].item())
-            else:
-                val = float(rewards[0])
-            return {
-                "edit_following": val,
-                "edit_quality": float("nan"),
-            }
-
-        # Fallback
-        return {k: float("nan") for k in self.sub_metric_names}
+        return self._shape_reward(rewards, 0)
 
     def onload(self) -> None:
         self.inferencer.model.to(self._target_device)
