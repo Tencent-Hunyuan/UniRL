@@ -76,7 +76,8 @@ class TensorWeightSync(FullWeightSync):
         tp_size = int(ri.tp_size) if ri is not None else 1
         is_tp_zero = ri is None or ri.tp_rank == 0
 
-        rollout_mod = type(self._rollout).__module__
+        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+        rollout_mod = type(receiver).__module__
         use_sglang = "sglang" in rollout_mod and "vllm" not in rollout_mod
         if use_sglang:
             try:
@@ -106,7 +107,7 @@ class TensorWeightSync(FullWeightSync):
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
             del name, tensor
 
-            fanout = int(getattr(self._rollout, "weight_payload_fanout", tp_size))
+            fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
             sglang_tp_fanout = use_sglang and fanout > 1
             participates_in_sglang_tp = sglang_tp_fanout and dist_ready
 

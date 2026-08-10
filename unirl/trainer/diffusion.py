@@ -3,11 +3,11 @@ import inspect
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
@@ -21,6 +21,147 @@ from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
+
+
+# Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
+_RETIRED_EVAL_KEYS = {
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
+    "eval_height": "eval_sampling: {height: X}",
+    "eval_width": "eval_sampling: {width: X}",
+    "eval_media_max_items": "logging: {log_media: true, media_max_items: X}",
+    "eval_shift": "no equivalent: the per-request time-shift override was dropped (static-shift models keep their checkpoint shift)",
+    "eval_mu": "not needed: dynamic-shift μ re-derives from the eval steps/resolution",
+}
+
+# Engine/driver-owned object fields the overlay cannot carry: overrides come from
+# plain YAML (never hydra-instantiated), so a nested ``_target_`` would ride into
+# the params as a bare dict and only blow up deep inside the first eval's request
+# build (``'dict' object has no attribute 'get_sde_indices'``). Rejected by name.
+_UNSUPPORTED_OVERLAY_FIELDS = frozenset(
+    {"scheduler", "sde_strategy", "sigmas", "noise_group_ids", "init_noise_latent_shape"}
+)
+
+
+def cfg_scale_of(params: Any) -> float:
+    """The CFG scale a diffusion params object will actually be sampled with.
+
+    BAGEL-family params carry ``cfg_text_scale``; every other family carries
+    ``guidance_scale``. Log lines read the scale through here so they report the
+    field the pipeline actually consumes.
+    """
+    scale = getattr(params, "cfg_text_scale", None)
+    return float(params.guidance_scale if scale is None else scale)
+
+
+def reject_retired_eval_keys(cfg: Any) -> None:
+    """Fail fast on the per-field ``eval_*`` knobs that ``eval_sampling:`` replaced.
+
+    Ignoring them would silently evaluate at the rollout's own setting — the exact
+    train/eval mismatch the overlay exists to make explicit.
+    """
+    present = sorted(key for key in _RETIRED_EVAL_KEYS if cfg is not None and cfg.get(key) is not None)
+    if not present:
+        return
+    moves = "\n".join(f"  {key}: X   ->   {_RETIRED_EVAL_KEYS[key]}" for key in present)
+    raise ValueError(
+        "These per-field eval knobs are not supported — most moved into the `eval_sampling:` overlay, "
+        f"which accepts ANY plain DiffusionSamplingParams field:\n{moves}"
+    )
+
+
+def build_eval_sampling(
+    sampling_params: Dict[str, BaseSamplingParams],
+    *,
+    eta: float = 0.0,
+    samples_per_prompt: Optional[int] = None,
+    overrides: Any = None,
+) -> Dict[str, BaseSamplingParams]:
+    """Return ``sampling_params`` with its ``diffusion`` entry rebuilt for evaluation.
+
+    Eval INHERITS the training ``sampling:`` block and overlays only what the
+    recipe asks for, later winning over earlier:
+
+    1. ``eta`` — recipe ``eval_eta`` (default ``0.0``: deterministic ODE eval).
+    2. ``samples_per_prompt`` when given — recipe ``eval_samples_per_prompt``.
+    3. ``overrides`` — the recipe's ``eval_sampling:`` block: any plain
+       :class:`~unirl.types.sampling.DiffusionSamplingParams` field
+       (``guidance_scale``, ``num_inference_steps``, ``height`` / ``width``,
+       ``seed``, ...). Unknown keys raise rather than being silently dropped,
+       and so do the engine/driver-owned object fields
+       (``_UNSUPPORTED_OVERLAY_FIELDS``) that plain YAML cannot express.
+
+    CFG needs no knob of its own: an unmentioned ``guidance_scale`` inherits the
+    training guidance, so a CFG-off run cannot silently evaluate with CFG on, and
+    naming it decouples the two. It is the field the pipeline consumes, so a
+    family that reads ``cfg_text_scale`` must be given THAT one — the inert
+    sibling raises instead of being accepted and ignored.
+
+    A resolved ``eta <= 0`` then clears the SDE gate (``sde_indices=[]``,
+    ``scheduler=None``): eta=0 with gated steps is a contradictory request — the
+    central kernel degrades such steps to ODE, and worker-resident schedulers
+    (BAGEL) refuse the pair outright. A resolved ``eta > 0`` keeps the training
+    gate, whose indices are resolved against the ROLLOUT's step count, so a step
+    override is rejected here rather than addressing a schedule it cannot reach.
+
+    The rollout's params are never mutated, so eval settings cannot leak into the
+    trajectories the policy is trained on.
+    """
+    base = sampling_params.get("diffusion")
+    if base is None:
+        raise ValueError("build_eval_sampling: sampling params carry no `diffusion` entry to override.")
+    field_names = {f.name for f in dataclasses.fields(base)}
+
+    updates: Dict[str, Any] = {"eta": float(eta)}
+    if samples_per_prompt is not None:
+        updates["samples_per_prompt"] = int(samples_per_prompt)
+    updates.update(_resolve_overrides(overrides, field_names))
+
+    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
+    # field at all and _resolve_overrides already rejected it.
+    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
+        raise ValueError(
+            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
+            "pipeline discards — the eval would silently run at the training CFG. "
+            "Set `cfg_text_scale` instead."
+        )
+
+    steps = int(updates.get("num_inference_steps", base.num_inference_steps))
+    if float(updates["eta"]) <= 0.0:
+        updates["sde_indices"] = []
+        updates["scheduler"] = None
+    elif steps != int(base.num_inference_steps):
+        raise ValueError(
+            f"eval eta={updates['eta']} leaves the SDE gate on, but eval_sampling.num_inference_steps"
+            f"={steps} differs from the rollout's {base.num_inference_steps}: the gated step indices "
+            "are resolved against the rollout's step count and cannot address the eval schedule. "
+            "Set eval_eta: 0, or drop the step override."
+        )
+    return {**sampling_params, "diffusion": dataclasses.replace(base, **updates)}
+
+
+def _resolve_overrides(overrides: Any, field_names: Set[str]) -> Dict[str, Any]:
+    """Validate a recipe ``eval_sampling:`` block into plain ``dataclasses.replace`` kwargs."""
+    if overrides is None:
+        return {}
+    if OmegaConf.is_config(overrides):
+        overrides = OmegaConf.to_container(overrides, resolve=True)
+    if not isinstance(overrides, Mapping):
+        raise TypeError(
+            "eval_sampling must be a mapping of diffusion sampling fields, "
+            f"got {type(overrides).__name__}. It overlays `sampling:`, so it takes no `_target_`."
+        )
+    unknown = sorted(set(overrides) - field_names)
+    if unknown:
+        raise ValueError(f"eval_sampling has unknown field(s) {unknown}; valid fields are {sorted(field_names)}.")
+    unsupported = sorted(set(overrides) & _UNSUPPORTED_OVERLAY_FIELDS)
+    if unsupported:
+        raise ValueError(
+            f"eval_sampling cannot override {unsupported}: engine/driver-owned object fields "
+            "(plain YAML cannot carry instantiated objects), so eval keeps the rollout's own. "
+            "The SDE gate is governed by eval_eta: <= 0 clears it, > 0 keeps the training gate."
+        )
+    return dict(overrides)
 
 
 class DiffusionTrainer(BaseTrainer):
@@ -57,12 +198,13 @@ class DiffusionTrainer(BaseTrainer):
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
         eval_chunk_prompts: int = 16,
-        eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        reject_retired_eval_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
@@ -72,7 +214,6 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_chunk_prompts = int(eval_chunk_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
@@ -84,12 +225,52 @@ class DiffusionTrainer(BaseTrainer):
         self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        # Frozen at init, so overlay contradictions surface at startup rather than an
+        # hour in.
+        self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
+            self.sampling_params,
+            eta=self.eval_eta,
+            samples_per_prompt=self.eval_samples_per_prompt,
+            overrides=eval_sampling_cfg,
+        )
 
         self._noise_latent_shape: Optional[list] = (
             None
             if os.environ.get("DISABLE_DRIVER_XT")
-            else self._resolve_noise_latent_shape(pipeline_cfg=pipeline_cfg, model_cfg=bundle_cfg)
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+                sampling_spec=self.sampling_params.get("diffusion"),
+            )
         )
+        # Eval may render at its own resolution, so the driver-authored x_T has to
+        # match THAT geometry rather than the rollout's.
+        self._eval_noise_latent_shape: Optional[list] = (
+            None
+            if self._noise_latent_shape is None
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+                sampling_spec=self._eval_sampling_params.get("diffusion"),
+            )
+        )
+        if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
+            eval_diffusion = self._eval_sampling_params.get("diffusion")
+            if self._eval_noise_latent_shape is None or bool(eval_diffusion.disable_driver_xt):
+                logger.warning(
+                    "logging.log_media is on, but eval has no driver-authored x_T "
+                    "(DISABLE_DRIVER_XT / disable_driver_xt, or latent_shape() opted out), so "
+                    "every eval draws fresh noise and the eval panel will not be comparable "
+                    "across evals."
+                )
+            elif float(eval_diffusion.eta) > 0.0:
+                logger.warning(
+                    "logging.log_media is on with eval eta=%.2f > 0: x_T is prompt-keyed, but "
+                    "per-step SDE noise is seeded from the eval step's sample ids, so eval "
+                    "panels differ by noise as well as policy. Set eval_eta: 0 for a "
+                    "like-for-like filmstrip.",
+                    float(eval_diffusion.eta),
+                )
 
         self.weight_sync = None
         # None when the recipe has no ``reward:`` block (validated below).
@@ -301,7 +482,9 @@ class DiffusionTrainer(BaseTrainer):
         else:
             self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
-    def _resolve_noise_latent_shape(self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig) -> Optional[list]:
+    def _resolve_noise_latent_shape(
+        self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
+    ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``.
 
         Delegates to the pipeline's ``latent_shape`` classmethod — the framework's
@@ -316,6 +499,9 @@ class DiffusionTrainer(BaseTrainer):
         In practice every shipped pipeline returns a shape, so a recipe is
         authored for all models; recipe *consumption* is currently SD3-only (see
         the scope caveat in ``__init__``).
+
+        ``sampling_spec`` selects whose geometry to resolve — the rollout's or
+        eval's, which may render at a different resolution.
         """
         target = getattr(pipeline_cfg, "_target_", None)
         if not isinstance(target, str):
@@ -326,7 +512,7 @@ class DiffusionTrainer(BaseTrainer):
         if latent_shape_fn is None:
             return None
         try:
-            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=self.sampling_params.get("diffusion"))
+            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=sampling_spec)
         except NotImplementedError:
             return None
         return [int(x) for x in shape]
@@ -356,10 +542,11 @@ class DiffusionTrainer(BaseTrainer):
         its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
         sp = sampling if sampling is not None else self.sampling_params
+        noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
-            diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=self._noise_latent_shape
+            diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )
         request = prepare_input_sample(
             inputs,
@@ -371,7 +558,7 @@ class DiffusionTrainer(BaseTrainer):
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
 
-        if sampling is not None and self._noise_latent_shape is not None:
+        if sampling is not None and noise_latent_shape is not None:
             from unirl.sde.noise import make_prompt_seed_group_id
 
             texts = next((value for value in request.conditioning() if isinstance(value, Texts)), None)
@@ -506,11 +693,11 @@ class DiffusionTrainer(BaseTrainer):
         """Periodic eval on the eval set (no training); returns the mean reward.
 
         Mirrors :meth:`_rollout_and_score`'s rollout+reward path but skips advantage/backward.
-        Generates at the deterministic best-quality setting (``cfg_text_scale=
-        eval_cfg_text_scale``, ``eta=eval_eta`` — at ``eval_eta=0`` the SDE gate
-        is also cleared, so the request is pure ODE; ``eval_samples_per_prompt``
-        x_T per prompt) and scores. The training reward plus every shared-set
-        ``eval_rewards`` suite scores the SAME generated images over the default
+        Eval sampling INHERITS the training ``sampling:`` block and overlays the
+        ``eval_*`` knobs plus the recipe's ``eval_sampling:`` block on top — see
+        :func:`build_eval_sampling` for the precedence.
+        The training reward plus every shared-set ``eval_rewards`` suite scores the
+        SAME generated images over the default
         eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
         own-set suite then gets its own generation pass over its own prompts.
         All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
@@ -527,22 +714,8 @@ class DiffusionTrainer(BaseTrainer):
                 "DiffusionTrainer.evaluate: no reward configured (the recipe has no `reward:` "
                 "block) — evaluation scores generations and needs one."
             )
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(
-            samples_per_prompt=self.eval_samples_per_prompt,
-            eta=self.eval_eta,
-        )
-        if self.eval_eta <= 0.0:
-            # Deterministic eval must also clear the SDE gate: eta=0 with gated
-            # steps is a contradictory request — the central kernel degrades such
-            # steps to ODE, but worker-resident schedulers (BAGEL) refuse the pair.
-            replace_kwargs.update(sde_indices=[], scheduler=None)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        eval_sp = self._eval_sampling_params
+        eval_diffusion = eval_sp.get("diffusion")
         self.rollout.wake_up()
         try:
             if sync_weights and self.weight_sync is not None:
@@ -550,20 +723,34 @@ class DiffusionTrainer(BaseTrainer):
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
+            metrics = self._eval_pass(
+                self.data_source, self.eval_num_prompts, scorers, eval_sp, step, media_prefix="eval"
+            )
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                            media_prefix=f"eval/{suite.name}",
+                        )
+                    )
         finally:
             if sleep_after:
                 self.rollout.sleep()
         logger.info(
-            "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
+            "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
-            self.eval_samples_per_prompt,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
+            int(eval_diffusion.samples_per_prompt),
+            int(eval_diffusion.num_inference_steps),
+            int(eval_diffusion.height),
+            int(eval_diffusion.width),
+            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -576,6 +763,8 @@ class DiffusionTrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        *,
+        media_prefix: Optional[str] = None,
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean.
 
@@ -583,6 +772,10 @@ class DiffusionTrainer(BaseTrainer):
         never holds N x the KV/decoded on the driver (the it2i memory
         bottleneck). Scores the single scorable (segment-carrying) track with
         every scorer — single-track for now; revisit if multi-track lands.
+
+        ``media_prefix`` names the wandb key family for the preview grid drawn
+        from the FIRST chunk (see :meth:`BaseTrainer._log_eval_media`); the first
+        scorer's Sample is used, so captions carry its reward.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
@@ -593,13 +786,21 @@ class DiffusionTrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
+            first_scored: Optional[Sample] = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if first_scored is None:
+                    first_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
+                    if scored is first_scored:
+                        # Captions read part.rewards, which remote scoring returns dehydrated.
+                        scored.parts[-1].rewards = r
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if media_prefix and start == 0 and first_scored is not None:
+                self._log_eval_media(first_scored, step, prefix=media_prefix)
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(

@@ -6,7 +6,7 @@ picked from the registry by ``config.modality``, owns the ``Sample`` →
 and no concrete backend (the seam owns the runtime — boot, ports, env quirks,
 the per-stage ``collective_rpc`` fan-out). Weight sync is a :class:`WeightSync`
 component constructed over the seam; the offload lifecycle (a single flag)
-lives directly on the engine. The frozen ``synchronous.py`` surface is implemented as
+lives directly on the engine. The frozen ``base.py`` surface is implemented as
 thin forwards here — they must be real class attributes anyway (``Worker.call``
 dispatches by name; ``@distributed`` binds the most-derived attribute) — which
 also absorbs the surface quirks (``track_prefix``) so the component keeps
@@ -14,7 +14,7 @@ clean signatures.
 
 One-shot construction: after ``__init__`` returns, the ``Omni`` orchestrator
 is spawned and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
-re-apply ``@distributed`` (the decorator is not inherited — see ``synchronous.py``).
+re-apply ``@distributed`` (the decorator is not inherited — see ``base.py``).
 ``set_lora_from_tensors_copy`` additionally keeps v1's ``@distributed(BROADCAST)``
 — the documented exception to the "weight-sync entry points undecorated" rule:
 it is how the HI3 two-engine LoRA sync reaches engines anchored on disjoint
@@ -31,7 +31,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
@@ -42,7 +42,7 @@ from unirl.types.sample import Sample
 logger = logging.getLogger(__name__)
 
 
-class VLLMOmniRolloutEngine(SyncRolloutEngine):
+class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"

@@ -15,7 +15,8 @@ Launch (single node):
 
 Extra config knobs vs the synchronous separate recipe:
   * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``weight_sync_interval`` — rollout batches one published snapshot serves; max staleness is interval - 1.
+  * ``weight_sync_interval`` — trained batches between publications; also derives
+    the default output-version lag filter.
 ``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
 """
 
@@ -51,8 +52,9 @@ def main(cfg: DictConfig) -> None:
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
-        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
+        eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),

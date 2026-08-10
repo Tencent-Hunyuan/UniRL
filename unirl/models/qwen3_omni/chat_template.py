@@ -1,4 +1,4 @@
-"""Build role-aware token and TMRoPE video conditions for Qwen3-Omni."""
+"""Build role-aware multimodal token and TMRoPE conditions for Qwen3-Omni."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ import torch
 
 from unirl.models.types.conversations import build_omni_messages
 from unirl.types.conditions import TextTokenCondition
+from unirl.types.media import MediaRefs
 from unirl.types.primitives import Texts
 from unirl.types.sample import Turn
 
 from .bundle import Qwen3OmniBundle
 from .conditions import Qwen3OmniARConditions
-from .media import prepare_omni_media
+from .media import omni_processor_media_kwargs, prepare_omni_media
 
 Qwen3OmniChatInput = Union[List[Turn], Texts]
 
@@ -26,6 +27,7 @@ class Qwen3OmniChatTemplateStage:
         system_instruction: Optional[str] = None,
         max_prompt_length: int = 4096,
         pad_to_max_length: bool = False,
+        image_max_pixels: Optional[int] = None,
         video_fps: float = 1.0,
         video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
@@ -36,11 +38,33 @@ class Qwen3OmniChatTemplateStage:
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
         self.pad_to_max_length = bool(pad_to_max_length)
+        self.image_max_pixels = int(image_max_pixels) if image_max_pixels else None
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
         self.use_audio_in_video = bool(use_audio_in_video)
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+
+    def embed_sft_prompt(
+        self,
+        *,
+        texts: Texts,
+        media_refs: Optional[MediaRefs] = None,
+    ) -> Qwen3OmniARConditions:
+        """Encode single-turn SFT prompts through the model-specific media path."""
+        if media_refs is None or not any(media_refs.rows):
+            return self.embed(texts)
+        if len(texts) != len(media_refs):
+            raise ValueError(
+                "Qwen3OmniChatTemplateStage.embed_sft_prompt: "
+                f"media row count {len(media_refs)} != text batch {len(texts)}."
+            )
+        return self.embed(
+            [
+                Turn(role="user", content=media_refs),
+                Turn(role="user", content=texts),
+            ]
+        )
 
     def embed(
         self,
@@ -86,18 +110,21 @@ class Qwen3OmniChatTemplateStage:
 
         return self.embed_messages(conversations)
 
-    def _multimodal_processor_kwargs(self, *, video_fps: float) -> Dict[str, Any]:
-        processor = self.bundle.processor
-        kwargs: Dict[str, Any] = {
-            "fps": video_fps,
-            "do_sample_frames": False,
-        }
-        if self.video_max_pixels is not None:
-            kwargs["size"] = {
-                "shortest_edge": int(processor.video_processor.size["shortest_edge"]),
-                "longest_edge": self.video_max_pixels,
-            }
-        return kwargs
+    def _multimodal_processor_kwargs(
+        self,
+        *,
+        has_image: bool,
+        has_video: bool,
+        video_fps: float,
+    ) -> Dict[str, Any]:
+        return omni_processor_media_kwargs(
+            self.bundle.processor,
+            has_image=has_image,
+            has_video=has_video,
+            image_max_pixels=self.image_max_pixels,
+            video_fps=video_fps,
+            video_max_pixels=self.video_max_pixels,
+        )
 
     def _prepare_messages(
         self,
@@ -127,8 +154,10 @@ class Qwen3OmniChatTemplateStage:
             video_max_frames=self.video_max_frames,
             use_audio_in_video=self.use_audio_in_video,
         )
-        processor_kwargs = (
-            self._multimodal_processor_kwargs(video_fps=media.effective_fps) if media.video_frames is not None else {}
+        processor_kwargs = self._multimodal_processor_kwargs(
+            has_image=media.image is not None,
+            has_video=media.video_frames is not None,
+            video_fps=media.effective_fps,
         )
         has_media = media.image is not None or media.video_frames is not None or media.audio_waveform is not None
         return (
@@ -205,7 +234,8 @@ class Qwen3OmniChatTemplateStage:
                     raise ValueError(
                         "Qwen3OmniChatTemplateStage: multimodal prompt produced "
                         f"{prompt_len} tokens, exceeding max_prompt_length={self.max_prompt_length}. "
-                        "Reduce video_max_frames, video_max_pixels, or video_fps, or raise max_prompt_length."
+                        "Reduce image_max_pixels, video_max_frames, video_max_pixels, or video_fps, "
+                        "or raise max_prompt_length."
                     )
                 inputs = dict(inputs)
                 inputs["input_ids"] = inputs["input_ids"][..., -self.max_prompt_length :]
