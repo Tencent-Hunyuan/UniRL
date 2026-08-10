@@ -103,6 +103,8 @@ def main() -> None:
         parser.error("--val-fraction must be in (0, 1)")
     if args.min_val_per_class < 1:
         parser.error("--min-val-per-class must be >= 1")
+    if args.max_val_samples < 0:
+        parser.error("--max-val-samples must be >= 0")
 
     classes = tuple(args.classes)
     by_class = _rows(args.data_root, classes)
@@ -111,16 +113,21 @@ def main() -> None:
         rng.shuffle(class_rows)
 
     val: list[dict[str, Any]] = []
+    train: list[dict[str, Any]] = []
     for class_name in classes:
         class_rows = by_class[class_name]
         count = max(args.min_val_per_class, round(len(class_rows) * args.val_fraction))
+        if count >= len(class_rows):
+            parser.error(
+                f"class {class_name!r} has {len(class_rows)} samples but the validation split requests {count}; "
+                "reduce --val-fraction/--min-val-per-class so each class keeps at least one training sample"
+            )
         val.extend(class_rows[:count])
+        train.extend(class_rows[count:])
     rng.shuffle(val)
     if args.max_val_samples > 0:
+        train.extend(val[args.max_val_samples :])
         val = val[: args.max_val_samples]
-
-    val_ids = {row["sample_id"] for row in val}
-    train = [row for class_name in classes for row in by_class[class_name] if row["sample_id"] not in val_ids]
     rng.shuffle(train)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)

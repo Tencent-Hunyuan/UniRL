@@ -53,11 +53,6 @@ pipeline:
   trajectory_precision: bf16
   logprob_precision: fp32
   max_sequence_length: 512
-  video_encode:
-    num_frames: 17
-    height: 256
-    width: 448
-    max_decode_frames: 256
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 
@@ -105,7 +100,15 @@ stack:
 
 track_builder:
   _target_: unirl.train.sft.track_builder.VideoDiffusionSupervisedTrackBuilder
+  encode_stage:
+    _target_: unirl.models.wan21.video_encode.WANVideoLatentEncodeStage
+    bundle: ${bundle}
+    num_frames: 17
+    height: 256
+    width: 448
+  num_frames: 17
   guidance_scale: 1.0
+  max_decode_frames: 256
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource

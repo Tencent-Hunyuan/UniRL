@@ -26,13 +26,15 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
 from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.models.types.codec import EncodeStage
+from unirl.types.conditions import ImageLatentCondition
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts, Video, Videos
 from unirl.types.sample import Part
@@ -42,6 +44,12 @@ from unirl.types.segments.text import TextSegment
 logger = logging.getLogger(__name__)
 
 Record = Dict[str, Any]
+
+
+class _VideoSFTPipeline(Protocol):
+    bundle: Any
+
+    def build_conditions(self, texts: Texts, *, guidance_scale: float) -> Any: ...
 
 
 def _load_pil_image(uri: str):
@@ -57,15 +65,12 @@ def _load_pil_image(uri: str):
 
 
 def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:
-    """URIs of media refs matching a role and optional modality."""
-    uris: List[str] = []
-    for ref in record.get("media_refs", []) or []:
-        ref_role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
-        ref_modality = getattr(ref, "modality", None) if not isinstance(ref, dict) else ref.get("modality")
-        ref_uri = getattr(ref, "uri", None) if not isinstance(ref, dict) else ref.get("uri")
-        if ref_role == role and (modality is None or ref_modality == modality) and ref_uri:
-            uris.append(str(ref_uri))
-    return uris
+    """URIs of normalized media refs matching ``role`` and ``modality``."""
+    return [
+        ref.uri
+        for ref in record.get("media_refs", []) or []
+        if isinstance(ref, MediaRef) and ref.role == role and (modality is None or ref.modality == modality)
+    ]
 
 
 def _sample_ids(records: Sequence[Record]) -> List[str]:
@@ -383,7 +388,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
         return torch.stack(rows, dim=0)
 
 
-def _decode_video(uri: str, *, max_frames: Optional[int] = None) -> Video:
+def _decode_video(uri: str, *, max_frames: int) -> Video:
     """Decode one local video (or tensor fixture) to ``Video[T,C,H,W]``."""
     if uri.startswith(("http://", "https://", "s3://", "gs://")):
         raise NotImplementedError(
@@ -404,9 +409,18 @@ def _decode_video(uri: str, *, max_frames: Optional[int] = None) -> Video:
         else:
             frames = torch.as_tensor(loaded)
     else:
-        from unirl.models.qwen3_omni.video import sample_video_frames_pyav
+        import av
 
-        frames, _ = sample_video_frames_pyav(uri, target_fps=1_000_000.0, max_frames=max_frames)
+        frames = []
+        with av.open(uri) as container:
+            for frame in container.decode(video=0):
+                array = frame.to_ndarray(format="rgb24")
+                frames.append(torch.from_numpy(array).permute(2, 0, 1).contiguous())
+                if len(frames) >= max_frames:
+                    break
+        if not frames:
+            raise ValueError(f"VideoDiffusionSupervisedTrackBuilder: target video has no decoded frames: {uri}")
+        frames = torch.stack(frames)
     if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or int(frames.shape[1]) != 3:
         raise ValueError(
             f"VideoDiffusionSupervisedTrackBuilder: expected decoded frames [T, 3, H, W], "
@@ -426,35 +440,28 @@ class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
     """Dataset records → video-diffusion ``Part`` with a clean x0 latent.
 
     Records must contain one ``(modality="video", role="target")`` media ref.
-    Decoding happens on the training worker; the configured pipeline's
-    ``video_encode`` stage owns frame sampling, resize, and VAE normalization.
+    Decoding and WAN VAE encoding both happen on the training worker.
     """
 
     def __init__(
         self,
         *,
-        pipeline: Any,
-        encode_stage_attr: str = "video_encode",
+        pipeline: _VideoSFTPipeline,
+        encode_stage: EncodeStage[Videos, ImageLatentCondition],
+        num_frames: int,
         guidance_scale: float = 1.0,
+        max_decode_frames: int = 256,
     ) -> None:
         super().__init__()
         self.pipeline = pipeline
-        self.guidance_scale = float(guidance_scale)
-        self._encode = getattr(pipeline, encode_stage_attr, None)
-        if self._encode is None or not callable(getattr(self._encode, "encode", None)):
+        self._encode = encode_stage
+        self._num_frames = int(num_frames)
+        self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": float(guidance_scale)}
+        self._max_decode_frames = int(max_decode_frames)
+        if self._max_decode_frames < self._num_frames:
             raise ValueError(
-                f"VideoDiffusionSupervisedTrackBuilder: pipeline.{encode_stage_attr} is missing or has no "
-                ".encode(); configure the model pipeline with a target-video VAE encode stage."
-            )
-        build_conditions = getattr(pipeline, "build_conditions", None)
-        if not callable(build_conditions):
-            raise ValueError("VideoDiffusionSupervisedTrackBuilder: pipeline has no build_conditions(texts, ...).")
-        self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": self.guidance_scale}
-        max_decode_frames = getattr(self._encode, "max_decode_frames", None)
-        self._max_decode_frames = None if max_decode_frames is None else int(max_decode_frames)
-        if self._max_decode_frames is not None and self._max_decode_frames < 1:
-            raise ValueError(
-                "VideoDiffusionSupervisedTrackBuilder: encode stage max_decode_frames must be >= 1 or None."
+                "VideoDiffusionSupervisedTrackBuilder: max_decode_frames must be >= num_frames "
+                f"({self._num_frames}), got {self._max_decode_frames}."
             )
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -471,10 +478,10 @@ class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
                 f"VideoDiffusionSupervisedTrackBuilder.build: encoded {latents.shape[0]} latents "
                 f"from {len(records)} records."
             )
-        pad = torch.tensor([0.0 if p else 1.0 for p in _pad_flags(records)], dtype=torch.float32)
+        loss_mask = torch.tensor([not is_pad for is_pad in _pad_flags(records)], dtype=torch.float32)
         segment = make_video_segment(
             latents=latents.unsqueeze(1),
-            loss_mask=pad.to(latents.device),
+            loss_mask=loss_mask.to(latents.device),
         )
         return Part(
             sample_ids=_sample_ids(records),

@@ -28,8 +28,7 @@ class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
     Input videos use the framework layout ``[T, 3, H, W]`` with values in
     ``[0, 1]``. The stage uniformly samples ``num_frames``, resizes each frame,
     maps pixels to ``[-1, 1]``, and returns the normalized latent convention
-    consumed by WAN's diffusion transformer. ``max_decode_frames`` bounds the
-    worker-side PyAV buffer before this final sampling step.
+    consumed by WAN's diffusion transformer.
     """
 
     def __init__(
@@ -39,13 +38,11 @@ class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
         num_frames: int,
         height: int,
         width: int,
-        max_decode_frames: int | None = 256,
     ) -> None:
         self.bundle = bundle
         self.num_frames = int(num_frames)
         self.height = int(height)
         self.width = int(width)
-        self.max_decode_frames = None if max_decode_frames is None else int(max_decode_frames)
         if self.num_frames < 1 or (self.num_frames - 1) % _TEMPORAL_DOWNSAMPLE != 0:
             raise ValueError(
                 f"WAN VAE temporal_downsample={_TEMPORAL_DOWNSAMPLE} requires "
@@ -60,11 +57,6 @@ class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
             raise ValueError(
                 f"WAN VAE spatial_downsample={_SPATIAL_DOWNSAMPLE} requires height/width divisible by "
                 f"{_SPATIAL_DOWNSAMPLE}, got {self.height}x{self.width}."
-            )
-        if self.max_decode_frames is not None and self.max_decode_frames < self.num_frames:
-            raise ValueError(
-                f"WANVideoLatentEncodeStage: max_decode_frames={self.max_decode_frames} must be >= "
-                f"num_frames={self.num_frames}, or None."
             )
 
     @torch.no_grad()
