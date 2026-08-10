@@ -15,8 +15,8 @@ Launch (single node):
 
 Extra config knobs vs the synchronous separate recipe:
   * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``buffer_max_staleness`` — regular rollout-weight syncs a buffered group may
-    cross. ``0``/unset never crosses a sync; ``>0`` enables bounded policy lag.
+  * ``weight_sync_interval`` — trained batches between publications; also derives
+    the default output-version lag filter.
 ``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
 """
 
@@ -52,16 +52,16 @@ def main(cfg: DictConfig) -> None:
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
-        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
+        eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),
-        buffer_max_staleness=cfg.get("buffer_max_staleness"),
+        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),
-        weight_sync_interval=cfg.get("weight_sync_interval", 1),
         save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),

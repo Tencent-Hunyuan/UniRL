@@ -14,6 +14,10 @@ against the manifest's directory):
 - AR (agent): ``{"messages": [..., {"role": "assistant", ...}], "tools": [...]}``
 - AR (VLM):   ``{"prompt", "response", "media": [{"modality": "image",
   "role": "condition", "uri": "img/0.png"}]}``
+- AR (omni):  ``{"prompt", "response", "media": [{"modality": "audio",
+  "role": "prompt", "uri": "audio/0.wav"}]}`` — URI-backed prompt media
+  (image / audio / video) for chat stages that render it themselves; the
+  builder rejects ``role="condition"`` here rather than silently dropping it
 - Diffusion:  ``{"prompt": str, "media": [{"modality": "image",
   "role": "target", "uri": "img/0.png"}]}`` (``caption`` accepted as an alias
   for ``prompt``)

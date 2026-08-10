@@ -52,6 +52,27 @@ def _resolve_build_batch_2d_rope():
     )
 
 
+def _resolve_get_system_prompt():
+    """Locate the checkpoint's ``get_system_prompt``; FSDP2 can rebind ``__module__``."""
+    for _name, _mod in sys.modules.items():
+        if _name.startswith("transformers_modules.") and hasattr(_mod, "get_system_prompt"):
+            return _mod.get_system_prompt
+    raise RuntimeError(
+        "HunyuanImage3TextEmbedStage: could not locate get_system_prompt "
+        "in any transformers_modules.* — was the checkpoint loaded with "
+        "trust_remote_code=True?"
+    )
+
+
+def _resolve_system_prompt_preset(sys_type: str, bot_task: str) -> Optional[str]:
+    """Resolve a checkpoint system-prompt preset, stripped as upstream does."""
+    resolved = _resolve_get_system_prompt()(str(sys_type), str(bot_task))
+    if resolved is None:
+        return None
+    stripped = str(resolved).strip()
+    return stripped or None
+
+
 def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.device) -> Optional[torch.Tensor]:
     """First non-None attribute of ``output`` among ``names``, moved to
     ``device``; None if absent. Attr names differ across HI3 checkpoint
@@ -83,6 +104,7 @@ class HunyuanImage3TextEmbedStage:
         batch_prompt: Optional[List[str]],
         bot_task: str,
         cfg_factor: int,
+        sequence_template: Optional[str] = None,
         batch_message_list: Optional[Any] = None,
         batch_gen_image_info: Optional[Any] = None,
         batch_system_prompt: Optional[List[str]] = None,
@@ -103,6 +125,34 @@ class HunyuanImage3TextEmbedStage:
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
         repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
 
+        effective_sequence_template = (
+            gen_config.sequence_template if sequence_template is None else str(sequence_template)
+        )
+
+        # Two text sections tokenize independently; direct-T2I pretrain needs one BPE pass.
+        if (
+            mode == "gen_image"
+            and effective_sequence_template == "pretrain"
+            and sequence_template is not None
+            and bot_task == "image"
+            and cfg_factor == 1
+            and batch_message_list is None
+            and batch_prompt is not None
+            and batch_system_prompt is not None
+            and batch_cot_text is None
+            and batch_cond_image_info is None
+        ):
+            if len(batch_prompt) != len(batch_system_prompt):
+                raise ValueError(
+                    "pretrain direct-T2I batch_prompt and batch_system_prompt must align, "
+                    f"got {len(batch_prompt)} and {len(batch_system_prompt)}"
+                )
+            if all(batch_system_prompt):
+                batch_prompt = [
+                    f"{system_prompt}{prompt}" for prompt, system_prompt in zip(batch_prompt, batch_system_prompt)
+                ]
+                batch_system_prompt = None
+
         _cond_kw = (
             "batch_cond_images"
             if "batch_cond_images" in inspect.signature(tkw.apply_chat_template).parameters
@@ -118,7 +168,7 @@ class HunyuanImage3TextEmbedStage:
             max_length=max_length,
             bot_task=bot_task,
             image_base_size=config.image_base_size,
-            sequence_template=gen_config.sequence_template,
+            sequence_template=effective_sequence_template,
             cfg_factor=cfg_factor,
             drop_think=gen_config.drop_think,
             **{_cond_kw: batch_cond_image_info},
@@ -296,6 +346,8 @@ class HunyuanImage3TextEmbedStage:
         bot_task: str = "image",
         cot_text: Optional[List[str]] = None,
         system_prompt: Optional[List[str]] = None,
+        sys_type: Optional[str] = None,
+        sequence_template: Optional[str] = None,
         batch_cond_image_info: Optional[List[List[Any]]] = None,
     ) -> Dict[str, Any]:
         """Build the unified-MM input tensors for ``mode="gen_image"``.
@@ -328,13 +380,14 @@ class HunyuanImage3TextEmbedStage:
             bot_task:
                 Chat-template flag selecting the AR-prefix preset baked
                 into ``input_ids``. One of ``{"image", "auto", "think",
-                "recaption", "think_recaption", "img_ratio"}``. Default
-                ``"image"`` matches vllm-omni's ``t2i_vanilla`` preset
-                (no prefix marker). ``"think"`` / ``"recaption"`` insert
-                a static ``<think>`` / ``<recaption>`` marker after the
-                ``Assistant:`` system prompt — the model treats this as
-                a reasoning-mode signal during the diffusion forward.
-                Per vllm-omni ``prompt_utils.py:23-31``.
+                "recaption", "think_recaption", "img_ratio"}``.
+                ``"image"`` inserts no marker; vllm-omni's
+                ``t2i_vanilla`` preset additionally needs
+                ``sys_type="en_vanilla"`` and ``sequence_template="pretrain"``.
+                ``"think"`` / ``"recaption"`` insert a static ``<think>`` /
+                ``<recaption>`` marker after the ``Assistant:`` system
+                prompt — a reasoning-mode signal during the diffusion
+                forward. Per vllm-omni ``prompt_utils.py:23-31``.
             cot_text:
                 Optional per-sample chain-of-thought text (length B,
                 NOT B*cfg — the wrapper duplicates internally and drops
@@ -346,6 +399,14 @@ class HunyuanImage3TextEmbedStage:
                 Optional per-sample system prompts (length B), spliced
                 ahead of the user prompt — t2ti passes the same resolved
                 system prompt used for its AR phase.
+            sys_type:
+                Optional system-prompt preset (``"en_vanilla"``,
+                ``"en_unified"``, ...) resolved through the checkpoint's own
+                ``get_system_prompt``; ignored when ``system_prompt`` is given.
+            sequence_template:
+                Optional override; ``None`` keeps
+                ``generation_config.sequence_template`` (``"instruct"`` on the
+                Instruct checkpoint). Direct ``t2i_vanilla`` needs ``"pretrain"``.
             batch_cond_image_info:
                 Optional per-sample list of ``JointImageInfo`` for
                 cond-image marker insertion (it2i).
@@ -378,6 +439,10 @@ class HunyuanImage3TextEmbedStage:
         if not prompts:
             raise ValueError("HunyuanImage3TextEmbedStage.embed_for_gen_image: prompts is empty")
         cfg_factor = 2 if cfg else 1
+        if system_prompt is None and sys_type is not None:
+            resolved_system_prompt = _resolve_system_prompt_preset(str(sys_type), bot_task)
+            if resolved_system_prompt is not None:
+                system_prompt = [resolved_system_prompt] * len(prompts)
 
         ip = transformer.image_processor
         if hasattr(ip, "build_image_info"):
@@ -395,6 +460,7 @@ class HunyuanImage3TextEmbedStage:
             batch_prompt=prompts,
             bot_task=bot_task,
             cfg_factor=cfg_factor,
+            sequence_template=sequence_template,
             batch_gen_image_info=batch_gen_image_info,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,

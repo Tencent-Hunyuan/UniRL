@@ -375,6 +375,11 @@ class BaseFSDP2Backend(Remote):
         if self.ema is not None:
             self.ema.on_rollout_end(self._optimizer_step_count)
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def get_optimizer_step_count(self) -> int:
+        """Return the authoritative number of committed optimizer updates."""
+        return self._optimizer_step_count
+
     @property
     def rollout_adapter_name(self) -> str:
         """Adapter the rollout must sample under (single source of truth).

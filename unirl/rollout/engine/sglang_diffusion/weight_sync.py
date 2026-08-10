@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes the
 backend and the LoRA spec explicitly and owns all sync/LoRA state
 (``_lora_loaded`` / ``_active_adapter``). Method names mirror
-the frozen ``synchronous.py`` surface minus ``track_prefix`` (the engine's forwards absorb
+the frozen ``base.py`` surface minus ``track_prefix`` (the engine's forwards absorb
 that, along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
 trainer-side entry point lands here.
 

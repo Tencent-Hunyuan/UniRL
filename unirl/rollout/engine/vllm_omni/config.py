@@ -25,8 +25,8 @@ from typing import Any, Dict, Optional
 from omegaconf import MISSING
 
 from unirl.config.require import require
+from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
-from unirl.rollout.engine.synchronous import BaseEngineConfig
 
 
 @dataclass(frozen=True)

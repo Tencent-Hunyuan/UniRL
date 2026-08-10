@@ -1,17 +1,15 @@
-"""Rollout engine base classes. Engines complete construction in ``__init__``; no separate initialize step."""
+"""Rollout engine contracts. Engines complete construction in ``__init__``; no separate initialize step."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
-
-RolloutOutput = Union[Sample, List[Sample]]
 
 
 class BaseEngineConfig(ABC):
@@ -23,7 +21,7 @@ class BaseEngineConfig(ABC):
 
 
 class BaseRolloutEngine(Remote, ABC):
-    """Rollout engine ABC."""
+    """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
     @abstractmethod
     def shutdown(self) -> None:
@@ -37,6 +35,11 @@ class BaseRolloutEngine(Remote, ABC):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Restore runtime resources after ``sleep``. Default no-op."""
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_stopping(self, stopping: bool = True) -> None:
+        """Arm cooperative rollout suspension. Default no-op."""
+        del stopping
 
     def onload_weights(self, *, track_prefix: str = "") -> None:
         """Restore the resources needed to receive a weight update."""
@@ -62,8 +65,8 @@ class BaseRolloutEngine(Remote, ABC):
         }
 
     @abstractmethod
-    def generate(self, sample: Sample) -> RolloutOutput:
-        """Synchronously run rollout generation; each concrete contract owns its dispatch mode."""
+    def generate(self, sample: Sample) -> Sample:
+        """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
@@ -147,23 +150,21 @@ class BaseRolloutEngine(Remote, ABC):
         del track_prefix
         raise NotImplementedError
 
+    _version: int = 0
 
-class SyncRolloutEngine(BaseRolloutEngine, ABC):
-    """Engines that fill and return one ``Sample``; ``generate`` may be called concurrently (agentic drain)."""
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_version(self, train_version: int) -> None:
+        """Set the committed-update version after a full weight publication."""
+        if train_version < 0:
+            raise ValueError(f"train_version must be >= 0, got {train_version}")
+        self._version = train_version
 
-    _weight_version: int = 0
-
-    @abstractmethod
-    def generate(self, sample: Sample) -> Sample:
-        """Synchronously fill and return one request ``Sample``."""
-
-    def _stamp_weight_version(self, sample: Sample) -> Sample:
-        """Stamp ``self._weight_version`` onto the frontier (last) gen Part."""
-        v = getattr(self, "_weight_version", None)
-        if v is None or not sample.parts:
+    def _stamp_output_version(self, sample: Sample) -> Sample:
+        """Stamp ``self._version`` onto the frontier (last) gen Part."""
+        if not sample.parts:
             return sample
-        gen = sample.parts[-1].fill(weight_version=int(v))
+        gen = sample.parts[-1].fill(output_version=self._version)
         return sample.with_parts([*sample.parts[:-1], gen])
 
 
-__all__ = ["BaseRolloutEngine", "SyncRolloutEngine", "RolloutOutput"]
+__all__ = ["BaseRolloutEngine"]

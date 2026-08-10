@@ -1,0 +1,179 @@
+# @package _global_
+# HunyuanImage-3 pure text-to-image FlowGRPO with a trainside rollout.
+#
+# No AR rollout, no AR algorithm, no unified two-track stack: the same
+# FSDP-wrapped decoder samples and replays only mode=gen_image. HI3's qkv/o
+# modules are shared by its AR and diffusion modes, so this freezes the AR
+# objective and topology, not the adapter's effect on a later AR forward.
+#
+# The prompt shape is vLLM-Omni's t2i_vanilla preset, which is three settings,
+# not one: bot_task=image (no reasoning marker) plus sys_type=en_vanilla plus
+# sequence_template=pretrain. The Instruct checkpoint defaults to en_unified +
+# instruct, so both overrides below are load-bearing.
+#
+# Measured on 8x H20 (see PR): rollout reward 0.759 -> 0.863 over 199 rollouts.
+# Smoke: override num_rollouts=2 eval_interval=0 logging.report_to_wandb=false.
+
+num_devices: 8
+batch_size: 16                 # prompts/rollout. TRAINSIDE DP_SCATTER splits prompts before
+                               # group expansion, so this must be divisible by num_devices.
+                               # 16/8 = 2 prompts/GPU, x4 = 8 images/GPU.
+adv_use_global_std: false      # per-group GRPO normalization
+num_rollouts: 500              # reward plateaus by rollout 80; the tail is drift monitoring
+eval_interval: 10
+save_interval: 10
+save_mode: adapter
+save_dir: ${oc.env:SAVE_DIR,checkpoints/hi3_trainside_t2i}
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# Deterministic eval: ODE (eta=0) at cfg=1 over a fixed prompt set, so the
+# series tracks the policy rather than sampling noise.
+eval_num_prompts: 8
+eval_samples_per_prompt: 1
+eval_chunk_prompts: 8
+eval_eta: 0.0
+eval_sampling:
+  guidance_scale: 1.0          # pinned: eval stays unguided even if the rollout CFG changes
+
+task_config:
+  task: t2i
+  bot_task: image              # no reasoning marker
+  sys_type: en_vanilla         # overrides the checkpoint's en_unified default
+  sequence_template: pretrain  # overrides the Instruct checkpoint's instruct default
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,hi3-grpo}
+  run_name: ${oc.env:WANDB_RUN_NAME,hi3_trainside_t2i_pickscore}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [hi3, t2i, pickscore, diffusion-only, trainside]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  _target_: unirl.models.hunyuan_image3.bundle.HunyuanImage3Bundle.from_meta_config
+  config:
+    _target_: unirl.models.hunyuan_image3.config.HunyuanImage3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,tencent/HunyuanImage-3.0-Instruct}
+    model_precision: bf16
+    vae_dtype: fp32
+    autocast_precision: bf16
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    shift: 3.0
+    guidance_scale: 1.0
+    # Full-prefill sampling and replay at fbs=mbs=1, so update 0 is an
+    # on-policy diagnostic: it measured ratio within 1.7e-6 of 1.
+    diffuse_kv_cache: false
+
+pipeline:
+  _target_: unirl.models.hunyuan_image3.pipeline.HunyuanImage3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["HunyuanImage3DecoderLayer"]
+  trainable_attr: transformer
+  with_aux: [vae]              # T2I decodes the final latent but never materializes the ViT
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32         # LoRA image gradients are small; bf16 masters round them away
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 2.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - qkv_proj
+      - o_proj
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # Not a throughput knob: above 1 the upstream batched chat template tokenizes
+  # only the first sample of the call and the rest silently reuse it.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cpu           # 80B trainside generation already fills H20; keep the scorer off-GPU
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 4
+      device: cpu
+      processor_id: ${oc.env:PICKSCORE_PROCESSOR,yuvalkirstain/PickScore_v1}
+      model_id: ${oc.env:PICKSCORE_MODEL,yuvalkirstain/PickScore_v1}
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # Deliberately tight. The measured run clipped 4.7% of updates at this bound
+  # and still gained reward; loosen only with a fresh curve.
+  clip_range: 2.0e-5
+  clip_schedule: constant
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.hunyuan_image3.conditions.HunyuanImage3DiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  samples_per_prompt: 4        # GRPO group size
+  num_inference_steps: 16
+  guidance_scale: 1.0          # cfg=1: sampling and replay are both unguided
+  height: 1024
+  width: 1024
+  eta: 1.0
+  seed: 42                     # base_seed of the driver-authored x_T recipe
+  init_same_noise: false       # per-sample x_T -> diverse GRPO groups
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]

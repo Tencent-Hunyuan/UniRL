@@ -16,8 +16,8 @@ fresh one (a fresh loop would work once and deadlock on the second call).
 :class:`LoopThread` enforces it with a serve/park lifecycle: while generation
 is in flight the loop runs in one dedicated thread and any number of caller
 threads submit coroutines onto it (``run_coroutine_threadsafe`` — this is what
-lets the agentic drain call ``generate`` concurrently from one thread per
-trajectory while the scheduler batches the in-flight requests). The
+lets independent callers run ``generate`` concurrently while the scheduler
+batches the in-flight requests). The
 weight/memory verbs require quiesced generation, PARK the loop (stop + join
 the thread), then run the Engine's own synchronous wrappers exactly as before
 — those wrappers drive ``engine.loop`` themselves and need it idle.

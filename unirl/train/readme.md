@@ -43,7 +43,8 @@ knows nothing about DTensor sharding or wrap topology.
   one source, `_optimizer_step_slices`, shared with `prepare_segment` — so when an
   algorithm replays its anchor, it's recomputed at the *exact* geometry training
   uses, which is what pins the on-policy PPO ratio to 1 under bf16's batch-shape
-  sensitivity.
+  sensitivity. `AgenticTrainer` uses the same interface after concatenating every
+  successful trajectory's generated assistant turns.
 - **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).

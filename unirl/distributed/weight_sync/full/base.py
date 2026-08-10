@@ -160,7 +160,6 @@ class FullWeightSync(Remote):
         self._name_remap = _validate_name_remap(name_remap)
         self._track_prefix = str(track_prefix or "")
         self._wire_dtype = parse_torch_dtype(wire_dtype, field_name="wire_dtype", allow_none=True)
-        self.weight_version = 0
 
     def _iter_full_tensors(self) -> Iterator[Tuple[str, "object"]]:
         """Yield ``(name, full_tensor)`` one at a time (lazy → bounded memory).

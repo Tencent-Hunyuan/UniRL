@@ -33,6 +33,7 @@ import torch
 from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment
@@ -127,6 +128,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self.max_response_length = max_response_length
         self.append_eos = append_eos
         self._embed_takes_images = "images" in inspect.signature(self._chat_stage.embed).parameters
+        self._embed_sft_prompt = getattr(self._chat_stage, "embed_sft_prompt", None)
         self._warned_truncation = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -168,7 +170,30 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             return embed_messages(histories, tools=tools)
 
         texts = Texts(texts=[str(r["prompt"]) for r in records])
+        # The data layer normalizes every manifest media entry to MediaRef, so no dict form here.
+        prompt_media_rows: List[List[MediaRef]] = [
+            [ref for ref in (r.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "prompt"]
+            for r in records
+        ]
+        if any(prompt_media_rows):
+            if not callable(self._embed_sft_prompt):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support "
+                    "role='prompt' media through embed_sft_prompt(texts, media_refs)."
+                )
+            return self._embed_sft_prompt(
+                texts=texts,
+                media_refs=MediaRefs.from_rows(prompt_media_rows),
+            )
+
         if not self._embed_takes_images:
+            unconsumed = [r.get("sample_id") for r in records if r.get("media_refs")]
+            if unconsumed:
+                raise ValueError(
+                    f"ARSupervisedTrackBuilder: records {unconsumed[:3]} carry media_refs that this chat stage "
+                    "cannot consume — prompt media must use role='prompt' (see unirl/data/sft.py row shapes). "
+                    "Embedding them as text-only would train the model without the media, undetectably."
+                )
             return self._chat_stage.embed(texts)
         images: List[Optional[Any]] = []
         for r in records:

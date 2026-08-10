@@ -20,7 +20,7 @@ is a trainable unit of a model pipeline — `DiffusionStage` / `ARStage`, see
 As source, the package falls into four groups:
 
 - **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
-  `train_unified_model.py`, plus the `train_agentic*.py` multi-turn variants)
+  `train_unified_model.py`, plus `train_agentic.py` for multi-turn training)
   — each composes and validates a Hydra recipe, then hands off to its trainer.
 - **Orchestration** (`trainer/`) — the per-domain `<Domain>Trainer` owns GPU
   placement, builds the rollout and train workers, and runs the
@@ -37,8 +37,8 @@ As source, the package falls into four groups:
 
 | Path | Responsibility |
 |---|---|
-| `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and synchronous/partial/asynchronous agentic workflows |
-| `trainer/` | Training lifecycle (`base.py` plus domain and agentic trainers): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
+| `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and service-scored barrier agentic training |
+| `trainer/` | Training lifecycle (`base.py` plus domain trainers and `AgenticTrainer`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
 | `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
 | `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, composed) |
@@ -82,10 +82,11 @@ flows through them like this:
 7. Each train worker owns a model `Bundle`, an `FSDPBackend`, and one loss algorithm.
 8. Dedicated-rollout modes (separate / colocate) sync trainer weights back to the rollout workers.
 
-Agentic workflows extend step 3 into a trajectory: the coordinator repeatedly
-invokes a single-turn engine, executes tool or environment actions between turns,
-and returns `list[Sample]`. The agentic trainers then assemble the trainable turns
-before applying the same reward, advantage, and train-stack contracts.
+The agentic workflow extends step 3 into trajectories: a driver-side manager
+dispatches one task per remote engine slot while each engine executes model and
+environment turns. `AgenticTrainer` waits for complete sibling groups, scores
+their terminal answers through `RewardService`, and assigns each trajectory's
+group-normalized advantage to all of its generated turns before training.
 
 ## Deeper Module Docs
 
@@ -93,7 +94,7 @@ before applying the same reward, advantage, and train-stack contracts.
 - `types/README.md`: the `Sample` / `Part` contract and migration from the retired request/response API.
 - `config/README.md`: flat-recipe config — `require`/precision validators, `_target_` instantiation, cross-component contracts.
 - `rollout/README.md`: rollout modes, engines, and the `Sample` / `Part` generation flow.
-- `rollout/env/README.md`: agentic environments, tools, trajectories, and partial-resume behavior.
+- `rollout/env/README.md`: agentic environments, tools, trajectories, and manager quiescence behavior.
 - `train/readme.md`: train stack, FSDP backend, injection, EMA shadow.
 - `algorithms/README.md`: per-track loss algorithms.
 - `reward/README.md`: reward backends and custom scorers.

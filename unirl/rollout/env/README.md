@@ -38,11 +38,12 @@ turn on the `"policy"` engine, and stops when the environment returns `done=True
 `max_turns`, or — at a turn boundary — when the runtime requests a cooperative suspension
 (`HarnessContext.suspend_requested`).
 
-`AgenticRolloutEngine` is the production coordinator. Rank 0 expands `P` prompts into `P * n`
-single-trajectory tasks. Each worker runs up to `per_worker_concurrency` synchronous trajectories
-in a thread pool; concurrent calls let the inner backend batch generation while other threads wait
-on tools. `generate` is a barrier call. `submit`, `poll`, and `abort` provide the background
-partial-rollout interface.
+`AgenticTrainer` expands `P` prompts into `P * n` tasks, and `RolloutManager`
+dispatches each through a single engine slot. Ray actor concurrency lets each
+worker run up to `per_worker_inflight` synchronous trajectories while the inner
+backend batches requests.
+`AgenticRolloutEngine.generate` runs one trajectory; manager `collect` provides
+group completion, while `quiesce` provides turn-boundary suspension for cleanup.
 
 ## Trajectories and observations
 
@@ -56,25 +57,17 @@ input(user) -> generated(assistant) -> observation(tool) -> generated(assistant)
 IDs. The engine fills that frontier. `Sample.observe` appends a branch-one input `Part`, defaults
 its role to `tool`, and carries no sampling parameters, so observations are conditioning rather
 than trainable policy output. The next generation reconstructs its chat history from the ancestor
-chain. The production engine attaches an environment-supplied `info["reward"]` to the final
-generated `Part`; tool-only environments normally omit it.
+chain. Environments produce observations and termination; the trainer scores
+valid terminal answers through its configured `RewardService`.
 
-### Partial rollout and resume
+### Manager quiescence
 
-On `abort`, workers stop pulling new work and let each in-flight turn finish. The trajectory is
-checkpointed before the next turn, so generation is never interrupted mid-turn. The returned
-carried set contains those checkpointed trajectories plus queued tasks that never started. A
-trajectory that becomes terminal during quiescence enters the completed buffer instead; call
-`poll()` once after `abort()` to collect it.
-
-Resumption starts at `len(sample.gen_parts())`, preserving the same lineage and continuing under
-the newly synchronized weights. This works only when `Environment.reset(partial)` preserves the
-existing chain and the environment can recover any required state. Stateless `ToolEnvironment`
-does this. `StatefulTool` sessions and `AlfworldEnv` episodes are closed at checkpoint teardown and
-their reset paths start fresh state, so their current recipes must drop the interrupted tail rather
-than carry it unless the environment supplies its own resumable state. Full stateful resume is
-deferred: it also requires keeping resource ownership on the same worker (or serializing it), plus
-an explicit release path for abandoned tails; disabling checkpoint teardown alone is not sufficient.
+On manager `quiesce`, dispatch pauses and each in-flight turn finishes. A
+nonterminal trajectory is checkpointed before its next turn, so generation is
+never interrupted mid-turn. The manager returns retained queued or suspended
+tasks according to its root filter. The public `AgenticTrainer` does not resume
+these across optimizer steps: normal steps block until every requested group is
+complete, and failure cleanup quiesces and discards unfinished work.
 
 ## Included environments and tools
 
@@ -92,10 +85,6 @@ The included tools are:
 - `SearchTool`: batched Serper or SerpApi search; requires `SERPER_KEY_ID`.
 - `VisitTool`: Jina page reading with optional OpenAI-compatible summarization.
 
-`AlfworldEnv` owns one simulator episode per trajectory, carries its episode ID in the root
-`Part.control`, returns observations and admissible actions, and emits the cumulative environment
-return through `info["reward"]`. GRPO siblings select the same game but run separate episodes.
-
 ## Errors and limits
 
 - A missing or malformed tool call is treated as a final answer. Unknown tools, invalid arguments,
@@ -103,14 +92,15 @@ return through `info["reward"]`. GRPO siblings select the same game but run sepa
 - `ToolEnvironment.step` requires a `Texts` frontier. Direct batched use keeps rows aligned with
   empty observations after one row finishes while a sibling continues; production execution uses
   one trajectory per task and avoids that mixed-row case.
-- The production engine catches an exception from one trajectory, logs it, returns the trajectory
-  accumulated so far as terminal, and continues draining other tasks. Coordinator/pull failures
-  still fail the drain. Teardown failures are logged and suppressed.
-- `max_turns` is the hard engine bound. When an environment also exposes `max_turns`, the production
-  engine requires it to match. `ToolEnvironment` also terminates when no row calls a tool;
-  `AlfworldEnv` terminates on simulator completion or `max_steps`.
+- The harness catches an exception from one trajectory, logs it, and returns the partial trace as
+  a `failed` outcome; the trainer excludes failed trajectories from GRPO statistics. A slot RPC
+  failure poisons the manager and fails the training step. Teardown failures are logged and
+  suppressed.
+- `max_turns` is the hard engine bound. When an environment also exposes
+  `max_turns`, the production engine requires it to match. `ToolEnvironment`
+  also terminates when no row calls a tool.
 - `ToolAgentHarness.run` calls `Environment.close` from `finally` on success, failure, AND
   suspension; a teardown error is logged, never raised.
 
-Current runnable configurations live under [`examples/deep_research`](../../../examples/deep_research)
-and [`examples/alfworld`](../../../examples/alfworld).
+The runnable agentic configuration is
+[`examples/deep_research/deep_research_search_judge.yaml`](../../../examples/deep_research/deep_research_search_judge.yaml).
