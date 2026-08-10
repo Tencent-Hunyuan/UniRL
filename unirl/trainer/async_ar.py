@@ -77,6 +77,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.eval_temperature = float(eval_temperature)
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        # AsyncARTrainer skips ARTrainer.__init__; restore the field _build_request_sample needs.
+        self._allowed_input_primitives = {"text", "image", "video"}
         self.weight_sync = None
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
         if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:

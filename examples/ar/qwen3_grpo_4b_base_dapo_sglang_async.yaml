@@ -19,15 +19,15 @@
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
 num_rollouts: 800
-worker_max_concurrency: 10 # eight rollout calls + two control-call threads per worker
+worker_max_concurrency: 18 # sixteen rollout calls + two control-call threads per worker
 
 # Train slab share (rollout gets the rest). 0.5 → equal split; raise for
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
 max_inflight: 2          # concurrent generations
-per_worker_inflight: 8   # concurrent prompt trees per rollout worker
-weight_sync_interval: 1  # no cross-batch overlap; per-lane dispatch still removes within-batch tails
+per_worker_inflight: 16   # concurrent prompt trees per rollout worker
+weight_sync_interval: 3  # admission stops before work would cross this sync boundary
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).
 eval_interval: 10

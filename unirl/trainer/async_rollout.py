@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
-from typing import TYPE_CHECKING, Callable, Deque, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from unirl.rollout.manager import RolloutManager, keep_within_lag
 from unirl.trainer.base import unwrap_replicated_int
@@ -15,37 +14,6 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
-
-
-class _PromptUnitSource:
-    """Split normal data batches into independently dispatched prompt trees."""
-
-    def __init__(
-        self,
-        data_source: object,
-        build_request: Callable[["Sample", int], "Sample"],
-        *,
-        batch_size: int,
-        start_batch_id: int,
-    ) -> None:
-        self._data_source = data_source
-        self._build_request = build_request
-        self._batch_size = int(batch_size)
-        self._next_batch_id = int(start_batch_id)
-        self._units: Deque["Sample"] = deque()
-
-    def take(self, count: int) -> List["Sample"]:
-        while len(self._units) < count:
-            request = self._build_request(
-                self._data_source.get_samples(self._batch_size),
-                self._next_batch_id,
-            )
-            self._next_batch_id += 1
-            units = request.split()
-            if len(units) != self._batch_size:
-                raise RuntimeError(f"request batch split into {len(units)} prompt units; expected {self._batch_size}")
-            self._units.extend(units)
-        return [self._units.popleft() for _ in range(count)]
 
 
 def next_hard_boundary(
@@ -74,6 +42,12 @@ def boundary_launch_units(
     weight_sync_interval: int,
 ) -> int:
     """Prompt units admissible without crossing a sync or hard boundary."""
+    if max_inflight_units % batch_size:
+        raise ValueError(f"max_inflight_units ({max_inflight_units}) must be divisible by batch_size ({batch_size})")
+    if outstanding_units % batch_size:
+        raise RuntimeError(
+            f"prompt-unit outstanding count must stay batch-aligned to {batch_size}; got {outstanding_units}"
+        )
     freshness_batches = max(0, weight_sync_interval - batches_since_sync)
     remaining_batches = max(0, min(num_rollouts, hard_boundary) - trained_batches)
     allowed_units = min(freshness_batches, remaining_batches) * batch_size
@@ -117,12 +91,7 @@ def combine_rollout_units(
     *,
     require_single_rollout_id: bool = False,
 ) -> Tuple["Sample", int]:
-    """Combine dynamically completed prompt trees sharing one published version.
-
-    Unit admission stops at every publication boundary, so one consumed training
-    batch must never straddle output versions. Keep the explicit check as a
-    guardrail for future admission changes.
-    """
+    """Combine dynamically completed prompt trees from one behavior-policy version."""
     chunks = [sample for group in groups for sample in group]
     if not chunks:
         raise ValueError("cannot combine an empty rollout result")
@@ -209,12 +178,7 @@ class AsyncRolloutTrainerMixin:
             },
         )
 
-        self._unit_source = _PromptUnitSource(
-            self.data_source,
-            self._build_request_sample,
-            batch_size=self.batch_size,
-            start_batch_id=start_rollout,
-        )
+        self._next_generation_id = start_rollout
         engine_slots = self.rollout.engine_slots
         launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
         self._rollout_manager = RolloutManager(
@@ -293,9 +257,8 @@ class AsyncRolloutTrainerMixin:
             self._batches_since_sync = 0
             return
 
-        # Unit admission exhausts exactly at this boundary. Quiesce still
-        # returns carried work defensively, but completed and relaunched units
-        # must not later be combined across output versions.
+        # Admission exhausts at this publication boundary, so regular sync does
+        # not intentionally carry generated work across output versions.
         carried = manager.quiesce(current_version=self._train_version)
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
@@ -331,8 +294,10 @@ class AsyncRolloutTrainerMixin:
             groups,
             require_single_rollout_id=getattr(self, "_require_single_generation", False),
         )
-        scored = self._score_completed(rollout_id, completed)
 
+        # Collecting a train batch releases one batch-equivalent of admission
+        # credit. Refill it before reward scoring so rollout engines stay busy
+        # while the CPU/reward workers process the completed batch.
         inflight_count, ready_count = manager.counts
         units = boundary_launch_units(
             outstanding_units=inflight_count + ready_count,
@@ -345,11 +310,26 @@ class AsyncRolloutTrainerMixin:
             weight_sync_interval=self._weight_sync_interval,
         )
         self._submit_prompt_units(units)
+
+        scored = self._score_completed(rollout_id, completed)
         return scored, output_version
 
     def _submit_prompt_units(self, count: int) -> None:
-        if count:
-            self._rollout_manager.submit(self._unit_source.take(count))
+        batch_count, remainder = divmod(int(count), self.batch_size)
+        if remainder:
+            raise RuntimeError(
+                f"prompt-unit admission must submit whole batches of {self.batch_size}; got {count} units"
+            )
+        for _ in range(batch_count):
+            request = self._build_request_sample(
+                self.data_source.get_samples(self.batch_size),
+                self._next_generation_id,
+            )
+            self._next_generation_id += 1
+            units = request.split()
+            if len(units) != self.batch_size:
+                raise RuntimeError(f"request batch split into {len(units)} prompt units; expected {self.batch_size}")
+            self._rollout_manager.submit(units)
 
 
 __all__ = [

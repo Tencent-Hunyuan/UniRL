@@ -61,6 +61,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         )
         self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
+        self._cross_sync_batches = 0
         self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
