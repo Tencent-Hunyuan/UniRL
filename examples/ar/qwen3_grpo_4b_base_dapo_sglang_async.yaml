@@ -27,7 +27,7 @@ train_fraction: 0.5
 
 max_inflight: 2          # concurrent generations
 per_worker_inflight: 16   # concurrent prompt trees per rollout worker
-weight_sync_interval: 3  # admission stops before work would cross this sync boundary
+weight_sync_interval: 3  # trained batches per publication; also configures the output-version lag filter
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).
 eval_interval: 10
