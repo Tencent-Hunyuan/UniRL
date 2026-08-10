@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import inspect
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -50,6 +51,52 @@ def _resolve_build_batch_2d_rope():
         "in any transformers_modules.* — was AutoModelForCausalLM.from_pretrained "
         "called with trust_remote_code=True before bundle construction?"
     )
+
+
+@contextmanager
+def _batched_template_over_full_batch(tkw: Any) -> Iterator[None]:
+    """Make the upstream batched chat template tokenize every sample, not just the first.
+
+    ``apply_chat_template`` delegates with ``batchify=True``, which calls
+    ``batch_gen_infer(prompt_list=[[]], infer_fn_kwargs_list=[...one per sample])``;
+    ``zip`` cuts the loop to one iteration, so samples 1..B-1 never reach the
+    tokenizer. Replicating ``prompt_list`` restores the pairing — every entry is
+    ``[]`` and spreads as zero positional args, so each sample's content still
+    comes only from its own kwargs entry. Per-instance, restored in ``finally``.
+    """
+    original = tkw.batch_gen_infer
+    had_instance_attr = "batch_gen_infer" in vars(tkw)
+    previous = vars(tkw).get("batch_gen_infer")
+
+    def _over_full_batch(*args: Any, **kwargs: Any) -> Any:
+        prompt_list = kwargs.get("prompt_list")
+        per_sample_kwargs = kwargs.get("infer_fn_kwargs_list")
+        if prompt_list is None and args:
+            # Matching on keywords is only safe while the caller passes them
+            # that way. Say so loudly rather than let the batch silently go
+            # back to being truncated to sample 0.
+            raise TypeError(
+                "HunyuanImage3TextEmbedStage: batch_gen_infer was called with positional "
+                "arguments, so the batched-template shim can no longer find prompt_list. "
+                "The upstream tokenizer signature changed; re-check the shim."
+            )
+        if (
+            isinstance(prompt_list, list)
+            and len(prompt_list) == 1
+            and isinstance(per_sample_kwargs, list)
+            and len(per_sample_kwargs) > 1
+        ):
+            kwargs["prompt_list"] = [list(prompt_list[0]) for _ in per_sample_kwargs]
+        return original(*args, **kwargs)
+
+    tkw.batch_gen_infer = _over_full_batch
+    try:
+        yield
+    finally:
+        if had_instance_attr:
+            tkw.batch_gen_infer = previous
+        else:
+            delattr(tkw, "batch_gen_infer")
 
 
 def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.device) -> Optional[torch.Tensor]:
@@ -108,21 +155,22 @@ class HunyuanImage3TextEmbedStage:
             if "batch_cond_images" in inspect.signature(tkw.apply_chat_template).parameters
             else "batch_cond_image_info"
         )
-        out = tkw.apply_chat_template(
-            batch_prompt=batch_prompt,
-            batch_message_list=batch_message_list,
-            mode=mode,
-            batch_gen_image_info=batch_gen_image_info,
-            batch_system_prompt=batch_system_prompt,
-            batch_cot_text=batch_cot_text,
-            max_length=max_length,
-            bot_task=bot_task,
-            image_base_size=config.image_base_size,
-            sequence_template=gen_config.sequence_template,
-            cfg_factor=cfg_factor,
-            drop_think=gen_config.drop_think,
-            **{_cond_kw: batch_cond_image_info},
-        )
+        with _batched_template_over_full_batch(tkw):
+            out = tkw.apply_chat_template(
+                batch_prompt=batch_prompt,
+                batch_message_list=batch_message_list,
+                mode=mode,
+                batch_gen_image_info=batch_gen_image_info,
+                batch_system_prompt=batch_system_prompt,
+                batch_cot_text=batch_cot_text,
+                max_length=max_length,
+                bot_task=bot_task,
+                image_base_size=config.image_base_size,
+                sequence_template=gen_config.sequence_template,
+                cfg_factor=cfg_factor,
+                drop_think=gen_config.drop_think,
+                **{_cond_kw: batch_cond_image_info},
+            )
         return out["output"], out["sections"]
 
     def _fused_common(

@@ -227,7 +227,9 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     diff_conds = HunyuanImage3DiffusionConditions(
         fused=mm2["fused"],
-        tokenizer_output=mm2["tokenizer_output"],
+        # _update_state is the only reader and it runs only when the cache is
+        # on, so with it off this object would ride the transport unread.
+        tokenizer_output=(mm2["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None),
     )
 
     latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=diff_sp)
