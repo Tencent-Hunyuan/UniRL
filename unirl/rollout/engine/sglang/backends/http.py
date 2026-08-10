@@ -5,10 +5,9 @@ spawn. :meth:`HTTPBackend.boot` filters the config-spelled intent against the
 real ``ServerArgs`` fields (the only place that knows them), quarantines the env
 the SRT subprocess needs at the spawn boundary, launches the server, and polls
 ``/health_generate``. Everything is plain blocking ``urllib`` — no event loop:
-generation concurrency comes from the CALLERS' threads (the agentic drain runs
-one thread per trajectory; the batch path fans out on its own pool), bounded by
-one ``threading.Semaphore``, and the SRT server batches the in-flight POSTs
-together. Weight/memory verbs keep the long weight-op timeout tier.
+generation concurrency comes from the callers' threads, bounded by one
+``threading.Semaphore``, and the SRT server batches the in-flight POSTs together.
+Weight/memory verbs keep the long weight-op timeout tier.
 
 Control-plane payloads (weight sync, memory, LoRA) are constructed from the
 installed runtime's own ``io_struct`` request dataclasses rather than hand-built

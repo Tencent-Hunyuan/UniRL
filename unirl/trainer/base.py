@@ -61,10 +61,13 @@ def prepare_input_sample(
         raise ValueError(f"{caller}: unsupported input primitive keys: {sorted(unsupported)}")
 
     namespaced = inputs.map_sample_ids(lambda sample_id: f"r{rollout_id}:{sample_id}")
-    if root_control is None:
-        return namespaced
     root = namespaced.parts[0]
-    root = replace(root, control={**root.control, **root_control})
+    metadata = root.metadata or [{} for _ in root.sample_ids]
+    if len(metadata) != len(root.sample_ids):
+        raise ValueError(f"{caller}: root metadata has {len(metadata)} rows for {len(root.sample_ids)} root samples.")
+    root = replace(root, metadata=[{**(row or {}), "rollout_id": int(rollout_id)} for row in metadata])
+    if root_control is not None:
+        root = replace(root, control={**root.control, **root_control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
 
 
@@ -86,6 +89,19 @@ def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParam
         obj = instantiate(sampling_cfg)
         return {"ar" if isinstance(obj, ARSamplingParams) else "diffusion": obj}
     return {key: instantiate(sub) for key, sub in sampling_cfg.items()}
+
+
+def unwrap_replicated_int(value: object, *, name: str) -> int:
+    """Normalize a BROADCAST return and verify all worker replicas agree."""
+    if isinstance(value, (list, tuple)):
+        if not value or any(not isinstance(item, int) for item in value):
+            raise TypeError(f"{name} returned invalid worker values: {value!r}")
+        if any(item != value[0] for item in value[1:]):
+            raise RuntimeError(f"{name} disagrees across workers: {value!r}")
+        return value[0]
+    if not isinstance(value, int):
+        raise TypeError(f"{name} returned {type(value).__name__}, expected int")
+    return value
 
 
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
@@ -272,13 +288,9 @@ class BaseTrainer:
         DP_SCATTER-serialized to the training workers right after this call):
 
         1. **Media logging (driver-side).** When the logger wants media this
-           rollout (``UniRLWandBLogger.should_log_media``), take each gen Part's
-           inbound ``media_preview`` or build one from the still-live
-           ``primitives`` (``build_media_preview_for_part`` hydrates a single DP
-           shard), cap to ``media_max_items``, and upload it at the same
-           ``rollout/step`` value :meth:`UniRLWandBLogger.log_rollout_step` uses,
-           so the panels align. Captions default to the frontier-aligned prompt
-           texts (``Sample.conditioning``).
+           rollout (``UniRLWandBLogger.should_log_media``), draw the previews via
+           :meth:`_upload_media_previews` at the same ``rollout/step`` value
+           :meth:`UniRLWandBLogger.log_rollout_step` uses, so the panels align.
         2. **Free the per-rollout payloads.** ``primitives`` (generated
            Images/Videos/Texts/Audios) is consumed upstream by reward scoring and never
            read by training (which uses only segment/conditions/advantages);
@@ -290,38 +302,80 @@ class BaseTrainer:
         Call after scoring / advantages (and any decoded-reading debug dump),
         immediately before dispatching to ``train_track``.
         """
-        from unirl.types.primitives import Images, Texts
-
-        gen_parts = sample.gen_parts()
         wb = self.wandb_logger
         if wb is not None and wb.should_log_media(rollout_id):
-            from unirl.types.media_preview import build_media_preview_for_part
+            self._upload_media_previews(sample, rollout_id + 1, prefix="rollout", step_key="rollout/step")
 
-            multi = len(gen_parts) > 1
-            cond = sample.conditioning()
-            default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
-            input_image = next((c for c in cond if isinstance(c, Images)), None)
-            for part in gen_parts:
-                name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
-                preview = part.media_preview
-                if preview is None and part.primitives:
-                    preview = build_media_preview_for_part(
-                        part=part,
-                        max_items=wb.media_max_items,
-                        prompts=default_prompts if part is sample.parts[-1] else None,
-                        input_image=input_image,
-                    )
-                if preview is None:
-                    continue
-                if len(preview) > wb.media_max_items:
-                    preview = preview.slice(0, wb.media_max_items)
-                key = f"rollout/{name}/generated_media" if multi else "rollout/generated_media"
-                wb.log_generated_media(rollout_id + 1, preview, key=key)
-
-        for part in gen_parts:
+        for part in sample.gen_parts():
             part.primitives = {}
             part.primitive_metadata = {}
             part.media_preview = None
+
+    def _upload_media_previews(self, sample: Sample, step: int, *, prefix: str, step_key: str) -> None:
+        """Upload one preview grid per generated track of ``sample`` under ``prefix``.
+
+        Takes each gen ``Part``'s inbound ``media_preview`` or builds one from its
+        still-live ``primitives`` (``build_media_preview_for_part`` hydrates a
+        single DP shard), caps it to ``media_max_items``, and logs it on
+        ``step_key`` so the panel shares an axis with that caller's scalars.
+        Captions default to the frontier-aligned prompt texts
+        (``Sample.conditioning``); a scored Sample also carries its rewards.
+        Multi-track samples get one key per track
+        (``{prefix}/{ar,diffusion}/generated_media``).
+
+        Decides only WHAT to draw — cadence and payload lifetime stay with the
+        caller, since eval must not free primitives its later scorers still read.
+        """
+        from unirl.types.media_preview import build_media_preview_for_part
+        from unirl.types.primitives import Images, Texts
+
+        wb = self.wandb_logger
+        gen_parts = sample.gen_parts()
+        multi = len(gen_parts) > 1
+        cond = sample.conditioning()
+        default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
+        input_image = next((c for c in cond if isinstance(c, Images)), None)
+        for part in gen_parts:
+            name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
+            preview = part.media_preview
+            if preview is None and part.primitives:
+                preview = build_media_preview_for_part(
+                    part=part,
+                    max_items=wb.media_max_items,
+                    prompts=default_prompts if part is sample.parts[-1] else None,
+                    input_image=input_image,
+                )
+            if preview is None:
+                continue
+            if len(preview) > wb.media_max_items:
+                preview = preview.slice(0, wb.media_max_items)
+            key = f"{prefix}/{name}/generated_media" if multi else f"{prefix}/generated_media"
+            wb.log_generated_media(step, preview, key=key, step_key=step_key)
+
+    def _log_eval_media(self, sample: Sample, step: int, *, prefix: str = "eval") -> None:
+        """Upload the eval preview grid for one scored eval chunk.
+
+        Called with the FIRST chunk of an eval sweep, which is a fixed comparison
+        grid rather than a fresh draw: eval prompts are the head of the eval set
+        (``get_eval_samples`` is deterministic) and eval x_T is keyed on prompt
+        content and sibling ordinal (``make_prompt_seed_group_id``, independent of
+        rollout id and rank). Capping at ``media_max_items`` therefore yields the
+        SAME prompts at the SAME noise at every eval, so the panels are a
+        like-for-like A/B across training.
+
+        That is the full-trajectory invariant only at ``eval_eta <= 0`` (the
+        default): an SDE eval additionally draws per-step noise seeded from the
+        eval step's sample ids, so its panels differ by noise as well as policy
+        (``DiffusionTrainer.__init__`` warns).
+
+        The cap counts SAMPLES, not prompts: siblings are adjacent
+        (``Part.fork``), so with ``eval_samples_per_prompt=4`` a cap of 8 shows
+        two prompts four ways.
+        """
+        wb = self.wandb_logger
+        if wb is None or not wb.should_log_eval_media():
+            return
+        self._upload_media_previews(sample, step, prefix=prefix, step_key="eval/step")
 
     def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
         """Flush a pending backend checkpoint before worker teardown.

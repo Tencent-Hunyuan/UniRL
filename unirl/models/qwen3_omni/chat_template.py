@@ -8,6 +8,7 @@ import torch
 
 from unirl.models.types.conversations import build_omni_messages
 from unirl.types.conditions import TextTokenCondition
+from unirl.types.media import MediaRefs
 from unirl.types.primitives import Texts
 from unirl.types.sample import Turn
 
@@ -41,6 +42,27 @@ class Qwen3OmniChatTemplateStage:
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
         self.use_audio_in_video = bool(use_audio_in_video)
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+
+    def embed_sft_prompt(
+        self,
+        *,
+        texts: Texts,
+        media_refs: Optional[MediaRefs] = None,
+    ) -> Qwen3OmniARConditions:
+        """Encode single-turn SFT prompts through the model-specific media path."""
+        if media_refs is None or not any(media_refs.rows):
+            return self.embed(texts)
+        if len(texts) != len(media_refs):
+            raise ValueError(
+                "Qwen3OmniChatTemplateStage.embed_sft_prompt: "
+                f"media row count {len(media_refs)} != text batch {len(texts)}."
+            )
+        return self.embed(
+            [
+                Turn(role="user", content=media_refs),
+                Turn(role="user", content=texts),
+            ]
+        )
 
     def embed(
         self,

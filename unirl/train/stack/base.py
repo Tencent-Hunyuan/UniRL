@@ -41,6 +41,7 @@ update shares the same PPO anchor; this is only correct for algorithms with
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Dict, List, Mapping, Optional, Tuple, Union
@@ -61,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TrainStepResult:
-    """Result of one full optimizer step on this stage."""
+    """Result of one ``train_track`` call, possibly spanning multiple optimizer updates."""
 
     loss: float
     grad_norm: float
@@ -69,6 +70,8 @@ class TrainStepResult:
     has_backward: bool
     micros: List[AlgorithmStepResult]
     metrics: Mapping[str, object]
+    # Steps that committed; a no-backward or non-finite grad norm contributes 0.
+    optimizer_updates: int
     per_update: Tuple[Mapping[str, object], ...] = ()
 
 
@@ -92,6 +95,7 @@ def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepRes
         has_backward=any(r.has_backward for r in results),
         micros=micros,
         metrics=metrics,
+        optimizer_updates=sum(r.optimizer_updates for r in results),
     )
 
 
@@ -322,6 +326,7 @@ class TrainStack(Remote):
             has_backward=has_backward,
             micros=micro_results,
             metrics=aggregated_metrics,
+            optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
         )
 
     def on_rollout_end(self) -> None:
@@ -603,7 +608,13 @@ class TrainStack(Remote):
             return results[0]
         aggregated = _aggregate_update_results(results)
         per_update = tuple(
-            {**dict(r.metrics), "loss": float(r.loss), "grad_norm": float(r.grad_norm), "lr": float(r.lr)}
+            {
+                **r.metrics,
+                "loss": r.loss,
+                "grad_norm": r.grad_norm,
+                "lr": r.lr,
+                "optimizer_updates": r.optimizer_updates,
+            }
             for r in results
         )
         return replace(aggregated, per_update=per_update)
