@@ -53,7 +53,6 @@ eval_interval: 25
 eval_num_prompts: 16
 eval_samples_per_prompt: 4
 eval_chunk_prompts: 8
-eval_cfg_text_scale: 1
 eval_eta: 0.0
 
 transport_kind: colocate_store
@@ -118,6 +117,7 @@ backend:
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true     # 7B + multi-step replay: required
+    ac_wrap_order: inside              # recompute re-enters FSDP hooks; the order this recipe's smoke validated
     use_torch_compile: false
     root_wrap: false                   # vendored BAGEL calls embed_tokens/lm_head outside a root forward
   optimizer_cfg:
@@ -204,13 +204,7 @@ reward:
         batch_size: 8
         request_batch_size: 8
         timeout: 600.0
-        # `first` == the scorer's first sub-metric == reward column 0. The pinned
-        # config above pools its two semantic heads INSIDE the model
-        # (pooling_strategy: mean) and emits output_dim=2 as [reward, log-sigma] —
-        # see the "sum" branch of the vendored model, which reads column 1 as
-        # exp()-able sigma. Those columns are not instruction-following and visual
-        # quality, so `mean` would spend half the training signal driving the reward
-        # model's own uncertainty. Column 1 stays visible as a logged sub-metric.
+        # EditReward's first column is reward; the second is log uncertainty, so do not average them.
         sub_metric_reduce: first
         aggregation_method: weighted_sum
         input_kind: image

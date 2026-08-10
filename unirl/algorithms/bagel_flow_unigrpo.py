@@ -183,7 +183,10 @@ class BagelFlowUniGRPO(FlowGRPO):
                     )
                 # Rebuild reference conditioning only after policy weights are disabled.
                 ref_forward_kwargs = self.stage.build_forward_kwargs(
-                    typed_conds, params=self.params, device=device, force_rebuild=True
+                    typed_conds,
+                    params=self.params,
+                    device=device,
+                    force_rebuild=bool(typed_conds.input_images),
                 )
                 v_refs = [
                     self.stage.predict_velocity_at(

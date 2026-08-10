@@ -226,6 +226,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         force_rebuild: bool = False,
     ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch."""
+        if force_rebuild:
+            require(
+                bool(conditions.input_images),
+                "_resolve_single(force_rebuild=True) requires image-conditioned "
+                "raw material; prompt-only stored contexts (t2i/t2ti) cannot be "
+                "reproduced from the bare prompt.",
+            )
         if differentiable and conditions.input_images:
             prompt, input_image, image_shape = conditions.single_prompt()
             gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
